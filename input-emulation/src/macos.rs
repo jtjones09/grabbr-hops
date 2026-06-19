@@ -58,6 +58,9 @@ pub(crate) struct MacOSEmulation {
     /// skipping CGEvent entirely (vs the default dual-post). Host-only HID test —
     /// breaks VM guests, which need the CGEvent device bits.
     hid_pure: bool,
+    /// Cached "is the focused window a VM guest", short TTL, so the per-modifier
+    /// window lookup stays cheap.
+    vm_guest_cache: Cell<Option<(Instant, bool)>>,
 }
 
 /// Maps an evdev button code to the CGEventType used for drag events.
@@ -99,6 +102,7 @@ impl MacOSEmulation {
             secure_input_prev: Cell::new(false),
             hid_connect,
             hid_pure,
+            vm_guest_cache: Cell::new(None),
         })
     }
 
@@ -226,22 +230,50 @@ impl MacOSEmulation {
         log::warn!("[coherence] {ctx}: reconciled — cleared stuck 0x{stuck:06x}");
     }
 
-    /// Posts a modifier `FlagsChanged`. Mode via `LAN_MOUSE_HID_MODIFIERS`:
-    /// - unset: CGEvent only (#460; device bits reach VM guests) — stable.
-    /// - set (dual): IOHIDPostEvent + CGEvent (host HID state + guest coverage).
-    /// - `pure`: IOHIDPostEvent only, no CGEvent — host-only test, breaks VM guests.
+    /// Posts a modifier `FlagsChanged`. Behaviour via `LAN_MOUSE_HID_MODIFIERS`:
+    /// - unset: CGEvent device bits only (#460) — reaches VM guests, stable.
+    /// - set: auto — IOHIDPostEvent when native macOS is focused (smooth, wakes
+    ///   the display); CGEvent device bits when a VM guest window is focused
+    ///   (IOHIDPostEvent does not reach guests).
+    /// - `pure`: force IOHIDPostEvent everywhere, skipping guest detection (debug).
     fn post_modifier(&self, key: u16, depressed: XMods) {
         if let Some(connect) = self.hid_connect {
-            let nx_flags = (modifier_flags_changed_flags(depressed).bits()
-                & !CGEventFlags::CGEventFlagNonCoalesced.bits()) as u32;
-            let posted = post_hid_flags_changed(connect, key, nx_flags);
-            // Pure HID: skip the CGEvent post — unless the HID post failed, in
-            // which case fall through so the modifier isn't lost.
-            if self.hid_pure && posted {
-                return;
+            // HID is great for native macOS but does NOT reach VM guests, so use
+            // it only when the focused window is not a guest (unless `pure` forces
+            // it). On a guest, fall through to the CGEvent device-bit path (#460).
+            if self.hid_pure || !self.target_is_vm_guest() {
+                let nx_flags = (modifier_flags_changed_flags(depressed).bits()
+                    & !CGEventFlags::CGEventFlagNonCoalesced.bits())
+                    as u32;
+                if post_hid_flags_changed(connect, key, nx_flags) {
+                    return;
+                }
             }
         }
         modifier_key_event(self.event_source.clone(), key, depressed);
+    }
+
+    /// Whether the focused window belongs to a VM hypervisor, cached with a short
+    /// TTL (the window lookup is too heavy to run per keystroke). Logs on
+    /// transition so the native↔guest switch is visible at the default level.
+    fn target_is_vm_guest(&self) -> bool {
+        let now = Instant::now();
+        if let Some((when, val)) = self.vm_guest_cache.get() {
+            if now.duration_since(when) < VM_DETECT_TTL {
+                return val;
+            }
+        }
+        let prev = self.vm_guest_cache.get().map(|(_, v)| v);
+        let val = frontmost_is_vm_guest();
+        if prev != Some(val) {
+            if val {
+                log::info!("[vm] guest window focused → CGEvent device-bit modifiers");
+            } else {
+                log::info!("[vm] native focus → IOHIDPostEvent modifiers");
+            }
+        }
+        self.vm_guest_cache.set(Some((now, val)));
+        val
     }
 }
 
@@ -420,6 +452,80 @@ fn post_hid_flags_changed(connect: u32, key: u16, nx_flags: u32) -> bool {
         log::warn!("IOHIDPostEvent(FlagsChanged) failed: kr=0x{kr:x}");
     }
     kr == 0
+}
+
+// ---- VM-guest focus detection ----------------------------------------------
+//
+// IOHIDPostEvent is smooth for native macOS but does NOT reach VM guests; the
+// CGEvent device bits (#460) do. We detect whether the focused window belongs to
+// a hypervisor and route modifiers accordingly. Detection reads the focused
+// window's owner (process) name via CGWindowList — no Screen Recording needed
+// (that only gates window *titles*, not owner names).
+
+const VM_DETECT_TTL: Duration = Duration::from_millis(300);
+
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    fn CFArrayGetCount(array: core_foundation::array::CFArrayRef) -> isize;
+    fn CFArrayGetValueAtIndex(
+        array: core_foundation::array::CFArrayRef,
+        idx: isize,
+    ) -> *const c_void;
+    fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
+}
+
+/// `kCGWindowOwnerName` values for the common macOS hypervisor UIs.
+fn is_hypervisor_owner(name: &str) -> bool {
+    const HYPERVISORS: [&str; 6] = [
+        "Parallels Desktop",
+        "prl_client_app",
+        "VMware Fusion",
+        "VirtualBoxVM",
+        "UTM",
+        "VirtualBuddy",
+    ];
+    HYPERVISORS.iter().any(|h| name.contains(h))
+}
+
+fn frontmost_is_vm_guest() -> bool {
+    frontmost_owner_name().is_some_and(|n| is_hypervisor_owner(&n))
+}
+
+/// Owner (process) name of the frontmost on-screen normal window (layer 0).
+fn frontmost_owner_name() -> Option<String> {
+    use core_foundation::base::TCFType;
+    use core_foundation::number::{CFNumber, CFNumberRef};
+    use core_foundation::string::{CFString, CFStringRef};
+    use core_graphics::window::{
+        copy_window_info, kCGNullWindowID, kCGWindowLayer, kCGWindowListOptionOnScreenOnly,
+        kCGWindowOwnerName,
+    };
+
+    let windows = copy_window_info(kCGWindowListOptionOnScreenOnly, kCGNullWindowID)?;
+    let array = windows.as_concrete_TypeRef();
+    let count = unsafe { CFArrayGetCount(array) };
+    for i in 0..count {
+        let dict = unsafe { CFArrayGetValueAtIndex(array, i) };
+        if dict.is_null() {
+            continue;
+        }
+        // The frontmost *normal* window is layer 0 (skip menubar/dock/overlays).
+        let layer_ref = unsafe { CFDictionaryGetValue(dict, kCGWindowLayer as *const c_void) };
+        if layer_ref.is_null() {
+            continue;
+        }
+        let layer = unsafe { CFNumber::wrap_under_get_rule(layer_ref as CFNumberRef) }.to_i32();
+        if layer != Some(0) {
+            continue;
+        }
+        let name_ref = unsafe { CFDictionaryGetValue(dict, kCGWindowOwnerName as *const c_void) };
+        if name_ref.is_null() {
+            continue;
+        }
+        let name = unsafe { CFString::wrap_under_get_rule(name_ref as CFStringRef) }.to_string();
+        return Some(name);
+    }
+    None
 }
 
 /// Mac virtual key codes for the four arrow keys.
