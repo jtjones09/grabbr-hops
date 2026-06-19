@@ -266,23 +266,25 @@ impl MacOSEmulation {
                 return val;
             }
         }
-        let owner = frontmost_owner_name();
-        let val = owner.as_deref().is_some_and(is_hypervisor_owner);
-        // Log when the focused window's owner changes — reveals the exact owner
-        // name (to tune the hypervisor match) and shows the HID↔CGEvent route.
+        let info = frontmost_window_owner();
+        let path = info.as_ref().and_then(|(_, pid)| pid_exe_path(*pid));
+        let val = path.as_deref().is_some_and(is_hypervisor_path);
+        // Log when the focused window changes — owner name + exe path + route.
         {
+            let owner = info.map(|(name, _)| name).unwrap_or_default();
             let mut last = self.last_owner.borrow_mut();
-            if last.as_deref() != owner.as_deref() {
+            if last.as_deref() != Some(owner.as_str()) {
                 log::info!(
-                    "[vm] focus owner={:?} → {}",
-                    owner.as_deref().unwrap_or("<none>"),
+                    "[vm] focus owner={:?} path={:?} → {}",
+                    owner,
+                    path.as_deref().unwrap_or("<none>"),
                     if val {
                         "guest (CGEvent)"
                     } else {
                         "native (HID)"
                     }
                 );
-                *last = owner;
+                *last = Some(owner);
             }
         }
         self.vm_guest_cache.set(Some((now, val)));
@@ -487,27 +489,46 @@ extern "C" {
     fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
 }
 
-/// `kCGWindowOwnerName` values for the common macOS hypervisor UIs.
-fn is_hypervisor_owner(name: &str) -> bool {
-    const HYPERVISORS: [&str; 6] = [
-        "Parallels Desktop",
-        "prl_client_app",
-        "VMware Fusion",
-        "VirtualBoxVM",
-        "UTM",
-        "VirtualBuddy",
-    ];
-    HYPERVISORS.iter().any(|h| name.contains(h))
+extern "C" {
+    // libproc (libSystem): executable path for a process id.
+    fn proc_pidpath(pid: i32, buffer: *mut c_void, buffersize: u32) -> i32;
 }
 
-/// Owner (process) name of the frontmost on-screen normal window (layer 0).
-fn frontmost_owner_name() -> Option<String> {
+/// Whether an executable path belongs to a known macOS hypervisor. We match the
+/// *path* (stable) rather than the window owner name — Parallels sets the owner
+/// name to the user's VM name (e.g. "macOS VM", "Windows 11"), which is useless
+/// for matching.
+fn is_hypervisor_path(path: &str) -> bool {
+    const MARKERS: [&str; 5] = [
+        "Parallels Desktop.app",
+        "VMware Fusion.app",
+        "VirtualBox",
+        "UTM.app",
+        "VirtualBuddy.app",
+    ];
+    MARKERS.iter().any(|m| path.contains(m))
+}
+
+/// Executable path of a process id, via libproc.
+fn pid_exe_path(pid: i32) -> Option<String> {
+    let mut buf = [0u8; 4096];
+    let len = unsafe { proc_pidpath(pid, buf.as_mut_ptr() as *mut c_void, buf.len() as u32) };
+    if len <= 0 {
+        return None;
+    }
+    std::str::from_utf8(&buf[..len as usize])
+        .ok()
+        .map(str::to_string)
+}
+
+/// (owner name, owner pid) of the frontmost on-screen normal window (layer 0).
+fn frontmost_window_owner() -> Option<(String, i32)> {
     use core_foundation::base::TCFType;
     use core_foundation::number::{CFNumber, CFNumberRef};
     use core_foundation::string::{CFString, CFStringRef};
     use core_graphics::window::{
         copy_window_info, kCGNullWindowID, kCGWindowLayer, kCGWindowListOptionOnScreenOnly,
-        kCGWindowOwnerName,
+        kCGWindowOwnerName, kCGWindowOwnerPID,
     };
 
     let windows = copy_window_info(kCGWindowListOptionOnScreenOnly, kCGNullWindowID)?;
@@ -527,12 +548,21 @@ fn frontmost_owner_name() -> Option<String> {
         if layer != Some(0) {
             continue;
         }
-        let name_ref = unsafe { CFDictionaryGetValue(dict, kCGWindowOwnerName as *const c_void) };
-        if name_ref.is_null() {
+        let pid_ref = unsafe { CFDictionaryGetValue(dict, kCGWindowOwnerPID as *const c_void) };
+        if pid_ref.is_null() {
             continue;
         }
-        let name = unsafe { CFString::wrap_under_get_rule(name_ref as CFStringRef) }.to_string();
-        return Some(name);
+        let pid = match unsafe { CFNumber::wrap_under_get_rule(pid_ref as CFNumberRef) }.to_i32() {
+            Some(p) => p,
+            None => continue,
+        };
+        let name_ref = unsafe { CFDictionaryGetValue(dict, kCGWindowOwnerName as *const c_void) };
+        let name = if name_ref.is_null() {
+            String::new()
+        } else {
+            unsafe { CFString::wrap_under_get_rule(name_ref as CFStringRef) }.to_string()
+        };
+        return Some((name, pid));
     }
     None
 }
