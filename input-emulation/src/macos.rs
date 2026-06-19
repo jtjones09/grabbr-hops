@@ -17,6 +17,7 @@ use input_event::{
 use keycode::{KeyMap, KeyMapping};
 use std::cell::Cell;
 use std::collections::HashSet;
+use std::os::raw::{c_char, c_void};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -50,6 +51,9 @@ pub(crate) struct MacOSEmulation {
     reconcile_enabled: bool,
     /// last observed secure-input state, so we log only on the transition into it
     secure_input_prev: Cell<bool>,
+    /// IOHIDSystem connection for the IOHIDPostEvent modifier path, when enabled
+    /// via `LAN_MOUSE_HID_MODIFIERS` (None = CGEvent-only)
+    hid_connect: Option<u32>,
 }
 
 /// Maps an evdev button code to the CGEventType used for drag events.
@@ -70,6 +74,11 @@ impl MacOSEmulation {
 
         let event_source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .map_err(|_| MacOSEmulationCreationError::EventSourceCreation)?;
+        let hid_connect = if std::env::var_os("LAN_MOUSE_HID_MODIFIERS").is_some() {
+            open_hid_connection()
+        } else {
+            None
+        };
         Ok(Self {
             event_source,
             pressed_buttons: HashSet::new(),
@@ -81,6 +90,7 @@ impl MacOSEmulation {
             modifier_state: Rc::new(Cell::new(XMods::empty())),
             reconcile_enabled: std::env::var_os("LAN_MOUSE_NO_RECONCILE").is_none(),
             secure_input_prev: Cell::new(false),
+            hid_connect,
         })
     }
 
@@ -192,6 +202,23 @@ impl MacOSEmulation {
         );
         log::warn!("[coherence] {ctx}: reconciled OS modifiers to intended=0x{intended:06x}");
     }
+
+    /// Posts a modifier `FlagsChanged`.
+    ///
+    /// Always via CGEvent (carries the device-dependent bits VM guests read,
+    /// #460). Additionally via IOHIDPostEvent when the HID path is enabled and
+    /// connected: that sets the host session's modifier state authoritatively at
+    /// the IOKit HID layer, aimed at curing the "stuck modifier" case where
+    /// macOS ignores a synthetic CGEvent release. Dual-post because IOHIDPostEvent
+    /// does not reach `VZVirtualMachineView` guests and CGEvent does.
+    fn post_modifier(&self, key: u16, depressed: XMods) {
+        modifier_key_event(self.event_source.clone(), key, depressed);
+        if let Some(connect) = self.hid_connect {
+            let nx_flags = (modifier_flags_changed_flags(depressed).bits()
+                & !CGEventFlags::CGEventFlagNonCoalesced.bits()) as u32;
+            post_hid_flags_changed(connect, key, nx_flags);
+        }
+    }
 }
 
 fn request_macos_emulation_permissions() -> Result<(), MacOSEmulationCreationError> {
@@ -238,6 +265,137 @@ extern "C" {
     /// True when a focused field has enabled secure input (e.g. a password
     /// field), which makes macOS suppress synthetic keystrokes entirely.
     fn IsSecureEventInputEnabled() -> u8;
+}
+
+// ---- IOHIDPostEvent (legacy IOKit HID) modifier path -----------------------
+//
+// Opt-in via LAN_MOUSE_HID_MODIFIERS. Posts modifier FlagsChanged through the
+// lower-level IOKit HID layer, which sets the host session's modifier state
+// authoritatively (CGEvent releases are sometimes ignored by macOS, leaving a
+// stuck modifier). CGEvent is still posted alongside it for VM-guest coverage
+// (#460) — IOHIDPostEvent does NOT reach VZVirtualMachineView guests — so this
+// is a hybrid, not a replacement.
+
+const NX_FLAGSCHANGED: u32 = 12; // IOLLEvent.h NX_FLAGSCHANGED
+const NX_EVENT_DATA_VERSION: u32 = 2; // kNXEventDataVersion
+const KIO_HID_PARAM_CONNECT_TYPE: u32 = 1; // kIOHIDParamConnectType
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // FFI layout; fields read by the C side
+struct IOGPoint {
+    x: i16,
+    y: i16,
+}
+
+// NXEventData.key (IOLLEvent.h). Only key_code is used for FlagsChanged; the
+// modifier state itself travels in IOHIDPostEvent's eventFlags argument.
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // FFI layout; fields read by the C side
+struct NXKeyEventData {
+    orig_charset: u16,
+    repeat: i16,
+    charset: u16,
+    char_code: u16,
+    key_code: u16,
+    orig_char_code: u16,
+    reserved1: i32,
+    keyboard_type: u32,
+    reserved2: i32,
+    reserved3: i32,
+    reserved4: i32,
+    reserved5: [i32; 4],
+}
+
+// NXEventData is a union; we only fill `key`. Pad well past sizeof(NXEventData)
+// (~112 B) so IOHIDPostEvent never reads beyond our buffer.
+#[repr(C)]
+#[allow(dead_code)] // FFI layout; bytes read by the C side
+struct NXEventDataBuf {
+    key: NXKeyEventData,
+    _pad: [u8; 208],
+}
+
+#[link(name = "IOKit", kind = "framework")]
+extern "C" {
+    fn IOServiceMatching(name: *const c_char) -> *mut c_void;
+    fn IOServiceGetMatchingService(main_port: u32, matching: *mut c_void) -> u32;
+    fn IOServiceOpen(service: u32, owning_task: u32, connect_type: u32, connect: *mut u32) -> i32;
+    fn IOObjectRelease(object: u32) -> i32;
+    fn IOHIDPostEvent(
+        connect: u32,
+        event_type: u32,
+        location: IOGPoint,
+        event_data: *const NXEventDataBuf,
+        event_data_version: u32,
+        event_flags: u32,
+        options: u32,
+    ) -> i32;
+}
+
+extern "C" {
+    static mach_task_self_: u32;
+}
+
+/// Opens a connection to `IOHIDSystem` for `IOHIDPostEvent`.
+///
+/// Returns None (and logs) if the service is missing or the open is refused — the
+/// caller then stays on the CGEvent path. Known risk: this legacy connection may
+/// be denied on recent macOS; the log line tells us whether it works here.
+fn open_hid_connection() -> Option<u32> {
+    unsafe {
+        let matching = IOServiceMatching(c"IOHIDSystem".as_ptr());
+        if matching.is_null() {
+            log::warn!("IOHIDSystem: IOServiceMatching returned null");
+            return None;
+        }
+        // IOServiceGetMatchingService consumes a reference to `matching`.
+        let service = IOServiceGetMatchingService(0, matching);
+        if service == 0 {
+            log::warn!("IOHIDSystem service not found");
+            return None;
+        }
+        let mut connect: u32 = 0;
+        let kr = IOServiceOpen(
+            service,
+            mach_task_self_,
+            KIO_HID_PARAM_CONNECT_TYPE,
+            &mut connect,
+        );
+        IOObjectRelease(service);
+        if kr == 0 && connect != 0 {
+            log::info!("IOHIDSystem connection opened — IOHIDPostEvent modifier path active");
+            Some(connect)
+        } else {
+            log::warn!("IOServiceOpen(IOHIDSystem) failed: kr=0x{kr:x}; staying on CGEvent");
+            None
+        }
+    }
+}
+
+/// Posts a modifier `FlagsChanged` via IOHIDPostEvent. `nx_flags` is the new
+/// modifier mask (same bit layout as `CGEventFlags`). Returns false (and logs)
+/// on failure.
+fn post_hid_flags_changed(connect: u32, key: u16, nx_flags: u32) -> bool {
+    let mut data: NXEventDataBuf = unsafe { std::mem::zeroed() };
+    data.key.key_code = key;
+    let location = IOGPoint { x: 0, y: 0 };
+    let kr = unsafe {
+        IOHIDPostEvent(
+            connect,
+            NX_FLAGSCHANGED,
+            location,
+            &data,
+            NX_EVENT_DATA_VERSION,
+            nx_flags,
+            0,
+        )
+    };
+    if kr != 0 {
+        log::warn!("IOHIDPostEvent(FlagsChanged) failed: kr=0x{kr:x}");
+    }
+    kr == 0
 }
 
 /// Mac virtual key codes for the four arrow keys.
@@ -741,11 +899,7 @@ impl Emulation for MacOSEmulation {
                         // slot, so pressing a second modifier would cancel the first
                         // modifier's repeat task and post a keyUp while it is still
                         // physically held, tearing chords apart (issue #450, #357).
-                        modifier_key_event(
-                            self.event_source.clone(),
-                            code,
-                            self.modifier_state.get(),
-                        );
+                        self.post_modifier(code, self.modifier_state.get());
                     } else {
                         // Before typing a normal key, make sure no stale modifier
                         // flag the OS still holds turns it into a silent chord (the
