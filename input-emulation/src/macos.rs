@@ -54,6 +54,10 @@ pub(crate) struct MacOSEmulation {
     /// IOHIDSystem connection for the IOHIDPostEvent modifier path, when enabled
     /// via `LAN_MOUSE_HID_MODIFIERS` (None = CGEvent-only)
     hid_connect: Option<u32>,
+    /// `LAN_MOUSE_HID_MODIFIERS=pure`: post modifiers via IOHIDPostEvent ONLY,
+    /// skipping CGEvent entirely (vs the default dual-post). Host-only HID test —
+    /// breaks VM guests, which need the CGEvent device bits.
+    hid_pure: bool,
 }
 
 /// Maps an evdev button code to the CGEventType used for drag events.
@@ -74,11 +78,14 @@ impl MacOSEmulation {
 
         let event_source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .map_err(|_| MacOSEmulationCreationError::EventSourceCreation)?;
-        let hid_connect = if std::env::var_os("LAN_MOUSE_HID_MODIFIERS").is_some() {
+        let hid_mode = std::env::var("LAN_MOUSE_HID_MODIFIERS").ok();
+        let hid_connect = if hid_mode.is_some() {
             open_hid_connection()
         } else {
             None
         };
+        // "pure" => HID only (no CGEvent for modifiers); any other value => dual.
+        let hid_pure = hid_mode.as_deref() == Some("pure");
         Ok(Self {
             event_source,
             pressed_buttons: HashSet::new(),
@@ -91,6 +98,7 @@ impl MacOSEmulation {
             reconcile_enabled: std::env::var_os("LAN_MOUSE_NO_RECONCILE").is_none(),
             secure_input_prev: Cell::new(false),
             hid_connect,
+            hid_pure,
         })
     }
 
@@ -218,21 +226,22 @@ impl MacOSEmulation {
         log::warn!("[coherence] {ctx}: reconciled — cleared stuck 0x{stuck:06x}");
     }
 
-    /// Posts a modifier `FlagsChanged`.
-    ///
-    /// Always via CGEvent (carries the device-dependent bits VM guests read,
-    /// #460). Additionally via IOHIDPostEvent when the HID path is enabled and
-    /// connected: that sets the host session's modifier state authoritatively at
-    /// the IOKit HID layer, aimed at curing the "stuck modifier" case where
-    /// macOS ignores a synthetic CGEvent release. Dual-post because IOHIDPostEvent
-    /// does not reach `VZVirtualMachineView` guests and CGEvent does.
+    /// Posts a modifier `FlagsChanged`. Mode via `LAN_MOUSE_HID_MODIFIERS`:
+    /// - unset: CGEvent only (#460; device bits reach VM guests) — stable.
+    /// - set (dual): IOHIDPostEvent + CGEvent (host HID state + guest coverage).
+    /// - `pure`: IOHIDPostEvent only, no CGEvent — host-only test, breaks VM guests.
     fn post_modifier(&self, key: u16, depressed: XMods) {
-        modifier_key_event(self.event_source.clone(), key, depressed);
         if let Some(connect) = self.hid_connect {
             let nx_flags = (modifier_flags_changed_flags(depressed).bits()
                 & !CGEventFlags::CGEventFlagNonCoalesced.bits()) as u32;
-            post_hid_flags_changed(connect, key, nx_flags);
+            let posted = post_hid_flags_changed(connect, key, nx_flags);
+            // Pure HID: skip the CGEvent post — unless the HID post failed, in
+            // which case fall through so the modifier isn't lost.
+            if self.hid_pure && posted {
+                return;
+            }
         }
+        modifier_key_event(self.event_source.clone(), key, depressed);
     }
 }
 
