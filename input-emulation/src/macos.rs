@@ -15,7 +15,7 @@ use input_event::{
     scancode,
 };
 use keycode::{KeyMap, KeyMapping};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::os::raw::{c_char, c_void};
 use std::rc::Rc;
@@ -61,6 +61,8 @@ pub(crate) struct MacOSEmulation {
     /// Cached "is the focused window a VM guest", short TTL, so the per-modifier
     /// window lookup stays cheap.
     vm_guest_cache: Cell<Option<(Instant, bool)>>,
+    /// Last focused-window owner name we logged, so we log only on change.
+    last_owner: RefCell<Option<String>>,
 }
 
 /// Maps an evdev button code to the CGEventType used for drag events.
@@ -103,6 +105,7 @@ impl MacOSEmulation {
             hid_connect,
             hid_pure,
             vm_guest_cache: Cell::new(None),
+            last_owner: RefCell::new(None),
         })
     }
 
@@ -263,13 +266,23 @@ impl MacOSEmulation {
                 return val;
             }
         }
-        let prev = self.vm_guest_cache.get().map(|(_, v)| v);
-        let val = frontmost_is_vm_guest();
-        if prev != Some(val) {
-            if val {
-                log::info!("[vm] guest window focused → CGEvent device-bit modifiers");
-            } else {
-                log::info!("[vm] native focus → IOHIDPostEvent modifiers");
+        let owner = frontmost_owner_name();
+        let val = owner.as_deref().is_some_and(is_hypervisor_owner);
+        // Log when the focused window's owner changes — reveals the exact owner
+        // name (to tune the hypervisor match) and shows the HID↔CGEvent route.
+        {
+            let mut last = self.last_owner.borrow_mut();
+            if last.as_deref() != owner.as_deref() {
+                log::info!(
+                    "[vm] focus owner={:?} → {}",
+                    owner.as_deref().unwrap_or("<none>"),
+                    if val {
+                        "guest (CGEvent)"
+                    } else {
+                        "native (HID)"
+                    }
+                );
+                *last = owner;
             }
         }
         self.vm_guest_cache.set(Some((now, val)));
@@ -485,10 +498,6 @@ fn is_hypervisor_owner(name: &str) -> bool {
         "VirtualBuddy",
     ];
     HYPERVISORS.iter().any(|h| name.contains(h))
-}
-
-fn frontmost_is_vm_guest() -> bool {
-    frontmost_owner_name().is_some_and(|n| is_hypervisor_owner(&n))
 }
 
 /// Owner (process) name of the frontmost on-screen normal window (layer 0).
