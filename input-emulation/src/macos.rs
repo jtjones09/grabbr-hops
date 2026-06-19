@@ -45,6 +45,9 @@ pub(crate) struct MacOSEmulation {
     modifier_state: Rc<Cell<XMods>>,
     /// notify to cancel key repeats
     notify_repeat_task: Arc<Notify>,
+    /// whether the modifier-coherence self-heal is active (kill switch: set
+    /// the `LAN_MOUSE_NO_RECONCILE` env var to disable it)
+    reconcile_enabled: bool,
 }
 
 /// Maps an evdev button code to the CGEventType used for drag events.
@@ -74,6 +77,7 @@ impl MacOSEmulation {
             repeat_task: None,
             notify_repeat_task: Arc::new(Notify::new()),
             modifier_state: Rc::new(Cell::new(XMods::empty())),
+            reconcile_enabled: std::env::var_os("LAN_MOUSE_NO_RECONCILE").is_none(),
         })
     }
 
@@ -130,6 +134,59 @@ impl MacOSEmulation {
             let _ = task.await;
         }
     }
+
+    /// Diagnose (and optionally self-heal) modifier-state coherence.
+    ///
+    /// Compares the modifier state lan-mouse intends (`modifier_state`) with the
+    /// modifier flags the OS currently has applied (`CGEventSourceFlagsState`). A
+    /// divergence is the signature of the "ghosting" / stuck-modifier bug: a flag
+    /// the OS still holds turns the next keystroke into a silent chord. The
+    /// divergence is logged at `warn` — it only fires on an anomaly, so it is
+    /// visible at the default `info` level without trace logging.
+    ///
+    /// When `reconcile` is set (and not disabled by `LAN_MOUSE_NO_RECONCILE`), it
+    /// re-asserts the intended modifier state with a real-keycode `FlagsChanged`,
+    /// healing the drift in one event — *unless* a real key on this Mac's own
+    /// keyboard backs the differing bit, in which case it leaves it alone (we
+    /// never fight the local user).
+    fn coherence_pass(&self, ctx: &str, reconcile: bool) {
+        let mods = self.modifier_state.get();
+        let intended = to_cgevent_flags(mods).bits() & MANAGED_FLAG_MASK;
+        let os = os_flags_state() & MANAGED_FLAG_MASK;
+
+        if secure_input_active() {
+            log::warn!(
+                "[coherence] {ctx}: secure event input active — synthetic keystrokes may be suppressed"
+            );
+        }
+
+        if intended == os {
+            return;
+        }
+        let stuck = os & !intended;
+        log::warn!(
+            "[coherence] {ctx}: divergence intended=0x{intended:06x} os=0x{os:06x} stuck=0x{stuck:06x}"
+        );
+
+        if !(reconcile && self.reconcile_enabled) {
+            return;
+        }
+        // Never clear a flag a real key on the local keyboard is currently holding.
+        let held = physically_held_flags();
+        if (intended ^ os) & held != 0 {
+            log::debug!(
+                "[coherence] {ctx}: skip reconcile, physical modifier held (held=0x{held:06x})"
+            );
+            return;
+        }
+        let key = representative_keycode(intended ^ os);
+        post_flags_changed_event(
+            self.event_source.clone(),
+            key,
+            modifier_flags_changed_flags(mods),
+        );
+        log::warn!("[coherence] {ctx}: reconciled OS modifiers to intended=0x{intended:06x}");
+    }
 }
 
 fn request_macos_emulation_permissions() -> Result<(), MacOSEmulationCreationError> {
@@ -161,11 +218,23 @@ fn request_input_control_permission() -> bool {
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGPreflightPostEventAccess() -> bool;
+    /// Current modifier flags the session is applying (combined hardware +
+    /// synthetic). `state_id` is a `CGEventSourceStateID`.
+    fn CGEventSourceFlagsState(state_id: i32) -> u64;
+    /// Whether `key` (a Mac virtual keycode) is currently down for `state_id`.
+    fn CGEventSourceKeyState(state_id: i32, key: u16) -> bool;
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     fn AXIsProcessTrusted() -> bool;
+}
+
+#[link(name = "Carbon", kind = "framework")]
+extern "C" {
+    /// True when a focused field has enabled secure input (e.g. a password
+    /// field), which makes macOS suppress synthetic keystrokes entirely.
+    fn IsSecureEventInputEnabled() -> u8;
 }
 
 /// Mac virtual key codes for the four arrow keys.
@@ -217,14 +286,89 @@ fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods)
 /// keycode; the type is then overridden to `FlagsChanged` and the *current*
 /// modifier flags (already updated by the caller) describe the new state.
 fn modifier_key_event(event_source: CGEventSource, key: u16, depressed: XMods) {
+    post_flags_changed_event(event_source, key, modifier_flags_changed_flags(depressed));
+    log::trace!("modifier key event: {key} {depressed:?}");
+}
+
+// CGEventSourceStateID values (CGEventSource.h).
+const CG_SOURCE_COMBINED: i32 = 0; // kCGEventSourceStateCombinedSessionState
+const CG_SOURCE_HID: i32 = 1; // kCGEventSourceStateHIDSystemState
+
+// Device-independent CGEventFlags modifier bits (CGEventTypes.h).
+const FLAG_ALPHASHIFT: u64 = 0x0001_0000; // Caps Lock
+const FLAG_SHIFT: u64 = 0x0002_0000;
+const FLAG_CONTROL: u64 = 0x0004_0000;
+const FLAG_ALTERNATE: u64 = 0x0008_0000; // Option
+const FLAG_COMMAND: u64 = 0x0010_0000;
+/// The modifier bits lan-mouse manages; the coherence check masks to these.
+const MANAGED_FLAG_MASK: u64 =
+    FLAG_ALPHASHIFT | FLAG_SHIFT | FLAG_CONTROL | FLAG_ALTERNATE | FLAG_COMMAND;
+
+/// The modifier flags the OS is currently applying to events (combined session).
+fn os_flags_state() -> u64 {
+    unsafe { CGEventSourceFlagsState(CG_SOURCE_COMBINED) }
+}
+
+/// Whether a focused secure-input field is suppressing synthetic keystrokes.
+fn secure_input_active() -> bool {
+    unsafe { IsSecureEventInputEnabled() != 0 }
+}
+
+/// Modifier flags backed by a key physically held on *this* Mac's keyboard, read
+/// from the HID (hardware) source state so the reconciler never clears a flag the
+/// local user is holding. Keycodes are Mac virtual keycodes (Events.h).
+fn physically_held_flags() -> u64 {
+    let probe = |l: u16, r: u16| unsafe {
+        CGEventSourceKeyState(CG_SOURCE_HID, l) || CGEventSourceKeyState(CG_SOURCE_HID, r)
+    };
+    let mut held = 0u64;
+    if probe(0x38, 0x3C) {
+        held |= FLAG_SHIFT; // L/R Shift
+    }
+    if probe(0x3B, 0x3E) {
+        held |= FLAG_CONTROL; // L/R Control
+    }
+    if probe(0x3A, 0x3D) {
+        held |= FLAG_ALTERNATE; // L/R Option
+    }
+    if probe(0x37, 0x36) {
+        held |= FLAG_COMMAND; // L/R Command
+    }
+    if probe(0x39, 0x39) {
+        held |= FLAG_ALPHASHIFT; // Caps Lock
+    }
+    held
+}
+
+/// A representative Mac modifier keycode to stamp on a corrective `FlagsChanged`.
+fn representative_keycode(diff: u64) -> u16 {
+    if diff & FLAG_COMMAND != 0 {
+        0x37
+    } else if diff & FLAG_SHIFT != 0 {
+        0x38
+    } else if diff & FLAG_CONTROL != 0 {
+        0x3B
+    } else if diff & FLAG_ALTERNATE != 0 {
+        0x3A
+    } else {
+        0x39
+    }
+}
+
+/// Posts a `FlagsChanged` event with an explicit keycode and flag set.
+///
+/// The event MUST carry a real modifier keycode: a bare `CGEvent` defaults to
+/// keycode 0 (`kVK_ANSI_A`) and arrives in apps as a phantom "A" (issue #450).
+/// The event is built as a key-down so it gets a valid keycode; the type is then
+/// overridden to `FlagsChanged` and `flags` describes the new modifier state.
+fn post_flags_changed_event(event_source: CGEventSource, key: u16, flags: CGEventFlags) {
     let Ok(event) = CGEvent::new_keyboard_event(event_source, key, true) else {
-        log::warn!("could not create modifier key event");
+        log::warn!("could not create flags-changed event");
         return;
     };
     event.set_type(CGEventType::FlagsChanged);
-    event.set_flags(modifier_flags_changed_flags(depressed));
+    event.set_flags(flags);
     event.post(CGEventTapLocation::HID);
-    log::trace!("modifier key event: {key} {depressed:?}");
 }
 
 /// Builds the flag set for a modifier `FlagsChanged` event.
@@ -443,6 +587,11 @@ impl Emulation for MacOSEmulation {
                         };
                         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, dx as i64);
                         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, dy as i64);
+                        // Carry the current modifier flags so modifier-aware drags
+                        // (e.g. a Shift/Option-constrained screenshot-region drag)
+                        // see the held modifier instead of a flagless move — without
+                        // this the selection collapses to a degenerate box.
+                        event.set_flags(to_cgevent_flags(self.modifier_state.get()));
                         event.post(CGEventTapLocation::HID);
                     }
                     PointerEvent::Button {
@@ -523,6 +672,10 @@ impl Emulation for MacOSEmulation {
                                 btn_num,
                             );
                         }
+                        // Carry the current modifier flags (e.g. Shift-click,
+                        // Cmd-click) so the click isn't seen as flagless.
+                        event.set_flags(to_cgevent_flags(self.modifier_state.get()));
+                        self.coherence_pass("button", false);
                         event.post(CGEventTapLocation::HID);
                     }
                     PointerEvent::Axis {
@@ -618,6 +771,13 @@ impl Emulation for MacOSEmulation {
                             self.modifier_state.get(),
                         );
                     } else {
+                        // Before typing a normal key, make sure no stale modifier
+                        // flag the OS still holds turns it into a silent chord (the
+                        // "ghosting" / dead-keyboard symptom). Diagnoses and, if
+                        // enabled, self-heals the divergence in one event.
+                        if state == 1 {
+                            self.coherence_pass("key", true);
+                        }
                         match state {
                             // pressed
                             1 => self.spawn_repeat_task(code).await,
