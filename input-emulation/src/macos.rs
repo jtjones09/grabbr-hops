@@ -178,29 +178,44 @@ impl MacOSEmulation {
         }
         self.secure_input_prev.set(secure);
 
-        if intended == os {
+        let stuck = os & !intended; // OS holds modifiers we do NOT intend — the ghosting bug
+        let missing = intended & !os; // we intend modifiers the OS lacks
+
+        // The "missing" direction (intended set, OS clear) is NOT the bug and must
+        // not be reconciled. It fires constantly when focus is in a VM guest: the
+        // guest owns the modifier state, so the host session
+        // (CGEventSourceFlagsState) reads 0 even though the modifier was injected
+        // correctly. Re-asserting it just spams the guest with FlagsChanged and
+        // thrashes (observed 2026-06-19: 65 such events broke Finder Shift-select
+        // in a Parallels guest). It is also usually transient on the host.
+        if stuck == 0 {
+            if missing != 0 {
+                log::debug!(
+                    "[coherence] {ctx}: intended-but-unapplied 0x{missing:06x} (likely guest focus); not reconciling"
+                );
+            }
             return;
         }
-        let stuck = os & !intended;
+
         log::warn!(
-            "[coherence] {ctx}: divergence intended=0x{intended:06x} os=0x{os:06x} stuck=0x{stuck:06x}"
+            "[coherence] {ctx}: stuck modifier intended=0x{intended:06x} os=0x{os:06x} stuck=0x{stuck:06x}"
         );
 
         if !(reconcile && self.reconcile_enabled) {
             return;
         }
-        // Re-assert the sender's intended modifier state authoritatively. We do
-        // NOT guard on a locally-held key: during remote control the Mac's own
-        // keyboard is idle, and an HID-state guard misfired on our own
-        // device-bit-carrying synthetic modifiers (they look like real hardware),
-        // blocking legitimate heals (observed 2026-06-19, stuck Shift not cleared).
-        let key = representative_keycode(intended ^ os);
+        // Heal only the stuck-ON direction: re-assert the intended state, which
+        // drops the bits the OS holds but we don't want. We never re-assert
+        // "missing" modifiers (see above). No local-key guard: during remote
+        // control the Mac's own keyboard is idle, and an HID-state guard misfired
+        // on our own device-bit-carrying synthetic modifiers.
+        let key = representative_keycode(stuck);
         post_flags_changed_event(
             self.event_source.clone(),
             key,
             modifier_flags_changed_flags(mods),
         );
-        log::warn!("[coherence] {ctx}: reconciled OS modifiers to intended=0x{intended:06x}");
+        log::warn!("[coherence] {ctx}: reconciled — cleared stuck 0x{stuck:06x}");
     }
 
     /// Posts a modifier `FlagsChanged`.
