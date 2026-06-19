@@ -48,6 +48,8 @@ pub(crate) struct MacOSEmulation {
     /// whether the modifier-coherence self-heal is active (kill switch: set
     /// the `LAN_MOUSE_NO_RECONCILE` env var to disable it)
     reconcile_enabled: bool,
+    /// last observed secure-input state, so we log only on the transition into it
+    secure_input_prev: Cell<bool>,
 }
 
 /// Maps an evdev button code to the CGEventType used for drag events.
@@ -78,6 +80,7 @@ impl MacOSEmulation {
             notify_repeat_task: Arc::new(Notify::new()),
             modifier_state: Rc::new(Cell::new(XMods::empty())),
             reconcile_enabled: std::env::var_os("LAN_MOUSE_NO_RECONCILE").is_none(),
+            secure_input_prev: Cell::new(false),
         })
     }
 
@@ -154,11 +157,16 @@ impl MacOSEmulation {
         let intended = to_cgevent_flags(mods).bits() & MANAGED_FLAG_MASK;
         let os = os_flags_state() & MANAGED_FLAG_MASK;
 
-        if secure_input_active() {
+        // Secure input (e.g. a focused password field) makes macOS suppress
+        // synthetic keystrokes; log once on the transition into it, not on every
+        // key while it is active.
+        let secure = secure_input_active();
+        if secure && !self.secure_input_prev.get() {
             log::warn!(
-                "[coherence] {ctx}: secure event input active — synthetic keystrokes may be suppressed"
+                "[coherence] {ctx}: secure event input ACTIVE — synthetic keystrokes may be suppressed (password field?)"
             );
         }
+        self.secure_input_prev.set(secure);
 
         if intended == os {
             return;
@@ -171,14 +179,11 @@ impl MacOSEmulation {
         if !(reconcile && self.reconcile_enabled) {
             return;
         }
-        // Never clear a flag a real key on the local keyboard is currently holding.
-        let held = physically_held_flags();
-        if (intended ^ os) & held != 0 {
-            log::debug!(
-                "[coherence] {ctx}: skip reconcile, physical modifier held (held=0x{held:06x})"
-            );
-            return;
-        }
+        // Re-assert the sender's intended modifier state authoritatively. We do
+        // NOT guard on a locally-held key: during remote control the Mac's own
+        // keyboard is idle, and an HID-state guard misfired on our own
+        // device-bit-carrying synthetic modifiers (they look like real hardware),
+        // blocking legitimate heals (observed 2026-06-19, stuck Shift not cleared).
         let key = representative_keycode(intended ^ os);
         post_flags_changed_event(
             self.event_source.clone(),
@@ -221,8 +226,6 @@ extern "C" {
     /// Current modifier flags the session is applying (combined hardware +
     /// synthetic). `state_id` is a `CGEventSourceStateID`.
     fn CGEventSourceFlagsState(state_id: i32) -> u64;
-    /// Whether `key` (a Mac virtual keycode) is currently down for `state_id`.
-    fn CGEventSourceKeyState(state_id: i32, key: u16) -> bool;
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -290,9 +293,8 @@ fn modifier_key_event(event_source: CGEventSource, key: u16, depressed: XMods) {
     log::trace!("modifier key event: {key} {depressed:?}");
 }
 
-// CGEventSourceStateID values (CGEventSource.h).
+// CGEventSourceStateID value (CGEventSource.h).
 const CG_SOURCE_COMBINED: i32 = 0; // kCGEventSourceStateCombinedSessionState
-const CG_SOURCE_HID: i32 = 1; // kCGEventSourceStateHIDSystemState
 
 // Device-independent CGEventFlags modifier bits (CGEventTypes.h).
 const FLAG_ALPHASHIFT: u64 = 0x0001_0000; // Caps Lock
@@ -312,32 +314,6 @@ fn os_flags_state() -> u64 {
 /// Whether a focused secure-input field is suppressing synthetic keystrokes.
 fn secure_input_active() -> bool {
     unsafe { IsSecureEventInputEnabled() != 0 }
-}
-
-/// Modifier flags backed by a key physically held on *this* Mac's keyboard, read
-/// from the HID (hardware) source state so the reconciler never clears a flag the
-/// local user is holding. Keycodes are Mac virtual keycodes (Events.h).
-fn physically_held_flags() -> u64 {
-    let probe = |l: u16, r: u16| unsafe {
-        CGEventSourceKeyState(CG_SOURCE_HID, l) || CGEventSourceKeyState(CG_SOURCE_HID, r)
-    };
-    let mut held = 0u64;
-    if probe(0x38, 0x3C) {
-        held |= FLAG_SHIFT; // L/R Shift
-    }
-    if probe(0x3B, 0x3E) {
-        held |= FLAG_CONTROL; // L/R Control
-    }
-    if probe(0x3A, 0x3D) {
-        held |= FLAG_ALTERNATE; // L/R Option
-    }
-    if probe(0x37, 0x36) {
-        held |= FLAG_COMMAND; // L/R Command
-    }
-    if probe(0x39, 0x39) {
-        held |= FLAG_ALPHASHIFT; // Caps Lock
-    }
-    held
 }
 
 /// A representative Mac modifier keycode to stamp on a corrective `FlagsChanged`.
