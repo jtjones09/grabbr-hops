@@ -436,22 +436,33 @@ fn update_clients(request: ClientUpdate) {
 
 fn to_key_event(wparam: WPARAM, lparam: LPARAM) -> Option<KeyboardEvent> {
     let kybrdllhookstruct: KBDLLHOOKSTRUCT = unsafe { *(lparam.0 as *const KBDLLHOOKSTRUCT) };
-    let mut scan_code = kybrdllhookstruct.scanCode;
-    log::trace!("scan_code: {scan_code}");
-    if kybrdllhookstruct.flags.contains(LLKHF_EXTENDED) {
-        scan_code |= 0xE000;
-    }
-    let Ok(win_scan_code) = scancode::Windows::try_from(scan_code) else {
-        log::warn!("failed to translate to windows scancode: {scan_code}");
-        return None;
+
+    // Media / consumer keys (volume, play/pause, next/prev) come through the
+    // low-level hook with scanCode 0, so the scancode tables can't resolve them —
+    // map by virtual-key code instead.
+    let scan_code = if let Some(evdev) = media_vk_to_evdev(kybrdllhookstruct.vkCode) {
+        evdev
+    } else {
+        let mut scan_code = kybrdllhookstruct.scanCode;
+        log::trace!("scan_code: {scan_code}");
+        if kybrdllhookstruct.flags.contains(LLKHF_EXTENDED) {
+            scan_code |= 0xE000;
+        }
+        let Ok(win_scan_code) = scancode::Windows::try_from(scan_code) else {
+            log::warn!(
+                "failed to translate to windows scancode: {scan_code} (vk={:#04x})",
+                kybrdllhookstruct.vkCode
+            );
+            return None;
+        };
+        log::trace!("windows_scan: {win_scan_code:?}");
+        let Ok(linux_scan_code): Result<Linux, ()> = win_scan_code.try_into() else {
+            log::warn!("failed to translate into linux scancode: {win_scan_code:?}");
+            return None;
+        };
+        log::trace!("linux_scan: {linux_scan_code:?}");
+        linux_scan_code as u32
     };
-    log::trace!("windows_scan: {win_scan_code:?}");
-    let Ok(linux_scan_code): Result<Linux, ()> = win_scan_code.try_into() else {
-        log::warn!("failed to translate into linux scancode: {win_scan_code:?}");
-        return None;
-    };
-    log::trace!("windows_scan: {linux_scan_code:?}");
-    let scan_code = linux_scan_code as u32;
     match wparam {
         WPARAM(p) if p == WM_KEYDOWN as usize => Some(KeyboardEvent::Key {
             time: 0,
@@ -475,6 +486,22 @@ fn to_key_event(wparam: WPARAM, lparam: LPARAM) -> Option<KeyboardEvent> {
         }),
         _ => None,
     }
+}
+
+/// Maps a Windows media/consumer virtual-key code to its evdev code. These keys
+/// arrive through the low-level keyboard hook with scanCode 0, so they can't be
+/// resolved via the scancode tables; the virtual-key code is the reliable id.
+fn media_vk_to_evdev(vk: u32) -> Option<u32> {
+    Some(match vk {
+        0xAD => 113, // VK_VOLUME_MUTE      -> KEY_MUTE
+        0xAE => 114, // VK_VOLUME_DOWN      -> KEY_VOLUMEDOWN
+        0xAF => 115, // VK_VOLUME_UP        -> KEY_VOLUMEUP
+        0xB0 => 163, // VK_MEDIA_NEXT_TRACK -> KEY_NEXTSONG
+        0xB1 => 165, // VK_MEDIA_PREV_TRACK -> KEY_PREVIOUSSONG
+        0xB2 => 166, // VK_MEDIA_STOP       -> KEY_STOPCD
+        0xB3 => 164, // VK_MEDIA_PLAY_PAUSE -> KEY_PLAYPAUSE
+        _ => return None,
+    })
 }
 
 fn to_mouse_event(wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {

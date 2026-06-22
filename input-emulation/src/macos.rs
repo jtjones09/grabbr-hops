@@ -48,9 +48,13 @@ pub(crate) struct MacOSEmulation {
     notify_repeat_task: Arc<Notify>,
     /// last observed secure-input state, so we log only on the transition into it
     secure_input_prev: Cell<bool>,
-    /// IOHIDSystem connection for the IOHIDPostEvent modifier path, enabled via
-    /// `LAN_MOUSE_HID_MODIFIERS` (None = CGEvent only, the default)
+    /// IOHIDSystem connection, opened once at startup. Used for media/consumer
+    /// keys (NX_SYSDEFINED) always, and for the modifier path when `hid_modifiers`
+    /// is set. None if the connection could not be opened (→ CGEvent only).
     hid_connect: Option<u32>,
+    /// `LAN_MOUSE_HID_MODIFIERS`: route modifiers via IOHIDPostEvent on native
+    /// focus (vs CGEvent device bits). Media keys are unaffected by this.
+    hid_modifiers: bool,
     /// Cached "is the focused window a VM guest", short TTL, so the per-modifier
     /// window lookup stays cheap.
     vm_guest_cache: Cell<Option<(Instant, bool)>>,
@@ -82,14 +86,13 @@ impl MacOSEmulation {
 
         let event_source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .map_err(|_| MacOSEmulationCreationError::EventSourceCreation)?;
-        // Opt-in: when LAN_MOUSE_HID_MODIFIERS is set, modifiers for native macOS
-        // focus go via IOHIDPostEvent (smoother, wakes the display) while VM-guest
-        // focus stays on the CGEvent device-bit path. Unset = CGEvent only.
-        let hid_connect = if std::env::var_os("LAN_MOUSE_HID_MODIFIERS").is_some() {
-            open_hid_connection()
-        } else {
-            None
-        };
+        // The IOHIDSystem connection is needed for media/consumer keys
+        // (NX_SYSDEFINED) regardless of mode, so open it once up front.
+        // LAN_MOUSE_HID_MODIFIERS additionally routes *modifiers* via
+        // IOHIDPostEvent on native focus (smoother, wakes the display); VM-guest
+        // focus always uses the CGEvent device-bit path.
+        let hid_connect = open_hid_connection();
+        let hid_modifiers = std::env::var_os("LAN_MOUSE_HID_MODIFIERS").is_some();
         Ok(Self {
             event_source,
             pressed_buttons: HashSet::new(),
@@ -101,6 +104,7 @@ impl MacOSEmulation {
             modifier_state: Rc::new(Cell::new(XMods::empty())),
             secure_input_prev: Cell::new(false),
             hid_connect,
+            hid_modifiers,
             vm_guest_cache: Cell::new(None),
             last_owner: RefCell::new(None),
         })
@@ -225,13 +229,15 @@ impl MacOSEmulation {
     /// - set + VM-guest focus → CGEvent device bits (IOHIDPostEvent does not reach
     ///   guests, so fall back to the path that does).
     fn post_modifier(&self, key: u16, depressed: XMods) {
-        if let Some(connect) = self.hid_connect {
-            if !self.target_is_vm_guest() {
-                let nx_flags = (modifier_flags_changed_flags(depressed).bits()
-                    & !CGEventFlags::CGEventFlagNonCoalesced.bits())
-                    as u32;
-                if post_hid_flags_changed(connect, key, nx_flags) {
-                    return;
+        if self.hid_modifiers {
+            if let Some(connect) = self.hid_connect {
+                if !self.target_is_vm_guest() {
+                    let nx_flags = (modifier_flags_changed_flags(depressed).bits()
+                        & !CGEventFlags::CGEventFlagNonCoalesced.bits())
+                        as u32;
+                    if post_hid_flags_changed(connect, key, nx_flags) {
+                        return;
+                    }
                 }
             }
         }
@@ -394,7 +400,7 @@ extern "C" {
         connect: u32,
         event_type: u32,
         location: IOGPoint,
-        event_data: *const NXEventDataBuf,
+        event_data: *const c_void,
         event_data_version: u32,
         event_flags: u32,
         options: u32,
@@ -433,7 +439,7 @@ fn open_hid_connection() -> Option<u32> {
         );
         IOObjectRelease(service);
         if kr == 0 && connect != 0 {
-            log::info!("IOHIDSystem connection opened — IOHIDPostEvent modifier path active");
+            log::info!("IOHIDSystem connection opened (media keys + HID modifier path)");
             Some(connect)
         } else {
             log::warn!("IOServiceOpen(IOHIDSystem) failed: kr=0x{kr:x}; staying on CGEvent");
@@ -454,7 +460,7 @@ fn post_hid_flags_changed(connect: u32, key: u16, nx_flags: u32) -> bool {
             connect,
             NX_FLAGSCHANGED,
             location,
-            &data,
+            &data as *const NXEventDataBuf as *const c_void,
             NX_EVENT_DATA_VERSION,
             nx_flags,
             0,
@@ -462,6 +468,75 @@ fn post_hid_flags_changed(connect: u32, key: u16, nx_flags: u32) -> bool {
     };
     if kr != 0 {
         log::warn!("IOHIDPostEvent(FlagsChanged) failed: kr=0x{kr:x}");
+    }
+    kr == 0
+}
+
+// ---- NX_SYSDEFINED media / consumer keys (volume, play/pause, next/prev) ----
+//
+// macOS media keys are not regular keycodes; they are system-defined
+// aux-control-button events. We post them through the same IOHIDSystem
+// connection used for the modifier path.
+
+const NX_SYSDEFINED: u32 = 14; // IOLLEvent.h NX_SYSDEFINED
+const NX_SUBTYPE_AUX_CONTROL_BUTTONS: i16 = 8;
+const NX_KEYTYPE_SOUND_UP: u8 = 0;
+const NX_KEYTYPE_SOUND_DOWN: u8 = 1;
+const NX_KEYTYPE_MUTE: u8 = 7;
+const NX_KEYTYPE_PLAY: u8 = 16;
+const NX_KEYTYPE_NEXT: u8 = 17;
+const NX_KEYTYPE_PREVIOUS: u8 = 18;
+
+// NXEventData.compound (IOLLEvent.h) — the union member used by NX_SYSDEFINED.
+// Padded past sizeof(NXEventData) (48 B), like NXEventDataBuf.
+#[repr(C)]
+#[allow(dead_code)] // FFI layout; bytes read by the C side
+struct NXCompoundEventData {
+    reserved: i16,
+    sub_type: i16,
+    misc_l0: i32,
+    misc_l1: i32,
+    _pad: [u8; 116],
+}
+
+/// Maps an evdev key code to the macOS `NX_KEYTYPE_*` for a media/consumer key,
+/// or None if it isn't one we forward as a system-defined event.
+fn evdev_to_nx_keytype(evdev: u32) -> Option<u8> {
+    Some(match evdev {
+        115 => NX_KEYTYPE_SOUND_UP,   // KEY_VOLUMEUP
+        114 => NX_KEYTYPE_SOUND_DOWN, // KEY_VOLUMEDOWN
+        113 => NX_KEYTYPE_MUTE,       // KEY_MUTE
+        164 => NX_KEYTYPE_PLAY,       // KEY_PLAYPAUSE
+        163 => NX_KEYTYPE_NEXT,       // KEY_NEXTSONG
+        165 => NX_KEYTYPE_PREVIOUS,   // KEY_PREVIOUSSONG
+        _ => return None,
+    })
+}
+
+/// Posts a system-defined aux-control (media) key event via IOHIDPostEvent.
+fn post_hid_media_key(connect: u32, nx_keytype: u8, down: bool) -> bool {
+    const NX_KEYDOWN: i32 = 0x0a;
+    const NX_KEYUP: i32 = 0x0b;
+    let mut data: NXCompoundEventData = unsafe { std::mem::zeroed() };
+    data.sub_type = NX_SUBTYPE_AUX_CONTROL_BUTTONS;
+    let state = if down { NX_KEYDOWN } else { NX_KEYUP };
+    // data1 layout for aux buttons: (keycode << 16) | (event_type << 8).
+    data.misc_l0 = (i32::from(nx_keytype) << 16) | (state << 8);
+    data.misc_l1 = -1;
+    let location = IOGPoint { x: 0, y: 0 };
+    let kr = unsafe {
+        IOHIDPostEvent(
+            connect,
+            NX_SYSDEFINED,
+            location,
+            &data as *const NXCompoundEventData as *const c_void,
+            NX_EVENT_DATA_VERSION,
+            0,
+            0,
+        )
+    };
+    if kr != 0 {
+        log::warn!("IOHIDPostEvent(media key {nx_keytype}) failed: kr=0x{kr:x}");
     }
     kr == 0
 }
@@ -1086,6 +1161,19 @@ impl Emulation for MacOSEmulation {
                     key,
                     state,
                 } => {
+                    // Media / consumer keys (volume, play/pause, next/prev) are not
+                    // regular macOS keycodes — post them as NX_SYSDEFINED aux events.
+                    if let Some(nx_keytype) = evdev_to_nx_keytype(key) {
+                        match self.hid_connect {
+                            Some(connect) => {
+                                post_hid_media_key(connect, nx_keytype, state == 1);
+                            }
+                            None => {
+                                log::debug!("media key {key} dropped: no IOHIDSystem connection")
+                            }
+                        }
+                        return Ok(());
+                    }
                     let code = match KeyMap::from_key_mapping(KeyMapping::Evdev(key as u16)) {
                         Ok(k) => k.mac as CGKeyCode,
                         Err(_) => {
