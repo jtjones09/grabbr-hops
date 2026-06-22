@@ -46,18 +46,11 @@ pub(crate) struct MacOSEmulation {
     modifier_state: Rc<Cell<XMods>>,
     /// notify to cancel key repeats
     notify_repeat_task: Arc<Notify>,
-    /// whether the modifier-coherence self-heal is active (kill switch: set
-    /// the `LAN_MOUSE_NO_RECONCILE` env var to disable it)
-    reconcile_enabled: bool,
     /// last observed secure-input state, so we log only on the transition into it
     secure_input_prev: Cell<bool>,
-    /// IOHIDSystem connection for the IOHIDPostEvent modifier path, when enabled
-    /// via `LAN_MOUSE_HID_MODIFIERS` (None = CGEvent-only)
+    /// IOHIDSystem connection for the IOHIDPostEvent modifier path, enabled via
+    /// `LAN_MOUSE_HID_MODIFIERS` (None = CGEvent only, the default)
     hid_connect: Option<u32>,
-    /// `LAN_MOUSE_HID_MODIFIERS=pure`: post modifiers via IOHIDPostEvent ONLY,
-    /// skipping CGEvent entirely (vs the default dual-post). Host-only HID test —
-    /// breaks VM guests, which need the CGEvent device bits.
-    hid_pure: bool,
     /// Cached "is the focused window a VM guest", short TTL, so the per-modifier
     /// window lookup stays cheap.
     vm_guest_cache: Cell<Option<(Instant, bool)>>,
@@ -75,6 +68,12 @@ fn drag_event_type(button: u32) -> CGEventType {
     }
 }
 
+// SAFETY: MacOSEmulation runs entirely on one thread — the emulation task is
+// driven via tokio's `spawn_local` inside a current-thread runtime / `LocalSet`
+// (see src/main.rs), so the `!Sync` interior-mutability fields (Cell/RefCell/Rc)
+// and the raw CG/IOKit handles are never accessed concurrently. The `Send` bound
+// is required because `Emulation` is a `Send` supertrait stored as a boxed trait
+// object; the value is constructed, used, and dropped on that single thread.
 unsafe impl Send for MacOSEmulation {}
 
 impl MacOSEmulation {
@@ -83,14 +82,14 @@ impl MacOSEmulation {
 
         let event_source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .map_err(|_| MacOSEmulationCreationError::EventSourceCreation)?;
-        let hid_mode = std::env::var("LAN_MOUSE_HID_MODIFIERS").ok();
-        let hid_connect = if hid_mode.is_some() {
+        // Opt-in: when LAN_MOUSE_HID_MODIFIERS is set, modifiers for native macOS
+        // focus go via IOHIDPostEvent (smoother, wakes the display) while VM-guest
+        // focus stays on the CGEvent device-bit path. Unset = CGEvent only.
+        let hid_connect = if std::env::var_os("LAN_MOUSE_HID_MODIFIERS").is_some() {
             open_hid_connection()
         } else {
             None
         };
-        // "pure" => HID only (no CGEvent for modifiers); any other value => dual.
-        let hid_pure = hid_mode.as_deref() == Some("pure");
         Ok(Self {
             event_source,
             pressed_buttons: HashSet::new(),
@@ -100,10 +99,8 @@ impl MacOSEmulation {
             repeat_task: None,
             notify_repeat_task: Arc::new(Notify::new()),
             modifier_state: Rc::new(Cell::new(XMods::empty())),
-            reconcile_enabled: std::env::var_os("LAN_MOUSE_NO_RECONCILE").is_none(),
             secure_input_prev: Cell::new(false),
             hid_connect,
-            hid_pure,
             vm_guest_cache: Cell::new(None),
             last_owner: RefCell::new(None),
         })
@@ -163,32 +160,27 @@ impl MacOSEmulation {
         }
     }
 
-    /// Diagnose (and optionally self-heal) modifier-state coherence.
+    /// Diagnose (and, when `reconcile` is set, self-heal) modifier-state coherence.
     ///
     /// Compares the modifier state lan-mouse intends (`modifier_state`) with the
-    /// modifier flags the OS currently has applied (`CGEventSourceFlagsState`). A
-    /// divergence is the signature of the "ghosting" / stuck-modifier bug: a flag
-    /// the OS still holds turns the next keystroke into a silent chord. The
-    /// divergence is logged at `warn` — it only fires on an anomaly, so it is
-    /// visible at the default `info` level without trace logging.
-    ///
-    /// When `reconcile` is set (and not disabled by `LAN_MOUSE_NO_RECONCILE`), it
-    /// re-asserts the intended modifier state with a real-keycode `FlagsChanged`,
-    /// healing the drift in one event — *unless* a real key on this Mac's own
-    /// keyboard backs the differing bit, in which case it leaves it alone (we
-    /// never fight the local user).
+    /// flags the OS currently has applied (`CGEventSourceFlagsState`). A stuck
+    /// modifier — a flag the OS still holds that we no longer intend — is the
+    /// signature of the "ghosting" bug: it turns the next keystroke into a silent
+    /// chord. When `reconcile` is set it re-asserts the intended state with a
+    /// real-keycode `FlagsChanged`, healing the drift in one event. Only the
+    /// stuck-ON direction is healed; the "missing" direction (common during
+    /// VM-guest focus) is deliberately ignored — see the body.
     fn coherence_pass(&self, ctx: &str, reconcile: bool) {
         let mods = self.modifier_state.get();
         let intended = to_cgevent_flags(mods).bits() & MANAGED_FLAG_MASK;
         let os = os_flags_state() & MANAGED_FLAG_MASK;
 
         // Secure input (e.g. a focused password field) makes macOS suppress
-        // synthetic keystrokes; log once on the transition into it, not on every
-        // key while it is active.
+        // synthetic keystrokes; log once on the transition into it.
         let secure = secure_input_active();
         if secure && !self.secure_input_prev.get() {
-            log::warn!(
-                "[coherence] {ctx}: secure event input ACTIVE — synthetic keystrokes may be suppressed (password field?)"
+            log::debug!(
+                "{ctx}: secure event input active; synthetic keystrokes may be suppressed (password field?)"
             );
         }
         self.secure_input_prev.set(secure);
@@ -196,55 +188,45 @@ impl MacOSEmulation {
         let stuck = os & !intended; // OS holds modifiers we do NOT intend — the ghosting bug
         let missing = intended & !os; // we intend modifiers the OS lacks
 
-        // The "missing" direction (intended set, OS clear) is NOT the bug and must
-        // not be reconciled. It fires constantly when focus is in a VM guest: the
-        // guest owns the modifier state, so the host session
-        // (CGEventSourceFlagsState) reads 0 even though the modifier was injected
-        // correctly. Re-asserting it just spams the guest with FlagsChanged and
-        // thrashes (observed 2026-06-19: 65 such events broke Finder Shift-select
-        // in a Parallels guest). It is also usually transient on the host.
+        // Only the stuck-ON direction is healed. The "missing" direction (we
+        // intend a modifier the OS lacks) fires constantly during VM-guest focus —
+        // the guest owns the modifier state, so the host session reads 0 even
+        // though the modifier was injected correctly — and re-asserting it just
+        // spams the guest with FlagsChanged. It is also usually transient on the
+        // host, so it is never reconciled.
         if stuck == 0 {
             if missing != 0 {
-                log::debug!(
-                    "[coherence] {ctx}: intended-but-unapplied 0x{missing:06x} (likely guest focus); not reconciling"
+                log::trace!(
+                    "{ctx}: modifier 0x{missing:06x} intended but unapplied (guest focus?)"
                 );
             }
             return;
         }
-
-        log::warn!(
-            "[coherence] {ctx}: stuck modifier intended=0x{intended:06x} os=0x{os:06x} stuck=0x{stuck:06x}"
-        );
-
-        if !(reconcile && self.reconcile_enabled) {
+        if !reconcile {
+            log::debug!(
+                "{ctx}: stuck modifier 0x{stuck:06x} (os=0x{os:06x} intended=0x{intended:06x})"
+            );
             return;
         }
-        // Heal only the stuck-ON direction: re-assert the intended state, which
-        // drops the bits the OS holds but we don't want. We never re-assert
-        // "missing" modifiers (see above). No local-key guard: during remote
-        // control the Mac's own keyboard is idle, and an HID-state guard misfired
-        // on our own device-bit-carrying synthetic modifiers.
+        // Re-assert the intended state, which drops the bits the OS holds but we
+        // no longer intend, healing the drift in one event.
         let key = representative_keycode(stuck);
         post_flags_changed_event(
             self.event_source.clone(),
             key,
             modifier_flags_changed_flags(mods),
         );
-        log::warn!("[coherence] {ctx}: reconciled — cleared stuck 0x{stuck:06x}");
+        log::debug!("{ctx}: reconciled stuck modifier 0x{stuck:06x}");
     }
 
-    /// Posts a modifier `FlagsChanged`. Behaviour via `LAN_MOUSE_HID_MODIFIERS`:
-    /// - unset: CGEvent device bits only (#460) — reaches VM guests, stable.
-    /// - set: auto — IOHIDPostEvent when native macOS is focused (smooth, wakes
-    ///   the display); CGEvent device bits when a VM guest window is focused
-    ///   (IOHIDPostEvent does not reach guests).
-    /// - `pure`: force IOHIDPostEvent everywhere, skipping guest detection (debug).
+    /// Posts a modifier `FlagsChanged`, choosing the injection path:
+    /// - `LAN_MOUSE_HID_MODIFIERS` unset → CGEvent device bits (#460), the default.
+    /// - set + native focus → IOHIDPostEvent (smoother, wakes the display).
+    /// - set + VM-guest focus → CGEvent device bits (IOHIDPostEvent does not reach
+    ///   guests, so fall back to the path that does).
     fn post_modifier(&self, key: u16, depressed: XMods) {
         if let Some(connect) = self.hid_connect {
-            // HID is great for native macOS but does NOT reach VM guests, so use
-            // it only when the focused window is not a guest (unless `pure` forces
-            // it). On a guest, fall through to the CGEvent device-bit path (#460).
-            if self.hid_pure || !self.target_is_vm_guest() {
+            if !self.target_is_vm_guest() {
                 let nx_flags = (modifier_flags_changed_flags(depressed).bits()
                     & !CGEventFlags::CGEventFlagNonCoalesced.bits())
                     as u32;
@@ -274,12 +256,12 @@ impl MacOSEmulation {
             let owner = info.map(|(name, _)| name).unwrap_or_default();
             let mut last = self.last_owner.borrow_mut();
             if last.as_deref() != Some(owner.as_str()) {
-                log::info!(
-                    "[vm] focus owner={:?} path={:?} → {}",
+                log::debug!(
+                    "focus owner={:?} path={:?} → {}",
                     owner,
                     path.as_deref().unwrap_or("<none>"),
                     if val {
-                        "guest (CGEvent)"
+                        "VM guest (CGEvent)"
                     } else {
                         "native (HID)"
                     }
@@ -289,6 +271,17 @@ impl MacOSEmulation {
         }
         self.vm_guest_cache.set(Some((now, val)));
         val
+    }
+}
+
+impl Drop for MacOSEmulation {
+    fn drop(&mut self) {
+        // Release the IOHIDSystem connection if we opened one. Process-lifetime
+        // ownership means this rarely matters in practice, but it keeps the
+        // mach port tidy if the emulation backend is ever recreated.
+        if let Some(connect) = self.hid_connect {
+            unsafe { IOServiceClose(connect) };
+        }
     }
 }
 
@@ -379,13 +372,15 @@ struct NXKeyEventData {
     reserved5: [i32; 4],
 }
 
-// NXEventData is a union; we only fill `key`. Pad well past sizeof(NXEventData)
-// (~112 B) so IOHIDPostEvent never reads beyond our buffer.
+// NXEventData is a union; we only fill `key`. sizeof(NXEventData) is 48 B
+// (verified against IOLLEvent.h); IOHIDPostEvent reads eventDataVersion's worth
+// of bytes from this pointer, so the buffer only needs to be >= that. The pad
+// keeps a comfortable margin.
 #[repr(C)]
 #[allow(dead_code)] // FFI layout; bytes read by the C side
 struct NXEventDataBuf {
     key: NXKeyEventData,
-    _pad: [u8; 208],
+    _pad: [u8; 80],
 }
 
 #[link(name = "IOKit", kind = "framework")]
@@ -393,6 +388,7 @@ extern "C" {
     fn IOServiceMatching(name: *const c_char) -> *mut c_void;
     fn IOServiceGetMatchingService(main_port: u32, matching: *mut c_void) -> u32;
     fn IOServiceOpen(service: u32, owning_task: u32, connect_type: u32, connect: *mut u32) -> i32;
+    fn IOServiceClose(connect: u32) -> i32;
     fn IOObjectRelease(object: u32) -> i32;
     fn IOHIDPostEvent(
         connect: u32,
@@ -421,7 +417,8 @@ fn open_hid_connection() -> Option<u32> {
             log::warn!("IOHIDSystem: IOServiceMatching returned null");
             return None;
         }
-        // IOServiceGetMatchingService consumes a reference to `matching`.
+        // 0 = kIOMainPortDefault. IOServiceGetMatchingService consumes a reference
+        // to `matching`, so we must not release the dictionary ourselves.
         let service = IOServiceGetMatchingService(0, matching);
         if service == 0 {
             log::warn!("IOHIDSystem service not found");
@@ -473,11 +470,14 @@ fn post_hid_flags_changed(connect: u32, key: u16, nx_flags: u32) -> bool {
 //
 // IOHIDPostEvent is smooth for native macOS but does NOT reach VM guests; the
 // CGEvent device bits (#460) do. We detect whether the focused window belongs to
-// a hypervisor and route modifiers accordingly. Detection reads the focused
-// window's owner (process) name via CGWindowList — no Screen Recording needed
-// (that only gates window *titles*, not owner names).
-
-const VM_DETECT_TTL: Duration = Duration::from_millis(300);
+// a hypervisor and route modifiers accordingly. Detection resolves the focused
+// window's owner PID (via CGWindowList) to its executable path (via proc_pidpath)
+// and matches known hypervisor app bundles — no Screen Recording needed (that
+// only gates window *titles*, not owner PIDs).
+//
+// Cached briefly so the per-modifier lookup stays cheap; the short TTL bounds how
+// long the first chord after a focus switch could take the wrong path.
+const VM_DETECT_TTL: Duration = Duration::from_millis(50);
 
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
@@ -487,6 +487,9 @@ extern "C" {
         idx: isize,
     ) -> *const c_void;
     fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
+    fn CFGetTypeID(cf: *const c_void) -> usize;
+    fn CFNumberGetTypeID() -> usize;
+    fn CFStringGetTypeID() -> usize;
 }
 
 extern "C" {
@@ -521,7 +524,26 @@ fn pid_exe_path(pid: i32) -> Option<String> {
         .map(str::to_string)
 }
 
-/// (owner name, owner pid) of the frontmost on-screen normal window (layer 0).
+/// System UI processes that can own a layer-0 window but are never the user's
+/// foreground application.
+fn is_overlay_owner(name: &str) -> bool {
+    const OVERLAYS: [&str; 6] = [
+        "Window Server",
+        "WindowServer",
+        "Spotlight",
+        "Notification Center",
+        "Control Center",
+        "Dock",
+    ];
+    OVERLAYS.contains(&name)
+}
+
+/// (owner name, owner pid) of the frontmost on-screen normal window (layer 0),
+/// skipping lan-mouse's own windows and system overlays.
+///
+/// Each CF value is type-checked (`CFGetTypeID`) before it is cast: the
+/// CGWindowList schema guarantees the types, but the check keeps a malformed
+/// entry from turning a wrong-typed `CFTypeRef` into UB.
 fn frontmost_window_owner() -> Option<(String, i32)> {
     use core_foundation::base::TCFType;
     use core_foundation::number::{CFNumber, CFNumberRef};
@@ -531,9 +553,12 @@ fn frontmost_window_owner() -> Option<(String, i32)> {
         kCGWindowOwnerName, kCGWindowOwnerPID,
     };
 
+    let own_pid = std::process::id() as i32;
     let windows = copy_window_info(kCGWindowListOptionOnScreenOnly, kCGNullWindowID)?;
     let array = windows.as_concrete_TypeRef();
     let count = unsafe { CFArrayGetCount(array) };
+    let number_id = unsafe { CFNumberGetTypeID() };
+    let string_id = unsafe { CFStringGetTypeID() };
     for i in 0..count {
         let dict = unsafe { CFArrayGetValueAtIndex(array, i) };
         if dict.is_null() {
@@ -541,7 +566,7 @@ fn frontmost_window_owner() -> Option<(String, i32)> {
         }
         // The frontmost *normal* window is layer 0 (skip menubar/dock/overlays).
         let layer_ref = unsafe { CFDictionaryGetValue(dict, kCGWindowLayer as *const c_void) };
-        if layer_ref.is_null() {
+        if layer_ref.is_null() || unsafe { CFGetTypeID(layer_ref) } != number_id {
             continue;
         }
         let layer = unsafe { CFNumber::wrap_under_get_rule(layer_ref as CFNumberRef) }.to_i32();
@@ -549,7 +574,7 @@ fn frontmost_window_owner() -> Option<(String, i32)> {
             continue;
         }
         let pid_ref = unsafe { CFDictionaryGetValue(dict, kCGWindowOwnerPID as *const c_void) };
-        if pid_ref.is_null() {
+        if pid_ref.is_null() || unsafe { CFGetTypeID(pid_ref) } != number_id {
             continue;
         }
         let pid = match unsafe { CFNumber::wrap_under_get_rule(pid_ref as CFNumberRef) }.to_i32() {
@@ -557,11 +582,16 @@ fn frontmost_window_owner() -> Option<(String, i32)> {
             None => continue,
         };
         let name_ref = unsafe { CFDictionaryGetValue(dict, kCGWindowOwnerName as *const c_void) };
-        let name = if name_ref.is_null() {
-            String::new()
-        } else {
+        let name = if !name_ref.is_null() && unsafe { CFGetTypeID(name_ref) } == string_id {
             unsafe { CFString::wrap_under_get_rule(name_ref as CFStringRef) }.to_string()
+        } else {
+            String::new()
         };
+        // Skip our own windows and system overlays that can also be layer 0, so we
+        // report the actual foreground application.
+        if pid == own_pid || is_overlay_owner(&name) {
+            continue;
+        }
         return Some((name, pid));
     }
     None
@@ -643,18 +673,21 @@ fn secure_input_active() -> bool {
     unsafe { IsSecureEventInputEnabled() != 0 }
 }
 
-/// A representative Mac modifier keycode to stamp on a corrective `FlagsChanged`.
+/// A representative Mac modifier keycode (Events.h `kVK_*`) to stamp on a
+/// corrective `FlagsChanged`. It only needs to be *a* modifier key involved in
+/// the change (one of the stuck bits being cleared); the resulting state is
+/// carried by the flags, not the keycode. Falls back to Caps Lock.
 fn representative_keycode(diff: u64) -> u16 {
     if diff & FLAG_COMMAND != 0 {
-        0x37
+        0x37 // kVK_Command
     } else if diff & FLAG_SHIFT != 0 {
-        0x38
+        0x38 // kVK_Shift
     } else if diff & FLAG_CONTROL != 0 {
-        0x3B
+        0x3B // kVK_Control
     } else if diff & FLAG_ALTERNATE != 0 {
-        0x3A
+        0x3A // kVK_Option
     } else {
-        0x39
+        0x39 // kVK_CapsLock
     }
 }
 
@@ -1204,5 +1237,79 @@ bitflags! {
         const Mod3Mask = (1<<5);
         const Mod4Mask = (1<<6);
         const Mod5Mask = (1<<7);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hypervisor_path_matches_known_apps_only() {
+        assert!(is_hypervisor_path(
+            "/Applications/Parallels Desktop.app/Contents/MacOS/prl_client_app"
+        ));
+        // macOS guest binary is nested several bundles deep, still matches.
+        assert!(is_hypervisor_path(
+            "/Applications/Parallels Desktop.app/Contents/MacOS/Parallels Mac VM.app/Contents/MacOS/prl_macvm_app"
+        ));
+        assert!(is_hypervisor_path(
+            "/Applications/VMware Fusion.app/Contents/MacOS/vmware"
+        ));
+        assert!(is_hypervisor_path(
+            "/Applications/UTM.app/Contents/MacOS/UTM"
+        ));
+        // Real native apps must not match.
+        assert!(!is_hypervisor_path(
+            "/Applications/Visual Studio Code.app/Contents/MacOS/Code"
+        ));
+        assert!(!is_hypervisor_path(
+            "/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder"
+        ));
+        assert!(!is_hypervisor_path(""));
+    }
+
+    #[test]
+    fn overlay_owners_are_recognised() {
+        assert!(is_overlay_owner("WindowServer"));
+        assert!(is_overlay_owner("Dock"));
+        assert!(!is_overlay_owner("Parallels Desktop"));
+        assert!(!is_overlay_owner("Finder"));
+    }
+
+    #[test]
+    fn representative_keycode_prioritises_command_then_falls_back() {
+        assert_eq!(representative_keycode(FLAG_COMMAND), 0x37);
+        assert_eq!(representative_keycode(FLAG_SHIFT), 0x38);
+        assert_eq!(representative_keycode(FLAG_CONTROL), 0x3B);
+        assert_eq!(representative_keycode(FLAG_ALTERNATE), 0x3A);
+        // Command wins when several bits are set.
+        assert_eq!(representative_keycode(FLAG_COMMAND | FLAG_SHIFT), 0x37);
+        // AlphaShift / empty fall back to Caps Lock.
+        assert_eq!(representative_keycode(FLAG_ALPHASHIFT), 0x39);
+        assert_eq!(representative_keycode(0), 0x39);
+    }
+
+    #[test]
+    fn modifier_flags_carry_device_dependent_bits_and_noncoalesced() {
+        const NX_DEVICE_L_SHIFT: u64 = 0x2;
+        const NX_DEVICE_L_CMD: u64 = 0x8;
+        let non_coalesced = CGEventFlags::CGEventFlagNonCoalesced.bits();
+
+        // Shift: device-independent shift + device-dependent left-shift + NonCoalesced.
+        let f = modifier_flags_changed_flags(XMods::ShiftMask).bits();
+        assert_ne!(f & FLAG_SHIFT, 0);
+        assert_ne!(f & NX_DEVICE_L_SHIFT, 0);
+        assert_ne!(f & non_coalesced, 0);
+
+        // Empty: NonCoalesced only, no managed modifier bits.
+        let e = modifier_flags_changed_flags(XMods::empty()).bits();
+        assert_eq!(e & MANAGED_FLAG_MASK, 0);
+        assert_ne!(e & non_coalesced, 0);
+
+        // Command -> device-independent command + device-dependent left-command.
+        let c = modifier_flags_changed_flags(XMods::Mod4Mask).bits();
+        assert_ne!(c & FLAG_COMMAND, 0);
+        assert_ne!(c & NX_DEVICE_L_CMD, 0);
     }
 }
