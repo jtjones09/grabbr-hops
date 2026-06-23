@@ -1003,8 +1003,17 @@ impl Emulation for MacOSEmulation {
                                 return Ok(());
                             }
                         };
-                        event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, dx as i64);
-                        event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, dy as i64);
+                        // VM guests (Parallels et al.) apply BOTH the absolute warp
+                        // above AND these relative deltas, double-counting motion: 2x
+                        // sensitivity in a macOS guest (small moves trip "shake to
+                        // locate"), drift-to-corner in a Windows guest. Native macOS
+                        // consumers read only one. So stamp the delta ONLY when not
+                        // targeting a guest — the warp already positions the cursor and
+                        // the guest follows it 1:1.
+                        if !self.target_is_vm_guest() {
+                            event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, dx as i64);
+                            event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, dy as i64);
+                        }
                         // Carry the current modifier flags so modifier-aware drags
                         // (e.g. a Shift/Option-constrained screenshot-region drag)
                         // see the held modifier instead of a flagless move — without
