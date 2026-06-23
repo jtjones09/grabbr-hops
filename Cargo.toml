@@ -58,14 +58,21 @@ slab = "0.4.9"
 thiserror = "2.0.0"
 tokio-util = "0.7.11"
 local-channel = "0.1.5"
-webrtc-dtls = { version = "0.12.0", features = ["pem"] }
-webrtc-util = "0.11.0"
+quinn = { version = "0.11", default-features = false, features = [
+    "runtime-tokio",
+    "rustls-ring",
+    "log",
+] }
 rustls = { version = "0.23.12", default-features = false, features = [
     "std",
     "ring",
+    "tls12",
 ] }
+rustls-pki-types = "1"
+rustls-pemfile = "2"
 rcgen = "0.13.1"
 sha2 = "0.10.8"
+time = "0.3"
 notify = "8.2.0"
 
 [target.'cfg(unix)'.dependencies]

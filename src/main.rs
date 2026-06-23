@@ -118,6 +118,7 @@ where
     Ok(runtime.block_on(LocalSet::new().run_until(f))?)
 }
 
+#[cfg_attr(not(feature = "gtk"), allow(dead_code))]
 fn start_service() -> Result<Child, io::Error> {
     let child = process::Command::new(std::env::current_exe()?)
         .args(std::env::args().skip(1))

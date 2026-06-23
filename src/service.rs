@@ -33,6 +33,8 @@ pub enum ServiceError {
     ListenError(#[from] ListenerCreationError),
     #[error("failed to load certificate: `{0}`")]
     Certificate(#[from] crypto::Error),
+    #[error("connection setup failed: {0}")]
+    Connect(String),
 }
 
 pub struct Service {
@@ -83,18 +85,24 @@ impl Service {
             client_manager.add_with_config(client);
         }
 
-        // load certificate
-        let cert = crypto::load_or_generate_key_and_cert(config.cert_path())?;
-        let public_key_fingerprint = crypto::certificate_fingerprint(&cert);
+        // load identity (cert + key)
+        let identity = Arc::new(crypto::load_or_generate_key_and_cert(config.cert_path())?);
+        let public_key_fingerprint = crypto::certificate_fingerprint(&identity);
 
         // create frontend communication adapter, exit if already running
         let frontend_listener = AsyncFrontendListener::new().await?;
 
         let authorized_keys = Arc::new(RwLock::new(config.authorized_fingerprints()));
-        // listener + connection
+        // listener + connection (both authenticate the peer against the shared
+        // authorized-fingerprint allowlist)
         let listener =
-            LanMouseListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
-        let conn = LanMouseConnection::new(cert.clone(), client_manager.clone());
+            LanMouseListener::new(config.port(), identity.clone(), authorized_keys.clone()).await?;
+        let conn = LanMouseConnection::new(
+            identity.clone(),
+            client_manager.clone(),
+            authorized_keys.clone(),
+        )
+        .map_err(|e| ServiceError::Connect(e.to_string()))?;
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
