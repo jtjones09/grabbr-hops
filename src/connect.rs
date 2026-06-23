@@ -13,7 +13,10 @@ use std::{
     io,
     net::SocketAddr,
     rc::Rc,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use thiserror::Error;
@@ -50,6 +53,10 @@ const MAX_IDLE: Duration = Duration::from_secs(20);
 struct PeerLink {
     conn: Connection,
     send: Arc<Mutex<SendStream>>,
+    /// `false` until the peer Acks our `Enter`. While cold, even droppable
+    /// pointer events go on the reliable stream so the first move after
+    /// crossing can't overtake the Enter via a faster datagram (C1).
+    warm: Arc<AtomicBool>,
 }
 
 fn client_config(
@@ -94,6 +101,7 @@ async fn connect(
         PeerLink {
             conn,
             send: Arc::new(Mutex::new(send)),
+            warm: Arc::new(AtomicBool::new(false)),
         },
         addr,
     ))
@@ -172,7 +180,26 @@ impl LanMouseConnection {
                 if !self.client_manager.alive(handle) {
                     return Err(LanMouseConnectionError::TargetEmulationDisabled);
                 }
-                let result = {
+                // Crossing (re)starts the Enter/Ack handshake: go cold until the
+                // new Enter is Ack'd (warm is set in the receive loop).
+                if matches!(event, ProtoEvent::Enter(_)) {
+                    link.warm.store(false, Ordering::Relaxed);
+                }
+                // Droppable pointer events (motion/scroll) ride unreliable
+                // datagrams once warm; everything else — and everything while
+                // cold — stays on the ordered reliable stream. A datagram the
+                // peer can't accept (no datagram support / too large) falls back
+                // to the stream so nothing is silently lost on that path.
+                let via_datagram = event.is_droppable() && link.warm.load(Ordering::Relaxed);
+                let result = if via_datagram {
+                    match link.conn.send_datagram(transport::encode_datagram(event)) {
+                        Ok(()) => Ok(()),
+                        Err(_) => {
+                            let mut send = link.send.lock().await;
+                            transport::write_frame(&mut send, event).await
+                        }
+                    }
+                } else {
                     let mut send = link.send.lock().await;
                     transport::write_frame(&mut send, event).await
                 };
@@ -180,7 +207,8 @@ impl LanMouseConnection {
                     log::warn!("client {handle} failed to send: {e}");
                     disconnect(&self.client_manager, handle, addr, &self.conns).await;
                 } else {
-                    log::trace!("{event} >->->->->- {addr}");
+                    let arrow = if via_datagram { ">~>~>~>~>~" } else { ">->->->->-" };
+                    log::trace!("{event} {arrow} {addr}");
                 }
                 return Ok(());
             }
@@ -350,6 +378,12 @@ async fn receive_loop(
                         client_manager.set_peer_commit(handle, Some(commit));
                     }
                     event => {
+                        // The Enter is now Ack'd — the receiver has the cursor in
+                        // this client's region, so droppable motion/scroll may now
+                        // ride datagrams (C1: never before this point).
+                        if matches!(event, ProtoEvent::Ack(_)) {
+                            link.warm.store(true, Ordering::Relaxed);
+                        }
                         let _ = tx.send((handle, event));
                     }
                 }

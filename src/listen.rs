@@ -141,7 +141,8 @@ impl LanMouseListener {
                                             fingerprint: fingerprint.clone(),
                                         });
                                         let _ = listen_tx.send(ListenEvent::Accept { addr, fingerprint });
-                                        spawn_local(read_loop(conns.clone(), addr, conn, listen_tx.clone()));
+                                        spawn_local(read_loop(conns.clone(), addr, conn.clone(), listen_tx.clone()));
+                                        spawn_local(datagram_loop(addr, conn, listen_tx.clone()));
                                     }
                                     Err(e) => {
                                         log::warn!("handshake from {remote} failed: {e}");
@@ -283,4 +284,25 @@ async fn read_loop(
     }
     log::info!("client disconnected {addr:?}");
     remove_conn(&conns, addr).await;
+}
+
+/// Receive high-rate droppable pointer events (motion/scroll) the peer sends as
+/// unreliable QUIC datagrams, forwarding them into the same channel as stream
+/// events so emulation handles them identically. Connection teardown is owned
+/// by [`read_loop`]; this loop simply exits when the connection ends.
+async fn datagram_loop(addr: SocketAddr, conn: Connection, listen_tx: Sender<ListenEvent>) {
+    loop {
+        match conn.read_datagram().await {
+            Ok(data) => match transport::decode_datagram(&data) {
+                Ok(event) => {
+                    let _ = listen_tx.send(ListenEvent::Msg { event, addr });
+                }
+                Err(e) => log::debug!("ignoring undecodable datagram from {addr}: {e}"),
+            },
+            Err(e) => {
+                log::debug!("{addr}: datagram path ended: {e}");
+                break;
+            }
+        }
+    }
 }

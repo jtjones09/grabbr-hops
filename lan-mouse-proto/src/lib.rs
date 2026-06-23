@@ -137,6 +137,21 @@ impl ProtoEvent {
             ProtoEvent::Hello { .. } => EventType::Hello,
         }
     }
+
+    /// High-rate pointer events (motion + scroll) that tolerate loss. These ride
+    /// unreliable QUIC datagrams (Stage 2) instead of the ordered stream, so a
+    /// dropped or late one never head-of-line-blocks reliable input (keys,
+    /// buttons, enter/leave).
+    pub fn is_droppable(&self) -> bool {
+        matches!(
+            self,
+            ProtoEvent::Input(InputEvent::Pointer(
+                PointerEvent::Motion { .. }
+                    | PointerEvent::Axis { .. }
+                    | PointerEvent::AxisDiscrete120 { .. }
+            ))
+        )
+    }
 }
 
 impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {

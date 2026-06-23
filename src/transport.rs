@@ -12,6 +12,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, Once, RwLock};
 
+use bytes::Bytes;
+
 use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent, ProtocolError};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
@@ -265,4 +267,29 @@ pub async fn read_frame(recv: &mut quinn::RecvStream) -> Result<Option<ProtoEven
     let mut buf = [0u8; MAX_EVENT_SIZE];
     recv.read_exact(&mut buf[..len]).await?;
     Ok(Some(ProtoEvent::try_from(buf)?))
+}
+
+// ---------------------------------------------------------------------------
+// datagrams (stage 2) — unreliable + self-framed (exactly one event per
+// datagram), so no length prefix is needed. Used for high-rate droppable
+// pointer events (motion/scroll); every other event stays on the reliable
+// stream above.
+// ---------------------------------------------------------------------------
+
+/// Serialize one [`ProtoEvent`] into a QUIC datagram payload.
+pub fn encode_datagram(event: ProtoEvent) -> Bytes {
+    let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
+    Bytes::copy_from_slice(&buf[..len])
+}
+
+/// Decode one [`ProtoEvent`] from a QUIC datagram payload. The length is
+/// bound-checked and the buffer zero-padded before decoding, mirroring
+/// [`read_frame`], so a malformed/hostile datagram can't trigger a panic.
+pub fn decode_datagram(data: &[u8]) -> Result<ProtoEvent, FrameError> {
+    if data.len() > MAX_EVENT_SIZE {
+        return Err(FrameError::BadLength(data.len()));
+    }
+    let mut buf = [0u8; MAX_EVENT_SIZE];
+    buf[..data.len()].copy_from_slice(data);
+    Ok(ProtoEvent::try_from(buf)?)
 }

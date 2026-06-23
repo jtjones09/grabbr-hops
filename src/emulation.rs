@@ -158,7 +158,14 @@ impl ListenTask {
                             }
                             ProtoEvent::Leave(_) => {
                                 self.emulation_proxy.remove(addr);
-                                self.listener.reply(addr, ProtoEvent::Ack(0)).await;
+                                // Deliberately NOT Ack'd. Enter and Leave both carry
+                                // serial 0, so a Leave-Ack is indistinguishable from
+                                // the next Enter's Ack. On a fast re-cross a stale
+                                // Leave-Ack could warm the sender's link (and flip
+                                // capture to State::Sending) before the new Enter is
+                                // acked, letting a motion datagram overtake the
+                                // reliable Enter — the C1 race. Leave rides the
+                                // reliable stream, so no Ack is needed to confirm it.
                             }
                             ProtoEvent::Input(event) => self.emulation_proxy.consume(event, addr),
                             ProtoEvent::Ping => self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())).await,
