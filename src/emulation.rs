@@ -208,10 +208,13 @@ impl ListenTask {
                 },
                 _ = interval.tick() => {
                     last_response.retain(|&addr,instant| {
-                        if instant.elapsed() > Duration::from_secs(1) {
+                        // QUIC keep-alive handles real liveness; only treat a
+                        // peer as gone after a long quiet window so normal
+                        // pauses / load don't falsely release keys mid-session.
+                        if instant.elapsed() > Duration::from_secs(10) {
                             log::warn!("releasing keys: {addr} not responding!");
                             self.emulation_proxy.remove(addr);
-                            self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
+                            let _ = self.event_tx.send(EmulationEvent::Disconnected { addr });
                             false
                         } else {
                             true

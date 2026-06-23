@@ -307,11 +307,14 @@ async fn ping_pong(
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
-        if !ping_response.borrow_mut().remove(&addr) {
-            log::warn!("{addr} did not respond, closing connection");
-            disconnect(&client_manager, handle, addr, &conns).await;
-            return;
-        }
+        // Liveness is QUIC's job now (keep-alive + idle timeout). A missed pong
+        // under load — e.g. the Pong head-of-line-blocked behind input on the
+        // shared reliable stream — must NOT tear down the connection; that false
+        // teardown was triggering release_keys and the stuck-key cascade. We
+        // keep pinging only to refresh the Pong's emulation-enabled bit; a truly
+        // dead link surfaces as a write error above (and a read error in the
+        // receive loop).
+        let _ = ping_response.borrow_mut().remove(&addr);
     }
 }
 
