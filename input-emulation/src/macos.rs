@@ -1003,22 +1003,25 @@ impl Emulation for MacOSEmulation {
                                 return Ok(());
                             }
                         };
-                        // VM guests (Parallels et al.) apply BOTH the absolute warp
-                        // above AND these relative deltas, double-counting motion: 2x
-                        // sensitivity in a macOS guest (small moves trip "shake to
-                        // locate"), drift-to-corner in a Windows guest. Native macOS
-                        // consumers read only one. So stamp the delta ONLY when not
-                        // targeting a guest — the warp already positions the cursor and
-                        // the guest follows it 1:1.
-                        if !self.target_is_vm_guest() {
-                            event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, dx as i64);
-                            event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, dy as i64);
+                        // Stamp the relative delta unconditionally, exactly like
+                        // upstream. The earlier VM-guest delta-gate here was a
+                        // misdiagnosis: stock 0.11.0 sets the delta for guests too and
+                        // feels correct (verified by running the upstream RC into a
+                        // Parallels guest), so the delta was never the over-sensitivity
+                        // cause.
+                        event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, dx as i64);
+                        event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, dy as i64);
+                        // Carry modifier flags ONLY when a modifier is actually held, so
+                        // modifier-aware drags (e.g. a Shift/Option-constrained
+                        // screenshot-region drag) still see the modifier. Stamping flags
+                        // on EVERY plain move (the previous behavior) overrode macOS
+                        // pointer scaling and regressed motion feel — slow on the native
+                        // host, over-sensitive in a guest — so plain moves now stay
+                        // byte-identical to upstream.
+                        let flags = to_cgevent_flags(self.modifier_state.get());
+                        if !flags.is_empty() {
+                            event.set_flags(flags);
                         }
-                        // Carry the current modifier flags so modifier-aware drags
-                        // (e.g. a Shift/Option-constrained screenshot-region drag)
-                        // see the held modifier instead of a flagless move — without
-                        // this the selection collapses to a degenerate box.
-                        event.set_flags(to_cgevent_flags(self.modifier_state.get()));
                         event.post(CGEventTapLocation::HID);
                     }
                     PointerEvent::Button {
