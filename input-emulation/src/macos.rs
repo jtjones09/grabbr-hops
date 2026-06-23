@@ -159,7 +159,14 @@ impl MacOSEmulation {
 
     async fn cancel_repeat_task(&mut self) {
         if let Some(task) = self.repeat_task.take() {
-            self.notify_repeat_task.notify_waiters();
+            // notify_one (NOT notify_waiters): the repeat task spends most of its
+            // time posting key events, not parked on `.notified()`. notify_waiters
+            // only wakes a currently-parked waiter and drops the signal otherwise,
+            // so a cancel that landed mid-keypress was silently lost and the repeat
+            // loop ran forever (runaway key autorepeat / stuck key). notify_one
+            // stores a permit, so the task sees the cancel at its next checkpoint
+            // and always stops and releases the key.
+            self.notify_repeat_task.notify_one();
             let _ = task.await;
         }
     }
