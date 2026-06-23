@@ -114,40 +114,45 @@ impl LanMouseListener {
                     tokio::select! {
                         incoming = endpoint.accept() => {
                             let Some(incoming) = incoming else { break };
-                            let remote = incoming.remote_address();
-                            match incoming.await {
-                                Ok(conn) => {
-                                    let addr = conn.remote_address();
-                                    log::info!("client connected, ip: {addr}");
-                                    let fingerprint =
-                                        peer_fingerprint(&conn).unwrap_or_else(|| "unknown".to_owned());
-                                    let send = match conn.open_uni().await {
-                                        Ok(s) => Arc::new(AsyncMutex::new(s)),
-                                        Err(e) => {
-                                            log::warn!("{addr}: opening reply stream failed: {e}");
-                                            continue;
+                            // Drive each handshake on its own task so one slow
+                            // peer can't head-of-line-block all other accepts.
+                            let conns = conns_clone.clone();
+                            let listen_tx = listen_tx.clone();
+                            let attempts = attempts.clone();
+                            spawn_local(async move {
+                                let remote = incoming.remote_address();
+                                match incoming.await {
+                                    Ok(conn) => {
+                                        let addr = conn.remote_address();
+                                        log::info!("client connected, ip: {addr}");
+                                        let fingerprint = peer_fingerprint(&conn)
+                                            .unwrap_or_else(|| "unknown".to_owned());
+                                        let send = match conn.open_uni().await {
+                                            Ok(s) => Arc::new(AsyncMutex::new(s)),
+                                            Err(e) => {
+                                                log::warn!("{addr}: opening reply stream failed: {e}");
+                                                return;
+                                            }
+                                        };
+                                        conns.lock().await.push(ConnEntry {
+                                            addr,
+                                            conn: conn.clone(),
+                                            send,
+                                            fingerprint: fingerprint.clone(),
+                                        });
+                                        let _ = listen_tx.send(ListenEvent::Accept { addr, fingerprint });
+                                        spawn_local(read_loop(conns.clone(), addr, conn, listen_tx.clone()));
+                                    }
+                                    Err(e) => {
+                                        log::warn!("handshake from {remote} failed: {e}");
+                                        if let Some(fingerprint) =
+                                            attempts.lock().expect("lock").pop_front()
+                                        {
+                                            let _ = listen_tx.send(ListenEvent::Rejected { fingerprint });
                                         }
-                                    };
-                                    conns_clone.lock().await.push(ConnEntry {
-                                        addr,
-                                        conn: conn.clone(),
-                                        send,
-                                        fingerprint: fingerprint.clone(),
-                                    });
-                                    listen_tx
-                                        .send(ListenEvent::Accept { addr, fingerprint })
-                                        .expect("channel closed");
-                                    spawn_local(read_loop(conns_clone.clone(), addr, conn, listen_tx.clone()));
-                                }
-                                Err(e) => {
-                                    log::warn!("handshake from {remote} failed: {e}");
-                                    if let Some(fingerprint) = attempts.lock().expect("lock").pop_front() {
-                                        listen_tx
-                                            .send(ListenEvent::Rejected { fingerprint })
-                                            .expect("channel closed");
                                     }
                                 }
-                            }
+                            });
                         },
                         port = request_port_change_rx.recv() => {
                             let port = port.expect("channel closed");
@@ -262,9 +267,9 @@ async fn read_loop(
     };
     loop {
         match transport::read_frame(&mut recv).await {
-            Ok(Some(event)) => listen_tx
-                .send(ListenEvent::Msg { event, addr })
-                .expect("channel closed"),
+            Ok(Some(event)) => {
+                let _ = listen_tx.send(ListenEvent::Msg { event, addr });
+            }
             Ok(None) => break,
             // unknown/forward-compat event: framing intact, keep listening
             Err(transport::FrameError::Protocol(e)) => {

@@ -260,7 +260,14 @@ async fn connect_to_handle(
             }
         }
 
-        spawn_local(ping_pong(addr, link.clone(), ping_response.clone()));
+        spawn_local(ping_pong(
+            client_manager.clone(),
+            handle,
+            addr,
+            link.clone(),
+            conns.clone(),
+            ping_response.clone(),
+        ));
         spawn_local(receive_loop(
             client_manager,
             handle,
@@ -276,7 +283,14 @@ async fn connect_to_handle(
     Err(LanMouseConnectionError::NotConnected)
 }
 
-async fn ping_pong(addr: SocketAddr, link: PeerLink, ping_response: Rc<RefCell<HashSet<SocketAddr>>>) {
+async fn ping_pong(
+    client_manager: ClientManager,
+    handle: ClientHandle,
+    addr: SocketAddr,
+    link: PeerLink,
+    conns: Rc<Mutex<HashMap<SocketAddr, PeerLink>>>,
+    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+) {
     loop {
         // send 4 pings, at least one must be answered
         for _ in 0..4 {
@@ -286,7 +300,7 @@ async fn ping_pong(addr: SocketAddr, link: PeerLink, ping_response: Rc<RefCell<H
             };
             if let Err(e) = result {
                 log::warn!("{addr}: send error `{e}`, closing connection");
-                link.conn.close(0u32.into(), b"ping send error");
+                disconnect(&client_manager, handle, addr, &conns).await;
                 return;
             }
             log::trace!("PING >->->->->- {addr}");
@@ -295,7 +309,7 @@ async fn ping_pong(addr: SocketAddr, link: PeerLink, ping_response: Rc<RefCell<H
 
         if !ping_response.borrow_mut().remove(&addr) {
             log::warn!("{addr} did not respond, closing connection");
-            link.conn.close(0u32.into(), b"no pong");
+            disconnect(&client_manager, handle, addr, &conns).await;
             return;
         }
     }
@@ -332,7 +346,9 @@ async fn receive_loop(
                     ProtoEvent::Hello { commit } => {
                         client_manager.set_peer_commit(handle, Some(commit));
                     }
-                    event => tx.send((handle, event)).expect("channel closed"),
+                    event => {
+                        let _ = tx.send((handle, event));
+                    }
                 }
             }
             // clean stream end
