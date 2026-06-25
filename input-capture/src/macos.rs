@@ -31,6 +31,7 @@ use std::{
     sync::{Arc, OnceLock},
     task::{Context, Poll, ready},
     thread::{self},
+    time::Duration,
 };
 use tokio::sync::{
     Mutex,
@@ -38,7 +39,7 @@ use tokio::sync::{
     oneshot,
 };
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 struct Bounds {
     xmin: f64,
     xmax: f64,
@@ -101,19 +102,42 @@ impl InputCaptureState {
         None
     }
 
-    // Get the max bounds of all displays
+    // Recompute the union bounds of all currently-active displays.
     fn update_bounds(&mut self) -> Result<(), MacosCaptureCreationError> {
         let active_ids =
             CGDisplay::active_displays().map_err(MacosCaptureCreationError::ActiveDisplays)?;
-        active_ids.iter().for_each(|d| {
-            let bounds = CGDisplay::new(*d).bounds();
-            self.bounds.xmin = self.bounds.xmin.min(bounds.origin.x);
-            self.bounds.xmax = self.bounds.xmax.max(bounds.origin.x + bounds.size.width);
-            self.bounds.ymin = self.bounds.ymin.min(bounds.origin.y);
-            self.bounds.ymax = self.bounds.ymax.max(bounds.origin.y + bounds.size.height);
-        });
-
-        log::debug!("Updated displays bounds: {0:?}", self.bounds);
+        if active_ids.is_empty() {
+            log::warn!("no active displays reported; keeping previous bounds");
+            return Ok(());
+        }
+        // Recompute from scratch each call. The previous code folded
+        // min/max into the *existing* self.bounds, so the bounds could only
+        // ever grow — removing a display (lid close in clamshell → built-in
+        // display gone) never shrank them. The barrier edges then sat at the
+        // phantom coordinates of a display that no longer existed, so the
+        // cursor couldn't reach a real edge to cross ("auto switching
+        // stopped") and could trip stale edges and oscillate. Reset to
+        // inverted extremes, then fold the live displays in.
+        let mut bounds = Bounds {
+            xmin: f64::MAX,
+            xmax: f64::MIN,
+            ymin: f64::MAX,
+            ymax: f64::MIN,
+        };
+        for d in active_ids.iter() {
+            let b = CGDisplay::new(*d).bounds();
+            bounds.xmin = bounds.xmin.min(b.origin.x);
+            bounds.xmax = bounds.xmax.max(b.origin.x + b.size.width);
+            bounds.ymin = bounds.ymin.min(b.origin.y);
+            bounds.ymax = bounds.ymax.max(b.origin.y + b.size.height);
+        }
+        if bounds != self.bounds {
+            log::info!(
+                "display geometry changed: {:?} -> {:?}",
+                self.bounds, bounds
+            );
+            self.bounds = bounds;
+        }
         Ok(())
     }
 
@@ -189,17 +213,14 @@ impl InputCaptureState {
                 return Err(CaptureError::EventTapDisabled);
             }
             ProducerEvent::DisplayReconfigured => {
-                // The macOS display configuration changed — a monitor
-                // was plugged in/out, the resolution changed, the
-                // arrangement was rearranged, etc. Re-fetch the
-                // active-display bounds so barrier crossings and the
-                // cursor-warp on capture-start use the current
-                // geometry instead of whatever was true at process
-                // start.
+                // A monitor was added/removed (lid open/close), or the
+                // resolution/arrangement changed. Refresh bounds so barrier
+                // crossings use the current geometry. The 1s poll in the
+                // consumer task also covers this, in case the Quartz
+                // reconfiguration callback misses the event — as it does on
+                // some dock/lid configurations.
                 if let Err(e) = self.update_bounds() {
                     log::warn!("failed to refresh display bounds: {e}");
-                } else {
-                    log::info!("display reconfigured: {:?}", self.bounds);
                 }
             }
         };
@@ -686,6 +707,14 @@ impl MacOSInputCapture {
         let run_loop = ready_rx.recv().expect("channel closed")?;
 
         let _tap_task: tokio::task::JoinHandle<()> = tokio::task::spawn_local(async move {
+            // Safety-net poll: the Quartz display-reconfiguration callback
+            // doesn't reliably fire on lid open/close with some docks, which
+            // left the capture bounds stale — on an extended display the
+            // cursor then crossed mid-screen instead of at the real edge.
+            // Re-poll the geometry once a second; update_bounds only logs and
+            // changes state when the bounds actually differ.
+            let mut bounds_poll = tokio::time::interval(Duration::from_secs(1));
+            bounds_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     producer_event = notify_rx.recv() => {
@@ -696,6 +725,10 @@ impl MacOSInputCapture {
                         state.handle_producer_event(producer_event).await.unwrap_or_else(|e| {
                             log::error!("Failed to handle producer event: {e}");
                         })
+                    }
+                    _ = bounds_poll.tick() => {
+                        let mut state = state.lock().await;
+                        let _ = state.update_bounds();
                     }
                     _ = &mut tap_exit_rx => break,
                 }
