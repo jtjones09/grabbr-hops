@@ -92,6 +92,7 @@ impl LanMouseListener {
         port: u16,
         identity: Arc<Identity>,
         authorized: Authorized,
+        clipboard_in: Sender<String>,
     ) -> Result<Self, ListenerCreationError> {
         transport::install_crypto_provider();
         let (listen_tx, listen_rx) = channel();
@@ -119,6 +120,7 @@ impl LanMouseListener {
                             let conns = conns_clone.clone();
                             let listen_tx = listen_tx.clone();
                             let attempts = attempts.clone();
+                            let clipboard_in = clipboard_in.clone();
                             spawn_local(async move {
                                 let remote = incoming.remote_address();
                                 match incoming.await {
@@ -141,7 +143,7 @@ impl LanMouseListener {
                                             fingerprint: fingerprint.clone(),
                                         });
                                         let _ = listen_tx.send(ListenEvent::Accept { addr, fingerprint });
-                                        spawn_local(read_loop(conns.clone(), addr, conn, listen_tx.clone()));
+                                        spawn_local(read_loop(conns.clone(), addr, conn, listen_tx.clone(), clipboard_in));
                                     }
                                     Err(e) => {
                                         log::warn!("handshake from {remote} failed: {e}");
@@ -230,6 +232,48 @@ impl LanMouseListener {
             .find(|e| e.addr == addr)
             .map(|e| e.fingerprint.clone())
     }
+
+    /// A handle for broadcasting local clipboard changes to all connected
+    /// peers. Grabbed before this listener is moved into `Emulation` so the
+    /// service can drive it directly.
+    pub(crate) fn clipboard_sender(&self) -> ClipboardSenderListen {
+        ClipboardSenderListen {
+            conns: self.conns.clone(),
+        }
+    }
+}
+
+/// Broadcasts clipboard text to every connected peer, each on its own
+/// ephemeral uni stream. Cloneable handle over the shared connection list.
+#[derive(Clone)]
+pub(crate) struct ClipboardSenderListen {
+    conns: Rc<AsyncMutex<Vec<ConnEntry>>>,
+}
+
+impl ClipboardSenderListen {
+    pub(crate) async fn broadcast(&self, text: String) {
+        let conns: Vec<Connection> = {
+            let conns = self.conns.lock().await;
+            conns.iter().map(|e| e.conn.clone()).collect()
+        };
+        for conn in conns {
+            let text = text.clone();
+            spawn_local(async move {
+                match tokio::time::timeout(
+                    transport::CLIPBOARD_IO_TIMEOUT,
+                    transport::send_clipboard(&conn, &text),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => log::debug!("clipboard broadcast failed: {e}"),
+                    // dropping the send future on timeout abandons a stuck
+                    // open_uni/write instead of pinning the task indefinitely
+                    Err(_) => log::debug!("clipboard broadcast timed out"),
+                }
+            });
+        }
+    }
 }
 
 impl Stream for LanMouseListener {
@@ -255,6 +299,7 @@ async fn read_loop(
     addr: SocketAddr,
     conn: Connection,
     listen_tx: Sender<ListenEvent>,
+    clipboard_in: Sender<String>,
 ) {
     // the peer's reliable inbound stream (their uni stream to us)
     let mut recv = match conn.accept_uni().await {
@@ -265,6 +310,9 @@ async fn read_loop(
             return;
         }
     };
+    // The input stream above is accepted first (opened at connection setup);
+    // clipboard transfers ride the subsequent uni streams on this connection.
+    spawn_local(clipboard_accept_loop(conn.clone(), addr, clipboard_in));
     loop {
         match transport::read_frame(&mut recv).await {
             Ok(Some(event)) => {
@@ -282,5 +330,41 @@ async fn read_loop(
         }
     }
     log::info!("client disconnected {addr:?}");
+    // Close the connection so the spawned clipboard_accept_loop's accept_uni
+    // errors and the loop (and this connection's remaining clones) are
+    // released. Mirrors connect.rs::disconnect; without it a half-closed-but-
+    // alive connection (primary input stream finished/reset while keep-alive
+    // holds the connection up) would leak the clipboard task and the connection.
+    conn.close(0u32.into(), b"bye");
     remove_conn(&conns, addr).await;
+}
+
+/// Accepts the peer's ephemeral clipboard uni streams (everything after the
+/// primary input stream) and forwards each payload to the service.
+async fn clipboard_accept_loop(conn: Connection, addr: SocketAddr, clipboard_in: Sender<String>) {
+    loop {
+        match conn.accept_uni().await {
+            Ok(recv) => {
+                let clipboard_in = clipboard_in.clone();
+                spawn_local(async move {
+                    match tokio::time::timeout(
+                        transport::CLIPBOARD_IO_TIMEOUT,
+                        transport::recv_clipboard(recv),
+                    )
+                    .await
+                    {
+                        Ok(Ok(text)) => {
+                            let _ = clipboard_in.send(text);
+                        }
+                        Ok(Err(e)) => log::debug!("{addr}: bad clipboard transfer: {e}"),
+                        // dropping the recv future on timeout stops the stream
+                        // and frees the uni-stream slot (never reaped otherwise)
+                        Err(_) => log::debug!("{addr}: clipboard transfer timed out"),
+                    }
+                });
+            }
+            // connection closed — the input read_loop handles cleanup
+            Err(_) => break,
+        }
+    }
 }

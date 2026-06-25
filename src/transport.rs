@@ -266,3 +266,57 @@ pub async fn read_frame(recv: &mut quinn::RecvStream) -> Result<Option<ProtoEven
     recv.read_exact(&mut buf[..len]).await?;
     Ok(Some(ProtoEvent::try_from(buf)?))
 }
+
+// ---------------------------------------------------------------------------
+// clipboard — variable-length content that does not fit the fixed event frame.
+// Each transfer rides its OWN ephemeral uni stream (opened on copy, finished
+// immediately): a large paste never head-of-line-blocks the realtime input
+// stream, and the stream's clean finish delimits the message (no length
+// prefix). The input/reply "primary" stream is always opened first at
+// connection setup, so on the receiving side it is accepted before any
+// clipboard stream and the two never get confused.
+// ---------------------------------------------------------------------------
+
+/// Hard cap on a single clipboard transfer so a hostile/buggy peer cannot make
+/// us buffer unbounded data. 1 MiB is generous for text (images, when added,
+/// get their own typed path).
+pub const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
+
+/// Abandon a single clipboard transfer (send or receive) that stalls longer
+/// than this. Dropping the future resets/stops the stream and frees its
+/// uni-stream slot, so a stuck or half-open stream (sender crash, congestion,
+/// hostile peer) cannot pin a task or a slot for the life of the connection.
+/// QUIC keep-alive defeats the connection idle timeout, so this is the only
+/// thing that reaps such streams. 10s is far above any real LAN transfer.
+pub const CLIPBOARD_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[derive(Debug, Error)]
+pub enum ClipboardError {
+    #[error("open stream: {0}")]
+    Open(#[from] quinn::ConnectionError),
+    #[error("write: {0}")]
+    Write(#[from] quinn::WriteError),
+    #[error("finish: {0}")]
+    Finish(#[from] quinn::ClosedStream),
+    #[error("read: {0}")]
+    Read(#[from] quinn::ReadToEndError),
+    #[error("clipboard payload was not valid utf-8")]
+    Utf8(#[from] std::string::FromUtf8Error),
+}
+
+/// Send one clipboard text payload to a peer on a fresh uni stream. The stream
+/// is finished immediately; quinn delivers the buffered data + FIN even after
+/// the handle is dropped, so this is fire-and-forget.
+pub async fn send_clipboard(conn: &quinn::Connection, text: &str) -> Result<(), ClipboardError> {
+    let mut send = conn.open_uni().await?;
+    send.write_all(text.as_bytes()).await?;
+    send.finish()?;
+    Ok(())
+}
+
+/// Read one clipboard text payload from an accepted uni stream, bounded by
+/// [`MAX_CLIPBOARD_BYTES`]. The stream's clean finish delimits the payload.
+pub async fn recv_clipboard(mut recv: quinn::RecvStream) -> Result<String, ClipboardError> {
+    let bytes = recv.read_to_end(MAX_CLIPBOARD_BYTES).await?;
+    Ok(String::from_utf8(bytes)?)
+}

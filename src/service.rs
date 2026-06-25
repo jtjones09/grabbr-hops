@@ -1,13 +1,15 @@
 use crate::{
     capture::{Capture, CaptureType, ICaptureEvent},
     client::ClientManager,
+    clipboard::{Clipboard, ClipboardEvent},
     config::{Config, ConfigClient},
-    connect::LanMouseConnection,
+    connect::{ClipboardSender, LanMouseConnection},
     crypto,
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
-    listen::{LanMouseListener, ListenerCreationError},
+    listen::{ClipboardSenderListen, LanMouseListener, ListenerCreationError},
 };
+use local_channel::mpsc::{Receiver, channel};
 use futures::StreamExt;
 use lan_mouse_ipc::{
     AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
@@ -69,6 +71,17 @@ pub struct Service {
     /// map from capture handle to connection info
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
     next_trigger_handle: u64,
+    /// cross-machine clipboard sync backend (local monitor + apply)
+    clipboard: Clipboard,
+    /// whether the clipboard backend is still running (false once it stops, so
+    /// the run loop does not busy-poll a closed channel)
+    clipboard_alive: bool,
+    /// inbound clipboard text received from peers, applied to the local clipboard
+    clipboard_in: Receiver<String>,
+    /// broadcast local clipboard changes to outgoing-connection peers
+    clipboard_out_conn: ClipboardSender,
+    /// broadcast local clipboard changes to incoming-connection peers
+    clipboard_out_listen: ClipboardSenderListen,
 }
 
 #[derive(Debug)]
@@ -93,16 +106,38 @@ impl Service {
         let frontend_listener = AsyncFrontendListener::new().await?;
 
         let authorized_keys = Arc::new(RwLock::new(config.authorized_fingerprints()));
+
+        // clipboard sync: a single inbound channel both transports push received
+        // payloads into, plus the local monitor/apply backend. The channel is
+        // unbounded — acceptable for the trusted KVM-pair model (peers are
+        // mutually fingerprint-authenticated). Each transfer is capped at
+        // transport::MAX_CLIPBOARD_BYTES and stalled transfers time out, but a
+        // malicious/buggy *authorized* peer flooding valid payloads is not yet
+        // back-pressured; a bounded/coalescing channel is the future hardening.
+        let (clipboard_in_tx, clipboard_in) = channel();
+        let clipboard = Clipboard::new();
+
         // listener + connection (both authenticate the peer against the shared
         // authorized-fingerprint allowlist)
-        let listener =
-            LanMouseListener::new(config.port(), identity.clone(), authorized_keys.clone()).await?;
+        let listener = LanMouseListener::new(
+            config.port(),
+            identity.clone(),
+            authorized_keys.clone(),
+            clipboard_in_tx.clone(),
+        )
+        .await?;
         let conn = LanMouseConnection::new(
             identity.clone(),
             client_manager.clone(),
             authorized_keys.clone(),
+            clipboard_in_tx,
         )
         .map_err(|e| ServiceError::Connect(e.to_string()))?;
+
+        // clipboard broadcast handles — grabbed before the transports are moved
+        // into capture/emulation below.
+        let clipboard_out_conn = conn.clipboard_sender();
+        let clipboard_out_listen = listener.clipboard_sender();
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
@@ -131,6 +166,11 @@ impl Service {
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
+            clipboard,
+            clipboard_alive: true,
+            clipboard_in,
+            clipboard_out_conn,
+            clipboard_out_listen,
         };
         Ok(service)
     }
@@ -155,6 +195,12 @@ impl Service {
                 event = self.emulation.event() => self.handle_emulation_event(event),
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
+                event = self.clipboard.changed(), if self.clipboard_alive => self.handle_clipboard_change(event).await,
+                text = self.clipboard_in.recv() => {
+                    if let Some(text) = text {
+                        self.clipboard.apply(text);
+                    }
+                }
                 _ = self.config.changed() => self.handle_config_change(),
                 r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
             }
@@ -169,6 +215,28 @@ impl Service {
         self.resolver.terminate().await;
 
         Ok(())
+    }
+
+    /// A *local* clipboard change → broadcast it to every connected peer (both
+    /// directions). `None` means the clipboard backend stopped; disable the arm.
+    ///
+    /// Content *applied from a peer* is intentionally NOT re-broadcast (apply()
+    /// seeds the poll baseline, so it never fires `changed()`), which prevents
+    /// A→B→A echo. The consequence: clipboard sync is PAIRWISE — in a 3+-machine
+    /// star, a copy on one peer reaches this hub but is not forwarded to the
+    /// others. Multi-hop would need origin-tagging + versioned de-dup; out of
+    /// scope for the current 1-sender/1-receiver model.
+    async fn handle_clipboard_change(&mut self, event: Option<ClipboardEvent>) {
+        match event {
+            Some(ClipboardEvent::Changed(text)) => {
+                self.clipboard_out_conn.broadcast(text.clone()).await;
+                self.clipboard_out_listen.broadcast(text).await;
+            }
+            None => {
+                log::warn!("clipboard sync stopped");
+                self.clipboard_alive = false;
+            }
+        }
     }
 
     fn handle_frontend_request(&mut self, request: Option<Result<FrontendRequest, IpcError>>) {
