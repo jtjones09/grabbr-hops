@@ -263,7 +263,14 @@ impl MacOSEmulation {
         }
         let info = frontmost_window_owner();
         let path = info.as_ref().and_then(|(_, pid)| pid_exe_path(*pid));
-        let val = path.as_deref().is_some_and(is_hypervisor_path);
+        let val = match path.as_deref() {
+            Some(p) => is_hypervisor_path(p),
+            // Focus/owner lookup failed (transient None). Flipping to "native"
+            // here would momentarily re-apply host natural-scroll (inverting
+            // guest scroll) and bounce modifier routing. Reuse the last known
+            // verdict instead; fall back to native only if we have none yet.
+            None => self.vm_guest_cache.get().map(|(_, v)| v).unwrap_or(false),
+        };
         // Log when the focused window changes — owner name + exe path + route.
         {
             let owner = info.map(|(name, _)| name).unwrap_or_default();
@@ -1113,9 +1120,19 @@ impl Emulation for MacOSEmulation {
                         axis,
                         value,
                     } => {
-                        // honour the receiver's natural-scroll preference (macOS
-                        // doesn't apply it to synthetic events); see apply_natural_scroll.
-                        let value = apply_natural_scroll(value as i32);
+                        // Honour the receiver's natural-scroll preference (macOS
+                        // doesn't apply it to synthetic events); see
+                        // apply_natural_scroll. EXCEPT when the target is a VM
+                        // guest: the guest applies its OWN natural-scroll to the
+                        // injected scroll, so negating here too double-inverts it
+                        // (the "scroll is backwards inside the guest" bug). Let
+                        // the guest own it; negate only for native targets.
+                        let value = value as i32;
+                        let value = if self.target_is_vm_guest() {
+                            value
+                        } else {
+                            apply_natural_scroll(value)
+                        };
                         let (count, wheel1, wheel2, wheel3) = match axis {
                             0 => (1, value, 0, 0), // 0 = vertical => 1 scroll wheel device (y axis)
                             1 => (2, 0, value, 0), // 1 = horizontal => 2 scroll wheel devices (y, x) -> (0, x)
@@ -1142,7 +1159,14 @@ impl Emulation for MacOSEmulation {
                     }
                     PointerEvent::AxisDiscrete120 { axis, value } => {
                         const LINES_PER_STEP: i32 = 3;
-                        let value = apply_natural_scroll(value);
+                        // Same guest exception as the Axis handler above: don't
+                        // double-invert inside a VM guest (it applies its own
+                        // natural-scroll to the injected scroll).
+                        let value = if self.target_is_vm_guest() {
+                            value
+                        } else {
+                            apply_natural_scroll(value)
+                        };
                         let (count, wheel1, wheel2, wheel3) = match axis {
                             0 => (1, value / (120 / LINES_PER_STEP), 0, 0), // 0 = vertical => 1 scroll wheel device (y axis)
                             1 => (2, 0, value / (120 / LINES_PER_STEP), 0), // 1 = horizontal => 2 scroll wheel devices (y, x) -> (0, x)
