@@ -157,23 +157,26 @@ impl LanMouseListener {
                             });
                         },
                         port = request_port_change_rx.recv() => {
-                            let port = port.expect("channel closed");
+                            // None => the listener handle was dropped (shutdown); end the task.
+                            let Some(port) = port else { break };
                             let listen_addr = SocketAddr::new("0.0.0.0".parse().expect("invalid ip"), port);
+                            // A dropped port_changed receiver (requester gone) must NOT panic
+                            // this long-running accept loop — ignore the send result instead.
                             match server_config(&identity, authorized.clone(), attempts.clone()) {
                                 Ok(cfg) => match Endpoint::server(cfg, listen_addr) {
                                     Ok(new_endpoint) => {
                                         endpoint.close(0u32.into(), b"port change");
                                         endpoint = new_endpoint;
-                                        port_changed_tx.send(Ok(port)).expect("channel closed");
+                                        let _ = port_changed_tx.send(Ok(port));
                                     }
                                     Err(e) => {
                                         log::warn!("unable to change port: {e}");
-                                        port_changed_tx.send(Err(e.into())).expect("channel closed");
+                                        let _ = port_changed_tx.send(Err(e.into()));
                                     }
                                 },
                                 Err(e) => {
                                     log::warn!("unable to rebuild server config: {e}");
-                                    port_changed_tx.send(Err(e)).expect("channel closed");
+                                    let _ = port_changed_tx.send(Err(e));
                                 }
                             };
                         },

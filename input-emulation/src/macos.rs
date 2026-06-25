@@ -296,6 +296,12 @@ impl MacOSEmulation {
 
 impl Drop for MacOSEmulation {
     fn drop(&mut self) {
+        // Abort the key-repeat task: dropping a JoinHandle only DETACHES it, so a
+        // backend recreation (reconnect) would otherwise leave the old repeat task
+        // posting key events forever on the shared LocalSet.
+        if let Some(task) = self.repeat_task.take() {
+            task.abort();
+        }
         // Release the IOHIDSystem connection if we opened one. Process-lifetime
         // ownership means this rarely matters in practice, but it keeps the
         // mach port tidy if the emulation backend is ever recreated.
@@ -976,6 +982,13 @@ impl Emulation for MacOSEmulation {
             Event::Pointer(pointer_event) => {
                 match pointer_event {
                     PointerEvent::Motion { time: _, dx, dy } => {
+                        // Reject non-finite deltas (NaN/Inf from a malformed/hostile peer)
+                        // before they poison the cursor coordinate. The proto also rejects
+                        // these at decode; this is defense in depth.
+                        if !dx.is_finite() || !dy.is_finite() {
+                            log::warn!("ignoring non-finite motion delta ({dx}, {dy})");
+                            return Ok(());
+                        }
                         let mut mouse_location = match self.get_mouse_location() {
                             Some(l) => l,
                             None => {
@@ -1085,7 +1098,17 @@ impl Emulation for MacOSEmulation {
                         }
 
                         log::debug!("click_state: {}", self.button_click_state);
-                        let location = self.get_mouse_location().unwrap();
+                        // Must NOT unwrap: get_mouse_location() is None on a transient
+                        // CGEvent failure (display reconfig / lid-dock churn / memory
+                        // pressure). With panic=abort a single mistimed button event would
+                        // hard-kill the whole receiver. Mirror the Motion arm and skip.
+                        let location = match self.get_mouse_location() {
+                            Some(l) => l,
+                            None => {
+                                log::warn!("could not get mouse location for button event!");
+                                return Ok(());
+                            }
+                        };
                         let event = match CGEvent::new_mouse_event(
                             self.event_source.clone(),
                             event_type,
@@ -1270,9 +1293,20 @@ impl Emulation for MacOSEmulation {
 
     async fn create(&mut self, _handle: EmulationHandle) {}
 
-    async fn destroy(&mut self, _handle: EmulationHandle) {}
+    async fn destroy(&mut self, _handle: EmulationHandle) {
+        // A peer leave / watchdog timeout lands here. Stop any running key-repeat —
+        // otherwise an abnormal teardown (connection loss mid-keypress, where the
+        // matching key-up never arrives) leaves the key auto-repeating forever, and
+        // the watchdog's "release keys" path would silently do nothing on macOS.
+        // Also clear modifier state so no stale modifier is applied afterwards.
+        self.cancel_repeat_task().await;
+        self.modifier_state.set(XMods::empty());
+    }
 
-    async fn terminate(&mut self) {}
+    async fn terminate(&mut self) {
+        self.cancel_repeat_task().await;
+        self.modifier_state.set(XMods::empty());
+    }
 }
 
 fn update_modifiers(modifiers: &Cell<XMods>, key: u32, state: u8) -> bool {

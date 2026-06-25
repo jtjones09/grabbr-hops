@@ -286,7 +286,16 @@ macro_rules! decode_impl {
 decode_impl!(u8);
 decode_impl!(u32);
 decode_impl!(i32);
-decode_impl!(f64);
+
+// f64 gets a hand-written decoder (not via decode_impl): a non-finite value
+// (NaN/Inf) from a malformed/hostile peer would poison a cursor coordinate or
+// scroll delta, so coerce non-finite to 0.0 (a harmless no-op).
+fn decode_f64(data: &mut &[u8]) -> Result<f64, ProtocolError> {
+    let (bytes, rest) = data.split_at(size_of::<f64>());
+    *data = rest;
+    let v = f64::from_be_bytes(bytes.try_into().unwrap());
+    Ok(if v.is_finite() { v } else { 0.0 })
+}
 
 macro_rules! encode_impl {
     ($t:ty) => {

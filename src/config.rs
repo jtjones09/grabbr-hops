@@ -445,6 +445,12 @@ impl Config {
             .as_ref()
             .and_then(|c| c.authorized_fingerprints.clone())
             .unwrap_or_default()
+            .into_iter()
+            // Normalize keys to lowercase: computed leaf-cert fingerprints are
+            // lowercase `aa:bb:..`, so an upper/mixed-case fingerprint in a
+            // hand-edited config would otherwise silently never match its peer.
+            .map(|(k, v)| (k.to_lowercase(), v))
+            .collect()
     }
 
     /// path to certificate
