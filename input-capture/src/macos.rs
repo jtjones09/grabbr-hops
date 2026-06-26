@@ -464,52 +464,37 @@ fn create_event_tap<'a>(
         let mut capture_position = None;
         let mut res_events = vec![];
 
-        if matches!(event_type, CGEventType::TapDisabledByTimeout) {
-            // The kernel disables the tap when our callback runs
-            // longer than ~1s on a single event — typical causes
-            // are heavy load, scheduler contention, or this
-            // process being briefly suspended (e.g. App Nap on a
-            // long idle). It is NOT a fatal condition: Apple's
-            // documented recovery is to call CGEventTapEnable
-            // and resume processing. Re-enable in place and KEEP
-            // existing capture state so the user doesn't see the
-            // cursor pop back to the local screen mid-session.
+        // The kernel disables the tap on a long callback (Timeout — heavy load,
+        // scheduler contention, or App Nap suspending us) OR a secure-input
+        // transition (UserInput — screensaver/lock, password field, fast user
+        // switch). BOTH are recoverable: Apple's documented response is to
+        // re-enable the tap. Re-enable in place and KEEP capture state so the
+        // cursor doesn't pop back mid-session — and, crucially for UserInput, so
+        // it isn't STRANDED on this device after a screensaver (the old fatal path
+        // left the cursor stuck here until the release-bind was pressed). The OS
+        // still blocks the tap from genuinely-secure events (passwords) while it
+        // is re-enabled, so this is safe. Only tear down if we have no mach port.
+        if matches!(
+            event_type,
+            CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
+        ) {
             if let Some(&port) = tap_mach_port_cb.get() {
-                log::warn!("CGEventTap disabled by timeout — re-enabling");
+                log::warn!("CGEventTap disabled ({event_type:?}) — re-enabling");
                 unsafe {
                     CGEventTapEnable(port as *mut c_void, true);
                 }
             } else {
                 log::error!(
-                    "CGEventTap disabled by timeout, but mach port not yet stored — cannot re-enable"
+                    "CGEventTap disabled ({event_type:?}) but mach port not stored — tearing down"
                 );
+                if state.current_pos.is_some() {
+                    let _ = CGDisplay::show_cursor(&CGDisplay::main());
+                    state.current_pos = None;
+                }
+                notify_tx
+                    .blocking_send(ProducerEvent::EventTapDisabled)
+                    .unwrap_or_else(|e| log::error!("failed to send notification: {e}"));
             }
-            return CallbackResult::Keep;
-        }
-
-        if matches!(event_type, CGEventType::TapDisabledByUserInput) {
-            // Deliberate kill — secure-input mode (e.g. password
-            // field), TCC Accessibility revoked mid-session, or
-            // the user disabling event-monitoring. We can't
-            // recover from this; drop captured state synchronously
-            // and return Keep on this event. Otherwise the
-            // `current_pos.is_some()` branch below would drop this
-            // event (and any racing callback still in flight) back
-            // into `CallbackResult::Drop`, silently eating the
-            // user's clicks and keypresses while the tap winds
-            // down. Clear state + show the cursor here, then
-            // notify the producer loop so the service can tear
-            // down cleanly.
-            log::error!("CGEventTap disabled by user input, releasing capture state");
-            if state.current_pos.is_some() {
-                let _ = CGDisplay::show_cursor(&CGDisplay::main());
-                state.current_pos = None;
-            }
-            notify_tx
-                .blocking_send(ProducerEvent::EventTapDisabled)
-                .unwrap_or_else(|e| {
-                    log::error!("Failed to send notification: {e}");
-                });
             return CallbackResult::Keep;
         }
 
