@@ -7,6 +7,7 @@ use crate::{
     crypto,
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
+    hop_log::Lifecycle,
     listen::{ClipboardSenderListen, LanMouseListener, ListenerCreationError},
 };
 use local_channel::mpsc::{Receiver, channel};
@@ -68,6 +69,10 @@ pub struct Service {
     emulation_status: Status,
     /// keep track of registered connections to avoid duplicate barriers
     incoming_conns: HashSet<SocketAddr>,
+    /// addrs whose cursor is currently ON this device (crossing-level state) —
+    /// used only to log entered/left exactly once per crossing, distinct from
+    /// `incoming_conns` which is connection-level
+    currently_controlling: HashSet<SocketAddr>,
     /// map from capture handle to connection info
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
     next_trigger_handle: u64,
@@ -165,6 +170,7 @@ impl Service {
             emulation_status: Default::default(),
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
+            currently_controlling: Default::default(),
             next_trigger_handle: 0,
             clipboard,
             clipboard_alive: true,
@@ -355,7 +361,13 @@ impl Service {
                 pos,
                 fingerprint,
             } => {
-                // check if already registered
+                // Log the crossing exactly once: `insert` returns true only on the
+                // real cross-on transition, not on the sender's redundant Enter
+                // re-sends (which all land here while it waits for the Ack).
+                if self.currently_controlling.insert(addr) {
+                    Lifecycle::Entered { addr, pos }.log();
+                }
+                // connection-level registration / frontend (deduped separately)
                 if !self.incoming_conns.contains(&addr) {
                     self.add_incoming(addr, pos, fingerprint.clone());
                     self.notify_frontend(FrontendEvent::DeviceEntered {
@@ -368,7 +380,9 @@ impl Service {
                 }
             }
             EmulationEvent::Disconnected { addr } => {
+                self.currently_controlling.remove(&addr);
                 if let Some(addr) = self.remove_incoming(addr) {
+                    Lifecycle::Disconnected { addr }.log();
                     self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
                 }
             }
@@ -390,6 +404,11 @@ impl Service {
             }
             EmulationEvent::ReleaseNotify => self.capture.release(),
             EmulationEvent::Connected { addr, fingerprint } => {
+                Lifecycle::Connected {
+                    addr,
+                    fingerprint: &fingerprint,
+                }
+                .log();
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
             }
             EmulationEvent::PeerHello { addr, commit } => {
@@ -412,7 +431,12 @@ impl Service {
                 // we entered the capture zone for an incoming connection
                 // => notify it that its capture should be released
                 if let Some(incoming) = self.incoming_conn_info.get(&handle) {
-                    self.emulation.send_leave_event(incoming.addr);
+                    let addr = incoming.addr;
+                    // log the cross-off once (this barrier can re-fire per move)
+                    if self.currently_controlling.remove(&addr) {
+                        Lifecycle::Left { addr }.log();
+                    }
+                    self.emulation.send_leave_event(addr);
                 }
             }
             ICaptureEvent::CaptureDisabled => {

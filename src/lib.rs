@@ -8,6 +8,7 @@ mod crypto;
 mod dns;
 mod emulation;
 pub mod emulation_test;
+mod hop_log;
 mod listen;
 pub mod service;
 mod transport;

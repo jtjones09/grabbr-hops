@@ -150,7 +150,10 @@ impl ListenTask {
                         match event {
                             ProtoEvent::Enter(pos) => {
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
-                                    log::info!("releasing capture: {addr} entered this device");
+                                    // per-wire-event (the sender re-sends Enter until the
+                                    // Ack); the once-per-crossing "entered" line is logged by
+                                    // the service via hop_log::Lifecycle::Entered.
+                                    log::trace!("Enter received from {addr}");
                                     self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
                                     self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                                     self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");

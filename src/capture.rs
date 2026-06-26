@@ -338,7 +338,9 @@ impl CaptureTask {
             // if there is no active outgoing connection at the current capture,
             // we release the capture
             if !self.is_default_capture_at(self.get_pos(handle)) {
-                log::info!("releasing capture: no active client at this position");
+                // per-event barrier probe (fires on every move at this edge); not a
+                // lifecycle transition, so keep it at trace.
+                log::trace!("releasing capture: no active client at this position");
                 capture.release().await?;
             }
             // we dont care about events from incoming handles except for releasing the capture
