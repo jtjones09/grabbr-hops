@@ -264,7 +264,16 @@ pub async fn read_frame(recv: &mut quinn::RecvStream) -> Result<Option<ProtoEven
     }
     let mut buf = [0u8; MAX_EVENT_SIZE];
     recv.read_exact(&mut buf[..len]).await?;
-    Ok(Some(ProtoEvent::try_from(buf)?))
+    let event = ProtoEvent::try_from(buf)?;
+    // A truncated (or over-long) frame would otherwise decode from the
+    // zero-padded buffer into a bogus event. The frame length must equal the
+    // event's true encoded width — re-encode (ProtoEvent is Copy) and reject a
+    // mismatch rather than accept garbage from a malformed/hostile peer.
+    let (_, encoded_len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
+    if encoded_len != len {
+        return Err(FrameError::BadLength(len));
+    }
+    Ok(Some(event))
 }
 
 // ---------------------------------------------------------------------------

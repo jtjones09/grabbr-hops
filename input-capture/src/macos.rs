@@ -104,20 +104,28 @@ impl InputCaptureState {
 
     // Recompute the union bounds of all currently-active displays.
     fn update_bounds(&mut self) -> Result<(), MacosCaptureCreationError> {
+        match Self::compute_display_bounds()? {
+            Some(bounds) => self.store_bounds_if_changed(bounds),
+            None => log::warn!("no active displays reported; keeping previous bounds"),
+        }
+        Ok(())
+    }
+
+    /// Enumerate active displays and compute their union bounds. Does NOT touch
+    /// `self` or any lock — call it OUTSIDE the state lock so the CoreGraphics
+    /// enumeration can't stall the input-tap callback (which contends for that
+    /// lock; a stalled callback trips TapDisabledByTimeout). `None` = no displays.
+    ///
+    /// Recompute from scratch each call: the previous code folded min/max into
+    /// the *existing* bounds, so they could only ever grow — removing a display
+    /// (lid close in clamshell) never shrank them, leaving barrier edges at
+    /// phantom coordinates so the cursor couldn't reach a real edge to cross.
+    fn compute_display_bounds() -> Result<Option<Bounds>, MacosCaptureCreationError> {
         let active_ids =
             CGDisplay::active_displays().map_err(MacosCaptureCreationError::ActiveDisplays)?;
         if active_ids.is_empty() {
-            log::warn!("no active displays reported; keeping previous bounds");
-            return Ok(());
+            return Ok(None);
         }
-        // Recompute from scratch each call. The previous code folded
-        // min/max into the *existing* self.bounds, so the bounds could only
-        // ever grow — removing a display (lid close in clamshell → built-in
-        // display gone) never shrank them. The barrier edges then sat at the
-        // phantom coordinates of a display that no longer existed, so the
-        // cursor couldn't reach a real edge to cross ("auto switching
-        // stopped") and could trip stale edges and oscillate. Reset to
-        // inverted extremes, then fold the live displays in.
         let mut bounds = Bounds {
             xmin: f64::MAX,
             xmax: f64::MIN,
@@ -131,14 +139,16 @@ impl InputCaptureState {
             bounds.ymin = bounds.ymin.min(b.origin.y);
             bounds.ymax = bounds.ymax.max(b.origin.y + b.size.height);
         }
+        Ok(Some(bounds))
+    }
+
+    /// Store new bounds if they differ (logging the change). Cheap — no CG
+    /// calls — so it is safe to call while holding the state lock.
+    fn store_bounds_if_changed(&mut self, bounds: Bounds) {
         if bounds != self.bounds {
-            log::info!(
-                "display geometry changed: {:?} -> {:?}",
-                self.bounds, bounds
-            );
+            log::info!("display geometry changed: {:?} -> {:?}", self.bounds, bounds);
             self.bounds = bounds;
         }
-        Ok(())
     }
 
     /// start the input capture by
@@ -712,8 +722,14 @@ impl MacOSInputCapture {
                         })
                     }
                     _ = bounds_poll.tick() => {
-                        let mut state = state.lock().await;
-                        let _ = state.update_bounds();
+                        // Compute geometry OUTSIDE the lock (the CoreGraphics
+                        // enumeration can be slow); take the lock only to store,
+                        // so the poll never stalls the input-tap callback.
+                        match InputCaptureState::compute_display_bounds() {
+                            Ok(Some(bounds)) => state.lock().await.store_bounds_if_changed(bounds),
+                            Ok(None) => {}
+                            Err(e) => log::warn!("bounds poll failed: {e}"),
+                        }
                     }
                     _ = &mut tap_exit_rx => break,
                 }

@@ -370,7 +370,11 @@ impl CaptureTask {
         if let Err(e) = self.conn.send(event, handle).await {
             const DUR: Duration = Duration::from_millis(500);
             debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
-            capture.release().await?;
+            // Full release (not just capture.release()): also resets active_client
+            // + state, so a re-entry to the SAME client re-arms the Enter->Ack
+            // handshake (State::WaitingForAck) instead of silently skipping it and
+            // sending Input the peer hasn't acknowledged.
+            self.release_capture(capture).await?;
         }
         Ok(())
     }
