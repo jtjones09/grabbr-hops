@@ -60,6 +60,14 @@ pub(crate) struct MacOSEmulation {
     vm_guest_cache: Cell<Option<(Instant, bool)>>,
     /// Last focused-window owner name we logged, so we log only on change.
     last_owner: RefCell<Option<String>>,
+    /// IOPMAssertion id that keeps this Mac from idle-sleeping while it is the
+    /// receiver (an asleep Mac is unreachable over the KVM). None if not held.
+    power_assertion: Option<u32>,
+    /// Reusable IOPMAssertionDeclareUserActivity id (0 = none yet) — wakes the
+    /// display on incoming remote input (synthetic CGEvents alone don't wake it).
+    user_activity_id: Cell<u32>,
+    /// Throttle so we don't call DeclareUserActivity on every motion event.
+    last_user_activity: Cell<Option<Instant>>,
 }
 
 /// Maps an evdev button code to the CGEventType used for drag events.
@@ -107,12 +115,45 @@ impl MacOSEmulation {
             hid_modifiers,
             vm_guest_cache: Cell::new(None),
             last_owner: RefCell::new(None),
+            power_assertion: create_power_assertion(),
+            user_activity_id: Cell::new(0),
+            last_user_activity: Cell::new(None),
         })
     }
 
     fn get_mouse_location(&self) -> Option<CGPoint> {
         let event: CGEvent = CGEvent::new(self.event_source.clone()).ok()?;
         Some(event.location())
+    }
+
+    /// Wake the display (and reset the idle-sleep timer) on incoming remote
+    /// input. Synthetic CGEvents deliver input to the system but do NOT wake a
+    /// sleeping display — only real HID activity or this assertion does. Throttled
+    /// so we don't hammer IOKit on every motion event.
+    fn declare_user_activity(&self) {
+        let now = Instant::now();
+        if let Some(last) = self.last_user_activity.get() {
+            if now.duration_since(last).as_millis() < 500 {
+                return;
+            }
+        }
+        self.last_user_activity.set(Some(now));
+        use core_foundation::base::TCFType;
+        use core_foundation::string::CFString;
+        let name = CFString::new("grabbr-hop remote input");
+        let mut id = self.user_activity_id.get();
+        // SAFETY: `name` outlives the synchronous call; `id` is a valid in/out
+        // pointer (0 on first call → creates; reused id later → extends).
+        let r = unsafe {
+            IOPMAssertionDeclareUserActivity(
+                name.as_concrete_TypeRef(),
+                0, // kIOPMUserActiveLocal
+                &mut id,
+            )
+        };
+        if r == 0 {
+            self.user_activity_id.set(id);
+        }
     }
 
     async fn spawn_repeat_task(&mut self, key: u16) {
@@ -308,6 +349,10 @@ impl Drop for MacOSEmulation {
         if let Some(connect) = self.hid_connect {
             unsafe { IOServiceClose(connect) };
         }
+        // Release the power assertion so the Mac can sleep normally again.
+        if let Some(id) = self.power_assertion {
+            unsafe { IOPMAssertionRelease(id) };
+        }
     }
 }
 
@@ -425,10 +470,77 @@ extern "C" {
         event_flags: u32,
         options: u32,
     ) -> i32;
+    // Power management: hold an assertion so this Mac doesn't idle-sleep while it
+    // is the KVM receiver — an asleep Mac suspends this process and is unreachable
+    // over the network until a hardware wake (lid-lift).
+    fn IOPMAssertionCreateWithName(
+        assertion_type: core_foundation::string::CFStringRef,
+        level: u32,
+        name: core_foundation::string::CFStringRef,
+        assertion_id: *mut u32,
+    ) -> i32;
+    fn IOPMAssertionRelease(assertion_id: u32) -> i32;
+    // Wake the display + reset the idle-sleep timer on incoming remote input.
+    // Synthetic CGEvents deliver input to the system but do NOT wake a sleeping
+    // display — only real HID activity or this call does.
+    fn IOPMAssertionDeclareUserActivity(
+        name: core_foundation::string::CFStringRef,
+        user_type: u32,
+        assertion_id: *mut u32,
+    ) -> i32;
 }
 
 extern "C" {
     static mach_task_self_: u32;
+}
+
+/// Hold an IOPMAssertion so this Mac doesn't idle-sleep while it is the KVM
+/// receiver. A fully-asleep Mac suspends grabbr-hop and is unreachable over the
+/// KVM (only a hardware wake / lid-lift brings it back — the exact symptom).
+///
+/// Default = prevent SYSTEM idle-sleep (`PreventUserIdleSystemSleep`): the
+/// system stays awake + reachable while the DISPLAY is free to blank — so the
+/// screen goes black, you cross over, and incoming input wakes it (see
+/// `declare_user_activity`). This is the Synergy-equivalent behavior, validated
+/// on AC (where `pmset sleep` is 0 anyway). `GRABBR_KEEP_AWAKE=display` keeps the
+/// display on too (heavier; screen never blanks); `=off` holds no assertion at
+/// all (lets the Mac truly sleep — only useful with a WoL-capable wired NIC,
+/// which USB-bridged dock ethernet is not).
+fn create_power_assertion() -> Option<u32> {
+    use core_foundation::base::TCFType;
+    use core_foundation::string::CFString;
+    let assertion_type = match std::env::var("GRABBR_KEEP_AWAKE").as_deref() {
+        // Opt out entirely (let the Mac truly sleep, e.g. for a WoL-capable NIC).
+        Ok("off") => {
+            log::info!("GRABBR_KEEP_AWAKE=off — holding no power assertion; the Mac may sleep");
+            return None;
+        }
+        // Keep the display on too — the screen never blanks (heavier; opt-in).
+        Ok("display") => "PreventUserIdleDisplaySleep",
+        // Default: system stays awake, display free to blank (screen goes black,
+        // incoming input wakes it). Synergy-equivalent.
+        _ => "PreventUserIdleSystemSleep",
+    };
+    let kind = CFString::new(assertion_type);
+    let name = CFString::new("grabbr-hop KVM receiver active");
+    let mut id: u32 = 0;
+    const LEVEL_ON: u32 = 255; // kIOPMAssertionLevelOn
+    // SAFETY: the CFStrings outlive the synchronous call; `id` is a valid out-ptr.
+    let result = unsafe {
+        IOPMAssertionCreateWithName(
+            kind.as_concrete_TypeRef(),
+            LEVEL_ON,
+            name.as_concrete_TypeRef(),
+            &mut id,
+        )
+    };
+    if result == 0 {
+        log::info!("holding power assertion ({assertion_type}) to keep this Mac reachable over the KVM");
+        Some(id)
+    } else {
+        log::warn!("could not hold a power assertion ({result:#x}); the Mac may sleep and become unreachable");
+        None
+    }
 }
 
 /// Opens a connection to `IOHIDSystem` for `IOHIDPostEvent`.
@@ -978,6 +1090,10 @@ impl Emulation for MacOSEmulation {
         _handle: EmulationHandle,
     ) -> Result<(), EmulationError> {
         log::trace!("{event:?}");
+        // Wake a sleeping display on any incoming remote input (throttled). The
+        // system stays awake via the power assertion, but synthetic CGEvents
+        // don't wake the screen by themselves — this does.
+        self.declare_user_activity();
         match event {
             Event::Pointer(pointer_event) => {
                 match pointer_event {
