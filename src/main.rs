@@ -36,6 +36,9 @@ enum LanMouseError {
     #[cfg(feature = "gtk")]
     #[error(transparent)]
     Gtk(#[from] GtkError),
+    #[cfg(feature = "tui")]
+    #[error(transparent)]
+    Tui(#[from] lan_mouse_tui::TuiError),
     #[error(transparent)]
     Cli(#[from] CliError),
 }
@@ -87,9 +90,25 @@ fn run() -> Result<(), LanMouseError> {
                 service.kill()?;
                 res?;
             }
-            #[cfg(not(feature = "gtk"))]
+            #[cfg(all(feature = "tui", not(feature = "gtk")))]
             {
-                // run daemon if gtk is diabled
+                let mut service = start_service()?;
+                let res = run_async(lan_mouse_tui::run());
+                #[cfg(unix)]
+                {
+                    // give the service a chance to terminate gracefully
+                    let pid = service.id() as libc::pid_t;
+                    unsafe {
+                        libc::kill(pid, libc::SIGINT);
+                    }
+                    service.wait()?;
+                }
+                service.kill()?;
+                res?;
+            }
+            #[cfg(not(any(feature = "gtk", feature = "tui")))]
+            {
+                // run daemon if no frontend feature is enabled
                 match run_async(run_service(config)) {
                     Err(LanMouseError::Service(ServiceError::IpcListen(
                         IpcListenerCreationError::AlreadyRunning,
