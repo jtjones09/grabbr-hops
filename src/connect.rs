@@ -252,6 +252,26 @@ impl ClipboardSender {
     }
 }
 
+/// Rebind the client endpoint to a fresh OS-chosen UDP socket. quinn pins a
+/// per-path source IP at the QUIC handshake; after a sleep/wake or interface
+/// bounce that IP can vanish, and every send then fails with EADDRNOTAVAIL —
+/// which quinn-udp silently swallows (treats UDP loss as non-fatal), so the
+/// reconnect machinery never sees it and the reused endpoint keeps selecting the
+/// dead source IP. Swapping in a fresh socket before each (re)connect forces
+/// quinn to re-select the source address against the current interface table.
+/// Idempotent + cheap on cold start; on bind error the old socket is retained.
+fn rebind_endpoint(endpoint: &Endpoint) {
+    match std::net::UdpSocket::bind("0.0.0.0:0") {
+        Ok(sock) => match endpoint.rebind(sock) {
+            Ok(()) => {
+                log::info!("rebound client endpoint to a fresh socket (interface/wake recovery)")
+            }
+            Err(e) => log::warn!("endpoint rebind failed, keeping existing socket: {e}"),
+        },
+        Err(e) => log::warn!("could not bind a fresh socket to rebind endpoint: {e}"),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn connect_to_handle(
     endpoint: Endpoint,
@@ -265,6 +285,9 @@ async fn connect_to_handle(
     clipboard_in: Sender<String>,
 ) -> Result<(), LanMouseConnectionError> {
     log::info!("client {handle} connecting ...");
+    // Swap in a fresh UDP socket before every (re)connect so a sleep/wake or
+    // interface change can't strand us on a dead source IP (see rebind_endpoint).
+    rebind_endpoint(&endpoint);
     if let Some(addrs) = client_manager.get_ips(handle) {
         let port = client_manager.get_port(handle).unwrap_or(DEFAULT_PORT);
         let addrs = addrs
