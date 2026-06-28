@@ -1065,8 +1065,13 @@ fn clamp_to_screen_space(
     let current_display = match get_display_at_point(current_x, current_y) {
         Some(display) => display,
         None => {
-            log::warn!("could not get current display!");
-            return (current_x, current_y);
+            // Post-wake the cursor can briefly map to no display while the display
+            // topology settles. Fall back to the main display so we clamp onto
+            // something real instead of leaving the cursor at a phantom coordinate;
+            // this self-heals once CG reports a display under the point again.
+            // (debug, not warn: it would otherwise flood one line per motion event.)
+            log::debug!("no display under cursor ({current_x}, {current_y}); using main display");
+            core_graphics::display::CGDisplay::main().id
         }
     };
 
