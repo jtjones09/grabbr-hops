@@ -11,7 +11,11 @@
 //! n=rename, d=revoke. Global: r=re-enable, s=save, t=theme, ↑↓=select, q=close.
 //! An untrusted peer that connects raises an approve/deny pairing prompt.
 
-use std::{collections::HashSet, io, time::Duration};
+use std::{
+    collections::HashMap,
+    io,
+    time::{Duration, Instant},
+};
 
 use lan_mouse_frontend_core::{
     theme::{self, Rgb, Theme},
@@ -27,6 +31,12 @@ use ratatui::{
 };
 use thiserror::Error;
 use tokio::sync::mpsc;
+
+/// How long a denied pairing stays snoozed before a fresh attempt re-prompts.
+const DISMISS_TTL: Duration = Duration::from_secs(120);
+/// If no new ConnectionAttempt refreshes a pending pairing within this window,
+/// treat it as stale (the peer gave up) and stop showing the prompt.
+const STALE_TTL: Duration = Duration::from_secs(12);
 
 #[derive(Debug, Error)]
 pub enum TuiError {
@@ -111,8 +121,9 @@ pub async fn run() -> Result<(), TuiError> {
     let mut trust_sel: usize = 0;
     let mut input: Option<Input> = None;
     let mut confirm: Option<Confirm> = None;
-    // pairing requests the user has dismissed this session (denied "for now").
-    let mut dismissed: HashSet<String> = HashSet::new();
+    // fingerprint -> when the user last denied it; snoozes the prompt for
+    // DISMISS_TTL so a retrying peer doesn't nag, but a later attempt re-asks.
+    let mut dismissed: HashMap<String, Instant> = HashMap::new();
 
     let result = loop {
         let model = client.snapshot();
@@ -122,11 +133,22 @@ pub async fn run() -> Result<(), TuiError> {
         dev_sel = clamp_sel(dev_sel, dev_count);
         trust_sel = clamp_sel(trust_sel, tr_count);
 
-        // a pending pairing the user hasn't dismissed and isn't already trusted
-        let pairing: Option<String> = model
-            .pending_pairing
-            .clone()
-            .filter(|fp| !dismissed.contains(fp) && !model.authorized.contains_key(fp));
+        // a live pending pairing: untrusted, still actively attempting (not a
+        // stale prompt for a peer that left), and not currently snooze-dismissed
+        let pairing: Option<String> = model.pending_pairing.clone().filter(|fp| {
+            if model.authorized.contains_key(fp) {
+                return false;
+            }
+            let fresh = model
+                .pending_pairing_since
+                .map(|t| t.elapsed() < STALE_TTL)
+                .unwrap_or(false);
+            let snoozed = dismissed
+                .get(fp)
+                .map(|t| t.elapsed() < DISMISS_TTL)
+                .unwrap_or(false);
+            fresh && !snoozed
+        });
 
         let mut dev_state = ListState::default();
         if focus == Focus::Devices && dev_count > 0 {
@@ -160,6 +182,11 @@ pub async fn run() -> Result<(), TuiError> {
                 Some(k) if k.kind == KeyEventKind::Press => {
                     let ctrl_c = k.code == KeyCode::Char('c')
                         && k.modifiers.contains(KeyModifiers::CONTROL);
+                    // Ctrl+C closes from any mode (raw mode swallows SIGINT), and
+                    // must precede the text-input branch so it isn't typed as 'c'.
+                    if ctrl_c {
+                        break Ok(());
+                    }
 
                     if input.is_some() {
                         // ---- text-input mode ----
@@ -209,9 +236,8 @@ pub async fn run() -> Result<(), TuiError> {
                                 input = Some(Input::TrustedName { fp, buf: String::new() });
                             }
                             KeyCode::Char('n') | KeyCode::Esc => {
-                                dismissed.insert(fp);
+                                dismissed.insert(fp, Instant::now());
                             }
-                            _ if ctrl_c => break Ok(()),
                             _ => {}
                         }
                     } else {
@@ -626,7 +652,7 @@ fn pairing_popup(f: &mut Frame, fp: &str, theme: &Theme) {
 
 /// A rectangle centered in `area`: `percent_x` wide, `height` rows tall.
 fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
-    let w = (area.width * percent_x / 100).max(1);
+    let w = ((area.width as u32 * percent_x as u32 / 100) as u16).max(1);
     let h = height.min(area.height);
     Rect {
         x: area.x + area.width.saturating_sub(w) / 2,

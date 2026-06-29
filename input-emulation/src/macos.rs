@@ -393,9 +393,12 @@ fn guide_to_settings() {
         log::error!("  binary: {exe}");
         log::error!("Opening System Settings → Privacy & Security → Accessibility…");
         log::error!("──────────────────────────────────────────────────────────");
-        let _ = std::process::Command::new("open")
+        if let Ok(mut child) = std::process::Command::new("open")
             .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
-            .spawn();
+            .spawn()
+        {
+            let _ = child.wait(); // reap; `open` hands off to launchd and exits promptly
+        }
     });
 }
 
@@ -413,8 +416,9 @@ fn request_accessibility_permission() -> bool {
         key.as_CFType(),
         CFBoolean::true_value().as_CFType(),
     )]);
-    // SAFETY: `options` outlives the synchronous call.
-    unsafe { AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef() as *const c_void) }
+    // SAFETY: `options` outlives the synchronous call. Normalize the `Boolean`
+    // (u8) result with != 0 — materializing a non-canonical byte as Rust `bool` is UB.
+    unsafe { AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef() as *const c_void) != 0 }
 }
 
 fn request_input_control_permission() -> bool {
@@ -431,7 +435,8 @@ extern "C" {
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
-    fn AXIsProcessTrustedWithOptions(options: *const c_void) -> bool;
+    // Apple declares this `Boolean` (u8), not C `_Bool`; bind as u8 and normalize.
+    fn AXIsProcessTrustedWithOptions(options: *const c_void) -> u8;
 }
 
 #[link(name = "Carbon", kind = "framework")]

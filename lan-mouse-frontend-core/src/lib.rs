@@ -10,7 +10,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     net::SocketAddr,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use futures::StreamExt;
@@ -54,6 +54,10 @@ pub struct AppModel {
     /// on `ConnectionAttempt`; cleared once it becomes authorized or the daemon
     /// link drops. The UI surfaces this as an approve/deny prompt.
     pub pending_pairing: Option<String>,
+    /// When `pending_pairing` was last (re)asserted by a `ConnectionAttempt`.
+    /// A front-end can treat the prompt as stale (the peer gave up) once this is
+    /// older than a small TTL, since the daemon emits no retraction event.
+    pub pending_pairing_since: Option<Instant>,
     /// Maps a connected peer's socket address -> fingerprint, so the addr-only
     /// `IncomingDisconnected` event can be correlated back to a fingerprint.
     peer_addrs: HashMap<SocketAddr, String>,
@@ -81,6 +85,7 @@ impl AppModel {
                 if let Some(fp) = self.pending_pairing.clone() {
                     if self.authorized.contains_key(&fp) {
                         self.pending_pairing = None;
+                        self.pending_pairing_since = None;
                     }
                 }
             }
@@ -92,8 +97,7 @@ impl AppModel {
             }
             FrontendEvent::Error(e) => self.push_message(format!("error: {e}")),
             FrontendEvent::DeviceConnected { addr, fingerprint } => {
-                self.peer_addrs.insert(addr, fingerprint.clone());
-                self.connected_peers.insert(fingerprint);
+                self.register_peer(addr, fingerprint);
                 self.push_message(format!("device connected: {addr}"));
             }
             FrontendEvent::DeviceEntered {
@@ -101,8 +105,7 @@ impl AppModel {
                 pos,
                 fingerprint,
             } => {
-                self.peer_addrs.insert(addr, fingerprint.clone());
-                self.connected_peers.insert(fingerprint);
+                self.register_peer(addr, fingerprint);
                 self.push_message(format!("cursor entered from {addr} ({pos})"));
             }
             FrontendEvent::IncomingDisconnected(addr) => {
@@ -115,10 +118,23 @@ impl AppModel {
                 self.push_message(format!("pairing request: {fingerprint}"));
                 if !self.authorized.contains_key(&fingerprint) {
                     self.pending_pairing = Some(fingerprint);
+                    self.pending_pairing_since = Some(Instant::now());
                 }
             }
             FrontendEvent::NoSuchClient(_) => {}
         }
+    }
+
+    /// Record a peer as connected, dropping any stale fingerprint previously
+    /// mapped to the same socket address — prevents a permanently "connected"
+    /// ghost when an addr reconnects under a different fingerprint.
+    fn register_peer(&mut self, addr: SocketAddr, fingerprint: String) {
+        if let Some(old) = self.peer_addrs.insert(addr, fingerprint.clone()) {
+            if old != fingerprint {
+                self.connected_peers.remove(&old);
+            }
+        }
+        self.connected_peers.insert(fingerprint);
     }
 
     fn push_message(&mut self, msg: String) {
@@ -224,6 +240,7 @@ async fn connection_loop(
             m.connected_peers.clear();
             m.peer_addrs.clear();
             m.pending_pairing = None;
+            m.pending_pairing_since = None;
         }
         changed.notify_one();
         tokio::time::sleep(Duration::from_millis(500)).await;
