@@ -7,7 +7,8 @@
 //! `lan-mouse-ipc`; they contain no protocol logic of their own.
 
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    net::SocketAddr,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -42,6 +43,14 @@ pub struct AppModel {
     pub port: Option<u16>,
     /// Recent transient events / errors (newest last), capped at [`MAX_MESSAGES`].
     pub messages: VecDeque<String>,
+    /// Fingerprints of peers currently connected *in*, as known from live
+    /// connect/disconnect events while this client is attached. CAVEAT: a peer
+    /// that connected before we attached is not reflected until the daemon
+    /// reports current connections on `Sync` (a planned additive event).
+    pub connected_peers: HashSet<String>,
+    /// Maps a connected peer's socket address -> fingerprint, so the addr-only
+    /// `IncomingDisconnected` event can be correlated back to a fingerprint.
+    peer_addrs: HashMap<SocketAddr, String>,
 }
 
 impl AppModel {
@@ -68,14 +77,25 @@ impl AppModel {
                 }
             }
             FrontendEvent::Error(e) => self.push_message(format!("error: {e}")),
-            FrontendEvent::DeviceConnected { addr, .. } => {
-                self.push_message(format!("device connected: {addr}"))
+            FrontendEvent::DeviceConnected { addr, fingerprint } => {
+                self.peer_addrs.insert(addr, fingerprint.clone());
+                self.connected_peers.insert(fingerprint);
+                self.push_message(format!("device connected: {addr}"));
             }
-            FrontendEvent::DeviceEntered { addr, pos, .. } => {
-                self.push_message(format!("cursor entered from {addr} ({pos})"))
+            FrontendEvent::DeviceEntered {
+                addr,
+                pos,
+                fingerprint,
+            } => {
+                self.peer_addrs.insert(addr, fingerprint.clone());
+                self.connected_peers.insert(fingerprint);
+                self.push_message(format!("cursor entered from {addr} ({pos})"));
             }
             FrontendEvent::IncomingDisconnected(addr) => {
-                self.push_message(format!("incoming disconnected: {addr}"))
+                if let Some(fp) = self.peer_addrs.remove(&addr) {
+                    self.connected_peers.remove(&fp);
+                }
+                self.push_message(format!("incoming disconnected: {addr}"));
             }
             FrontendEvent::ConnectionAttempt { fingerprint } => {
                 self.push_message(format!("pairing request: {fingerprint}"))
@@ -179,7 +199,14 @@ async fn connection_loop(
             }
         }
 
-        model.lock().expect("model lock poisoned").connected = false;
+        {
+            let mut m = model.lock().expect("model lock poisoned");
+            m.connected = false;
+            // we lose live connect/disconnect tracking when the daemon link
+            // drops; clear it so we don't show a stale "connected" peer.
+            m.connected_peers.clear();
+            m.peer_addrs.clear();
+        }
         changed.notify_one();
         tokio::time::sleep(Duration::from_millis(500)).await;
     }

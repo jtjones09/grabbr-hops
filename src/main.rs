@@ -92,19 +92,12 @@ fn run() -> Result<(), LanMouseError> {
             }
             #[cfg(all(feature = "tui", not(feature = "gtk")))]
             {
-                let mut service = start_service()?;
-                let res = run_async(lan_mouse_tui::run());
-                #[cfg(unix)]
-                {
-                    // give the service a chance to terminate gracefully
-                    let pid = service.id() as libc::pid_t;
-                    unsafe {
-                        libc::kill(pid, libc::SIGINT);
-                    }
-                    service.wait()?;
-                }
-                service.kill()?;
-                res?;
+                // The daemon is the persistent core engine. Start it DETACHED if
+                // it isn't already running, then attach the TUI. Quitting or
+                // closing the TUI detaches only — the daemon keeps running so the
+                // KVM keeps working with no UI open.
+                start_detached_daemon()?;
+                run_async(lan_mouse_tui::run())?;
             }
             #[cfg(not(any(feature = "gtk", feature = "tui")))]
             {
@@ -144,6 +137,55 @@ fn start_service() -> Result<Child, io::Error> {
         .arg("daemon")
         .spawn()?;
     Ok(child)
+}
+
+/// Start the daemon as a DETACHED background process (its own session, with
+/// stdio sent to a contained log file) if one isn't already running, then return
+/// without owning it. Used by attach-and-detach front-ends (TUI/GUI): the daemon
+/// is the persistent core engine and must survive the front-end — and its
+/// terminal — going away. A redundant daemon self-exits (`AlreadyRunning`).
+#[cfg(all(feature = "tui", not(feature = "gtk")))]
+fn start_detached_daemon() -> Result<(), io::Error> {
+    use std::process::Stdio;
+    // contained daemon log (never the home root)
+    let (out, err) = {
+        let mut path = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default();
+        path.push("grabbr-hop/logs");
+        let _ = std::fs::create_dir_all(&path);
+        path.push("daemon.log");
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|f| Ok((f.try_clone()?, f)))
+        {
+            Ok((a, b)) => (Stdio::from(a), Stdio::from(b)),
+            Err(_) => (Stdio::null(), Stdio::null()),
+        }
+    };
+    let mut cmd = process::Command::new(std::env::current_exe()?);
+    cmd.args(std::env::args().skip(1))
+        .arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(out)
+        .stderr(err);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid() in the forked child detaches it into a new session so
+        // the front-end's terminal closing (SIGHUP) can't take the daemon down.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    // we deliberately drop the Child handle — the daemon owns its own lifecycle.
+    let _ = cmd.spawn()?;
+    Ok(())
 }
 
 async fn run_service(config: Config) -> Result<(), ServiceError> {

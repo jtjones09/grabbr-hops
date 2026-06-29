@@ -13,7 +13,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
     Frame,
 };
 use thiserror::Error;
@@ -80,7 +80,7 @@ fn ui(f: &mut Frame, model: &AppModel) {
         .constraints([
             Constraint::Length(3),
             Constraint::Min(0),
-            Constraint::Length(3),
+            Constraint::Length(4),
         ])
         .split(f.area());
 
@@ -103,10 +103,16 @@ fn ui(f: &mut Frame, model: &AppModel) {
         chunks[0],
     );
 
-    // body: device list
-    let items: Vec<ListItem> = if model.clients.is_empty() {
+    // body: configured devices (outgoing) on top, trusted devices (incoming) below
+    let body = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[1]);
+
+    // devices this machine is configured to cross *to* (outgoing clients)
+    let devices: Vec<ListItem> = if model.clients.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
-            "no devices configured",
+            "none — this device only receives (cross back with the release bind)",
             Style::default().fg(Color::DarkGray),
         )))]
     } else {
@@ -132,23 +138,75 @@ fn ui(f: &mut Frame, model: &AppModel) {
             .collect()
     };
     f.render_widget(
-        List::new(items).block(Block::default().borders(Borders::ALL).title(" devices ")),
-        chunks[1],
+        List::new(devices)
+            .block(Block::default().borders(Borders::ALL).title(" devices (cross to) ")),
+        body[0],
     );
 
-    // footer: this device's fingerprint + quit hint
-    let fp = model
-        .fingerprint
-        .as_deref()
-        .map(short_fp)
-        .unwrap_or_else(|| "—".into());
-    let footer = Line::from(vec![
-        Span::styled("q", Style::default().fg(Color::Yellow)),
-        Span::raw(" quit   ·   this device: "),
-        Span::styled(fp, Style::default().fg(Color::Magenta)),
-    ]);
+    // trusted peers allowed to connect *in* — the saved relationships; persist offline
+    let trusted: Vec<ListItem> = if model.authorized.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            "no trusted devices",
+            Style::default().fg(Color::DarkGray),
+        )))]
+    } else {
+        let mut entries: Vec<(&String, &String)> = model.authorized.iter().collect();
+        entries.sort_by(|a, b| a.1.cmp(b.1)); // stable order by description
+        entries
+            .into_iter()
+            .map(|(fp, desc)| {
+                let online = model.connected_peers.contains(fp);
+                let (dot, dot_color, state) = if online {
+                    (
+                        "●",
+                        Color::Green,
+                        Span::styled("connected", Style::default().fg(Color::Green)),
+                    )
+                } else {
+                    (
+                        "○",
+                        Color::Red,
+                        Span::styled("offline", Style::default().fg(Color::Red)),
+                    )
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{dot} "), Style::default().fg(dot_color)),
+                    Span::raw(desc.clone()),
+                    Span::styled(
+                        format!("  {}  ", short_fp(fp)),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    state,
+                ]))
+            })
+            .collect()
+    };
     f.render_widget(
-        Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
+        List::new(trusted)
+            .block(Block::default().borders(Borders::ALL).title(" trusted devices ")),
+        body[1],
+    );
+
+    // footer: quit hint + this device's FULL fingerprint (the pairing id — must
+    // be shown whole so it can be verified/added on the other device; wraps so a
+    // narrow terminal still shows all of it)
+    let fp = model.fingerprint.as_deref().unwrap_or("—");
+    let footer = vec![
+        Line::from(vec![
+            Span::styled("q", Style::default().fg(Color::Yellow)),
+            Span::raw(" / "),
+            Span::styled("esc", Style::default().fg(Color::Yellow)),
+            Span::raw("   close   ·   engine keeps running"),
+        ]),
+        Line::from(vec![
+            Span::raw("this device: "),
+            Span::styled(fp.to_string(), Style::default().fg(Color::Magenta)),
+        ]),
+    ];
+    f.render_widget(
+        Paragraph::new(footer)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL)),
         chunks[2],
     );
 }
