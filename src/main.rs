@@ -92,11 +92,13 @@ fn run() -> Result<(), LanMouseError> {
             }
             #[cfg(all(feature = "tui", not(feature = "gtk")))]
             {
-                // The daemon is the persistent core engine. Start it DETACHED if
-                // it isn't already running, then attach the TUI. Quitting or
-                // closing the TUI detaches only — the daemon keeps running so the
-                // KVM keeps working with no UI open.
-                start_detached_daemon()?;
+                // The TUI is a pure viewer/controller: it ATTACHES to a daemon
+                // and never starts or stops it. Run the daemon separately (your
+                // launcher / `lan-mouse daemon`) so the GRANTED, injecting backend
+                // is the receiver — a front-end-spawned daemon can silently land
+                // on the dummy backend if its binary lacks the Accessibility
+                // grant (e.g. a `cargo run` debug build). Closing the TUI leaves
+                // the daemon running.
                 run_async(lan_mouse_tui::run())?;
             }
             #[cfg(not(any(feature = "gtk", feature = "tui")))]
@@ -144,6 +146,9 @@ fn start_service() -> Result<Child, io::Error> {
 /// without owning it. Used by attach-and-detach front-ends (TUI/GUI): the daemon
 /// is the persistent core engine and must survive the front-end — and its
 /// terminal — going away. A redundant daemon self-exits (`AlreadyRunning`).
+// Retained for a future GRANTED auto-start (a signed/release TUI build that can
+// inject); the TUI is attach-only today, so this is currently unused.
+#[allow(dead_code)]
 #[cfg(all(feature = "tui", not(feature = "gtk")))]
 fn start_detached_daemon() -> Result<(), io::Error> {
     use std::process::Stdio;
