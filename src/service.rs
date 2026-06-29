@@ -75,6 +75,10 @@ pub struct Service {
     currently_controlling: HashSet<SocketAddr>,
     /// map from capture handle to connection info
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
+    /// peers with a live INCOMING connection (addr -> fingerprint), tracked at the
+    /// connection level (independent of whether their cursor has crossed in) and
+    /// re-emitted on Sync so a freshly-attached UI sees who is connected right now
+    connected_peers: HashMap<SocketAddr, String>,
     next_trigger_handle: u64,
     /// cross-machine clipboard sync backend (local monitor + apply)
     clipboard: Clipboard,
@@ -171,6 +175,7 @@ impl Service {
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             currently_controlling: Default::default(),
+            connected_peers: Default::default(),
             next_trigger_handle: 0,
             clipboard,
             clipboard_alive: true,
@@ -381,6 +386,7 @@ impl Service {
             }
             EmulationEvent::Disconnected { addr } => {
                 self.currently_controlling.remove(&addr);
+                self.connected_peers.remove(&addr);
                 if let Some(addr) = self.remove_incoming(addr) {
                     Lifecycle::Disconnected { addr }.log();
                     self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
@@ -409,6 +415,7 @@ impl Service {
                     fingerprint: &fingerprint,
                 }
                 .log();
+                self.connected_peers.insert(addr, fingerprint.clone());
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
             }
             EmulationEvent::PeerHello { addr, commit } => {
@@ -489,6 +496,16 @@ impl Service {
         ));
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+        // re-emit current incoming connections so a freshly-attached UI knows
+        // which trusted peers are connected right now, not just from future events
+        let connected: Vec<(SocketAddr, String)> = self
+            .connected_peers
+            .iter()
+            .map(|(addr, fp)| (*addr, fp.clone()))
+            .collect();
+        for (addr, fingerprint) in connected {
+            self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
+        }
     }
 
     const ENTER_HANDLE_BEGIN: u64 = u64::MAX / 2 + 1;
