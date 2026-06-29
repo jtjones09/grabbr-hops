@@ -373,9 +373,21 @@ fn request_macos_emulation_permissions() -> Result<(), MacOSEmulationCreationErr
 }
 
 fn request_accessibility_permission() -> bool {
-    // Silent check. The GUI owns the one-time user-visible prompt at
-    // startup (see lan_mouse_gtk::macos_privacy).
-    unsafe { AXIsProcessTrusted() }
+    // Fire the one-time system Accessibility prompt if not yet granted, then
+    // return the current trust state. Ported from the GUI's macos_privacy so a
+    // headless / TUI daemon is self-granting — there's no GUI to own the prompt.
+    use core_foundation::base::TCFType;
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::string::CFString;
+    // kAXTrustedCheckOptionPrompt == CFSTR("AXTrustedCheckOptionPrompt")
+    let key = CFString::from_static_string("AXTrustedCheckOptionPrompt");
+    let options = CFDictionary::from_CFType_pairs(&[(
+        key.as_CFType(),
+        CFBoolean::true_value().as_CFType(),
+    )]);
+    // SAFETY: `options` outlives the synchronous call.
+    unsafe { AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef() as *const c_void) }
 }
 
 fn request_input_control_permission() -> bool {
@@ -392,7 +404,7 @@ extern "C" {
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
-    fn AXIsProcessTrusted() -> bool;
+    fn AXIsProcessTrustedWithOptions(options: *const c_void) -> bool;
 }
 
 #[link(name = "Carbon", kind = "framework")]
