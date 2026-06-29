@@ -364,12 +364,39 @@ fn request_macos_emulation_permissions() -> Result<(), MacOSEmulationCreationErr
     let input_control = request_input_control_permission();
 
     if !accessibility {
+        guide_to_settings();
         return Err(MacOSEmulationCreationError::AccessibilityPermission);
     }
     if !input_control {
+        guide_to_settings();
         return Err(MacOSEmulationCreationError::InputControlPermission);
     }
     Ok(())
+}
+
+/// On a missing grant, print an actionable message naming the exact binary and
+/// open the right System Settings pane — once per process. A backgrounded CLI's
+/// TCC dialog is unreliable, so we steer the user straight to the toggle instead
+/// of relying on a prompt that may never surface.
+fn guide_to_settings() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let exe = std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "the grabbr-hop binary".into());
+        log::error!("──────────────────────────────────────────────────────────");
+        log::error!("grabbr-hop can't inject input: a macOS permission is missing.");
+        log::error!("Enable BOTH for this exact binary, then re-run the launcher:");
+        log::error!("  • Accessibility");
+        log::error!("  • Input Monitoring");
+        log::error!("  binary: {exe}");
+        log::error!("Opening System Settings → Privacy & Security → Accessibility…");
+        log::error!("──────────────────────────────────────────────────────────");
+        let _ = std::process::Command::new("open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+            .spawn();
+    });
 }
 
 fn request_accessibility_permission() -> bool {
