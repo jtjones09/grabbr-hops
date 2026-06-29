@@ -50,6 +50,10 @@ pub struct AppModel {
     /// that connected before we attached is not reflected until the daemon
     /// reports current connections on `Sync` (a planned additive event).
     pub connected_peers: HashSet<String>,
+    /// An untrusted peer's fingerprint awaiting the user's pairing approval. Set
+    /// on `ConnectionAttempt`; cleared once it becomes authorized or the daemon
+    /// link drops. The UI surfaces this as an approve/deny prompt.
+    pub pending_pairing: Option<String>,
     /// Maps a connected peer's socket address -> fingerprint, so the addr-only
     /// `IncomingDisconnected` event can be correlated back to a fingerprint.
     peer_addrs: HashMap<SocketAddr, String>,
@@ -71,7 +75,15 @@ impl AppModel {
             FrontendEvent::CaptureStatus(s) => self.capture = s,
             FrontendEvent::EmulationStatus(s) => self.emulation = s,
             FrontendEvent::PublicKeyFingerprint(fp) => self.fingerprint = Some(fp),
-            FrontendEvent::AuthorizedUpdated(map) => self.authorized = map,
+            FrontendEvent::AuthorizedUpdated(map) => {
+                self.authorized = map;
+                // a pending request that just became trusted is resolved
+                if let Some(fp) = self.pending_pairing.clone() {
+                    if self.authorized.contains_key(&fp) {
+                        self.pending_pairing = None;
+                    }
+                }
+            }
             FrontendEvent::PortChanged(port, err) => {
                 self.port = Some(port);
                 if let Some(e) = err {
@@ -100,7 +112,10 @@ impl AppModel {
                 self.push_message(format!("incoming disconnected: {addr}"));
             }
             FrontendEvent::ConnectionAttempt { fingerprint } => {
-                self.push_message(format!("pairing request: {fingerprint}"))
+                self.push_message(format!("pairing request: {fingerprint}"));
+                if !self.authorized.contains_key(&fingerprint) {
+                    self.pending_pairing = Some(fingerprint);
+                }
             }
             FrontendEvent::NoSuchClient(_) => {}
         }
@@ -208,6 +223,7 @@ async fn connection_loop(
             // drops; clear it so we don't show a stale "connected" peer.
             m.connected_peers.clear();
             m.peer_addrs.clear();
+            m.pending_pairing = None;
         }
         changed.notify_one();
         tokio::time::sleep(Duration::from_millis(500)).await;
