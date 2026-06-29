@@ -1,14 +1,19 @@
 //! grabbr-hop terminal UI (Ratatui).
 //!
 //! A thin view + control surface over the shared [`lan_mouse_frontend_core`]
-//! client: it renders the observable [`AppModel`] and sends [`FrontendRequest`]s.
-//! It holds no protocol logic. Actions (P2, increment 1): add / delete / select a
-//! device, re-enable capture+emulation, save config. Closing the UI leaves the
-//! daemon (the core engine) running.
+//! client: it renders the observable [`AppModel`] and sends [`FrontendRequest`]s;
+//! it holds no protocol logic. Closing the UI leaves the daemon (the core engine)
+//! running.
+//!
+//! Actions: a=add, d=delete, n=name (text input), p=cycle position,
+//! space=activate/deactivate, r=re-enable capture+emulation, s=save, ↑↓=select,
+//! q/esc=close.
 
 use std::{io, time::Duration};
 
-use lan_mouse_frontend_core::{AppModel, FrontendClient, FrontendRequest, Status};
+use lan_mouse_frontend_core::{
+    AppModel, ClientHandle, FrontendClient, FrontendRequest, Position, Status,
+};
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     layout::{Constraint, Direction, Layout},
@@ -46,11 +51,12 @@ pub async fn run() -> Result<(), TuiError> {
 
     let mut terminal = ratatui::init();
     let mut selected: usize = 0; // highlighted row in the devices list
+    // Some(handle, buffer) while editing a device's hostname.
+    let mut input: Option<(ClientHandle, String)> = None;
 
     let result = loop {
         let model = client.snapshot();
         let count = model.clients.len();
-        // keep the selection valid as the list changes
         if count == 0 {
             selected = 0;
         } else if selected >= count {
@@ -61,7 +67,7 @@ pub async fn run() -> Result<(), TuiError> {
             list_state.select(Some(selected));
         }
 
-        if let Err(e) = terminal.draw(|f| ui(f, &model, &mut list_state)) {
+        if let Err(e) = terminal.draw(|f| ui(f, &model, &mut list_state, input.as_ref())) {
             break Err(TuiError::from(e));
         }
 
@@ -69,35 +75,76 @@ pub async fn run() -> Result<(), TuiError> {
             _ = client.changed() => {}
             key = key_rx.recv() => match key {
                 Some(k) if k.kind == KeyEventKind::Press => {
-                    let ctrl_c = k.code == KeyCode::Char('c')
-                        && k.modifiers.contains(KeyModifiers::CONTROL);
-                    match k.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
-                        _ if ctrl_c => break Ok(()),
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            selected = selected.saturating_sub(1);
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            if count > 0 && selected + 1 < count {
-                                selected += 1;
+                    if input.is_some() {
+                        // ---- text-input mode (editing a hostname) ----
+                        match k.code {
+                            KeyCode::Enter => {
+                                if let Some((handle, buf)) = input.take() {
+                                    let val = (!buf.trim().is_empty()).then_some(buf);
+                                    client.request(FrontendRequest::UpdateHostname(handle, val));
+                                }
                             }
-                        }
-                        // add a (blank) device — name/position/activate come next increment
-                        KeyCode::Char('a') => client.request(FrontendRequest::Create),
-                        // delete the selected device
-                        KeyCode::Char('d') | KeyCode::Delete => {
-                            if let Some((&handle, _)) = model.clients.iter().nth(selected) {
-                                client.request(FrontendRequest::Delete(handle));
+                            KeyCode::Esc => input = None,
+                            KeyCode::Backspace => {
+                                if let Some((_, buf)) = input.as_mut() {
+                                    buf.pop();
+                                }
                             }
+                            KeyCode::Char(c) => {
+                                if let Some((_, buf)) = input.as_mut() {
+                                    buf.push(c);
+                                }
+                            }
+                            _ => {}
                         }
-                        // re-enable input capture + emulation (e.g. after a secure-input lockout)
-                        KeyCode::Char('r') => {
-                            client.request(FrontendRequest::EnableCapture);
-                            client.request(FrontendRequest::EnableEmulation);
+                    } else {
+                        // ---- normal mode ----
+                        let ctrl_c = k.code == KeyCode::Char('c')
+                            && k.modifiers.contains(KeyModifiers::CONTROL);
+                        match k.code {
+                            KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
+                            _ if ctrl_c => break Ok(()),
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                selected = selected.saturating_sub(1);
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if count > 0 && selected + 1 < count {
+                                    selected += 1;
+                                }
+                            }
+                            KeyCode::Char('a') => client.request(FrontendRequest::Create),
+                            KeyCode::Char('d') | KeyCode::Delete => {
+                                if let Some((&handle, _)) = model.clients.iter().nth(selected) {
+                                    client.request(FrontendRequest::Delete(handle));
+                                }
+                            }
+                            KeyCode::Char('n') => {
+                                if let Some((&handle, (c, _))) = model.clients.iter().nth(selected) {
+                                    input = Some((handle, c.hostname.clone().unwrap_or_default()));
+                                }
+                            }
+                            KeyCode::Char('p') => {
+                                if let Some((&handle, (c, _))) = model.clients.iter().nth(selected) {
+                                    client.request(FrontendRequest::UpdatePosition(
+                                        handle,
+                                        next_pos(&c.pos),
+                                    ));
+                                }
+                            }
+                            KeyCode::Char(' ') => {
+                                if let Some((&handle, (_, s))) = model.clients.iter().nth(selected) {
+                                    client.request(FrontendRequest::Activate(handle, !s.active));
+                                }
+                            }
+                            KeyCode::Char('r') => {
+                                client.request(FrontendRequest::EnableCapture);
+                                client.request(FrontendRequest::EnableEmulation);
+                            }
+                            KeyCode::Char('s') => {
+                                client.request(FrontendRequest::SaveConfiguration)
+                            }
+                            _ => {}
                         }
-                        // persist current config to disk
-                        KeyCode::Char('s') => client.request(FrontendRequest::SaveConfiguration),
-                        _ => {}
                     }
                 }
                 Some(_) => {}
@@ -111,7 +158,17 @@ pub async fn run() -> Result<(), TuiError> {
     result
 }
 
-fn ui(f: &mut Frame, model: &AppModel, devices_state: &mut ListState) {
+/// Cycle a device's edge: left → right → top → bottom → left.
+fn next_pos(p: &Position) -> Position {
+    match p {
+        Position::Left => Position::Right,
+        Position::Right => Position::Top,
+        Position::Top => Position::Bottom,
+        Position::Bottom => Position::Left,
+    }
+}
+
+fn ui(f: &mut Frame, model: &AppModel, devices_state: &mut ListState, input: Option<&(ClientHandle, String)>) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -156,7 +213,7 @@ fn ui(f: &mut Frame, model: &AppModel, devices_state: &mut ListState) {
             .clients
             .iter()
             .map(|(h, (c, s))| {
-                let host = c.hostname.clone().unwrap_or_else(|| "unknown".into());
+                let host = c.hostname.clone().unwrap_or_else(|| "unnamed".into());
                 let dot = if s.alive {
                     Span::styled("●", Style::default().fg(Color::Green))
                 } else if s.active {
@@ -168,7 +225,7 @@ fn ui(f: &mut Frame, model: &AppModel, devices_state: &mut ListState) {
                     dot,
                     Span::raw(format!(" [{h}] {host}:{} ", c.port)),
                     Span::styled(format!("({})", c.pos), Style::default().fg(Color::Cyan)),
-                    Span::raw(if s.active { "  active" } else { "" }),
+                    Span::raw(if s.active { "  active" } else { "  off" }),
                 ]))
             })
             .collect()
@@ -229,24 +286,40 @@ fn ui(f: &mut Frame, model: &AppModel, devices_state: &mut ListState) {
         body[1],
     );
 
-    // footer: actions + this device's FULL fingerprint (the pairing id), wrapped
-    let fp = model.fingerprint.as_deref().unwrap_or("—");
+    // footer: text-input prompt (when editing) OR the keymap, plus the full fingerprint
     let key = Style::default().fg(Color::Yellow);
-    let footer = vec![
+    let line1 = if let Some((handle, buf)) = input {
+        Line::from(vec![
+            Span::styled(format!("name [{handle}]: "), key),
+            Span::raw(buf.clone()),
+            Span::styled("▌", key),
+            Span::styled("   enter save · esc cancel", Style::default().fg(Color::DarkGray)),
+        ])
+    } else {
         Line::from(vec![
             Span::styled("a", key),
-            Span::raw(" add   "),
+            Span::raw(" add  "),
             Span::styled("d", key),
-            Span::raw(" delete   "),
+            Span::raw(" del  "),
+            Span::styled("n", key),
+            Span::raw(" name  "),
+            Span::styled("p", key),
+            Span::raw(" pos  "),
+            Span::styled("spc", key),
+            Span::raw(" on/off  "),
             Span::styled("r", key),
-            Span::raw(" re-enable   "),
+            Span::raw(" re-en  "),
             Span::styled("s", key),
-            Span::raw(" save   "),
+            Span::raw(" save  "),
             Span::styled("↑↓", key),
-            Span::raw(" select   "),
+            Span::raw(" sel  "),
             Span::styled("q", key),
             Span::raw(" close"),
-        ]),
+        ])
+    };
+    let fp = model.fingerprint.as_deref().unwrap_or("—");
+    let footer = vec![
+        line1,
         Line::from(vec![
             Span::raw("this device: "),
             Span::styled(fp.to_string(), Style::default().fg(Color::Magenta)),
