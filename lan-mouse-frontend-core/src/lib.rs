@@ -21,6 +21,8 @@ pub use lan_mouse_ipc::{
     Position, Status,
 };
 
+pub mod theme;
+
 /// How many transient event/error lines to keep for the UI log pane.
 const MAX_MESSAGES: usize = 50;
 

@@ -6,12 +6,13 @@
 //! running.
 //!
 //! Actions: a=add, d=delete, n=name (text input), p=cycle position,
-//! space=activate/deactivate, r=re-enable capture+emulation, s=save, ↑↓=select,
-//! q/esc=close.
+//! space=activate/deactivate, r=re-enable capture+emulation, s=save, t=theme,
+//! ↑↓=select, q/esc=close.
 
 use std::{io, time::Duration};
 
 use lan_mouse_frontend_core::{
+    theme::{self, Rgb, Theme},
     AppModel, ClientHandle, FrontendClient, FrontendRequest, Position, Status,
 };
 use ratatui::{
@@ -29,6 +30,11 @@ use tokio::sync::mpsc;
 pub enum TuiError {
     #[error("terminal io error: {0}")]
     Io(#[from] io::Error),
+}
+
+/// Map a theme [`Rgb`] to a true-color ratatui [`Color`].
+fn col(c: Rgb) -> Color {
+    Color::Rgb(c.0, c.1, c.2)
 }
 
 /// Run the TUI front-end. Must be called within a tokio `LocalSet`.
@@ -49,6 +55,12 @@ pub async fn run() -> Result<(), TuiError> {
         }
     });
 
+    // theme: persisted name → built-in index, default to the first.
+    let themes = theme::builtins();
+    let mut theme_idx = theme::load_name()
+        .and_then(|n| themes.iter().position(|t| t.name == n))
+        .unwrap_or(0);
+
     let mut terminal = ratatui::init();
     let mut selected: usize = 0; // highlighted row in the devices list
     // Some(handle, buffer) while editing a device's hostname.
@@ -67,7 +79,8 @@ pub async fn run() -> Result<(), TuiError> {
             list_state.select(Some(selected));
         }
 
-        if let Err(e) = terminal.draw(|f| ui(f, &model, &mut list_state, input.as_ref())) {
+        let theme = &themes[theme_idx];
+        if let Err(e) = terminal.draw(|f| ui(f, &model, &mut list_state, input.as_ref(), theme)) {
             break Err(TuiError::from(e));
         }
 
@@ -143,6 +156,10 @@ pub async fn run() -> Result<(), TuiError> {
                             KeyCode::Char('s') => {
                                 client.request(FrontendRequest::SaveConfiguration)
                             }
+                            KeyCode::Char('t') => {
+                                theme_idx = (theme_idx + 1) % themes.len();
+                                theme::save_name(themes[theme_idx].name);
+                            }
                             _ => {}
                         }
                     }
@@ -168,7 +185,28 @@ fn next_pos(p: &Position) -> Position {
     }
 }
 
-fn ui(f: &mut Frame, model: &AppModel, devices_state: &mut ListState, input: Option<&(ClientHandle, String)>) {
+fn ui(
+    f: &mut Frame,
+    model: &AppModel,
+    devices_state: &mut ListState,
+    input: Option<&(ClientHandle, String)>,
+    theme: &Theme,
+) {
+    let base = Style::default().bg(col(theme.bg)).fg(col(theme.fg));
+    let border = Style::default().fg(col(theme.muted)).bg(col(theme.bg));
+    let accent = Style::default().fg(col(theme.accent)).bg(col(theme.bg));
+    let muted = Style::default().fg(col(theme.muted)).bg(col(theme.bg));
+    let panel = |title: Span<'static>| {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(border)
+            .style(base)
+            .title(title)
+    };
+
+    // paint the whole window in the theme background first
+    f.render_widget(Block::default().style(base), f.area());
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -180,20 +218,22 @@ fn ui(f: &mut Frame, model: &AppModel, devices_state: &mut ListState, input: Opt
 
     // header: connection + capture/emulation status
     let conn = if model.connected {
-        Span::styled("● connected", Style::default().fg(Color::Green))
+        Span::styled("● connected", Style::default().fg(col(theme.success)))
     } else {
-        Span::styled("○ connecting…", Style::default().fg(Color::Yellow))
+        Span::styled("○ connecting…", Style::default().fg(col(theme.warn)))
     };
     let header = Line::from(vec![
         conn,
         Span::raw("   capture: "),
-        status_span(model.capture),
+        status_span(model.capture, theme),
         Span::raw("   emulation: "),
-        status_span(model.emulation),
+        status_span(model.emulation, theme),
     ]);
+    let title = format!(" grabbr-hop · {} ", theme.name);
     f.render_widget(
         Paragraph::new(header)
-            .block(Block::default().borders(Borders::ALL).title(" grabbr-hop ")),
+            .style(base)
+            .block(panel(Span::styled(title, accent))),
         chunks[0],
     );
 
@@ -206,7 +246,7 @@ fn ui(f: &mut Frame, model: &AppModel, devices_state: &mut ListState, input: Opt
     let devices: Vec<ListItem> = if model.clients.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             "none — this device only receives (cross back with the release bind)",
-            Style::default().fg(Color::DarkGray),
+            muted,
         )))]
     } else {
         model
@@ -215,40 +255,40 @@ fn ui(f: &mut Frame, model: &AppModel, devices_state: &mut ListState, input: Opt
             .map(|(h, (c, s))| {
                 let host = c.hostname.clone().unwrap_or_else(|| "unnamed".into());
                 let dot = if s.alive {
-                    Span::styled("●", Style::default().fg(Color::Green))
+                    Span::styled("●", Style::default().fg(col(theme.success)))
                 } else if s.active {
-                    Span::styled("●", Style::default().fg(Color::Yellow))
+                    Span::styled("●", Style::default().fg(col(theme.warn)))
                 } else {
-                    Span::styled("○", Style::default().fg(Color::DarkGray))
+                    Span::styled("○", Style::default().fg(col(theme.muted)))
                 };
                 ListItem::new(Line::from(vec![
                     dot,
                     Span::raw(format!(" [{h}] {host}:{} ", c.port)),
-                    Span::styled(format!("({})", c.pos), Style::default().fg(Color::Cyan)),
-                    Span::raw(if s.active { "  active" } else { "  off" }),
+                    Span::styled(format!("({})", c.pos), Style::default().fg(col(theme.accent))),
+                    Span::styled(
+                        if s.active { "  active" } else { "  off" },
+                        if s.active { Style::default().fg(col(theme.fg)) } else { muted },
+                    ),
                 ]))
             })
             .collect()
     };
     f.render_stateful_widget(
         List::new(devices)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" devices (cross to) "),
+            .block(panel(Span::styled(" devices (cross to) ", accent)))
+            .highlight_style(
+                Style::default()
+                    .fg(col(theme.highlight_fg))
+                    .bg(col(theme.highlight_bg)),
             )
-            .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
             .highlight_symbol("▶ "),
         body[0],
         devices_state,
     );
 
-    // trusted peers (incoming) — saved relationships; green=connected / red=offline
+    // trusted peers (incoming) — saved relationships; success=connected / error=offline
     let trusted: Vec<ListItem> = if model.authorized.is_empty() {
-        vec![ListItem::new(Line::from(Span::styled(
-            "no trusted devices",
-            Style::default().fg(Color::DarkGray),
-        )))]
+        vec![ListItem::new(Line::from(Span::styled("no trusted devices", muted)))]
     } else {
         let mut entries: Vec<(&String, &String)> = model.authorized.iter().collect();
         entries.sort_by(|a, b| a.1.cmp(b.1));
@@ -259,41 +299,38 @@ fn ui(f: &mut Frame, model: &AppModel, devices_state: &mut ListState, input: Opt
                 let (dot, dot_color, state) = if online {
                     (
                         "●",
-                        Color::Green,
-                        Span::styled("connected", Style::default().fg(Color::Green)),
+                        col(theme.success),
+                        Span::styled("connected", Style::default().fg(col(theme.success))),
                     )
                 } else {
                     (
                         "○",
-                        Color::Red,
-                        Span::styled("offline", Style::default().fg(Color::Red)),
+                        col(theme.error),
+                        Span::styled("offline", Style::default().fg(col(theme.error))),
                     )
                 };
                 ListItem::new(Line::from(vec![
                     Span::styled(format!("{dot} "), Style::default().fg(dot_color)),
                     Span::raw(desc.clone()),
-                    Span::styled(
-                        format!("  {}  ", short_fp(fp)),
-                        Style::default().fg(Color::DarkGray),
-                    ),
+                    Span::styled(format!("  {}  ", short_fp(fp)), muted),
                     state,
                 ]))
             })
             .collect()
     };
     f.render_widget(
-        List::new(trusted).block(Block::default().borders(Borders::ALL).title(" trusted devices ")),
+        List::new(trusted).block(panel(Span::styled(" trusted devices ", accent))),
         body[1],
     );
 
     // footer: text-input prompt (when editing) OR the keymap, plus the full fingerprint
-    let key = Style::default().fg(Color::Yellow);
+    let key = accent;
     let line1 = if let Some((handle, buf)) = input {
         Line::from(vec![
             Span::styled(format!("name [{handle}]: "), key),
             Span::raw(buf.clone()),
             Span::styled("▌", key),
-            Span::styled("   enter save · esc cancel", Style::default().fg(Color::DarkGray)),
+            Span::styled("   enter save · esc cancel", muted),
         ])
     } else {
         Line::from(vec![
@@ -311,6 +348,8 @@ fn ui(f: &mut Frame, model: &AppModel, devices_state: &mut ListState, input: Opt
             Span::raw(" re-en  "),
             Span::styled("s", key),
             Span::raw(" save  "),
+            Span::styled("t", key),
+            Span::raw(" theme  "),
             Span::styled("↑↓", key),
             Span::raw(" sel  "),
             Span::styled("q", key),
@@ -321,22 +360,23 @@ fn ui(f: &mut Frame, model: &AppModel, devices_state: &mut ListState, input: Opt
     let footer = vec![
         line1,
         Line::from(vec![
-            Span::raw("this device: "),
-            Span::styled(fp.to_string(), Style::default().fg(Color::Magenta)),
+            Span::styled("this device: ", muted),
+            Span::styled(fp.to_string(), Style::default().fg(col(theme.accent))),
         ]),
     ];
     f.render_widget(
         Paragraph::new(footer)
+            .style(base)
             .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL)),
+            .block(panel(Span::styled("", accent))),
         chunks[2],
     );
 }
 
-fn status_span(s: Status) -> Span<'static> {
+fn status_span(s: Status, theme: &Theme) -> Span<'static> {
     match s {
-        Status::Enabled => Span::styled("enabled", Style::default().fg(Color::Green)),
-        Status::Disabled => Span::styled("disabled", Style::default().fg(Color::Red)),
+        Status::Enabled => Span::styled("enabled", Style::default().fg(col(theme.success))),
+        Status::Disabled => Span::styled("disabled", Style::default().fg(col(theme.error))),
     }
 }
 
