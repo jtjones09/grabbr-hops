@@ -1,0 +1,78 @@
+// grabbr-hop Slint GUI — P0 scaffold.
+//
+// Deliberately minimal: it proves the crate compiles, the daemon/IPC spine works
+// (status updates live via the shared frontend-core), and the theme palette is
+// wired. The real visual design (device canvas, trust panel, themed widgets) is
+// the next step — built with eyes on the screen.
+
+export struct Palette {
+    bg: color,
+    fg: color,
+    muted: color,
+    accent: color,
+    success: color,
+    warn: color,
+    error: color,
+}
+
+export component AppWindow inherits Window {
+    title: "grabbr-hop";
+    preferred-width: 520px;
+    preferred-height: 380px;
+    min-width: 360px;
+    min-height: 260px;
+
+    // pushed from Rust each tick
+    in property <Palette> palette: {
+        bg: #121216, fg: #e8e8ea, muted: #8e8e99, accent: #579bff,
+        success: #44c468, warn: #e7b84b, error: #f25d5d,
+    };
+    in property <bool> connected: false;
+    in property <string> capture: "—";
+    in property <string> emulation: "—";
+    in property <string> summary: "";
+    in property <string> fingerprint: "—";
+
+    background: root.palette.bg;
+
+    VerticalLayout {
+        padding: 20px;
+        spacing: 10px;
+
+        Text {
+            text: "grabbr-hop";
+            font-size: 22px;
+            font-weight: 700;
+            color: root.palette.accent;
+        }
+
+        Text {
+            text: root.connected ? "● connected" : "○ connecting…";
+            color: root.connected ? root.palette.success : root.palette.warn;
+            font-size: 14px;
+        }
+
+        Text {
+            text: "capture: " + root.capture + "    emulation: " + root.emulation;
+            color: root.palette.fg;
+            font-size: 13px;
+        }
+
+        Rectangle { height: 1px; background: root.palette.muted; }
+
+        Text {
+            text: root.summary;
+            color: root.palette.fg;
+            font-size: 13px;
+        }
+
+        Rectangle { } // spacer
+
+        Text {
+            text: "this device: " + root.fingerprint;
+            color: root.palette.muted;
+            font-size: 10px;
+            wrap: word-wrap;
+        }
+    }
+}

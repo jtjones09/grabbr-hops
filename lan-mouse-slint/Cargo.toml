@@ -1,0 +1,18 @@
+[package]
+name = "lan-mouse-slint"
+description = "Slint GUI frontend for grabbr-hop / lan-mouse"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/jtjones09/grabbr-hop"
+
+[dependencies]
+slint = "1.8"
+lan-mouse-frontend-core = { path = "../lan-mouse-frontend-core", version = "0.1.0" }
+lan-mouse-ipc = { path = "../lan-mouse-ipc", version = "0.3.0" }
+tokio = { version = "1.32", features = ["rt", "sync", "macros", "time"] }
+thiserror = "2.0"
+log = "0.4"
+
+[build-dependencies]
+slint-build = "1.8"

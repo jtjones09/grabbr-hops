@@ -39,6 +39,9 @@ enum LanMouseError {
     #[cfg(feature = "tui")]
     #[error(transparent)]
     Tui(#[from] lan_mouse_tui::TuiError),
+    #[cfg(feature = "slint")]
+    #[error(transparent)]
+    Slint(#[from] lan_mouse_slint::SlintError),
     #[error(transparent)]
     Cli(#[from] CliError),
 }
@@ -101,7 +104,13 @@ fn run() -> Result<(), LanMouseError> {
                 // the daemon running.
                 run_async(lan_mouse_tui::run())?;
             }
-            #[cfg(not(any(feature = "gtk", feature = "tui")))]
+            #[cfg(all(feature = "slint", not(feature = "gtk"), not(feature = "tui")))]
+            {
+                // The Slint GUI is attach-only too (same rationale as the TUI): it
+                // connects to the launchd-managed daemon and never spawns one.
+                lan_mouse_slint::run()?;
+            }
+            #[cfg(not(any(feature = "gtk", feature = "tui", feature = "slint")))]
             {
                 // run daemon if no frontend feature is enabled
                 match run_async(run_service(config)) {
