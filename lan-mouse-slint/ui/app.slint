@@ -1,9 +1,6 @@
-// grabbr-hop Slint GUI — P0 scaffold.
-//
-// Deliberately minimal: it proves the crate compiles, the daemon/IPC spine works
-// (status updates live via the shared frontend-core), and the theme palette is
-// wired. The real visual design (device canvas, trust panel, themed widgets) is
-// the next step — built with eyes on the screen.
+// grabbr-hop Slint GUI — P1 (functional read-only: live status + device + trusted
+// lists, themed via the shared palette). Interactivity (add/trust/revoke) and the
+// visual polish come next — designed with eyes on the screen.
 
 export struct Palette {
     bg: color,
@@ -15,14 +12,27 @@ export struct Palette {
     error: color,
 }
 
+export struct DeviceRow {
+    label: string,
+    pos: string,
+    state: string,
+    dot: color,
+}
+
+export struct TrustedRow {
+    name: string,
+    fp: string,
+    status: string,
+    dot: color,
+}
+
 export component AppWindow inherits Window {
     title: "grabbr-hop";
-    preferred-width: 520px;
-    preferred-height: 380px;
-    min-width: 360px;
-    min-height: 260px;
+    preferred-width: 560px;
+    preferred-height: 460px;
+    min-width: 380px;
+    min-height: 300px;
 
-    // pushed from Rust each tick
     in property <Palette> palette: {
         bg: #121216, fg: #e8e8ea, muted: #8e8e99, accent: #579bff,
         success: #44c468, warn: #e7b84b, error: #f25d5d,
@@ -30,47 +40,70 @@ export component AppWindow inherits Window {
     in property <bool> connected: false;
     in property <string> capture: "—";
     in property <string> emulation: "—";
-    in property <string> summary: "";
+    in property <string> port: "—";
     in property <string> fingerprint: "—";
+    in property <[DeviceRow]> devices: [];
+    in property <[TrustedRow]> trusted: [];
 
-    background: root.palette.bg;
+    background: palette.bg;
 
     VerticalLayout {
-        padding: 20px;
-        spacing: 10px;
+        padding: 18px;
+        spacing: 12px;
 
         Text {
             text: "grabbr-hop";
             font-size: 22px;
-            font-weight: 700;
-            color: root.palette.accent;
+            font-weight: 800;
+            color: palette.accent;
         }
 
-        Text {
-            text: root.connected ? "● connected" : "○ connecting…";
-            color: root.connected ? root.palette.success : root.palette.warn;
-            font-size: 14px;
+        HorizontalLayout {
+            spacing: 20px;
+            Text {
+                text: root.connected ? "● connected" : "○ connecting…";
+                color: root.connected ? palette.success : palette.warn;
+            }
+            Text { text: "capture: " + root.capture; color: palette.fg; }
+            Text { text: "emulation: " + root.emulation; color: palette.fg; }
+            Text { text: "port: " + root.port; color: palette.muted; }
         }
 
-        Text {
-            text: "capture: " + root.capture + "    emulation: " + root.emulation;
-            color: root.palette.fg;
-            font-size: 13px;
+        Rectangle { height: 1px; background: palette.muted; }
+
+        Text { text: "devices (cross to)"; font-weight: 700; color: palette.accent; }
+        if root.devices.length == 0: Text {
+            text: "none — this device only receives";
+            color: palette.muted;
+        }
+        for d in root.devices: HorizontalLayout {
+            spacing: 8px;
+            Text { text: "●"; color: d.dot; }
+            Text { text: d.label; color: palette.fg; }
+            Text { text: d.pos; color: palette.accent; }
+            Text { text: d.state; color: palette.muted; }
         }
 
-        Rectangle { height: 1px; background: root.palette.muted; }
+        Rectangle { height: 1px; background: palette.muted; }
 
-        Text {
-            text: root.summary;
-            color: root.palette.fg;
-            font-size: 13px;
+        Text { text: "trusted devices"; font-weight: 700; color: palette.accent; }
+        if root.trusted.length == 0: Text {
+            text: "no trusted devices";
+            color: palette.muted;
+        }
+        for t in root.trusted: HorizontalLayout {
+            spacing: 8px;
+            Text { text: "●"; color: t.dot; }
+            Text { text: t.name; color: palette.fg; }
+            Text { text: t.fp; color: palette.muted; }
+            Text { text: t.status; color: t.dot; }
         }
 
-        Rectangle { } // spacer
+        Rectangle { } // spacer pushes the fingerprint to the bottom
 
         Text {
             text: "this device: " + root.fingerprint;
-            color: root.palette.muted;
+            color: palette.muted;
             font-size: 10px;
             wrap: word-wrap;
         }
