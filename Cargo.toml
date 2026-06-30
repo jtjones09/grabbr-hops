@@ -17,8 +17,16 @@ name = "lan-mouse"
 description = "Software KVM Switch / mouse & keyboard sharing software for Local Area Networks"
 version = "0.11.0"
 edition = "2021"
+autobins = false
 license = "GPL-3.0-or-later"
-repository = "https://github.com/feschber/lan-mouse"
+repository = "https://github.com/jtjones09/grabbr-hop"
+
+# grabbr-hop: the product binary is `grabbr-hop` (this is a GPLv3 fork of
+# lan-mouse — attribution preserved in NOTICE/headers; the Cargo *package* stays
+# `lan-mouse` to minimize churn, but the shipped binary + identity are grabbr-hop).
+[[bin]]
+name = "grabbr-hop"
+path = "src/main.rs"
 
 [profile.release]
 codegen-units = 1
