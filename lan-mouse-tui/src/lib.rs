@@ -224,7 +224,10 @@ pub async fn run() -> Result<(), TuiError> {
                             }
                             KeyCode::Char(c) => {
                                 if let Some(i) = input.as_mut() {
-                                    i.buf_mut().push(c);
+                                    // the port field only accepts digits
+                                    if !matches!(i, Input::Port { .. }) || c.is_ascii_digit() {
+                                        i.buf_mut().push(c);
+                                    }
                                 }
                             }
                             _ => {}

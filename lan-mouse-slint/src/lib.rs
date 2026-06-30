@@ -19,6 +19,8 @@ slint::include_modules!();
 pub enum SlintError {
     #[error("slint platform error: {0}")]
     Platform(#[from] slint::PlatformError),
+    #[error("frontend client thread failed to start")]
+    ClientInit,
 }
 
 fn status_text(s: Status) -> &'static str {
@@ -49,7 +51,7 @@ pub fn run() -> Result<(), SlintError> {
             std::future::pending::<()>().await;
         });
     });
-    let client = rx.recv().expect("frontend client handle");
+    let client = rx.recv().map_err(|_| SlintError::ClientInit)?;
 
     let ui = AppWindow::new()?;
 
@@ -88,7 +90,7 @@ pub fn run() -> Result<(), SlintError> {
                 )
                 .into(),
             );
-            ui.set_fingerprint(m.fingerprint.clone().unwrap_or_else(|| "—".into()).into());
+            ui.set_fingerprint(m.fingerprint.as_deref().unwrap_or("—").into());
         },
     );
 
