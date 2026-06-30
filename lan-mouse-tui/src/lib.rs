@@ -8,11 +8,12 @@
 //! Tab switches focus between the *devices* panel (outgoing clients you cross to)
 //! and the *trusted* panel (incoming peers allowed to control this machine).
 //! Devices: a=add, d=delete, n=name, p=position, space=on/off. Trusted:
-//! n=rename, d=revoke. Global: r=re-enable, s=save, t=theme, ↑↓=select, q=close.
+//! n=rename, d=revoke. Global: l=activity log, o=listen port, r=re-enable,
+//! s=save, t=theme, ↑↓=select, q=close.
 //! An untrusted peer that connects raises an approve/deny pairing prompt.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io,
     time::{Duration, Instant},
 };
@@ -57,6 +58,8 @@ enum Input {
     Hostname { handle: ClientHandle, buf: String },
     /// Naming a trusted peer (new pairing approval, or rename existing).
     TrustedName { fp: String, buf: String },
+    /// Editing the daemon's listen port.
+    Port { buf: String },
 }
 
 impl Input {
@@ -64,6 +67,7 @@ impl Input {
         match self {
             Input::Hostname { buf, .. } => buf,
             Input::TrustedName { buf, .. } => buf,
+            Input::Port { buf } => buf,
         }
     }
 }
@@ -124,6 +128,7 @@ pub async fn run() -> Result<(), TuiError> {
     // fingerprint -> when the user last denied it; snoozes the prompt for
     // DISMISS_TTL so a retrying peer doesn't nag, but a later attempt re-asks.
     let mut dismissed: HashMap<String, Instant> = HashMap::new();
+    let mut show_log = false;
 
     let result = loop {
         let model = client.snapshot();
@@ -170,6 +175,7 @@ pub async fn run() -> Result<(), TuiError> {
                 input.as_ref(),
                 confirm.as_ref(),
                 pairing.as_deref(),
+                show_log,
                 theme,
             )
         }) {
@@ -203,6 +209,11 @@ pub async fn run() -> Result<(), TuiError> {
                                         buf.trim().to_string()
                                     };
                                     client.request(FrontendRequest::AuthorizeKey(desc, fp));
+                                }
+                                Input::Port { buf } => {
+                                    if let Ok(port) = buf.trim().parse::<u16>() {
+                                        client.request(FrontendRequest::ChangePort(port));
+                                    }
                                 }
                             },
                             KeyCode::Esc => input = None,
@@ -240,6 +251,13 @@ pub async fn run() -> Result<(), TuiError> {
                             }
                             _ => {}
                         }
+                    } else if show_log {
+                        // ---- activity-log overlay ----
+                        match k.code {
+                            KeyCode::Char('q') => break Ok(()),
+                            KeyCode::Char('l') | KeyCode::Esc => show_log = false,
+                            _ => {}
+                        }
                     } else {
                         // ---- normal mode ----
                         match k.code {
@@ -275,6 +293,12 @@ pub async fn run() -> Result<(), TuiError> {
                             KeyCode::Char('t') => {
                                 theme_idx = (theme_idx + 1) % themes.len();
                                 theme::save_name(themes[theme_idx].name);
+                            }
+                            KeyCode::Char('l') => show_log = true,
+                            KeyCode::Char('o') => {
+                                input = Some(Input::Port {
+                                    buf: model.port.map(|p| p.to_string()).unwrap_or_default(),
+                                });
                             }
                             // panel-specific actions
                             _ => match focus {
@@ -380,6 +404,7 @@ fn ui(
     input: Option<&Input>,
     confirm: Option<&Confirm>,
     pairing: Option<&str>,
+    show_log: bool,
     theme: &Theme,
 ) {
     let base = Style::default().bg(col(theme.bg)).fg(col(theme.fg));
@@ -406,7 +431,7 @@ fn ui(
         .constraints([
             Constraint::Length(3),
             Constraint::Min(0),
-            Constraint::Length(4),
+            Constraint::Length(6),
         ])
         .split(f.area());
 
@@ -422,6 +447,13 @@ fn ui(
         status_span(model.capture, theme),
         Span::raw("   emulation: "),
         status_span(model.emulation, theme),
+        Span::styled(
+            format!(
+                "   port: {}",
+                model.port.map(|p| p.to_string()).unwrap_or_else(|| "—".into())
+            ),
+            muted,
+        ),
     ]);
     let title = format!(" grabbr-hop · {} ", theme.name);
     f.render_widget(
@@ -544,11 +576,13 @@ fn ui(
         chunks[2],
     );
 
-    // pairing-approval popup (only when nothing else is capturing input)
+    // overlays (only when nothing else is capturing input): pairing takes priority
     if let Some(fp) = pairing {
         if input.is_none() && confirm.is_none() {
             pairing_popup(f, fp, theme);
         }
+    } else if show_log && input.is_none() && confirm.is_none() {
+        log_overlay(f, &model.messages, theme);
     }
 }
 
@@ -568,6 +602,7 @@ fn footer_line(
         let (label, buf) = match inp {
             Input::Hostname { handle, buf } => (format!("name [{handle}]: "), buf.clone()),
             Input::TrustedName { buf, .. } => ("trust as: ".to_string(), buf.clone()),
+            Input::Port { buf } => ("listen port: ".to_string(), buf.clone()),
         };
         return Line::from(vec![
             Span::styled(label, key),
@@ -607,7 +642,14 @@ fn footer_line(
             }
         }
     }
-    for (k, label) in [("r", " re-en  "), ("s", " save  "), ("t", " theme  "), ("q", " close")] {
+    for (k, label) in [
+        ("l", " log  "),
+        ("o", " port  "),
+        ("r", " re-en  "),
+        ("s", " save  "),
+        ("t", " theme  "),
+        ("q", " close"),
+    ] {
         spans.push(Span::styled(k, key));
         spans.push(Span::raw(label));
     }
@@ -643,6 +685,40 @@ fn pairing_popup(f: &mut Frame, fp: &str, theme: &Theme) {
     f.render_widget(Clear, area);
     f.render_widget(
         Paragraph::new(body)
+            .wrap(Wrap { trim: false })
+            .style(base)
+            .block(block),
+        area,
+    );
+}
+
+/// Render a centered overlay of the recent activity log (newest at the bottom).
+fn log_overlay(f: &mut Frame, messages: &VecDeque<String>, theme: &Theme) {
+    let h = f.area().height.saturating_sub(4).max(6);
+    let area = centered_rect(80, h, f.area());
+    let base = Style::default().bg(col(theme.bg)).fg(col(theme.fg));
+    let accent = Style::default().fg(col(theme.accent)).bg(col(theme.bg));
+    let muted = Style::default().fg(col(theme.muted)).bg(col(theme.bg));
+    let cap = area.height.saturating_sub(2) as usize;
+    let lines: Vec<Line> = if messages.is_empty() {
+        vec![Line::from(Span::styled("no activity yet", muted))]
+    } else {
+        messages
+            .iter()
+            .rev()
+            .take(cap)
+            .rev()
+            .map(|m| Line::from(Span::styled(m.clone(), base)))
+            .collect()
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(accent)
+        .style(base)
+        .title(Span::styled(" activity log · l/esc close ", accent));
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .style(base)
             .block(block),
