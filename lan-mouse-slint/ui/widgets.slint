@@ -1,0 +1,134 @@
+// grabbr-hop reusable UI atoms — built from the design tokens (theme.slint), so
+// every control is themed and consistent. Kept presentational: no app state, just
+// inputs + a `clicked` callback where relevant. Composition lives in app.slint.
+
+import { Theme, Type, Space, Radius, Motion } from "theme.slint";
+
+// A rounded surface panel. Tonal elevation: surface sits above the window bg.
+export component Card inherits Rectangle {
+    background: Theme.c.surface;
+    border-radius: Radius.lg;
+    border-width: 1px;
+    border-color: Theme.c.border;
+}
+
+// Hairline separator.
+export component Separator inherits Rectangle {
+    height: 1px;
+    background: Theme.c.border;
+}
+
+// Small status dot.
+export component Dot inherits Rectangle {
+    in property <color> tint: Theme.c.muted;
+    width: 8px;
+    height: 8px;
+    border-radius: self.width / 2;
+    background: root.tint;
+}
+
+// A compact rounded label (position, state, …). Hugs its text.
+export component Chip inherits Rectangle {
+    in property <string> text;
+    in property <color> text-color: Theme.c.muted;
+    in property <color> fill: Theme.c.surface-raised;
+    background: root.fill;
+    border-radius: Radius.sm;
+    horizontal-stretch: 0;
+    HorizontalLayout {
+        padding-left: Space.sm;
+        padding-right: Space.sm;
+        padding-top: 3px;
+        padding-bottom: 3px;
+        Text {
+            text: root.text;
+            color: root.text-color;
+            font-size: Type.caption;
+            font-weight: Type.semibold;
+        }
+    }
+}
+
+// Labeled stat ("capture · on"). Label in sans, value in mono with tracking.
+export component StatChip inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    in property <color> value-color: Theme.c.foreground;
+    background: Theme.c.surface;
+    border-radius: Radius.sm;
+    border-width: 1px;
+    border-color: Theme.c.border;
+    horizontal-stretch: 0;
+    HorizontalLayout {
+        padding-left: Space.sm;
+        padding-right: Space.sm;
+        padding-top: 4px;
+        padding-bottom: 4px;
+        spacing: 6px;
+        Text {
+            text: root.label;
+            color: Theme.c.muted;
+            font-size: Type.caption;
+        }
+        Text {
+            text: root.value;
+            color: root.value-color;
+            font-family: Type.mono;
+            font-size: Type.caption;
+            font-weight: Type.bold;
+            letter-spacing: Type.mono-tracking;
+        }
+    }
+}
+
+// Section eyebrow ("DEVICES"). Pass uppercase text; tracking gives the premium feel.
+export component SectionTitle inherits Text {
+    font-size: Type.small;
+    font-weight: Type.semibold;
+    color: Theme.c.muted;
+    letter-spacing: 0.8px;
+}
+
+// A pill button. `primary` = filled accent, `danger` = filled error, else outline.
+export component PillButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary: false;
+    in property <bool> danger: false;
+    in property <bool> enabled: true;
+    callback clicked;
+
+    property <color> base: root.danger
+        ? Theme.c.error
+        : (root.primary ? Theme.c.accent : Theme.c.surface-raised);
+    property <bool> filled: root.primary || root.danger;
+
+    horizontal-stretch: 0;
+    border-radius: Radius.sm;
+    border-width: root.filled ? 0px : 1px;
+    border-color: Theme.c.border;
+    opacity: root.enabled ? 1.0 : 0.45;
+    background: !root.enabled
+        ? root.base
+        : (ta.pressed ? root.base.darker(0.12) : (ta.has-hover ? root.base.brighter(0.12) : root.base));
+    animate background { duration: Motion.fast; }
+
+    HorizontalLayout {
+        padding-left: Space.md;
+        padding-right: Space.md;
+        padding-top: 6px;
+        padding-bottom: 6px;
+        alignment: center;
+        Text {
+            text: root.text;
+            color: root.filled ? Theme.c.on-accent : Theme.c.foreground;
+            font-size: Type.small;
+            font-weight: Type.semibold;
+        }
+    }
+
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}

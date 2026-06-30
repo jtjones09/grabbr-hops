@@ -1,0 +1,110 @@
+// grabbr-hop design language — the single source of truth for the GUI.
+//
+// One token system, rendered identically on macOS / Windows / Linux / Pi (Slint
+// draws its own pixels). Encodes the Hotash house style: Space Grotesk + Space
+// Mono, restraint (one accent, grayscale rest), tonal elevation (lighter surface
+// = higher, no drop shadows in the dark themes). Everything in logical `px` so it
+// scales cleanly across HiDPI.
+
+// --- font registration (makes the families available app-wide) ----------------
+import "../fonts/SpaceGrotesk-Regular.ttf";
+import "../fonts/SpaceGrotesk-Medium.ttf";
+import "../fonts/SpaceGrotesk-SemiBold.ttf";
+import "../fonts/SpaceGrotesk-Bold.ttf";
+import "../fonts/SpaceMono-Regular.ttf";
+import "../fonts/SpaceMono-Bold.ttf";
+
+// --- spacing scale (4px base) -------------------------------------------------
+export global Space {
+    out property <length> xs: 4px;
+    out property <length> sm: 8px;
+    out property <length> md: 12px;
+    out property <length> lg: 16px;
+    out property <length> xl: 20px;
+    out property <length> xxl: 24px;
+    out property <length> xxxl: 32px;
+}
+
+// --- corner radii -------------------------------------------------------------
+export global Radius {
+    out property <length> sm: 6px;   // chips, small buttons
+    out property <length> md: 10px;  // rows, cards
+    out property <length> lg: 14px;  // window, panels
+    out property <length> pill: 999px;
+}
+
+// --- typography ---------------------------------------------------------------
+export global Type {
+    out property <string> sans: "Space Grotesk";
+    out property <string> mono: "Space Mono";
+    out property <length> caption: 11px;
+    out property <length> small: 12px;
+    out property <length> body: 14px;
+    out property <length> heading: 16px;
+    out property <length> title: 22px;
+    out property <int> regular: 400;
+    out property <int> medium: 500;
+    out property <int> semibold: 600;
+    out property <int> bold: 700;
+    // letter-spacing applied to mono at small sizes (keeps Space Mono legible
+    // in dense rows like the fingerprint / addresses)
+    out property <length> mono-tracking: 0.4px;
+}
+
+// --- motion -------------------------------------------------------------------
+export global Motion {
+    out property <duration> fast: 120ms;   // hover, press
+    out property <duration> base: 200ms;   // list/panel changes
+    out property <duration> slow: 320ms;   // overlays (pairing prompt)
+}
+
+// --- color: semantic taxonomy (mirrors Slint's built-in Palette) --------------
+// `color` (not `brush`) so components can derive hover/press/tint states with
+// .brighter() / .darker() / .transparentize().
+export struct ThemeColors {
+    background: color,       // window
+    surface: color,         // panels / list backgrounds
+    surface-raised: color,  // cards / controls / hover
+    foreground: color,      // primary text
+    muted: color,           // secondary text / hints
+    accent: color,          // the one accent
+    on-accent: color,       // text/icons on accent
+    selection: color,       // selected row tint
+    border: color,          // hairlines / separators
+    success: color,
+    warn: color,
+    error: color,
+}
+
+// The 6 themes as token sets. Rust sets `index`; `c` resolves the active palette.
+// Surfaces step up in luminance for elevation (dark themes) instead of shadows.
+export global Theme {
+    in-out property <int> index: 0;
+    out property <ThemeColors> c: root.palettes[root.index];
+    property <[ThemeColors]> palettes: [
+        // 0 — grabbr dark (default)
+        { background: #121216, surface: #1b1b22, surface-raised: #23232b,
+          foreground: #e8e8ea, muted: #8e8e99, accent: #579bff, on-accent: #101218,
+          selection: #1d2740, border: #2a2a33, success: #44c468, warn: #e7b84b, error: #f25d5d },
+        // 1 — catppuccin (mocha)
+        { background: #1e1e2e, surface: #282839, surface-raised: #313244,
+          foreground: #cdd6f4, muted: #9399b2, accent: #89b4fa, on-accent: #1e1e2e,
+          selection: #2a2a45, border: #45475a, success: #a6e3a1, warn: #f9e2af, error: #f38ba8 },
+        // 2 — nord
+        { background: #2e3440, surface: #3b4252, surface-raised: #434c5e,
+          foreground: #d8dee9, muted: #9aa3b5, accent: #88c0d0, on-accent: #2e3440,
+          selection: #3a4a5a, border: #4c566a, success: #a3be8c, warn: #ebcb8b, error: #bf616a },
+        // 3 — tokyo night
+        { background: #1a1b26, surface: #20212e, surface-raised: #292e42,
+          foreground: #c0caf5, muted: #8891c4, accent: #7aa2f7, on-accent: #1a1b26,
+          selection: #283457, border: #343a52, success: #9ece6a, warn: #e0af68, error: #f7768e },
+        // 4 — gruvbox
+        { background: #282828, surface: #32302f, surface-raised: #3c3836,
+          foreground: #ebdbb2, muted: #a89984, accent: #83a598, on-accent: #282828,
+          selection: #45403a, border: #504945, success: #b8bb26, warn: #fabd2f, error: #fb4934 },
+        // 5 — light
+        { background: #fafafa, surface: #f0f0f2, surface-raised: #ffffff,
+          foreground: #1b1b1b, muted: #6b6b6b, accent: #0066cc, on-accent: #ffffff,
+          selection: #dce8f8, border: #e0e0e4, success: #1d8a34, warn: #b86b00, error: #cc2f2f },
+    ];
+}

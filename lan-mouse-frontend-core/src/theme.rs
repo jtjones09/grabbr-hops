@@ -132,6 +132,13 @@ pub fn by_name(name: &str) -> Theme {
         .unwrap_or_else(default_theme)
 }
 
+/// Position of a built-in in [`builtins`] (0-based), or 0 if unknown. The Slint
+/// GUI uses this to select the matching palette from its own token table, so the
+/// `builtins()` order is the shared contract between the two front-ends.
+pub fn index_of(name: &str) -> usize {
+    builtins().iter().position(|t| t.name == name).unwrap_or(0)
+}
+
 fn pref_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     let mut p = PathBuf::from(home);

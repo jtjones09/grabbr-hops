@@ -11,7 +11,7 @@
 use std::{sync::mpsc, time::Duration};
 
 use lan_mouse_frontend_core::{theme, FrontendClient, Status};
-use slint::{ModelRc, VecModel};
+use slint::{ComponentHandle, ModelRc, VecModel};
 use thiserror::Error;
 
 slint::include_modules!();
@@ -29,10 +29,6 @@ fn status_text(s: Status) -> &'static str {
         Status::Enabled => "enabled",
         Status::Disabled => "disabled",
     }
-}
-
-fn slint_color(c: theme::Rgb) -> slint::Color {
-    slint::Color::from_rgb_u8(c.0, c.1, c.2)
 }
 
 /// First 16 hex chars of a fingerprint for a glanceable id.
@@ -62,24 +58,13 @@ pub fn run() -> Result<(), SlintError> {
 
     let ui = AppWindow::new()?;
 
-    // theme palette (UI-local preference, shared with the TUI)
-    let t = theme::load_name()
-        .map(|n| theme::by_name(&n))
-        .unwrap_or_else(theme::default_theme);
-    ui.set_palette(Palette {
-        bg: slint_color(t.bg),
-        fg: slint_color(t.fg),
-        muted: slint_color(t.muted),
-        accent: slint_color(t.accent),
-        success: slint_color(t.success),
-        warn: slint_color(t.warn),
-        error: slint_color(t.error),
-    });
-    // dot colors precomputed (theme is fixed for the session)
-    let c_success = slint_color(t.success);
-    let c_warn = slint_color(t.warn);
-    let c_muted = slint_color(t.muted);
-    let c_error = slint_color(t.error);
+    // theme is a UI-local preference shared with the TUI; tell the GUI which
+    // palette to select (the Slint side owns the actual color tables, keyed by
+    // the shared `builtins()` order).
+    let theme_name =
+        theme::load_name().unwrap_or_else(|| theme::default_theme().name.to_string());
+    ui.global::<Theme>()
+        .set_index(theme::index_of(&theme_name) as i32);
 
     // poll the model ~4x/sec and push it into the window
     let weak = ui.as_weak();
@@ -114,15 +99,9 @@ pub fn run() -> Result<(), SlintError> {
                         c.port
                     )
                     .into(),
-                    pos: format!("({})", c.pos).into(),
-                    state: if s.active { "active".into() } else { "off".into() },
-                    dot: if s.alive {
-                        c_success
-                    } else if s.active {
-                        c_warn
-                    } else {
-                        c_muted
-                    },
+                    pos: c.pos.to_string().into(),
+                    active: s.active,
+                    alive: s.alive,
                 })
                 .collect();
             ui.set_devices(ModelRc::new(VecModel::from(devices)));
@@ -136,14 +115,10 @@ pub fn run() -> Result<(), SlintError> {
             tv.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
             let trusted: Vec<TrustedRow> = tv
                 .iter()
-                .map(|(fp, desc)| {
-                    let online = m.connected_peers.contains(fp);
-                    TrustedRow {
-                        name: desc.clone().into(),
-                        fp: short_fp(fp).into(),
-                        status: if online { "connected".into() } else { "offline".into() },
-                        dot: if online { c_success } else { c_error },
-                    }
+                .map(|(fp, desc)| TrustedRow {
+                    name: desc.clone().into(),
+                    fp: short_fp(fp).into(),
+                    online: m.connected_peers.contains(fp),
                 })
                 .collect();
             ui.set_trusted(ModelRc::new(VecModel::from(trusted)));

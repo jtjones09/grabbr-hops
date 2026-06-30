@@ -1,42 +1,38 @@
-// grabbr-hop Slint GUI — P1 (functional read-only: live status + device + trusted
-// lists, themed via the shared palette). Interactivity (add/trust/revoke) and the
-// visual polish come next — designed with eyes on the screen.
+// grabbr-hop — the GUI surface. Composes the design tokens (theme.slint) and the
+// atoms (widgets.slint) into the control panel: live status, the outgoing-device
+// list, and the trusted-peer list. Rust sets `Theme.index` (active palette) plus
+// the status fields and the two lists. Read-only for now; the action callbacks
+// (toggle / add / revoke) land next.
 
-export struct Palette {
-    bg: color,
-    fg: color,
-    muted: color,
-    accent: color,
-    success: color,
-    warn: color,
-    error: color,
-}
+import { Theme, Type, Space, Radius, Motion } from "theme.slint";
+import { Card, Separator, Dot, Chip, StatChip, SectionTitle, PillButton } from "widgets.slint";
+
+// re-export so Rust can select the active palette via `ui.global::<Theme>()`
+export { Theme }
 
 export struct DeviceRow {
-    label: string,
-    pos: string,
-    state: string,
-    dot: color,
+    label: string,   // "[handle] hostname:port"
+    pos: string,     // "left" / "right" / …
+    active: bool,    // capture is routed to this device
+    alive: bool,     // device is reachable
 }
 
 export struct TrustedRow {
     name: string,
-    fp: string,
-    status: string,
-    dot: color,
+    fp: string,      // short fingerprint
+    online: bool,
 }
 
 export component AppWindow inherits Window {
     title: "grabbr-hop";
-    preferred-width: 560px;
-    preferred-height: 460px;
-    min-width: 380px;
-    min-height: 300px;
+    default-font-family: Type.sans;
+    default-font-size: Type.body;
+    preferred-width: 600px;
+    preferred-height: 520px;
+    min-width: 440px;
+    min-height: 380px;
+    background: Theme.c.background;
 
-    in property <Palette> palette: {
-        bg: #121216, fg: #e8e8ea, muted: #8e8e99, accent: #579bff,
-        success: #44c468, warn: #e7b84b, error: #f25d5d,
-    };
     in property <bool> connected: false;
     in property <string> capture: "—";
     in property <string> emulation: "—";
@@ -45,67 +41,209 @@ export component AppWindow inherits Window {
     in property <[DeviceRow]> devices: [];
     in property <[TrustedRow]> trusted: [];
 
-    background: palette.bg;
-
     VerticalLayout {
-        padding: 18px;
-        spacing: 12px;
+        padding: Space.xxl;
+        spacing: Space.lg;
 
-        Text {
-            text: "grabbr-hop";
-            font-size: 22px;
-            font-weight: 800;
-            color: palette.accent;
-        }
-
+        // --- header: wordmark + connection pill ---------------------------------
         HorizontalLayout {
-            spacing: 20px;
-            Text {
-                text: root.connected ? "● connected" : "○ connecting…";
-                color: root.connected ? palette.success : palette.warn;
+            alignment: space-between;
+            VerticalLayout {
+                spacing: 2px;
+                vertical-stretch: 0;
+                Text {
+                    text: "grabbr-hop";
+                    font-size: Type.title;
+                    font-weight: Type.bold;
+                    color: Theme.c.foreground;
+                }
+                Text {
+                    text: "software KVM";
+                    font-family: Type.mono;
+                    font-size: Type.caption;
+                    letter-spacing: Type.mono-tracking;
+                    color: Theme.c.muted;
+                }
             }
-            Text { text: "capture: " + root.capture; color: palette.fg; }
-            Text { text: "emulation: " + root.emulation; color: palette.fg; }
-            Text { text: "port: " + root.port; color: palette.muted; }
+            Rectangle {
+                horizontal-stretch: 0;
+                vertical-stretch: 0;
+                background: root.connected
+                    ? Theme.c.success.transparentize(0.86)
+                    : Theme.c.warn.transparentize(0.86);
+                border-radius: Radius.pill;
+                border-width: 1px;
+                border-color: root.connected
+                    ? Theme.c.success.transparentize(0.6)
+                    : Theme.c.warn.transparentize(0.6);
+                HorizontalLayout {
+                    padding-left: Space.md;
+                    padding-right: Space.md;
+                    padding-top: 6px;
+                    padding-bottom: 6px;
+                    spacing: Space.sm;
+                    Dot { tint: root.connected ? Theme.c.success : Theme.c.warn; }
+                    Text {
+                        text: root.connected ? "connected" : "connecting";
+                        color: root.connected ? Theme.c.success : Theme.c.warn;
+                        font-size: Type.small;
+                        font-weight: Type.semibold;
+                    }
+                }
+            }
         }
 
-        Rectangle { height: 1px; background: palette.muted; }
-
-        Text { text: "devices (cross to)"; font-weight: 700; color: palette.accent; }
-        if root.devices.length == 0: Text {
-            text: "none — this device only receives";
-            color: palette.muted;
-        }
-        for d in root.devices: HorizontalLayout {
-            spacing: 8px;
-            Text { text: "●"; color: d.dot; }
-            Text { text: d.label; color: palette.fg; }
-            Text { text: d.pos; color: palette.accent; }
-            Text { text: d.state; color: palette.muted; }
-        }
-
-        Rectangle { height: 1px; background: palette.muted; }
-
-        Text { text: "trusted devices"; font-weight: 700; color: palette.accent; }
-        if root.trusted.length == 0: Text {
-            text: "no trusted devices";
-            color: palette.muted;
-        }
-        for t in root.trusted: HorizontalLayout {
-            spacing: 8px;
-            Text { text: "●"; color: t.dot; }
-            Text { text: t.name; color: palette.fg; }
-            Text { text: t.fp; color: palette.muted; }
-            Text { text: t.status; color: t.dot; }
+        // --- status strip -------------------------------------------------------
+        HorizontalLayout {
+            spacing: Space.sm;
+            alignment: start;
+            StatChip {
+                label: "capture";
+                value: root.capture;
+                value-color: root.capture == "enabled" ? Theme.c.success : Theme.c.muted;
+            }
+            StatChip {
+                label: "emulation";
+                value: root.emulation;
+                value-color: root.emulation == "enabled" ? Theme.c.success : Theme.c.muted;
+            }
+            StatChip {
+                label: "port";
+                value: root.port;
+            }
         }
 
-        Rectangle { } // spacer pushes the fingerprint to the bottom
+        // --- devices ------------------------------------------------------------
+        SectionTitle { text: "DEVICES"; }
+        Card {
+            vertical-stretch: 0;
+            VerticalLayout {
+                padding: Space.sm;
+                spacing: 2px;
+                if root.devices.length == 0: HorizontalLayout {
+                    padding: Space.sm;
+                    Text {
+                        text: "no outgoing devices — this Mac only receives";
+                        color: Theme.c.muted;
+                        font-size: Type.small;
+                    }
+                }
+                for d in root.devices: Rectangle {
+                    height: 46px;
+                    border-radius: Radius.md;
+                    background: drow.has-hover ? Theme.c.surface-raised : transparent;
+                    animate background { duration: Motion.fast; }
+                    HorizontalLayout {
+                        padding-left: Space.md;
+                        padding-right: Space.md;
+                        spacing: Space.md;
+                        Dot {
+                            tint: d.alive
+                                ? Theme.c.success
+                                : (d.active ? Theme.c.warn : Theme.c.muted);
+                        }
+                        Text {
+                            text: d.label;
+                            color: Theme.c.foreground;
+                            font-weight: Type.medium;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                            vertical-alignment: center;
+                        }
+                        Chip {
+                            text: d.pos;
+                            text-color: Theme.c.accent;
+                            fill: Theme.c.accent.transparentize(0.85);
+                        }
+                        Chip {
+                            text: d.alive ? "active" : (d.active ? "idle" : "off");
+                            text-color: d.alive
+                                ? Theme.c.success
+                                : (d.active ? Theme.c.warn : Theme.c.muted);
+                            fill: Theme.c.surface-raised;
+                        }
+                    }
+                    drow := TouchArea {}
+                }
+            }
+        }
 
-        Text {
-            text: "this device: " + root.fingerprint;
-            color: palette.muted;
-            font-size: 10px;
-            wrap: word-wrap;
+        // --- trusted peers ------------------------------------------------------
+        SectionTitle { text: "TRUSTED"; }
+        Card {
+            vertical-stretch: 0;
+            VerticalLayout {
+                padding: Space.sm;
+                spacing: 2px;
+                if root.trusted.length == 0: HorizontalLayout {
+                    padding: Space.sm;
+                    Text {
+                        text: "no trusted devices yet";
+                        color: Theme.c.muted;
+                        font-size: Type.small;
+                    }
+                }
+                for t in root.trusted: Rectangle {
+                    height: 50px;
+                    border-radius: Radius.md;
+                    background: trow.has-hover ? Theme.c.surface-raised : transparent;
+                    animate background { duration: Motion.fast; }
+                    HorizontalLayout {
+                        padding-left: Space.md;
+                        padding-right: Space.md;
+                        spacing: Space.md;
+                        Dot { tint: t.online ? Theme.c.success : Theme.c.muted; }
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 1px;
+                            horizontal-stretch: 1;
+                            Text {
+                                text: t.name;
+                                color: Theme.c.foreground;
+                                font-weight: Type.medium;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: t.fp;
+                                color: Theme.c.muted;
+                                font-family: Type.mono;
+                                font-size: Type.caption;
+                                letter-spacing: Type.mono-tracking;
+                                overflow: elide;
+                            }
+                        }
+                        Chip {
+                            text: t.online ? "connected" : "offline";
+                            text-color: t.online ? Theme.c.success : Theme.c.muted;
+                            fill: Theme.c.surface-raised;
+                        }
+                    }
+                    trow := TouchArea {}
+                }
+            }
+        }
+
+        Rectangle { vertical-stretch: 1; } // pushes the footer to the bottom
+
+        // --- footer: this device's id ------------------------------------------
+        HorizontalLayout {
+            spacing: Space.sm;
+            Text {
+                text: "device id";
+                color: Theme.c.muted;
+                font-size: Type.caption;
+                vertical-alignment: center;
+            }
+            Text {
+                text: root.fingerprint;
+                color: Theme.c.muted;
+                font-family: Type.mono;
+                font-size: Type.caption;
+                letter-spacing: Type.mono-tracking;
+                overflow: elide;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
         }
     }
 }
