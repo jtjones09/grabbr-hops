@@ -1,16 +1,18 @@
 // grabbr-hop — the GUI surface. Composes the design tokens (theme.slint) and the
 // atoms (widgets.slint) into the control panel: live status, the outgoing-device
-// list, and the trusted-peer list. Rust sets `Theme.index` (active palette) plus
-// the status fields and the two lists. Read-only for now; the action callbacks
-// (toggle / add / revoke) land next.
+// list, and the trusted-peer list, with the core interactions wired — approve a
+// Windows→Mac pairing, re-enable input, toggle a device, revoke trust (confirm-
+// gated). Rust sets `Theme.index`, the status fields, the two lists, and the live
+// `pairing-fp`; the callbacks below send `FrontendRequest`s back through Rust.
 
 import { Theme, Type, Space, Radius, Motion } from "theme.slint";
-import { Card, Separator, Dot, Chip, StatChip, SectionTitle, PillButton } from "widgets.slint";
+import { Card, Separator, Dot, Chip, StatChip, SectionTitle, PillButton, TextField } from "widgets.slint";
 
 // re-export so Rust can select the active palette via `ui.global::<Theme>()`
 export { Theme }
 
 export struct DeviceRow {
+    handle: string,  // ClientHandle (u64 as text — Slint int is only i32)
     label: string,   // "[handle] hostname:port"
     pos: string,     // "left" / "right" / …
     active: bool,    // capture is routed to this device
@@ -19,7 +21,8 @@ export struct DeviceRow {
 
 export struct TrustedRow {
     name: string,
-    fp: string,      // short fingerprint
+    fp: string,      // short fingerprint (display)
+    fp-full: string, // full fingerprint (for requests)
     online: bool,
 }
 
@@ -28,9 +31,9 @@ export component AppWindow inherits Window {
     default-font-family: Type.sans;
     default-font-size: Type.body;
     preferred-width: 600px;
-    preferred-height: 520px;
+    preferred-height: 540px;
     min-width: 440px;
-    min-height: 380px;
+    min-height: 400px;
     background: Theme.c.background;
 
     in property <bool> connected: false;
@@ -40,6 +43,18 @@ export component AppWindow inherits Window {
     in property <string> fingerprint: "—";
     in property <[DeviceRow]> devices: [];
     in property <[TrustedRow]> trusted: [];
+    // full fingerprint of a peer awaiting pairing approval ("" = none). Rust
+    // sets this only while the request is live (freshness + snooze applied).
+    in property <string> pairing-fp: "";
+
+    // UI-local: which trusted row is mid-revoke-confirm ("" = none)
+    property <string> confirm-revoke-fp: "";
+
+    callback enable-input();
+    callback activate-device(string /* handle */, bool /* active */);
+    callback revoke(string /* full fingerprint */);
+    callback approve-pairing(string /* name */, string /* full fingerprint */);
+    callback deny-pairing(string /* full fingerprint */);
 
     VerticalLayout {
         padding: Space.xxl;
@@ -93,6 +108,56 @@ export component AppWindow inherits Window {
             }
         }
 
+        // --- pairing request banner (Windows wants to connect to this Mac) ------
+        if root.pairing-fp != "": Rectangle {
+            vertical-stretch: 0;
+            background: Theme.c.accent.transparentize(0.88);
+            border-radius: Radius.lg;
+            border-width: 1px;
+            border-color: Theme.c.accent.transparentize(0.5);
+            VerticalLayout {
+                padding: Space.md;
+                spacing: Space.sm;
+                Text {
+                    text: "pairing request";
+                    color: Theme.c.accent;
+                    font-size: Type.small;
+                    font-weight: Type.semibold;
+                }
+                Text {
+                    text: root.pairing-fp;
+                    color: Theme.c.muted;
+                    font-family: Type.mono;
+                    font-size: Type.caption;
+                    letter-spacing: Type.mono-tracking;
+                    overflow: elide;
+                }
+                HorizontalLayout {
+                    spacing: Space.sm;
+                    name := TextField {
+                        placeholder: "name this device";
+                        horizontal-stretch: 1;
+                        accepted => {
+                            root.approve-pairing(self.text, root.pairing-fp);
+                            self.text = "";
+                        }
+                    }
+                    PillButton {
+                        text: "approve";
+                        primary: true;
+                        clicked => {
+                            root.approve-pairing(name.text, root.pairing-fp);
+                            name.text = "";
+                        }
+                    }
+                    PillButton {
+                        text: "deny";
+                        clicked => { root.deny-pairing(root.pairing-fp); }
+                    }
+                }
+            }
+        }
+
         // --- status strip -------------------------------------------------------
         HorizontalLayout {
             spacing: Space.sm;
@@ -110,6 +175,11 @@ export component AppWindow inherits Window {
             StatChip {
                 label: "port";
                 value: root.port;
+            }
+            if root.capture != "enabled" || root.emulation != "enabled": PillButton {
+                text: "enable input";
+                primary: true;
+                clicked => { root.enable-input(); }
             }
         }
 
@@ -131,6 +201,7 @@ export component AppWindow inherits Window {
                 for d in root.devices: Rectangle {
                     height: 46px;
                     border-radius: Radius.md;
+                    drow := TouchArea {}
                     background: drow.has-hover ? Theme.c.surface-raised : transparent;
                     animate background { duration: Motion.fast; }
                     HorizontalLayout {
@@ -155,15 +226,12 @@ export component AppWindow inherits Window {
                             text-color: Theme.c.accent;
                             fill: Theme.c.accent.transparentize(0.85);
                         }
-                        Chip {
-                            text: d.alive ? "active" : (d.active ? "idle" : "off");
-                            text-color: d.alive
-                                ? Theme.c.success
-                                : (d.active ? Theme.c.warn : Theme.c.muted);
-                            fill: Theme.c.surface-raised;
+                        PillButton {
+                            text: d.active ? "on" : "off";
+                            primary: d.active;
+                            clicked => { root.activate-device(d.handle, !d.active); }
                         }
                     }
-                    drow := TouchArea {}
                 }
             }
         }
@@ -186,6 +254,7 @@ export component AppWindow inherits Window {
                 for t in root.trusted: Rectangle {
                     height: 50px;
                     border-radius: Radius.md;
+                    trow := TouchArea {}
                     background: trow.has-hover ? Theme.c.surface-raised : transparent;
                     animate background { duration: Motion.fast; }
                     HorizontalLayout {
@@ -212,13 +281,36 @@ export component AppWindow inherits Window {
                                 overflow: elide;
                             }
                         }
-                        Chip {
+                        // normal trailing controls
+                        if root.confirm-revoke-fp != t.fp-full: Chip {
                             text: t.online ? "connected" : "offline";
                             text-color: t.online ? Theme.c.success : Theme.c.muted;
                             fill: Theme.c.surface-raised;
                         }
+                        if root.confirm-revoke-fp != t.fp-full: PillButton {
+                            text: "revoke";
+                            clicked => { root.confirm-revoke-fp = t.fp-full; }
+                        }
+                        // confirm state
+                        if root.confirm-revoke-fp == t.fp-full: Text {
+                            text: "remove trust?";
+                            color: Theme.c.muted;
+                            font-size: Type.caption;
+                            vertical-alignment: center;
+                        }
+                        if root.confirm-revoke-fp == t.fp-full: PillButton {
+                            text: "yes";
+                            danger: true;
+                            clicked => {
+                                root.revoke(t.fp-full);
+                                root.confirm-revoke-fp = "";
+                            }
+                        }
+                        if root.confirm-revoke-fp == t.fp-full: PillButton {
+                            text: "no";
+                            clicked => { root.confirm-revoke-fp = ""; }
+                        }
                     }
-                    trow := TouchArea {}
                 }
             }
         }

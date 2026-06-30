@@ -1,4 +1,5 @@
-//! grabbr-hop Slint GUI frontend (P1 — live status + device/trusted lists).
+//! grabbr-hop Slint GUI frontend (P2 — live status + device/trusted lists,
+//! token-driven design system, core interactions wired).
 //!
 //! Mirrors the TUI's architecture: a background tokio thread owns the
 //! auto-reconnecting [`lan_mouse_frontend_core::FrontendClient`], and the Slint
@@ -6,15 +7,28 @@
 //! into the window — status fields plus the device + trusted lists as Slint
 //! models. Slint components/models aren't `Send`, so the model snapshot crosses
 //! threads (the client handle is `Send + Sync`) and the `VecModel`s are built on
-//! the UI thread. Read-only for now; interactivity is the next step.
+//! the UI thread. UI callbacks send [`FrontendRequest`]s back through the client.
 
-use std::{sync::mpsc, time::Duration};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    rc::Rc,
+    sync::mpsc,
+    time::{Duration, Instant},
+};
 
-use lan_mouse_frontend_core::{theme, FrontendClient, Status};
+use lan_mouse_frontend_core::{theme, FrontendClient, FrontendRequest, Status};
 use slint::{ComponentHandle, ModelRc, VecModel};
 use thiserror::Error;
 
 slint::include_modules!();
+
+/// A pairing prompt is "live" only this long after the last connection attempt
+/// (the daemon emits no retraction); matches the TUI's `STALE_TTL`.
+const STALE_TTL: Duration = Duration::from_secs(12);
+/// After the user denies a pairing, snooze the prompt this long so a retrying
+/// peer doesn't nag — but a later attempt re-asks; matches the TUI's `DISMISS_TTL`.
+const DISMISS_TTL: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Error)]
 pub enum SlintError {
@@ -66,6 +80,52 @@ pub fn run() -> Result<(), SlintError> {
     ui.global::<Theme>()
         .set_index(theme::index_of(&theme_name) as i32);
 
+    // fingerprints the user has denied -> when (UI-local snooze; see DISMISS_TTL).
+    // Shared between the deny callback and the poll loop, both on the UI thread.
+    let dismissed: Rc<RefCell<HashMap<String, Instant>>> = Rc::new(RefCell::new(HashMap::new()));
+
+    // --- wire UI actions -> FrontendRequests (each closure owns a client clone) ---
+    {
+        let c = client.clone();
+        ui.on_enable_input(move || {
+            c.request(FrontendRequest::EnableCapture);
+            c.request(FrontendRequest::EnableEmulation);
+        });
+    }
+    {
+        let c = client.clone();
+        ui.on_activate_device(move |handle, active| {
+            if let Ok(h) = handle.as_str().parse::<u64>() {
+                c.request(FrontendRequest::Activate(h, active));
+            }
+        });
+    }
+    {
+        let c = client.clone();
+        ui.on_revoke(move |fp| {
+            c.request(FrontendRequest::RemoveAuthorizedKey(fp.to_string()));
+        });
+    }
+    {
+        let c = client.clone();
+        ui.on_approve_pairing(move |name, fp| {
+            let desc = if name.trim().is_empty() {
+                "device".to_string()
+            } else {
+                name.trim().to_string()
+            };
+            c.request(FrontendRequest::AuthorizeKey(desc, fp.to_string()));
+        });
+    }
+    {
+        let dismissed = dismissed.clone();
+        ui.on_deny_pairing(move |fp| {
+            dismissed
+                .borrow_mut()
+                .insert(fp.to_string(), Instant::now());
+        });
+    }
+
     // poll the model ~4x/sec and push it into the window
     let weak = ui.as_weak();
     let timer = slint::Timer::default();
@@ -87,11 +147,32 @@ pub fn run() -> Result<(), SlintError> {
             );
             ui.set_fingerprint(m.fingerprint.as_deref().unwrap_or("—").into());
 
+            // a live pairing prompt: untrusted, still actively attempting (not a
+            // stale prompt for a peer that left), and not currently snooze-dismissed
+            let pairing = m
+                .pending_pairing
+                .as_ref()
+                .filter(|fp| {
+                    !m.authorized.contains_key(*fp)
+                        && m.pending_pairing_since
+                            .map(|t| t.elapsed() < STALE_TTL)
+                            .unwrap_or(false)
+                        && dismissed
+                            .borrow()
+                            .get(*fp)
+                            .map(|t| t.elapsed() >= DISMISS_TTL)
+                            .unwrap_or(true)
+                })
+                .cloned()
+                .unwrap_or_default();
+            ui.set_pairing_fp(pairing.into());
+
             // outgoing devices
             let devices: Vec<DeviceRow> = m
                 .clients
                 .iter()
                 .map(|(h, (c, s))| DeviceRow {
+                    handle: h.to_string().into(),
                     label: format!(
                         "[{}] {}:{}",
                         h,
@@ -118,6 +199,7 @@ pub fn run() -> Result<(), SlintError> {
                 .map(|(fp, desc)| TrustedRow {
                     name: desc.clone().into(),
                     fp: short_fp(fp).into(),
+                    fp_full: fp.clone().into(),
                     online: m.connected_peers.contains(fp),
                 })
                 .collect();

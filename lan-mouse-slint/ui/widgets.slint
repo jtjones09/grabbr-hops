@@ -132,3 +132,40 @@ export component PillButton inherits Rectangle {
         clicked => { root.clicked(); }
     }
 }
+
+// A single-line text field built on the low-level TextInput so it matches the
+// design tokens (no stock-widget chrome). Accent border on focus, themed caret
+// selection, muted placeholder that hides once focused.
+export component TextField inherits Rectangle {
+    in property <string> placeholder;
+    in-out property <string> text <=> ti.text;
+    callback accepted <=> ti.accepted;
+    forward-focus: ti;
+    height: 30px;
+    background: Theme.c.surface-raised;
+    border-radius: Radius.sm;
+    border-width: 1px;
+    border-color: ti.has-focus ? Theme.c.accent : Theme.c.border;
+    animate border-color { duration: Motion.fast; }
+
+    Text {
+        x: Space.sm;
+        height: 100%;
+        vertical-alignment: center;
+        text: root.placeholder;
+        color: Theme.c.muted;
+        font-size: Type.small;
+        visible: ti.text == "" && !ti.has-focus;
+    }
+    ti := TextInput {
+        x: Space.sm;
+        width: parent.width - 2 * Space.sm;
+        height: 100%;
+        vertical-alignment: center;
+        color: Theme.c.foreground;
+        font-size: Type.small;
+        single-line: true;
+        selection-background-color: Theme.c.accent;
+        selection-foreground-color: Theme.c.on-accent;
+    }
+}
