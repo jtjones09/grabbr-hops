@@ -33,6 +33,7 @@ impl ClientManager {
             port: config_client.port,
             pos: config_client.pos,
             cmd: config_client.enter_hook,
+            geometry: None,
         };
         let state = ClientState {
             active: config_client.active,

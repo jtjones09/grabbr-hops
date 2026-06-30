@@ -128,6 +128,17 @@ impl TryFrom<&str> for Position {
     }
 }
 
+/// A node's rectangle in the unified virtual-desktop space, for spatial
+/// (coordinate-based) edge crossing. `None` on a client means "use the edge-based
+/// `pos` model" — the default until the layout canvas (P4) assigns geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Geometry {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
     /// hostname of this client
@@ -140,6 +151,11 @@ pub struct ClientConfig {
     pub pos: Position,
     /// enter hook
     pub cmd: Option<String>,
+    /// spatial geometry (rect in the virtual desktop) for coordinate-based
+    /// crossing; `None` = use the edge-based `pos` model. Additive P4 layout
+    /// foundation — set by the layout canvas, read by coordinate crossing.
+    #[serde(default)]
+    pub geometry: Option<Geometry>,
 }
 
 impl Default for ClientConfig {
@@ -150,6 +166,7 @@ impl Default for ClientConfig {
             fix_ips: Default::default(),
             pos: Default::default(),
             cmd: None,
+            geometry: None,
         }
     }
 }
