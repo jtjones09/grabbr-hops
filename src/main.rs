@@ -150,14 +150,57 @@ fn run_tui() -> Result<(), LanMouseError> {
 }
 
 /// `hops` with no subcommand: ensure the receiver is up, then open the user's
-/// preferred front-end (or the sensible default for this environment).
+/// preferred front-end (or the sensible default for this environment). On the
+/// very first launch, show the "choose your interface" onboarding screen first
+/// and persist the pick, so every launch after that is a single, silent step.
 #[cfg(all(not(feature = "gtk"), any(feature = "tui", feature = "slint")))]
 fn front_door() -> Result<(), LanMouseError> {
-    use lan_mouse_frontend_core::prefs::{load_frontend, Frontend};
+    use lan_mouse_frontend_core::prefs::{
+        load_frontend, onboarding_done, save_frontend, set_onboarding_done, Frontend,
+    };
     ensure_daemon_running();
-    match load_frontend().unwrap_or_else(default_frontend) {
+
+    let frontend = if onboarding_done() {
+        load_frontend().unwrap_or_else(default_frontend)
+    } else if let Some(chosen) = run_onboarding_picker() {
+        save_frontend(chosen);
+        set_onboarding_done();
+        chosen
+    } else {
+        // closed/escaped without picking — don't mark onboarding done (ask
+        // again next launch), just use the environment default for THIS run
+        default_frontend()
+    };
+
+    match frontend {
         Frontend::Tui => run_tui(),
         Frontend::Gui => run_gui(),
+    }
+}
+
+/// Show the first-run interface picker in whichever medium fits the
+/// environment — the same GUI-on-desktop/TUI-over-SSH question as
+/// [`default_frontend`], since which picker CAN run is the same question as
+/// which front-end runs by default.
+#[cfg(all(not(feature = "gtk"), any(feature = "tui", feature = "slint")))]
+fn run_onboarding_picker() -> Option<lan_mouse_frontend_core::prefs::Frontend> {
+    #[cfg(all(feature = "slint", feature = "tui"))]
+    {
+        let ssh = std::env::var_os("SSH_CONNECTION").is_some()
+            || std::env::var_os("SSH_TTY").is_some();
+        if ssh {
+            lan_mouse_tui::run_onboarding().ok().flatten()
+        } else {
+            lan_mouse_slint::run_onboarding().ok().flatten()
+        }
+    }
+    #[cfg(all(feature = "slint", not(feature = "tui")))]
+    {
+        lan_mouse_slint::run_onboarding().ok().flatten()
+    }
+    #[cfg(all(feature = "tui", not(feature = "slint")))]
+    {
+        lan_mouse_tui::run_onboarding().ok().flatten()
     }
 }
 

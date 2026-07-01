@@ -255,3 +255,48 @@ pub fn run() -> Result<(), SlintError> {
     drop(timer);
     Ok(())
 }
+
+/// Show the first-run "choose your interface" screen and block until the user
+/// picks one (or closes the window, in which case `Ok(None)` — the caller should
+/// treat that as "ask again next launch" rather than assuming a default, since
+/// closing isn't the same as choosing).
+pub fn run_onboarding() -> Result<Option<lan_mouse_frontend_core::prefs::Frontend>, SlintError> {
+    use lan_mouse_frontend_core::prefs::Frontend;
+
+    let ui = OnboardingWindow::new()?;
+
+    let themes = theme::all_themes();
+    ui.global::<Theme>().set_palettes(ModelRc::new(VecModel::from(
+        themes.iter().map(theme_colors).collect::<Vec<_>>(),
+    )));
+    let theme_name =
+        theme::load_name().unwrap_or_else(|| theme::default_theme().name.to_string());
+    ui.global::<Theme>()
+        .set_index(theme::index_of(&themes, &theme_name) as i32);
+
+    let choice: Rc<RefCell<Option<Frontend>>> = Rc::new(RefCell::new(None));
+    {
+        let choice = choice.clone();
+        let weak = ui.as_weak();
+        ui.on_choose_gui(move || {
+            *choice.borrow_mut() = Some(Frontend::Gui);
+            if let Some(ui) = weak.upgrade() {
+                let _ = ui.hide();
+            }
+        });
+    }
+    {
+        let choice = choice.clone();
+        let weak = ui.as_weak();
+        ui.on_choose_tui(move || {
+            *choice.borrow_mut() = Some(Frontend::Tui);
+            if let Some(ui) = weak.upgrade() {
+                let _ = ui.hide();
+            }
+        });
+    }
+
+    ui.run()?;
+    let picked = *choice.borrow();
+    Ok(picked)
+}

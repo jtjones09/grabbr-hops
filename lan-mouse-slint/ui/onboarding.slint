@@ -1,0 +1,109 @@
+// grabbr-hop — first-run "choose your interface" screen. This is the very first
+// thing a new user sees when they launch `hops`: two illustrative previews (the
+// GUI you're looking at right now, and the terminal alternative) side by side, so
+// the choice is concrete rather than a description. The choice is persisted
+// (lan_mouse_frontend_core::prefs) and always changeable later from Settings —
+// this screen is not a one-way door.
+
+import { Theme, Type, Space, Radius } from "theme.slint";
+import { PillButton } from "widgets.slint";
+import { GuiPreviewMockup, TuiPreviewMockup } from "previews.slint";
+
+export component OnboardingWindow inherits Window {
+    title: "welcome to grabbr-hop";
+    default-font-family: Type.sans;
+    default-font-size: Type.body;
+    // no preferred-height: sizes to content, like AppWindow (a fixed height +
+    // `alignment: start` would leave a dead gap below the footer instead).
+    preferred-width: 580px;
+    min-width: 480px;
+    min-height: 380px;
+    background: Theme.c.background;
+
+    callback choose-gui();
+    callback choose-tui();
+
+    VerticalLayout {
+        padding: Space.xxl;
+        spacing: Space.lg;
+
+        VerticalLayout {
+            spacing: 4px;
+            Text {
+                text: "welcome to grabbr-hop";
+                font-size: Type.title;
+                font-weight: Type.bold;
+                color: Theme.c.foreground;
+            }
+            Text {
+                text: "choose how you'd like to control your devices — you can switch anytime from Settings";
+                font-size: Type.small;
+                color: Theme.c.muted;
+                wrap: word-wrap;
+            }
+        }
+
+        HorizontalLayout {
+            spacing: Space.lg;
+
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: Space.md;
+                GuiPreviewMockup { height: 130px; }
+                VerticalLayout {
+                    spacing: 2px;
+                    Text {
+                        text: "graphical";
+                        font-size: Type.heading;
+                        font-weight: Type.semibold;
+                        color: Theme.c.foreground;
+                    }
+                    Text {
+                        text: "windowed, point-and-click — best on your desktop";
+                        font-size: Type.caption;
+                        color: Theme.c.muted;
+                        wrap: word-wrap;
+                    }
+                }
+                PillButton {
+                    text: "choose graphical";
+                    primary: true;
+                    clicked => { root.choose-gui(); }
+                }
+            }
+
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: Space.md;
+                TuiPreviewMockup { height: 130px; }
+                VerticalLayout {
+                    spacing: 2px;
+                    Text {
+                        text: "terminal";
+                        font-size: Type.heading;
+                        font-weight: Type.semibold;
+                        color: Theme.c.foreground;
+                    }
+                    Text {
+                        text: "keyboard-driven — runs anywhere, great over SSH";
+                        font-size: Type.caption;
+                        color: Theme.c.muted;
+                        wrap: word-wrap;
+                    }
+                }
+                PillButton {
+                    text: "choose terminal";
+                    primary: true;
+                    clicked => { root.choose-tui(); }
+                }
+            }
+        }
+
+        Text {
+            text: "grabbr-hop keeps working in the background either way — this only picks how you view it";
+            font-size: Type.caption;
+            color: Theme.c.muted;
+            horizontal-alignment: center;
+        }
+    }
+}

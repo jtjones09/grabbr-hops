@@ -23,8 +23,12 @@ slint-build = "1.14"
 [dev-dependencies]
 image = "0.25"
 
-# Headless render harness — dumps AppWindow to a PNG so the design can be
+# Headless render harnesses — dump a window to a PNG so the design can be
 # reviewed without a display: `cargo run -p lan-mouse-slint --example render_png -- out.png`
 [[example]]
 name = "render_png"
 path = "examples/render_png.rs"
+
+[[example]]
+name = "render_onboarding"
+path = "examples/render_onboarding.rs"

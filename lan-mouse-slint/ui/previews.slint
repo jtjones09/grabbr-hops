@@ -1,0 +1,127 @@
+// Small, non-interactive, theme-accurate mockups of each front-end's look — used
+// on the first-run "choose your interface" screen so the choice isn't abstract.
+// Driven by the live theme tokens (Theme.c), so they never drift out of sync with
+// the real app's appearance the way a baked screenshot would once a theme changes.
+
+import { Theme, Type, Space, Radius } from "theme.slint";
+
+struct PreviewRow {
+    label: string,
+    on: bool,
+}
+
+// A tiny illustrative slice of the graphical app: wordmark + two device rows,
+// one toggled on. Mirrors app.slint's actual device-row anatomy at thumbnail scale.
+export component GuiPreviewMockup inherits Rectangle {
+    background: Theme.c.surface;
+    border-width: 1px;
+    border-color: Theme.c.border;
+    border-radius: Radius.md;
+
+    property <[PreviewRow]> rows: [
+        { label: "studio-pc", on: true },
+        { label: "media-rig", on: false },
+    ];
+
+    VerticalLayout {
+        padding: Space.sm;
+        spacing: Space.xs;
+        HorizontalLayout {
+            spacing: 4px;
+            Rectangle { width: 6px; height: 6px; border-radius: 3px; background: Theme.c.success; y: 3px; }
+            Text { text: "grabbr-hop"; font-size: Type.small; font-weight: Type.bold; color: Theme.c.foreground; }
+        }
+        for row in root.rows: Rectangle {
+            height: 18px;
+            border-radius: Radius.sm;
+            background: Theme.c.surface-raised;
+            HorizontalLayout {
+                padding-left: Space.xs;
+                padding-right: Space.xs;
+                spacing: 4px;
+                Rectangle {
+                    width: 5px;
+                    height: 5px;
+                    border-radius: 2.5px;
+                    background: row.on ? Theme.c.success : Theme.c.muted;
+                    y: (parent.height - self.height) / 2;
+                }
+                Text {
+                    text: row.label;
+                    font-size: Type.caption;
+                    color: Theme.c.foreground;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                }
+                Rectangle {
+                    width: 18px;
+                    height: 9px;
+                    border-radius: 4.5px;
+                    background: row.on ? Theme.c.success : Theme.c.border;
+                    y: (parent.height - self.height) / 2;
+                    Rectangle {
+                        width: 7px;
+                        height: 7px;
+                        border-radius: 3.5px;
+                        background: #ffffff;
+                        y: 1px;
+                        x: row.on ? parent.width - self.width - 1px : 1px;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// A tiny illustrative slice of the terminal app: monospace wordmark + a bordered
+// list with one accent-filled "selected" row — the ratatui look (reverse-video
+// selection inside a bordered panel) in miniature.
+export component TuiPreviewMockup inherits Rectangle {
+    background: Theme.c.background;
+    border-width: 1px;
+    border-color: Theme.c.border;
+    border-radius: Radius.md;
+
+    VerticalLayout {
+        padding: Space.sm;
+        spacing: 2px;
+        Text {
+            text: "grabbr-hop";
+            font-family: Type.mono;
+            font-size: Type.small;
+            font-weight: Type.bold;
+            color: Theme.c.accent;
+            letter-spacing: Type.mono-tracking;
+        }
+        Rectangle { height: 1px; background: Theme.c.border; }
+        Rectangle {
+            height: 16px;
+            background: Theme.c.accent;
+            HorizontalLayout {
+                padding-left: 4px;
+                Text {
+                    text: "> studio-pc";
+                    font-family: Type.mono;
+                    font-size: Type.caption;
+                    color: Theme.c.on-accent;
+                    letter-spacing: Type.mono-tracking;
+                    vertical-alignment: center;
+                }
+            }
+        }
+        Text {
+            text: "  media-rig";
+            font-family: Type.mono;
+            font-size: Type.caption;
+            color: Theme.c.muted;
+            letter-spacing: Type.mono-tracking;
+        }
+        Text {
+            text: "  ScornW20";
+            font-family: Type.mono;
+            font-size: Type.caption;
+            color: Theme.c.muted;
+            letter-spacing: Type.mono-tracking;
+        }
+    }
+}

@@ -4,9 +4,14 @@
 
 import { Theme, Type, Space, Radius, Motion, Size } from "theme.slint";
 import { Card, Separator, Dot, Chip, StatChip, SectionTitle, PillButton, TextField, Toggle } from "widgets.slint";
+import { OnboardingWindow } from "onboarding.slint";
 
-// re-export so Rust can select the active palette via `ui.global::<Theme>()`
-export { Theme }
+// re-export so Rust can select the active palette via `ui.global::<Theme>()`.
+// OnboardingWindow is re-exported here too (not compiled as its own separate
+// slint_build entry point) so it shares this SAME generated `Theme`/`ThemeColors`
+// Rust type — two independent `slint_build::compile()` calls over files that both
+// import theme.slint would otherwise produce two nominally distinct types.
+export { Theme, OnboardingWindow }
 
 export struct DeviceRow {
     handle: string,  // ClientHandle (u64 as text — Slint int is only i32)

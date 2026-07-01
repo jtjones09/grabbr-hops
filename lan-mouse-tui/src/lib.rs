@@ -19,6 +19,7 @@ use std::{
 };
 
 use lan_mouse_frontend_core::{
+    prefs::Frontend,
     theme::{self, Rgb, Theme},
     AppModel, ClientHandle, FrontendClient, FrontendRequest, Position, Status,
 };
@@ -377,6 +378,98 @@ pub async fn run() -> Result<(), TuiError> {
     };
 
     let _ = ratatui::restore();
+    result
+}
+
+/// Show the first-run "choose your interface" screen and block until the user
+/// picks one. A terminal can't show a graphical preview, so unlike the GUI's
+/// onboarding (which renders an illustrative mockup of each option) this is a
+/// plain described choice — still the same underlying pick, just text instead of
+/// pixels. Synchronous: runs before any daemon connection is needed. `Ok(None)`
+/// on Esc/q — the caller should ask again next launch, not assume a default.
+pub fn run_onboarding() -> Result<Option<Frontend>, TuiError> {
+    let theme = theme::default_theme();
+    let base = Style::default()
+        .bg(col(theme.background))
+        .fg(col(theme.foreground));
+    let accent = Style::default().fg(col(theme.accent));
+    let muted = Style::default().fg(col(theme.muted));
+    let highlight = Style::default()
+        .fg(col(theme.on_accent))
+        .bg(col(theme.accent));
+
+    let options: [(&str, &str); 2] = [
+        ("graphical", "windowed, point-and-click — best on your desktop"),
+        ("terminal (this)", "keyboard-driven — runs anywhere, great over SSH"),
+    ];
+    let mut sel: usize = 1; // we're already in a terminal; sensible default
+
+    let mut terminal = ratatui::init();
+    let result = loop {
+        if let Err(e) = terminal.draw(|f| {
+            f.render_widget(Block::default().style(base), f.area());
+            let area = f.area();
+            let v = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(2),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Min(0),
+                    Constraint::Length(1),
+                ])
+                .split(area);
+
+            f.render_widget(
+                Paragraph::new("welcome to grabbr-hop").style(accent.add_modifier(
+                    ratatui::style::Modifier::BOLD,
+                )),
+                v[0],
+            );
+            f.render_widget(
+                Paragraph::new("choose how you'd like to control your devices — ↑↓ + enter, switch anytime from Settings")
+                    .style(muted)
+                    .wrap(Wrap { trim: true }),
+                v[1],
+            );
+
+            let items: Vec<ListItem> = options
+                .iter()
+                .map(|(name, desc)| {
+                    ListItem::new(Line::from(vec![
+                        Span::styled(format!("{name:<18}"), Style::default()),
+                        Span::styled(*desc, muted),
+                    ]))
+                })
+                .collect();
+            let list = List::new(items)
+                .block(Block::default().borders(Borders::ALL).style(base).border_style(muted))
+                .highlight_style(highlight);
+            let mut state = ListState::default();
+            state.select(Some(sel));
+            f.render_stateful_widget(list, v[3], &mut state);
+        }) {
+            break Err(TuiError::from(e));
+        }
+
+        if let Ok(true) = event::poll(Duration::from_millis(250)) {
+            if let Ok(Event::Key(k)) = event::read() {
+                if k.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match k.code {
+                    KeyCode::Up | KeyCode::Char('k') => sel = sel.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Char('j') => sel = (sel + 1).min(options.len() - 1),
+                    KeyCode::Enter => {
+                        break Ok(Some(if sel == 0 { Frontend::Gui } else { Frontend::Tui }));
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') => break Ok(None),
+                    _ => {}
+                }
+            }
+        }
+    };
+    ratatui::restore();
     result
 }
 
