@@ -58,6 +58,15 @@ export global Motion {
     out property <duration> slow: 320ms;   // overlays (pairing prompt)
 }
 
+// --- control sizing -----------------------------------------------------------
+// Fixed heights so controls hug + center in a row instead of stretching to the
+// cross-axis (Slint stretches an unpinned layout child to fill the row height).
+export global Size {
+    out property <length> chip: 22px;     // pos / status chips
+    out property <length> control: 30px;  // buttons, pill, text field
+    out property <length> row: 44px;      // list rows
+}
+
 // --- color: semantic taxonomy (mirrors Slint's built-in Palette) --------------
 // `color` (not `brush`) so components can derive hover/press/tint states with
 // .brighter() / .darker() / .transparentize().
@@ -81,11 +90,12 @@ export struct ThemeColors {
 export global Theme {
     in-out property <int> index: 0;
     out property <ThemeColors> c: root.palettes[root.index];
-    property <[ThemeColors]> palettes: [
+    // `out` so the footer swatch picker can read every theme's accent
+    out property <[ThemeColors]> palettes: [
         // 0 — grabbr dark (default)
-        { background: #121216, surface: #1b1b22, surface-raised: #23232b,
-          foreground: #e8e8ea, muted: #8e8e99, accent: #579bff, on-accent: #101218,
-          selection: #1d2740, border: #2a2a33, success: #44c468, warn: #e7b84b, error: #f25d5d },
+        { background: #0f0f13, surface: #1a1b22, surface-raised: #26272f,
+          foreground: #e8e8ea, muted: #8e8e99, accent: #579bff, on-accent: #0f1016,
+          selection: #1d2740, border: #34343f, success: #44c468, warn: #e7b84b, error: #f25d5d },
         // 1 — catppuccin (mocha)
         { background: #1e1e2e, surface: #282839, surface-raised: #313244,
           foreground: #cdd6f4, muted: #9399b2, accent: #89b4fa, on-accent: #1e1e2e,

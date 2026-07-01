@@ -125,6 +125,17 @@ pub fn run() -> Result<(), SlintError> {
                 .insert(fp.to_string(), Instant::now());
         });
     }
+    {
+        // theme swatch picker: set the live palette + persist (shared with the TUI)
+        let weak = ui.as_weak();
+        ui.on_set_theme(move |i| {
+            let Some(ui) = weak.upgrade() else { return };
+            ui.global::<Theme>().set_index(i);
+            if let Some(t) = theme::builtins().get(i as usize) {
+                theme::save_name(t.name);
+            }
+        });
+    }
 
     // poll the model ~4x/sec and push it into the window
     let weak = ui.as_weak();
@@ -171,18 +182,21 @@ pub fn run() -> Result<(), SlintError> {
             let devices: Vec<DeviceRow> = m
                 .clients
                 .iter()
-                .map(|(h, (c, s))| DeviceRow {
-                    handle: h.to_string().into(),
-                    label: format!(
-                        "[{}] {}:{}",
-                        h,
-                        c.hostname.clone().unwrap_or_else(|| "unnamed".into()),
-                        c.port
-                    )
-                    .into(),
-                    pos: c.pos.to_string().into(),
-                    active: s.active,
-                    alive: s.alive,
+                .map(|(h, (c, s))| {
+                    let addr = s
+                        .active_addr
+                        .map(|a| a.to_string())
+                        .or_else(|| c.fix_ips.first().map(|ip| format!("{ip}:{}", c.port)))
+                        .or_else(|| s.ips.iter().next().map(|ip| format!("{ip}:{}", c.port)))
+                        .unwrap_or_else(|| "unresolved".into());
+                    DeviceRow {
+                        handle: h.to_string().into(),
+                        name: c.hostname.clone().unwrap_or_else(|| "unnamed".into()).into(),
+                        addr: addr.into(),
+                        pos: c.pos.to_string().into(),
+                        active: s.active,
+                        alive: s.alive,
+                    }
                 })
                 .collect();
             ui.set_devices(ModelRc::new(VecModel::from(devices)));

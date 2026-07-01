@@ -7,7 +7,10 @@ license = "GPL-3.0-or-later"
 repository = "https://github.com/jtjones09/grabbr-hop"
 
 [dependencies]
-slint = "1.8"
+# `software-renderer-systemfonts` is additive — the real windowed app keeps its
+# default backend; the feature adds the CPU font rasterizer so the headless
+# `render_png` example (below) can rasterize the embedded TTFs for self-review.
+slint = { version = "1.14", features = ["software-renderer-systemfonts"] }
 lan-mouse-frontend-core = { path = "../lan-mouse-frontend-core", version = "0.1.0" }
 lan-mouse-ipc = { path = "../lan-mouse-ipc", version = "0.3.0" }
 tokio = { version = "1.32", features = ["rt", "sync", "macros", "time"] }
@@ -15,4 +18,13 @@ thiserror = "2.0"
 log = "0.4"
 
 [build-dependencies]
-slint-build = "1.8"
+slint-build = "1.14"
+
+[dev-dependencies]
+image = "0.25"
+
+# Headless render harness — dumps AppWindow to a PNG so the design can be
+# reviewed without a display: `cargo run -p lan-mouse-slint --example render_png -- out.png`
+[[example]]
+name = "render_png"
+path = "examples/render_png.rs"

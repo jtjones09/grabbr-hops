@@ -2,7 +2,7 @@
 // every control is themed and consistent. Kept presentational: no app state, just
 // inputs + a `clicked` callback where relevant. Composition lives in app.slint.
 
-import { Theme, Type, Space, Radius, Motion } from "theme.slint";
+import { Theme, Type, Space, Radius, Motion, Size } from "theme.slint";
 
 // A rounded surface panel. Tonal elevation: surface sits above the window bg.
 export component Card inherits Rectangle {
@@ -27,7 +27,8 @@ export component Dot inherits Rectangle {
     background: root.tint;
 }
 
-// A compact rounded label (position, state, …). Hugs its text.
+// A compact rounded label (position, state, …). Hugs its text; fixed height so
+// it centers in a row instead of stretching to fill it.
 export component Chip inherits Rectangle {
     in property <string> text;
     in property <color> text-color: Theme.c.muted;
@@ -35,16 +36,17 @@ export component Chip inherits Rectangle {
     background: root.fill;
     border-radius: Radius.sm;
     horizontal-stretch: 0;
+    height: Size.chip;
     HorizontalLayout {
         padding-left: Space.sm;
         padding-right: Space.sm;
-        padding-top: 3px;
-        padding-bottom: 3px;
+        alignment: center;
         Text {
             text: root.text;
             color: root.text-color;
             font-size: Type.caption;
             font-weight: Type.semibold;
+            vertical-alignment: center;
         }
     }
 }
@@ -59,16 +61,17 @@ export component StatChip inherits Rectangle {
     border-width: 1px;
     border-color: Theme.c.border;
     horizontal-stretch: 0;
+    height: Size.control;
     HorizontalLayout {
-        padding-left: Space.sm;
-        padding-right: Space.sm;
-        padding-top: 4px;
-        padding-bottom: 4px;
+        padding-left: Space.md;
+        padding-right: Space.md;
         spacing: 6px;
+        alignment: center;
         Text {
             text: root.label;
             color: Theme.c.muted;
             font-size: Type.caption;
+            vertical-alignment: center;
         }
         Text {
             text: root.value;
@@ -77,6 +80,7 @@ export component StatChip inherits Rectangle {
             font-size: Type.caption;
             font-weight: Type.bold;
             letter-spacing: Type.mono-tracking;
+            vertical-alignment: center;
         }
     }
 }
@@ -89,11 +93,13 @@ export component SectionTitle inherits Text {
     letter-spacing: 0.8px;
 }
 
-// A pill button. `primary` = filled accent, `danger` = filled error, else outline.
+// A pill button. `primary` = filled accent, `danger` = filled error,
+// `ghost` = chromeless (muted text, lights up on hover), else outline.
 export component PillButton inherits Rectangle {
     in property <string> text;
     in property <bool> primary: false;
     in property <bool> danger: false;
+    in property <bool> ghost: false;
     in property <bool> enabled: true;
     callback clicked;
 
@@ -103,26 +109,32 @@ export component PillButton inherits Rectangle {
     property <bool> filled: root.primary || root.danger;
 
     horizontal-stretch: 0;
+    height: Size.control;
     border-radius: Radius.sm;
-    border-width: root.filled ? 0px : 1px;
+    border-width: (root.filled || root.ghost) ? 0px : 1px;
     border-color: Theme.c.border;
     opacity: root.enabled ? 1.0 : 0.45;
-    background: !root.enabled
-        ? root.base
-        : (ta.pressed ? root.base.darker(0.12) : (ta.has-hover ? root.base.brighter(0.12) : root.base));
+    background: root.ghost
+        ? (ta.pressed
+            ? Theme.c.surface-raised.darker(0.1)
+            : (ta.has-hover ? Theme.c.surface-raised : transparent))
+        : (!root.enabled
+            ? root.base
+            : (ta.pressed ? root.base.darker(0.12) : (ta.has-hover ? root.base.brighter(0.12) : root.base)));
     animate background { duration: Motion.fast; }
 
     HorizontalLayout {
         padding-left: Space.md;
         padding-right: Space.md;
-        padding-top: 6px;
-        padding-bottom: 6px;
         alignment: center;
         Text {
             text: root.text;
-            color: root.filled ? Theme.c.on-accent : Theme.c.foreground;
+            color: root.filled
+                ? Theme.c.on-accent
+                : (root.ghost && !ta.has-hover ? Theme.c.muted : Theme.c.foreground);
             font-size: Type.small;
             font-weight: Type.semibold;
+            vertical-alignment: center;
         }
     }
 
@@ -130,6 +142,35 @@ export component PillButton inherits Rectangle {
         enabled: root.enabled;
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
+    }
+}
+
+// An iOS-style toggle switch. Track lights green when on; the knob slides.
+export component Toggle inherits Rectangle {
+    in property <bool> checked;
+    callback toggled(bool);
+    width: 42px;
+    height: 24px;
+    horizontal-stretch: 0;
+    border-radius: self.height / 2;
+    background: root.checked ? Theme.c.success : Theme.c.surface-raised;
+    border-width: root.checked ? 0px : 1px;
+    border-color: Theme.c.border;
+    animate background { duration: Motion.fast; }
+
+    knob := Rectangle {
+        width: 18px;
+        height: 18px;
+        border-radius: self.width / 2;
+        background: #ffffff;
+        y: (parent.height - self.height) / 2;
+        x: root.checked ? parent.width - self.width - 3px : 3px;
+        animate x { duration: Motion.fast; }
+    }
+
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.toggled(!root.checked); }
     }
 }
 
@@ -141,7 +182,7 @@ export component TextField inherits Rectangle {
     in-out property <string> text <=> ti.text;
     callback accepted <=> ti.accepted;
     forward-focus: ti;
-    height: 30px;
+    height: Size.control;
     background: Theme.c.surface-raised;
     border-radius: Radius.sm;
     border-width: 1px;
