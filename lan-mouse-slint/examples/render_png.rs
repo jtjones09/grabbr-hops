@@ -2,7 +2,7 @@
 // using the pure software renderer — no window, no GPU, no macOS TCC permission.
 // This is how the GUI's design gets reviewed without a display.
 //
-//   cargo run -p lan-mouse-slint --example render_png -- /path/to/out.png
+//   cargo run -p lan-mouse-slint --example render_png -- /path/to/out.png [w] [h] [theme_index]
 //
 // Requires the crate's slint dep to carry feature "software-renderer-systemfonts"
 // (see Cargo.toml) — without it, AppWindow::new() panics when the embedded
@@ -14,7 +14,12 @@ use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferTyp
 use slint::platform::{Platform, WindowAdapter, WindowEvent};
 use slint::{ComponentHandle, ModelRc, PhysicalSize, VecModel};
 
-slint::include_modules!(); // AppWindow, DeviceRow, TrustedRow
+// Reuse the lib crate's Slint-generated types (AppWindow, DeviceRow, TrustedRow,
+// Theme, theme_colors) instead of calling `include_modules!()` again here — a
+// second invocation would compile the SAME .slint source into a SECOND, nominally
+// distinct set of Rust types, incompatible with the lib's (e.g. two different
+// `ThemeColors` structs), even though they look identical.
+use lan_mouse_slint::{theme_colors, AppWindow, DeviceRow, Theme, TrustedRow};
 
 /// Headless platform: every window is a MinimalSoftwareWindow (CPU renderer, no OS window).
 struct HeadlessPlatform {
@@ -39,6 +44,18 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
     // 2) Build the component. Runs the generated register_font_from_memory(...) for the
     //    embedded TTFs — needs the software-renderer-systemfonts feature.
     let ui = AppWindow::new()?;
+
+    // 2b) Theme.palettes is populated by Rust at runtime (not hardcoded in
+    //     .slint) — the real app does this in lib.rs::run(); without it here the
+    //     preview would render every color as the struct default (transparent).
+    let themes = lan_mouse_frontend_core::theme::all_themes();
+    ui.global::<Theme>().set_palettes(ModelRc::new(VecModel::from(
+        themes.iter().map(theme_colors).collect::<Vec<_>>(),
+    )));
+    // 4th arg picks which theme to render (index into all_themes(): built-ins
+    // then any user themes) — handy for reviewing every palette, not just index 0.
+    let theme_idx: i32 = std::env::args().nth(4).and_then(|s| s.parse().ok()).unwrap_or(0);
+    ui.global::<Theme>().set_index(theme_idx);
 
     // 3) Representative mock data so every region is exercised in one shot.
     ui.set_connected(true);

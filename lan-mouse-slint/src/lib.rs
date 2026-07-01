@@ -45,6 +45,31 @@ fn status_text(s: Status) -> &'static str {
     }
 }
 
+fn slint_color(c: theme::Rgb) -> slint::Color {
+    slint::Color::from_rgb_u8(c.0, c.1, c.2)
+}
+
+/// Map a [`theme::Theme`] (Rust — the single source of truth for palette data,
+/// built-in or user-authored) to the Slint-generated `ThemeColors` struct. `pub`
+/// so other Slint-frontend code (e.g. the `render_png` self-review harness) can
+/// populate `Theme.palettes` the same way without duplicating the field mapping.
+pub fn theme_colors(t: &theme::Theme) -> ThemeColors {
+    ThemeColors {
+        background: slint_color(t.background),
+        surface: slint_color(t.surface),
+        surface_raised: slint_color(t.surface_raised),
+        foreground: slint_color(t.foreground),
+        muted: slint_color(t.muted),
+        accent: slint_color(t.accent),
+        on_accent: slint_color(t.on_accent),
+        selection: slint_color(t.selection),
+        border: slint_color(t.border),
+        success: slint_color(t.success),
+        warn: slint_color(t.warn),
+        error: slint_color(t.error),
+    }
+}
+
 /// First 16 hex chars of a fingerprint for a glanceable id.
 fn short_fp(fp: &str) -> String {
     let head: String = fp.chars().take(16).collect();
@@ -72,13 +97,17 @@ pub fn run() -> Result<(), SlintError> {
 
     let ui = AppWindow::new()?;
 
-    // theme is a UI-local preference shared with the TUI; tell the GUI which
-    // palette to select (the Slint side owns the actual color tables, keyed by
-    // the shared `builtins()` order).
+    // theme is a UI-local preference shared with the TUI. Rust owns the palette
+    // DATA (built-ins + any user themes in ~/.config/lan-mouse/themes/*.toml) —
+    // push the whole table into the GUI once, then just flip the index to switch.
+    let themes = Rc::new(theme::all_themes());
+    ui.global::<Theme>().set_palettes(ModelRc::new(VecModel::from(
+        themes.iter().map(theme_colors).collect::<Vec<_>>(),
+    )));
     let theme_name =
         theme::load_name().unwrap_or_else(|| theme::default_theme().name.to_string());
     ui.global::<Theme>()
-        .set_index(theme::index_of(&theme_name) as i32);
+        .set_index(theme::index_of(&themes, &theme_name) as i32);
 
     // fingerprints the user has denied -> when (UI-local snooze; see DISMISS_TTL).
     // Shared between the deny callback and the poll loop, both on the UI thread.
@@ -128,11 +157,12 @@ pub fn run() -> Result<(), SlintError> {
     {
         // theme swatch picker: set the live palette + persist (shared with the TUI)
         let weak = ui.as_weak();
+        let themes = themes.clone();
         ui.on_set_theme(move |i| {
             let Some(ui) = weak.upgrade() else { return };
             ui.global::<Theme>().set_index(i);
-            if let Some(t) = theme::builtins().get(i as usize) {
-                theme::save_name(t.name);
+            if let Some(t) = themes.get(i as usize) {
+                theme::save_name(&t.name);
             }
         });
     }

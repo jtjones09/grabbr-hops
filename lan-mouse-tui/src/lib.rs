@@ -113,10 +113,11 @@ pub async fn run() -> Result<(), TuiError> {
         }
     });
 
-    // theme: persisted name → built-in index, default to the first.
-    let themes = theme::builtins();
+    // theme: built-ins + any user themes dropped in ~/.config/lan-mouse/themes/,
+    // persisted name → index, default to the first.
+    let themes = theme::all_themes();
     let mut theme_idx = theme::load_name()
-        .and_then(|n| themes.iter().position(|t| t.name == n))
+        .map(|n| theme::index_of(&themes, &n))
         .unwrap_or(0);
 
     let mut terminal = ratatui::init();
@@ -295,7 +296,7 @@ pub async fn run() -> Result<(), TuiError> {
                             KeyCode::Char('s') => client.request(FrontendRequest::SaveConfiguration),
                             KeyCode::Char('t') => {
                                 theme_idx = (theme_idx + 1) % themes.len();
-                                theme::save_name(themes[theme_idx].name);
+                                theme::save_name(&themes[theme_idx].name);
                             }
                             KeyCode::Char('l') => show_log = true,
                             KeyCode::Char('o') => {
@@ -410,13 +411,13 @@ fn ui(
     show_log: bool,
     theme: &Theme,
 ) {
-    let base = Style::default().bg(col(theme.bg)).fg(col(theme.fg));
-    let border = Style::default().fg(col(theme.muted)).bg(col(theme.bg));
-    let accent = Style::default().fg(col(theme.accent)).bg(col(theme.bg));
-    let muted = Style::default().fg(col(theme.muted)).bg(col(theme.bg));
+    let base = Style::default().bg(col(theme.background)).fg(col(theme.foreground));
+    let border = Style::default().fg(col(theme.muted)).bg(col(theme.background));
+    let accent = Style::default().fg(col(theme.accent)).bg(col(theme.background));
+    let muted = Style::default().fg(col(theme.muted)).bg(col(theme.background));
     let highlight = Style::default()
-        .fg(col(theme.highlight_fg))
-        .bg(col(theme.highlight_bg));
+        .fg(col(theme.on_accent))
+        .bg(col(theme.accent));
     let panel = |title: Span<'static>, focused: bool| {
         let bs = if focused { accent } else { border };
         Block::default()
@@ -497,7 +498,7 @@ fn ui(
                     Span::styled(
                         if s.active { "  active" } else { "  off" },
                         if s.active {
-                            Style::default().fg(col(theme.fg))
+                            Style::default().fg(col(theme.foreground))
                         } else {
                             muted
                         },
@@ -597,9 +598,9 @@ fn footer_line(
     focus: Focus,
     theme: &Theme,
 ) -> Line<'static> {
-    let key = Style::default().fg(col(theme.accent)).bg(col(theme.bg));
-    let muted = Style::default().fg(col(theme.muted)).bg(col(theme.bg));
-    let warn = Style::default().fg(col(theme.warn)).bg(col(theme.bg));
+    let key = Style::default().fg(col(theme.accent)).bg(col(theme.background));
+    let muted = Style::default().fg(col(theme.muted)).bg(col(theme.background));
+    let warn = Style::default().fg(col(theme.warn)).bg(col(theme.background));
 
     if let Some(inp) = input {
         let (label, buf) = match inp {
@@ -662,10 +663,10 @@ fn footer_line(
 /// Render a centered approve/deny popup for an untrusted incoming peer.
 fn pairing_popup(f: &mut Frame, fp: &str, theme: &Theme) {
     let area = centered_rect(70, 9, f.area());
-    let base = Style::default().bg(col(theme.bg)).fg(col(theme.fg));
-    let warn = Style::default().fg(col(theme.warn)).bg(col(theme.bg));
-    let key = Style::default().fg(col(theme.accent)).bg(col(theme.bg));
-    let muted = Style::default().fg(col(theme.muted)).bg(col(theme.bg));
+    let base = Style::default().bg(col(theme.background)).fg(col(theme.foreground));
+    let warn = Style::default().fg(col(theme.warn)).bg(col(theme.background));
+    let key = Style::default().fg(col(theme.accent)).bg(col(theme.background));
+    let muted = Style::default().fg(col(theme.muted)).bg(col(theme.background));
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(warn)
@@ -699,9 +700,9 @@ fn pairing_popup(f: &mut Frame, fp: &str, theme: &Theme) {
 fn log_overlay(f: &mut Frame, messages: &VecDeque<String>, theme: &Theme) {
     let h = f.area().height.saturating_sub(4).max(6);
     let area = centered_rect(80, h, f.area());
-    let base = Style::default().bg(col(theme.bg)).fg(col(theme.fg));
-    let accent = Style::default().fg(col(theme.accent)).bg(col(theme.bg));
-    let muted = Style::default().fg(col(theme.muted)).bg(col(theme.bg));
+    let base = Style::default().bg(col(theme.background)).fg(col(theme.foreground));
+    let accent = Style::default().fg(col(theme.accent)).bg(col(theme.background));
+    let muted = Style::default().fg(col(theme.muted)).bg(col(theme.background));
     let cap = area.height.saturating_sub(2) as usize;
     let lines: Vec<Line> = if messages.is_empty() {
         vec![Line::from(Span::styled("no activity yet", muted))]
