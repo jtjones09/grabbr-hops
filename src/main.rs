@@ -64,15 +64,9 @@ fn run() -> Result<(), LanMouseError> {
             Command::TestEmulation(args) => run_async(emulation_test::run(config, args))?,
             Command::TestCapture(args) => run_async(capture_test::run(config, args))?,
             Command::Cli(cli_args) => run_async(lan_mouse_cli::run(cli_args))?,
-            Command::Daemon => {
-                // if daemon is specified we run the service
-                match run_async(run_service(config)) {
-                    Err(LanMouseError::Service(ServiceError::IpcListen(
-                        IpcListenerCreationError::AlreadyRunning,
-                    ))) => log::info!("service already running!"),
-                    r => r?,
-                }
-            }
+            Command::Daemon => run_daemon(config)?,
+            Command::Gui => run_gui()?,
+            Command::Tui => run_tui()?,
         },
         None => {
             //  otherwise start the service as a child process and
@@ -93,37 +87,194 @@ fn run() -> Result<(), LanMouseError> {
                 service.kill()?;
                 res?;
             }
-            #[cfg(all(feature = "tui", not(feature = "gtk")))]
+            // The `hops` front door (any build with a front-end, non-gtk): make
+            // sure the receiver daemon is up, then open the user's chosen
+            // interface. Front-ends are attach-only — they never spawn the daemon
+            // themselves (a front-end-spawned daemon can land on the dummy backend
+            // if its path lacks the Accessibility grant); `ensure_daemon_running`
+            // brings up the GRANTED launchd service instead.
+            #[cfg(all(not(feature = "gtk"), any(feature = "tui", feature = "slint")))]
             {
-                // The TUI is a pure viewer/controller: it ATTACHES to a daemon
-                // and never starts or stops it. Run the daemon separately (your
-                // launcher / `lan-mouse daemon`) so the GRANTED, injecting backend
-                // is the receiver — a front-end-spawned daemon can silently land
-                // on the dummy backend if its binary lacks the Accessibility
-                // grant (e.g. a `cargo run` debug build). Closing the TUI leaves
-                // the daemon running.
-                run_async(lan_mouse_tui::run())?;
+                front_door()?;
             }
-            #[cfg(all(feature = "slint", not(feature = "gtk"), not(feature = "tui")))]
-            {
-                // The Slint GUI is attach-only too (same rationale as the TUI): it
-                // connects to the launchd-managed daemon and never spawns one.
-                lan_mouse_slint::run()?;
-            }
+            // no front-end compiled in: just run the daemon
             #[cfg(not(any(feature = "gtk", feature = "tui", feature = "slint")))]
             {
-                // run daemon if no frontend feature is enabled
-                match run_async(run_service(config)) {
-                    Err(LanMouseError::Service(ServiceError::IpcListen(
-                        IpcListenerCreationError::AlreadyRunning,
-                    ))) => log::info!("service already running!"),
-                    r => r?,
-                }
+                run_daemon(config)?;
             }
         }
     }
 
     Ok(())
+}
+
+/// Run the daemon (the receiver service). A redundant instance self-exits.
+fn run_daemon(config: config::Config) -> Result<(), LanMouseError> {
+    match run_async(run_service(config)) {
+        Err(LanMouseError::Service(ServiceError::IpcListen(
+            IpcListenerCreationError::AlreadyRunning,
+        ))) => {
+            log::info!("service already running!");
+            Ok(())
+        }
+        r => r,
+    }
+}
+
+/// Open the Slint GUI (attach-only). No-op with a hint if this build lacks it.
+fn run_gui() -> Result<(), LanMouseError> {
+    #[cfg(feature = "slint")]
+    {
+        lan_mouse_slint::run()?;
+        Ok(())
+    }
+    #[cfg(not(feature = "slint"))]
+    {
+        log::error!("this build has no GUI — rebuild with `--features slint`");
+        Ok(())
+    }
+}
+
+/// Open the Ratatui TUI (attach-only). No-op with a hint if this build lacks it.
+fn run_tui() -> Result<(), LanMouseError> {
+    #[cfg(feature = "tui")]
+    {
+        run_async(lan_mouse_tui::run())?;
+        Ok(())
+    }
+    #[cfg(not(feature = "tui"))]
+    {
+        log::error!("this build has no TUI — rebuild with `--features tui`");
+        Ok(())
+    }
+}
+
+/// `hops` with no subcommand: ensure the receiver is up, then open the user's
+/// preferred front-end (or the sensible default for this environment).
+#[cfg(all(not(feature = "gtk"), any(feature = "tui", feature = "slint")))]
+fn front_door() -> Result<(), LanMouseError> {
+    use lan_mouse_frontend_core::prefs::{load_frontend, Frontend};
+    ensure_daemon_running();
+    match load_frontend().unwrap_or_else(default_frontend) {
+        Frontend::Tui => run_tui(),
+        Frontend::Gui => run_gui(),
+    }
+}
+
+/// Default front-end when the user hasn't chosen: GUI on a local desktop, TUI
+/// over SSH / when only the TUI is compiled in.
+#[cfg(all(not(feature = "gtk"), any(feature = "tui", feature = "slint")))]
+fn default_frontend() -> lan_mouse_frontend_core::prefs::Frontend {
+    use lan_mouse_frontend_core::prefs::Frontend;
+    let ssh = std::env::var_os("SSH_CONNECTION").is_some()
+        || std::env::var_os("SSH_TTY").is_some();
+    if !ssh && cfg!(feature = "slint") {
+        Frontend::Gui
+    } else if cfg!(feature = "tui") {
+        Frontend::Tui
+    } else {
+        Frontend::Gui
+    }
+}
+
+/// Make sure the GRANTED receiver daemon is running, without spawning it as our
+/// own child (which could land on the dummy backend). On macOS that means the
+/// launchd service; elsewhere a detached background process.
+#[cfg(all(not(feature = "gtk"), any(feature = "tui", feature = "slint")))]
+fn ensure_daemon_running() {
+    // If a receiver is already listening (e.g. the granted daemon under any
+    // identity), do nothing — never start a second one, and don't (re)install a
+    // LaunchAgent that would race the running one on next login.
+    if daemon_socket_alive() {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    ensure_launchd_daemon();
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = start_detached_daemon();
+    }
+}
+
+/// True if a daemon is already listening on the IPC socket.
+#[cfg(all(not(feature = "gtk"), any(feature = "tui", feature = "slint")))]
+fn daemon_socket_alive() -> bool {
+    #[cfg(unix)]
+    {
+        match lan_mouse_ipc::default_socket_path() {
+            Ok(path) => std::os::unix::net::UnixStream::connect(path).is_ok(),
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// Bring up `com.grabbr.hops` via launchd if it isn't already loaded,
+/// self-installing the LaunchAgent plist (pointed at this binary) on first run.
+#[cfg(all(not(feature = "gtk"), target_os = "macos", any(feature = "tui", feature = "slint")))]
+fn ensure_launchd_daemon() {
+    let uid = unsafe { libc::getuid() };
+    let service = format!("gui/{uid}/com.grabbr.hops");
+    let loaded = process::Command::new("launchctl")
+        .args(["print", &service])
+        .stdout(process::Stdio::null())
+        .stderr(process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if loaded {
+        return;
+    }
+    if let Some(plist) = install_launchd_plist_if_missing() {
+        let _ = process::Command::new("launchctl")
+            .args(["bootstrap", &format!("gui/{uid}"), &plist])
+            .stdout(process::Stdio::null())
+            .stderr(process::Stdio::null())
+            .status();
+    }
+}
+
+/// Write `~/Library/LaunchAgents/com.grabbr.hops.plist` (pointed at the current
+/// binary) if absent; returns its path. Grant is path-bound, so the plist must
+/// point at whatever `hops` binary the user actually launched.
+#[cfg(all(not(feature = "gtk"), target_os = "macos", any(feature = "tui", feature = "slint")))]
+fn install_launchd_plist_if_missing() -> Option<String> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+    let plist_path = home.join("Library/LaunchAgents/com.grabbr.hops.plist");
+    if plist_path.exists() {
+        return Some(plist_path.to_string_lossy().into_owned());
+    }
+    let exe = std::env::current_exe().ok()?;
+    let logs = home.join("hops/logs");
+    let _ = std::fs::create_dir_all(&logs);
+    let log = logs.join("daemon.log");
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.grabbr.hops</string>
+    <key>ProgramArguments</key>
+    <array><string>{exe}</string><string>daemon</string></array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><false/>
+    <key>ProcessType</key><string>Interactive</string>
+    <key>StandardOutPath</key><string>{log}</string>
+    <key>StandardErrorPath</key><string>{log}</string>
+</dict>
+</plist>
+"#,
+        exe = exe.display(),
+        log = log.display()
+    );
+    if let Some(dir) = plist_path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    std::fs::write(&plist_path, plist).ok()?;
+    Some(plist_path.to_string_lossy().into_owned())
 }
 
 fn run_async<F, E>(f: F) -> Result<(), LanMouseError>
@@ -152,13 +303,14 @@ fn start_service() -> Result<Child, io::Error> {
 
 /// Start the daemon as a DETACHED background process (its own session, with
 /// stdio sent to a contained log file) if one isn't already running, then return
-/// without owning it. Used by attach-and-detach front-ends (TUI/GUI): the daemon
-/// is the persistent core engine and must survive the front-end — and its
-/// terminal — going away. A redundant daemon self-exits (`AlreadyRunning`).
-// Retained for a future GRANTED auto-start (a signed/release TUI build that can
-// inject); the TUI is attach-only today, so this is currently unused.
-#[allow(dead_code)]
-#[cfg(all(feature = "tui", not(feature = "gtk")))]
+/// without owning it. Used by the front door on non-macOS (macOS uses launchd):
+/// the daemon is the persistent core engine and must survive the front-end — and
+/// its terminal — going away. A redundant daemon self-exits (`AlreadyRunning`).
+#[cfg(all(
+    not(feature = "gtk"),
+    not(target_os = "macos"),
+    any(feature = "tui", feature = "slint")
+))]
 fn start_detached_daemon() -> Result<(), io::Error> {
     use std::process::Stdio;
     // contained daemon log (never the home root)
@@ -166,7 +318,7 @@ fn start_detached_daemon() -> Result<(), io::Error> {
         let mut path = std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
             .unwrap_or_default();
-        path.push("grabbr-hop/logs");
+        path.push("hops/logs");
         let _ = std::fs::create_dir_all(&path);
         path.push("daemon.log");
         match std::fs::OpenOptions::new()

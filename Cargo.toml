@@ -21,11 +21,12 @@ autobins = false
 license = "GPL-3.0-or-later"
 repository = "https://github.com/jtjones09/grabbr-hop"
 
-# grabbr-hop: the product binary is `grabbr-hop` (this is a GPLv3 fork of
-# lan-mouse — attribution preserved in NOTICE/headers; the Cargo *package* stays
-# `lan-mouse` to minimize churn, but the shipped binary + identity are grabbr-hop).
+# hops: the product binary is `hops` (this is a GPLv3 fork of lan-mouse —
+# attribution preserved in NOTICE/headers; the Cargo *package* stays `lan-mouse`
+# to minimize churn, but the shipped binary + identity are `hops`). One binary
+# does everything: `hops` (front door) / `hops gui` / `hops tui` / `hops daemon`.
 [[bin]]
-name = "grabbr-hop"
+name = "hops"
 path = "src/main.rs"
 
 [profile.release]
@@ -45,6 +46,7 @@ lan-mouse-cli = { path = "lan-mouse-cli", version = "0.3.0" }
 lan-mouse-gtk = { path = "lan-mouse-gtk", version = "0.3.0", optional = true }
 lan-mouse-tui = { path = "lan-mouse-tui", version = "0.1.0", optional = true }
 lan-mouse-slint = { path = "lan-mouse-slint", version = "0.1.0", optional = true }
+lan-mouse-frontend-core = { path = "lan-mouse-frontend-core", version = "0.1.0", optional = true }
 lan-mouse-ipc = { path = "lan-mouse-ipc", version = "0.3.0" }
 lan-mouse-proto = { path = "lan-mouse-proto", version = "0.3.0" }
 shadow-rs = { version = "1.2.0", features = ["metadata"] }
@@ -104,8 +106,8 @@ default = [
     "x11_emulation",
 ]
 gtk = ["dep:lan-mouse-gtk"]
-tui = ["dep:lan-mouse-tui"]
-slint = ["dep:lan-mouse-slint"]
+tui = ["dep:lan-mouse-tui", "dep:lan-mouse-frontend-core"]
+slint = ["dep:lan-mouse-slint", "dep:lan-mouse-frontend-core"]
 layer_shell_capture = ["input-capture/layer_shell"]
 x11_capture = ["input-capture/x11"]
 libei_capture = ["input-event/libei", "input-capture/libei"]

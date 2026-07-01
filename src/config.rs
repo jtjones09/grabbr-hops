@@ -125,8 +125,12 @@ pub enum Command {
     TestCapture(TestCaptureArgs),
     /// Lan Mouse commandline interface
     Cli(CliArgs),
-    /// run in daemon mode
+    /// run in daemon mode (the receiver; normally started by launchd)
     Daemon,
+    /// open the graphical interface (attaches to the daemon)
+    Gui,
+    /// open the terminal interface (attaches to the daemon)
+    Tui,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]

@@ -3426,6 +3426,7 @@ dependencies = [
  "input-emulation",
  "input-event",
  "lan-mouse-cli",
+ "lan-mouse-frontend-core",
  "lan-mouse-gtk",
  "lan-mouse-ipc",
  "lan-mouse-proto",
@@ -3515,6 +3516,7 @@ dependencies = [
 name = "lan-mouse-slint"
 version = "0.1.0"
 dependencies = [
+ "image",
  "lan-mouse-frontend-core",
  "lan-mouse-ipc",
  "log",
