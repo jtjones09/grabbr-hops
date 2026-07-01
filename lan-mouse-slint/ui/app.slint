@@ -50,6 +50,12 @@ export component AppWindow inherits Window {
     in property <string> pairing-fp: "";
 
     property <string> confirm-revoke-fp: "";
+    // `in-out` (not a plain internal property) so the render_png self-review
+    // harness can open these overlays from outside for a look — not used by the
+    // real app's Rust side, which only ever reads them indirectly via clicks.
+    in-out property <bool> show-settings: false;
+    in-out property <bool> show-add-device: false;
+    property <string> add-device-position: "left";
 
     callback enable-input();
     callback activate-device(string /* handle */, bool /* active */);
@@ -57,6 +63,8 @@ export component AppWindow inherits Window {
     callback approve-pairing(string /* name */, string /* full fingerprint */);
     callback deny-pairing(string /* full fingerprint */);
     callback set-theme(int /* palette index */);
+    callback create-device(string /* name */, string /* port */, string /* position */);
+    callback switch-interface();
 
     VerticalLayout {
         padding: Space.xxl;
@@ -74,17 +82,25 @@ export component AppWindow inherits Window {
                 vertical-alignment: center;
             }
             HorizontalLayout {
-                spacing: Space.sm;
-                VerticalLayout {
-                    alignment: center;
-                    Dot { tint: root.connected ? Theme.c.success : Theme.c.warn; }
+                spacing: Space.md;
+                HorizontalLayout {
+                    spacing: Space.sm;
+                    VerticalLayout {
+                        alignment: center;
+                        Dot { tint: root.connected ? Theme.c.success : Theme.c.warn; }
+                    }
+                    Text {
+                        text: root.connected ? "connected" : "connecting";
+                        color: root.connected ? Theme.c.success : Theme.c.warn;
+                        font-size: Type.small;
+                        font-weight: Type.semibold;
+                        vertical-alignment: center;
+                    }
                 }
-                Text {
-                    text: root.connected ? "connected" : "connecting";
-                    color: root.connected ? Theme.c.success : Theme.c.warn;
-                    font-size: Type.small;
-                    font-weight: Type.semibold;
-                    vertical-alignment: center;
+                PillButton {
+                    text: "settings";
+                    ghost: true;
+                    clicked => { root.show-settings = true; }
                 }
             }
         }
@@ -182,7 +198,65 @@ export component AppWindow inherits Window {
         }
 
         // --- devices ------------------------------------------------------------
-        SectionTitle { text: "devices — cross to"; color: Theme.c.accent; }
+        HorizontalLayout {
+            alignment: space-between;
+            SectionTitle { text: "devices — cross to"; color: Theme.c.accent; }
+            PillButton {
+                text: root.show-add-device ? "cancel" : "+ add";
+                ghost: true;
+                clicked => { root.show-add-device = !root.show-add-device; }
+            }
+        }
+        if root.show-add-device: Rectangle {
+            vertical-stretch: 0;
+            background: Theme.c.surface;
+            border-radius: Radius.lg;
+            border-width: 1px;
+            border-color: Theme.c.border;
+            VerticalLayout {
+                padding: Space.md;
+                spacing: Space.sm;
+                HorizontalLayout {
+                    spacing: Space.sm;
+                    add-name := TextField {
+                        placeholder: "name (e.g. studio-pc)";
+                        horizontal-stretch: 2;
+                    }
+                    add-port := TextField {
+                        placeholder: "4242";
+                        horizontal-stretch: 1;
+                    }
+                }
+                HorizontalLayout {
+                    spacing: Space.sm;
+                    Text {
+                        text: "position";
+                        color: Theme.c.muted;
+                        font-size: Type.small;
+                        vertical-alignment: center;
+                    }
+                    for p in ["left", "right", "top", "bottom"]: PillButton {
+                        text: p;
+                        primary: root.add-device-position == p;
+                        clicked => { root.add-device-position = p; }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: Space.sm;
+                    PillButton {
+                        text: "add device";
+                        primary: true;
+                        clicked => {
+                            root.create-device(add-name.text, add-port.text, root.add-device-position);
+                            add-name.text = "";
+                            add-port.text = "";
+                            root.add-device-position = "left";
+                            root.show-add-device = false;
+                        }
+                    }
+                }
+            }
+        }
         Card {
             vertical-stretch: 0;
             VerticalLayout {
@@ -385,6 +459,59 @@ export component AppWindow inherits Window {
                     font-size: Type.caption;
                     letter-spacing: Type.mono-tracking;
                     overflow: elide;
+                }
+            }
+        }
+    }
+
+    // --- settings overlay (a sibling of the root layout so it floats above it) --
+    if root.show-settings: Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        background: #000000cc;
+
+        TouchArea { clicked => { root.show-settings = false; } }
+
+        Rectangle {
+            width: 320px;
+            height: 200px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: Theme.c.surface;
+            border-radius: Radius.lg;
+            border-width: 1px;
+            border-color: Theme.c.border;
+
+            TouchArea {} // swallows clicks so the panel doesn't close itself
+
+            VerticalLayout {
+                padding: Space.xxl;
+                spacing: Space.md;
+                Text {
+                    text: "settings";
+                    font-size: Type.heading;
+                    font-weight: Type.bold;
+                    color: Theme.c.foreground;
+                }
+                VerticalLayout {
+                    spacing: 6px;
+                    SectionTitle { text: "interface"; color: Theme.c.accent; }
+                    HorizontalLayout {
+                        spacing: Space.sm;
+                        PillButton { text: "graphical"; primary: true; enabled: false; }
+                        PillButton {
+                            text: "terminal";
+                            clicked => { root.switch-interface(); }
+                        }
+                    }
+                }
+                Rectangle { vertical-stretch: 1; }
+                PillButton {
+                    text: "close";
+                    ghost: true;
+                    clicked => { root.show-settings = false; }
                 }
             }
         }

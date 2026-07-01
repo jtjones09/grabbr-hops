@@ -11,13 +11,14 @@
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     rc::Rc,
     sync::mpsc,
     time::{Duration, Instant},
 };
 
-use lan_mouse_frontend_core::{theme, FrontendClient, FrontendRequest, Status};
+use lan_mouse_frontend_core::{prefs, theme, ClientHandle, FrontendClient, FrontendRequest, Position, Status};
+use lan_mouse_ipc::DEFAULT_PORT;
 use slint::{ComponentHandle, ModelRc, VecModel};
 use thiserror::Error;
 
@@ -166,6 +167,32 @@ pub fn run() -> Result<(), SlintError> {
             }
         });
     }
+    {
+        ui.on_switch_interface(move || {
+            let err = prefs::switch_to(prefs::Frontend::Tui);
+            // only reached if the exec failed — a successful switch never returns
+            log::warn!("could not switch to the terminal interface: {err}");
+        });
+    }
+
+    // A device the user just asked to create, awaiting the handle the daemon
+    // assigns (Create is fire-and-forget; the handle only appears once the
+    // resulting `Created` event reaches the next snapshot). Applied by the poll
+    // loop below as soon as a handle absent from `known_handles` shows up.
+    let pending_new_device: Rc<RefCell<Option<(String, u16, Position)>>> =
+        Rc::new(RefCell::new(None));
+    let known_handles: Rc<RefCell<HashSet<ClientHandle>>> = Rc::new(RefCell::new(HashSet::new()));
+    {
+        let c = client.clone();
+        let pending = pending_new_device.clone();
+        ui.on_create_device(move |name, port, position| {
+            let name = name.trim().to_string();
+            let port = port.trim().parse::<u16>().unwrap_or(DEFAULT_PORT);
+            let position = Position::try_from(position.as_str()).unwrap_or_default();
+            *pending.borrow_mut() = Some((name, port, position));
+            c.request(FrontendRequest::Create);
+        });
+    }
 
     // poll the model ~4x/sec and push it into the window
     let weak = ui.as_weak();
@@ -176,6 +203,28 @@ pub fn run() -> Result<(), SlintError> {
         move || {
             let Some(ui) = weak.upgrade() else { return };
             let m = client.snapshot();
+
+            // apply a pending create's name/port/position once its handle shows up
+            {
+                let current: HashSet<ClientHandle> = m.clients.keys().copied().collect();
+                if let Some((name, port, position)) = pending_new_device.borrow_mut().take() {
+                    match current.difference(&known_handles.borrow()).next() {
+                        Some(&new_handle) => {
+                            if !name.is_empty() {
+                                client.request(FrontendRequest::UpdateHostname(
+                                    new_handle,
+                                    Some(name),
+                                ));
+                            }
+                            client.request(FrontendRequest::UpdatePort(new_handle, port));
+                            client.request(FrontendRequest::UpdatePosition(new_handle, position));
+                        }
+                        // the Created event hasn't reached a snapshot yet — retry next tick
+                        None => *pending_new_device.borrow_mut() = Some((name, port, position)),
+                    }
+                }
+                *known_handles.borrow_mut() = current;
+            }
 
             ui.set_connected(m.connected);
             ui.set_capture(status_text(m.capture).into());

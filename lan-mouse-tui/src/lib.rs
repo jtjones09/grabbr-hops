@@ -9,7 +9,7 @@
 //! and the *trusted* panel (incoming peers allowed to control this machine).
 //! Devices: a=add, d=delete, n=name, p=position, space=on/off. Trusted:
 //! n=rename, d=revoke. Global: l=activity log, o=listen port, r=re-enable,
-//! s=save, t=theme, ↑↓=select, q=close.
+//! s=save, t=theme, g=switch to the graphical interface, ↑↓=select, q=close.
 //! An untrusted peer that connects raises an approve/deny pairing prompt.
 
 use std::{
@@ -304,6 +304,14 @@ pub async fn run() -> Result<(), TuiError> {
                                 input = Some(Input::Port {
                                     buf: model.port.map(|p| p.to_string()).unwrap_or_default(),
                                 });
+                            }
+                            KeyCode::Char('g') => {
+                                ratatui::restore();
+                                let err = lan_mouse_frontend_core::prefs::switch_to(Frontend::Gui);
+                                log::warn!("could not switch to the graphical interface: {err}");
+                                // exec() failed (or this build has no GUI) — the
+                                // process is still us, so put the terminal back.
+                                terminal = ratatui::init();
                             }
                             // panel-specific actions
                             _ => match focus {
@@ -745,6 +753,7 @@ fn footer_line(
         ("r", " re-en  "),
         ("s", " save  "),
         ("t", " theme  "),
+        ("g", " gui  "),
         ("q", " close"),
     ] {
         spans.push(Span::styled(k, key));

@@ -2,7 +2,8 @@
 // using the pure software renderer — no window, no GPU, no macOS TCC permission.
 // This is how the GUI's design gets reviewed without a display.
 //
-//   cargo run -p lan-mouse-slint --example render_png -- /path/to/out.png [w] [h] [theme_index]
+//   cargo run -p lan-mouse-slint --example render_png -- /path/to/out.png [w] [h] [theme_index] [mode]
+//   mode: normal (default) | settings | add-device — opens that overlay for review
 //
 // Requires the crate's slint dep to carry feature "software-renderer-systemfonts"
 // (see Cargo.toml) — without it, AppWindow::new() panics when the embedded
@@ -98,6 +99,12 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             online: false,
         },
     ])));
+
+    match std::env::args().nth(5).as_deref() {
+        Some("settings") => ui.set_show_settings(true),
+        Some("add-device") => ui.set_show_add_device(true),
+        _ => {}
+    }
 
     // 4) Fixed HiDPI size. No Window::set_scale_factor in 1.14 — dispatch a WindowEvent
     //    BEFORE set_size (which takes PHYSICAL px; MinimalSoftwareWindow does not auto-size).

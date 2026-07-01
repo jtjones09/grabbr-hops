@@ -73,3 +73,34 @@ pub fn onboarding_done() -> bool {
 pub fn set_onboarding_done() {
     write_pref("onboarded", "1");
 }
+
+/// Persist `target` as the preferred front-end, then EXEC-REPLACE this process
+/// with `hops <target>` — the current process image becomes the other front-end
+/// in place (same PID; a controlling terminal, if any, carries straight over to
+/// the TUI), so switching is instant with no separate process to spawn or clean
+/// up. Only ever returns on FAILURE: a successful `exec` never returns, so the
+/// caller should surface the error rather than assume anything continued.
+///
+/// If the caller is a TUI holding the terminal in raw mode, it must restore the
+/// terminal (e.g. `ratatui::restore()`) BEFORE calling this — exec doesn't run
+/// any of the old process's cleanup code, so a still-raw terminal would carry
+/// over broken into whatever comes next.
+#[cfg(unix)]
+pub fn switch_to(target: Frontend) -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    save_frontend(target);
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    std::process::Command::new(exe).arg(target.as_str()).exec()
+}
+
+#[cfg(not(unix))]
+pub fn switch_to(target: Frontend) -> std::io::Error {
+    save_frontend(target);
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "switching interfaces on the fly isn't supported on this platform — restart manually",
+    )
+}
