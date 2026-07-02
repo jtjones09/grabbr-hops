@@ -50,6 +50,18 @@ export component AppWindow inherits Window {
     in property <string> pairing-fp: "";
 
     property <string> confirm-revoke-fp: "";
+    // `in-out` so the render_png self-review harness can open it for a look.
+    in-out property <string> confirm-delete-handle: "";
+    // handle of the device being renamed ("" = none). The rename FIELD lives
+    // in a single shared panel below the list, NOT inline per-row — `devices`
+    // is a brand-new VecModel every ~250ms poll tick, so a TextField inside
+    // the `for` loop would have its in-progress typing wiped out on the next
+    // tick along with the rest of that row's instance. A property compared
+    // against `d.handle` (like this one, and confirm-revoke-fp/
+    // confirm-delete-handle above) is safe because it lives on `root`, outside
+    // the loop, and is just re-read fresh each time a row re-renders.
+    // `in-out` so the render_png self-review harness can open it for a look.
+    in-out property <string> editing-device: "";
     // `in-out` (not a plain internal property) so the render_png self-review
     // harness can open these overlays from outside for a look — not used by the
     // real app's Rust side, which only ever reads them indirectly via clicks.
@@ -59,6 +71,9 @@ export component AppWindow inherits Window {
 
     callback enable-input();
     callback activate-device(string /* handle */, bool /* active */);
+    callback reposition-device(string /* handle */, string /* new position */);
+    callback rename-device(string /* handle */, string /* new name */);
+    callback delete-device(string /* handle */);
     callback revoke(string /* full fingerprint */);
     callback approve-pairing(string /* name */, string /* full fingerprint */);
     callback deny-pairing(string /* full fingerprint */);
@@ -313,6 +328,14 @@ export component AppWindow inherits Window {
                                 text: d.pos;
                                 text-color: Theme.c.accent;
                                 fill: Theme.c.accent.transparentize(0.85);
+                                pos-ta := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => {
+                                        root.reposition-device(d.handle, d.pos == "left" ? "right"
+                                            : d.pos == "right" ? "top"
+                                            : d.pos == "top" ? "bottom" : "left");
+                                    }
+                                }
                             }
                         }
                         VerticalLayout {
@@ -320,6 +343,92 @@ export component AppWindow inherits Window {
                             Toggle {
                                 checked: d.active;
                                 toggled(v) => { root.activate-device(d.handle, v); }
+                            }
+                        }
+                        if root.confirm-delete-handle != d.handle: VerticalLayout {
+                            alignment: center;
+                            PillButton {
+                                text: "edit";
+                                ghost: true;
+                                clicked => { root.editing-device = root.editing-device == d.handle ? "" : d.handle; }
+                            }
+                        }
+                        if root.confirm-delete-handle != d.handle: VerticalLayout {
+                            alignment: center;
+                            PillButton {
+                                text: "delete";
+                                ghost: true;
+                                clicked => { root.confirm-delete-handle = d.handle; }
+                            }
+                        }
+                        if root.confirm-delete-handle == d.handle: VerticalLayout {
+                            alignment: center;
+                            Text {
+                                text: "delete?";
+                                color: Theme.c.muted;
+                                font-size: Type.small;
+                            }
+                        }
+                        if root.confirm-delete-handle == d.handle: VerticalLayout {
+                            alignment: center;
+                            PillButton {
+                                text: "yes";
+                                danger: true;
+                                clicked => {
+                                    root.delete-device(d.handle);
+                                    root.confirm-delete-handle = "";
+                                    root.editing-device = "";
+                                }
+                            }
+                        }
+                        if root.confirm-delete-handle == d.handle: VerticalLayout {
+                            alignment: center;
+                            PillButton {
+                                text: "no";
+                                ghost: true;
+                                clicked => { root.confirm-delete-handle = ""; }
+                            }
+                        }
+                    }
+                }
+                if root.editing-device != "": Rectangle {
+                    background: Theme.c.surface-raised;
+                    border-radius: Radius.md;
+                    VerticalLayout {
+                        padding: Space.md;
+                        spacing: Space.sm;
+                        Text {
+                            text: "rename device";
+                            color: Theme.c.muted;
+                            font-size: Type.caption;
+                        }
+                        HorizontalLayout {
+                            spacing: Space.sm;
+                            rename-field := TextField {
+                                placeholder: "new name";
+                                horizontal-stretch: 1;
+                                accepted => {
+                                    root.rename-device(root.editing-device, self.text);
+                                    self.text = "";
+                                    root.editing-device = "";
+                                }
+                            }
+                            PillButton {
+                                text: "save";
+                                primary: true;
+                                clicked => {
+                                    root.rename-device(root.editing-device, rename-field.text);
+                                    rename-field.text = "";
+                                    root.editing-device = "";
+                                }
+                            }
+                            PillButton {
+                                text: "cancel";
+                                ghost: true;
+                                clicked => {
+                                    rename-field.text = "";
+                                    root.editing-device = "";
+                                }
                             }
                         }
                     }

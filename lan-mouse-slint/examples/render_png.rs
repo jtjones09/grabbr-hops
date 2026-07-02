@@ -103,6 +103,8 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
     match std::env::args().nth(5).as_deref() {
         Some("settings") => ui.set_show_settings(true),
         Some("add-device") => ui.set_show_add_device(true),
+        Some("edit-device") => ui.set_editing_device("1".into()), // matches the mock studio-pc handle
+        Some("delete-confirm") => ui.set_confirm_delete_handle("1".into()),
         _ => {}
     }
 

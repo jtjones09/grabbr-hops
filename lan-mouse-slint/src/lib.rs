@@ -135,6 +135,33 @@ pub fn run() -> Result<(), SlintError> {
     }
     {
         let c = client.clone();
+        ui.on_reposition_device(move |handle, position| {
+            if let Ok(h) = handle.as_str().parse::<u64>() {
+                let pos = Position::try_from(position.as_str()).unwrap_or_default();
+                c.request(FrontendRequest::UpdatePosition(h, pos));
+            }
+        });
+    }
+    {
+        let c = client.clone();
+        ui.on_rename_device(move |handle, name| {
+            let name = name.trim();
+            if let Ok(h) = handle.as_str().parse::<u64>() {
+                let name = (!name.is_empty()).then(|| name.to_string());
+                c.request(FrontendRequest::UpdateHostname(h, name));
+            }
+        });
+    }
+    {
+        let c = client.clone();
+        ui.on_delete_device(move |handle| {
+            if let Ok(h) = handle.as_str().parse::<u64>() {
+                c.request(FrontendRequest::Delete(h));
+            }
+        });
+    }
+    {
+        let c = client.clone();
         ui.on_revoke(move |fp| {
             c.request(FrontendRequest::RemoveAuthorizedKey(fp.to_string()));
         });
