@@ -1,0 +1,171 @@
+// grabbr-hop — the drag-to-arrange spatial layout canvas. Lets you position
+// each device relative to "this Mac" by dragging; the result persists as a
+// Geometry rect per device (UpdateGeometry). STORAGE ONLY for now — nothing
+// reads these rects to change how crossing actually behaves yet. That's a
+// separate, deliberately deferred step: crossing behavior needs A/B hardware
+// testing before it can trust computed geometry (see the project's own
+// behavioral-bugs-need-runtime-test lesson — spatial crossing has been
+// misdiagnosed from code alone before).
+//
+// Box positions are intentionally NOT re-pushed by the ~250ms poll timer
+// while the canvas is open (see AppWindow.open-layout-canvas in app.slint) —
+// only a fresh open() call repopulates them. If the live device poll kept
+// overwriting `x`/`y` every tick, it would fight a drag in progress the same
+// way a live-bound rename TextField would (see app.slint's note on that).
+
+import { Theme, Type, Space, Radius, Motion } from "theme.slint";
+import { PillButton } from "widgets.slint";
+
+export struct CanvasBox {
+    handle: string,
+    name: string,
+    // logical px, plain floats (not `length`) so Rust can construct/read this
+    // struct without needing Slint's length wrapper type.
+    x: float,
+    y: float,
+}
+
+// shared constants — Slint has no top-level `const`, only `global` (the same
+// idiom theme.slint uses for Space/Radius/etc.)
+global CanvasSize {
+    out property <length> width: 480px;
+    out property <length> height: 280px;
+    out property <length> box-width: 96px;
+    out property <length> box-height: 64px;
+}
+
+component DraggableBox inherits Rectangle {
+    in property <string> label;
+    in-out property <length> box-x;
+    in-out property <length> box-y;
+    callback dropped(length /* x */, length /* y */);
+
+    width: CanvasSize.box-width;
+    height: CanvasSize.box-height;
+    x: box-x;
+    y: box-y;
+    background: ta.pressed ? Theme.c.accent.transparentize(0.55) : Theme.c.accent.transparentize(0.75);
+    border-width: 2px;
+    border-color: Theme.c.accent;
+    border-radius: Radius.md;
+    animate background { duration: Motion.fast; }
+
+    Text {
+        text: root.label;
+        color: Theme.c.foreground;
+        font-size: Type.small;
+        font-weight: Type.semibold;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        width: 100%;
+        height: 100%;
+        wrap: word-wrap;
+    }
+
+    ta := TouchArea {
+        property <length> pressed-box-x;
+        property <length> pressed-box-y;
+        mouse-cursor: pointer;
+
+        // the down/up-detecting drag idiom is Slint's own — mirrors the
+        // built-in SliderBase widget (i-slint-compiler's widgets/common/
+        // slider-base.slint), the proven reference for this exact pattern.
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down) {
+                self.pressed-box-x = root.box-x;
+                self.pressed-box-y = root.box-y;
+            } else if (event.kind == PointerEventKind.up) {
+                root.dropped(root.box-x, root.box-y);
+            }
+        }
+        moved => {
+            root.box-x = max(0px, min(CanvasSize.width - CanvasSize.box-width, self.pressed-box-x + (self.mouse-x - self.pressed-x)));
+            root.box-y = max(0px, min(CanvasSize.height - CanvasSize.box-height, self.pressed-box-y + (self.mouse-y - self.pressed-y)));
+        }
+    }
+}
+
+export component LayoutCanvas inherits Rectangle {
+    in property <[CanvasBox]> boxes: [];
+    callback close();
+    // x/y in plain logical-px floats — see CanvasBox's own note on why.
+    callback geometry-changed(string /* handle */, float /* x */, float /* y */);
+
+    background: Theme.c.surface;
+    border-radius: Radius.lg;
+    border-width: 1px;
+    border-color: Theme.c.border;
+
+    // declared BEFORE the real content below, so it only catches clicks on
+    // empty panel background (later siblings win hit-testing) — stops a click
+    // inside the panel from falling through to the outer scrim's close-on-
+    // click-outside handler, same pattern the settings overlay uses.
+    TouchArea {}
+
+    VerticalLayout {
+        padding: Space.xxl;
+        spacing: Space.md;
+
+        HorizontalLayout {
+            alignment: space-between;
+            Text {
+                text: "arrange devices";
+                font-size: Type.heading;
+                font-weight: Type.bold;
+                color: Theme.c.foreground;
+                vertical-alignment: center;
+            }
+            PillButton {
+                text: "done";
+                primary: true;
+                clicked => { root.close(); }
+            }
+        }
+        Text {
+            text: "drag a device relative to this Mac — purely visual for now, doesn't change crossing yet";
+            color: Theme.c.muted;
+            font-size: Type.caption;
+            wrap: word-wrap;
+        }
+
+        Rectangle {
+            width: CanvasSize.width;
+            height: CanvasSize.height;
+            background: Theme.c.background;
+            border-radius: Radius.md;
+            border-width: 1px;
+            border-color: Theme.c.border;
+
+            // "this Mac" — a fixed anchor, not draggable (its own geometry
+            // isn't a remote client's config, so there's nowhere to persist
+            // a dragged position for it in this pass).
+            Rectangle {
+                width: CanvasSize.box-width;
+                height: CanvasSize.box-height;
+                x: (CanvasSize.width - self.width) / 2;
+                y: (CanvasSize.height - self.height) / 2;
+                background: Theme.c.surface-raised;
+                border-width: 2px;
+                border-color: Theme.c.muted;
+                border-radius: Radius.md;
+                Text {
+                    text: "this Mac";
+                    color: Theme.c.foreground;
+                    font-size: Type.small;
+                    font-weight: Type.semibold;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    width: 100%;
+                    height: 100%;
+                }
+            }
+
+            for b in root.boxes: DraggableBox {
+                label: b.name;
+                box-x: b.x * 1px;
+                box-y: b.y * 1px;
+                dropped(x, y) => { root.geometry-changed(b.handle, x / 1px, y / 1px); }
+            }
+        }
+    }
+}

@@ -18,7 +18,7 @@ use std::{
 };
 
 use lan_mouse_frontend_core::{prefs, theme, ClientHandle, FrontendClient, FrontendRequest, Position, Status};
-use lan_mouse_ipc::DEFAULT_PORT;
+use lan_mouse_ipc::{Geometry, DEFAULT_PORT};
 use slint::{ComponentHandle, ModelRc, VecModel};
 use thiserror::Error;
 
@@ -78,6 +78,20 @@ pub fn theme_colors(t: &theme::Theme) -> ThemeColors {
 fn short_fp(fp: &str) -> String {
     let head: String = fp.chars().take(16).collect();
     format!("{head}…")
+}
+
+/// A starting position for a device with no stored geometry yet, placed just
+/// outside the "this Mac" anchor on its edge — matches layout_canvas.slint's
+/// `CanvasSize` global (480x280 canvas, 96x64 boxes, Mac centered) so a
+/// freshly opened canvas looks intentional rather than dumping everything at
+/// the origin. Only ever a starting point — dragging overrides it immediately.
+fn default_canvas_pos(pos: Position) -> (f32, f32) {
+    match pos {
+        Position::Left => (20.0, 108.0),
+        Position::Right => (364.0, 108.0),
+        Position::Top => (192.0, 16.0),
+        Position::Bottom => (192.0, 200.0),
+    }
 }
 
 /// Run the Slint GUI front-end. Blocks on the Slint event loop until the window
@@ -221,6 +235,53 @@ pub fn run() -> Result<(), SlintError> {
             let position = Position::try_from(position.as_str()).unwrap_or_default();
             *pending.borrow_mut() = Some((name, port, position));
             c.request(FrontendRequest::Create);
+        });
+    }
+    {
+        // Snapshot device positions into canvas-boxes ONCE, here, rather than
+        // feeding them from the regular poll loop — see layout_canvas.slint's
+        // header note on why a live-updated model would fight an in-progress drag.
+        let c = client.clone();
+        let weak = ui.as_weak();
+        ui.on_open_layout_canvas(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let m = c.snapshot();
+            let boxes: Vec<CanvasBox> = m
+                .clients
+                .iter()
+                .map(|(h, (cfg, _))| {
+                    let (x, y) = cfg
+                        .geometry
+                        .map(|g| (g.x as f32, g.y as f32))
+                        .unwrap_or_else(|| default_canvas_pos(cfg.pos));
+                    CanvasBox {
+                        handle: h.to_string().into(),
+                        name: cfg
+                            .hostname
+                            .clone()
+                            .unwrap_or_else(|| "unnamed".into())
+                            .into(),
+                        x,
+                        y,
+                    }
+                })
+                .collect();
+            ui.set_canvas_boxes(ModelRc::new(VecModel::from(boxes)));
+            ui.set_show_layout_canvas(true);
+        });
+    }
+    {
+        let c = client.clone();
+        ui.on_update_device_geometry(move |handle, x, y| {
+            if let Ok(h) = handle.as_str().parse::<u64>() {
+                let geometry = Geometry {
+                    x: x.round() as i32,
+                    y: y.round() as i32,
+                    width: 96,
+                    height: 64,
+                };
+                c.request(FrontendRequest::UpdateGeometry(h, Some(geometry)));
+            }
         });
     }
 

@@ -292,6 +292,10 @@ impl Service {
                 self.update_pos(handle, pos);
                 self.save_config();
             }
+            FrontendRequest::UpdateGeometry(handle, geometry) => {
+                self.update_geometry(handle, geometry);
+                self.save_config();
+            }
             FrontendRequest::ResolveDns(handle) => self.resolve(handle),
             FrontendRequest::Sync => self.sync_frontend(),
             FrontendRequest::RemoveAuthorizedKey(key) => {
@@ -682,6 +686,11 @@ impl Service {
             self.deactivate_client(handle);
             self.activate_client(handle);
         }
+        self.broadcast_client(handle);
+    }
+
+    fn update_geometry(&mut self, handle: ClientHandle, geometry: Option<lan_mouse_ipc::Geometry>) {
+        self.client_manager.set_geometry(handle, geometry);
         self.broadcast_client(handle);
     }
 

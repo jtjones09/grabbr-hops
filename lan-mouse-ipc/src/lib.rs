@@ -262,6 +262,9 @@ pub enum FrontendRequest {
     UpdatePort(ClientHandle, u16),
     /// update position
     UpdatePosition(ClientHandle, Position),
+    /// update spatial layout rect (the drag-to-arrange canvas). Storage only —
+    /// coordinate-based crossing is a separate, not-yet-built behavior change.
+    UpdateGeometry(ClientHandle, Option<Geometry>),
     /// update fix-ips
     UpdateFixIps(ClientHandle, Vec<IpAddr>),
     /// request reenabling input capture

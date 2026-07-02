@@ -7,7 +7,7 @@ use std::{
 
 use slab::Slab;
 
-use lan_mouse_ipc::{ClientConfig, ClientHandle, ClientState, Position};
+use lan_mouse_ipc::{ClientConfig, ClientHandle, ClientState, Geometry, Position};
 
 use crate::config::ConfigClient;
 
@@ -234,6 +234,16 @@ impl ClientManager {
     pub(crate) fn set_enter_hook(&self, handle: ClientHandle, enter_hook: Option<String>) {
         if let Some((c, _s)) = self.clients.borrow_mut().get_mut(handle as usize) {
             c.cmd = enter_hook;
+        }
+    }
+
+    /// update the spatial layout rect of the client (the drag-to-arrange
+    /// canvas). Purely additive/storage — unlike `set_pos`, this does NOT
+    /// affect capture activation; coordinate-based crossing is a separate,
+    /// not-yet-built behavior change that reads this field later.
+    pub(crate) fn set_geometry(&self, handle: ClientHandle, geometry: Option<Geometry>) {
+        if let Some((c, _s)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            c.geometry = geometry;
         }
     }
 

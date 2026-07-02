@@ -3,7 +3,7 @@
 // This is how the GUI's design gets reviewed without a display.
 //
 //   cargo run -p lan-mouse-slint --example render_png -- /path/to/out.png [w] [h] [theme_index] [mode]
-//   mode: normal (default) | settings | add-device — opens that overlay for review
+//   mode: normal (default) | settings | add-device | edit-device | delete-confirm | layout-canvas
 //
 // Requires the crate's slint dep to carry feature "software-renderer-systemfonts"
 // (see Cargo.toml) — without it, AppWindow::new() panics when the embedded
@@ -20,7 +20,7 @@ use slint::{ComponentHandle, ModelRc, PhysicalSize, VecModel};
 // second invocation would compile the SAME .slint source into a SECOND, nominally
 // distinct set of Rust types, incompatible with the lib's (e.g. two different
 // `ThemeColors` structs), even though they look identical.
-use lan_mouse_slint::{theme_colors, AppWindow, DeviceRow, Theme, TrustedRow};
+use lan_mouse_slint::{theme_colors, AppWindow, CanvasBox, DeviceRow, Theme, TrustedRow};
 
 /// Headless platform: every window is a MinimalSoftwareWindow (CPU renderer, no OS window).
 struct HeadlessPlatform {
@@ -105,6 +105,13 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
         Some("add-device") => ui.set_show_add_device(true),
         Some("edit-device") => ui.set_editing_device("1".into()), // matches the mock studio-pc handle
         Some("delete-confirm") => ui.set_confirm_delete_handle("1".into()),
+        Some("layout-canvas") => {
+            ui.set_canvas_boxes(ModelRc::new(VecModel::from(vec![
+                CanvasBox { handle: "1".into(), name: "studio-pc".into(), x: 20.0, y: 108.0 },
+                CanvasBox { handle: "2".into(), name: "media-rig".into(), x: 192.0, y: 16.0 },
+            ])));
+            ui.set_show_layout_canvas(true);
+        }
         _ => {}
     }
 

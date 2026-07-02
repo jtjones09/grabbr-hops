@@ -5,13 +5,15 @@
 import { Theme, Type, Space, Radius, Motion, Size } from "theme.slint";
 import { Card, Separator, Dot, Chip, StatChip, SectionTitle, PillButton, TextField, Toggle } from "widgets.slint";
 import { OnboardingWindow } from "onboarding.slint";
+import { LayoutCanvas, CanvasBox } from "layout_canvas.slint";
 
 // re-export so Rust can select the active palette via `ui.global::<Theme>()`.
-// OnboardingWindow is re-exported here too (not compiled as its own separate
-// slint_build entry point) so it shares this SAME generated `Theme`/`ThemeColors`
-// Rust type — two independent `slint_build::compile()` calls over files that both
-// import theme.slint would otherwise produce two nominally distinct types.
-export { Theme, OnboardingWindow }
+// OnboardingWindow/CanvasBox are re-exported here too (not compiled as their
+// own separate slint_build entry points) so they share this SAME generated
+// `Theme`/`ThemeColors` Rust type — two independent `slint_build::compile()`
+// calls over files that both import theme.slint would otherwise produce two
+// nominally distinct types.
+export { Theme, OnboardingWindow, CanvasBox }
 
 export struct DeviceRow {
     handle: string,  // ClientHandle (u64 as text — Slint int is only i32)
@@ -68,6 +70,11 @@ export component AppWindow inherits Window {
     in-out property <bool> show-settings: false;
     in-out property <bool> show-add-device: false;
     property <string> add-device-position: "left";
+    // `in-out`: Rust sets both together, once, when the canvas opens — NOT
+    // re-pushed by the poll timer (see layout_canvas.slint's header note on
+    // why a drag would otherwise get fought by the next live update).
+    in-out property <bool> show-layout-canvas: false;
+    in-out property <[CanvasBox]> canvas-boxes: [];
 
     callback enable-input();
     callback activate-device(string /* handle */, bool /* active */);
@@ -80,6 +87,8 @@ export component AppWindow inherits Window {
     callback set-theme(int /* palette index */);
     callback create-device(string /* name */, string /* port */, string /* position */);
     callback switch-interface();
+    callback open-layout-canvas();
+    callback update-device-geometry(string /* handle */, float /* x */, float /* y */);
 
     VerticalLayout {
         padding: Space.xxl;
@@ -216,10 +225,18 @@ export component AppWindow inherits Window {
         HorizontalLayout {
             alignment: space-between;
             SectionTitle { text: "devices — cross to"; color: Theme.c.accent; }
-            PillButton {
-                text: root.show-add-device ? "cancel" : "+ add";
-                ghost: true;
-                clicked => { root.show-add-device = !root.show-add-device; }
+            HorizontalLayout {
+                spacing: Space.sm;
+                PillButton {
+                    text: "arrange";
+                    ghost: true;
+                    clicked => { root.open-layout-canvas(); }
+                }
+                PillButton {
+                    text: root.show-add-device ? "cancel" : "+ add";
+                    ghost: true;
+                    clicked => { root.show-add-device = !root.show-add-device; }
+                }
             }
         }
         if root.show-add-device: Rectangle {
@@ -623,6 +640,27 @@ export component AppWindow inherits Window {
                     clicked => { root.show-settings = false; }
                 }
             }
+        }
+    }
+
+    // --- layout canvas overlay ---------------------------------------------
+    if root.show-layout-canvas: Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        background: #000000cc;
+
+        TouchArea { clicked => { root.show-layout-canvas = false; } }
+
+        LayoutCanvas {
+            width: 560px;
+            height: 420px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            boxes: root.canvas-boxes;
+            close => { root.show-layout-canvas = false; }
+            geometry-changed(handle, x, y) => { root.update-device-geometry(handle, x, y); }
         }
     }
 }
