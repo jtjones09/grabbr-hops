@@ -24,6 +24,9 @@ use thiserror::Error;
 
 slint::include_modules!();
 
+#[cfg(target_os = "macos")]
+mod macos_status_item;
+
 /// A pairing prompt is "live" only this long after the last connection attempt
 /// (the daemon emits no retraction); matches the TUI's `STALE_TTL`.
 const STALE_TTL: Duration = Duration::from_secs(12);
@@ -300,7 +303,23 @@ pub fn run() -> Result<(), SlintError> {
         },
     );
 
-    ui.run()?;
+    ui.show()?;
+    // On macOS, a menu bar icon reopens the window after it's closed, so the
+    // event loop must survive having zero visible windows — the generated
+    // `ui.run()` (show + run_event_loop + hide) quits as soon as the last
+    // window closes, which would leave nothing to click "reopen" on. Elsewhere
+    // there's no tray icon yet, so the normal quit-on-close behavior is the
+    // safer default (a hidden, unreachable window would be a dead end).
+    #[cfg(target_os = "macos")]
+    {
+        macos_status_item::setup(ui.as_weak());
+        slint::run_event_loop_until_quit()?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        slint::run_event_loop()?;
+    }
+    ui.hide().ok();
     drop(timer);
     Ok(())
 }
