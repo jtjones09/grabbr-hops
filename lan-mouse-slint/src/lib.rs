@@ -13,7 +13,10 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
     rc::Rc,
-    sync::mpsc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -94,9 +97,107 @@ fn default_canvas_pos(pos: Position) -> (f32, f32) {
     }
 }
 
-/// Run the Slint GUI front-end. Blocks on the Slint event loop until the window
-/// closes; the daemon (separate launchd service) keeps running.
-pub fn run() -> Result<(), SlintError> {
+/// Single-instance coordination result (Unix). A second `hops gui` launch
+/// signals the first (any connection to the socket = "show your window") and
+/// exits, so re-launching focuses the resident menu-bar app instead of stacking
+/// duplicate tray icons.
+#[cfg(unix)]
+enum Instance {
+    /// We're the first instance; the guard keeps the socket file cleaned up.
+    Primary(SingleInstanceGuard),
+    /// Another instance is already running (we've signaled it).
+    Secondary,
+}
+
+/// Removes the single-instance socket file on drop (normal GUI exit).
+#[cfg(unix)]
+struct SingleInstanceGuard {
+    path: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        if !self.path.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn gui_socket_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let mut p = std::path::PathBuf::from(home);
+    p.push(".config/lan-mouse");
+    let _ = std::fs::create_dir_all(&p);
+    p.push("hops-gui.sock");
+    Some(p)
+}
+
+/// Own the socket + spawn a thread that flips `show_requested` on every incoming
+/// connection (each = a second launch asking us to surface the window).
+#[cfg(unix)]
+fn become_primary(
+    listener: std::os::unix::net::UnixListener,
+    path: std::path::PathBuf,
+    show_requested: Arc<AtomicBool>,
+) -> Instance {
+    std::thread::spawn(move || {
+        for _stream in listener.incoming() {
+            show_requested.store(true, Ordering::SeqCst);
+        }
+    });
+    Instance::Primary(SingleInstanceGuard { path })
+}
+
+/// Try to become the single running GUI instance; if one already runs, signal it.
+#[cfg(unix)]
+fn acquire_single_instance(show_requested: Arc<AtomicBool>) -> Instance {
+    use std::os::unix::net::{UnixListener, UnixStream};
+    // no socket path (no $HOME) → skip single-instance, just run
+    let Some(path) = gui_socket_path() else {
+        return Instance::Primary(SingleInstanceGuard {
+            path: std::path::PathBuf::new(),
+        });
+    };
+    match UnixListener::bind(&path) {
+        Ok(listener) => become_primary(listener, path, show_requested),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            // either a live primary, or a stale socket left by a crashed one
+            if UnixStream::connect(&path).is_ok() {
+                Instance::Secondary // signaled the live primary; we exit
+            } else {
+                let _ = std::fs::remove_file(&path); // stale — take it over
+                match UnixListener::bind(&path) {
+                    Ok(listener) => become_primary(listener, path, show_requested),
+                    Err(_) => Instance::Primary(SingleInstanceGuard {
+                        path: std::path::PathBuf::new(),
+                    }),
+                }
+            }
+        }
+        // any other bind error → run anyway without single-instance
+        Err(_) => Instance::Primary(SingleInstanceGuard {
+            path: std::path::PathBuf::new(),
+        }),
+    }
+}
+
+/// Run the Slint GUI front-end. Blocks on the Slint event loop until the user
+/// quits (macOS: via the menu bar "Quit"); the daemon keeps running regardless.
+/// `hidden` starts with only the menu-bar/tray icon and no window (login
+/// autostart); the window then opens on tray click or a second `hops gui` launch.
+pub fn run(hidden: bool) -> Result<(), SlintError> {
+    // A second launch surfaces the resident window rather than duplicating the
+    // tray icon; the flag is flipped by the single-instance socket thread and
+    // read by the poll timer (both below). Also the vehicle for "reopen".
+    let show_requested = Arc::new(AtomicBool::new(false));
+    #[cfg(unix)]
+    let _instance_guard = match acquire_single_instance(show_requested.clone()) {
+        Instance::Secondary => return Ok(()),
+        Instance::Primary(guard) => guard,
+    };
+
     // background thread owns the tokio runtime + the IPC client
     let (tx, rx) = mpsc::channel::<FrontendClient>();
     std::thread::spawn(move || {
@@ -287,12 +388,22 @@ pub fn run() -> Result<(), SlintError> {
 
     // poll the model ~4x/sec and push it into the window
     let weak = ui.as_weak();
+    let show_requested_poll = show_requested.clone();
     let timer = slint::Timer::default();
     timer.start(
         slint::TimerMode::Repeated,
         Duration::from_millis(250),
         move || {
             let Some(ui) = weak.upgrade() else { return };
+
+            // a second `hops gui` launch (or the tray on some paths) asked us to
+            // surface the window — do it on the UI thread, here.
+            if show_requested_poll.swap(false, Ordering::SeqCst) {
+                let _ = ui.show();
+                #[cfg(target_os = "macos")]
+                macos_status_item::activate_app();
+            }
+
             let m = client.snapshot();
 
             // apply a pending create's name/port/position once its handle shows up
@@ -391,7 +502,6 @@ pub fn run() -> Result<(), SlintError> {
         },
     );
 
-    ui.show()?;
     // On macOS, a menu bar icon reopens the window after it's closed, so the
     // event loop must survive having zero visible windows — the generated
     // `ui.run()` (show + run_event_loop + hide) quits as soon as the last
@@ -400,11 +510,20 @@ pub fn run() -> Result<(), SlintError> {
     // safer default (a hidden, unreachable window would be a dead end).
     #[cfg(target_os = "macos")]
     {
+        // `hidden` (login autostart) starts as just the tray icon; the window
+        // opens on tray-click or a second launch. Manual launches show it now.
+        if !hidden {
+            ui.show()?;
+        }
         macos_status_item::setup(ui.as_weak());
         slint::run_event_loop_until_quit()?;
     }
     #[cfg(not(target_os = "macos"))]
     {
+        // no tray icon on non-macOS yet, so a hidden window would be unreachable
+        // — always show until the platform tray lands.
+        let _ = hidden;
+        ui.show()?;
         slint::run_event_loop()?;
     }
     ui.hide().ok();

@@ -128,7 +128,13 @@ pub enum Command {
     /// run in daemon mode (the receiver; normally started by launchd)
     Daemon,
     /// open the graphical interface (attaches to the daemon)
-    Gui,
+    Gui {
+        /// start hidden in the menu bar / system tray — no window until the
+        /// tray icon is clicked. Used by the login-autostart item so logging in
+        /// shows the icon, not a window.
+        #[arg(long)]
+        hidden: bool,
+    },
     /// open the terminal interface (attaches to the daemon)
     Tui,
 }

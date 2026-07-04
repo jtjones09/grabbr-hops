@@ -65,7 +65,7 @@ fn run() -> Result<(), LanMouseError> {
             Command::TestCapture(args) => run_async(capture_test::run(config, args))?,
             Command::Cli(cli_args) => run_async(lan_mouse_cli::run(cli_args))?,
             Command::Daemon => run_daemon(config)?,
-            Command::Gui => run_gui()?,
+            Command::Gui { hidden } => run_gui(hidden)?,
             Command::Tui => run_tui()?,
         },
         None => {
@@ -122,14 +122,16 @@ fn run_daemon(config: config::Config) -> Result<(), LanMouseError> {
 }
 
 /// Open the Slint GUI (attach-only). No-op with a hint if this build lacks it.
-fn run_gui() -> Result<(), LanMouseError> {
+/// `hidden` starts the app in the menu bar / tray only, no window shown.
+fn run_gui(hidden: bool) -> Result<(), LanMouseError> {
     #[cfg(feature = "slint")]
     {
-        lan_mouse_slint::run()?;
+        lan_mouse_slint::run(hidden)?;
         Ok(())
     }
     #[cfg(not(feature = "slint"))]
     {
+        let _ = hidden;
         log::error!("this build has no GUI — rebuild with `--features slint`");
         Ok(())
     }
@@ -174,7 +176,8 @@ fn front_door() -> Result<(), LanMouseError> {
 
     match frontend {
         Frontend::Tui => run_tui(),
-        Frontend::Gui => run_gui(),
+        // front door = the user actively opening the app, so show the window
+        Frontend::Gui => run_gui(false),
     }
 }
 

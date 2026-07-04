@@ -76,6 +76,16 @@ pub fn setup(window: Weak<AppWindow>) {
     });
 }
 
+/// Bring the app to the front (used after showing the window from a background
+/// signal — a second launch's single-instance ping). `.show()` alone doesn't
+/// raise an accessory-policy app above whatever's currently focused.
+pub fn activate_app() {
+    unsafe {
+        let ns_app = msg_send_id(class(c"NSApplication"), sel(c"sharedApplication"));
+        msg_send_void_bool(ns_app, sel(c"activateIgnoringOtherApps:"), 1);
+    }
+}
+
 extern "C" fn show_hops(_this: Id, _cmd: Sel, _sender: Id) {
     present_window();
 }
