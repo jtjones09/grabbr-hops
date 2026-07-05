@@ -123,7 +123,7 @@ pub enum Command {
     TestEmulation(TestEmulationArgs),
     /// test input capture
     TestCapture(TestCaptureArgs),
-    /// Lan Mouse commandline interface
+    /// hops commandline interface
     Cli(CliArgs),
     /// run in daemon mode (the receiver; normally started by launchd)
     Daemon,

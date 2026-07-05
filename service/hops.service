@@ -1,0 +1,27 @@
+# hops.service — DESKTOP Linux user service.
+#
+# For a normal desktop (Wayland/X11) where hops runs alongside your graphical
+# session. For a HEADLESS server (no display), use hops-headless.service instead.
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp hops.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now hops.service
+#
+# Adjust ExecStart if the hops binary isn't on your PATH.
+
+[Unit]
+Description=hops — software KVM
+Documentation=https://github.com/jtjones09/grabbr-hops
+# hops needs an active graphical session for the desktop capture/emulation backends
+After=graphical-session.target
+# terminate with the graphical session
+BindsTo=graphical-session.target
+
+[Service]
+ExecStart=hops daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

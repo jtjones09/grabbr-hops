@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.grabbr.hops.plist — macOS launchd daemon for a headless / GUI-less install.
+
+  Runs `hops daemon` in the background at login. Edit the ExecStart path to where
+  your hops binary lives, then install as a per-user LaunchAgent:
+
+    cp com.grabbr.hops.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.grabbr.hops.plist
+
+  IMPORTANT — one-time interactive grant: macOS input emulation requires an
+  Accessibility permission (System Settings → Privacy & Security → Accessibility)
+  that can only be granted from a logged-in session; it can't be pre-granted on a
+  truly headless box. Grant it once for the hops binary, and it persists across
+  reboots (bound to the binary's code signature — keep a stable codesign identity).
+
+  After re-signing the binary, launchd caches a launch constraint keyed to the old
+  signature, so `launchctl kickstart -k` fails with OS_REASON_CODESIGNING — always
+  `launchctl bootout` then `bootstrap` again to pick up the new signature.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.grabbr.hops</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/hops</string>
+        <string>daemon</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><false/>
+    <key>ProcessType</key><string>Interactive</string>
+    <key>EnvironmentVariables</key>
+    <dict><key>RUST_LOG</key><string>lan_mouse=info</string></dict>
+    <key>StandardOutPath</key><string>/tmp/hops-daemon.log</string>
+    <key>StandardErrorPath</key><string>/tmp/hops-daemon.log</string>
+</dict>
+</plist>

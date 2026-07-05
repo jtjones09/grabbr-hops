@@ -1,0 +1,38 @@
+# hops-headless.service — HEADLESS Linux server (no display).
+#
+# Runs the hops daemon as a background service with no graphical session, so a
+# server can act as a KVM node you cross onto and control over the network.
+#
+# Install (as a user service):
+#   mkdir -p ~/.config/systemd/user
+#   cp hops-headless.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now hops-headless.service
+#
+# Start at BOOT without an interactive login (the point of a headless box):
+#   sudo loginctl enable-linger "$USER"
+#
+# Input emulation on Linux uses /dev/uinput. Grant access without running as root
+# by adding your user to the group that owns it (commonly `input`) — or ship a
+# udev rule — then re-login:
+#   sudo usermod -aG input "$USER"
+#
+# Configure it over SSH after it's running: `hops tui` (needs a --features tui
+# build), `hops cli ...`, or edit ~/.config/lan-mouse/config.toml. See
+# service/README.md.
+
+[Unit]
+Description=hops — software KVM daemon (headless)
+Documentation=https://github.com/jtjones09/grabbr-hops
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/hops daemon
+Restart=on-failure
+RestartSec=2
+# headless emulation needs uinput; if you run as root instead of the input group,
+# that also works but is not recommended.
+
+[Install]
+WantedBy=default.target
