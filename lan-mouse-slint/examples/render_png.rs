@@ -87,7 +87,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
 
     ui.set_trusted(ModelRc::new(VecModel::from(vec![
         TrustedRow {
-            name: "ScornW20".into(),
+            name: "windows-pc".into(),
             fp: "1e:19:1b:c4…".into(),
             fp_full: "1e:19:1b:c4:a8:44".into(),
             online: true,
