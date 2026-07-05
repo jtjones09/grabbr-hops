@@ -1,4 +1,4 @@
-// grabbr-hop — first-run "choose your interface" screen. This is the very first
+// hops — first-run "choose your interface" screen. This is the very first
 // thing a new user sees when they launch `hops`: two illustrative previews (the
 // GUI you're looking at right now, and the terminal alternative) side by side, so
 // the choice is concrete rather than a description. The choice is persisted
@@ -10,7 +10,7 @@ import { PillButton } from "widgets.slint";
 import { GuiPreviewMockup, TuiPreviewMockup } from "previews.slint";
 
 export component OnboardingWindow inherits Window {
-    title: "welcome to grabbr-hop";
+    title: "welcome to hops";
     default-font-family: Type.sans;
     default-font-size: Type.body;
     // no preferred-height: sizes to content, like AppWindow (a fixed height +
@@ -30,7 +30,7 @@ export component OnboardingWindow inherits Window {
         VerticalLayout {
             spacing: 4px;
             Text {
-                text: "welcome to grabbr-hop";
+                text: "welcome to hops";
                 font-size: Type.title;
                 font-weight: Type.bold;
                 color: Theme.c.foreground;
@@ -100,7 +100,7 @@ export component OnboardingWindow inherits Window {
         }
 
         Text {
-            text: "grabbr-hop keeps working in the background either way — this only picks how you view it";
+            text: "hops keeps working in the background either way — this only picks how you view it";
             font-size: Type.caption;
             color: Theme.c.muted;
             horizontal-alignment: center;

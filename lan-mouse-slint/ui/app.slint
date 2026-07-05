@@ -1,4 +1,4 @@
-// grabbr-hop — the GUI surface. Composes the design tokens (theme.slint) and the
+// hops — the GUI surface. Composes the design tokens (theme.slint) and the
 // atoms (widgets.slint) into the control panel. Rust sets Theme.index, the status
 // fields, the two lists, and the live pairing-fp; the callbacks send FrontendRequests.
 
@@ -33,7 +33,7 @@ export struct TrustedRow {
 }
 
 export component AppWindow inherits Window {
-    title: "grabbr-hop";
+    title: "hops";
     default-font-family: Type.sans;
     default-font-size: Type.body;
     // no preferred-height: the window sizes to its content (avoids a dead band
@@ -100,7 +100,7 @@ export component AppWindow inherits Window {
         HorizontalLayout {
             alignment: space-between;
             Text {
-                text: "grabbr-hop";
+                text: "hops";
                 font-size: Type.heading;
                 font-weight: Type.bold;
                 color: Theme.c.foreground;

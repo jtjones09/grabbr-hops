@@ -1,4 +1,4 @@
-//! grabbr-hop Slint GUI frontend (P2 — live status + device/trusted lists,
+//! hops Slint GUI frontend (P2 — live status + device/trusted lists,
 //! token-driven design system, core interactions wired).
 //!
 //! Mirrors the TUI's architecture: a background tokio thread owns the

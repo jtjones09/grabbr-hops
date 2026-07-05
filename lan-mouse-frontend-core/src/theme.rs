@@ -1,4 +1,4 @@
-//! UI-agnostic theming for grabbr-hop front-ends.
+//! UI-agnostic theming for hops front-ends.
 //!
 //! A named RGB palette with semantic roles, mirroring Slint's built-in `Palette`
 //! taxonomy (background/surface/foreground/accent/…) so ONE schema drives both the
@@ -307,7 +307,7 @@ pub fn load_user_themes() -> Vec<Theme> {
         .collect()
 }
 
-const THEMES_README: &str = r##"# grabbr-hop themes
+const THEMES_README: &str = r##"# hops themes
 
 Drop a `.toml` file in this directory to add a theme to BOTH front-ends'
 picker (the GUI's swatch footer and the TUI's `t` cycle) — no code, no

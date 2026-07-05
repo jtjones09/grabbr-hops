@@ -1,7 +1,7 @@
 ---
 name: preview-gui
 description: >-
-  Render the grabbr-hop Slint GUI to a PNG and LOOK AT IT yourself before showing
+  Render the hops Slint GUI to a PNG and LOOK AT IT yourself before showing
   the user or claiming a change works. Use this whenever you touch anything in
   lan-mouse-slint (ui/*.slint — app, widgets, theme — layout, colors, fonts,
   sizing), whenever asked to preview / see / screenshot / check how the GUI looks,
@@ -39,7 +39,7 @@ The harness already lives in the repo: [`lan-mouse-slint/examples/render_png.rs`
 4. **Critique** against the target (the user's reference image, or plain good
    taste). Be your own harshest reviewer — see the checklist below.
 5. **Iterate** until it's genuinely right. *Then* show the user (copy the PNG
-   somewhere they can open it, e.g. `~/grabbr-hop/`, and/or relaunch the live app).
+   somewhere they can open it, e.g. `~/hops/`, and/or relaunch the live app).
 
 Do NOT hand the user a screenshot to QA for you. Render, review, fix, and only
 surface it when you'd be proud of it.

@@ -1,4 +1,4 @@
-//! Shared frontend core for grabbr-hop UIs (Ratatui TUI + Slint GUI).
+//! Shared frontend core for hops UIs (Ratatui TUI + Slint GUI).
 //!
 //! Owns a typed, auto-reconnecting async IPC client over
 //! [`lan_mouse_ipc::connect_async`], an observable [`AppModel`] reduced from the

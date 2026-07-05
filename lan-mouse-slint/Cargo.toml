@@ -1,10 +1,10 @@
 [package]
 name = "lan-mouse-slint"
-description = "Slint GUI frontend for grabbr-hop / lan-mouse"
+description = "Slint GUI frontend for grabbr-hops / lan-mouse"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/jtjones09/grabbr-hop"
+repository = "https://github.com/jtjones09/grabbr-hops"
 
 [dependencies]
 # `software-renderer-systemfonts` is additive — the real windowed app keeps its

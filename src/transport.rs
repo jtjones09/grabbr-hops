@@ -26,6 +26,11 @@ use crate::crypto::generate_fingerprint;
 pub type Authorized = Arc<RwLock<HashMap<String, String>>>;
 
 /// Private ALPN so we never complete a handshake with a stray QUIC peer.
+///
+/// This is a wire-protocol identifier, NOT a display name — it is deliberately
+/// frozen at `grabbr-hop/1` and must match byte-for-byte on both peers, so do not
+/// "rebrand" it to `hops/1` to match the app name. Changing it is a breaking
+/// protocol bump: bump the version suffix and rebuild both ends together.
 pub const ALPN: &[u8] = b"grabbr-hop/1";
 
 static INSTALL: Once = Once::new();

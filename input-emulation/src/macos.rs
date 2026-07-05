@@ -140,7 +140,7 @@ impl MacOSEmulation {
         self.last_user_activity.set(Some(now));
         use core_foundation::base::TCFType;
         use core_foundation::string::CFString;
-        let name = CFString::new("grabbr-hop remote input");
+        let name = CFString::new("hops remote input");
         let mut id = self.user_activity_id.get();
         // SAFETY: `name` outlives the synchronous call; `id` is a valid in/out
         // pointer (0 on first call → creates; reused id later → extends).
@@ -384,9 +384,9 @@ fn guide_to_settings() {
     ONCE.call_once(|| {
         let exe = std::env::current_exe()
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "the grabbr-hop binary".into());
+            .unwrap_or_else(|_| "the hops binary".into());
         log::error!("──────────────────────────────────────────────────────────");
-        log::error!("grabbr-hop can't inject input: a macOS permission is missing.");
+        log::error!("hops can't inject input: a macOS permission is missing.");
         log::error!("Enable BOTH for this exact binary, then re-run the launcher:");
         log::error!("  • Accessibility");
         log::error!("  • Input Monitoring");
@@ -539,7 +539,7 @@ extern "C" {
 }
 
 /// Hold an IOPMAssertion so this Mac doesn't idle-sleep while it is the KVM
-/// receiver. A fully-asleep Mac suspends grabbr-hop and is unreachable over the
+/// receiver. A fully-asleep Mac suspends hops and is unreachable over the
 /// KVM (only a hardware wake / lid-lift brings it back — the exact symptom).
 ///
 /// Default = prevent SYSTEM idle-sleep (`PreventUserIdleSystemSleep`): the
@@ -566,7 +566,7 @@ fn create_power_assertion() -> Option<u32> {
         _ => "PreventUserIdleSystemSleep",
     };
     let kind = CFString::new(assertion_type);
-    let name = CFString::new("grabbr-hop KVM receiver active");
+    let name = CFString::new("hops KVM receiver active");
     let mut id: u32 = 0;
     const LEVEL_ON: u32 = 255; // kIOPMAssertionLevelOn
     // SAFETY: the CFStrings outlive the synchronous call; `id` is a valid out-ptr.

@@ -1,4 +1,4 @@
-//! grabbr-hop terminal UI (Ratatui).
+//! hops terminal UI (Ratatui).
 //!
 //! A thin view + control surface over the shared [`lan_mouse_frontend_core`]
 //! client: it renders the observable [`AppModel`] and sends [`FrontendRequest`]s;
@@ -429,7 +429,7 @@ pub fn run_onboarding() -> Result<Option<Frontend>, TuiError> {
                 .split(area);
 
             f.render_widget(
-                Paragraph::new("welcome to grabbr-hop").style(accent.add_modifier(
+                Paragraph::new("welcome to hops").style(accent.add_modifier(
                     ratatui::style::Modifier::BOLD,
                 )),
                 v[0],
@@ -560,7 +560,7 @@ fn ui(
             muted,
         ),
     ]);
-    let title = format!(" grabbr-hop · {} ", theme.name);
+    let title = format!(" hops · {} ", theme.name);
     f.render_widget(
         Paragraph::new(header)
             .style(base)

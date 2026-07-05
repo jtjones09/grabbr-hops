@@ -1,7 +1,7 @@
 //! Composable, platform-agnostic logging for the connection / screen-crossing
 //! lifecycle.
 //!
-//! Every grabbr-hop instance — on whatever platform it's installed — drives its
+//! Every hops instance — on whatever platform it's installed — drives its
 //! crossings through this same shared service layer, so logging these transitions
 //! in ONE place yields identical, quiet, **once-per-transition** logs everywhere.
 //! The noisy per-wire-event diagnostics (the sender re-sending `Enter` until the

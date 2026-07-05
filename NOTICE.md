@@ -1,11 +1,11 @@
-# grabbr-hop
+# grabbr-hops
 
 Share one keyboard and mouse across your Mac, Windows, and Linux machines — a
 software KVM. Part of the **grabbr** suite of power-user utilities.
 
 ## Upstream & credit
 
-grabbr-hop is a fork of **lan-mouse** by Felix Eschberger (`feschber`) and its
+grabbr-hops is a fork of **lan-mouse** by Felix Eschberger (`feschber`) and its
 contributors:
 
   https://github.com/feschber/lan-mouse
@@ -14,7 +14,7 @@ It is distributed under the **GNU General Public License v3.0 or later** (see
 `LICENSE`) — the same license as lan-mouse. All original lan-mouse copyright and
 authorship is preserved in the git history.
 
-### What grabbr-hop adds / changes
+### What grabbr-hops adds / changes
 
 - A substantially reworked **macOS input backend**: modifier-coherence self-heal,
   an `IOHIDPostEvent` native-focus path (smoother, wakes the display), and

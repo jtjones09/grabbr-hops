@@ -19,7 +19,7 @@ version = "0.11.0"
 edition = "2021"
 autobins = false
 license = "GPL-3.0-or-later"
-repository = "https://github.com/jtjones09/grabbr-hop"
+repository = "https://github.com/jtjones09/grabbr-hops"
 
 # hops: the product binary is `hops` (this is a GPLv3 fork of lan-mouse —
 # attribution preserved in NOTICE/headers; the Cargo *package* stays `lan-mouse`
@@ -117,9 +117,9 @@ x11_emulation = ["input-emulation/x11"]
 rdp_emulation = ["input-emulation/remote_desktop_portal"]
 
 [package.metadata.bundle]
-name = "Lan Mouse"
+name = "hops"
 icon = ["target/icon.icns", "lan-mouse-gtk/resources/de.feschber.LanMouse.svg"]
-identifier = "de.feschber.LanMouse"
+identifier = "com.grabbr.hops"
 deb_depends = [ "libadwaita-1-0" ]
 osx_info_plist_exts = ["build-aux/macos-lsui-element.plist"]
 resources = ["target/menubar-template.png"]

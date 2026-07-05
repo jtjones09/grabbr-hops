@@ -1,6 +1,6 @@
 [package]
 name = "lan-mouse-frontend-core"
-description = "Shared frontend core (IPC client + observable app model + theming) for grabbr-hop UIs"
+description = "Shared frontend core (IPC client + observable app model + theming) for grabbr-hops UIs"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"

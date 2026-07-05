@@ -1,6 +1,6 @@
 [package]
 name = "lan-mouse-tui"
-description = "grabbr-hop terminal UI (Ratatui) — a themeable front-end over the daemon IPC"
+description = "grabbr-hops terminal UI (Ratatui) — a themeable front-end over the daemon IPC"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
