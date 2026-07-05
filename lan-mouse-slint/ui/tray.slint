@@ -1,0 +1,37 @@
+// System-tray / menu-bar icon. Native on every desktop via Slint 1.17's
+// `SystemTrayIcon` element — NSStatusItem on macOS, Shell_NotifyIcon on Windows,
+// StatusNotifierItem on Linux — so one declarative component replaces the old
+// hand-rolled raw-AppKit `macos_status_item` module and gives Windows/Linux the
+// tray for free.
+//
+// A `SystemTrayIcon` is a top-level component (no window of its own) that must
+// contain exactly one `Menu`. Its icon only registers once a non-empty image is
+// assigned, so we ship `tray-icon.png` (the accent-blue pointer badge) — a bare
+// text title won't show on Windows, which renders only the icon.
+export component HopsTray inherits SystemTrayIcon {
+    icon: @image-url("tray-icon.png");
+    tooltip: "hops";
+
+    // wired in lib.rs. `quit` stops the event loop so the process exits.
+    callback open-window();
+    callback quit();
+
+    // Windows fires `clicked` on a left-click of the icon (right-click opens the
+    // menu); forward it to `open-window` so a left-click surfaces the window too.
+    // On macOS `clicked` doesn't fire while a populated menu is attached (AppKit
+    // opens the menu instead), so this is a Windows/Linux affordance — harmless
+    // elsewhere.
+    clicked => { root.open-window(); }
+
+    Menu {
+        MenuItem {
+            title: "Open hops";
+            activated => { root.open-window(); }
+        }
+        MenuSeparator {}
+        MenuItem {
+            title: "Quit hops";
+            activated => { root.quit(); }
+        }
+    }
+}

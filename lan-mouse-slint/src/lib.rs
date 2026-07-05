@@ -28,7 +28,7 @@ use thiserror::Error;
 slint::include_modules!();
 
 #[cfg(target_os = "macos")]
-mod macos_status_item;
+mod macos_app;
 
 /// A pairing prompt is "live" only this long after the last connection attempt
 /// (the daemon emits no retraction); matches the TUI's `STALE_TTL`.
@@ -97,27 +97,33 @@ fn default_canvas_pos(pos: Position) -> (f32, f32) {
     }
 }
 
-/// Single-instance coordination result (Unix). A second `hops gui` launch
-/// signals the first (any connection to the socket = "show your window") and
-/// exits, so re-launching focuses the resident menu-bar app instead of stacking
-/// duplicate tray icons.
-#[cfg(unix)]
+/// Single-instance coordination result. A second `hops gui` launch signals the
+/// first (any connection to the rendezvous = "show your window") and exits, so
+/// re-launching focuses the resident menu-bar app instead of stacking duplicate
+/// tray icons. The rendezvous is a Unix-domain socket on unix (per-user, scoped
+/// by `~/.config` permissions) and a loopback `TcpListener` on Windows (no
+/// per-user filesystem socket there; a `127.0.0.1` listener is the std-only
+/// equivalent).
+#[cfg(any(unix, windows))]
 enum Instance {
-    /// We're the first instance; the guard keeps the socket file cleaned up.
+    /// We're the first instance; the guard cleans up the rendezvous on exit.
     Primary(SingleInstanceGuard),
     /// Another instance is already running (we've signaled it).
     Secondary,
 }
 
-/// Removes the single-instance socket file on drop (normal GUI exit).
-#[cfg(unix)]
+/// Cleans up the single-instance rendezvous on drop (normal GUI exit). Only Unix
+/// leaves a filesystem artifact (the socket file); on Windows the `TcpListener`
+/// closes itself, so `path` is left empty.
+#[cfg(any(unix, windows))]
 struct SingleInstanceGuard {
     path: std::path::PathBuf,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Drop for SingleInstanceGuard {
     fn drop(&mut self) {
+        #[cfg(unix)]
         if !self.path.as_os_str().is_empty() {
             let _ = std::fs::remove_file(&self.path);
         }
@@ -183,6 +189,44 @@ fn acquire_single_instance(show_requested: Arc<AtomicBool>) -> Instance {
     }
 }
 
+/// Windows single-instance via a loopback `TcpListener`. Bound to `127.0.0.1`
+/// only (never `0.0.0.0`), so it's a local rendezvous — not a reachable service —
+/// and a loopback bind doesn't trip the Windows Firewall prompt. Any successful
+/// connect from a second launch flips `show_requested`; the second launch then
+/// exits. Degrades gracefully (runs without single-instance) on any bind error.
+#[cfg(windows)]
+fn acquire_single_instance(show_requested: Arc<AtomicBool>) -> Instance {
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+    // fixed high port below the ephemeral range (49152+) to avoid churn collisions
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 47842));
+    match TcpListener::bind(addr) {
+        Ok(listener) => {
+            std::thread::spawn(move || {
+                for _stream in listener.incoming() {
+                    show_requested.store(true, Ordering::SeqCst);
+                }
+            });
+            Instance::Primary(SingleInstanceGuard {
+                path: std::path::PathBuf::new(),
+            })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            // a live primary already owns the port; poke it to surface, then exit
+            if TcpStream::connect(addr).is_ok() {
+                Instance::Secondary
+            } else {
+                Instance::Primary(SingleInstanceGuard {
+                    path: std::path::PathBuf::new(),
+                })
+            }
+        }
+        // any other bind error → run anyway without single-instance
+        Err(_) => Instance::Primary(SingleInstanceGuard {
+            path: std::path::PathBuf::new(),
+        }),
+    }
+}
+
 /// Run the Slint GUI front-end. Blocks on the Slint event loop until the user
 /// quits (macOS: via the menu bar "Quit"); the daemon keeps running regardless.
 /// `hidden` starts with only the menu-bar/tray icon and no window (login
@@ -192,7 +236,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
     // tray icon; the flag is flipped by the single-instance socket thread and
     // read by the poll timer (both below). Also the vehicle for "reopen".
     let show_requested = Arc::new(AtomicBool::new(false));
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let _instance_guard = match acquire_single_instance(show_requested.clone()) {
         Instance::Secondary => return Ok(()),
         Instance::Primary(guard) => guard,
@@ -401,7 +445,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
             if show_requested_poll.swap(false, Ordering::SeqCst) {
                 let _ = ui.show();
                 #[cfg(target_os = "macos")]
-                macos_status_item::activate_app();
+                macos_app::activate_app();
             }
 
             let m = client.snapshot();
@@ -502,31 +546,47 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
         },
     );
 
-    // On macOS, a menu bar icon reopens the window after it's closed, so the
-    // event loop must survive having zero visible windows — the generated
-    // `ui.run()` (show + run_event_loop + hide) quits as soon as the last
-    // window closes, which would leave nothing to click "reopen" on. Elsewhere
-    // there's no tray icon yet, so the normal quit-on-close behavior is the
-    // safer default (a hidden, unreachable window would be a dead end).
+    // The menu-bar / system-tray icon (native on every platform via Slint 1.17).
+    // A visible tray keeps the event loop alive even with no window shown, so the
+    // app can start `--hidden` (tray only) and reopen its window on demand — the
+    // reason we run `run_event_loop_until_quit()` (quit only on the tray's "Quit")
+    // instead of the generated `ui.run()`, which exits the moment the last window
+    // hides. Keep the tray alive for the whole session (dropping it removes the
+    // icon), so bind it to a name that lives until the function returns.
+    let tray = HopsTray::new()?;
+    {
+        // "Open hops" (menu) and, on Windows/Linux, a left-click of the icon (the
+        // builtin `clicked`, forwarded to `open-window` in tray.slint) both surface
+        // the window.
+        let weak = ui.as_weak();
+        tray.on_open_window(move || {
+            if let Some(ui) = weak.upgrade() {
+                let _ = ui.show();
+                #[cfg(target_os = "macos")]
+                macos_app::activate_app();
+            }
+        });
+        tray.on_quit(|| {
+            // stops run_event_loop_until_quit(), letting run() return + the process exit
+            let _ = slint::quit_event_loop();
+        });
+    }
+
+    // Menu-bar-only app on macOS: no Dock icon / Cmd-Tab entry, so `--hidden`
+    // login-autostart is truly just the tray. Must precede showing any window.
     #[cfg(target_os = "macos")]
-    {
-        // `hidden` (login autostart) starts as just the tray icon; the window
-        // opens on tray-click or a second launch. Manual launches show it now.
-        if !hidden {
-            ui.show()?;
-        }
-        macos_status_item::setup(ui.as_weak());
-        slint::run_event_loop_until_quit()?;
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        // no tray icon on non-macOS yet, so a hidden window would be unreachable
-        // — always show until the platform tray lands.
-        let _ = hidden;
+    macos_app::set_accessory_policy();
+
+    // `hidden` (login autostart) starts as tray only; the window opens on
+    // tray-click / "Open hops" / a second launch. Manual launches show it now.
+    if !hidden {
         ui.show()?;
-        slint::run_event_loop()?;
     }
+    tray.show()?;
+    slint::run_event_loop_until_quit()?;
+
     ui.hide().ok();
+    tray.hide().ok();
     drop(timer);
     Ok(())
 }
