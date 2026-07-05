@@ -395,6 +395,19 @@ fn start_detached_daemon() -> Result<(), io::Error> {
             });
         }
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Windows has no setsid(): give the daemon its own detached console and
+        // process group so closing the launching terminal (or the console being
+        // logged off) can't deliver CTRL_CLOSE/CTRL_BREAK and take it down —
+        // without this the "detached" daemon dies with the front-end's console.
+        // For login-persistent autostart prefer the Scheduled Task in
+        // service/windows/; this only covers a hand-launched `hops`.
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
     // we deliberately drop the Child handle — the daemon owns its own lifecycle.
     let _ = cmd.spawn()?;
     Ok(())

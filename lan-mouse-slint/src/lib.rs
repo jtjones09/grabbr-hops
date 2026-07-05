@@ -117,6 +117,9 @@ enum Instance {
 /// closes itself, so `path` is left empty.
 #[cfg(any(unix, windows))]
 struct SingleInstanceGuard {
+    // only Drop (unix-only) reads this; on Windows there's no socket file to
+    // clean up, so the field is written-but-unread there.
+    #[cfg_attr(not(unix), allow(dead_code))]
     path: std::path::PathBuf,
 }
 
