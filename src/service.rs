@@ -12,7 +12,7 @@ use crate::{
 };
 use local_channel::mpsc::{Receiver, channel};
 use futures::StreamExt;
-use lan_mouse_ipc::{
+use hops_ipc::{
     AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
     IpcListenerCreationError, Position, Status,
 };
@@ -689,7 +689,7 @@ impl Service {
         self.broadcast_client(handle);
     }
 
-    fn update_geometry(&mut self, handle: ClientHandle, geometry: Option<lan_mouse_ipc::Geometry>) {
+    fn update_geometry(&mut self, handle: ClientHandle, geometry: Option<hops_ipc::Geometry>) {
         self.client_manager.set_geometry(handle, geometry);
         self.broadcast_client(handle);
     }

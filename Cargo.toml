@@ -3,17 +3,17 @@ members = [
     "input-capture",
     "input-emulation",
     "input-event",
-    "lan-mouse-ipc",
-    "lan-mouse-cli",
-    "lan-mouse-gtk",
-    "lan-mouse-proto",
-    "lan-mouse-frontend-core",
-    "lan-mouse-tui",
-    "lan-mouse-slint",
+    "hops-ipc",
+    "hops-cli",
+    "hops-gtk",
+    "hops-proto",
+    "hops-frontend-core",
+    "hops-tui",
+    "hops-slint",
 ]
 
 [package]
-name = "lan-mouse"
+name = "hops"
 description = "Software KVM Switch / mouse & keyboard sharing software for Local Area Networks"
 version = "0.11.0"
 edition = "2021"
@@ -21,9 +21,10 @@ autobins = false
 license = "GPL-3.0-or-later"
 repository = "https://github.com/jtjones09/grabbr-hops"
 
-# hops: the product binary is `hops` (this is a GPLv3 fork of lan-mouse —
-# attribution preserved in NOTICE/headers; the Cargo *package* stays `lan-mouse`
-# to minimize churn, but the shipped binary + identity are `hops`). One binary
+# hops: a GPLv3 fork of lan-mouse (attribution preserved in NOTICE/headers). The
+# Cargo package, the binary, and the code-signing identity are all `hops`; only
+# the wire protocol (ALPN `grabbr-hop/1`) and the on-disk state dir
+# (`~/.config/lan-mouse/`) keep their old names, for compatibility. One binary
 # does everything: `hops` (front door) / `hops gui` / `hops tui` / `hops daemon`.
 [[bin]]
 name = "hops"
@@ -42,13 +43,13 @@ shadow-rs = "1.2.0"
 input-event = { path = "input-event", version = "0.4.0" }
 input-emulation = { path = "input-emulation", version = "0.4.0", default-features = false }
 input-capture = { path = "input-capture", version = "0.4.0", default-features = false }
-lan-mouse-cli = { path = "lan-mouse-cli", version = "0.3.0" }
-lan-mouse-gtk = { path = "lan-mouse-gtk", version = "0.3.0", optional = true }
-lan-mouse-tui = { path = "lan-mouse-tui", version = "0.1.0", optional = true }
-lan-mouse-slint = { path = "lan-mouse-slint", version = "0.1.0", optional = true }
-lan-mouse-frontend-core = { path = "lan-mouse-frontend-core", version = "0.1.0", optional = true }
-lan-mouse-ipc = { path = "lan-mouse-ipc", version = "0.3.0" }
-lan-mouse-proto = { path = "lan-mouse-proto", version = "0.3.0" }
+hops-cli = { path = "hops-cli", version = "0.3.0" }
+hops-gtk = { path = "hops-gtk", version = "0.3.0", optional = true }
+hops-tui = { path = "hops-tui", version = "0.1.0", optional = true }
+hops-slint = { path = "hops-slint", version = "0.1.0", optional = true }
+hops-frontend-core = { path = "hops-frontend-core", version = "0.1.0", optional = true }
+hops-ipc = { path = "hops-ipc", version = "0.3.0" }
+hops-proto = { path = "hops-proto", version = "0.3.0" }
 shadow-rs = { version = "1.2.0", features = ["metadata"] }
 
 toml = "0.8"
@@ -105,9 +106,9 @@ default = [
     "rdp_emulation",
     "x11_emulation",
 ]
-gtk = ["dep:lan-mouse-gtk"]
-tui = ["dep:lan-mouse-tui", "dep:lan-mouse-frontend-core"]
-slint = ["dep:lan-mouse-slint", "dep:lan-mouse-frontend-core"]
+gtk = ["dep:hops-gtk"]
+tui = ["dep:hops-tui", "dep:hops-frontend-core"]
+slint = ["dep:hops-slint", "dep:hops-frontend-core"]
 layer_shell_capture = ["input-capture/layer_shell"]
 x11_capture = ["input-capture/x11"]
 libei_capture = ["input-event/libei", "input-capture/libei"]
@@ -118,7 +119,7 @@ rdp_emulation = ["input-emulation/remote_desktop_portal"]
 
 [package.metadata.bundle]
 name = "hops"
-icon = ["target/icon.icns", "lan-mouse-gtk/resources/de.feschber.LanMouse.svg"]
+icon = ["target/icon.icns", "hops-gtk/resources/de.feschber.LanMouse.svg"]
 identifier = "com.grabbr.hops"
 deb_depends = [ "libadwaita-1-0" ]
 osx_info_plist_exts = ["build-aux/macos-lsui-element.plist"]

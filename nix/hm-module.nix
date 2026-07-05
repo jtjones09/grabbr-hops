@@ -5,18 +5,18 @@ self: {
   ...
 }:
 with lib; let
-  cfg = config.programs.lan-mouse;
+  cfg = config.programs.hops;
   defaultPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
   tomlFormat = pkgs.formats.toml {};
 in {
-  options.programs.lan-mouse = with types; {
-    enable = mkEnableOption "Whether or not to enable lan-mouse.";
+  options.programs.hops = with types; {
+    enable = mkEnableOption "Whether or not to enable hops.";
     package = mkOption {
       type = with types; nullOr package;
       default = defaultPackage;
-      defaultText = literalExpression "inputs.lan-mouse.packages.${pkgs.stdenv.hostPlatform.system}.default";
+      defaultText = literalExpression "inputs.hops.packages.${pkgs.stdenv.hostPlatform.system}.default";
       description = ''
-        The lan-mouse package to use.
+        The hops package to use.
 
         By default, this option will use the `packages.default` as exposed by this flake.
       '';
@@ -24,12 +24,12 @@ in {
     systemd = mkOption {
       type = types.bool;
       default = pkgs.stdenv.isLinux;
-      description = "Whether to enable to systemd service for lan-mouse on linux.";
+      description = "Whether to enable to systemd service for hops on linux.";
     };
     launchd = mkOption {
       type = types.bool;
       default = pkgs.stdenv.isDarwin;
-      description = "Whether to enable to launchd service for lan-mouse on macOS.";
+      description = "Whether to enable to launchd service for hops on macOS.";
     };
     settings = lib.mkOption {
       inherit (tomlFormat) type;
@@ -38,21 +38,21 @@ in {
       description = ''
         Optional configuration written to {file}`$XDG_CONFIG_HOME/lan-mouse/config.toml`.
 
-        See <https://github.com/feschber/lan-mouse/> for
+        See <https://github.com/feschber/hops/> for
         available options and documentation.
       '';
     };
   };
 
   config = mkIf cfg.enable {
-    systemd.user.services.lan-mouse = lib.mkIf cfg.systemd {
+    systemd.user.services.hops = lib.mkIf cfg.systemd {
       Unit = {
         Description = "Systemd service for Lan Mouse";
         Requires = ["graphical-session.target"];
       };
       Service = {
         Type = "simple";
-        ExecStart = "${cfg.package}/bin/lan-mouse daemon";
+        ExecStart = "${cfg.package}/bin/hops daemon";
       };
       Install.WantedBy = [
         (lib.mkIf config.wayland.windowManager.hyprland.systemd.enable "hyprland-session.target")
@@ -60,11 +60,11 @@ in {
       ];
     };
 
-    launchd.agents.lan-mouse = lib.mkIf cfg.launchd {
+    launchd.agents.hops = lib.mkIf cfg.launchd {
       enable = true;
       config = {
         ProgramArguments = [
-          "${cfg.package}/bin/lan-mouse"
+          "${cfg.package}/bin/hops"
           "daemon"
         ];
         KeepAlive = true;

@@ -1,5 +1,5 @@
 use futures::{Stream, StreamExt};
-use lan_mouse_proto::ProtoEvent;
+use hops_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender, channel};
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::{Connection, Endpoint, SendStream, TransportConfig};

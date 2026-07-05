@@ -2644,6 +2644,132 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
+name = "hops"
+version = "0.11.0"
+dependencies = [
+ "arboard",
+ "clap",
+ "env_logger",
+ "futures",
+ "hops-cli",
+ "hops-frontend-core",
+ "hops-gtk",
+ "hops-ipc",
+ "hops-proto",
+ "hops-slint",
+ "hops-tui",
+ "input-capture",
+ "input-emulation",
+ "input-event",
+ "libc",
+ "local-channel",
+ "log",
+ "notify",
+ "quinn",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "sha2",
+ "shadow-rs",
+ "slab",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tokio-util",
+ "toml 0.8.23",
+ "toml_edit 0.22.27",
+]
+
+[[package]]
+name = "hops-cli"
+version = "0.3.0"
+dependencies = [
+ "clap",
+ "futures",
+ "hops-ipc",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "hops-frontend-core"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "hops-ipc",
+ "log",
+ "serde",
+ "tokio",
+ "toml 0.8.23",
+]
+
+[[package]]
+name = "hops-gtk"
+version = "0.3.0"
+dependencies = [
+ "async-channel",
+ "glib-build-tools",
+ "gtk4",
+ "hops-ipc",
+ "hostname",
+ "libadwaita",
+ "log",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "hops-ipc"
+version = "0.3.0"
+dependencies = [
+ "futures",
+ "log",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
+name = "hops-proto"
+version = "0.3.0"
+dependencies = [
+ "input-event",
+ "num_enum",
+ "paste",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "hops-slint"
+version = "0.1.0"
+dependencies = [
+ "hops-frontend-core",
+ "hops-ipc",
+ "image",
+ "log",
+ "slint",
+ "slint-build",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "hops-tui"
+version = "0.1.0"
+dependencies = [
+ "hops-frontend-core",
+ "hops-ipc",
+ "log",
+ "ratatui",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "hostname"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3650,132 +3776,6 @@ name = "lab"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf36173d4167ed999940f804952e6b08197cae5ad5d572eb4db150ce8ad5d58f"
-
-[[package]]
-name = "lan-mouse"
-version = "0.11.0"
-dependencies = [
- "arboard",
- "clap",
- "env_logger",
- "futures",
- "input-capture",
- "input-emulation",
- "input-event",
- "lan-mouse-cli",
- "lan-mouse-frontend-core",
- "lan-mouse-gtk",
- "lan-mouse-ipc",
- "lan-mouse-proto",
- "lan-mouse-slint",
- "lan-mouse-tui",
- "libc",
- "local-channel",
- "log",
- "notify",
- "quinn",
- "rcgen",
- "rustls",
- "rustls-pemfile",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "sha2",
- "shadow-rs",
- "slab",
- "thiserror 2.0.18",
- "time",
- "tokio",
- "tokio-util",
- "toml 0.8.23",
- "toml_edit 0.22.27",
-]
-
-[[package]]
-name = "lan-mouse-cli"
-version = "0.3.0"
-dependencies = [
- "clap",
- "futures",
- "lan-mouse-ipc",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
-name = "lan-mouse-frontend-core"
-version = "0.1.0"
-dependencies = [
- "futures",
- "lan-mouse-ipc",
- "log",
- "serde",
- "tokio",
- "toml 0.8.23",
-]
-
-[[package]]
-name = "lan-mouse-gtk"
-version = "0.3.0"
-dependencies = [
- "async-channel",
- "glib-build-tools",
- "gtk4",
- "hostname",
- "lan-mouse-ipc",
- "libadwaita",
- "log",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "lan-mouse-ipc"
-version = "0.3.0"
-dependencies = [
- "futures",
- "log",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
-]
-
-[[package]]
-name = "lan-mouse-proto"
-version = "0.3.0"
-dependencies = [
- "input-event",
- "num_enum",
- "paste",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "lan-mouse-slint"
-version = "0.1.0"
-dependencies = [
- "image",
- "lan-mouse-frontend-core",
- "lan-mouse-ipc",
- "log",
- "slint",
- "slint-build",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
-name = "lan-mouse-tui"
-version = "0.1.0"
-dependencies = [
- "lan-mouse-frontend-core",
- "lan-mouse-ipc",
- "log",
- "ratatui",
- "thiserror 2.0.18",
- "tokio",
-]
 
 [[package]]
 name = "lazy_static"

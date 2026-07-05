@@ -12,7 +12,7 @@
 //! callers just write `Lifecycle::Foo { .. }.log()`. Format and level live in one
 //! place, so the log reads the same on macOS, Windows, and Linux.
 
-use lan_mouse_ipc::Position;
+use hops_ipc::Position;
 use std::net::SocketAddr;
 
 /// A connection / screen-crossing transition worth exactly one info line.

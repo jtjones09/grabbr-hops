@@ -9,7 +9,7 @@ use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
 };
 use input_event::{Event, KeyboardEvent, scancode};
-use lan_mouse_proto::ProtoEvent;
+use hops_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
@@ -109,7 +109,7 @@ impl Capture {
     pub(crate) fn create(
         &self,
         handle: CaptureHandle,
-        pos: lan_mouse_ipc::Position,
+        pos: hops_ipc::Position,
         capture_type: CaptureType,
     ) {
         let pos = to_capture_pos(pos);
@@ -437,21 +437,21 @@ enum State {
     Sending,
 }
 
-fn to_capture_pos(pos: lan_mouse_ipc::Position) -> input_capture::Position {
+fn to_capture_pos(pos: hops_ipc::Position) -> input_capture::Position {
     match pos {
-        lan_mouse_ipc::Position::Left => input_capture::Position::Left,
-        lan_mouse_ipc::Position::Right => input_capture::Position::Right,
-        lan_mouse_ipc::Position::Top => input_capture::Position::Top,
-        lan_mouse_ipc::Position::Bottom => input_capture::Position::Bottom,
+        hops_ipc::Position::Left => input_capture::Position::Left,
+        hops_ipc::Position::Right => input_capture::Position::Right,
+        hops_ipc::Position::Top => input_capture::Position::Top,
+        hops_ipc::Position::Bottom => input_capture::Position::Bottom,
     }
 }
 
-fn to_proto_pos(pos: input_capture::Position) -> lan_mouse_proto::Position {
+fn to_proto_pos(pos: input_capture::Position) -> hops_proto::Position {
     match pos {
-        input_capture::Position::Left => lan_mouse_proto::Position::Left,
-        input_capture::Position::Right => lan_mouse_proto::Position::Right,
-        input_capture::Position::Top => lan_mouse_proto::Position::Top,
-        input_capture::Position::Bottom => lan_mouse_proto::Position::Bottom,
+        input_capture::Position::Left => hops_proto::Position::Left,
+        input_capture::Position::Right => hops_proto::Position::Right,
+        input_capture::Position::Top => hops_proto::Position::Top,
+        input_capture::Position::Bottom => hops_proto::Position::Bottom,
     }
 }
 

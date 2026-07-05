@@ -3,7 +3,7 @@ name: preview-gui
 description: >-
   Render the hops Slint GUI to a PNG and LOOK AT IT yourself before showing
   the user or claiming a change works. Use this whenever you touch anything in
-  lan-mouse-slint (ui/*.slint — app, widgets, theme — layout, colors, fonts,
+  hops-slint (ui/*.slint — app, widgets, theme — layout, colors, fonts,
   sizing), whenever asked to preview / see / screenshot / check how the GUI looks,
   and whenever the user reacts to the GUI's appearance. Slint draws its own pixels,
   so layout mistakes (stretched controls, an oval "pill", misaligned dots, blank
@@ -22,16 +22,16 @@ actual `AppWindow` to a PNG headlessly (no display, no screen-recording
 permission) so you can open the image, critique it, fix it, and repeat — the same
 loop a designer uses with their eyes.
 
-The harness already lives in the repo: [`lan-mouse-slint/examples/render_png.rs`](../../../lan-mouse-slint/examples/render_png.rs).
+The harness already lives in the repo: [`hops-slint/examples/render_png.rs`](../../../hops-slint/examples/render_png.rs).
 
 ## The loop
 
 1. **Edit** the `.slint` files (or `lib.rs` data).
 2. **Render** to a PNG:
    ```bash
-   cargo run -q -p lan-mouse-slint --example render_png -- <out.png> [width] [height]
+   cargo run -q -p hops-slint --example render_png -- <out.png> [width] [height]
    # e.g. write a 560x690 logical window (rendered at 2x -> 1120x1380 px):
-   cargo run -q -p lan-mouse-slint --example render_png -- /tmp/preview.png 560 690
+   cargo run -q -p hops-slint --example render_png -- /tmp/preview.png 560 690
    ```
    Use the session scratchpad dir for `<out.png>`. Width/height default to
    `560 760`; pass a height close to the content so there's no dead band.
@@ -78,7 +78,7 @@ The workspace pins **slint 1.14.1** (`Cargo.lock`). The harness depends on these
 all verified against the installed source:
 
 - The slint dep needs feature **`software-renderer-systemfonts`** (see
-  `lan-mouse-slint/Cargo.toml`). It's additive — the real windowed app keeps its
+  `hops-slint/Cargo.toml`). It's additive — the real windowed app keeps its
   default backend. Without it, `AppWindow::new()` *panics* (the embedded TTFs try
   to register with a renderer that can't accept them) — it does not fail quietly.
 - Install the headless `Platform` (returning a `MinimalSoftwareWindow`) **before**

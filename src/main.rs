@@ -1,16 +1,16 @@
 use env_logger::Env;
 use input_capture::InputCaptureError;
 use input_emulation::InputEmulationError;
-use lan_mouse::{
+use hops::{
     capture_test,
     config::{self, Command, Config, ConfigError},
     emulation_test,
     service::{Service, ServiceError},
 };
-use lan_mouse_cli::CliError;
+use hops_cli::CliError;
 #[cfg(feature = "gtk")]
-use lan_mouse_gtk::GtkError;
-use lan_mouse_ipc::{IpcError, IpcListenerCreationError};
+use hops_gtk::GtkError;
+use hops_ipc::{IpcError, IpcListenerCreationError};
 use std::{
     future::Future,
     io,
@@ -20,7 +20,7 @@ use thiserror::Error;
 use tokio::task::LocalSet;
 
 #[derive(Debug, Error)]
-enum LanMouseError {
+enum HopsError {
     #[error(transparent)]
     Service(#[from] ServiceError),
     #[error(transparent)]
@@ -38,17 +38,17 @@ enum LanMouseError {
     Gtk(#[from] GtkError),
     #[cfg(feature = "tui")]
     #[error(transparent)]
-    Tui(#[from] lan_mouse_tui::TuiError),
+    Tui(#[from] hops_tui::TuiError),
     #[cfg(feature = "slint")]
     #[error(transparent)]
-    Slint(#[from] lan_mouse_slint::SlintError),
+    Slint(#[from] hops_slint::SlintError),
     #[error(transparent)]
     Cli(#[from] CliError),
 }
 
 fn main() {
     // init logging
-    let env = Env::default().filter_or("LAN_MOUSE_LOG_LEVEL", "info");
+    let env = Env::default().filter_or("HOPS_LOG_LEVEL", "info");
     env_logger::init_from_env(env);
 
     if let Err(e) = run() {
@@ -57,13 +57,13 @@ fn main() {
     }
 }
 
-fn run() -> Result<(), LanMouseError> {
+fn run() -> Result<(), HopsError> {
     let config = config::Config::new()?;
     match config.command() {
         Some(command) => match command {
             Command::TestEmulation(args) => run_async(emulation_test::run(config, args))?,
             Command::TestCapture(args) => run_async(capture_test::run(config, args))?,
-            Command::Cli(cli_args) => run_async(lan_mouse_cli::run(cli_args))?,
+            Command::Cli(cli_args) => run_async(hops_cli::run(cli_args))?,
             Command::Daemon => run_daemon(config)?,
             Command::Gui { hidden } => run_gui(hidden)?,
             Command::Tui => run_tui()?,
@@ -74,7 +74,7 @@ fn run() -> Result<(), LanMouseError> {
             #[cfg(feature = "gtk")]
             {
                 let mut service = start_service()?;
-                let res = lan_mouse_gtk::run(config::local_commit());
+                let res = hops_gtk::run(config::local_commit());
                 #[cfg(unix)]
                 {
                     // on unix we give the service a chance to terminate gracefully
@@ -109,9 +109,9 @@ fn run() -> Result<(), LanMouseError> {
 }
 
 /// Run the daemon (the receiver service). A redundant instance self-exits.
-fn run_daemon(config: config::Config) -> Result<(), LanMouseError> {
+fn run_daemon(config: config::Config) -> Result<(), HopsError> {
     match run_async(run_service(config)) {
-        Err(LanMouseError::Service(ServiceError::IpcListen(
+        Err(HopsError::Service(ServiceError::IpcListen(
             IpcListenerCreationError::AlreadyRunning,
         ))) => {
             log::info!("service already running!");
@@ -123,10 +123,10 @@ fn run_daemon(config: config::Config) -> Result<(), LanMouseError> {
 
 /// Open the Slint GUI (attach-only). No-op with a hint if this build lacks it.
 /// `hidden` starts the app in the menu bar / tray only, no window shown.
-fn run_gui(hidden: bool) -> Result<(), LanMouseError> {
+fn run_gui(hidden: bool) -> Result<(), HopsError> {
     #[cfg(feature = "slint")]
     {
-        lan_mouse_slint::run(hidden)?;
+        hops_slint::run(hidden)?;
         Ok(())
     }
     #[cfg(not(feature = "slint"))]
@@ -138,10 +138,10 @@ fn run_gui(hidden: bool) -> Result<(), LanMouseError> {
 }
 
 /// Open the Ratatui TUI (attach-only). No-op with a hint if this build lacks it.
-fn run_tui() -> Result<(), LanMouseError> {
+fn run_tui() -> Result<(), HopsError> {
     #[cfg(feature = "tui")]
     {
-        run_async(lan_mouse_tui::run())?;
+        run_async(hops_tui::run())?;
         Ok(())
     }
     #[cfg(not(feature = "tui"))]
@@ -156,8 +156,8 @@ fn run_tui() -> Result<(), LanMouseError> {
 /// very first launch, show the "choose your interface" onboarding screen first
 /// and persist the pick, so every launch after that is a single, silent step.
 #[cfg(all(not(feature = "gtk"), any(feature = "tui", feature = "slint")))]
-fn front_door() -> Result<(), LanMouseError> {
-    use lan_mouse_frontend_core::prefs::{
+fn front_door() -> Result<(), HopsError> {
+    use hops_frontend_core::prefs::{
         load_frontend, onboarding_done, save_frontend, set_onboarding_done, Frontend,
     };
     ensure_daemon_running();
@@ -186,32 +186,32 @@ fn front_door() -> Result<(), LanMouseError> {
 /// [`default_frontend`], since which picker CAN run is the same question as
 /// which front-end runs by default.
 #[cfg(all(not(feature = "gtk"), any(feature = "tui", feature = "slint")))]
-fn run_onboarding_picker() -> Option<lan_mouse_frontend_core::prefs::Frontend> {
+fn run_onboarding_picker() -> Option<hops_frontend_core::prefs::Frontend> {
     #[cfg(all(feature = "slint", feature = "tui"))]
     {
         let ssh = std::env::var_os("SSH_CONNECTION").is_some()
             || std::env::var_os("SSH_TTY").is_some();
         if ssh {
-            lan_mouse_tui::run_onboarding().ok().flatten()
+            hops_tui::run_onboarding().ok().flatten()
         } else {
-            lan_mouse_slint::run_onboarding().ok().flatten()
+            hops_slint::run_onboarding().ok().flatten()
         }
     }
     #[cfg(all(feature = "slint", not(feature = "tui")))]
     {
-        lan_mouse_slint::run_onboarding().ok().flatten()
+        hops_slint::run_onboarding().ok().flatten()
     }
     #[cfg(all(feature = "tui", not(feature = "slint")))]
     {
-        lan_mouse_tui::run_onboarding().ok().flatten()
+        hops_tui::run_onboarding().ok().flatten()
     }
 }
 
 /// Default front-end when the user hasn't chosen: GUI on a local desktop, TUI
 /// over SSH / when only the TUI is compiled in.
 #[cfg(all(not(feature = "gtk"), any(feature = "tui", feature = "slint")))]
-fn default_frontend() -> lan_mouse_frontend_core::prefs::Frontend {
-    use lan_mouse_frontend_core::prefs::Frontend;
+fn default_frontend() -> hops_frontend_core::prefs::Frontend {
+    use hops_frontend_core::prefs::Frontend;
     let ssh = std::env::var_os("SSH_CONNECTION").is_some()
         || std::env::var_os("SSH_TTY").is_some();
     if !ssh && cfg!(feature = "slint") {
@@ -247,7 +247,7 @@ fn ensure_daemon_running() {
 fn daemon_socket_alive() -> bool {
     #[cfg(unix)]
     {
-        match lan_mouse_ipc::default_socket_path() {
+        match hops_ipc::default_socket_path() {
             Ok(path) => std::os::unix::net::UnixStream::connect(path).is_ok(),
             Err(_) => false,
         }
@@ -323,10 +323,10 @@ fn install_launchd_plist_if_missing() -> Option<String> {
     Some(plist_path.to_string_lossy().into_owned())
 }
 
-fn run_async<F, E>(f: F) -> Result<(), LanMouseError>
+fn run_async<F, E>(f: F) -> Result<(), HopsError>
 where
     F: Future<Output = Result<(), E>>,
-    LanMouseError: From<E>,
+    HopsError: From<E>,
 {
     // create single threaded tokio runtime
     let runtime = tokio::runtime::Builder::new_current_thread()

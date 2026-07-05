@@ -16,8 +16,8 @@ use thiserror::Error;
 use toml;
 use toml_edit::{self, DocumentMut};
 
-use lan_mouse_cli::CliArgs;
-use lan_mouse_ipc::{DEFAULT_PORT, Position};
+use hops_cli::CliArgs;
+use hops_ipc::{DEFAULT_PORT, Position};
 
 use input_event::scancode::{
     self,
@@ -29,7 +29,7 @@ use shadow_rs::shadow;
 shadow!(build);
 
 /// Local build's 8-byte ASCII short commit hash, suitable for use
-/// in [`lan_mouse_proto::ProtoEvent::Hello`]. Pads with `'?'` if
+/// in [`hops_proto::ProtoEvent::Hello`]. Pads with `'?'` if
 /// shadow_rs returns an unexpected length so the field is always
 /// well-formed on the wire.
 pub fn local_commit() -> [u8; 8] {

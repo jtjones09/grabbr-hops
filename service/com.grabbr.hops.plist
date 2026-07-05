@@ -31,7 +31,7 @@
     <key>KeepAlive</key><false/>
     <key>ProcessType</key><string>Interactive</string>
     <key>EnvironmentVariables</key>
-    <dict><key>RUST_LOG</key><string>lan_mouse=info</string></dict>
+    <dict><key>HOPS_LOG_LEVEL</key><string>info</string></dict>
     <key>StandardOutPath</key><string>/tmp/hops-daemon.log</string>
     <key>StandardErrorPath</key><string>/tmp/hops-daemon.log</string>
 </dict>

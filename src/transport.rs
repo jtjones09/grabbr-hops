@@ -12,7 +12,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, Once, RwLock};
 
-use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent, ProtocolError};
+use hops_proto::{MAX_EVENT_SIZE, ProtoEvent, ProtocolError};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
