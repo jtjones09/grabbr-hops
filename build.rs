@@ -1,10 +1,23 @@
-use shadow_rs::ShadowBuilder;
+use std::process::Command;
 
 fn main() {
-    ShadowBuilder::builder()
-        .deny_const(Default::default())
-        .build()
-        .expect("shadow build");
+    // Embed the short git commit (sent in the peer "hello" as a build id). We read
+    // it with the `git` CLI on purpose, NOT a libgit2 binding: pulling in
+    // git2/libgit2-sys compiles libgit2's bundled C sources — including a file
+    // literally named `credential.c` — which trips endpoint-security (EDR)
+    // heuristics on managed machines. The CLI needs no C compilation. Falls back
+    // to "unknown" outside a git checkout (e.g. a release tarball).
+    let commit = Command::new("git")
+        .args(["rev-parse", "--short=8", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo::rustc-env=HOPS_SHORT_COMMIT={commit}");
+    println!("cargo::rerun-if-changed=.git/HEAD");
 
     let unix = cfg!(unix);
     let macos = cfg!(target_os = "macos");

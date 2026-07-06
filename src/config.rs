@@ -24,21 +24,20 @@ use input_event::scancode::{
     Linux::{KeyLeftAlt, KeyLeftCtrl, KeyLeftMeta, KeyLeftShift},
 };
 
-use shadow_rs::shadow;
-
-shadow!(build);
-
 /// Local build's 8-byte ASCII short commit hash, suitable for use
-/// in [`hops_proto::ProtoEvent::Hello`]. Pads with `'?'` if
-/// shadow_rs returns an unexpected length so the field is always
-/// well-formed on the wire.
+/// in [`hops_proto::ProtoEvent::Hello`]. Set by `build.rs` (via the `git` CLI —
+/// no libgit2). Pads with `'?'` if it's an unexpected length so the field is
+/// always well-formed on the wire.
 pub fn local_commit() -> [u8; 8] {
-    let bytes = build::SHORT_COMMIT.as_bytes();
+    let bytes = env!("HOPS_SHORT_COMMIT").as_bytes();
     let mut out = [b'?'; 8];
     let n = bytes.len().min(8);
     out[..n].copy_from_slice(&bytes[..n]);
     out
 }
+
+/// `--version` string: package version + short git commit (both compile-time).
+const LONG_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("HOPS_SHORT_COMMIT"), ")");
 
 const CONFIG_FILE_NAME: &str = "config.toml";
 const CERT_FILE_NAME: &str = "lan-mouse.pem";
@@ -90,7 +89,7 @@ impl ConfigToml {
 }
 
 #[derive(Parser, Debug)]
-#[command(author, version=build::CLAP_LONG_VERSION, about, long_about = None)]
+#[command(author, version = LONG_VERSION, about, long_about = None)]
 struct Args {
     /// the listen port for lan-mouse
     #[arg(short, long)]
