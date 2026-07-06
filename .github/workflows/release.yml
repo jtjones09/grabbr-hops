@@ -1,0 +1,93 @@
+# Build pre-built hops binaries and publish them to a GitHub Release.
+#
+# Trigger: push a version tag (e.g. `git tag v0.11.0 && git push origin v0.11.0`),
+# or run it by hand from the Actions tab ("Run workflow").
+#
+# Produces, per release:
+#   - hops-macos-universal.tar.gz   (Intel + Apple Silicon, GUI build)
+#   - hops-windows-x86_64.zip        (GUI build)
+#   - hops-linux-x86_64.tar.gz       (daemon + terminal UI; the Slint GUI on Linux
+#                                     needs desktop libs, so the Linux artifact is
+#                                     TUI-only for a reliable, dependency-light build)
+#
+# The binaries are UNSIGNED. Downloaders get a one-time OS warning
+# (macOS Gatekeeper / Windows SmartScreen) until code-signing is wired in — see
+# the `TODO(signing)` markers below.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build-${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest,   name: macos-universal,  features: "tui slint" }
+          - { os: windows-latest, name: windows-x86_64,    features: "tui slint" }
+          - { os: ubuntu-latest,  name: linux-x86_64,      features: "tui" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # so build.rs can read the git commit
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # --- build ---
+      - name: Build (macOS universal)
+        if: runner.os == 'macOS'
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --release --no-default-features --features "${{ matrix.features }}" --target aarch64-apple-darwin
+          cargo build --release --no-default-features --features "${{ matrix.features }}" --target x86_64-apple-darwin
+          mkdir -p dist
+          lipo -create -output dist/hops \
+            target/aarch64-apple-darwin/release/hops \
+            target/x86_64-apple-darwin/release/hops
+          # TODO(signing): codesign --sign "Developer ID Application: <you>" --options runtime dist/hops
+          #                then notarize via `xcrun notarytool submit` + `stapler`.
+          tar -C dist -czf hops-${{ matrix.name }}.tar.gz hops
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cargo build --release --no-default-features --features "${{ matrix.features }}"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\hops.exe dist\hops.exe
+          # TODO(signing): signtool sign /fd SHA256 /tr <timestamp-url> /td SHA256 /a dist\hops.exe
+          Compress-Archive -Path dist\hops.exe -DestinationPath hops-${{ matrix.name }}.zip
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release --no-default-features --features "${{ matrix.features }}"
+          mkdir -p dist
+          cp target/release/hops dist/hops
+          tar -C dist -czf hops-${{ matrix.name }}.tar.gz hops
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hops-${{ matrix.name }}
+          path: hops-${{ matrix.name }}.*
+
+  release:
+    name: publish-release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
