@@ -44,34 +44,42 @@ it asks how you'd like to drive it:
   <img src="screenshots/hops-onboarding.png" width="620" alt="first-run interface picker">
 </p>
 
-## Quick start
+## Get hops
 
-Install [Rust](https://rustup.rs) once (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`).
+**Download a pre-built binary — no Rust, no compiling.** Do this on **each machine**
+you want to share the keyboard & mouse across.
 
-Then, **on each machine** you want to share the keyboard & mouse across:
+**→ [Download the latest release](https://github.com/jtjones09/grabbr-hops/releases/latest)**, grab the file for your OS, unpack it, and run `hops`:
+
+| OS | File |
+| --- | --- |
+| macOS (Intel + Apple Silicon) | `hops-macos-universal.tar.gz` |
+| Windows | `hops-windows-x86_64.zip` |
+| Linux (terminal UI + daemon) | `hops-linux-x86_64.tar.gz` |
+
+The binaries aren't code-signed yet, so your OS shows a **one-time** warning:
+- **macOS** — right-click the `hops` binary → **Open** (or `xattr -d com.apple.quarantine hops`), then switch **hops** on under System Settings → Privacy & Security → **Accessibility** (it can't move your cursor without it).
+- **Windows** — if SmartScreen appears, click **More info → Run anyway**; allow it on your **private** network if the firewall asks.
+
+<details>
+<summary><b>Or build from source</b> (for developers, or the latest <code>main</code>)</summary>
+
+Install [Rust](https://rustup.rs), then on each machine:
 
 ```sh
 git clone https://github.com/jtjones09/grabbr-hops
 cd grabbr-hops
 ./install.sh                 # macOS / Linux
 ```
-On **Windows**, run the installer with PowerShell instead:
-```powershell
-powershell -ExecutionPolicy Bypass -File .\install.ps1
+On **Windows**: `powershell -ExecutionPolicy Bypass -File .\install.ps1`
+
+That builds hops and starts it in your menu bar / system tray at login. Or just
+build and run the binary directly:
+```sh
+cargo build --release --no-default-features --features "tui slint"
+./target/release/hops           # hops.exe on Windows
 ```
-
-That builds hops and starts it in your **menu bar / system tray**, set to launch
-at login. Two per-OS things to allow:
-
-- **macOS** opens the Accessibility settings — switch **hops** on (it can't move
-  your cursor without it).
-- **Windows** — if the firewall asks, allow hops on your **private** network.
-
-> **Just want to try it, no install?** Build and run the binary directly:
-> ```sh
-> cargo build --release --no-default-features --features "tui slint"
-> ./target/release/hops           # hops.exe on Windows
-> ```
+</details>
 
 ## Connect two machines
 
