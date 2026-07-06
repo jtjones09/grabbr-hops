@@ -4,7 +4,7 @@ description = "GTK4 / Libadwaita Frontend for lan-mouse"
 version = "0.3.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/feschber/lan-mouse"
+repository = "https://github.com/jtjones09/grabbr-hops"
 
 [dependencies]
 gtk = { package = "gtk4", version = "0.9.0", features = ["v4_2"] }
