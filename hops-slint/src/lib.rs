@@ -45,6 +45,23 @@ pub enum SlintError {
     ClientInit,
 }
 
+/// Everything the poll loop pushes into the window, in a cheaply-comparable form.
+/// Re-pushing an identical model every 250ms forces a repaint even when nothing
+/// changed — which makes variable-refresh-rate (G-Sync/FreeSync) displays flicker
+/// — so the poll only touches Slint when this differs from the previous tick.
+/// Primitive fields because Slint's generated row structs aren't `PartialEq`.
+#[derive(PartialEq)]
+struct PolledUi {
+    connected: bool,
+    capture: String,
+    emulation: String,
+    port: String,
+    fingerprint: String,
+    pairing: String,
+    devices: Vec<(String, String, String, String, bool, bool)>,
+    trusted: Vec<(String, String, String, bool)>,
+}
+
 fn status_text(s: Status) -> &'static str {
     match s {
         Status::Enabled => "enabled",
@@ -433,9 +450,12 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
         });
     }
 
-    // poll the model ~4x/sec and push it into the window
+    // poll the model ~4x/sec and push it into the window — but only when it
+    // actually changed since last tick (see PolledUi: a constant repaint flickers
+    // VRR displays). `last_ui` holds the previous pushed state.
     let weak = ui.as_weak();
     let show_requested_poll = show_requested.clone();
+    let last_ui: RefCell<Option<PolledUi>> = RefCell::new(None);
     let timer = slint::Timer::default();
     timer.start(
         slint::TimerMode::Repeated,
@@ -475,16 +495,10 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                 *known_handles.borrow_mut() = current;
             }
 
-            ui.set_connected(m.connected);
-            ui.set_capture(status_text(m.capture).into());
-            ui.set_emulation(status_text(m.emulation).into());
-            ui.set_port(
-                m.port
-                    .map(|p| p.to_string())
-                    .unwrap_or_else(|| "—".into())
-                    .into(),
-            );
-            ui.set_fingerprint(m.fingerprint.as_deref().unwrap_or("—").into());
+            // --- Build the derived UI state, then push to Slint ONLY if it
+            // changed since last tick. Re-pushing an identical model every 250ms
+            // repaints the window constantly (flickering VRR displays); when
+            // nothing changed we touch nothing and the window stays static.
 
             // a live pairing prompt: untrusted, still actively attempting (not a
             // stale prompt for a peer that left), and not currently snooze-dismissed
@@ -504,12 +518,13 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                 })
                 .cloned()
                 .unwrap_or_default();
-            ui.set_pairing_fp(pairing.into());
 
-            // outgoing devices
-            let devices: Vec<DeviceRow> = m
-                .clients
-                .iter()
+            // outgoing devices, sorted by handle so the list order (and the change
+            // check below) is stable across the map's arbitrary iteration order
+            let mut clients: Vec<_> = m.clients.iter().collect();
+            clients.sort_by_key(|(h, _)| **h);
+            let devices: Vec<DeviceRow> = clients
+                .into_iter()
                 .map(|(h, (c, s))| {
                     let addr = s
                         .active_addr
@@ -527,7 +542,6 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                     }
                 })
                 .collect();
-            ui.set_devices(ModelRc::new(VecModel::from(devices)));
 
             // trusted peers (sorted by description, then fingerprint)
             let mut tv: Vec<(String, String)> = m
@@ -545,7 +559,48 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                     online: m.connected_peers.contains(fp),
                 })
                 .collect();
+
+            let snap = PolledUi {
+                connected: m.connected,
+                capture: status_text(m.capture).to_string(),
+                emulation: status_text(m.emulation).to_string(),
+                port: m.port.map(|p| p.to_string()).unwrap_or_else(|| "—".to_string()),
+                fingerprint: m.fingerprint.clone().unwrap_or_else(|| "—".to_string()),
+                pairing,
+                devices: devices
+                    .iter()
+                    .map(|d| {
+                        (
+                            d.handle.to_string(),
+                            d.name.to_string(),
+                            d.addr.to_string(),
+                            d.pos.to_string(),
+                            d.active,
+                            d.alive,
+                        )
+                    })
+                    .collect(),
+                trusted: trusted
+                    .iter()
+                    .map(|t| (t.name.to_string(), t.fp.to_string(), t.fp_full.to_string(), t.online))
+                    .collect(),
+            };
+
+            // Unchanged since last tick → leave the window entirely alone (no
+            // property writes, no model swap → Slint has nothing to repaint).
+            if last_ui.borrow().as_ref() == Some(&snap) {
+                return;
+            }
+
+            ui.set_connected(snap.connected);
+            ui.set_capture(snap.capture.as_str().into());
+            ui.set_emulation(snap.emulation.as_str().into());
+            ui.set_port(snap.port.as_str().into());
+            ui.set_fingerprint(snap.fingerprint.as_str().into());
+            ui.set_pairing_fp(snap.pairing.as_str().into());
+            ui.set_devices(ModelRc::new(VecModel::from(devices)));
             ui.set_trusted(ModelRc::new(VecModel::from(trusted)));
+            *last_ui.borrow_mut() = Some(snap);
         },
     );
 
