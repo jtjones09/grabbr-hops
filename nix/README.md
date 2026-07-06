@@ -3,10 +3,10 @@
 ## Run
 
 ```bash
-nix run github:feschber/lan-mouse
+nix run github:jtjones09/grabbr-hops
 
 # With params
-nix run github:feschber/lan-mouse -- --help
+nix run github:jtjones09/grabbr-hops -- --help
 
 ```
 
@@ -16,7 +16,7 @@ Add input:
 
 ```nix
 inputs = {
-    lan-mouse.url = "github:feschber/lan-mouse";
+    hops.url = "github:jtjones09/grabbr-hops";
 }
 ```
 
