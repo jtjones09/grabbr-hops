@@ -44,53 +44,53 @@ it asks how you'd like to drive it:
   <img src="screenshots/hops-onboarding.png" width="620" alt="first-run interface picker">
 </p>
 
-## Install
+## Quick start
 
-### Build from source (all platforms)
+Install [Rust](https://rustup.rs) once (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`).
 
-You need a [Rust toolchain](https://rustup.rs) (stable).
+Then, **on each machine** you want to share the keyboard & mouse across:
 
 ```sh
 git clone https://github.com/jtjones09/grabbr-hops
 cd grabbr-hops
-cargo build --release --no-default-features --features "tui slint"
+./install.sh                 # macOS / Linux
+```
+On **Windows**, run the installer with PowerShell instead:
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-The binary lands at `target/release/hops` (`hops.exe` on Windows). The
-`slint` feature builds the cross-platform GUI; `tui` adds the terminal UI. For a
-GUI-less server build, see [Headless](#headless).
+That builds hops and starts it in your **menu bar / system tray**, set to launch
+at login. Two per-OS things to allow:
 
-### Platform notes
+- **macOS** opens the Accessibility settings — switch **hops** on (it can't move
+  your cursor without it).
+- **Windows** — if the firewall asks, allow hops on your **private** network.
 
-- **macOS** — grant **Accessibility** to the `hops` binary (System Settings →
-  Privacy & Security → Accessibility) so it can inject input. For the grant to
-  survive rebuilds, codesign with a stable identity. A menu-bar icon keeps hops
-  reachable; `--hidden` starts it as tray-only.
-- **Windows** — run `hops.exe`; allow it on your **private network** if Windows
-  Firewall prompts. The tray icon lives in the notification area.
-- **Linux** — the input capture/emulation backends are selected via cargo
-  features (`layer_shell_capture`, `x11_capture`, `libei_*`, `wlroots_emulation`,
-  …); see `Cargo.toml`. A legacy GTK front-end is also available via the default
-  feature set. Desktop tray needs a StatusNotifierItem host (e.g. GNOME's
-  AppIndicator extension).
+> **Just want to try it, no install?** Build and run the binary directly:
+> ```sh
+> cargo build --release --no-default-features --features "tui slint"
+> ./target/release/hops           # hops.exe on Windows
+> ```
 
-### Headless
+## Connect two machines
 
-Run hops as a background daemon with no GUI — a KVM node you cross onto and
-control over the network. Autostart units for **Linux (systemd)**, **macOS
-(launchd)**, and **Windows (Scheduled Task)**, plus how to configure over SSH,
-are in **[service/README.md](service/README.md)**.
+1. Both machines are running hops now.
+2. On one, open the window (click the tray icon) → **+ add** the other machine:
+   its IP address and which screen edge it sits on (left/right/top/bottom).
+3. The first connection shows a **pairing request** with a fingerprint — name it
+   and hit **trust & name**. Just once per pair.
+4. Move your cursor off that edge — it hops over. Keyboard, scroll, and modifier
+   keys follow.
 
-## Usage
+## Other ways to run it
 
-1. Start hops on both machines (`hops`, or install the autostart unit).
-2. On one machine, add the other as a device (its address + which screen edge it
-   sits on) — in the GUI's **+ add**, the TUI, or `config.toml`.
-3. The first connection shows a **pairing request** with the peer's fingerprint.
-   Name it and click **trust & name** (or approve it over the CLI/TUI on a
-   headless box). Do this once per pair.
-4. Move your cursor off the configured edge — it hops to the other machine.
-   Keyboard, scroll, and modifiers follow.
+- **Terminal UI** (keyboard-driven, great over SSH): `hops tui`.
+- **Headless / servers** (no GUI, controlled over the network): build with
+  `--no-default-features` and use the service units + guide in
+  [service/README.md](service/README.md).
+- **Linux backends / advanced:** input capture & emulation backends are cargo
+  features (`layer_shell_capture`, `x11_capture`, `libei_*`, …) — see `Cargo.toml`.
 
 ## Security
 
