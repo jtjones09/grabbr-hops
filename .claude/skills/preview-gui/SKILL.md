@@ -22,7 +22,7 @@ actual `AppWindow` to a PNG headlessly (no display, no screen-recording
 permission) so you can open the image, critique it, fix it, and repeat — the same
 loop a designer uses with their eyes.
 
-The harness already lives in the repo: [`hops-slint/examples/render_png.rs`](../../../hops-slint/examples/render_png.rs).
+The harness already lives in the repo: [`crates/hops-slint/examples/render_png.rs`](../../../crates/hops-slint/examples/render_png.rs).
 
 ## The loop
 
@@ -78,7 +78,7 @@ The workspace pins **slint 1.14.1** (`Cargo.lock`). The harness depends on these
 all verified against the installed source:
 
 - The slint dep needs feature **`software-renderer-systemfonts`** (see
-  `hops-slint/Cargo.toml`). It's additive — the real windowed app keeps its
+  `crates/hops-slint/Cargo.toml`). It's additive — the real windowed app keeps its
   default backend. Without it, `AppWindow::new()` *panics* (the embedded TTFs try
   to register with a renderer that can't accept them) — it does not fail quietly.
 - Install the headless `Platform` (returning a `MinimalSoftwareWindow`) **before**

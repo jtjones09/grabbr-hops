@@ -48,7 +48,7 @@ rustPlatform.buildRustPackage {
 
   postInstall = ''
     install -Dm444 *.desktop -t $out/share/applications
-    install -Dm444 hops-gtk/resources/*.svg -t $out/share/icons/hicolor/scalable/apps
+    install -Dm444 crates/hops-gtk/resources/*.svg -t $out/share/icons/hicolor/scalable/apps
   '';
 
   meta = with lib; {

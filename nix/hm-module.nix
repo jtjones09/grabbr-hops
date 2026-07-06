@@ -34,9 +34,9 @@ in {
     settings = lib.mkOption {
       inherit (tomlFormat) type;
       default = {};
-      example = builtins.fromTOML (builtins.readFile (self + /config.toml));
+      example = builtins.fromTOML (builtins.readFile (self + /config.example.toml));
       description = ''
-        Optional configuration written to {file}`$XDG_CONFIG_HOME/lan-mouse/config.toml`.
+        Optional configuration written to {file}`$XDG_CONFIG_HOME/lan-mouse/config.example.toml`.
 
         See <https://github.com/feschber/hops/> for
         available options and documentation.
@@ -75,7 +75,7 @@ in {
       cfg.package
     ];
 
-    xdg.configFile."lan-mouse/config.toml" = lib.mkIf (cfg.settings != {}) {
+    xdg.configFile."lan-mouse/config.example.toml" = lib.mkIf (cfg.settings != {}) {
       source = tomlFormat.generate "config.toml" cfg.settings;
     };
   };

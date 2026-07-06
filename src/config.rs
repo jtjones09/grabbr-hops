@@ -13,7 +13,6 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::{collections::HashSet, io};
 use thiserror::Error;
-use toml;
 use toml_edit::{self, DocumentMut};
 
 use hops_cli::CliArgs;
@@ -84,7 +83,7 @@ struct TomlClient {
 impl ConfigToml {
     fn new(path: &Path) -> Result<ConfigToml, ConfigError> {
         let config = fs::read_to_string(path)?;
-        Ok(toml::from_str::<_>(&config)?)
+        Ok(toml_edit::de::from_str::<_>(&config)?)
     }
 }
 
@@ -335,7 +334,7 @@ impl From<ConfigClient> for TomlClient {
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error(transparent)]
-    Toml(#[from] toml::de::Error),
+    Toml(#[from] toml_edit::de::Error),
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
@@ -369,7 +368,7 @@ impl Config {
         // FSEvents and some Linux backends) has a concrete path to watch.
         fs::create_dir_all(&config_dir)?;
         if !config_path.exists() {
-            let default_toml = toml::to_string_pretty(&ConfigToml::default())
+            let default_toml = toml_edit::ser::to_string_pretty(&ConfigToml::default())
                 .expect("default ConfigToml serialization cannot fail");
             fs::write(&config_path, default_toml)?;
         }

@@ -358,7 +358,7 @@ impl Drop for MacOSEmulation {
 
 fn request_macos_emulation_permissions() -> Result<(), MacOSEmulationCreationError> {
     // Request both permissions up front so the user sees both TCC prompts
-    // on the first launch. See the matching comment in input-capture/src/
+    // on the first launch. See the matching comment in crates/input-capture/src/
     // macos.rs::request_macos_capture_permissions for the rationale.
     let accessibility = request_accessibility_permission();
     let input_control = request_input_control_permission();

@@ -1,15 +1,15 @@
 [workspace]
 members = [
-    "input-capture",
-    "input-emulation",
-    "input-event",
-    "hops-ipc",
-    "hops-cli",
-    "hops-gtk",
-    "hops-proto",
-    "hops-frontend-core",
-    "hops-tui",
-    "hops-slint",
+    "crates/input-capture",
+    "crates/input-emulation",
+    "crates/input-event",
+    "crates/hops-ipc",
+    "crates/hops-cli",
+    "crates/hops-gtk",
+    "crates/hops-proto",
+    "crates/hops-frontend-core",
+    "crates/hops-tui",
+    "crates/hops-slint",
 ]
 
 [package]
@@ -39,18 +39,17 @@ panic = "abort"
 [build-dependencies]
 
 [dependencies]
-input-event = { path = "input-event", version = "0.4.0" }
-input-emulation = { path = "input-emulation", version = "0.4.0", default-features = false }
-input-capture = { path = "input-capture", version = "0.4.0", default-features = false }
-hops-cli = { path = "hops-cli", version = "0.3.0" }
-hops-gtk = { path = "hops-gtk", version = "0.3.0", optional = true }
-hops-tui = { path = "hops-tui", version = "0.1.0", optional = true }
-hops-slint = { path = "hops-slint", version = "0.1.0", optional = true }
-hops-frontend-core = { path = "hops-frontend-core", version = "0.1.0", optional = true }
-hops-ipc = { path = "hops-ipc", version = "0.3.0" }
-hops-proto = { path = "hops-proto", version = "0.3.0" }
+input-event = { path = "crates/input-event", version = "0.4.0" }
+input-emulation = { path = "crates/input-emulation", version = "0.4.0", default-features = false }
+input-capture = { path = "crates/input-capture", version = "0.4.0", default-features = false }
+hops-cli = { path = "crates/hops-cli", version = "0.3.0" }
+hops-gtk = { path = "crates/hops-gtk", version = "0.3.0", optional = true }
+hops-tui = { path = "crates/hops-tui", version = "0.1.0", optional = true }
+hops-slint = { path = "crates/hops-slint", version = "0.1.0", optional = true }
+hops-frontend-core = { path = "crates/hops-frontend-core", version = "0.1.0", optional = true }
+hops-ipc = { path = "crates/hops-ipc", version = "0.3.0" }
+hops-proto = { path = "crates/hops-proto", version = "0.3.0" }
 
-toml = "0.8"
 toml_edit = { version = "0.22", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4.20"
@@ -117,7 +116,7 @@ rdp_emulation = ["input-emulation/remote_desktop_portal"]
 
 [package.metadata.bundle]
 name = "hops"
-icon = ["target/icon.icns", "hops-gtk/resources/de.feschber.LanMouse.svg"]
+icon = ["target/icon.icns", "crates/hops-gtk/resources/de.feschber.LanMouse.svg"]
 identifier = "com.grabbr.hops"
 deb_depends = [ "libadwaita-1-0" ]
 osx_info_plist_exts = ["build-aux/macos-lsui-element.plist"]
