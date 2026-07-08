@@ -32,6 +32,20 @@ mod error;
 
 pub type EmulationHandle = u64;
 
+/// A screen edge of the receiving desktop, as seen by input emulation.
+/// Emitted by [`InputEmulation::take_edge_push`] when a backend's adaptive-edge
+/// detector concludes the remote-controlled cursor was *deliberately pushed*
+/// past that edge (accumulated blocked outward motion, not a position
+/// tripwire — the injected cursor is clamped on-screen and can never actually
+/// occupy the barrier coordinate).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EdgeSide {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Backend {
     #[cfg(wlroots)]
@@ -153,6 +167,14 @@ impl InputEmulation {
         }
     }
 
+    /// Take the pending adaptive-edge signal, if the backend detected one
+    /// while consuming motion events: the remote-controlled cursor was
+    /// deliberately pushed past the returned edge. Poll after [`Self::consume`];
+    /// returns at most one signal, then resets.
+    pub fn take_edge_push(&mut self) -> Option<EdgeSide> {
+        self.emulation.take_edge_push()
+    }
+
     pub async fn create(&mut self, handle: EmulationHandle) -> bool {
         if self.handles.insert(handle) {
             self.pressed_keys.insert(handle, HashSet::new());
@@ -237,4 +259,9 @@ trait Emulation: Send {
     async fn create(&mut self, handle: EmulationHandle);
     async fn destroy(&mut self, handle: EmulationHandle);
     async fn terminate(&mut self);
+    /// Adaptive-edge signal (see [`InputEmulation::take_edge_push`]). Backends
+    /// without a detector keep the default: never signals.
+    fn take_edge_push(&mut self) -> Option<EdgeSide> {
+        None
+    }
 }

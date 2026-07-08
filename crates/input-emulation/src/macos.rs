@@ -1,9 +1,9 @@
-use super::{Emulation, EmulationHandle, error::EmulationError};
+use super::{EdgeSide, Emulation, EmulationHandle, error::EmulationError};
 use async_trait::async_trait;
 use bitflags::bitflags;
 use core_graphics::base::CGFloat;
 use core_graphics::display::{
-    CGDirectDisplayID, CGDisplayBounds, CGGetDisplaysWithRect, CGPoint, CGRect, CGSize,
+    CGDirectDisplayID, CGDisplay, CGDisplayBounds, CGGetDisplaysWithRect, CGPoint, CGRect, CGSize,
 };
 use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton, EventField,
@@ -68,6 +68,13 @@ pub(crate) struct MacOSEmulation {
     user_activity_id: Cell<u32>,
     /// Throttle so we don't call DeclareUserActivity on every motion event.
     last_user_activity: Cell<Option<Instant>>,
+    /// Adaptive edge crossing (intent detector) — integrates the outward motion
+    /// the clamp discards at a screen edge; a deliberate push signals a
+    /// cross-back. See [`EdgePressureDetector`].
+    edge_pressure: EdgePressureDetector,
+    /// Edge signalled by the detector, waiting to be collected via
+    /// [`Emulation::take_edge_push`] after the current `consume`.
+    pending_edge_push: Option<EdgeSide>,
 }
 
 /// Maps an evdev button code to the CGEventType used for drag events.
@@ -118,6 +125,8 @@ impl MacOSEmulation {
             power_assertion: create_power_assertion(),
             user_activity_id: Cell::new(0),
             last_user_activity: Cell::new(None),
+            edge_pressure: EdgePressureDetector::from_env(),
+            pending_edge_push: None,
         })
     }
 
@@ -1093,6 +1102,249 @@ fn get_display_bounds(display: CGDirectDisplayID) -> (CGFloat, CGFloat, CGFloat,
     }
 }
 
+/// Adaptive edge crossing, rung 1: the intent/momentum detector.
+///
+/// Why: the receiver clamps the injected cursor to the display bounds
+/// ([`clamp_to_screen_space`], `max - 1`), so the cursor can never occupy the
+/// capture-side barrier coordinate at the union edge (`>= max`) — and macOS
+/// suppresses the bridging delta after warps. Live-confirmed 2026-07-07: a
+/// hard flick pins the cursor at exactly `max_x - 1` and the barrier never
+/// fires. So don't use a position tripwire at all: integrate the *blocked*
+/// outward motion — the part of each Motion delta the clamp discards — into a
+/// per-edge "pressure". A deliberate push accumulates past the threshold and
+/// signals a cross-back; letting go ends the gesture and the pressure resets.
+/// Coordinate-free by construction (live display bounds + relative motion
+/// only), so it works for any screen size, DPI, or arrangement. Design:
+/// nisaba `projects/grabbr-hops/ADAPTIVE-EDGE-CROSSING.md`.
+///
+/// Model (post-adversarial-review):
+/// - **Gesture, not decay**: pressure accumulates linearly while events keep
+///   coming; a pause > [`EDGE_GESTURE_GAP_MS`] ends the gesture and resets.
+///   (An exponential decay gave a rate *floor* — pushes slower than ~277 px/s
+///   could mathematically never fire.)
+/// - **Per-side accumulators**: all four edges integrate independently; a
+///   corner push feeds both its edges instead of resetting on axis flips.
+/// - **Warp-artifact guard**: each event's blocked motion is capped to the
+///   requested delta (sign-matched) — a post-wake/reconfig phantom cursor
+///   coordinate contributes nothing instead of firing instantly.
+/// - **Union gate**: blocked motion only counts when the clamp pinned the
+///   cursor on the *desktop union* edge in that direction (1s-cached bounds),
+///   matching the capture-side barrier's semantics — an interior display
+///   bezel (offset second display) never builds cross-back pressure.
+/// - **Per-event cap** of half the threshold: no single-event crossing from a
+///   throw at an edge target; a real flick still fires within ~2 events.
+///
+/// `HOPS_ADAPTIVE_EDGE=off` disables (A/B toggle);
+/// `HOPS_EDGE_THRESHOLD=<px>` overrides the pressure threshold.
+struct EdgePressureDetector {
+    enabled: bool,
+    /// accumulated blocked outward motion (px) needed to cross
+    threshold: f64,
+    /// accumulated blocked motion per side: [Left, Right, Top, Bottom]
+    pressure: [f64; 4],
+    /// timestamp of the previous update, for gesture-gap detection
+    last_update: Option<Instant>,
+    /// cached desktop-union bounds: (xmin, xmax, ymin, ymax, computed_at)
+    union: Option<(f64, f64, f64, f64, Instant)>,
+}
+
+/// A pause longer than this (no motion events) ends the push gesture and
+/// resets all pressure — deliberateness is *sustained* contact, drift-and-rest
+/// never accumulates across pauses.
+const EDGE_GESTURE_GAP_MS: f64 = 200.0;
+/// Default blocked-motion threshold (px of outward push within one gesture).
+/// Tunable via `HOPS_EDGE_THRESHOLD` while we gather real-world numbers for
+/// the rung-2 self-tuning layer.
+const DEFAULT_EDGE_THRESHOLD: f64 = 60.0;
+/// Inward motion (px) on a side's axis that counts as "deliberately moving
+/// away" — resets that side immediately. Set well above hand wobble (a few px)
+/// so a shaky push doesn't self-cancel.
+const EDGE_INWARD_RESET: f64 = 8.0;
+/// How long the desktop-union bounds cache stays fresh. Enumerating displays
+/// per motion event would risk stalling the hot path (the capture side polls
+/// at this same 1s cadence for the same reason).
+const EDGE_UNION_CACHE: Duration = Duration::from_secs(1);
+/// Slack when testing whether the clamped coordinate sits on the union edge
+/// (the clamp lands at `max - 1` on max sides and `min` on min sides).
+const EDGE_UNION_TOLERANCE: f64 = 1.5;
+
+const EDGE_SIDES: [EdgeSide; 4] = [
+    EdgeSide::Left,
+    EdgeSide::Right,
+    EdgeSide::Top,
+    EdgeSide::Bottom,
+];
+
+impl EdgePressureDetector {
+    fn from_env() -> Self {
+        let enabled = match std::env::var("HOPS_ADAPTIVE_EDGE") {
+            Ok(v) => !matches!(
+                v.to_ascii_lowercase().as_str(),
+                "off" | "0" | "false" | "no" | "disabled"
+            ),
+            Err(_) => true,
+        };
+        let threshold = std::env::var("HOPS_EDGE_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|t| *t > 0.0)
+            .unwrap_or(DEFAULT_EDGE_THRESHOLD);
+        if enabled {
+            log::info!(
+                "adaptive edge crossing enabled (threshold {threshold}px; HOPS_ADAPTIVE_EDGE=off to disable)"
+            );
+        } else {
+            log::info!("adaptive edge crossing DISABLED (HOPS_ADAPTIVE_EDGE)");
+        }
+        Self {
+            enabled,
+            threshold,
+            pressure: [0.0; 4],
+            last_update: None,
+            union: None,
+        }
+    }
+
+    /// Feed one motion event: `(dx, dy)` is the requested delta, `(blocked_x,
+    /// blocked_y)` the part the clamp discarded, `(clamped_x, clamped_y)` the
+    /// position the cursor was actually placed at. Returns the edge to cross
+    /// when a side's pressure exceeds the threshold.
+    fn update(
+        &mut self,
+        dx: f64,
+        dy: f64,
+        blocked_x: f64,
+        blocked_y: f64,
+        clamped_x: f64,
+        clamped_y: f64,
+    ) -> Option<EdgeSide> {
+        if !self.enabled {
+            return None;
+        }
+
+        // a pause ends the gesture — pressure is per continuous push
+        let now = Instant::now();
+        if let Some(prev) = self.last_update {
+            if now.duration_since(prev).as_secs_f64() * 1000.0 > EDGE_GESTURE_GAP_MS {
+                self.pressure = [0.0; 4];
+            }
+        }
+        self.last_update = Some(now);
+
+        // warp-artifact guard: real clamping never discards more than was
+        // asked for; a larger (or sign-flipped) "blocked" means the cursor
+        // *started* out of bounds (post-wake / display-reconfig fallback) —
+        // that's a settling artifact, not a user push. Contribute nothing.
+        let bx = if dx > 0.0 && blocked_x > 0.0 {
+            blocked_x.min(dx)
+        } else if dx < 0.0 && blocked_x < 0.0 {
+            blocked_x.max(dx)
+        } else {
+            0.0
+        };
+        let by = if dy > 0.0 && blocked_y > 0.0 {
+            blocked_y.min(dy)
+        } else if dy < 0.0 && blocked_y < 0.0 {
+            blocked_y.max(dy)
+        } else {
+            0.0
+        };
+
+        // inward motion is explicit intent to stay on this screen: reset the
+        // side(s) being moved away from
+        if dx > EDGE_INWARD_RESET {
+            self.pressure[0] = 0.0; // away from Left
+        }
+        if dx < -EDGE_INWARD_RESET {
+            self.pressure[1] = 0.0; // away from Right
+        }
+        if dy > EDGE_INWARD_RESET {
+            self.pressure[2] = 0.0; // away from Top (CG +y is down)
+        }
+        if dy < -EDGE_INWARD_RESET {
+            self.pressure[3] = 0.0; // away from Bottom
+        }
+
+        // union gate: only count blocked motion when the cursor is pinned on
+        // the DESKTOP's outer edge in that direction. Interior display bezels
+        // clamp too, but must never build cross-back pressure (the capture
+        // barrier likewise only exists at the union edge).
+        if bx != 0.0 || by != 0.0 {
+            let (uxmin, uxmax, uymin, uymax) = self.union_bounds(now)?;
+            let cap = self.threshold / 2.0;
+            if bx < 0.0 && (clamped_x - uxmin).abs() <= EDGE_UNION_TOLERANCE {
+                self.pressure[0] += bx.abs().min(cap);
+            }
+            if bx > 0.0 && (clamped_x - (uxmax - 1.0)).abs() <= EDGE_UNION_TOLERANCE {
+                self.pressure[1] += bx.abs().min(cap);
+            }
+            if by < 0.0 && (clamped_y - uymin).abs() <= EDGE_UNION_TOLERANCE {
+                self.pressure[2] += by.abs().min(cap);
+            }
+            if by > 0.0 && (clamped_y - (uymax - 1.0)).abs() <= EDGE_UNION_TOLERANCE {
+                self.pressure[3] += by.abs().min(cap);
+            }
+            log::trace!(
+                "edge pressure [L/R/T/B]: {:.0}/{:.0}/{:.0}/{:.0} of {:.0}px",
+                self.pressure[0],
+                self.pressure[1],
+                self.pressure[2],
+                self.pressure[3],
+                self.threshold
+            );
+        }
+
+        // fire the strongest side past the threshold, if any
+        let mut best: Option<(EdgeSide, f64)> = None;
+        for (i, side) in EDGE_SIDES.iter().enumerate() {
+            if self.pressure[i] >= self.threshold
+                && best.is_none_or(|(_, p)| self.pressure[i] > p)
+            {
+                best = Some((*side, self.pressure[i]));
+            }
+        }
+        if let Some((side, p)) = best {
+            log::info!(
+                "adaptive edge: deliberate push past {side:?} edge ({p:.0}px >= {:.0}px)",
+                self.threshold
+            );
+            self.reset();
+            return Some(side);
+        }
+        None
+    }
+
+    /// Desktop-union bounds, cached for [`EDGE_UNION_CACHE`]. `None` when no
+    /// displays are reported (mid-reconfig) — the caller skips accumulation.
+    fn union_bounds(&mut self, now: Instant) -> Option<(f64, f64, f64, f64)> {
+        if let Some((a, b, c, d, at)) = self.union {
+            if now.duration_since(at) < EDGE_UNION_CACHE {
+                return Some((a, b, c, d));
+            }
+        }
+        let ids = CGDisplay::active_displays().ok()?;
+        if ids.is_empty() {
+            return None;
+        }
+        let (mut xmin, mut xmax, mut ymin, mut ymax) =
+            (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+        for id in ids {
+            let b = CGDisplay::new(id).bounds();
+            xmin = xmin.min(b.origin.x);
+            xmax = xmax.max(b.origin.x + b.size.width);
+            ymin = ymin.min(b.origin.y);
+            ymax = ymax.max(b.origin.y + b.size.height);
+        }
+        self.union = Some((xmin, xmax, ymin, ymax, now));
+        Some((xmin, xmax, ymin, ymax))
+    }
+
+    /// Zero all pressure (keeps the union cache — geometry didn't change).
+    fn reset(&mut self) {
+        self.pressure = [0.0; 4];
+    }
+}
+
 fn clamp_to_screen_space(
     current_x: CGFloat,
     current_y: CGFloat,
@@ -1164,6 +1416,33 @@ impl Emulation for MacOSEmulation {
 
                         let (new_mouse_x, new_mouse_y) =
                             clamp_to_screen_space(mouse_location.x, mouse_location.y, dx, dy);
+
+                        // Adaptive edge: whatever the clamp just discarded is
+                        // outward motion the user *asked for* and didn't get —
+                        // feed it to the intent detector. Uses the network
+                        // delta, not the OS-mangled post-warp one, so edge
+                        // suppression can't eat the crossing.
+                        if self.pressed_buttons.is_empty() {
+                            let blocked_x = (mouse_location.x + dx) - new_mouse_x;
+                            let blocked_y = (mouse_location.y + dy) - new_mouse_y;
+                            if let Some(side) = self.edge_pressure.update(
+                                dx,
+                                dy,
+                                blocked_x,
+                                blocked_y,
+                                new_mouse_x,
+                                new_mouse_y,
+                            ) {
+                                self.pending_edge_push = Some(side);
+                            }
+                        } else {
+                            // Parity with the capture-side barrier, which only
+                            // crosses on plain MouseMoved: never cross mid-drag
+                            // (a drag against the edge is aimed at THIS screen's
+                            // edge content, and crossing would strand the held
+                            // button). Drop any built-up intent too.
+                            self.edge_pressure.reset();
+                        }
 
                         mouse_location.x = new_mouse_x;
                         mouse_location.y = new_mouse_y;
@@ -1456,7 +1735,16 @@ impl Emulation for MacOSEmulation {
         Ok(())
     }
 
-    async fn create(&mut self, _handle: EmulationHandle) {}
+    fn take_edge_push(&mut self) -> Option<EdgeSide> {
+        self.pending_edge_push.take()
+    }
+
+    async fn create(&mut self, _handle: EmulationHandle) {
+        // fresh session, fresh intent: no pressure or pending push may carry
+        // over from a previous peer/session
+        self.edge_pressure.reset();
+        self.pending_edge_push = None;
+    }
 
     async fn destroy(&mut self, _handle: EmulationHandle) {
         // A peer leave / watchdog timeout lands here. Stop any running key-repeat —
@@ -1466,6 +1754,9 @@ impl Emulation for MacOSEmulation {
         // Also clear modifier state so no stale modifier is applied afterwards.
         self.cancel_repeat_task().await;
         self.modifier_state.set(XMods::empty());
+        // drop any accumulated edge intent with the session
+        self.edge_pressure.reset();
+        self.pending_edge_push = None;
     }
 
     async fn terminate(&mut self) {

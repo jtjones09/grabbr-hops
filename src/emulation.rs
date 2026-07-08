@@ -53,6 +53,16 @@ pub(crate) enum EmulationEvent {
     EmulationEnabled,
     /// capture should be released
     ReleaseNotify,
+    /// the remote-controlled cursor was deliberately pushed past a screen
+    /// edge on this device (adaptive edge crossing, receiver side). The
+    /// service decides whether that edge belongs to the controlling peer
+    /// and, if so, hands the cursor back.
+    EdgePushed {
+        /// peer whose input pushed the edge
+        addr: SocketAddr,
+        /// which edge was pushed
+        side: hops_ipc::Position,
+    },
     /// peer sent us a Hello with its build commit hash. Used to
     /// populate `client_manager.peer_commit` from the listen side
     /// too — without this, peer-version visibility silently fails
@@ -402,6 +412,16 @@ impl EmulationTask {
                             }
                         };
                         emulation.consume(event, handle).await?;
+                        // adaptive edge: the backend may have concluded this
+                        // event was a deliberate push past a screen edge
+                        if let Some(side) = emulation.take_edge_push() {
+                            self.event_tx
+                                .send(EmulationEvent::EdgePushed {
+                                    addr,
+                                    side: edge_to_ipc_pos(side),
+                                })
+                                .expect("channel closed");
+                        }
                     },
                     ProxyRequest::Remove(addr) => {
                         if let Some(handle) = self.handles.remove(&addr) {
@@ -422,6 +442,15 @@ fn to_ipc_pos(pos: Position) -> hops_ipc::Position {
         Position::Right => hops_ipc::Position::Right,
         Position::Top => hops_ipc::Position::Top,
         Position::Bottom => hops_ipc::Position::Bottom,
+    }
+}
+
+fn edge_to_ipc_pos(side: input_emulation::EdgeSide) -> hops_ipc::Position {
+    match side {
+        input_emulation::EdgeSide::Left => hops_ipc::Position::Left,
+        input_emulation::EdgeSide::Right => hops_ipc::Position::Right,
+        input_emulation::EdgeSide::Top => hops_ipc::Position::Top,
+        input_emulation::EdgeSide::Bottom => hops_ipc::Position::Bottom,
     }
 }
 

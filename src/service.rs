@@ -413,6 +413,22 @@ impl Service {
                 self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
             }
             EmulationEvent::ReleaseNotify => self.capture.release(),
+            EmulationEvent::EdgePushed { addr, side } => {
+                // Adaptive edge (receiver side): the controlling peer's cursor
+                // was deliberately pushed past `side`. Hand control back only
+                // if that is the edge the peer entered from — same semantics
+                // as the capture-side barrier in CaptureBegin below, which
+                // stays active as a redundant path; `currently_controlling`
+                // dedupes whichever fires second.
+                let entered_here = self
+                    .incoming_conn_info
+                    .values()
+                    .any(|i| i.addr == addr && i.pos == side);
+                if entered_here && self.currently_controlling.remove(&addr) {
+                    Lifecycle::Left { addr }.log();
+                    self.emulation.send_leave_event(addr);
+                }
+            }
             EmulationEvent::Connected { addr, fingerprint } => {
                 Lifecycle::Connected {
                     addr,
