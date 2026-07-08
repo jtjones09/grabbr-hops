@@ -7,6 +7,7 @@ import { Card, Separator, Dot, Chip, StatChip, SectionTitle, PillButton, TextFie
 import { OnboardingWindow } from "onboarding.slint";
 import { LayoutCanvas, CanvasBox } from "layout_canvas.slint";
 import { HopsTray } from "tray.slint";
+import { ScrollView } from "std-widgets.slint";
 
 // re-export so Rust can select the active palette via `ui.global::<Theme>()`.
 // OnboardingWindow/CanvasBox/HopsTray are re-exported here too (not compiled as
@@ -36,13 +37,18 @@ export component AppWindow inherits Window {
     title: "hops";
     default-font-family: Type.sans;
     default-font-size: Type.body;
-    // no preferred-height: the window sizes to its content (avoids a dead band
-    // below the footer when there are few devices). NB: the Rust side asserts a
-    // concrete size on show (see show_app_window) — an auto-sized window could
-    // otherwise open collapsed to the titlebar before its first layout settled.
+    // Fixed-size control panel — non-resizable, like Shottr / CleanShot /
+    // Synergy settings (a KVM control surface is all settings, never a canvas
+    // you drag-resize). min == max == preferred locks the frame, so it can
+    // neither be resized nor auto-collapse to the titlebar; the device/trusted
+    // lists SCROLL within it (ScrollView below) so any machine count fits.
+    // Rust also asserts this size on show (show_app_window) as belt-and-braces.
     preferred-width: 560px;
-    min-width: 460px;
-    min-height: 360px;
+    preferred-height: 690px;
+    min-width: 560px;
+    max-width: 560px;
+    min-height: 690px;
+    max-height: 690px;
     background: Theme.c.background;
 
     in property <bool> connected: false;
@@ -96,7 +102,6 @@ export component AppWindow inherits Window {
     VerticalLayout {
         padding: Space.xxl;
         spacing: Space.lg;
-        alignment: start;
 
         // --- header: wordmark + inline connection ------------------------------
         HorizontalLayout {
@@ -174,385 +179,397 @@ export component AppWindow inherits Window {
             }
         }
 
-        // --- pairing request (Windows wants to pair with this Mac) -------------
-        if root.pairing-fp != "": Rectangle {
-            vertical-stretch: 0;
-            background: Theme.c.warn.transparentize(0.9);
-            border-radius: Radius.lg;
-            border-width: 1px;
-            border-color: Theme.c.warn.transparentize(0.55);
+        // Everything between the fixed header/status and the fixed footer
+        // scrolls, so the window stays a fixed size no matter how many
+        // devices are paired (few -> some slack above the footer; many ->
+        // it scrolls). See the Window size note above.
+        ScrollView {
+            vertical-stretch: 1;
             VerticalLayout {
-                padding: Space.md;
-                spacing: Space.sm;
-                Text {
-                    text: "pairing request";
-                    color: Theme.c.warn;
-                    font-size: Type.small;
-                    font-weight: Type.semibold;
-                }
-                Text {
-                    text: root.pairing-fp;
-                    color: Theme.c.muted;
-                    font-family: Type.mono;
-                    font-size: Type.caption;
-                    letter-spacing: Type.mono-tracking;
-                    overflow: elide;
-                }
-                HorizontalLayout {
-                    spacing: Space.sm;
-                    name := TextField {
-                        placeholder: "name this device";
-                        horizontal-stretch: 1;
-                        accepted => {
-                            root.approve-pairing(self.text, root.pairing-fp);
-                            self.text = "";
-                        }
-                    }
-                    PillButton {
-                        text: "trust & name";
-                        primary: true;
-                        clicked => {
-                            root.approve-pairing(name.text, root.pairing-fp);
-                            name.text = "";
-                        }
-                    }
-                    PillButton {
-                        text: "deny";
-                        clicked => { root.deny-pairing(root.pairing-fp); }
-                    }
-                }
-            }
-        }
-
-        // --- devices ------------------------------------------------------------
-        HorizontalLayout {
-            alignment: space-between;
-            SectionTitle { text: "devices — cross to"; color: Theme.c.accent; }
-            HorizontalLayout {
-                spacing: Space.sm;
-                PillButton {
-                    text: "arrange";
-                    ghost: true;
-                    clicked => { root.open-layout-canvas(); }
-                }
-                PillButton {
-                    text: root.show-add-device ? "cancel" : "+ add";
-                    ghost: true;
-                    clicked => { root.show-add-device = !root.show-add-device; }
-                }
-            }
-        }
-        if root.show-add-device: Rectangle {
-            vertical-stretch: 0;
-            background: Theme.c.surface;
-            border-radius: Radius.lg;
-            border-width: 1px;
-            border-color: Theme.c.border;
-            VerticalLayout {
-                padding: Space.md;
-                spacing: Space.sm;
-                HorizontalLayout {
-                    spacing: Space.sm;
-                    add-name := TextField {
-                        placeholder: "name (e.g. studio-pc)";
-                        horizontal-stretch: 2;
-                    }
-                    add-port := TextField {
-                        placeholder: "4242";
-                        horizontal-stretch: 1;
-                    }
-                }
-                HorizontalLayout {
-                    spacing: Space.sm;
-                    Text {
-                        text: "position";
-                        color: Theme.c.muted;
-                        font-size: Type.small;
-                        vertical-alignment: center;
-                    }
-                    for p in ["left", "right", "top", "bottom"]: PillButton {
-                        text: p;
-                        primary: root.add-device-position == p;
-                        clicked => { root.add-device-position = p; }
-                    }
-                }
-                HorizontalLayout {
-                    spacing: Space.sm;
-                    PillButton {
-                        text: "add device";
-                        primary: true;
-                        clicked => {
-                            root.create-device(add-name.text, add-port.text, root.add-device-position);
-                            add-name.text = "";
-                            add-port.text = "";
-                            root.add-device-position = "left";
-                            root.show-add-device = false;
-                        }
-                    }
-                }
-            }
-        }
-        Card {
-            vertical-stretch: 0;
-            VerticalLayout {
-                padding: Space.sm;
-                spacing: 2px;
-                if root.devices.length == 0: HorizontalLayout {
-                    padding: Space.sm;
-                    Text {
-                        text: "no outgoing devices — this Mac only receives";
-                        color: Theme.c.muted;
-                        font-size: Type.small;
-                    }
-                }
-                for d in root.devices: Rectangle {
-                    height: 56px;
-                    border-radius: Radius.md;
-                    drow := TouchArea {}
-                    background: drow.has-hover ? Theme.c.surface-raised : transparent;
-                    animate background { duration: Motion.fast; }
-                    HorizontalLayout {
-                        padding-left: Space.md;
-                        padding-right: Space.md;
-                        spacing: Space.md;
-                        VerticalLayout {
-                            alignment: center;
-                            Dot {
-                                tint: d.alive
-                                    ? Theme.c.success
-                                    : (d.active ? Theme.c.warn : Theme.c.muted);
-                            }
-                        }
-                        VerticalLayout {
-                            alignment: center;
-                            spacing: 2px;
-                            horizontal-stretch: 1;
-                            Text {
-                                text: d.name;
-                                color: Theme.c.foreground;
-                                font-weight: Type.medium;
-                                overflow: elide;
-                            }
-                            Text {
-                                text: d.addr;
-                                color: Theme.c.muted;
-                                font-family: Type.mono;
-                                font-size: Type.caption;
-                                letter-spacing: Type.mono-tracking;
-                                overflow: elide;
-                            }
-                        }
-                        VerticalLayout {
-                            alignment: center;
-                            Chip {
-                                text: d.pos;
-                                text-color: Theme.c.accent;
-                                fill: Theme.c.accent.transparentize(0.85);
-                                pos-ta := TouchArea {
-                                    mouse-cursor: pointer;
-                                    clicked => {
-                                        root.reposition-device(d.handle, d.pos == "left" ? "right"
-                                            : d.pos == "right" ? "top"
-                                            : d.pos == "top" ? "bottom" : "left");
-                                    }
-                                }
-                            }
-                        }
-                        VerticalLayout {
-                            alignment: center;
-                            Toggle {
-                                checked: d.active;
-                                toggled(v) => { root.activate-device(d.handle, v); }
-                            }
-                        }
-                        if root.confirm-delete-handle != d.handle: VerticalLayout {
-                            alignment: center;
-                            PillButton {
-                                text: "edit";
-                                ghost: true;
-                                clicked => { root.editing-device = root.editing-device == d.handle ? "" : d.handle; }
-                            }
-                        }
-                        if root.confirm-delete-handle != d.handle: VerticalLayout {
-                            alignment: center;
-                            PillButton {
-                                text: "delete";
-                                ghost: true;
-                                clicked => { root.confirm-delete-handle = d.handle; }
-                            }
-                        }
-                        if root.confirm-delete-handle == d.handle: VerticalLayout {
-                            alignment: center;
-                            Text {
-                                text: "delete?";
-                                color: Theme.c.muted;
-                                font-size: Type.small;
-                            }
-                        }
-                        if root.confirm-delete-handle == d.handle: VerticalLayout {
-                            alignment: center;
-                            PillButton {
-                                text: "yes";
-                                danger: true;
-                                clicked => {
-                                    root.delete-device(d.handle);
-                                    root.confirm-delete-handle = "";
-                                    root.editing-device = "";
-                                }
-                            }
-                        }
-                        if root.confirm-delete-handle == d.handle: VerticalLayout {
-                            alignment: center;
-                            PillButton {
-                                text: "no";
-                                ghost: true;
-                                clicked => { root.confirm-delete-handle = ""; }
-                            }
-                        }
-                    }
-                }
-                if root.editing-device != "": Rectangle {
-                    background: Theme.c.surface-raised;
-                    border-radius: Radius.md;
+                spacing: Space.lg;
+                alignment: start;
+                // --- pairing request (Windows wants to pair with this Mac) -------------
+                if root.pairing-fp != "": Rectangle {
+                    vertical-stretch: 0;
+                    background: Theme.c.warn.transparentize(0.9);
+                    border-radius: Radius.lg;
+                    border-width: 1px;
+                    border-color: Theme.c.warn.transparentize(0.55);
                     VerticalLayout {
                         padding: Space.md;
                         spacing: Space.sm;
                         Text {
-                            text: "rename device";
+                            text: "pairing request";
+                            color: Theme.c.warn;
+                            font-size: Type.small;
+                            font-weight: Type.semibold;
+                        }
+                        Text {
+                            text: root.pairing-fp;
                             color: Theme.c.muted;
+                            font-family: Type.mono;
                             font-size: Type.caption;
+                            letter-spacing: Type.mono-tracking;
+                            overflow: elide;
                         }
                         HorizontalLayout {
                             spacing: Space.sm;
-                            rename-field := TextField {
-                                placeholder: "new name";
+                            name := TextField {
+                                placeholder: "name this device";
                                 horizontal-stretch: 1;
                                 accepted => {
-                                    root.rename-device(root.editing-device, self.text);
+                                    root.approve-pairing(self.text, root.pairing-fp);
                                     self.text = "";
-                                    root.editing-device = "";
                                 }
                             }
                             PillButton {
-                                text: "save";
+                                text: "trust & name";
                                 primary: true;
                                 clicked => {
-                                    root.rename-device(root.editing-device, rename-field.text);
-                                    rename-field.text = "";
-                                    root.editing-device = "";
+                                    root.approve-pairing(name.text, root.pairing-fp);
+                                    name.text = "";
                                 }
                             }
                             PillButton {
-                                text: "cancel";
-                                ghost: true;
-                                clicked => {
-                                    rename-field.text = "";
-                                    root.editing-device = "";
-                                }
+                                text: "deny";
+                                clicked => { root.deny-pairing(root.pairing-fp); }
                             }
                         }
                     }
                 }
-            }
-        }
 
-        // --- trusted peers ------------------------------------------------------
-        SectionTitle { text: "trusted devices"; color: Theme.c.accent; }
-        Card {
-            vertical-stretch: 0;
-            VerticalLayout {
-                padding: Space.sm;
-                spacing: 2px;
-                if root.trusted.length == 0: HorizontalLayout {
-                    padding: Space.sm;
-                    Text {
-                        text: "no trusted devices yet";
-                        color: Theme.c.muted;
-                        font-size: Type.small;
+                // --- devices ------------------------------------------------------------
+                HorizontalLayout {
+                    alignment: space-between;
+                    SectionTitle { text: "devices — cross to"; color: Theme.c.accent; }
+                    HorizontalLayout {
+                        spacing: Space.sm;
+                        PillButton {
+                            text: "arrange";
+                            ghost: true;
+                            clicked => { root.open-layout-canvas(); }
+                        }
+                        PillButton {
+                            text: root.show-add-device ? "cancel" : "+ add";
+                            ghost: true;
+                            clicked => { root.show-add-device = !root.show-add-device; }
+                        }
                     }
                 }
-                for t in root.trusted: Rectangle {
-                    height: 46px;
-                    border-radius: Radius.md;
-                    trow := TouchArea {}
-                    background: trow.has-hover ? Theme.c.surface-raised : transparent;
-                    animate background { duration: Motion.fast; }
-                    HorizontalLayout {
-                        padding-left: Space.md;
-                        padding-right: Space.sm;
-                        spacing: Space.md;
-                        VerticalLayout {
-                            alignment: center;
-                            Dot { tint: t.online ? Theme.c.success : Theme.c.muted; }
-                        }
-                        VerticalLayout {
-                            alignment: center;
-                            horizontal-stretch: 1;
-                            Text {
-                                text: t.name;
-                                color: Theme.c.foreground;
-                                font-weight: Type.medium;
-                                overflow: elide;
+                if root.show-add-device: Rectangle {
+                    vertical-stretch: 0;
+                    background: Theme.c.surface;
+                    border-radius: Radius.lg;
+                    border-width: 1px;
+                    border-color: Theme.c.border;
+                    VerticalLayout {
+                        padding: Space.md;
+                        spacing: Space.sm;
+                        HorizontalLayout {
+                            spacing: Space.sm;
+                            add-name := TextField {
+                                placeholder: "name (e.g. studio-pc)";
+                                horizontal-stretch: 2;
+                            }
+                            add-port := TextField {
+                                placeholder: "4242";
+                                horizontal-stretch: 1;
                             }
                         }
-                        VerticalLayout {
-                            alignment: center;
+                        HorizontalLayout {
+                            spacing: Space.sm;
                             Text {
-                                text: t.fp;
-                                color: Theme.c.muted;
-                                font-family: Type.mono;
-                                font-size: Type.caption;
-                                letter-spacing: Type.mono-tracking;
-                            }
-                        }
-                        // normal: colored status + ghost revoke
-                        if root.confirm-revoke-fp != t.fp-full: VerticalLayout {
-                            alignment: center;
-                            Text {
-                                text: t.online ? "connected" : "offline";
-                                color: t.online ? Theme.c.success : Theme.c.muted;
-                                font-size: Type.small;
-                                font-weight: Type.medium;
-                            }
-                        }
-                        if root.confirm-revoke-fp != t.fp-full: VerticalLayout {
-                            alignment: center;
-                            PillButton {
-                                text: "revoke";
-                                ghost: true;
-                                clicked => { root.confirm-revoke-fp = t.fp-full; }
-                            }
-                        }
-                        // confirm state
-                        if root.confirm-revoke-fp == t.fp-full: VerticalLayout {
-                            alignment: center;
-                            Text {
-                                text: "remove?";
+                                text: "position";
                                 color: Theme.c.muted;
                                 font-size: Type.small;
+                                vertical-alignment: center;
+                            }
+                            for p in ["left", "right", "top", "bottom"]: PillButton {
+                                text: p;
+                                primary: root.add-device-position == p;
+                                clicked => { root.add-device-position = p; }
                             }
                         }
-                        if root.confirm-revoke-fp == t.fp-full: VerticalLayout {
-                            alignment: center;
+                        HorizontalLayout {
+                            spacing: Space.sm;
                             PillButton {
-                                text: "yes";
-                                danger: true;
+                                text: "add device";
+                                primary: true;
                                 clicked => {
-                                    root.revoke(t.fp-full);
-                                    root.confirm-revoke-fp = "";
+                                    root.create-device(add-name.text, add-port.text, root.add-device-position);
+                                    add-name.text = "";
+                                    add-port.text = "";
+                                    root.add-device-position = "left";
+                                    root.show-add-device = false;
                                 }
                             }
                         }
-                        if root.confirm-revoke-fp == t.fp-full: VerticalLayout {
-                            alignment: center;
-                            PillButton {
-                                text: "no";
-                                ghost: true;
-                                clicked => { root.confirm-revoke-fp = ""; }
+                    }
+                }
+                Card {
+                    vertical-stretch: 0;
+                    VerticalLayout {
+                        padding: Space.sm;
+                        spacing: 2px;
+                        if root.devices.length == 0: HorizontalLayout {
+                            padding: Space.sm;
+                            Text {
+                                text: "no outgoing devices — this Mac only receives";
+                                color: Theme.c.muted;
+                                font-size: Type.small;
+                            }
+                        }
+                        for d in root.devices: Rectangle {
+                            height: 56px;
+                            border-radius: Radius.md;
+                            drow := TouchArea {}
+                            background: drow.has-hover ? Theme.c.surface-raised : transparent;
+                            animate background { duration: Motion.fast; }
+                            HorizontalLayout {
+                                padding-left: Space.md;
+                                padding-right: Space.md;
+                                spacing: Space.md;
+                                VerticalLayout {
+                                    alignment: center;
+                                    Dot {
+                                        tint: d.alive
+                                            ? Theme.c.success
+                                            : (d.active ? Theme.c.warn : Theme.c.muted);
+                                    }
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    spacing: 2px;
+                                    horizontal-stretch: 1;
+                                    Text {
+                                        text: d.name;
+                                        color: Theme.c.foreground;
+                                        font-weight: Type.medium;
+                                        overflow: elide;
+                                    }
+                                    Text {
+                                        text: d.addr;
+                                        color: Theme.c.muted;
+                                        font-family: Type.mono;
+                                        font-size: Type.caption;
+                                        letter-spacing: Type.mono-tracking;
+                                        overflow: elide;
+                                    }
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    Chip {
+                                        text: d.pos;
+                                        text-color: Theme.c.accent;
+                                        fill: Theme.c.accent.transparentize(0.85);
+                                        pos-ta := TouchArea {
+                                            mouse-cursor: pointer;
+                                            clicked => {
+                                                root.reposition-device(d.handle, d.pos == "left" ? "right"
+                                                    : d.pos == "right" ? "top"
+                                                    : d.pos == "top" ? "bottom" : "left");
+                                            }
+                                        }
+                                    }
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    Toggle {
+                                        checked: d.active;
+                                        toggled(v) => { root.activate-device(d.handle, v); }
+                                    }
+                                }
+                                if root.confirm-delete-handle != d.handle: VerticalLayout {
+                                    alignment: center;
+                                    PillButton {
+                                        text: "edit";
+                                        ghost: true;
+                                        clicked => { root.editing-device = root.editing-device == d.handle ? "" : d.handle; }
+                                    }
+                                }
+                                if root.confirm-delete-handle != d.handle: VerticalLayout {
+                                    alignment: center;
+                                    PillButton {
+                                        text: "delete";
+                                        ghost: true;
+                                        clicked => { root.confirm-delete-handle = d.handle; }
+                                    }
+                                }
+                                if root.confirm-delete-handle == d.handle: VerticalLayout {
+                                    alignment: center;
+                                    Text {
+                                        text: "delete?";
+                                        color: Theme.c.muted;
+                                        font-size: Type.small;
+                                    }
+                                }
+                                if root.confirm-delete-handle == d.handle: VerticalLayout {
+                                    alignment: center;
+                                    PillButton {
+                                        text: "yes";
+                                        danger: true;
+                                        clicked => {
+                                            root.delete-device(d.handle);
+                                            root.confirm-delete-handle = "";
+                                            root.editing-device = "";
+                                        }
+                                    }
+                                }
+                                if root.confirm-delete-handle == d.handle: VerticalLayout {
+                                    alignment: center;
+                                    PillButton {
+                                        text: "no";
+                                        ghost: true;
+                                        clicked => { root.confirm-delete-handle = ""; }
+                                    }
+                                }
+                            }
+                        }
+                        if root.editing-device != "": Rectangle {
+                            background: Theme.c.surface-raised;
+                            border-radius: Radius.md;
+                            VerticalLayout {
+                                padding: Space.md;
+                                spacing: Space.sm;
+                                Text {
+                                    text: "rename device";
+                                    color: Theme.c.muted;
+                                    font-size: Type.caption;
+                                }
+                                HorizontalLayout {
+                                    spacing: Space.sm;
+                                    rename-field := TextField {
+                                        placeholder: "new name";
+                                        horizontal-stretch: 1;
+                                        accepted => {
+                                            root.rename-device(root.editing-device, self.text);
+                                            self.text = "";
+                                            root.editing-device = "";
+                                        }
+                                    }
+                                    PillButton {
+                                        text: "save";
+                                        primary: true;
+                                        clicked => {
+                                            root.rename-device(root.editing-device, rename-field.text);
+                                            rename-field.text = "";
+                                            root.editing-device = "";
+                                        }
+                                    }
+                                    PillButton {
+                                        text: "cancel";
+                                        ghost: true;
+                                        clicked => {
+                                            rename-field.text = "";
+                                            root.editing-device = "";
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 }
+
+                // --- trusted peers ------------------------------------------------------
+                SectionTitle { text: "trusted devices"; color: Theme.c.accent; }
+                Card {
+                    vertical-stretch: 0;
+                    VerticalLayout {
+                        padding: Space.sm;
+                        spacing: 2px;
+                        if root.trusted.length == 0: HorizontalLayout {
+                            padding: Space.sm;
+                            Text {
+                                text: "no trusted devices yet";
+                                color: Theme.c.muted;
+                                font-size: Type.small;
+                            }
+                        }
+                        for t in root.trusted: Rectangle {
+                            height: 46px;
+                            border-radius: Radius.md;
+                            trow := TouchArea {}
+                            background: trow.has-hover ? Theme.c.surface-raised : transparent;
+                            animate background { duration: Motion.fast; }
+                            HorizontalLayout {
+                                padding-left: Space.md;
+                                padding-right: Space.sm;
+                                spacing: Space.md;
+                                VerticalLayout {
+                                    alignment: center;
+                                    Dot { tint: t.online ? Theme.c.success : Theme.c.muted; }
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    horizontal-stretch: 1;
+                                    Text {
+                                        text: t.name;
+                                        color: Theme.c.foreground;
+                                        font-weight: Type.medium;
+                                        overflow: elide;
+                                    }
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    Text {
+                                        text: t.fp;
+                                        color: Theme.c.muted;
+                                        font-family: Type.mono;
+                                        font-size: Type.caption;
+                                        letter-spacing: Type.mono-tracking;
+                                    }
+                                }
+                                // normal: colored status + ghost revoke
+                                if root.confirm-revoke-fp != t.fp-full: VerticalLayout {
+                                    alignment: center;
+                                    Text {
+                                        text: t.online ? "connected" : "offline";
+                                        color: t.online ? Theme.c.success : Theme.c.muted;
+                                        font-size: Type.small;
+                                        font-weight: Type.medium;
+                                    }
+                                }
+                                if root.confirm-revoke-fp != t.fp-full: VerticalLayout {
+                                    alignment: center;
+                                    PillButton {
+                                        text: "revoke";
+                                        ghost: true;
+                                        clicked => { root.confirm-revoke-fp = t.fp-full; }
+                                    }
+                                }
+                                // confirm state
+                                if root.confirm-revoke-fp == t.fp-full: VerticalLayout {
+                                    alignment: center;
+                                    Text {
+                                        text: "remove?";
+                                        color: Theme.c.muted;
+                                        font-size: Type.small;
+                                    }
+                                }
+                                if root.confirm-revoke-fp == t.fp-full: VerticalLayout {
+                                    alignment: center;
+                                    PillButton {
+                                        text: "yes";
+                                        danger: true;
+                                        clicked => {
+                                            root.revoke(t.fp-full);
+                                            root.confirm-revoke-fp = "";
+                                        }
+                                    }
+                                }
+                                if root.confirm-revoke-fp == t.fp-full: VerticalLayout {
+                                    alignment: center;
+                                    PillButton {
+                                        text: "no";
+                                        ghost: true;
+                                        clicked => { root.confirm-revoke-fp = ""; }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
             }
         }
 

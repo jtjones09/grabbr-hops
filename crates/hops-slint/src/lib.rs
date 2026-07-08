@@ -707,6 +707,10 @@ pub fn run_onboarding() -> Result<Option<hops_frontend_core::prefs::Frontend>, S
         });
     }
 
+    // Assert the fixed size before showing, same collapse guard as the main
+    // window (an auto-sized window can open collapsed before layout settles).
+    ui.window()
+        .set_size(slint::LogicalSize::new(580.0, 470.0));
     ui.run()?;
     let picked = *choice.borrow();
     Ok(picked)

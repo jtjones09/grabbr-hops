@@ -13,11 +13,14 @@ export component OnboardingWindow inherits Window {
     title: "welcome to hops";
     default-font-family: Type.sans;
     default-font-size: Type.body;
-    // no preferred-height: sizes to content, like AppWindow (a fixed height +
-    // `alignment: start` would leave a dead gap below the footer instead).
+    // Fixed-size, non-resizable (see AppWindow's note). Onboarding content is
+    // fixed — two interface previews — so no scroll is needed, just lock it.
     preferred-width: 580px;
-    min-width: 480px;
-    min-height: 380px;
+    preferred-height: 470px;
+    min-width: 580px;
+    max-width: 580px;
+    min-height: 470px;
+    max-height: 470px;
     background: Theme.c.background;
 
     callback choose-gui();
