@@ -37,7 +37,9 @@ export component AppWindow inherits Window {
     default-font-family: Type.sans;
     default-font-size: Type.body;
     // no preferred-height: the window sizes to its content (avoids a dead band
-    // below the footer when there are few devices)
+    // below the footer when there are few devices). NB: the Rust side asserts a
+    // concrete size on show (see show_app_window) — an auto-sized window could
+    // otherwise open collapsed to the titlebar before its first layout settled.
     preferred-width: 560px;
     min-width: 460px;
     min-height: 360px;

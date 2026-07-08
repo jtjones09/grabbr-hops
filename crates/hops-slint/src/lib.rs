@@ -280,6 +280,24 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
 
     let ui = AppWindow::new()?;
 
+    // Open the window at a sane size. app.slint deliberately omits
+    // preferred-height (it sizes to content), but an auto-sized window can open
+    // COLLAPSED to just the titlebar when it's shown before its first layout
+    // settles — min-height isn't applied to that initial winit size (seen in
+    // the wild via the tray "Open hops" path; a manual resize fixed it). Assert
+    // a size only when the window is collapsed/unsized, so a size the user chose
+    // survives a reopen; min-width/height still bound resizing.
+    fn show_app_window(ui: &AppWindow) -> Result<(), slint::PlatformError> {
+        // titlebar-only is ~tens of px tall at any DPI; a laid-out window is
+        // always hundreds (min-height 360). 100 physical px cleanly separates
+        // "collapsed / never shown" from "a real size".
+        if ui.window().size().height < 100 {
+            ui.window()
+                .set_size(slint::LogicalSize::new(560.0, 690.0));
+        }
+        ui.show()
+    }
+
     // theme is a UI-local preference shared with the TUI. Rust owns the palette
     // DATA (built-ins + any user themes in ~/.config/lan-mouse/themes/*.toml) —
     // push the whole table into the GUI once, then just flip the index to switch.
@@ -619,7 +637,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
         let weak = ui.as_weak();
         tray.on_open_window(move || {
             if let Some(ui) = weak.upgrade() {
-                let _ = ui.show();
+                let _ = show_app_window(&ui);
                 #[cfg(target_os = "macos")]
                 macos_app::activate_app();
             }
@@ -638,7 +656,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
     // `hidden` (login autostart) starts as tray only; the window opens on
     // tray-click / "Open hops" / a second launch. Manual launches show it now.
     if !hidden {
-        ui.show()?;
+        show_app_window(&ui)?;
     }
     tray.show()?;
     slint::run_event_loop_until_quit()?;
