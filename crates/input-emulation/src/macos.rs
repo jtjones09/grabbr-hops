@@ -1102,7 +1102,7 @@ fn get_display_bounds(display: CGDirectDisplayID) -> (CGFloat, CGFloat, CGFloat,
     }
 }
 
-/// Adaptive edge crossing, rung 1: the intent/momentum detector.
+/// Adaptive edge crossing — rung 1 (intent/momentum) + rung 2 (self-tuning).
 ///
 /// Why: the receiver clamps the injected cursor to the display bounds
 /// ([`clamp_to_screen_space`], `max - 1`), so the cursor can never occupy the
@@ -1117,7 +1117,7 @@ fn get_display_bounds(display: CGDirectDisplayID) -> (CGFloat, CGFloat, CGFloat,
 /// only), so it works for any screen size, DPI, or arrangement. Design:
 /// nisaba `projects/grabbr-hops/ADAPTIVE-EDGE-CROSSING.md`.
 ///
-/// Model (post-adversarial-review):
+/// Rung-1 model (shaped by an adversarial review pass):
 /// - **Gesture, not decay**: pressure accumulates linearly while events keep
 ///   coming; a pause > [`EDGE_GESTURE_GAP_MS`] ends the gesture and resets.
 ///   (An exponential decay gave a rate *floor* — pushes slower than ~277 px/s
@@ -1133,17 +1133,87 @@ fn get_display_bounds(display: CGDirectDisplayID) -> (CGFloat, CGFloat, CGFloat,
 ///   bezel (offset second display) never builds cross-back pressure.
 /// - **Per-event cap** of half the threshold: no single-event crossing from a
 ///   throw at an edge target; a real flick still fires within ~2 events.
+/// - **Latch**: one fire per push — after firing, a side stays quiet until
+///   the gesture ends (pause or inward motion). Leaning on an edge is one
+///   crossing intent, not a fire every 60px (validated live: 19 fires/sec
+///   while leaning on a clientless edge before the latch).
 ///
-/// `HOPS_ADAPTIVE_EDGE=off` disables (A/B toggle);
-/// `HOPS_EDGE_THRESHOLD=<px>` overrides the pressure threshold.
+/// Rung-2 model — per-edge thresholds that learn. A second adversarial pass
+/// killed the first design (event-flow-timing regret): a real crossing makes
+/// the peer send Leave back, which DESTROYS the emulation handle — so flow
+/// timing can't survive a crossing, and dead-edge fires polluted it. The
+/// session lifecycle itself is the reliable crossing signal:
+/// - **Cross confirmation**: [`Self::on_session_destroyed`] runs when the
+///   handle is torn down. If that happens within [`EDGE_CROSS_CONFIRM_MS`] of
+///   our fire, that fire verifiably crossed (a fire at a clientless edge
+///   never destroys the handle — it can't produce false regret).
+/// - **Regret, tentatively**: [`Self::on_session_created`] runs at the first
+///   input after re-entry. Returning within [`EDGE_REGRET_WINDOW_MS`] of the
+///   crossing means the user barely stayed — record a *pending* raise.
+/// - **Deferred commit**: the raise only commits once no same-edge fire has
+///   followed within [`EDGE_BOUNCE_CANCEL_MS`] — deliberate bouncing discards
+///   the pending raise instead of committing-then-reverting (no clamp
+///   asymmetry, and a bounce run costs at most the final return's raise).
+/// - **Effort**: a push abandoned at >= half its threshold arms a discount,
+///   stamped at the *abandon* time (not the resume — a 10-minute-old
+///   near-miss must not discount today's crossing); a fire on that edge
+///   within [`EDGE_EFFORT_WINDOW_MS`] of the abandon lowers the threshold.
+/// - **One adjustment per fire**: a bounce-discard consumes the fire's
+///   learning budget; effort applies only otherwise. Signals compose, never
+///   fight.
+/// - Thresholds clamp to [[`EDGE_THRESHOLD_MIN`], [`EDGE_THRESHOLD_MAX`]] and
+///   are learned in-memory per daemon run (persistence is a later rung once
+///   the dynamics are validated). Every adjustment logs at info.
+///
+/// Confirmed-cross gating (learning only ever touches a REAL crossing):
+/// - A fire holds off any *other* side from firing for [`EDGE_CROSS_CONFIRM_MS`]
+///   (a corner push pins two edges — without this the second fire
+///   misattributes the crossing to a clientless edge).
+/// - The effort discount is only *armed* at fire time; it commits in
+///   [`Self::on_session_destroyed`] once the teardown confirms the fire crossed.
+///
+/// Known + accepted (timing-inference limits; the robust fix is an explicit
+/// service→backend cross confirmation, deferred until multi-machine is in use):
+/// - Crossings won by the redundant position barrier (no detector fire) don't
+///   feed learning; a deliberate-bounce run's final return can commit one
+///   raise — the effort signal corrects it within a couple of pushes.
+/// - A single `pending_regret` slot: with clients on *two* edges, an
+///   accidental crossing on one whose raise hasn't committed can be
+///   overwritten by a crossing on the other (a legitimate raise is dropped,
+///   never a wrong one added). Single-client setups can't hit it.
+/// - A non-crossing teardown (peer release-bind / disconnect) within
+///   [`EDGE_CROSS_CONFIRM_MS`] of a *clientless-edge* fire can false-confirm a
+///   cross → one +25% raise on an edge with no client (a near-no-op: a
+///   clientless edge's threshold is never consulted).
+///
+/// `HOPS_ADAPTIVE_EDGE=off` disables everything (A/B toggle);
+/// `HOPS_EDGE_THRESHOLD=<px>` sets the starting threshold;
+/// `HOPS_EDGE_LEARN=off` freezes thresholds (rung 1 behavior only).
 struct EdgePressureDetector {
     enabled: bool,
-    /// accumulated blocked outward motion (px) needed to cross
-    threshold: f64,
+    /// rung 2 on/off — when off, thresholds stay at their starting value
+    learn: bool,
+    /// per-side crossing threshold (px): [Left, Right, Top, Bottom]
+    threshold: [f64; 4],
     /// accumulated blocked motion per side: [Left, Right, Top, Bottom]
     pressure: [f64; 4],
+    /// side already fired this gesture — one crossing intent per push
+    latched: [bool; 4],
     /// timestamp of the previous update, for gesture-gap detection
     last_update: Option<Instant>,
+    /// most recent detector fire (side index, at, effort-armed) — consumed by
+    /// [`Self::on_session_destroyed`] to recognize our-fire-caused crossings.
+    /// `effort-armed` means the fire followed an abandoned near-miss; the
+    /// effort discount commits only if the teardown confirms it crossed.
+    last_fire: Option<(usize, Instant, bool)>,
+    /// a fire that verifiably crossed — the handle was destroyed right after
+    /// it: (side index, destroyed at). Deliberately survives the teardown.
+    last_cross: Option<(usize, Instant)>,
+    /// a regret raise awaiting commit: (side index, returned at). Discarded
+    /// by a same-side fire inside the bounce window; committed after it.
+    pending_regret: Option<(usize, Instant)>,
+    /// abandoned near-miss push: (side index, abandoned at)
+    last_attempt: Option<(usize, Instant)>,
     /// cached desktop-union bounds: (xmin, xmax, ymin, ymax, computed_at)
     union: Option<(f64, f64, f64, f64, Instant)>,
 }
@@ -1152,10 +1222,14 @@ struct EdgePressureDetector {
 /// resets all pressure — deliberateness is *sustained* contact, drift-and-rest
 /// never accumulates across pauses.
 const EDGE_GESTURE_GAP_MS: f64 = 200.0;
-/// Default blocked-motion threshold (px of outward push within one gesture).
-/// Tunable via `HOPS_EDGE_THRESHOLD` while we gather real-world numbers for
-/// the rung-2 self-tuning layer.
+/// Default starting threshold (px of blocked outward push within one gesture).
+/// Rung 2 adjusts it per edge from there; `HOPS_EDGE_THRESHOLD` overrides the
+/// starting point.
 const DEFAULT_EDGE_THRESHOLD: f64 = 60.0;
+/// Learned-threshold bounds: the floor keeps effort-lowering from making an
+/// edge hair-trigger, the ceiling keeps regret-raising from walling it off.
+const EDGE_THRESHOLD_MIN: f64 = 24.0;
+const EDGE_THRESHOLD_MAX: f64 = 240.0;
 /// Inward motion (px) on a side's axis that counts as "deliberately moving
 /// away" — resets that side immediately. Set well above hand wobble (a few px)
 /// so a shaky push doesn't self-cancel.
@@ -1167,6 +1241,26 @@ const EDGE_UNION_CACHE: Duration = Duration::from_secs(1);
 /// Slack when testing whether the clamped coordinate sits on the union edge
 /// (the clamp lands at `max - 1` on max sides and `min` on min sides).
 const EDGE_UNION_TOLERANCE: f64 = 1.5;
+/// A session teardown within this long of our fire means that fire crossed
+/// (the peer's Leave-back destroys the handle a few ms after a real
+/// crossing; clientless-edge fires never tear the session down).
+const EDGE_CROSS_CONFIRM_MS: f64 = 500.0;
+/// Regret: re-entering within this long of the crossing means the user
+/// barely stayed. Overlaps deliberate-bounce timing by nature — that's what
+/// the deferred commit + bounce discard below are for.
+const EDGE_REGRET_WINDOW_MS: f64 = 800.0;
+/// A same-edge fire within this long of the return means deliberate
+/// bouncing: the pending raise is discarded. Only after this window does a
+/// pending raise commit.
+const EDGE_BOUNCE_CANCEL_MS: f64 = 1500.0;
+/// An abandoned near-miss push followed by a fire on the same edge within
+/// this long (measured from the ABANDON) means the threshold made the user
+/// work for the crossing — lower it.
+const EDGE_EFFORT_WINDOW_MS: f64 = 2000.0;
+/// Threshold adjustment factors: regret raises ×1.25, effort lowers ×0.85.
+/// Multiplicative so repeated signals converge smoothly.
+const EDGE_REGRET_FACTOR: f64 = 1.25;
+const EDGE_EFFORT_FACTOR: f64 = 0.85;
 
 const EDGE_SIDES: [EdgeSide; 4] = [
     EdgeSide::Left,
@@ -1177,30 +1271,39 @@ const EDGE_SIDES: [EdgeSide; 4] = [
 
 impl EdgePressureDetector {
     fn from_env() -> Self {
-        let enabled = match std::env::var("HOPS_ADAPTIVE_EDGE") {
-            Ok(v) => !matches!(
-                v.to_ascii_lowercase().as_str(),
-                "off" | "0" | "false" | "no" | "disabled"
-            ),
-            Err(_) => true,
+        let off = |v: Result<String, std::env::VarError>| {
+            matches!(
+                v.as_deref().map(|s| s.to_ascii_lowercase()).as_deref(),
+                Ok("off") | Ok("0") | Ok("false") | Ok("no") | Ok("disabled")
+            )
         };
-        let threshold = std::env::var("HOPS_EDGE_THRESHOLD")
+        let enabled = !off(std::env::var("HOPS_ADAPTIVE_EDGE"));
+        let learn = !off(std::env::var("HOPS_EDGE_LEARN"));
+        let base = std::env::var("HOPS_EDGE_THRESHOLD")
             .ok()
             .and_then(|s| s.parse::<f64>().ok())
             .filter(|t| *t > 0.0)
-            .unwrap_or(DEFAULT_EDGE_THRESHOLD);
+            .unwrap_or(DEFAULT_EDGE_THRESHOLD)
+            .clamp(EDGE_THRESHOLD_MIN, EDGE_THRESHOLD_MAX);
         if enabled {
             log::info!(
-                "adaptive edge crossing enabled (threshold {threshold}px; HOPS_ADAPTIVE_EDGE=off to disable)"
+                "adaptive edge crossing enabled (threshold {base}px, self-tuning {}; HOPS_ADAPTIVE_EDGE=off / HOPS_EDGE_LEARN=off to disable)",
+                if learn { "on" } else { "off" }
             );
         } else {
             log::info!("adaptive edge crossing DISABLED (HOPS_ADAPTIVE_EDGE)");
         }
         Self {
             enabled,
-            threshold,
+            learn,
+            threshold: [base; 4],
             pressure: [0.0; 4],
+            latched: [false; 4],
             last_update: None,
+            last_fire: None,
+            last_cross: None,
+            pending_regret: None,
+            last_attempt: None,
             union: None,
         }
     }
@@ -1208,7 +1311,7 @@ impl EdgePressureDetector {
     /// Feed one motion event: `(dx, dy)` is the requested delta, `(blocked_x,
     /// blocked_y)` the part the clamp discarded, `(clamped_x, clamped_y)` the
     /// position the cursor was actually placed at. Returns the edge to cross
-    /// when a side's pressure exceeds the threshold.
+    /// when a side's pressure exceeds its threshold.
     fn update(
         &mut self,
         dx: f64,
@@ -1222,14 +1325,36 @@ impl EdgePressureDetector {
             return None;
         }
 
-        // a pause ends the gesture — pressure is per continuous push
         let now = Instant::now();
         if let Some(prev) = self.last_update {
-            if now.duration_since(prev).as_secs_f64() * 1000.0 > EDGE_GESTURE_GAP_MS {
+            let gap_ms = now.duration_since(prev).as_secs_f64() * 1000.0;
+            if gap_ms > EDGE_GESTURE_GAP_MS {
+                // the gesture ended during the silence — effort bookkeeping
+                // reads the stale pressure, then start fresh
+                self.on_gesture_end(now, gap_ms);
                 self.pressure = [0.0; 4];
+                self.latched = [false; 4];
             }
         }
         self.last_update = Some(now);
+
+        // a pending regret raise commits once the bounce window has passed
+        // without a same-edge fire (checked cheaply on every event)
+        if let Some((i, t)) = self.pending_regret {
+            if now.duration_since(t).as_secs_f64() * 1000.0 > EDGE_BOUNCE_CANCEL_MS {
+                self.pending_regret = None;
+                if self.learn {
+                    let old = self.threshold[i];
+                    self.threshold[i] = (old * EDGE_REGRET_FACTOR).min(EDGE_THRESHOLD_MAX);
+                    log::info!(
+                        "edge learning: {:?} crossing looked accidental — threshold {:.0} -> {:.0}px",
+                        EDGE_SIDES[i],
+                        old,
+                        self.threshold[i]
+                    );
+                }
+            }
+        }
 
         // warp-artifact guard: real clamping never discards more than was
         // asked for; a larger (or sign-flipped) "blocked" means the cursor
@@ -1250,19 +1375,23 @@ impl EdgePressureDetector {
             0.0
         };
 
-        // inward motion is explicit intent to stay on this screen: reset the
-        // side(s) being moved away from
+        // inward motion is explicit intent to stay on this screen: reset (and
+        // unlatch) the side(s) being moved away from
         if dx > EDGE_INWARD_RESET {
             self.pressure[0] = 0.0; // away from Left
+            self.latched[0] = false;
         }
         if dx < -EDGE_INWARD_RESET {
             self.pressure[1] = 0.0; // away from Right
+            self.latched[1] = false;
         }
         if dy > EDGE_INWARD_RESET {
             self.pressure[2] = 0.0; // away from Top (CG +y is down)
+            self.latched[2] = false;
         }
         if dy < -EDGE_INWARD_RESET {
             self.pressure[3] = 0.0; // away from Bottom
+            self.latched[3] = false;
         }
 
         // union gate: only count blocked motion when the cursor is pinned on
@@ -1271,47 +1400,208 @@ impl EdgePressureDetector {
         // barrier likewise only exists at the union edge).
         if bx != 0.0 || by != 0.0 {
             let (uxmin, uxmax, uymin, uymax) = self.union_bounds(now)?;
-            let cap = self.threshold / 2.0;
-            if bx < 0.0 && (clamped_x - uxmin).abs() <= EDGE_UNION_TOLERANCE {
-                self.pressure[0] += bx.abs().min(cap);
+            if !self.latched[0] && bx < 0.0 && (clamped_x - uxmin).abs() <= EDGE_UNION_TOLERANCE {
+                self.pressure[0] += bx.abs().min(self.threshold[0] / 2.0);
             }
-            if bx > 0.0 && (clamped_x - (uxmax - 1.0)).abs() <= EDGE_UNION_TOLERANCE {
-                self.pressure[1] += bx.abs().min(cap);
+            if !self.latched[1]
+                && bx > 0.0
+                && (clamped_x - (uxmax - 1.0)).abs() <= EDGE_UNION_TOLERANCE
+            {
+                self.pressure[1] += bx.abs().min(self.threshold[1] / 2.0);
             }
-            if by < 0.0 && (clamped_y - uymin).abs() <= EDGE_UNION_TOLERANCE {
-                self.pressure[2] += by.abs().min(cap);
+            if !self.latched[2] && by < 0.0 && (clamped_y - uymin).abs() <= EDGE_UNION_TOLERANCE {
+                self.pressure[2] += by.abs().min(self.threshold[2] / 2.0);
             }
-            if by > 0.0 && (clamped_y - (uymax - 1.0)).abs() <= EDGE_UNION_TOLERANCE {
-                self.pressure[3] += by.abs().min(cap);
+            if !self.latched[3]
+                && by > 0.0
+                && (clamped_y - (uymax - 1.0)).abs() <= EDGE_UNION_TOLERANCE
+            {
+                self.pressure[3] += by.abs().min(self.threshold[3] / 2.0);
             }
             log::trace!(
-                "edge pressure [L/R/T/B]: {:.0}/{:.0}/{:.0}/{:.0} of {:.0}px",
+                "edge pressure [L/R/T/B]: {:.0}/{:.0}/{:.0}/{:.0} of {:.0}/{:.0}/{:.0}/{:.0}px",
                 self.pressure[0],
                 self.pressure[1],
                 self.pressure[2],
                 self.pressure[3],
-                self.threshold
+                self.threshold[0],
+                self.threshold[1],
+                self.threshold[2],
+                self.threshold[3]
             );
         }
 
-        // fire the strongest side past the threshold, if any
-        let mut best: Option<(EdgeSide, f64)> = None;
-        for (i, side) in EDGE_SIDES.iter().enumerate() {
-            if self.pressure[i] >= self.threshold
+        // fire the strongest unlatched side past its threshold, if any
+        let mut best: Option<(usize, f64)> = None;
+        for i in 0..4 {
+            if !self.latched[i]
+                && self.pressure[i] >= self.threshold[i]
                 && best.is_none_or(|(_, p)| self.pressure[i] > p)
             {
-                best = Some((*side, self.pressure[i]));
+                best = Some((i, self.pressure[i]));
             }
         }
-        if let Some((side, p)) = best {
+        if let Some((i, p)) = best {
+            // a crossing already in flight? A corner push pins two edges at
+            // once; if we fired one side and its Leave round-trip hasn't torn
+            // the session down yet, a second side firing here would
+            // misattribute the crossing (and emit a spurious EdgePushed the
+            // service drops). Hold until the in-flight fire resolves — a real
+            // crossing's teardown clears last_fire within the confirm window.
+            let in_flight = self.last_fire.is_some_and(|(_, t, _)| {
+                now.duration_since(t).as_secs_f64() * 1000.0 <= EDGE_CROSS_CONFIRM_MS
+            });
+            if in_flight {
+                return None;
+            }
+            let side = EDGE_SIDES[i];
             log::info!(
                 "adaptive edge: deliberate push past {side:?} edge ({p:.0}px >= {:.0}px)",
-                self.threshold
+                self.threshold[i]
             );
-            self.reset();
+            // latch: one crossing intent per push
+            self.latched[i] = true;
+            self.pressure[i] = 0.0;
+            // learning is armed at fire time but only COMMITTED once the
+            // teardown confirms the fire actually crossed (a clientless-edge
+            // fire never destroys the handle, so it never teaches)
+            let effort_armed = if self.learn { self.on_fire(i, now) } else { false };
+            self.last_fire = Some((i, now, effort_armed));
             return Some(side);
         }
         None
+    }
+
+    /// Effort bookkeeping when a gesture ends (observed at the first event
+    /// after the silence): the side with the strongest near-miss — pressure
+    /// at >= half its threshold — becomes an abandoned attempt, stamped at
+    /// the ABANDON time (`now - gap`), so an old near-miss can't discount a
+    /// much later crossing.
+    fn on_gesture_end(&mut self, now: Instant, gap_ms: f64) {
+        let mut best: Option<(usize, f64)> = None;
+        for i in 0..4 {
+            let ratio = self.pressure[i] / self.threshold[i];
+            if !self.latched[i]
+                && ratio >= 0.5
+                && best.is_none_or(|(_, r)| ratio > r)
+            {
+                best = Some((i, ratio));
+            }
+        }
+        if let Some((i, _)) = best {
+            let abandoned_at = now
+                .checked_sub(Duration::from_secs_f64(gap_ms / 1000.0))
+                .unwrap_or(now);
+            self.last_attempt = Some((i, abandoned_at));
+        }
+    }
+
+    /// Learning at fire time (only called when `learn` is on). At most one
+    /// signal applies per fire: a bounce-discard consumes the fire's learning
+    /// budget; effort applies only otherwise.
+    /// Learning at fire time (only called when `learn` is on). Returns whether
+    /// an effort discount is ARMED — applied later only on a confirmed
+    /// crossing. At most one signal per fire: a bounce-discard consumes the
+    /// fire's learning budget; effort arms only otherwise.
+    fn on_fire(&mut self, i: usize, now: Instant) -> bool {
+        // deliberate bounce: the user came back and immediately pushed
+        // through again — the pending "regret" raise was wrong, drop it
+        if let Some((ri, t_r)) = self.pending_regret {
+            if ri == i && now.duration_since(t_r).as_secs_f64() * 1000.0 <= EDGE_BOUNCE_CANCEL_MS {
+                log::info!(
+                    "edge learning: {:?} was a deliberate bounce — no threshold change",
+                    EDGE_SIDES[i]
+                );
+                self.pending_regret = None;
+                return false;
+            }
+        }
+        // effort: this fire follows an abandoned near-miss on the same edge —
+        // arm the discount; it commits only if the fire actually crosses
+        if let Some((ai, t_a)) = self.last_attempt {
+            if ai == i && now.duration_since(t_a).as_secs_f64() * 1000.0 <= EDGE_EFFORT_WINDOW_MS {
+                self.last_attempt = None;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The emulation session for a peer was torn down. A teardown moments
+    /// after our fire means that fire verifiably CROSSED (the peer's
+    /// Leave-back destroys the handle); remember it so the re-entry timing
+    /// can be judged. Everything gesture-scoped resets.
+    fn on_session_destroyed(&mut self) {
+        let now = Instant::now();
+        if let Some((i, t_fire, effort_armed)) = self.last_fire.take() {
+            if now.duration_since(t_fire).as_secs_f64() * 1000.0 <= EDGE_CROSS_CONFIRM_MS {
+                self.last_cross = Some((i, now));
+                // effort discount commits only now that the crossing is
+                // confirmed — a clientless-edge fire never reaches here, so it
+                // can't ratchet a dead edge to the floor
+                if self.learn && effort_armed {
+                    let old = self.threshold[i];
+                    self.threshold[i] = (old * EDGE_EFFORT_FACTOR).max(EDGE_THRESHOLD_MIN);
+                    log::info!(
+                        "edge learning: {:?} took repeated pushes — threshold {:.0} -> {:.0}px",
+                        EDGE_SIDES[i],
+                        old,
+                        self.threshold[i]
+                    );
+                }
+            }
+        }
+        // Resolve any pending regret at the teardown: a crossing this soon
+        // after the return is bouncing — whichever barrier detected it (the
+        // fire-time discard only sees OUR fires; a crossing won by the
+        // redundant position barrier would otherwise slip past and let the
+        // raise commit). Past the window, commit rather than silently drop.
+        if let Some((i, t_r)) = self.pending_regret.take() {
+            if now.duration_since(t_r).as_secs_f64() * 1000.0 <= EDGE_BOUNCE_CANCEL_MS {
+                log::info!(
+                    "edge learning: {:?} was a deliberate bounce — no threshold change",
+                    EDGE_SIDES[i]
+                );
+            } else if self.learn {
+                let old = self.threshold[i];
+                self.threshold[i] = (old * EDGE_REGRET_FACTOR).min(EDGE_THRESHOLD_MAX);
+                log::info!(
+                    "edge learning: {:?} crossing looked accidental — threshold {:.0} -> {:.0}px",
+                    EDGE_SIDES[i],
+                    old,
+                    self.threshold[i]
+                );
+            }
+        }
+        self.pressure = [0.0; 4];
+        self.latched = [false; 4];
+        self.last_update = None;
+        self.last_attempt = None;
+    }
+
+    /// A peer session (re)started — first input after an entry. Re-entering
+    /// shortly after a confirmed crossing means the user barely stayed:
+    /// record a tentative regret raise (committed later unless a same-edge
+    /// fire reveals deliberate bouncing).
+    fn on_session_created(&mut self) {
+        let now = Instant::now();
+        self.pressure = [0.0; 4];
+        self.latched = [false; 4];
+        self.last_update = None;
+        self.last_fire = None;
+        self.last_attempt = None;
+        if let Some((i, t_cross)) = self.last_cross.take() {
+            let away_ms = now.duration_since(t_cross).as_secs_f64() * 1000.0;
+            if self.learn && away_ms <= EDGE_REGRET_WINDOW_MS {
+                log::info!(
+                    "edge learning: returned from {:?} crossing in {:.0}ms — tentative regret (commits in {:.1}s unless bounced)",
+                    EDGE_SIDES[i],
+                    away_ms,
+                    EDGE_BOUNCE_CANCEL_MS / 1000.0
+                );
+                self.pending_regret = Some((i, now));
+            }
+        }
     }
 
     /// Desktop-union bounds, cached for [`EDGE_UNION_CACHE`]. `None` when no
@@ -1339,9 +1629,12 @@ impl EdgePressureDetector {
         Some((xmin, xmax, ymin, ymax))
     }
 
-    /// Zero all pressure (keeps the union cache — geometry didn't change).
+    /// Zero pressure and latches (keeps the union cache and all learning
+    /// state). Called per drag event by the button guard, so it must stay
+    /// cheap.
     fn reset(&mut self) {
         self.pressure = [0.0; 4];
+        self.latched = [false; 4];
     }
 }
 
@@ -1740,9 +2033,10 @@ impl Emulation for MacOSEmulation {
     }
 
     async fn create(&mut self, _handle: EmulationHandle) {
-        // fresh session, fresh intent: no pressure or pending push may carry
-        // over from a previous peer/session
-        self.edge_pressure.reset();
+        // a peer session (re)started — regret bookkeeping lives here: a fast
+        // return after a confirmed crossing is the "I didn't mean to leave"
+        // signal (learned thresholds survive across sessions)
+        self.edge_pressure.on_session_created();
         self.pending_edge_push = None;
     }
 
@@ -1754,8 +2048,9 @@ impl Emulation for MacOSEmulation {
         // Also clear modifier state so no stale modifier is applied afterwards.
         self.cancel_repeat_task().await;
         self.modifier_state.set(XMods::empty());
-        // drop any accumulated edge intent with the session
-        self.edge_pressure.reset();
+        // session teardown: if it follows our fire, that fire verifiably
+        // crossed — remember it so the re-entry timing can be judged
+        self.edge_pressure.on_session_destroyed();
         self.pending_edge_push = None;
     }
 
