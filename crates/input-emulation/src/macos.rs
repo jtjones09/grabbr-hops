@@ -18,6 +18,7 @@ use keycode::{KeyMap, KeyMapping};
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::os::raw::{c_char, c_void};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1216,6 +1217,9 @@ struct EdgePressureDetector {
     last_attempt: Option<(usize, Instant)>,
     /// cached desktop-union bounds: (xmin, xmax, ymin, ymax, computed_at)
     union: Option<(f64, f64, f64, f64, Instant)>,
+    /// where learned thresholds persist across daemon restarts. `None` = don't
+    /// persist (no HOME, or `HOPS_EDGE_THRESHOLD` forced an ephemeral A/B value).
+    state_path: Option<PathBuf>,
 }
 
 /// A pause longer than this (no motion events) ends the push gesture and
@@ -1268,6 +1272,57 @@ const EDGE_SIDES: [EdgeSide; 4] = [
     EdgeSide::Top,
     EdgeSide::Bottom,
 ];
+/// Persisted-thresholds filename, inside the frozen hops state dir.
+const EDGE_STATE_FILE: &str = "edge-thresholds.conf";
+
+/// Path to the persisted learned thresholds. Mirrors the rest of hops'
+/// state-dir convention (`$XDG_CONFIG_HOME` or `~/.config`, then `/lan-mouse/`
+/// — see src/config.rs `default_path`). `None` if there's no home to anchor to.
+fn edge_state_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("lan-mouse").join(EDGE_STATE_FILE))
+}
+
+/// Serialize the per-side thresholds to the tiny `key = value` file format.
+fn format_edge_thresholds(t: &[f64; 4]) -> String {
+    format!(
+        "# hops adaptive edge crossing — learned per-edge cross thresholds (px).\n\
+         # Auto-managed; delete this file to reset learning.\n\
+         left = {:.0}\nright = {:.0}\ntop = {:.0}\nbottom = {:.0}\n",
+        t[0], t[1], t[2], t[3]
+    )
+}
+
+/// Load per-side thresholds `[L, R, T, B]` from `path`. Every value is clamped
+/// to `[MIN, MAX]`; any missing/blank/garbage line falls back to the default,
+/// so a hand-edited or partial file can never produce an unusable threshold.
+fn load_edge_thresholds(path: Option<&Path>) -> [f64; 4] {
+    let mut t = [DEFAULT_EDGE_THRESHOLD; 4];
+    let Some(path) = path else { return t };
+    let Ok(contents) = std::fs::read_to_string(path) else { return t };
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else { continue };
+        let Ok(val) = v.trim().parse::<f64>() else { continue };
+        if !val.is_finite() {
+            continue;
+        }
+        let val = val.clamp(EDGE_THRESHOLD_MIN, EDGE_THRESHOLD_MAX);
+        match k.trim().to_ascii_lowercase().as_str() {
+            "left" => t[0] = val,
+            "right" => t[1] = val,
+            "top" => t[2] = val,
+            "bottom" => t[3] = val,
+            _ => {}
+        }
+    }
+    t
+}
 
 impl EdgePressureDetector {
     fn from_env() -> Self {
@@ -1279,16 +1334,27 @@ impl EdgePressureDetector {
         };
         let enabled = !off(std::env::var("HOPS_ADAPTIVE_EDGE"));
         let learn = !off(std::env::var("HOPS_EDGE_LEARN"));
-        let base = std::env::var("HOPS_EDGE_THRESHOLD")
+        // HOPS_EDGE_THRESHOLD forces a uniform starting value for A/B testing —
+        // ephemeral: it neither reads nor writes the persisted file. Otherwise
+        // load the per-edge learned thresholds (or the default per edge).
+        let env_forced = std::env::var("HOPS_EDGE_THRESHOLD")
             .ok()
             .and_then(|s| s.parse::<f64>().ok())
             .filter(|t| *t > 0.0)
-            .unwrap_or(DEFAULT_EDGE_THRESHOLD)
-            .clamp(EDGE_THRESHOLD_MIN, EDGE_THRESHOLD_MAX);
+            .map(|t| t.clamp(EDGE_THRESHOLD_MIN, EDGE_THRESHOLD_MAX));
+        let (threshold, state_path) = match env_forced {
+            Some(t) => ([t; 4], None),
+            None => {
+                let p = edge_state_path();
+                (load_edge_thresholds(p.as_deref()), p)
+            }
+        };
         if enabled {
             log::info!(
-                "adaptive edge crossing enabled (threshold {base}px, self-tuning {}; HOPS_ADAPTIVE_EDGE=off / HOPS_EDGE_LEARN=off to disable)",
-                if learn { "on" } else { "off" }
+                "adaptive edge crossing enabled (self-tuning {}; thresholds L/R/T/B = {:.0}/{:.0}/{:.0}/{:.0}px, {}; HOPS_ADAPTIVE_EDGE=off / HOPS_EDGE_LEARN=off to disable)",
+                if learn { "on" } else { "off" },
+                threshold[0], threshold[1], threshold[2], threshold[3],
+                if state_path.is_some() { "persisted" } else { "env-forced, not persisted" }
             );
         } else {
             log::info!("adaptive edge crossing DISABLED (HOPS_ADAPTIVE_EDGE)");
@@ -1296,7 +1362,7 @@ impl EdgePressureDetector {
         Self {
             enabled,
             learn,
-            threshold: [base; 4],
+            threshold,
             pressure: [0.0; 4],
             latched: [false; 4],
             last_update: None,
@@ -1305,6 +1371,26 @@ impl EdgePressureDetector {
             pending_regret: None,
             last_attempt: None,
             union: None,
+            state_path,
+        }
+    }
+
+    /// Set a side's threshold (clamped) and persist the table. The single
+    /// mutation point for `threshold`, so every learned change is saved.
+    fn set_threshold(&mut self, i: usize, value: f64) {
+        self.threshold[i] = value.clamp(EDGE_THRESHOLD_MIN, EDGE_THRESHOLD_MAX);
+        self.save();
+    }
+
+    /// Persist the learned thresholds (no-op when not persisting). Called only
+    /// on the rare learning events, never on the per-motion hot path.
+    fn save(&self) {
+        let Some(path) = self.state_path.as_deref() else { return };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Err(e) = std::fs::write(path, format_edge_thresholds(&self.threshold)) {
+            log::warn!("could not persist edge thresholds to {}: {e}", path.display());
         }
     }
 
@@ -1345,7 +1431,7 @@ impl EdgePressureDetector {
                 self.pending_regret = None;
                 if self.learn {
                     let old = self.threshold[i];
-                    self.threshold[i] = (old * EDGE_REGRET_FACTOR).min(EDGE_THRESHOLD_MAX);
+                    self.set_threshold(i, old * EDGE_REGRET_FACTOR);
                     log::info!(
                         "edge learning: {:?} crossing looked accidental — threshold {:.0} -> {:.0}px",
                         EDGE_SIDES[i],
@@ -1541,7 +1627,7 @@ impl EdgePressureDetector {
                 // can't ratchet a dead edge to the floor
                 if self.learn && effort_armed {
                     let old = self.threshold[i];
-                    self.threshold[i] = (old * EDGE_EFFORT_FACTOR).max(EDGE_THRESHOLD_MIN);
+                    self.set_threshold(i, old * EDGE_EFFORT_FACTOR);
                     log::info!(
                         "edge learning: {:?} took repeated pushes — threshold {:.0} -> {:.0}px",
                         EDGE_SIDES[i],
@@ -1564,7 +1650,7 @@ impl EdgePressureDetector {
                 );
             } else if self.learn {
                 let old = self.threshold[i];
-                self.threshold[i] = (old * EDGE_REGRET_FACTOR).min(EDGE_THRESHOLD_MAX);
+                self.set_threshold(i, old * EDGE_REGRET_FACTOR);
                 log::info!(
                     "edge learning: {:?} crossing looked accidental — threshold {:.0} -> {:.0}px",
                     EDGE_SIDES[i],
@@ -2159,6 +2245,40 @@ bitflags! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edge_thresholds_round_trip_and_are_robust() {
+        let dir = std::env::temp_dir().join(format!("hops-edge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(EDGE_STATE_FILE);
+
+        // format -> load round-trips exactly for in-range values
+        let orig = [30.0, 100.0, 60.0, 88.0];
+        std::fs::write(&path, format_edge_thresholds(&orig)).unwrap();
+        assert_eq!(load_edge_thresholds(Some(&path)), orig);
+
+        // out-of-range clamps; blank/comment/garbage/unparseable lines are
+        // skipped (falling back to default or the last valid value)
+        std::fs::write(
+            &path,
+            "# comment\n\nleft = 5\nright = 999\ntop = notanumber\nbogus line\nbottom = 88\n",
+        )
+        .unwrap();
+        let t = load_edge_thresholds(Some(&path));
+        assert_eq!(t[0], EDGE_THRESHOLD_MIN); // 5 clamped up to floor
+        assert_eq!(t[1], EDGE_THRESHOLD_MAX); // 999 clamped down to ceiling
+        assert_eq!(t[2], DEFAULT_EDGE_THRESHOLD); // unparseable -> default
+        assert_eq!(t[3], 88.0);
+
+        // missing file and no path both yield all-defaults
+        assert_eq!(
+            load_edge_thresholds(Some(&dir.join("nope.conf"))),
+            [DEFAULT_EDGE_THRESHOLD; 4]
+        );
+        assert_eq!(load_edge_thresholds(None), [DEFAULT_EDGE_THRESHOLD; 4]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn hypervisor_path_matches_known_apps_only() {
