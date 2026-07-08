@@ -280,21 +280,18 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
 
     let ui = AppWindow::new()?;
 
-    // Open the window at a sane size. app.slint deliberately omits
-    // preferred-height (it sizes to content), but an auto-sized window can open
-    // COLLAPSED to just the titlebar when it's shown before its first layout
-    // settles — min-height isn't applied to that initial winit size (seen in
-    // the wild via the tray "Open hops" path; a manual resize fixed it). Assert
-    // a size only when the window is collapsed/unsized, so a size the user chose
-    // survives a reopen; min-width/height still bound resizing.
+    // Fixed-size window (min == max in app.slint). Force the exact size on the
+    // Rust side too — winit can otherwise realize the window at a stale/default
+    // frame for a beat before Slint's constraints apply, which flashes as a
+    // wide/collapsed titlebar on open (reported repeatedly). Assert it at
+    // CREATION, before the window is ever shown, and again on every show,
+    // UNCONDITIONALLY — the window can't be resized, so there is never a user
+    // size to preserve.
+    ui.window()
+        .set_size(slint::LogicalSize::new(560.0, 690.0));
     fn show_app_window(ui: &AppWindow) -> Result<(), slint::PlatformError> {
-        // titlebar-only is ~tens of px tall at any DPI; a laid-out window is
-        // always hundreds (min-height 360). 100 physical px cleanly separates
-        // "collapsed / never shown" from "a real size".
-        if ui.window().size().height < 100 {
-            ui.window()
-                .set_size(slint::LogicalSize::new(560.0, 690.0));
-        }
+        ui.window()
+            .set_size(slint::LogicalSize::new(560.0, 690.0));
         ui.show()
     }
 
