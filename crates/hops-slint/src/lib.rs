@@ -280,13 +280,13 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
 
     let ui = AppWindow::new()?;
 
-    // Fixed-size window (min == max in app.slint). Force the exact size on the
-    // Rust side too — winit can otherwise realize the window at a stale/default
-    // frame for a beat before Slint's constraints apply, which flashes as a
-    // wide/collapsed titlebar on open (reported repeatedly). Assert it at
-    // CREATION, before the window is ever shown, and again on every show,
-    // UNCONDITIONALLY — the window can't be resized, so there is never a user
-    // size to preserve.
+    // Force the opening size to 560x690. preferred-width/height in app.slint
+    // aren't enough alone: the ScrollView lets the window shrink to a tiny
+    // content-min (~400x255 observed), so set the size explicitly. This is
+    // SAFE only because the size is no longer locked with min==max — that
+    // constant-folds the size property and set_size (or any winit resize)
+    // panics "Constant property being changed" and aborts. A plain resizable
+    // window's size property is mutable. Set at creation and on every show.
     ui.window()
         .set_size(slint::LogicalSize::new(560.0, 690.0));
     fn show_app_window(ui: &AppWindow) -> Result<(), slint::PlatformError> {
@@ -704,8 +704,8 @@ pub fn run_onboarding() -> Result<Option<hops_frontend_core::prefs::Frontend>, S
         });
     }
 
-    // Assert the fixed size before showing, same collapse guard as the main
-    // window (an auto-sized window can open collapsed before layout settles).
+    // Force the opening size (preferred alone isn't reliable — see the main
+    // window's note); safe because onboarding.slint no longer min==max-locks it.
     ui.window()
         .set_size(slint::LogicalSize::new(580.0, 470.0));
     ui.run()?;

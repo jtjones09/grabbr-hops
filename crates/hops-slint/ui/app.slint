@@ -37,18 +37,17 @@ export component AppWindow inherits Window {
     title: "hops";
     default-font-family: Type.sans;
     default-font-size: Type.body;
-    // Fixed-size control panel — non-resizable, like Shottr / CleanShot /
-    // Synergy settings (a KVM control surface is all settings, never a canvas
-    // you drag-resize). min == max == preferred locks the frame, so it can
-    // neither be resized nor auto-collapse to the titlebar; the device/trusted
-    // lists SCROLL within it (ScrollView below) so any machine count fits.
-    // Rust also asserts this size on show (show_app_window) as belt-and-braces.
+    // Fixed opening size (560x690) via preferred-* ONLY. Do NOT lock it with
+    // min == max: that constant-folds the window's size property, and then any
+    // runtime size change (a winit resize/DPI event) panics "Constant property
+    // being changed" in i-slint-core and ABORTS the process (release is
+    // panic=abort) — the window "vanishes". preferred-height (vs the old
+    // content-hug with no preferred-height) is what stops the collapse; the
+    // device/trusted lists SCROLL within it (ScrollView below) so any machine
+    // count fits. True non-resizability, if wanted, must come from the winit
+    // backend accessor, never a Slint min==max property lock.
     preferred-width: 560px;
     preferred-height: 690px;
-    min-width: 560px;
-    max-width: 560px;
-    min-height: 690px;
-    max-height: 690px;
     background: Theme.c.background;
 
     in property <bool> connected: false;
