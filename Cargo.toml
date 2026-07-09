@@ -15,7 +15,7 @@ members = [
 [package]
 name = "hops"
 description = "Software KVM Switch / mouse & keyboard sharing software for Local Area Networks"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2021"
 autobins = false
 license = "GPL-3.0-or-later"
