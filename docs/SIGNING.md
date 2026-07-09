@@ -52,20 +52,26 @@ DEVELOPER_ID="Developer ID Application: … (TEAMID)" NOTARY_PROFILE=hops-notary
 
 ## In CI (GitHub Actions)
 
-To sign release builds automatically, add these repo **secrets** and wire them
-into `release.yml` (at the `TODO(signing)` markers — the mechanical step):
+`release.yml` **already signs + notarizes the macOS `.dmg`** — you just add these
+repo **secrets** (Settings → Secrets and variables → Actions). With them set, a
+tagged release produces a signed, notarized `hops-macos-universal.dmg`; without
+them (e.g. on a fork) those steps are skipped and only the unsigned `.tar.gz` is
+built, so the workflow never fails for lack of credentials.
 
 | secret | what |
 | --- | --- |
 | `MACOS_CERT_P12` | the Developer ID cert exported from Keychain as `.p12`, base64-encoded (`base64 -i cert.p12`) |
 | `MACOS_CERT_PASSWORD` | the password you set when exporting the `.p12` |
-| `MACOS_NOTARY_KEY` | the `.p8` contents, base64-encoded |
+| `MACOS_DEVELOPER_ID` | the identity string, e.g. `Developer ID Application: Jane Doe (AB12CD34EF)` |
+| `MACOS_NOTARY_KEY` | the `.p8` contents, base64-encoded (`base64 -i AuthKey_XXXX.p8`) |
 | `MACOS_NOTARY_KEY_ID` | the Key ID |
 | `MACOS_NOTARY_ISSUER` | the Issuer ID |
 
 The workflow imports the cert into a temporary keychain
 ([Apple-Actions/import-codesign-certs](https://github.com/Apple-Actions/import-codesign-certs)),
-then runs `package-macos.sh` + `sign-macos.sh` with those values.
+decodes the `.p8` to a temp file, then runs `package-macos.sh` + `sign-macos.sh`
+on the universal binary. `sign-macos.sh` signs in a private temp workspace, so it
+also works locally from an iCloud-synced checkout (no `xattr` dance needed).
 
 ## Notes
 

@@ -53,13 +53,14 @@ you want to share the keyboard & mouse across.
 
 | OS | File |
 | --- | --- |
-| macOS (Intel + Apple Silicon) | `hops-macos-universal.tar.gz` |
+| macOS (Intel + Apple Silicon) | `hops-macos-universal.dmg` — open it, drag **hops** to Applications |
+| macOS (CLI / headless) | `hops-macos-universal.tar.gz` — just the `hops` binary |
 | Windows | `hops-windows-x86_64.zip` |
 | Linux (terminal UI + daemon) | `hops-linux-x86_64.tar.gz` |
 
-The binaries aren't code-signed yet, so your OS shows a **one-time** warning:
-- **macOS** — right-click the `hops` binary → **Open** (or `xattr -d com.apple.quarantine hops`), then switch **hops** on under System Settings → Privacy & Security → **Accessibility** (it can't move your cursor without it).
-- **Windows** — if SmartScreen appears, click **More info → Run anyway**; allow it on your **private** network if the firewall asks.
+First-launch notes:
+- **macOS** — the `.dmg` is **signed & notarized by Apple**, so it opens with no Gatekeeper warning. On first run, switch **hops** on under System Settings → Privacy & Security → **Accessibility** (it can't move your cursor without it). *(The bare `.tar.gz` CLI binary is unsigned — right-click it → **Open** the first time.)*
+- **Windows** — not code-signed yet, so SmartScreen shows a **one-time** warning: click **More info → Run anyway**, and allow it on your **private** network if the firewall asks.
 
 <details>
 <summary><b>Or build from source</b> (for developers, or the latest <code>main</code>)</summary>

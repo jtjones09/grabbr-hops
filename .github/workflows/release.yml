@@ -4,15 +4,19 @@
 # or run it by hand from the Actions tab ("Run workflow").
 #
 # Produces, per release:
-#   - hops-macos-universal.tar.gz   (Intel + Apple Silicon, GUI build)
+#   - hops-macos-universal.dmg       (Intel + Apple Silicon GUI app — SIGNED +
+#                                     notarized when the macOS signing secrets are
+#                                     configured; see docs/SIGNING.md)
+#   - hops-macos-universal.tar.gz    (the bare universal CLI binary; unsigned)
 #   - hops-windows-x86_64.zip        (GUI build)
 #   - hops-linux-x86_64.tar.gz       (daemon + terminal UI; the Slint GUI on Linux
 #                                     needs desktop libs, so the Linux artifact is
 #                                     TUI-only for a reliable, dependency-light build)
 #
-# The binaries are UNSIGNED. Downloaders get a one-time OS warning
-# (macOS Gatekeeper / Windows SmartScreen) until code-signing is wired in — see
-# the `TODO(signing)` markers below.
+# The macOS .dmg is signed + notarized when the MACOS_* secrets are present (it
+# then opens with no Gatekeeper warning). Without those secrets — e.g. on a fork —
+# the signing steps are skipped and only the unsigned artifacts are produced.
+# Windows signing is still a TODO (see the marker below).
 name: release
 
 on:
@@ -26,6 +30,10 @@ permissions:
 jobs:
   build:
     name: build-${{ matrix.name }}
+    # Surfaced so the macOS signing steps can gate on "are the secrets set?"
+    # (secrets aren't allowed directly in `if:`, but job env is).
+    env:
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
     strategy:
       fail-fast: false
       matrix:
@@ -52,9 +60,33 @@ jobs:
           lipo -create -output dist/hops \
             target/aarch64-apple-darwin/release/hops \
             target/x86_64-apple-darwin/release/hops
-          # TODO(signing): codesign --sign "Developer ID Application: <you>" --options runtime dist/hops
-          #                then notarize via `xcrun notarytool submit` + `stapler`.
+          # bare universal CLI binary (unsigned; for headless / daemon use)
           tar -C dist -czf hops-${{ matrix.name }}.tar.gz hops
+
+      # Sign + notarize a .dmg when the signing secrets are configured
+      # (docs/SIGNING.md). Skipped automatically on forks/PRs without the
+      # secrets — the unsigned .tar.gz above is still produced either way.
+      - name: Import Developer ID certificate (macOS)
+        if: runner.os == 'macOS' && env.MACOS_CERT_P12 != ''
+        uses: apple-actions/import-codesign-certs@v7
+        with:
+          p12-file-base64: ${{ secrets.MACOS_CERT_P12 }}
+          p12-password: ${{ secrets.MACOS_CERT_PASSWORD }}
+
+      - name: Package + sign + notarize macOS .dmg
+        if: runner.os == 'macOS' && env.MACOS_CERT_P12 != ''
+        env:
+          DEVELOPER_ID: ${{ secrets.MACOS_DEVELOPER_ID }}
+          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
+          MACOS_NOTARY_KEY_B64: ${{ secrets.MACOS_NOTARY_KEY }}
+        run: |
+          scripts/package-macos.sh dist/hops "$RUNNER_TEMP/dist"
+          KEYFILE="$RUNNER_TEMP/notary_key.p8"
+          printf '%s' "$MACOS_NOTARY_KEY_B64" | base64 --decode > "$KEYFILE"
+          NOTARY_KEY="$KEYFILE" scripts/sign-macos.sh "$RUNNER_TEMP/dist"
+          rm -f "$KEYFILE"
+          cp "$RUNNER_TEMP/dist/hops-macos.dmg" "hops-${{ matrix.name }}.dmg"
 
       - name: Build (Windows)
         if: runner.os == 'Windows'

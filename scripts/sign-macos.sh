@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
-# Code-sign + notarize + staple hops.app, then produce a stapled .dmg for
-# distribution. Run scripts/package-macos.sh FIRST to build dist/hops.app.
+# Code-sign + notarize + staple hops.app, then produce a notarized+stapled .dmg
+# for distribution. Run scripts/package-macos.sh FIRST to build <out-dir>/hops.app.
 #
 #   [env…] scripts/sign-macos.sh [out-dir]
+#
+# All code-signing happens in a private temp workspace, never in <out-dir>. That
+# matters when the repo lives in an iCloud-synced folder (~/Documents): iCloud's
+# file provider keeps re-adding com.apple.FinderInfo, and codesign then refuses
+# with "resource fork, Finder information, or similar detritus not allowed". By
+# signing in a non-synced workspace and only copying the finished artifacts out,
+# this runs cleanly from anywhere.
 #
 # Requires (from your Apple Developer account — see docs/SIGNING.md):
 #   DEVELOPER_ID   your signing identity, e.g.
@@ -19,8 +26,8 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${1:-$REPO/dist}"
-APP="$OUT/hops.app"
-[ -d "$APP" ] || { echo "no $APP — run scripts/package-macos.sh first" >&2; exit 1; }
+APP_SRC="$OUT/hops.app"
+[ -d "$APP_SRC" ] || { echo "no $APP_SRC — run scripts/package-macos.sh first" >&2; exit 1; }
 : "${DEVELOPER_ID:?set DEVELOPER_ID to your 'Developer ID Application: … (TEAMID)' identity}"
 
 # Resolve notarytool auth from the environment.
@@ -33,7 +40,14 @@ else
     exit 1
 fi
 
-echo "==> Signing with hardened runtime + secure timestamp"
+# Sign in a non-synced workspace so codesign never trips over iCloud xattrs.
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/hops-sign.XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT
+APP="$WORK/hops.app"
+ditto "$APP_SRC" "$APP"
+xattr -cr "$APP"
+
+echo "==> Signing hops.app (hardened runtime + secure timestamp)"
 # Sign the inner Mach-O first, then the bundle (inner → outer). No entitlements:
 # the Slint build links only Apple frameworks (no library-validation issue) and
 # uses no Apple Events / JIT, so the default hardened runtime is sufficient.
@@ -41,29 +55,40 @@ codesign --force --options runtime --timestamp --sign "$DEVELOPER_ID" "$APP/Cont
 codesign --force --options runtime --timestamp --sign "$DEVELOPER_ID" "$APP"
 codesign --verify --strict --verbose=2 "$APP"
 
-echo "==> Notarizing (submit + wait for Apple's verdict)"
-ZIP="$OUT/hops-notarize.zip"
+echo "==> Notarizing hops.app + stapling the ticket (offline verification)"
+ZIP="$WORK/hops-notarize.zip"
 ditto -c -k --keepParent "$APP" "$ZIP"     # notarytool needs a zip/pkg/dmg
 xcrun notarytool submit "$ZIP" "${NOTARY_AUTH[@]}" --wait
 rm -f "$ZIP"
-
-echo "==> Stapling the ticket to hops.app (offline verification)"
 xcrun stapler staple "$APP"
 xcrun stapler validate "$APP"
 
-echo "==> Rebuilding + stapling the .dmg from the stapled app"
-STAGE="$(mktemp -d)"
+echo "==> Building the .dmg from the stapled app, then signing + notarizing IT"
+# The app's notarization does NOT cover the dmg — the dmg needs its own ticket,
+# or `stapler staple <dmg>` fails with error 65. So sign + notarize the dmg too;
+# the result is a stapled dmg that itself contains a stapled app.
+DMG="$WORK/hops-macos.dmg"
+STAGE="$(mktemp -d "$WORK/stage.XXXXXX")"
 cp -R "$APP" "$STAGE/hops.app"
-ln -s /Applications "$STAGE/Applications"
-rm -f "$OUT/hops-macos.dmg"
-hdiutil create -volname "hops" -srcfolder "$STAGE" -ov -format UDZO "$OUT/hops-macos.dmg" >/dev/null
+ln -s /Applications "$STAGE/Applications"   # drag-to-install target
+hdiutil create -volname "hops" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
 rm -rf "$STAGE"
-xcrun stapler staple "$OUT/hops-macos.dmg"
+codesign --force --timestamp --sign "$DEVELOPER_ID" "$DMG"
+xcrun notarytool submit "$DMG" "${NOTARY_AUTH[@]}" --wait
+xcrun stapler staple "$DMG"
+xcrun stapler validate "$DMG"
 
 echo "==> Gatekeeper assessment (expect: accepted / source=Notarized Developer ID)"
-spctl --assess --type execute -vvv "$APP" 2>&1 || true
+spctl --assess --type execute -vv "$APP" 2>&1 || true
+spctl --assess --type open --context context:primary-signature -vv "$DMG" 2>&1 || true
+
+echo "==> Publishing signed artifacts to $OUT"
+mkdir -p "$OUT"
+rm -rf "$OUT/hops.app"
+ditto "$APP" "$OUT/hops.app"
+cp -f "$DMG" "$OUT/hops-macos.dmg"
 
 echo
 echo "✅  Signed + notarized + stapled:"
-echo "    $APP"
+echo "    $OUT/hops.app"
 echo "    $OUT/hops-macos.dmg   ← distribute this"
