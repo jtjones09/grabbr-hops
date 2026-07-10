@@ -40,6 +40,24 @@ else
     exit 1
 fi
 
+# Apple's secure-timestamp service (timestamp.apple.com) occasionally blips with
+# "The timestamp service is not available." — the same --timestamp sign can fail
+# and then succeed seconds later. Retry the timestamped steps so a transient
+# Apple outage doesn't sink the whole release. codesign is idempotent, so this
+# is safe.
+retry() {
+    local n=1 max=5
+    until "$@"; do
+        if [ "$n" -ge "$max" ]; then
+            echo "  ✗ still failing after $max attempts: $*" >&2
+            return 1
+        fi
+        echo "  … attempt $n failed; retrying in $((n * 10))s" >&2
+        sleep "$((n * 10))"
+        n=$((n + 1))
+    done
+}
+
 # Sign in a non-synced workspace so codesign never trips over iCloud xattrs.
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/hops-sign.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
@@ -51,8 +69,8 @@ echo "==> Signing hops.app (hardened runtime + secure timestamp)"
 # Sign the inner Mach-O first, then the bundle (inner → outer). No entitlements:
 # the Slint build links only Apple frameworks (no library-validation issue) and
 # uses no Apple Events / JIT, so the default hardened runtime is sufficient.
-codesign --force --options runtime --timestamp --sign "$DEVELOPER_ID" "$APP/Contents/MacOS/hops"
-codesign --force --options runtime --timestamp --sign "$DEVELOPER_ID" "$APP"
+retry codesign --force --options runtime --timestamp --sign "$DEVELOPER_ID" "$APP/Contents/MacOS/hops"
+retry codesign --force --options runtime --timestamp --sign "$DEVELOPER_ID" "$APP"
 codesign --verify --strict --verbose=2 "$APP"
 
 echo "==> Notarizing hops.app + stapling the ticket (offline verification)"
@@ -73,7 +91,7 @@ cp -R "$APP" "$STAGE/hops.app"
 ln -s /Applications "$STAGE/Applications"   # drag-to-install target
 hdiutil create -volname "hops" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
 rm -rf "$STAGE"
-codesign --force --timestamp --sign "$DEVELOPER_ID" "$DMG"
+retry codesign --force --timestamp --sign "$DEVELOPER_ID" "$DMG"
 xcrun notarytool submit "$DMG" "${NOTARY_AUTH[@]}" --wait
 xcrun stapler staple "$DMG"
 xcrun stapler validate "$DMG"
