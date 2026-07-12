@@ -8,7 +8,7 @@ use futures::StreamExt;
 use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
 };
-use input_event::{Event, KeyboardEvent, scancode};
+use input_event::{Event, KeyboardEvent, PointerEvent, scancode};
 use hops_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
@@ -82,7 +82,15 @@ impl Capture {
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
             state: Default::default(),
+            // HOPS_COALESCE_MOTION=1 (or any value except "0"/"off") turns it on.
+            coalesce_motion: std::env::var("HOPS_COALESCE_MOTION")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("off"))
+                .unwrap_or(false),
+            pending_motion: None,
         };
+        if capture_task.coalesce_motion {
+            log::info!("motion coalescing ON (HOPS_COALESCE_MOTION) — flushing at ~240 Hz");
+        }
         let task = spawn_local(capture_task.run());
         Self {
             cancellation_token,
@@ -166,6 +174,16 @@ struct CaptureTask {
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,
     state: State,
+    /// Motion coalescing (opt-in via `HOPS_COALESCE_MOTION`). A high-polling mouse
+    /// emits ~800 moves/sec; without this we send one Input per move, flooding the
+    /// receiver's injection queue (lag) and burning sender CPU. When enabled,
+    /// consecutive Motion deltas are summed into `pending_motion` (a depth-1 dirty
+    /// slot) and flushed as ONE event at a capped cadence — total displacement is
+    /// preserved, only redundant intermediate samples are dropped (what the OS does
+    /// natively). Gated + default-off until A/B-validated against the adaptive edge
+    /// crossing on the real rig.
+    coalesce_motion: bool,
+    pending_motion: Option<(f64, f64)>,
 }
 
 impl CaptureTask {
@@ -264,8 +282,15 @@ impl CaptureTask {
         &mut self,
         capture: &mut InputCapture,
     ) -> Result<(), InputCaptureError> {
+        // ~240 Hz flush cadence for coalesced motion (see `coalesce_motion`); the
+        // branch below is inert unless coalescing is on AND a delta is pending.
+        let mut motion_flush = tokio::time::interval(Duration::from_millis(4));
+        motion_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
+                _ = motion_flush.tick(), if self.coalesce_motion && self.pending_motion.is_some() => {
+                    self.flush_pending_motion(capture).await?;
+                }
                 event = capture.next() => match event {
                     Some(event) => self.handle_capture_event(capture, event?).await?,
                     None => return Ok(()),
@@ -314,6 +339,31 @@ impl CaptureTask {
         Ok(())
     }
 
+    /// Send any accumulated coalesced motion as a single Input event, then clear
+    /// the slot. Callers flush BEFORE emitting a non-motion event so ordering
+    /// holds (a click lands at the summed position). Mirrors the send + release
+    /// error handling in `handle_capture_event`.
+    async fn flush_pending_motion(
+        &mut self,
+        capture: &mut InputCapture,
+    ) -> Result<(), CaptureError> {
+        let Some((dx, dy)) = self.pending_motion.take() else {
+            return Ok(());
+        };
+        if dx == 0.0 && dy == 0.0 {
+            return Ok(());
+        }
+        let Some(handle) = self.active_client else {
+            return Ok(());
+        };
+        let event = ProtoEvent::Input(Event::Pointer(PointerEvent::Motion { time: 0, dx, dy }));
+        if let Err(e) = self.conn.send(event, handle).await {
+            log::warn!("releasing capture (motion flush): {e}");
+            self.release_capture(capture).await?;
+        }
+        Ok(())
+    }
+
     async fn handle_capture_event(
         &mut self,
         capture: &mut InputCapture,
@@ -325,6 +375,23 @@ impl CaptureTask {
         if capture.keys_pressed(&self.release_bind.borrow()) {
             log::info!("releasing capture: release-bind pressed");
             return self.release_capture(capture).await;
+        }
+
+        // Motion coalescing: while Sending, sum consecutive Motion deltas into the
+        // dirty slot and let the flush timer emit them as one event; any other
+        // event flushes the accumulated motion first so it lands in order.
+        if self.coalesce_motion {
+            match &event {
+                CaptureEvent::Input(Event::Pointer(PointerEvent::Motion { dx, dy, .. }))
+                    if matches!(self.state, State::Sending)
+                        && self.active_client == Some(handle) =>
+                {
+                    let (px, py) = self.pending_motion.unwrap_or((0.0, 0.0));
+                    self.pending_motion = Some((px + dx, py + dy));
+                    return Ok(());
+                }
+                _ => self.flush_pending_motion(capture).await?,
+            }
         }
 
         if event == CaptureEvent::Begin {
@@ -380,6 +447,10 @@ impl CaptureTask {
     }
 
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+        // Drop any un-flushed coalesced motion — it's <=1 flush-interval old and
+        // belongs to the visit we're leaving; sending it after Leave would be
+        // out of order.
+        self.pending_motion = None;
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
             // Synthesize key-up events for every key still held in the

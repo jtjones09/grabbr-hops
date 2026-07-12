@@ -248,6 +248,7 @@ pub(crate) struct EmulationProxy {
     exit_requested: Rc<Cell<bool>>,
     request_tx: Sender<ProxyRequest>,
     event_rx: Receiver<EmulationEvent>,
+    metrics: Rc<QueueMetrics>,
     task: JoinHandle<()>,
 }
 
@@ -258,12 +259,41 @@ enum ProxyRequest {
     Reenable,
 }
 
+/// Diagnostic counters for the network→injection queue: input events enqueued
+/// (network side) vs injected (emulation side), and the peak backlog between
+/// them. The runtime is single-threaded (`spawn_local` + `local_channel`), so a
+/// shared `Rc<QueueMetrics>` with `Cell` is safe and lock-free. The emulation
+/// task reports these once per second whenever there's input activity — this is
+/// how we confirm whether the cursor lag under load is the queue backing up.
+#[derive(Default)]
+struct QueueMetrics {
+    enqueued: Cell<u64>,
+    injected: Cell<u64>,
+    peak_backlog: Cell<u64>,
+}
+
+impl QueueMetrics {
+    fn on_enqueue(&self) {
+        let enqueued = self.enqueued.get() + 1;
+        self.enqueued.set(enqueued);
+        let backlog = enqueued.saturating_sub(self.injected.get());
+        if backlog > self.peak_backlog.get() {
+            self.peak_backlog.set(backlog);
+        }
+    }
+
+    fn on_inject(&self) {
+        self.injected.set(self.injected.get() + 1);
+    }
+}
+
 impl EmulationProxy {
     fn new(backend: Option<input_emulation::Backend>) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let emulation_active = Rc::new(Cell::new(false));
         let exit_requested = Rc::new(Cell::new(false));
+        let metrics = Rc::new(QueueMetrics::default());
         let emulation_task = EmulationTask {
             backend,
             exit_requested: exit_requested.clone(),
@@ -271,6 +301,7 @@ impl EmulationProxy {
             event_tx,
             handles: Default::default(),
             next_id: 0,
+            metrics: metrics.clone(),
         };
         let task = spawn_local(emulation_task.run());
         Self {
@@ -279,6 +310,7 @@ impl EmulationProxy {
             request_tx,
             task,
             event_rx,
+            metrics,
         }
     }
 
@@ -299,6 +331,7 @@ impl EmulationProxy {
             self.request_tx
                 .send(ProxyRequest::Input(event, addr))
                 .expect("channel closed");
+            self.metrics.on_enqueue();
         }
     }
 
@@ -330,6 +363,7 @@ struct EmulationTask {
     event_tx: Sender<EmulationEvent>,
     handles: HashMap<SocketAddr, EmulationHandle>,
     next_id: EmulationHandle,
+    metrics: Rc<QueueMetrics>,
 }
 
 impl EmulationTask {
@@ -346,7 +380,8 @@ impl EmulationTask {
                 match self.request_rx.recv().await.expect("channel closed") {
                     ProxyRequest::Reenable => break,
                     ProxyRequest::Terminate => return,
-                    ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
+                    // emulation inactive => drop, but keep the backlog counter honest
+                    ProxyRequest::Input(..) => self.metrics.on_inject(),
                     ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
                 }
             }
@@ -397,8 +432,26 @@ impl EmulationTask {
         &mut self,
         emulation: &mut InputEmulation,
     ) -> Result<(), InputEmulationError> {
+        // 1 Hz diagnostic report of the injection queue (input rate + backlog).
+        // Only logs on active seconds, so it's silent when idle.
+        let mut report = tokio::time::interval(Duration::from_secs(1));
+        report.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut prev_enqueued = self.metrics.enqueued.get();
         loop {
             tokio::select! {
+                _ = report.tick() => {
+                    let enqueued = self.metrics.enqueued.get();
+                    let rate = enqueued - prev_enqueued;
+                    prev_enqueued = enqueued;
+                    if rate > 0 {
+                        let backlog = enqueued.saturating_sub(self.metrics.injected.get());
+                        let peak = self.metrics.peak_backlog.get();
+                        log::info!(
+                            "[motion-metrics] {rate} input/s | backlog now {backlog} | peak {peak}"
+                        );
+                        self.metrics.peak_backlog.set(backlog);
+                    }
+                }
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     ProxyRequest::Input(event, addr) => {
                         let handle = match self.handles.get(&addr) {
@@ -412,6 +465,7 @@ impl EmulationTask {
                             }
                         };
                         emulation.consume(event, handle).await?;
+                        self.metrics.on_inject();
                         // adaptive edge: the backend may have concluded this
                         // event was a deliberate push past a screen edge
                         if let Some(side) = emulation.take_edge_push() {
