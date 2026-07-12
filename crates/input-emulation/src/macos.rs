@@ -76,6 +76,19 @@ pub(crate) struct MacOSEmulation {
     /// Edge signalled by the detector, waiting to be collected via
     /// [`Emulation::take_edge_push`] after the current `consume`.
     pending_edge_push: Option<EdgeSide>,
+    // --- Trueloop Phase A: passive divergence probe (HOPS_TRUELOOP_PROBE, default
+    // off). Measures (integral of REQUESTED unclamped deltas) − get_mouse_location():
+    // the accumulated clamp discard — how far the OS held the cursor from where we
+    // asked. On a KVM receiver the host cursor IS the clamp result, so this is
+    // nonzero *only* at a screen edge (guest-accel moves the guest cursor via the
+    // delta field and is invisible to a host readback — out of scope for Phase A).
+    // Receiver-only diagnostic; gates the Trueloop demo.
+    probe_enabled: bool,
+    probe_integral: Cell<Option<(f64, f64)>>, // running sum of unclamped requested deltas, anchored per visit
+    probe_peak_offset: Cell<f64>,             // per-window max |divergence| (peak net clamp offset)
+    probe_last_div: Cell<f64>,                // most-recent divergence magnitude
+    probe_win_start_div: Cell<Option<f64>>,   // divergence at the start of the current window
+    probe_report_at: Cell<Option<Instant>>,
 }
 
 /// Maps an evdev button code to the CGEventType used for drag events.
@@ -128,12 +141,49 @@ impl MacOSEmulation {
             last_user_activity: Cell::new(None),
             edge_pressure: EdgePressureDetector::from_env(),
             pending_edge_push: None,
+            probe_enabled: std::env::var_os("HOPS_TRUELOOP_PROBE").is_some(),
+            probe_integral: Cell::new(None),
+            probe_peak_offset: Cell::new(0.0),
+            probe_last_div: Cell::new(0.0),
+            probe_win_start_div: Cell::new(None),
+            probe_report_at: Cell::new(None),
         })
     }
 
     fn get_mouse_location(&self) -> Option<CGPoint> {
         let event: CGEvent = CGEvent::new(self.event_source.clone()).ok()?;
         Some(event.location())
+    }
+
+    /// Trueloop Phase A: log the probe once per active second. `peak-offset` = the
+    /// per-window max |divergence| (px the OS held the cursor away from where we asked);
+    /// `drift` = its rate of change (px/min, event-rate-independent). ~0 on open desktop,
+    /// climbs into a screen edge, negative on pull-back, leaving a persistent residual.
+    fn probe_flush(&self) {
+        let now = Instant::now();
+        let report_at = match self.probe_report_at.get() {
+            Some(t) => t,
+            None => {
+                self.probe_report_at.set(Some(now));
+                return;
+            }
+        };
+        let elapsed = now.duration_since(report_at).as_secs_f64();
+        if elapsed < 1.0 {
+            return;
+        }
+        if let Some(win_start_div) = self.probe_win_start_div.get() {
+            let drift = (self.probe_last_div.get() - win_start_div) / elapsed * 60.0;
+            log::info!(
+                "[trueloop] peak-offset {:.1}px | drift {:+.1}px/min",
+                self.probe_peak_offset.get(),
+                drift
+            );
+        }
+        // reset the window; peak carries the current divergence forward
+        self.probe_peak_offset.set(self.probe_last_div.get());
+        self.probe_win_start_div.set(None);
+        self.probe_report_at.set(Some(now));
     }
 
     /// Wake the display (and reset the idle-sleep timer) on incoming remote
@@ -1793,6 +1843,30 @@ impl Emulation for MacOSEmulation {
                             }
                         };
 
+                        // Trueloop Phase A probe: compare where the cursor actually is
+                        // (mouse_location, sampled at the TOP of this event = "did the
+                        // previous injection land?") against our running integral of the
+                        // UNCLAMPED requested deltas. The gap is the accumulated clamp
+                        // discard — the divergence Trueloop will one day servo out.
+                        if self.probe_enabled {
+                            match self.probe_integral.get() {
+                                Some((ix, iy)) => {
+                                    let div = (ix - mouse_location.x).hypot(iy - mouse_location.y);
+                                    self.probe_peak_offset
+                                        .set(self.probe_peak_offset.get().max(div));
+                                    if self.probe_win_start_div.get().is_none() {
+                                        self.probe_win_start_div.set(Some(div));
+                                    }
+                                    self.probe_last_div.set(div);
+                                    self.probe_integral.set(Some((ix + dx, iy + dy)));
+                                }
+                                None => self
+                                    .probe_integral
+                                    .set(Some((mouse_location.x + dx, mouse_location.y + dy))),
+                            }
+                            self.probe_flush();
+                        }
+
                         let (new_mouse_x, new_mouse_y) =
                             clamp_to_screen_space(mouse_location.x, mouse_location.y, dx, dy);
 
@@ -2124,6 +2198,13 @@ impl Emulation for MacOSEmulation {
         // signal (learned thresholds survive across sessions)
         self.edge_pressure.on_session_created();
         self.pending_edge_push = None;
+        // Trueloop Phase A: re-anchor the divergence integral each visit so a
+        // cross-away/return doesn't log a phantom offset.
+        self.probe_integral.set(None);
+        self.probe_peak_offset.set(0.0);
+        self.probe_last_div.set(0.0);
+        self.probe_win_start_div.set(None);
+        self.probe_report_at.set(None);
     }
 
     async fn destroy(&mut self, _handle: EmulationHandle) {
