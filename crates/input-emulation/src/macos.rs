@@ -89,6 +89,14 @@ pub(crate) struct MacOSEmulation {
     probe_last_div: Cell<f64>,                // most-recent divergence magnitude
     probe_win_start_div: Cell<Option<f64>>,   // divergence at the start of the current window
     probe_report_at: Cell<Option<Instant>>,
+    // per-window travel + speed — the mechanism fingerprint. If the OS accelerates
+    // our injected motion, actual travel > requested travel (ratio > 1) and the
+    // ratio rises with speed. Pure edge-clamp leaves ratio ~1 mid-screen.
+    probe_req_travel: Cell<f64>,              // Σ|requested delta| this window
+    probe_act_travel: Cell<f64>,              // Σ|actual cursor move| this window
+    probe_prev_pos: Cell<Option<(f64, f64)>>, // last readback, for actual travel
+    probe_peak_speed: Cell<f64>,              // max |delta|/dt this window (px/s)
+    probe_last_evt: Cell<Option<Instant>>,    // last event time, for dt
 }
 
 /// Maps an evdev button code to the CGEventType used for drag events.
@@ -147,6 +155,11 @@ impl MacOSEmulation {
             probe_last_div: Cell::new(0.0),
             probe_win_start_div: Cell::new(None),
             probe_report_at: Cell::new(None),
+            probe_req_travel: Cell::new(0.0),
+            probe_act_travel: Cell::new(0.0),
+            probe_prev_pos: Cell::new(None),
+            probe_peak_speed: Cell::new(0.0),
+            probe_last_evt: Cell::new(None),
         })
     }
 
@@ -174,16 +187,25 @@ impl MacOSEmulation {
         }
         if let Some(win_start_div) = self.probe_win_start_div.get() {
             let drift = (self.probe_last_div.get() - win_start_div) / elapsed * 60.0;
+            let req = self.probe_req_travel.get();
+            // ratio = actual cursor travel / requested travel. ~1 => we command the
+            // cursor 1:1; >1 => the OS amplifies our motion (acceleration).
+            let ratio = if req > 1.0 { self.probe_act_travel.get() / req } else { 0.0 };
             log::info!(
-                "[trueloop] peak-offset {:.1}px | drift {:+.1}px/min",
+                "[trueloop] peak-offset {:.1}px | drift {:+.1}px/min | ratio {:.3} (act/req) | peak-vel {:.0}px/s",
                 self.probe_peak_offset.get(),
-                drift
+                drift,
+                ratio,
+                self.probe_peak_speed.get()
             );
         }
         // reset the window; peak carries the current divergence forward
         self.probe_peak_offset.set(self.probe_last_div.get());
         self.probe_win_start_div.set(None);
         self.probe_report_at.set(Some(now));
+        self.probe_req_travel.set(0.0);
+        self.probe_act_travel.set(0.0);
+        self.probe_peak_speed.set(0.0);
     }
 
     /// Wake the display (and reset the idle-sleep timer) on incoming remote
@@ -1849,6 +1871,26 @@ impl Emulation for MacOSEmulation {
                         // UNCLAMPED requested deltas. The gap is the accumulated clamp
                         // discard — the divergence Trueloop will one day servo out.
                         if self.probe_enabled {
+                            // per-window travel + speed (the accel fingerprint)
+                            let pnow = Instant::now();
+                            let dmag = (dx * dx + dy * dy).sqrt();
+                            if let Some(last) = self.probe_last_evt.get() {
+                                let dt = pnow.duration_since(last).as_secs_f64();
+                                if dt > 0.0 {
+                                    self.probe_peak_speed
+                                        .set(self.probe_peak_speed.get().max(dmag / dt));
+                                }
+                            }
+                            self.probe_last_evt.set(Some(pnow));
+                            self.probe_req_travel.set(self.probe_req_travel.get() + dmag);
+                            if let Some((px, py)) = self.probe_prev_pos.get() {
+                                let amag = ((mouse_location.x - px).powi(2)
+                                    + (mouse_location.y - py).powi(2))
+                                .sqrt();
+                                self.probe_act_travel.set(self.probe_act_travel.get() + amag);
+                            }
+                            self.probe_prev_pos
+                                .set(Some((mouse_location.x, mouse_location.y)));
                             match self.probe_integral.get() {
                                 Some((ix, iy)) => {
                                     let div = (ix - mouse_location.x).hypot(iy - mouse_location.y);
@@ -2205,6 +2247,11 @@ impl Emulation for MacOSEmulation {
         self.probe_last_div.set(0.0);
         self.probe_win_start_div.set(None);
         self.probe_report_at.set(None);
+        self.probe_req_travel.set(0.0);
+        self.probe_act_travel.set(0.0);
+        self.probe_prev_pos.set(None);
+        self.probe_peak_speed.set(0.0);
+        self.probe_last_evt.set(None);
     }
 
     async fn destroy(&mut self, _handle: EmulationHandle) {
