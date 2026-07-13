@@ -390,6 +390,12 @@ impl CaptureTask {
             self.abs_vx += dx;
             self.abs_vy += dy;
             self.abs_seq = self.abs_seq.wrapping_add(1);
+            // Once-per-crossing confirmation that the peer negotiated absolute
+            // motion (abs_seq == 1 is the first emit after a Begin reset). Makes
+            // a two-machine A/B unambiguous: no line ⇒ relative fallback.
+            if self.abs_seq == 1 {
+                log::info!("absolute motion active for client {handle} (peer negotiated ABSOLUTE_MOTION)");
+            }
             ProtoEvent::PointerMotionAbsolute {
                 seq: self.abs_seq,
                 ts: 0,
