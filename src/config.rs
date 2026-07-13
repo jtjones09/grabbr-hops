@@ -35,6 +35,13 @@ pub fn local_commit() -> [u8; 8] {
     out
 }
 
+/// Capability bits this build advertises in the [`hops_proto::ProtoEvent::Capability`]
+/// handshake — the OR of every optional feature we actually implement and honor.
+/// Currently `0`: we speak the capability protocol but implement no optional
+/// features yet. As each Stage lands, OR in its bit from [`hops_proto::caps`]
+/// (e.g. `hops_proto::caps::ABSOLUTE_MOTION`) here — and only here.
+pub const LOCAL_CAPS: u32 = 0;
+
 /// `--version` string: package version + short git commit (both compile-time).
 const LONG_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("HOPS_SHORT_COMMIT"), ")");
 

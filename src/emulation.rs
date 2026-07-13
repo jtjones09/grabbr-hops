@@ -1,4 +1,4 @@
-use crate::config::local_commit;
+use crate::config::{LOCAL_CAPS, local_commit};
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
 use futures::StreamExt;
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
@@ -73,6 +73,15 @@ pub(crate) enum EmulationEvent {
     PeerHello {
         addr: SocketAddr,
         commit: [u8; 8],
+    },
+    /// peer sent us a Capability event advertising its supported
+    /// features. Routed upward (mirroring `PeerHello`) so the service
+    /// can record it via `client_manager.set_peer_caps` — the receiver
+    /// side needs the sender's caps to gate the future Trueloop
+    /// return-channel, just as the sender needs the receiver's.
+    PeerCaps {
+        addr: SocketAddr,
+        flags: u32,
     },
 }
 
@@ -188,7 +197,16 @@ impl ListenTask {
                             // the peer is in fact happily talking to us.
                             ProtoEvent::Hello { commit } => {
                                 self.listener.reply(addr, ProtoEvent::Hello { commit: local_commit() }).await;
+                                // Advertise our own capabilities right after the Hello
+                                // reply, on the same reply stream (so the peer sees Hello
+                                // then Capability, in order). Unconditional: an older
+                                // sender that predates the event skips the unknown type
+                                // and keeps the connection alive.
+                                self.listener.reply(addr, ProtoEvent::Capability { flags: LOCAL_CAPS }).await;
                                 self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
+                            }
+                            ProtoEvent::Capability { flags } => {
+                                self.event_tx.send(EmulationEvent::PeerCaps { addr, flags }).expect("channel closed");
                             }
                             _ => {}
                         }

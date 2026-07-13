@@ -299,6 +299,12 @@ impl ClientManager {
         }
     }
 
+    pub(crate) fn set_peer_caps(&self, handle: ClientHandle, caps: Option<u32>) {
+        if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            s.peer_caps = caps;
+        }
+    }
+
     pub(crate) fn active_addr(&self, handle: ClientHandle) -> Option<SocketAddr> {
         self.clients
             .borrow()
