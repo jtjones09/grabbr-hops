@@ -2,7 +2,7 @@ use crate::config::{LOCAL_CAPS, local_commit};
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
 use futures::StreamExt;
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
-use input_event::Event;
+use input_event::{Event, PointerEvent};
 use hops_proto::{Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
@@ -148,6 +148,53 @@ impl Emulation {
     }
 }
 
+/// Reconstructs per-event relative deltas from the cumulative absolute
+/// displacement carried by [`ProtoEvent::PointerMotionAbsolute`] (Stage 2).
+/// Each peer's displacement is anchored at (0,0) on Enter — matching the
+/// sender resetting its cumulative displacement at each crossing — and the
+/// reconstructed delta is `current − previous`. Absolute displacement is
+/// self-correcting: a lost or reordered update just means the next delta
+/// spans the gap, so no drift accumulates (unlike a relative-delta stream).
+/// The reconstructed delta is fed to the UNCHANGED injection path (the clamp
+/// + edge detector on the macOS side), so the crown-jewel motion arm is
+/// untouched.
+///
+/// Contract PR-4's sender must uphold: motion is emitted ONLY after the Enter
+/// is acked. hops's capture state machine already enforces this — every event
+/// during `State::WaitingForAck` becomes an Enter re-send (`capture.rs`), and
+/// `PointerMotionAbsolute` would be emitted only in `State::Sending`. So every
+/// `anchor()` (one per Enter re-send) lands before the first motion, and the
+/// last — at the WaitingForAck→Sending boundary — is the live anchor. If a
+/// future sender ever emitted motion before the Ack, this baseline would be
+/// wrong; it must not.
+#[derive(Default)]
+struct AbsMotionReconstructor {
+    prev: HashMap<SocketAddr, (f32, f32)>,
+}
+
+impl AbsMotionReconstructor {
+    /// Anchor this peer at the origin — call on Enter, matching the sender's
+    /// reset of its cumulative displacement at each crossing.
+    fn anchor(&mut self, addr: SocketAddr) {
+        self.prev.insert(addr, (0.0, 0.0));
+    }
+
+    /// Reconstruct the relative delta (f64, for the injection path) from a
+    /// cumulative (vx, vy) update. A never-seen peer defaults to the origin,
+    /// so a stray update before Enter degrades to "delta == absolute" rather
+    /// than a jump from stale state.
+    fn delta(&mut self, addr: SocketAddr, vx: f32, vy: f32) -> (f64, f64) {
+        let (px, py) = self.prev.get(&addr).copied().unwrap_or((0.0, 0.0));
+        self.prev.insert(addr, (vx, vy));
+        ((vx - px) as f64, (vy - py) as f64)
+    }
+
+    /// Drop this peer's state — call on Leave/disconnect.
+    fn forget(&mut self, addr: SocketAddr) {
+        self.prev.remove(&addr);
+    }
+}
+
 struct ListenTask {
     listener: LanMouseListener,
     emulation_proxy: EmulationProxy,
@@ -160,6 +207,7 @@ impl ListenTask {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         let mut last_response = HashMap::new();
         let mut rejected_connections = HashMap::new();
+        let mut absmotion = AbsMotionReconstructor::default();
         loop {
             select! {
                 e = self.listener.next() => {match e {
@@ -175,11 +223,17 @@ impl ListenTask {
                                     log::trace!("Enter received from {addr}");
                                     self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
                                     self.listener.reply(addr, ProtoEvent::Ack(0)).await;
+                                    // Anchor absolute-motion reconstruction at this
+                                    // crossing (the sender resets its cumulative
+                                    // displacement to 0 on Enter). Idempotent across the
+                                    // pre-Ack Enter re-sends; motion only arrives after.
+                                    absmotion.anchor(addr);
                                     self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");
                                 }
                             }
                             ProtoEvent::Leave(_) => {
                                 self.emulation_proxy.remove(addr);
+                                absmotion.forget(addr);
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                             }
                             ProtoEvent::Input(event) => self.emulation_proxy.consume(event, addr),
@@ -207,6 +261,19 @@ impl ListenTask {
                             }
                             ProtoEvent::Capability { flags } => {
                                 self.event_tx.send(EmulationEvent::PeerCaps { addr, flags }).expect("channel closed");
+                            }
+                            // Stage 2 absolute motion: reconstruct the per-event delta
+                            // from the cumulative displacement and feed the UNCHANGED
+                            // injection path (clamp + edge detector) as a relative
+                            // Motion — the macOS motion arm stays untouched. `seq` is
+                            // for the Stage 3 servo; unused here. Inert until a peer
+                            // negotiates caps::ABSOLUTE_MOTION and emits these (PR-4).
+                            ProtoEvent::PointerMotionAbsolute { seq: _, ts, vx, vy } => {
+                                let (dx, dy) = absmotion.delta(addr, vx, vy);
+                                self.emulation_proxy.consume(
+                                    Event::Pointer(PointerEvent::Motion { time: ts, dx, dy }),
+                                    addr,
+                                );
                             }
                             _ => {}
                         }
@@ -555,5 +622,57 @@ impl<T> Drop for DropGuard<T> {
         self.tx
             .send(self.on_drop.take().expect("item"))
             .expect("channel closed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(n: u16) -> SocketAddr {
+        format!("127.0.0.1:{n}").parse().unwrap()
+    }
+
+    #[test]
+    fn reconstructs_cumulative_to_per_event_deltas() {
+        let mut r = AbsMotionReconstructor::default();
+        let a = addr(1);
+        r.anchor(a);
+        // cumulative displacement from the anchor -> per-event delta
+        assert_eq!(r.delta(a, 10.0, 5.0), (10.0, 5.0)); // first, from origin
+        assert_eq!(r.delta(a, 15.0, 5.0), (5.0, 0.0));
+        assert_eq!(r.delta(a, 15.0, 20.0), (0.0, 15.0));
+        assert_eq!(r.delta(a, 12.0, 18.0), (-3.0, -2.0)); // deltas can be negative
+    }
+
+    #[test]
+    fn anchor_resets_on_reentry() {
+        let mut r = AbsMotionReconstructor::default();
+        let a = addr(1);
+        r.anchor(a);
+        r.delta(a, 100.0, 100.0); // cursor traveled far this visit
+        // re-enter: the sender resets its cumulative displacement to 0, so must we
+        r.anchor(a);
+        assert_eq!(r.delta(a, 3.0, 3.0), (3.0, 3.0)); // NOT (3 - 100)
+    }
+
+    #[test]
+    fn unseen_peer_degrades_to_absolute_not_a_jump() {
+        let mut r = AbsMotionReconstructor::default();
+        // no anchor() first (stray update) -> prev defaults to the origin
+        assert_eq!(r.delta(addr(9), 7.0, -4.0), (7.0, -4.0));
+    }
+
+    #[test]
+    fn peers_are_independent_and_forget_clears() {
+        let mut r = AbsMotionReconstructor::default();
+        let (a, b) = (addr(1), addr(2));
+        r.anchor(a);
+        r.anchor(b);
+        r.delta(a, 50.0, 0.0);
+        assert_eq!(r.delta(b, 4.0, 4.0), (4.0, 4.0)); // b independent of a
+        r.forget(a);
+        // a forgotten -> its next delta is measured from the origin again
+        assert_eq!(r.delta(a, 8.0, 8.0), (8.0, 8.0));
     }
 }
