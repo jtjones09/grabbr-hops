@@ -9,7 +9,7 @@ use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
 };
 use input_event::{Event, KeyboardEvent, PointerEvent, scancode};
-use hops_proto::ProtoEvent;
+use hops_proto::{ProtoEvent, caps};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
@@ -87,6 +87,9 @@ impl Capture {
                 .map(|v| v != "0" && !v.eq_ignore_ascii_case("off"))
                 .unwrap_or(false),
             pending_motion: None,
+            abs_vx: 0.0,
+            abs_vy: 0.0,
+            abs_seq: 0,
         };
         if capture_task.coalesce_motion {
             log::info!("motion coalescing ON (HOPS_COALESCE_MOTION) — flushing at ~240 Hz");
@@ -184,6 +187,15 @@ struct CaptureTask {
     /// crossing on the real rig.
     coalesce_motion: bool,
     pending_motion: Option<(f64, f64)>,
+    /// Cumulative pointer displacement from the entry anchor, for Stage 2
+    /// absolute motion — reset to 0 at each crossing (Enter), emitted as f32 in
+    /// `PointerMotionAbsolute` when the peer negotiated `caps::ABSOLUTE_MOTION`.
+    /// Accumulated in f64 (cast to f32 only on the wire) so rounding doesn't
+    /// drift over a visit. `abs_seq` is a per-crossing sequence for the Stage 3
+    /// servo; the receiver ignores it today.
+    abs_vx: f64,
+    abs_vy: f64,
+    abs_seq: u32,
 }
 
 impl CaptureTask {
@@ -356,9 +368,43 @@ impl CaptureTask {
         let Some(handle) = self.active_client else {
             return Ok(());
         };
-        let event = ProtoEvent::Input(Event::Pointer(PointerEvent::Motion { time: 0, dx, dy }));
+        self.send_motion(capture, handle, dx, dy).await
+    }
+
+    /// Emit a pointer-motion delta to `handle`. When the peer negotiated
+    /// `caps::ABSOLUTE_MOTION`, send cumulative absolute displacement
+    /// (`PointerMotionAbsolute`, Stage 2) — self-correcting under loss and the
+    /// substrate for the Stage 3 servo; otherwise the classic relative
+    /// `Input(Motion)`. Mirrors the send + release-on-error of its callers.
+    /// Switching relative→absolute mid-visit is safe: `abs_v*` accumulates only
+    /// absolute-path deltas from 0 and the receiver's anchor is 0, so the
+    /// reconstructed total matches no matter when the negotiated caps land.
+    async fn send_motion(
+        &mut self,
+        capture: &mut InputCapture,
+        handle: CaptureHandle,
+        dx: f64,
+        dy: f64,
+    ) -> Result<(), CaptureError> {
+        let event = if self.conn.peer_supports(handle, caps::ABSOLUTE_MOTION) {
+            self.abs_vx += dx;
+            self.abs_vy += dy;
+            self.abs_seq = self.abs_seq.wrapping_add(1);
+            ProtoEvent::PointerMotionAbsolute {
+                seq: self.abs_seq,
+                ts: 0,
+                vx: self.abs_vx as f32,
+                vy: self.abs_vy as f32,
+            }
+        } else {
+            ProtoEvent::Input(Event::Pointer(PointerEvent::Motion { time: 0, dx, dy }))
+        };
         if let Err(e) = self.conn.send(event, handle).await {
-            log::warn!("releasing capture (motion flush): {e}");
+            // Debounced (shared with the generic send path): motion is the
+            // highest-frequency event, so an undebounced warn floods at
+            // ~motion-rate when a peer goes unreachable mid-visit.
+            const DUR: Duration = Duration::from_millis(500);
+            debounce!(PREV_LOG, DUR, log::warn!("releasing capture (motion): {e}"));
             self.release_capture(capture).await?;
         }
         Ok(())
@@ -414,6 +460,20 @@ impl CaptureTask {
             return Ok(());
         }
 
+        // Re-anchor absolute motion on EVERY crossing (Begin past the
+        // EnterOnly return above, i.e. one that actually sends an Enter), not
+        // only when the active client changes: the receiver re-anchors its
+        // reconstruction at 0 on that Enter, so our cumulative must reset in
+        // lock-step — including a re-cross to the ALREADY-active client after a
+        // capture-backend restart that left state==Sending without a release.
+        // Otherwise the stale cumulative emits a huge first delta and teleports
+        // the remote cursor. Begin fires once per crossing (idempotent).
+        if event == CaptureEvent::Begin {
+            self.abs_vx = 0.0;
+            self.abs_vy = 0.0;
+            self.abs_seq = 0;
+        }
+
         // activated a new client
         if event == CaptureEvent::Begin && Some(handle) != self.active_client {
             self.state = State::WaitingForAck;
@@ -421,6 +481,17 @@ impl CaptureTask {
             self.event_tx
                 .send(ICaptureEvent::ClientEntered(handle))
                 .expect("channel closed");
+        }
+
+        // Sending motion routes through send_motion (absolute-aware). Only
+        // reached when coalescing is OFF — the coalesce path above intercepts
+        // Sending motion and flushes it via flush_pending_motion (also
+        // absolute-aware). Matched by reference so `event` stays owned for the
+        // generic path below (non-motion events + the Enter re-sends).
+        if matches!(self.state, State::Sending) {
+            if let CaptureEvent::Input(Event::Pointer(PointerEvent::Motion { dx, dy, .. })) = &event {
+                return self.send_motion(capture, handle, *dx, *dy).await;
+            }
         }
 
         let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());

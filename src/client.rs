@@ -305,6 +305,17 @@ impl ClientManager {
         }
     }
 
+    /// Capability bits the peer advertised via the Capability handshake, or
+    /// `0` if none received yet (older peer / not-yet-negotiated) — so every
+    /// gate degrades to the pre-capability behavior.
+    pub(crate) fn peer_caps(&self, handle: ClientHandle) -> u32 {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .and_then(|(_, s)| s.peer_caps)
+            .unwrap_or(0)
+    }
+
     pub(crate) fn active_addr(&self, handle: ClientHandle) -> Option<SocketAddr> {
         self.clients
             .borrow()

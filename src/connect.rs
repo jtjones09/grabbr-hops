@@ -1,5 +1,5 @@
 use crate::client::ClientManager;
-use crate::config::{LOCAL_CAPS, local_commit};
+use crate::config::{local_caps, local_commit};
 use crate::crypto::Identity;
 use crate::transport::{self, Authorized, FpServerVerifier};
 use hops_ipc::{ClientHandle, DEFAULT_PORT};
@@ -160,6 +160,14 @@ impl LanMouseConnection {
 
     pub(crate) async fn recv(&mut self) -> (ClientHandle, ProtoEvent) {
         self.recv_rx.recv().await.expect("channel closed")
+    }
+
+    /// Whether the peer for `handle` advertised support for `cap` (a
+    /// [`hops_proto::caps`] bit) via the Capability handshake. False if no
+    /// Capability was received (older peer, or not yet negotiated), so
+    /// capability-gated emissions fall back to the pre-capability behavior.
+    pub(crate) fn peer_supports(&self, handle: ClientHandle, cap: u32) -> bool {
+        self.client_manager.peer_caps(handle) & cap != 0
     }
 
     /// A handle for broadcasting local clipboard changes to all connected
@@ -333,7 +341,8 @@ async fn connect_to_handle(
                 log::debug!("hello send to {addr} failed: {e}");
             }
             if let Err(e) =
-                transport::write_frame(&mut send, ProtoEvent::Capability { flags: LOCAL_CAPS }).await
+                transport::write_frame(&mut send, ProtoEvent::Capability { flags: local_caps() })
+                    .await
             {
                 log::debug!("capability send to {addr} failed: {e}");
             }

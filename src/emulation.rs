@@ -1,4 +1,4 @@
-use crate::config::{LOCAL_CAPS, local_commit};
+use crate::config::{local_caps, local_commit};
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
 use futures::StreamExt;
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
@@ -256,7 +256,7 @@ impl ListenTask {
                                 // then Capability, in order). Unconditional: an older
                                 // sender that predates the event skips the unknown type
                                 // and keeps the connection alive.
-                                self.listener.reply(addr, ProtoEvent::Capability { flags: LOCAL_CAPS }).await;
+                                self.listener.reply(addr, ProtoEvent::Capability { flags: local_caps() }).await;
                                 self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
                             }
                             ProtoEvent::Capability { flags } => {
@@ -674,5 +674,38 @@ mod tests {
         r.forget(a);
         // a forgotten -> its next delta is measured from the origin again
         assert_eq!(r.delta(a, 8.0, 8.0), (8.0, 8.0));
+    }
+
+    /// End-to-end contract (PR-4 sender ⇄ PR-3 receiver): the sender accumulates
+    /// deltas in f64 and puts the cumulative on the wire as f32
+    /// (`abs_vx as f32`); the receiver reconstructs per-event deltas. The sum of
+    /// reconstructed deltas must equal the sender's intended total displacement,
+    /// to within f32 precision — no drift across a visit.
+    #[test]
+    fn absolute_roundtrip_preserves_total_displacement() {
+        let mut r = AbsMotionReconstructor::default();
+        let a = addr(1);
+        r.anchor(a);
+        let deltas = [
+            (10.0, 5.0),
+            (3.5, -2.0),
+            (0.0, 8.0),
+            (-4.0, -4.0),
+            (1234.5, -987.25),
+        ];
+        let (mut avx, mut avy) = (0.0f64, 0.0f64); // sender accumulator (f64)
+        let (mut rx, mut ry) = (0.0f64, 0.0f64); // sum of reconstructed deltas
+        for &(dx, dy) in &deltas {
+            avx += dx;
+            avy += dy;
+            let (rdx, rdy) = r.delta(a, avx as f32, avy as f32); // wire is f32
+            rx += rdx;
+            ry += rdy;
+        }
+        let (wx, wy) = deltas
+            .iter()
+            .fold((0.0f64, 0.0f64), |acc, &(x, y)| (acc.0 + x, acc.1 + y));
+        assert!((rx - wx).abs() < 0.01, "x total drift: {rx} vs {wx}");
+        assert!((ry - wy).abs() < 0.01, "y total drift: {ry} vs {wy}");
     }
 }

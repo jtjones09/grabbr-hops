@@ -36,11 +36,26 @@ pub fn local_commit() -> [u8; 8] {
 }
 
 /// Capability bits this build advertises in the [`hops_proto::ProtoEvent::Capability`]
-/// handshake — the OR of every optional feature we actually implement and honor.
-/// Currently `0`: we speak the capability protocol but implement no optional
-/// features yet. As each Stage lands, OR in its bit from [`hops_proto::caps`]
-/// (e.g. `hops_proto::caps::ABSOLUTE_MOTION`) here — and only here.
-pub const LOCAL_CAPS: u32 = 0;
+/// handshake — the OR of every optional feature we actually implement AND choose
+/// to negotiate right now. A peer that sees `ABSOLUTE_MOTION` emits absolute
+/// motion to us (which PR-3 reconstructs), and our sender emits it to any peer
+/// that advertises it back.
+///
+/// `ABSOLUTE_MOTION` is gated behind `HOPS_ABSOLUTE_MOTION` (default OFF) so it
+/// can be A/B'd on the real rig before becoming the default — "a mispredicted
+/// cursor is worse than a late one; validate, never assume". Set the env var on
+/// the RECEIVER to make its peer emit absolute motion to it. Advertising `0`
+/// when off is honest opt-out: we simply keep using the relative path.
+pub fn local_caps() -> u32 {
+    let absolute = std::env::var("HOPS_ABSOLUTE_MOTION")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("off"))
+        .unwrap_or(false);
+    if absolute {
+        hops_proto::caps::ABSOLUTE_MOTION
+    } else {
+        0
+    }
+}
 
 /// `--version` string: package version + short git commit (both compile-time).
 const LONG_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("HOPS_SHORT_COMMIT"), ")");
