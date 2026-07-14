@@ -41,19 +41,20 @@ pub fn local_commit() -> [u8; 8] {
 /// motion to us (which PR-3 reconstructs), and our sender emits it to any peer
 /// that advertises it back.
 ///
-/// `ABSOLUTE_MOTION` is gated behind `HOPS_ABSOLUTE_MOTION` (default OFF) so it
-/// can be A/B'd on the real rig before becoming the default — "a mispredicted
-/// cursor is worse than a late one; validate, never assume". Set the env var on
-/// the RECEIVER to make its peer emit absolute motion to it. Advertising `0`
-/// when off is honest opt-out: we simply keep using the relative path.
+/// `ABSOLUTE_MOTION` is now **on by default** — validated on the real rig
+/// (a full-workday soak: near-native feel, ratio parity with the relative
+/// path, zero regressions). Set `HOPS_ABSOLUTE_MOTION=0` (or `off`) to disable
+/// it for A/B comparison or debugging; the peer then never sees the bit and we
+/// fall back to the relative path. Advertising the bit is an honest opt-in:
+/// the peer only emits absolute motion once it observes we support it.
 pub fn local_caps() -> u32 {
-    let absolute = std::env::var("HOPS_ABSOLUTE_MOTION")
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("off"))
+    let disabled = std::env::var("HOPS_ABSOLUTE_MOTION")
+        .map(|v| v == "0" || v.eq_ignore_ascii_case("off"))
         .unwrap_or(false);
-    if absolute {
-        hops_proto::caps::ABSOLUTE_MOTION
-    } else {
+    if disabled {
         0
+    } else {
+        hops_proto::caps::ABSOLUTE_MOTION
     }
 }
 
