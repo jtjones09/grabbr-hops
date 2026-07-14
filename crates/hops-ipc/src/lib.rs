@@ -199,6 +199,13 @@ pub struct ClientState {
     /// that predates the Hello event. The frontend uses this to
     /// soft-warn on version mismatch.
     pub peer_commit: Option<[u8; 8]>,
+    /// Capability bits advertised by the peer via the `Capability`
+    /// proto event (see `hops_proto::caps`). `None` means no Capability
+    /// event was received — a fresh connection or a peer predating the
+    /// event; optional features are gated on these bits and degrade to
+    /// the pre-capability behavior when absent. Mirrors `peer_commit`.
+    #[serde(default)]
+    pub peer_caps: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

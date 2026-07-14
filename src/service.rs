@@ -449,6 +449,15 @@ impl Service {
                     self.broadcast_client(handle);
                 }
             }
+            EmulationEvent::PeerCaps { addr, flags } => {
+                // Mirror PeerHello: map the peer's addr to its client
+                // handle and record the advertised capability bits. Skip
+                // if there's no outgoing client for this peer.
+                if let Some(handle) = self.client_manager.get_client(addr) {
+                    self.client_manager.set_peer_caps(handle, Some(flags));
+                    self.broadcast_client(handle);
+                }
+            }
         }
     }
 

@@ -1,5 +1,5 @@
 use crate::client::ClientManager;
-use crate::config::local_commit;
+use crate::config::{local_caps, local_commit};
 use crate::crypto::Identity;
 use crate::transport::{self, Authorized, FpServerVerifier};
 use hops_ipc::{ClientHandle, DEFAULT_PORT};
@@ -162,6 +162,14 @@ impl LanMouseConnection {
         self.recv_rx.recv().await.expect("channel closed")
     }
 
+    /// Whether the peer for `handle` advertised support for `cap` (a
+    /// [`hops_proto::caps`] bit) via the Capability handshake. False if no
+    /// Capability was received (older peer, or not yet negotiated), so
+    /// capability-gated emissions fall back to the pre-capability behavior.
+    pub(crate) fn peer_supports(&self, handle: ClientHandle, cap: u32) -> bool {
+        self.client_manager.peer_caps(handle) & cap != 0
+    }
+
     /// A handle for broadcasting local clipboard changes to all connected
     /// peers. Grabbed before this connection is moved into `Capture` so the
     /// service can drive it directly.
@@ -316,7 +324,10 @@ async fn connect_to_handle(
         conns.lock().await.insert(addr, link.clone());
         connecting.lock().await.remove(&handle);
 
-        // Best-effort version handshake (see ProtoEvent::Hello docs).
+        // Best-effort version + capability handshake (see ProtoEvent::Hello and
+        // ProtoEvent::Capability docs). Both writes share the one send guard so
+        // the ping_pong task (spawned just below) can't wedge a Ping between
+        // them — the peer observes Hello then Capability, in order.
         {
             let mut send = link.send.lock().await;
             if let Err(e) = transport::write_frame(
@@ -328,6 +339,12 @@ async fn connect_to_handle(
             .await
             {
                 log::debug!("hello send to {addr} failed: {e}");
+            }
+            if let Err(e) =
+                transport::write_frame(&mut send, ProtoEvent::Capability { flags: local_caps() })
+                    .await
+            {
+                log::debug!("capability send to {addr} failed: {e}");
             }
         }
 
@@ -425,6 +442,9 @@ async fn receive_loop(
                     ProtoEvent::Hello { commit } => {
                         client_manager.set_peer_commit(handle, Some(commit));
                     }
+                    ProtoEvent::Capability { flags } => {
+                        client_manager.set_peer_caps(handle, Some(flags));
+                    }
                     event => {
                         let _ = tx.send((handle, event));
                     }
@@ -458,6 +478,7 @@ async fn disconnect(
     }
     client_manager.set_active_addr(handle, None);
     client_manager.set_peer_commit(handle, None);
+    client_manager.set_peer_caps(handle, None);
     let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
     log::info!("active connections: {active:?}");
 }

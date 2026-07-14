@@ -35,6 +35,29 @@ pub fn local_commit() -> [u8; 8] {
     out
 }
 
+/// Capability bits this build advertises in the [`hops_proto::ProtoEvent::Capability`]
+/// handshake — the OR of every optional feature we actually implement AND choose
+/// to negotiate right now. A peer that sees `ABSOLUTE_MOTION` emits absolute
+/// motion to us (which PR-3 reconstructs), and our sender emits it to any peer
+/// that advertises it back.
+///
+/// `ABSOLUTE_MOTION` is now **on by default** — validated on the real rig
+/// (a full-workday soak: near-native feel, ratio parity with the relative
+/// path, zero regressions). Set `HOPS_ABSOLUTE_MOTION=0` (or `off`) to disable
+/// it for A/B comparison or debugging; the peer then never sees the bit and we
+/// fall back to the relative path. Advertising the bit is an honest opt-in:
+/// the peer only emits absolute motion once it observes we support it.
+pub fn local_caps() -> u32 {
+    let disabled = std::env::var("HOPS_ABSOLUTE_MOTION")
+        .map(|v| v == "0" || v.eq_ignore_ascii_case("off"))
+        .unwrap_or(false);
+    if disabled {
+        0
+    } else {
+        hops_proto::caps::ABSOLUTE_MOTION
+    }
+}
+
 /// `--version` string: package version + short git commit (both compile-time).
 const LONG_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("HOPS_SHORT_COMMIT"), ")");
 
