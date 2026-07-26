@@ -160,8 +160,14 @@ impl ClientManager {
 
     /// update the fix ips of the client
     pub fn set_fix_ips(&self, handle: ClientHandle, fix_ips: Vec<IpAddr>) {
-        if let Some((c, _)) = self.clients.borrow_mut().get_mut(handle as usize) {
-            c.fix_ips = fix_ips
+        if let Some((c, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            // only forget the learned identity if the target set actually changed
+            // — an additive/no-op re-push shouldn't drop a good pin and re-open
+            // the unpinned race. A fresh handshake re-learns + re-pins it.
+            if c.fix_ips != fix_ips {
+                s.peer_fingerprint = None;
+            }
+            c.fix_ips = fix_ips;
         }
         self.update_ips(handle);
     }
@@ -198,6 +204,9 @@ impl ClientManager {
             c.hostname = hostname;
             s.active_addr = None;
             s.dns_ips.clear();
+            // a new hostname may resolve to a different machine — forget the
+            // learned identity so the pin re-learns it on the next handshake.
+            s.peer_fingerprint = None;
             drop(clients);
             self.update_ips(handle);
             true
@@ -308,6 +317,29 @@ impl ClientManager {
     pub(crate) fn set_peer_fingerprint(&self, handle: ClientHandle, fingerprint: Option<String>) {
         if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
             s.peer_fingerprint = fingerprint;
+        }
+    }
+
+    /// The receiver's last-known leaf-cert fingerprint for this client
+    /// (process-local; learned at handshake, not persisted), or `None` if it has
+    /// never connected this run or the target address / trust changed since.
+    /// Used to pin the outbound dial (fail closed).
+    pub(crate) fn peer_fingerprint(&self, handle: ClientHandle) -> Option<String> {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .and_then(|(_, s)| s.peer_fingerprint.clone())
+    }
+
+    /// Clear the pin on any client currently pinned to `fingerprint`, so its
+    /// next dial re-learns identity. Called when trust in that fingerprint is
+    /// revoked (`remove_authorized_key`) — e.g. a receiver re-keyed on reinstall
+    /// and the operator authorized the new key.
+    pub(crate) fn clear_pins_matching(&self, fingerprint: &str) {
+        for (_, (_, s)) in self.clients.borrow_mut().iter_mut() {
+            if s.peer_fingerprint.as_deref() == Some(fingerprint) {
+                s.peer_fingerprint = None;
+            }
         }
     }
 

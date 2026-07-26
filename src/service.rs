@@ -608,6 +608,11 @@ impl Service {
 
     fn remove_authorized_key(&mut self, fp: String) {
         self.authorized_keys.write().expect("lock").remove(&fp);
+        // Revoking trust in a fingerprint releases any outbound pin on it, so a
+        // client whose receiver re-keyed (e.g. reinstall) can re-learn + re-pin
+        // the new identity on its next dial instead of being stranded on the
+        // dead fingerprint. See the fail-closed pin in `connect::connect`.
+        self.client_manager.clear_pins_matching(&fp);
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
     }

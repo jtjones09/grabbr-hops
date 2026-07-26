@@ -39,6 +39,8 @@ pub(crate) enum LanMouseConnectionError {
     TargetEmulationDisabled,
     #[error("connection timed out")]
     Timeout,
+    #[error("receiver fingerprint did not match the expected identity")]
+    FingerprintMismatch,
 }
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -90,6 +92,7 @@ fn peer_fingerprint(conn: &Connection) -> Option<String> {
 async fn connect(
     endpoint: Endpoint,
     addr: SocketAddr,
+    expected_fp: Option<String>,
 ) -> Result<(PeerLink, SocketAddr), (SocketAddr, LanMouseConnectionError)> {
     log::info!("connecting to {addr} ...");
     // server_name is the SNI label; trust is by fingerprint, so it is not
@@ -100,6 +103,23 @@ async fn connect(
         Ok(Err(e)) => return Err((addr, e.into())),
         Ok(Ok(conn)) => conn,
     };
+    // Fail-closed fingerprint pin. `FpServerVerifier` only proves the receiver
+    // is *some* allowlisted peer; when this client's identity is already known
+    // (a prior handshake, or later a pairing code), the raced address MUST
+    // present that exact leaf-cert fingerprint — otherwise a poisoned or
+    // ambiguous address that completes an allowlisted handshake could win the
+    // race and receive input meant for a different machine.
+    if let Some(expected) = &expected_fp {
+        let actual = peer_fingerprint(&conn);
+        if actual.as_deref() != Some(expected.as_str()) {
+            log::warn!(
+                "{addr}: receiver fingerprint {} != expected {expected}; rejecting",
+                actual.as_deref().unwrap_or("<none>")
+            );
+            conn.close(0u32.into(), b"fingerprint mismatch");
+            return Err((addr, LanMouseConnectionError::FingerprintMismatch));
+        }
+    }
     let send = conn.open_uni().await.map_err(|e| (addr, e.into()))?;
     Ok((
         PeerLink {
@@ -113,18 +133,34 @@ async fn connect(
 async fn connect_any(
     endpoint: &Endpoint,
     addrs: &[SocketAddr],
+    expected_fp: Option<String>,
 ) -> Result<(PeerLink, SocketAddr), LanMouseConnectionError> {
     let mut joinset = JoinSet::new();
     for &addr in addrs {
         let endpoint = endpoint.clone();
-        joinset.spawn_local(connect(endpoint, addr));
+        let expected = expected_fp.clone();
+        joinset.spawn_local(connect(endpoint, addr, expected));
     }
+    // if every candidate failed the identity pin (not a transport error), surface
+    // that distinctly so the caller logs the right recovery guidance.
+    let mut only_mismatch = !addrs.is_empty();
     loop {
         match joinset.join_next().await {
-            None => return Err(LanMouseConnectionError::NotConnected),
+            None => {
+                return Err(if only_mismatch {
+                    LanMouseConnectionError::FingerprintMismatch
+                } else {
+                    LanMouseConnectionError::NotConnected
+                });
+            }
             Some(r) => match r.expect("join error") {
                 Ok(conn) => return Ok(conn),
-                Err((a, e)) => log::warn!("failed to connect to {a}: `{e}`"),
+                Err((a, e)) => {
+                    if !matches!(e, LanMouseConnectionError::FingerprintMismatch) {
+                        only_mismatch = false;
+                    }
+                    log::warn!("failed to connect to {a}: `{e}`");
+                }
             },
         };
     }
@@ -314,28 +350,52 @@ async fn connect_to_handle(
             .map(|a| SocketAddr::new(a, port))
             .collect::<Vec<_>>();
         log::info!("client ({handle}) connecting ... (ips: {addrs:?})");
-        let (link, addr) = match connect_any(&endpoint, &addrs).await {
+        // Pin to the client's known identity (if any) so the parallel race
+        // fails closed against a wrong-but-allowlisted receiver at a raced addr.
+        let expected_fp = client_manager.peer_fingerprint(handle);
+        let (link, addr) = match connect_any(&endpoint, &addrs, expected_fp).await {
             Ok(c) => c,
             Err(e) => {
                 connecting.lock().await.remove(&handle);
-                if let Some(fp) = observed.lock().expect("lock").take() {
-                    log::warn!(
-                        "client {handle}: receiver fingerprint {fp} is not authorized — \
-                         add it to authorized_fingerprints to trust this receiver"
-                    );
+                match e {
+                    // handshake succeeded but the identity didn't match the pin —
+                    // NOT an authorization failure (the presented fp IS allowlisted).
+                    LanMouseConnectionError::FingerprintMismatch => log::warn!(
+                        "client {handle}: the receiver answered but its fingerprint did \
+                         not match the pinned identity — the target address may point at \
+                         a different machine, or the receiver re-keyed (reinstall). If it \
+                         re-keyed, remove the old fingerprint from authorized_fingerprints \
+                         and authorize the new one."
+                    ),
+                    _ => {
+                        if let Some(fp) = observed.lock().expect("lock").take() {
+                            log::warn!(
+                                "client {handle}: receiver fingerprint {fp} is not \
+                                 authorized — add it to authorized_fingerprints to trust \
+                                 this receiver"
+                            );
+                        }
+                    }
                 }
                 return Err(e);
             }
         };
         log::info!("client ({handle}) connected @ {addr}");
         // Stamp the receiver's leaf-cert fingerprint from THIS connection — the
-        // join key the frontend uses to correlate this outgoing client with its
-        // authorized_fingerprints entry (byte-identical to the allowlist key).
-        let receiver_fp = peer_fingerprint(&link.conn);
-        if let Some(fp) = &receiver_fp {
-            log::info!("client {handle} receiver fingerprint: {fp}");
+        // pin identity + the key the frontend uses to correlate this client with
+        // its authorized_fingerprints entry. Only overwrite on a real read: a
+        // None from an accepted handshake (shouldn't happen) must NOT wipe a good
+        // prior pin — that would fail OPEN on the next dial.
+        match peer_fingerprint(&link.conn) {
+            Some(fp) => {
+                log::info!("client {handle} receiver fingerprint: {fp}");
+                client_manager.set_peer_fingerprint(handle, Some(fp));
+            }
+            None => log::warn!(
+                "client {handle}: connected but could not read the receiver's \
+                 leaf-cert fingerprint; keeping any prior pin"
+            ),
         }
-        client_manager.set_peer_fingerprint(handle, receiver_fp);
         client_manager.set_active_addr(handle, Some(addr));
         conns.lock().await.insert(addr, link.clone());
         connecting.lock().await.remove(&handle);
@@ -495,7 +555,11 @@ async fn disconnect(
     client_manager.set_active_addr(handle, None);
     client_manager.set_peer_commit(handle, None);
     client_manager.set_peer_caps(handle, None);
-    client_manager.set_peer_fingerprint(handle, None);
+    // NB: peer_fingerprint is deliberately NOT cleared here — it's the client's
+    // last-known identity (process-local), used to pin the reconnect dial + join
+    // the device view, not a per-connection value. It's cleared only when the
+    // target address config changes (set_hostname / set_fix_ips) or trust in it
+    // is revoked (remove_authorized_key).
     let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
     log::info!("active connections: {active:?}");
 }
