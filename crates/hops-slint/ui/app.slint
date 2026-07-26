@@ -56,6 +56,8 @@ export component AppWindow inherits Window {
     in property <string> emulation: "—";
     in property <string> port: "—";
     in property <string> fingerprint: "—";
+    // this device's own pairing code (encoded), for the "share" reveal; "" if none
+    in property <string> pairing-code: "";
     in property <[DeviceRow]> devices: [];
     in property <string> pairing-fp: "";
 
@@ -77,6 +79,7 @@ export component AppWindow inherits Window {
     // real app's Rust side, which only ever reads them indirectly via clicks.
     in-out property <bool> show-settings: false;
     in-out property <bool> show-add-device: false;
+    in-out property <bool> show-share-code: false;
     property <string> add-device-position: "left";
     // `in-out`: Rust sets both together, once, when the canvas opens — NOT
     // re-pushed by the poll timer (see layout_canvas.slint's header note on
@@ -244,6 +247,11 @@ export component AppWindow inherits Window {
                     HorizontalLayout {
                         spacing: Space.sm;
                         PillButton {
+                            text: root.show-share-code ? "hide code" : "share";
+                            ghost: true;
+                            clicked => { root.show-share-code = !root.show-share-code; }
+                        }
+                        PillButton {
                             text: "arrange";
                             ghost: true;
                             clicked => { root.open-layout-canvas(); }
@@ -252,6 +260,50 @@ export component AppWindow inherits Window {
                             text: root.show-add-device ? "cancel" : "+ add";
                             ghost: true;
                             clicked => { root.show-add-device = !root.show-add-device; }
+                        }
+                    }
+                }
+                if root.show-share-code: Rectangle {
+                    vertical-stretch: 0;
+                    background: Theme.c.surface;
+                    border-radius: Radius.lg;
+                    border-width: 1px;
+                    border-color: Theme.c.border;
+                    VerticalLayout {
+                        padding: Space.md;
+                        spacing: Space.sm;
+                        Text {
+                            text: "share this device — paste on the other machine to pair across networks";
+                            color: Theme.c.muted;
+                            font-size: Type.caption;
+                        }
+                        Rectangle {
+                            background: Theme.c.surface-raised;
+                            border-radius: Radius.md;
+                            height: root.pairing-code == "" ? 40px : 76px;
+                            VerticalLayout {
+                                padding: Space.sm;
+                                alignment: center;
+                                if root.pairing-code == "": Text {
+                                    text: "no shareable address on this network";
+                                    color: Theme.c.muted;
+                                    font-size: Type.small;
+                                }
+                                if root.pairing-code != "": TextInput {
+                                    text: root.pairing-code;
+                                    read-only: true;
+                                    single-line: false;
+                                    wrap: word-wrap;
+                                    color: Theme.c.foreground;
+                                    font-family: Type.mono;
+                                    font-size: Type.caption;
+                                }
+                            }
+                        }
+                        Text {
+                            text: "select the code above and copy it (⌘C)";
+                            color: Theme.c.muted;
+                            font-size: Type.small;
                         }
                     }
                 }
