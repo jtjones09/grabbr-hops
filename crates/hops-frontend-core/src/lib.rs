@@ -146,6 +146,172 @@ impl AppModel {
     }
 }
 
+/// The trust status of a [`Device`] in the unified view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustState {
+    /// An outgoing client we have never completed a handshake with, so its
+    /// identity (fingerprint) is unknown/unpinned — trust is not established.
+    Provisional,
+    /// The peer's fingerprint is in the authorized allowlist.
+    Trusted,
+    /// An un-authorized peer awaiting the user's pairing approval.
+    PendingApproval,
+}
+
+/// The outgoing ("send input to this device") facet of a [`Device`], present
+/// iff this machine has a configured client for it.
+#[derive(Debug, Clone)]
+pub struct DeviceSend {
+    pub handle: ClientHandle,
+    pub config: ClientConfig,
+    pub state: ClientState,
+}
+
+/// One physical peer, unifying the two disjoint namespaces — the outgoing
+/// `clients` list (address-shaped) and the `authorized_fingerprints` allowlist
+/// (identity-shaped) — into a single record joined by the TLS leaf-cert
+/// fingerprint. Built by [`AppModel::devices`]. See `DEVICE-MODEL-DISCOVERY.md`.
+#[derive(Debug, Clone)]
+pub struct Device {
+    /// The peer's leaf-cert fingerprint — the identity + join key. `None` for a
+    /// provisional outgoing client that has never connected (no fp learned yet).
+    pub fingerprint: Option<String>,
+    /// Display label: the send-side hostname, else the trusted description,
+    /// else a short fingerprint.
+    pub label: String,
+    pub trust: TrustState,
+    /// A peer with this fingerprint is currently connected *in*.
+    pub online: bool,
+    /// Present iff this machine dials the device (a configured client).
+    pub send: Option<DeviceSend>,
+    /// True iff the device's fingerprint is in the authorized allowlist
+    /// (trusted to connect *in*).
+    pub receive: bool,
+}
+
+/// A compact, human-comparable rendering of a colon-separated fingerprint
+/// (first three groups, e.g. `1e:19:1b`) for use as a fallback label.
+fn short_fingerprint(fp: &str) -> String {
+    fp.split(':').take(3).collect::<Vec<_>>().join(":")
+}
+
+/// Pick a display label, preferring the user-typed send-side hostname, then the
+/// trusted description, then a short fingerprint, then a placeholder.
+fn display_label(hostname: Option<&str>, description: Option<&str>, fp: &str) -> String {
+    if let Some(h) = hostname.filter(|h| !h.is_empty()) {
+        return h.to_string();
+    }
+    if let Some(d) = description.filter(|d| !d.is_empty()) {
+        return d.to_string();
+    }
+    if !fp.is_empty() {
+        return short_fingerprint(fp);
+    }
+    "unnamed device".to_string()
+}
+
+impl AppModel {
+    /// Project the two disjoint namespaces — outgoing `clients` and `authorized`
+    /// fingerprints — into one [`Device`] per physical peer, joined by the peer
+    /// fingerprint (stamped onto `ClientState` at handshake). An outgoing client
+    /// that has never connected (no `peer_fingerprint`) stays its own
+    /// provisional card; a trusted fingerprint with no outgoing client is a
+    /// receive-only card. One approval keyed by fingerprint therefore surfaces
+    /// as one device in both directions — the end of double-entry.
+    pub fn devices(&self) -> Vec<Device> {
+        let is_self = |fp: &str| self.fingerprint.as_deref() == Some(fp);
+        let mut by_fp: HashMap<String, Device> = HashMap::new();
+        // provisional (never-connected) send cards have no fingerprint to key on
+        let mut provisional: Vec<Device> = Vec::new();
+
+        // 1. authorized fingerprints -> trusted / receive-capable devices
+        for (fp, desc) in &self.authorized {
+            if is_self(fp) {
+                continue; // never list ourselves
+            }
+            by_fp.insert(
+                fp.clone(),
+                Device {
+                    fingerprint: Some(fp.clone()),
+                    label: display_label(None, Some(desc), fp),
+                    trust: TrustState::Trusted,
+                    online: self.connected_peers.contains(fp),
+                    send: None,
+                    receive: true,
+                },
+            );
+        }
+
+        // 2. outgoing clients -> attach a send facet, joining by peer_fingerprint
+        for (&handle, (config, state)) in &self.clients {
+            let send = DeviceSend {
+                handle,
+                config: config.clone(),
+                state: state.clone(),
+            };
+            match state.peer_fingerprint.as_deref() {
+                Some(fp) if !is_self(fp) => {
+                    let device = by_fp.entry(fp.to_string()).or_insert_with(|| Device {
+                        fingerprint: Some(fp.to_string()),
+                        label: display_label(config.hostname.as_deref(), None, fp),
+                        trust: if self.pending_pairing.as_deref() == Some(fp) {
+                            TrustState::PendingApproval
+                        } else {
+                            TrustState::Provisional
+                        },
+                        online: self.connected_peers.contains(fp),
+                        send: None,
+                        receive: false,
+                    });
+                    // a user-typed send-side hostname is the preferred label
+                    if let Some(host) = config.hostname.as_deref().filter(|h| !h.is_empty()) {
+                        device.label = host.to_string();
+                    }
+                    device.send = Some(send);
+                }
+                // never connected (or our own fp somehow) -> own provisional card
+                _ => provisional.push(Device {
+                    fingerprint: None,
+                    label: display_label(config.hostname.as_deref(), None, ""),
+                    trust: TrustState::Provisional,
+                    online: false,
+                    send: Some(send),
+                    receive: false,
+                }),
+            }
+        }
+
+        // 3. a bare inbound pairing request not already represented above
+        if let Some(fp) = self.pending_pairing.as_deref() {
+            if !self.authorized.contains_key(fp) && !is_self(fp) {
+                by_fp.entry(fp.to_string()).or_insert_with(|| Device {
+                    fingerprint: Some(fp.to_string()),
+                    label: short_fingerprint(fp),
+                    trust: TrustState::PendingApproval,
+                    online: self.connected_peers.contains(fp),
+                    send: None,
+                    receive: false,
+                });
+            }
+        }
+
+        // send-facet devices first (ordered by handle), then receive-only (by label)
+        let mut out: Vec<Device> = by_fp.into_values().chain(provisional).collect();
+        out.sort_by(|a, b| {
+            match (
+                a.send.as_ref().map(|s| s.handle),
+                b.send.as_ref().map(|s| s.handle),
+            ) {
+                (Some(x), Some(y)) => x.cmp(&y),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.label.to_lowercase().cmp(&b.label.to_lowercase()),
+            }
+        });
+        out
+    }
+}
+
 /// Handle to the running IPC client: a shared observable [`AppModel`], a change
 /// signal, and a request sink. Clone it freely; spawn it inside a `LocalSet`.
 #[derive(Clone)]
@@ -245,5 +411,84 @@ async fn connection_loop(
         }
         changed.notify_one();
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AppModel, ClientConfig, ClientState, TrustState};
+
+    fn client(hostname: Option<&str>, peer_fp: Option<&str>) -> (ClientConfig, ClientState) {
+        let config = ClientConfig {
+            hostname: hostname.map(String::from),
+            ..Default::default()
+        };
+        let state = ClientState {
+            peer_fingerprint: peer_fp.map(String::from),
+            ..Default::default()
+        };
+        (config, state)
+    }
+
+    #[test]
+    fn merges_client_and_authorized_by_fingerprint() {
+        let mut m = AppModel::default();
+        let fp = "aa:bb:cc:dd";
+        m.clients.insert(0, client(Some("studio-mac"), Some(fp)));
+        m.authorized.insert(fp.to_string(), "studio-mac".to_string());
+        let devices = m.devices();
+        assert_eq!(devices.len(), 1, "one machine must render as one card");
+        let d = &devices[0];
+        assert!(d.send.is_some(), "carries the outgoing facet");
+        assert!(d.receive, "trusted to connect in");
+        assert_eq!(d.trust, TrustState::Trusted);
+        assert_eq!(d.fingerprint.as_deref(), Some(fp));
+    }
+
+    #[test]
+    fn offline_client_and_unrelated_trust_stay_two_cards() {
+        let mut m = AppModel::default();
+        // an outgoing client that has never connected (no fingerprint yet)
+        m.clients.insert(0, client(Some("studio-mac"), None));
+        // an unrelated trusted sender (receive-only)
+        m.authorized
+            .insert("cc:dd:ee:ff".to_string(), "windows-box".to_string());
+        let devices = m.devices();
+        assert_eq!(devices.len(), 2, "no fingerprint to join on => two cards");
+        assert!(devices
+            .iter()
+            .any(|d| d.fingerprint.is_none() && d.send.is_some()));
+        assert!(devices.iter().any(|d| d.receive && d.send.is_none()));
+    }
+
+    #[test]
+    fn excludes_this_device() {
+        let mut m = AppModel::default();
+        let me = "de:ad:be:ef";
+        m.fingerprint = Some(me.to_string());
+        m.authorized.insert(me.to_string(), "myself".to_string());
+        assert!(m.devices().is_empty(), "never list ourselves");
+    }
+
+    #[test]
+    fn bare_pairing_request_surfaces_as_pending() {
+        let mut m = AppModel::default();
+        let fp = "12:34:56:78";
+        m.pending_pairing = Some(fp.to_string());
+        let devices = m.devices();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].trust, TrustState::PendingApproval);
+        assert_eq!(devices[0].fingerprint.as_deref(), Some(fp));
+    }
+
+    #[test]
+    fn online_reflects_connected_peers() {
+        let mut m = AppModel::default();
+        let fp = "aa:bb:cc:dd";
+        m.authorized.insert(fp.to_string(), "studio-mac".to_string());
+        m.connected_peers.insert(fp.to_string());
+        let devices = m.devices();
+        assert_eq!(devices.len(), 1);
+        assert!(devices[0].online);
     }
 }
