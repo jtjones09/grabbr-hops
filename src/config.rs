@@ -532,10 +532,14 @@ impl Config {
     }
 
     /// set configured clients
+    ///
+    /// Always persists the passed list — including an empty one. The caller
+    /// (`save_config`) hands us the authoritative current set, so an empty list
+    /// means "no clients" and must be written through; the old early-return on
+    /// empty was the "phantom no-hostname client regenerates" bug (deleting your
+    /// only client couldn't persist, so the stale entry reloaded). Mirrors
+    /// `set_authorized_keys`, which correctly has no such guard.
     pub fn set_clients(&mut self, clients: Vec<ConfigClient>) {
-        if clients.is_empty() {
-            return;
-        }
         if self.config_toml.is_none() {
             self.config_toml = Some(Default::default());
         }
