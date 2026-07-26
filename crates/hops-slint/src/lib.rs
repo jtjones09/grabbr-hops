@@ -58,8 +58,7 @@ struct PolledUi {
     port: String,
     fingerprint: String,
     pairing: String,
-    devices: Vec<(String, String, String, String, bool, bool)>,
-    trusted: Vec<(String, String, String, bool)>,
+    devices: Vec<(String, String, String, String, bool, bool, bool, String, String, bool)>,
 }
 
 fn status_text(s: Status) -> &'static str {
@@ -534,44 +533,65 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                 .cloned()
                 .unwrap_or_default();
 
-            // outgoing devices, sorted by handle so the list order (and the change
-            // check below) is stable across the map's arbitrary iteration order
-            let mut clients: Vec<_> = m.clients.iter().collect();
-            clients.sort_by_key(|(h, _)| **h);
-            let devices: Vec<DeviceRow> = clients
+            // unified device view: one row per physical peer. AppModel::devices()
+            // joins the outgoing clients with the trusted-fingerprint set by
+            // identity (already sorted: send-facet devices by handle, then
+            // receive-only by label). Filter out a bare inbound pairing request
+            // (no send facet, not yet trusted) — it lives in the pairing banner
+            // above, not the list.
+            let devices: Vec<DeviceRow> = m
+                .devices()
                 .into_iter()
-                .map(|(h, (c, s))| {
-                    let addr = s
-                        .active_addr
-                        .map(|a| a.to_string())
-                        .or_else(|| c.fix_ips.first().map(|ip| format!("{ip}:{}", c.port)))
-                        .or_else(|| s.ips.iter().next().map(|ip| format!("{ip}:{}", c.port)))
-                        .unwrap_or_else(|| "unresolved".into());
+                .filter(|d| d.send.is_some() || d.receive)
+                .map(|d| {
+                    let (handle, addr, pos, active, alive, has_send) = match &d.send {
+                        Some(s) => {
+                            let addr = s
+                                .state
+                                .active_addr
+                                .map(|a| a.to_string())
+                                .or_else(|| {
+                                    s.config
+                                        .fix_ips
+                                        .first()
+                                        .map(|ip| format!("{ip}:{}", s.config.port))
+                                })
+                                .or_else(|| {
+                                    s.state
+                                        .ips
+                                        .iter()
+                                        .next()
+                                        .map(|ip| format!("{ip}:{}", s.config.port))
+                                })
+                                .unwrap_or_else(|| "unresolved".into());
+                            (
+                                s.handle.to_string(),
+                                addr,
+                                s.config.pos.to_string(),
+                                s.state.active,
+                                s.state.alive,
+                                true,
+                            )
+                        }
+                        None => (String::new(), String::new(), String::new(), false, false, false),
+                    };
                     DeviceRow {
-                        handle: h.to_string().into(),
-                        name: c.hostname.clone().unwrap_or_else(|| "unnamed".into()).into(),
+                        handle: handle.into(),
+                        name: d.label.clone().into(),
                         addr: addr.into(),
-                        pos: c.pos.to_string().into(),
-                        active: s.active,
-                        alive: s.alive,
+                        pos: pos.into(),
+                        active,
+                        alive,
+                        has_send,
+                        fingerprint: d
+                            .fingerprint
+                            .as_deref()
+                            .map(short_fp)
+                            .unwrap_or_default()
+                            .into(),
+                        fp_full: d.fingerprint.clone().unwrap_or_default().into(),
+                        online: d.online,
                     }
-                })
-                .collect();
-
-            // trusted peers (sorted by description, then fingerprint)
-            let mut tv: Vec<(String, String)> = m
-                .authorized
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            tv.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
-            let trusted: Vec<TrustedRow> = tv
-                .iter()
-                .map(|(fp, desc)| TrustedRow {
-                    name: desc.clone().into(),
-                    fp: short_fp(fp).into(),
-                    fp_full: fp.clone().into(),
-                    online: m.connected_peers.contains(fp),
                 })
                 .collect();
 
@@ -592,12 +612,12 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                             d.pos.to_string(),
                             d.active,
                             d.alive,
+                            d.has_send,
+                            d.fingerprint.to_string(),
+                            d.fp_full.to_string(),
+                            d.online,
                         )
                     })
-                    .collect(),
-                trusted: trusted
-                    .iter()
-                    .map(|t| (t.name.to_string(), t.fp.to_string(), t.fp_full.to_string(), t.online))
                     .collect(),
             };
 
@@ -614,7 +634,6 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
             ui.set_fingerprint(snap.fingerprint.as_str().into());
             ui.set_pairing_fp(snap.pairing.as_str().into());
             ui.set_devices(ModelRc::new(VecModel::from(devices)));
-            ui.set_trusted(ModelRc::new(VecModel::from(trusted)));
             *last_ui.borrow_mut() = Some(snap);
         },
     );
