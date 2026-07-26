@@ -40,6 +40,10 @@ pub struct AppModel {
     pub emulation: Status,
     /// This device's public-key fingerprint.
     pub fingerprint: Option<String>,
+    /// This device's own shareable pairing code (encoded), or `None` if it has no
+    /// shareable LAN address. Sent by the daemon on sync; the UI reveals it so the
+    /// user can hand it to another machine to pair across a subnet.
+    pub local_pairing_code: Option<String>,
     /// Trusted peer fingerprints -> description.
     pub authorized: HashMap<String, String>,
     /// The daemon's listen port.
@@ -80,6 +84,9 @@ impl AppModel {
             FrontendEvent::CaptureStatus(s) => self.capture = s,
             FrontendEvent::EmulationStatus(s) => self.emulation = s,
             FrontendEvent::PublicKeyFingerprint(fp) => self.fingerprint = Some(fp),
+            FrontendEvent::PairingCode(code) => {
+                self.local_pairing_code = (!code.is_empty()).then_some(code);
+            }
             FrontendEvent::AuthorizedUpdated(map) => {
                 self.authorized = map;
                 // a pending request that just became trusted is resolved

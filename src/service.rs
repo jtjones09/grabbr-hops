@@ -523,6 +523,43 @@ impl Service {
         self.notify_frontend(FrontendEvent::PublicKeyFingerprint(
             self.public_key_fingerprint.clone(),
         ));
+        // this device's own shareable pairing code: its fingerprint + routable
+        // LAN IPv4 addresses + hostname label (empty if there's no shareable
+        // address). IPv4 only — IPv6 link-local is scope-dependent and useless
+        // out-of-band. See hops_ipc::pairing.
+        let pairing_code = {
+            let addrs: Vec<SocketAddr> = if_addrs::get_if_addrs()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|iface| match iface.ip() {
+                    std::net::IpAddr::V4(v4)
+                        if !v4.is_loopback()
+                            && !v4.is_link_local()
+                            && !v4.is_unspecified()
+                            && !v4.is_broadcast() =>
+                    {
+                        Some(SocketAddr::new(std::net::IpAddr::V4(v4), self.port))
+                    }
+                    _ => None,
+                })
+                .take(8) // matches hops_ipc::pairing MAX_ADDRS
+                .collect();
+            if addrs.is_empty() {
+                String::new()
+            } else {
+                let label = hostname::get()
+                    .ok()
+                    .and_then(|h| h.into_string().ok())
+                    .unwrap_or_default();
+                hops_ipc::PairingCode {
+                    fingerprint: self.public_key_fingerprint.clone(),
+                    addrs,
+                    label,
+                }
+                .encode()
+            }
+        };
+        self.notify_frontend(FrontendEvent::PairingCode(pairing_code));
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
         // re-emit current incoming connections so a freshly-attached UI knows

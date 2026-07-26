@@ -245,6 +245,9 @@ pub enum FrontendEvent {
     AuthorizedUpdated(HashMap<String, String>),
     /// public key fingerprint of this device
     PublicKeyFingerprint(String),
+    /// this device's own pairing code (encoded, ready to share out-of-band), or
+    /// empty if no shareable LAN address is available. See `pairing::PairingCode`.
+    PairingCode(String),
     /// new device connected
     DeviceConnected {
         addr: SocketAddr,
