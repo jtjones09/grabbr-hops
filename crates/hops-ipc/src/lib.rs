@@ -19,10 +19,12 @@ use serde::{Deserialize, Serialize};
 mod connect;
 mod connect_async;
 mod listen;
+pub mod pairing;
 
 pub use connect::{FrontendEventReader, FrontendRequestWriter, connect};
 pub use connect_async::{AsyncFrontendEventReader, AsyncFrontendRequestWriter, connect_async};
 pub use listen::AsyncFrontendListener;
+pub use pairing::{PairingCode, PairingError};
 
 #[derive(Debug, Error)]
 pub enum ConnectionError {
