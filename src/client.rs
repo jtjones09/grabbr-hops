@@ -305,6 +305,12 @@ impl ClientManager {
         }
     }
 
+    pub(crate) fn set_peer_fingerprint(&self, handle: ClientHandle, fingerprint: Option<String>) {
+        if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            s.peer_fingerprint = fingerprint;
+        }
+    }
+
     /// Capability bits the peer advertised via the Capability handshake, or
     /// `0` if none received yet (older peer / not-yet-negotiated) — so every
     /// gate degrades to the pre-capability behavior.

@@ -206,6 +206,14 @@ pub struct ClientState {
     /// the pre-capability behavior when absent. Mirrors `peer_commit`.
     #[serde(default)]
     pub peer_caps: Option<u32>,
+    /// Leaf-cert SHA-256 fingerprint of the connected peer (the receiver this
+    /// outgoing client dials), read from the completed TLS handshake. `None`
+    /// until a connection completes, and cleared on disconnect. This is the
+    /// join key a frontend uses to correlate an outgoing client with its
+    /// `authorized_fingerprints` entry — it is byte-identical to the allowlist
+    /// key. Mirrors `peer_commit`/`peer_caps`.
+    #[serde(default)]
+    pub peer_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

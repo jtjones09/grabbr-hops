@@ -7,6 +7,7 @@ use hops_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender, channel};
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig, Connection, Endpoint, SendStream, TransportConfig};
+use rustls::pki_types::CertificateDer;
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -74,6 +75,16 @@ fn client_config(
     transport_config.max_idle_timeout(Some(MAX_IDLE.try_into().expect("idle timeout")));
     config.transport_config(Arc::new(transport_config));
     config
+}
+
+/// Fingerprint of the peer's leaf cert from a completed handshake. quinn hands
+/// the presented chain as `Vec<CertificateDer>`. Reading it off the specific
+/// connection is race-free, unlike the shared `observed` slot (which concurrent
+/// dials to other handles can clobber). Mirrors `listen::peer_fingerprint`.
+fn peer_fingerprint(conn: &Connection) -> Option<String> {
+    let identity = conn.peer_identity()?;
+    let certs = identity.downcast::<Vec<CertificateDer<'static>>>().ok()?;
+    certs.first().map(transport::fingerprint_of)
 }
 
 async fn connect(
@@ -317,9 +328,14 @@ async fn connect_to_handle(
             }
         };
         log::info!("client ({handle}) connected @ {addr}");
-        if let Some(fp) = observed.lock().expect("lock").clone() {
+        // Stamp the receiver's leaf-cert fingerprint from THIS connection — the
+        // join key the frontend uses to correlate this outgoing client with its
+        // authorized_fingerprints entry (byte-identical to the allowlist key).
+        let receiver_fp = peer_fingerprint(&link.conn);
+        if let Some(fp) = &receiver_fp {
             log::info!("client {handle} receiver fingerprint: {fp}");
         }
+        client_manager.set_peer_fingerprint(handle, receiver_fp);
         client_manager.set_active_addr(handle, Some(addr));
         conns.lock().await.insert(addr, link.clone());
         connecting.lock().await.remove(&handle);
@@ -479,6 +495,7 @@ async fn disconnect(
     client_manager.set_active_addr(handle, None);
     client_manager.set_peer_commit(handle, None);
     client_manager.set_peer_caps(handle, None);
+    client_manager.set_peer_fingerprint(handle, None);
     let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
     log::info!("active connections: {active:?}");
 }
