@@ -130,19 +130,6 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
         Some("settings") => ui.set_show_settings(true),
         Some("add-device") => ui.set_show_add_device(true),
         Some("share-code") => ui.set_show_share_code(true),
-        Some("paste-code") => ui.set_show_paste_code(true),
-        Some("paste-confirm") => {
-            ui.set_show_paste_code(true);
-            ui.set_pending_code_label("carrier-mbp".into());
-            ui.set_pending_code_fp(
-                "2d:65:8f:e6:f8:23:df:9c:c3:df:23:0a:08:39:19:4f:ed:27:7e:d2:57:56:a0:43:41:49:af:8a:11:1b:e9:d5".into(),
-            );
-            ui.set_pending_code_addrs("10.110.21.46:4242, 10.110.20.99:4242".into());
-        }
-        Some("paste-error") => {
-            ui.set_show_paste_code(true);
-            ui.set_paste_error("not a hops pairing code".into());
-        }
         Some("edit-device") => ui.set_editing_device("1".into()), // matches the mock studio-pc handle
         Some("delete-confirm") => ui.set_confirm_delete_handle("1".into()),
         Some("layout-canvas") => {
