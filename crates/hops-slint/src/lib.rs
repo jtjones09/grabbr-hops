@@ -58,7 +58,6 @@ struct PolledUi {
     port: String,
     fingerprint: String,
     pairing: String,
-    pairing_code: String,
     devices: Vec<(String, String, String, String, bool, bool, bool, String, String, bool)>,
 }
 
@@ -603,7 +602,6 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                 port: m.port.map(|p| p.to_string()).unwrap_or_else(|| "—".to_string()),
                 fingerprint: m.fingerprint.clone().unwrap_or_else(|| "—".to_string()),
                 pairing,
-                pairing_code: m.local_pairing_code.clone().unwrap_or_default(),
                 devices: devices
                     .iter()
                     .map(|d| {
@@ -635,7 +633,6 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
             ui.set_port(snap.port.as_str().into());
             ui.set_fingerprint(snap.fingerprint.as_str().into());
             ui.set_pairing_fp(snap.pairing.as_str().into());
-            ui.set_pairing_code(snap.pairing_code.as_str().into());
             ui.set_devices(ModelRc::new(VecModel::from(devices)));
             *last_ui.borrow_mut() = Some(snap);
         },

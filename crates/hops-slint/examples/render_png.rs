@@ -65,10 +65,6 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
     ui.set_port("4242".into());
     ui.set_fingerprint("73:90:2a:3c:9d:e5:18:52:7c:aa:c3:de:de:04:cd:ec".into());
     ui.set_pairing_fp("a4:f0:9c:2e:11:bd:77:0c:35:9a".into()); // shows the pairing card
-    ui.set_pairing_code(
-        "hops-pair-1.eyJmaW5nZXJwcmludCI6IjFlOjE5OjFiOmM0OmE4OjQwOmY1OjI2IiwiYWRkcnMiOlsiMTAuMTEwLjIwLjk5OjQyNDIiLCIxMC4xMTAuMjEuMTc1OjQyNDIiXSwibGFiZWwiOiJzY29ybi1tYnAifQ"
-            .into(),
-    );
 
     // Exercise all four merged-card states in one shot.
     ui.set_devices(ModelRc::new(VecModel::from(vec![
@@ -129,7 +125,6 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
     match std::env::args().nth(5).as_deref() {
         Some("settings") => ui.set_show_settings(true),
         Some("add-device") => ui.set_show_add_device(true),
-        Some("share-code") => ui.set_show_share_code(true),
         Some("edit-device") => ui.set_editing_device("1".into()), // matches the mock studio-pc handle
         Some("delete-confirm") => ui.set_confirm_delete_handle("1".into()),
         Some("layout-canvas") => {
