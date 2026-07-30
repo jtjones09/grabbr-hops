@@ -86,6 +86,14 @@ export component AppWindow inherits Window {
     // why a drag would otherwise get fought by the next live update).
     in-out property <bool> show-layout-canvas: false;
     in-out property <[CanvasBox]> canvas-boxes: [];
+    // --- paste-a-pairing-code flow. Rust decodes into the `pending-code-*`
+    // fields (or sets `paste-error`); nothing is trusted until the user clicks
+    // "trust & add", which is the single approval gate for this path.
+    in-out property <bool> show-paste-code: false;
+    in-out property <string> paste-error: "";
+    in-out property <string> pending-code-label: "";
+    in-out property <string> pending-code-fp: "";
+    in-out property <string> pending-code-addrs: "";
 
     callback enable-input();
     callback activate-device(string /* handle */, bool /* active */);
@@ -97,6 +105,10 @@ export component AppWindow inherits Window {
     callback deny-pairing(string /* full fingerprint */);
     callback set-theme(int /* palette index */);
     callback create-device(string /* name */, string /* port */, string /* position */);
+    // paste-a-code: decode is inspection only (never grants trust); confirm is
+    // the explicit approval that authorizes the fingerprint AND adds the device.
+    callback decode-pairing-code(string /* pasted code */);
+    callback confirm-pairing-code(string /* position */);
     callback switch-interface();
     callback open-layout-canvas();
     callback update-device-geometry(string /* handle */, float /* x */, float /* y */);
@@ -252,6 +264,15 @@ export component AppWindow inherits Window {
                             clicked => { root.show-share-code = !root.show-share-code; }
                         }
                         PillButton {
+                            text: root.show-paste-code ? "cancel code" : "+ code";
+                            ghost: true;
+                            clicked => {
+                                root.show-paste-code = !root.show-paste-code;
+                                root.paste-error = "";
+                                root.pending-code-fp = "";
+                            }
+                        }
+                        PillButton {
                             text: "arrange";
                             ghost: true;
                             clicked => { root.open-layout-canvas(); }
@@ -260,6 +281,123 @@ export component AppWindow inherits Window {
                             text: root.show-add-device ? "cancel" : "+ add";
                             ghost: true;
                             clicked => { root.show-add-device = !root.show-add-device; }
+                        }
+                    }
+                }
+                // --- paste a pairing code from another device --------------------------
+                if root.show-paste-code: Rectangle {
+                    vertical-stretch: 0;
+                    background: Theme.c.surface;
+                    border-radius: Radius.lg;
+                    border-width: 1px;
+                    border-color: root.pending-code-fp != "" ? Theme.c.accent : Theme.c.border;
+                    VerticalLayout {
+                        padding: Space.md;
+                        spacing: Space.sm;
+                        Text {
+                            text: "paste a pairing code from the other device";
+                            color: Theme.c.muted;
+                            font-size: Type.caption;
+                        }
+                        // step 1 — paste + check (inspection only, grants nothing)
+                        if root.pending-code-fp == "": HorizontalLayout {
+                            spacing: Space.sm;
+                            code-field := TextField {
+                                placeholder: "hops-pair-1.…";
+                                horizontal-stretch: 1;
+                                accepted => { root.decode-pairing-code(self.text); }
+                            }
+                            PillButton {
+                                text: "check";
+                                primary: true;
+                                clicked => { root.decode-pairing-code(code-field.text); }
+                            }
+                        }
+                        if root.paste-error != "": Text {
+                            text: root.paste-error;
+                            color: Theme.c.error;
+                            font-size: Type.small;
+                            wrap: word-wrap;
+                        }
+                        // step 2 — confirm the IDENTITY, then grant
+                        if root.pending-code-fp != "": VerticalLayout {
+                            spacing: Space.sm;
+                            Text {
+                                text: "claims to be: " + root.pending-code-label;
+                                color: Theme.c.foreground;
+                                font-weight: Type.medium;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: root.pending-code-addrs;
+                                color: Theme.c.muted;
+                                font-family: Type.mono;
+                                font-size: Type.caption;
+                                letter-spacing: Type.mono-tracking;
+                                overflow: elide;
+                            }
+                            Rectangle {
+                                background: Theme.c.surface-raised;
+                                border-radius: Radius.md;
+                                VerticalLayout {
+                                    padding: Space.sm;
+                                    Text {
+                                        text: "fingerprint — confirm this matches the other device";
+                                        color: Theme.c.muted;
+                                        font-size: Type.caption;
+                                    }
+                                    Text {
+                                        text: root.pending-code-fp;
+                                        color: Theme.c.foreground;
+                                        font-family: Type.mono;
+                                        font-size: Type.caption;
+                                        letter-spacing: Type.mono-tracking;
+                                        wrap: word-wrap;
+                                    }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: Space.sm;
+                                Text {
+                                    text: "position";
+                                    color: Theme.c.muted;
+                                    font-size: Type.small;
+                                    vertical-alignment: center;
+                                }
+                                for p in ["left", "right", "top", "bottom"]: PillButton {
+                                    text: p;
+                                    primary: root.add-device-position == p;
+                                    clicked => { root.add-device-position = p; }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: Space.sm;
+                                alignment: start;
+                                VerticalLayout {
+                                    alignment: center;
+                                    PillButton {
+                                        text: "trust & add";
+                                        primary: true;
+                                        clicked => {
+                                            root.confirm-pairing-code(root.add-device-position);
+                                            root.pending-code-fp = "";
+                                            root.show-paste-code = false;
+                                            root.add-device-position = "left";
+                                        }
+                                    }
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    PillButton {
+                                        text: "discard";
+                                        ghost: true;
+                                        clicked => {
+                                            root.pending-code-fp = "";
+                                            root.paste-error = "";
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }

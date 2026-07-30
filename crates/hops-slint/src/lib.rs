@@ -403,7 +403,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
     // assigns (Create is fire-and-forget; the handle only appears once the
     // resulting `Created` event reaches the next snapshot). Applied by the poll
     // loop below as soon as a handle absent from `known_handles` shows up.
-    let pending_new_device: Rc<RefCell<Option<(String, u16, Position)>>> =
+    let pending_new_device: Rc<RefCell<Option<(String, u16, Position, Vec<std::net::IpAddr>)>>> =
         Rc::new(RefCell::new(None));
     let known_handles: Rc<RefCell<HashSet<ClientHandle>>> = Rc::new(RefCell::new(HashSet::new()));
     {
@@ -413,7 +413,65 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
             let name = name.trim().to_string();
             let port = port.trim().parse::<u16>().unwrap_or(DEFAULT_PORT);
             let position = Position::try_from(position.as_str()).unwrap_or_default();
-            *pending.borrow_mut() = Some((name, port, position));
+            *pending.borrow_mut() = Some((name, port, position, Vec::new()));
+            c.request(FrontendRequest::Create);
+        });
+    }
+    // --- paste a pairing code -------------------------------------------------
+    // Two steps by design. `decode` only INSPECTS (parses + validates + shows the
+    // fingerprint); it grants nothing and touches no config. `confirm` is the
+    // single approval gate: it authorizes the fingerprint and seeds the device.
+    // A pasted code is never sufficient on its own — see DEVICE-MODEL-DISCOVERY.md.
+    let pending_code: Rc<RefCell<Option<hops_ipc::PairingCode>>> = Rc::new(RefCell::new(None));
+    {
+        let weak = ui.as_weak();
+        let pc = pending_code.clone();
+        ui.on_decode_pairing_code(move |pasted| {
+            let Some(ui) = weak.upgrade() else { return };
+            match hops_ipc::PairingCode::decode(pasted.as_str()) {
+                Ok(code) => {
+                    let addrs = code
+                        .addrs
+                        .iter()
+                        .map(|a| a.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    ui.set_pending_code_label(
+                        if code.label.is_empty() { "unnamed device".into() } else { code.label.clone() }
+                            .as_str()
+                            .into(),
+                    );
+                    ui.set_pending_code_fp(code.fingerprint.as_str().into());
+                    ui.set_pending_code_addrs(addrs.as_str().into());
+                    ui.set_paste_error("".into());
+                    *pc.borrow_mut() = Some(code);
+                }
+                Err(e) => {
+                    ui.set_pending_code_fp("".into());
+                    ui.set_paste_error(format!("{e}").as_str().into());
+                    *pc.borrow_mut() = None;
+                }
+            }
+        });
+    }
+    {
+        let c = client.clone();
+        let pc = pending_code.clone();
+        let pending = pending_new_device.clone();
+        ui.on_confirm_pairing_code(move |position| {
+            let Some(code) = pc.borrow_mut().take() else { return };
+            let position = Position::try_from(position.as_str()).unwrap_or_default();
+            let label = if code.label.is_empty() {
+                short_fp(&code.fingerprint)
+            } else {
+                code.label.clone()
+            };
+            // 1. trust the identity the human just confirmed
+            c.request(FrontendRequest::AuthorizeKey(label.clone(), code.fingerprint.clone()));
+            // 2. seed the device; the poll loop applies these once the handle appears
+            let port = code.addrs.first().map(|a| a.port()).unwrap_or(DEFAULT_PORT);
+            let ips: Vec<std::net::IpAddr> = code.addrs.iter().map(|a| a.ip()).collect();
+            *pending.borrow_mut() = Some((label, port, position, ips));
             c.request(FrontendRequest::Create);
         });
     }
@@ -491,7 +549,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
             // apply a pending create's name/port/position once its handle shows up
             {
                 let current: HashSet<ClientHandle> = m.clients.keys().copied().collect();
-                if let Some((name, port, position)) = pending_new_device.borrow_mut().take() {
+                if let Some((name, port, position, ips)) = pending_new_device.borrow_mut().take() {
                     match current.difference(&known_handles.borrow()).next() {
                         Some(&new_handle) => {
                             if !name.is_empty() {
@@ -502,9 +560,16 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                             }
                             client.request(FrontendRequest::UpdatePort(new_handle, port));
                             client.request(FrontendRequest::UpdatePosition(new_handle, position));
+                            // from a pairing code: the routable addresses it carried
+                            if !ips.is_empty() {
+                                client.request(FrontendRequest::UpdateFixIps(new_handle, ips));
+                                client.request(FrontendRequest::Activate(new_handle, true));
+                            }
                         }
                         // the Created event hasn't reached a snapshot yet — retry next tick
-                        None => *pending_new_device.borrow_mut() = Some((name, port, position)),
+                        None => {
+                            *pending_new_device.borrow_mut() = Some((name, port, position, ips))
+                        }
                     }
                 }
                 *known_handles.borrow_mut() = current;
