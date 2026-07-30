@@ -45,6 +45,13 @@ pub(crate) struct MacOSEmulation {
     button_click_state: i64,
     /// current modifier state
     modifier_state: Rc<Cell<XMods>>,
+    /// Latch for whether the physical Caps Lock key is currently held. A held
+    /// Caps Lock auto-repeats a stream of key-downs (no intervening up), and
+    /// toggling the lock on each repeat flips it on/off erratically + floods
+    /// FlagsChanged posts (the "held Caps Lock jams the session" bug). This
+    /// latches the fresh press so repeats are ignored; cleared on key-up and at
+    /// session start.
+    caps_down: Cell<bool>,
     /// notify to cancel key repeats
     notify_repeat_task: Arc<Notify>,
     /// last observed secure-input state, so we log only on the transition into it
@@ -139,6 +146,7 @@ impl MacOSEmulation {
             repeat_task: None,
             notify_repeat_task: Arc::new(Notify::new()),
             modifier_state: Rc::new(Cell::new(XMods::empty())),
+            caps_down: Cell::new(false),
             secure_input_prev: Cell::new(false),
             hid_connect,
             hid_modifiers,
@@ -2186,27 +2194,29 @@ impl Emulation for MacOSEmulation {
                             return Ok(());
                         }
                     };
-                    let is_modifier = update_modifiers(&self.modifier_state, key, state);
-                    if is_modifier {
+                    match update_modifiers(&self.modifier_state, &self.caps_down, key, state) {
                         // Modifier keys are posted as FlagsChanged events carrying
                         // their real keycode (see modifier_key_event). They must NOT
                         // enter the key-repeat machinery: there is only one repeat
                         // slot, so pressing a second modifier would cancel the first
                         // modifier's repeat task and post a keyUp while it is still
                         // physically held, tearing chords apart (issue #450, #357).
-                        self.post_modifier(code, self.modifier_state.get());
-                    } else {
-                        // Before typing a normal key, make sure no stale modifier
-                        // flag the OS still holds turns it into a silent chord (the
-                        // "ghosting" / dead-keyboard symptom). Diagnoses and, if
-                        // enabled, self-heals the divergence in one event.
-                        if state == 1 {
-                            self.coherence_pass("key", true);
-                        }
-                        match state {
-                            // pressed
-                            1 => self.spawn_repeat_task(code).await,
-                            _ => self.cancel_repeat_task().await,
+                        ModifierAction::Post => self.post_modifier(code, self.modifier_state.get()),
+                        // Suppressed Caps Lock auto-repeat: consume, don't re-post.
+                        ModifierAction::Swallow => {}
+                        ModifierAction::NotModifier => {
+                            // Before typing a normal key, make sure no stale modifier
+                            // flag the OS still holds turns it into a silent chord (the
+                            // "ghosting" / dead-keyboard symptom). Diagnoses and, if
+                            // enabled, self-heals the divergence in one event.
+                            if state == 1 {
+                                self.coherence_pass("key", true);
+                            }
+                            match state {
+                                // pressed
+                                1 => self.spawn_repeat_task(code).await,
+                                _ => self.cancel_repeat_task().await,
+                            }
                         }
                     }
                 }
@@ -2240,6 +2250,8 @@ impl Emulation for MacOSEmulation {
         // signal (learned thresholds survive across sessions)
         self.edge_pressure.on_session_created();
         self.pending_edge_push = None;
+        // Fresh crossing: don't carry a stale Caps Lock held-latch across visits.
+        self.caps_down.set(false);
         // Trueloop Phase A: re-anchor the divergence integral each visit so a
         // cross-away/return doesn't log a phantom offset.
         self.probe_integral.set(None);
@@ -2274,44 +2286,77 @@ impl Emulation for MacOSEmulation {
     }
 }
 
-fn update_modifiers(modifiers: &Cell<XMods>, key: u32, state: u8) -> bool {
-    if let Ok(key) = scancode::Linux::try_from(key) {
-        // Caps Lock is a LOCKING modifier: a press toggles a persistent state
-        // rather than being active only while physically held. Toggle on
-        // key-down and ignore key-up, so the AlphaShift flag stays set on every
-        // following keystroke until Caps Lock is pressed again. (A synthetic
-        // CGEvent can't flip the hardware Caps Lock LED, but carrying the flag
-        // produces the correct upper-case output — and, like real Caps Lock,
-        // leaves the number-row symbols unshifted.)
-        if matches!(key, scancode::Linux::KeyCapsLock) {
-            if state == 1 {
+/// What [`update_modifiers`] decided a decoded key is, and what the caller
+/// should do with it.
+enum ModifierAction {
+    /// Not a modifier — dispatch it as a normal key (into the repeat machinery).
+    NotModifier,
+    /// A modifier whose effective flags changed — post a FlagsChanged.
+    Post,
+    /// A modifier event to consume but NOT post: a suppressed Caps Lock
+    /// auto-repeat. Its flags are unchanged, and re-posting a FlagsChanged for
+    /// every repeat is the event flood at the heart of the held-Caps-Lock bug.
+    Swallow,
+}
+
+fn update_modifiers(
+    modifiers: &Cell<XMods>,
+    caps_down: &Cell<bool>,
+    key: u32,
+    state: u8,
+) -> ModifierAction {
+    let Ok(key) = scancode::Linux::try_from(key) else {
+        return ModifierAction::NotModifier;
+    };
+    // Caps Lock is a LOCKING modifier: a press toggles a persistent state
+    // rather than being active only while physically held. Act on the key-DOWN
+    // TRANSITION only — a held Caps Lock auto-repeats a stream of key-downs with
+    // no intervening up. The old code toggled the lock AND posted a FlagsChanged
+    // on every repeat, flipping the lock on/off erratically and flooding the
+    // injection path (the "held Caps Lock jams the session" bug). `caps_down`
+    // latches the physical key: the fresh press toggles + posts, auto-repeats
+    // are swallowed (no toggle, no post), and the key-up (always delivered on
+    // the reliable stream — synthesized by release_capture if the crossing ends
+    // mid-hold) clears the latch. (A synthetic CGEvent can't flip the hardware
+    // Caps Lock LED, but carrying the flag produces the correct upper-case
+    // output — and, like real Caps Lock, leaves the number-row symbols
+    // unshifted.)
+    if matches!(key, scancode::Linux::KeyCapsLock) {
+        return match state {
+            // replace() latches the key down; the prior value distinguishes a
+            // fresh press (false) from an auto-repeat (already true)
+            1 if caps_down.replace(true) => ModifierAction::Swallow,
+            1 => {
                 let mut mods = modifiers.get();
                 mods.toggle(XMods::LockMask);
                 modifiers.set(mods);
+                ModifierAction::Post
             }
-            return true;
-        }
-        let mask = match key {
-            scancode::Linux::KeyLeftShift | scancode::Linux::KeyRightShift => XMods::ShiftMask,
-            scancode::Linux::KeyLeftCtrl | scancode::Linux::KeyRightCtrl => XMods::ControlMask,
-            scancode::Linux::KeyLeftAlt | scancode::Linux::KeyRightalt => XMods::Mod1Mask,
-            scancode::Linux::KeyLeftMeta | scancode::Linux::KeyRightmeta => XMods::Mod4Mask,
-            _ => XMods::empty(),
+            // release: clear the latch, post (flags unchanged — mirrors the
+            // prior per-tap behavior)
+            _ => {
+                caps_down.set(false);
+                ModifierAction::Post
+            }
         };
-        // unchanged
-        if mask.is_empty() {
-            return false;
-        }
-        let mut mods = modifiers.get();
-        match state {
-            1 => mods.insert(mask),
-            _ => mods.remove(mask),
-        }
-        modifiers.set(mods);
-        true
-    } else {
-        false
     }
+    let mask = match key {
+        scancode::Linux::KeyLeftShift | scancode::Linux::KeyRightShift => XMods::ShiftMask,
+        scancode::Linux::KeyLeftCtrl | scancode::Linux::KeyRightCtrl => XMods::ControlMask,
+        scancode::Linux::KeyLeftAlt | scancode::Linux::KeyRightalt => XMods::Mod1Mask,
+        scancode::Linux::KeyLeftMeta | scancode::Linux::KeyRightmeta => XMods::Mod4Mask,
+        _ => XMods::empty(),
+    };
+    if mask.is_empty() {
+        return ModifierAction::NotModifier;
+    }
+    let mut mods = modifiers.get();
+    match state {
+        1 => mods.insert(mask),
+        _ => mods.remove(mask),
+    }
+    modifiers.set(mods);
+    ModifierAction::Post
 }
 
 fn set_modifiers(
