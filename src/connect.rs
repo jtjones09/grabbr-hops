@@ -178,6 +178,12 @@ pub(crate) struct LanMouseConnection {
     observed: Arc<StdMutex<Option<String>>>,
     /// inbound clipboard text received from peers, forwarded to the service.
     clipboard_in: Sender<String>,
+    /// fingerprint of a receiver we tried to dial but do not trust. The service
+    /// turns this into a `ConnectionAttempt` so the UI can offer to authorize it
+    /// — without this, an untrusted RECEIVER is only ever a log line and the user
+    /// has no in-app way to trust it (the inbound path has had a prompt all
+    /// along; the outbound path never did).
+    untrusted_tx: Sender<String>,
 }
 
 impl LanMouseConnection {
@@ -186,6 +192,7 @@ impl LanMouseConnection {
         client_manager: ClientManager,
         authorized: Authorized,
         clipboard_in: Sender<String>,
+        untrusted_tx: Sender<String>,
     ) -> Result<Self, LanMouseConnectionError> {
         transport::install_crypto_provider();
         let observed = Arc::new(StdMutex::new(None));
@@ -202,6 +209,7 @@ impl LanMouseConnection {
             ping_response: Default::default(),
             observed,
             clipboard_in,
+            untrusted_tx,
         })
     }
 
@@ -268,6 +276,7 @@ impl LanMouseConnection {
                 self.ping_response.clone(),
                 self.observed.clone(),
                 self.clipboard_in.clone(),
+                self.untrusted_tx.clone(),
             ));
         }
         Err(LanMouseConnectionError::NotConnected)
@@ -338,6 +347,7 @@ async fn connect_to_handle(
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
     observed: Arc<StdMutex<Option<String>>>,
     clipboard_in: Sender<String>,
+    untrusted_tx: Sender<String>,
 ) -> Result<(), LanMouseConnectionError> {
     log::info!("client {handle} connecting ...");
     // Swap in a fresh UDP socket before every (re)connect so a sleep/wake or
@@ -371,9 +381,13 @@ async fn connect_to_handle(
                         if let Some(fp) = observed.lock().expect("lock").take() {
                             log::warn!(
                                 "client {handle}: receiver fingerprint {fp} is not \
-                                 authorized — add it to authorized_fingerprints to trust \
-                                 this receiver"
+                                 authorized — prompting to trust it"
                             );
+                            // Hand it to the service, which checks it against the
+                            // allowlist and raises a ConnectionAttempt if it really
+                            // is untrusted. Filtering lives there because that is
+                            // where the allowlist lives.
+                            let _ = untrusted_tx.send(fp);
                         }
                     }
                 }

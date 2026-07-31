@@ -87,6 +87,10 @@ pub struct Service {
     clipboard_alive: bool,
     /// inbound clipboard text received from peers, applied to the local clipboard
     clipboard_in: Receiver<String>,
+    /// fingerprints of RECEIVERS we tried to dial but don't trust (from the
+    /// connect side). Turned into `ConnectionAttempt` below so the UI can offer
+    /// to authorize them — the outbound counterpart of the inbound pairing prompt.
+    untrusted_receivers: Receiver<String>,
     /// broadcast local clipboard changes to outgoing-connection peers
     clipboard_out_conn: ClipboardSender,
     /// broadcast local clipboard changes to incoming-connection peers
@@ -124,6 +128,7 @@ impl Service {
         // malicious/buggy *authorized* peer flooding valid payloads is not yet
         // back-pressured; a bounded/coalescing channel is the future hardening.
         let (clipboard_in_tx, clipboard_in) = channel();
+        let (untrusted_tx, untrusted_receivers) = channel();
         let clipboard = Clipboard::new();
 
         // listener + connection (both authenticate the peer against the shared
@@ -140,6 +145,7 @@ impl Service {
             client_manager.clone(),
             authorized_keys.clone(),
             clipboard_in_tx,
+            untrusted_tx,
         )
         .map_err(|e| ServiceError::Connect(e.to_string()))?;
 
@@ -180,6 +186,7 @@ impl Service {
             clipboard,
             clipboard_alive: true,
             clipboard_in,
+            untrusted_receivers,
             clipboard_out_conn,
             clipboard_out_listen,
         };
@@ -207,6 +214,17 @@ impl Service {
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
                 event = self.clipboard.changed(), if self.clipboard_alive => self.handle_clipboard_change(event).await,
+                fp = self.untrusted_receivers.recv() => {
+                    if let Some(fp) = fp {
+                        // only prompt if it really is untrusted — a racing dial can
+                        // report a fingerprint that was authorized in the meantime
+                        let known = self.authorized_keys.read().expect("lock").contains_key(&fp);
+                        if !known {
+                            log::info!("untrusted receiver {fp} — raising an approval prompt");
+                            self.notify_frontend(FrontendEvent::ConnectionAttempt { fingerprint: fp });
+                        }
+                    }
+                }
                 text = self.clipboard_in.recv() => {
                     if let Some(text) = text {
                         self.clipboard.apply(text);
