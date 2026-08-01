@@ -236,6 +236,14 @@ impl LanMouseListener {
             .map(|e| e.fingerprint.clone())
     }
 
+    /// A handle for force-closing live inbound sessions when trust is revoked.
+    /// Grabbed before this listener is moved into `Emulation`.
+    pub(crate) fn revoker(&self) -> ConnRevoker {
+        ConnRevoker {
+            conns: self.conns.clone(),
+        }
+    }
+
     /// A handle for broadcasting local clipboard changes to all connected
     /// peers. Grabbed before this listener is moved into `Emulation` so the
     /// service can drive it directly.
@@ -243,6 +251,38 @@ impl LanMouseListener {
         ClipboardSenderListen {
             conns: self.conns.clone(),
         }
+    }
+}
+
+/// Force-closes live inbound sessions by peer fingerprint.
+///
+/// Peer identity is verified ONCE, during the TLS handshake — so dropping a
+/// fingerprint from the allowlist does not stop a session that is already
+/// established. Without this, "revoke" only removed the card while the peer
+/// kept injecting input. Revocation MUST cut the live session too.
+#[derive(Clone)]
+pub(crate) struct ConnRevoker {
+    conns: Rc<AsyncMutex<Vec<ConnEntry>>>,
+}
+
+impl ConnRevoker {
+    /// Close every live inbound session whose peer presented `fp`. Returns how
+    /// many were cut. The read loop's own cleanup is idempotent, so removing the
+    /// entries here does not race it.
+    pub(crate) async fn close_fingerprint(&self, fp: &str) -> usize {
+        let mut conns = self.conns.lock().await;
+        let mut closed = 0;
+        conns.retain(|e| {
+            if e.fingerprint == fp {
+                log::warn!("closing session with {} — trust revoked", e.addr);
+                e.conn.close(0u32.into(), b"trust revoked");
+                closed += 1;
+                false
+            } else {
+                true
+            }
+        });
+        closed
     }
 }
 

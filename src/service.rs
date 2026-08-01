@@ -95,6 +95,10 @@ pub struct Service {
     persist_requests: Receiver<ClientHandle>,
     /// broadcast local clipboard changes to outgoing-connection peers
     clipboard_out_conn: ClipboardSender,
+    /// force-close outgoing sessions to a receiver whose trust was revoked
+    revoke_conn: crate::connect::OutboundRevoker,
+    /// force-close incoming sessions from a sender whose trust was revoked
+    revoke_listen: crate::listen::ConnRevoker,
     /// broadcast local clipboard changes to incoming-connection peers
     clipboard_out_listen: ClipboardSenderListen,
 }
@@ -157,6 +161,9 @@ impl Service {
         // into capture/emulation below.
         let clipboard_out_conn = conn.clipboard_sender();
         let clipboard_out_listen = listener.clipboard_sender();
+        // revocation handles, grabbed before both are moved into capture/emulation
+        let revoke_conn = conn.revoker();
+        let revoke_listen = listener.revoker();
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
@@ -194,6 +201,8 @@ impl Service {
             persist_requests,
             clipboard_out_conn,
             clipboard_out_listen,
+            revoke_conn,
+            revoke_listen,
         };
         Ok(service)
     }
@@ -678,6 +687,20 @@ impl Service {
 
     fn remove_authorized_key(&mut self, fp: String) {
         self.authorized_keys.write().expect("lock").remove(&fp);
+        // Peer identity is checked ONCE, at the TLS handshake — so dropping the
+        // key does not stop a session that is already up. Cut the live sessions
+        // in BOTH directions, or "revoke" just hides the card while the peer
+        // keeps driving this machine (or we keep driving theirs).
+        // Resolve the handles first: clear_pins_matching below erases the
+        // fingerprint that the outbound match is made on.
+        let handles = self.client_manager.handles_with_fingerprint(&fp);
+        let (inbound, outbound, revoked) =
+            (self.revoke_listen.clone(), self.revoke_conn.clone(), fp.clone());
+        tokio::task::spawn_local(async move {
+            let cut_in = inbound.close_fingerprint(&revoked).await;
+            let cut_out = outbound.close_handles(&handles).await;
+            log::info!("revoked {revoked}: cut {cut_in} incoming + {cut_out} outgoing session(s)");
+        });
         // Revoking trust in a fingerprint releases any outbound pin on it, so a
         // client whose receiver re-keyed (e.g. reinstall) can re-learn + re-pin
         // the new identity on its next dial instead of being stranded on the

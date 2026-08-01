@@ -232,6 +232,15 @@ impl LanMouseConnection {
         self.client_manager.peer_caps(handle) & cap != 0
     }
 
+    /// A handle for force-closing outgoing sessions when trust is revoked.
+    /// Grabbed before this connection is moved into `Capture`.
+    pub(crate) fn revoker(&self) -> OutboundRevoker {
+        OutboundRevoker {
+            conns: self.conns.clone(),
+            client_manager: self.client_manager.clone(),
+        }
+    }
+
     /// A handle for broadcasting local clipboard changes to all connected
     /// peers. Grabbed before this connection is moved into `Capture` so the
     /// service can drive it directly.
@@ -568,6 +577,34 @@ async fn receive_loop(
         }
     }
     disconnect(&client_manager, handle, addr, &conns).await;
+}
+
+/// Force-closes outgoing sessions when we revoke trust in the receiver.
+///
+/// The mirror of `listen::ConnRevoker`: our own dial is authenticated once, at
+/// handshake, so revoking a receiver we are actively driving must also tear the
+/// session down — otherwise we keep sending it input we no longer trust it to
+/// receive.
+#[derive(Clone)]
+pub(crate) struct OutboundRevoker {
+    conns: Rc<Mutex<HashMap<SocketAddr, PeerLink>>>,
+    client_manager: ClientManager,
+}
+
+impl OutboundRevoker {
+    /// Disconnect each handle's active session. Handles are resolved by the
+    /// caller BEFORE it clears the pins, since clearing erases the fingerprint
+    /// the match is made on.
+    pub(crate) async fn close_handles(&self, handles: &[ClientHandle]) -> usize {
+        let mut closed = 0;
+        for &handle in handles {
+            if let Some(addr) = self.client_manager.active_addr(handle) {
+                disconnect(&self.client_manager, handle, addr, &self.conns).await;
+                closed += 1;
+            }
+        }
+        closed
+    }
 }
 
 async fn disconnect(

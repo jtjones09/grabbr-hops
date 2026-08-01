@@ -339,6 +339,17 @@ impl ClientManager {
     /// next dial re-learns identity. Called when trust in that fingerprint is
     /// revoked (`remove_authorized_key`) — e.g. a receiver re-keyed on reinstall
     /// and the operator authorized the new key.
+    /// Handles whose last-known receiver identity is `fingerprint`. Must be
+    /// called BEFORE `clear_pins_matching`, which erases what this matches on.
+    pub(crate) fn handles_with_fingerprint(&self, fingerprint: &str) -> Vec<ClientHandle> {
+        self.clients
+            .borrow()
+            .iter()
+            .filter(|(_, (_, s))| s.peer_fingerprint.as_deref() == Some(fingerprint))
+            .map(|(h, _)| h as ClientHandle)
+            .collect()
+    }
+
     pub(crate) fn clear_pins_matching(&self, fingerprint: &str) {
         for (_, (_, s)) in self.clients.borrow_mut().iter_mut() {
             if s.peer_fingerprint.as_deref() == Some(fingerprint) {
