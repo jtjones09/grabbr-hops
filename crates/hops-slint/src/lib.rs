@@ -58,7 +58,7 @@ struct PolledUi {
     port: String,
     fingerprint: String,
     pairing: String,
-    devices: Vec<(String, String, String, String, bool, bool, bool, String, String, bool)>,
+    devices: Vec<(String, String, String, String, bool, bool, bool, String, String, bool, bool)>,
 }
 
 fn status_text(s: Status) -> &'static str {
@@ -591,6 +591,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                             .into(),
                         fp_full: d.fingerprint.clone().unwrap_or_default().into(),
                         online: d.online,
+                        trusted: d.receive,
                     }
                 })
                 .collect();
@@ -616,6 +617,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                             d.fingerprint.to_string(),
                             d.fp_full.to_string(),
                             d.online,
+                            d.trusted,
                         )
                     })
                     .collect(),

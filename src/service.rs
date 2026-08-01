@@ -338,6 +338,7 @@ impl Service {
                 pos: c.pos,
                 active: s.active,
                 enter_hook: c.cmd,
+                fingerprint: s.peer_fingerprint,
             })
             .collect();
         self.config.set_clients(clients);

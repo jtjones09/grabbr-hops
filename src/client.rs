@@ -38,6 +38,10 @@ impl ClientManager {
         let state = ClientState {
             active: config_client.active,
             ips: HashSet::from_iter(config.fix_ips.iter().cloned()),
+            // seed the pin from config so the device view can join this client to
+            // its authorized_fingerprints entry from a COLD START, and so the
+            // fail-closed dial pin survives a restart
+            peer_fingerprint: config_client.fingerprint,
             ..Default::default()
         };
         let handle = self.add_client();

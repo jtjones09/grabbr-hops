@@ -80,6 +80,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             fingerprint: "1e:19:1b".into(),
             fp_full: "1e:19:1b:c4:a8:44".into(),
             online: true,
+            trusted: true,
         },
         // send-only, never connected (provisional — no fingerprint learned yet)
         DeviceRow {
@@ -93,6 +94,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             fingerprint: "".into(),
             fp_full: "".into(),
             online: false,
+            trusted: false,
         },
         // receive-only trusted peer, connected in
         DeviceRow {
@@ -106,6 +108,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             fingerprint: "b7:2a:55".into(),
             fp_full: "b7:2a:55:e1:90:33".into(),
             online: true,
+            trusted: true,
         },
         // receive-only trusted peer, offline
         DeviceRow {
@@ -119,6 +122,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             fingerprint: "c3:de:04".into(),
             fp_full: "c3:de:04:aa:11:22".into(),
             online: false,
+            trusted: true,
         },
     ])));
 

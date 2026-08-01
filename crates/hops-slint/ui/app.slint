@@ -32,6 +32,7 @@ export struct DeviceRow {
     fingerprint: string, // short fingerprint (display)
     fp-full: string,     // full fingerprint (for revoke)
     online: bool,        // a peer with this fingerprint is connected in
+    trusted: bool,       // its fingerprint is in authorized_fingerprints
 }
 
 export component AppWindow inherits Window {
@@ -437,7 +438,7 @@ export component AppWindow inherits Window {
                                         font-weight: Type.medium;
                                     }
                                 }
-                                if !d.has-send && root.confirm-revoke-fp != d.fp-full: VerticalLayout {
+                                if d.trusted && root.confirm-revoke-fp != d.fp-full: VerticalLayout {
                                     alignment: center;
                                     PillButton {
                                         text: "revoke";
@@ -445,7 +446,7 @@ export component AppWindow inherits Window {
                                         clicked => { root.confirm-revoke-fp = d.fp-full; }
                                     }
                                 }
-                                if !d.has-send && root.confirm-revoke-fp == d.fp-full: VerticalLayout {
+                                if d.trusted && root.confirm-revoke-fp == d.fp-full: VerticalLayout {
                                     alignment: center;
                                     Text {
                                         text: "remove?";
@@ -453,7 +454,7 @@ export component AppWindow inherits Window {
                                         font-size: Type.small;
                                     }
                                 }
-                                if !d.has-send && root.confirm-revoke-fp == d.fp-full: VerticalLayout {
+                                if d.trusted && root.confirm-revoke-fp == d.fp-full: VerticalLayout {
                                     alignment: center;
                                     PillButton {
                                         text: "yes";
@@ -464,7 +465,7 @@ export component AppWindow inherits Window {
                                         }
                                     }
                                 }
-                                if !d.has-send && root.confirm-revoke-fp == d.fp-full: VerticalLayout {
+                                if d.trusted && root.confirm-revoke-fp == d.fp-full: VerticalLayout {
                                     alignment: center;
                                     PillButton {
                                         text: "no";
