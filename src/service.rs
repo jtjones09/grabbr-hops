@@ -91,6 +91,8 @@ pub struct Service {
     /// connect side). Turned into `ConnectionAttempt` below so the UI can offer
     /// to authorize them — the outbound counterpart of the inbound pairing prompt.
     untrusted_receivers: Receiver<String>,
+    /// a client's peer_fingerprint was just learned — persist it and republish
+    persist_requests: Receiver<ClientHandle>,
     /// broadcast local clipboard changes to outgoing-connection peers
     clipboard_out_conn: ClipboardSender,
     /// broadcast local clipboard changes to incoming-connection peers
@@ -129,6 +131,7 @@ impl Service {
         // back-pressured; a bounded/coalescing channel is the future hardening.
         let (clipboard_in_tx, clipboard_in) = channel();
         let (untrusted_tx, untrusted_receivers) = channel();
+        let (persist_tx, persist_requests) = channel();
         let clipboard = Clipboard::new();
 
         // listener + connection (both authenticate the peer against the shared
@@ -146,6 +149,7 @@ impl Service {
             authorized_keys.clone(),
             clipboard_in_tx,
             untrusted_tx,
+            persist_tx,
         )
         .map_err(|e| ServiceError::Connect(e.to_string()))?;
 
@@ -187,6 +191,7 @@ impl Service {
             clipboard_alive: true,
             clipboard_in,
             untrusted_receivers,
+            persist_requests,
             clipboard_out_conn,
             clipboard_out_listen,
         };
@@ -214,6 +219,15 @@ impl Service {
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
                 event = self.clipboard.changed(), if self.clipboard_alive => self.handle_clipboard_change(event).await,
+                handle = self.persist_requests.recv() => {
+                    if let Some(handle) = handle {
+                        log::debug!("client {handle}: persisting newly-learned peer fingerprint");
+                        // persist so the device join survives a restart, and
+                        // republish so the merged card appears immediately
+                        self.save_config();
+                        self.broadcast_client(handle);
+                    }
+                }
                 fp = self.untrusted_receivers.recv() => {
                     if let Some(fp) = fp {
                         // only prompt if it really is untrusted — a racing dial can

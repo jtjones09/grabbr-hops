@@ -178,6 +178,11 @@ pub(crate) struct LanMouseConnection {
     observed: Arc<StdMutex<Option<String>>>,
     /// inbound clipboard text received from peers, forwarded to the service.
     clipboard_in: Sender<String>,
+    /// signals the service that this client's peer_fingerprint was just learned,
+    /// so it can persist it AND push the new state to the frontend. Without this
+    /// the join key is in-memory only and never reaches the UI, so every device
+    /// renders as two cards -- one client row, one trusted row.
+    persist_tx: Sender<ClientHandle>,
     /// fingerprint of a receiver we tried to dial but do not trust. The service
     /// turns this into a `ConnectionAttempt` so the UI can offer to authorize it
     /// — without this, an untrusted RECEIVER is only ever a log line and the user
@@ -193,6 +198,7 @@ impl LanMouseConnection {
         authorized: Authorized,
         clipboard_in: Sender<String>,
         untrusted_tx: Sender<String>,
+        persist_tx: Sender<ClientHandle>,
     ) -> Result<Self, LanMouseConnectionError> {
         transport::install_crypto_provider();
         let observed = Arc::new(StdMutex::new(None));
@@ -210,6 +216,7 @@ impl LanMouseConnection {
             observed,
             clipboard_in,
             untrusted_tx,
+            persist_tx,
         })
     }
 
@@ -277,6 +284,7 @@ impl LanMouseConnection {
                 self.observed.clone(),
                 self.clipboard_in.clone(),
                 self.untrusted_tx.clone(),
+                self.persist_tx.clone(),
             ));
         }
         Err(LanMouseConnectionError::NotConnected)
@@ -348,6 +356,7 @@ async fn connect_to_handle(
     observed: Arc<StdMutex<Option<String>>>,
     clipboard_in: Sender<String>,
     untrusted_tx: Sender<String>,
+    persist_tx: Sender<ClientHandle>,
 ) -> Result<(), LanMouseConnectionError> {
     log::info!("client {handle} connecting ...");
     // Swap in a fresh UDP socket before every (re)connect so a sleep/wake or
@@ -402,8 +411,13 @@ async fn connect_to_handle(
         // prior pin — that would fail OPEN on the next dial.
         match peer_fingerprint(&link.conn) {
             Some(fp) => {
+                let is_new = client_manager.peer_fingerprint(handle).as_deref() != Some(fp.as_str());
                 log::info!("client {handle} receiver fingerprint: {fp}");
                 client_manager.set_peer_fingerprint(handle, Some(fp));
+                // persist it so the device view can join from a cold start
+                if is_new {
+                    let _ = persist_tx.send(handle);
+                }
             }
             None => log::warn!(
                 "client {handle}: connected but could not read the receiver's \

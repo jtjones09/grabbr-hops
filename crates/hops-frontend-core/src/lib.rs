@@ -270,8 +270,16 @@ impl AppModel {
                         send: None,
                         receive: false,
                     });
-                    // a user-typed send-side hostname is the preferred label
-                    if let Some(host) = config.hostname.as_deref().filter(|h| !h.is_empty()) {
+                    // A user-typed send-side hostname is the preferred label --
+                    // EXCEPT when it is a bare IP literal. Adding a device by
+                    // address puts the IP in the name field, and an address is a
+                    // worse name than the peer's own advertised description.
+                    if let Some(host) = config
+                        .hostname
+                        .as_deref()
+                        .filter(|h| !h.is_empty())
+                        .filter(|h| h.parse::<std::net::IpAddr>().is_err())
+                    {
                         device.label = host.to_string();
                     }
                     device.send = Some(send);
@@ -450,6 +458,30 @@ mod tests {
         assert!(d.receive, "trusted to connect in");
         assert_eq!(d.trust, TrustState::Trusted);
         assert_eq!(d.fingerprint.as_deref(), Some(fp));
+    }
+
+    /// The rig case: both Mac receivers were added on Windows BY IP, so the
+    /// name field holds an address. Once the fingerprint is learned the two
+    /// rows must collapse into one card named by the peer, not by its IP.
+    #[test]
+    fn ip_named_client_merges_and_takes_the_peer_description() {
+        let mut m = AppModel::default();
+        let scorn = "73:90:2a:3c:9d:e5";
+        let carrier = "2d:65:8f:e6:f8:2b";
+        m.clients.insert(0, client(Some("10.110.20.99"), Some(scorn)));
+        m.clients.insert(1, client(Some("10.110.21.46"), Some(carrier)));
+        m.authorized.insert(scorn.to_string(), "ScornMBP23".to_string());
+        m.authorized.insert(carrier.to_string(), "CarrierMBP".to_string());
+
+        let devices = m.devices();
+        assert_eq!(devices.len(), 2, "two machines, not four cards");
+        let mut labels: Vec<&str> = devices.iter().map(|d| d.label.as_str()).collect();
+        labels.sort();
+        assert_eq!(labels, ["CarrierMBP", "ScornMBP23"], "named by peer, not by IP");
+        for d in &devices {
+            assert!(d.send.is_some(), "{} keeps its outgoing facet", d.label);
+            assert!(d.receive, "{} stays trusted (revoke must render)", d.label);
+        }
     }
 
     #[test]
