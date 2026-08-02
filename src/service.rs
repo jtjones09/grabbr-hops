@@ -404,8 +404,12 @@ impl Service {
             revoked
         };
         for fp in &revoked {
-            self.client_manager.clear_pins_matching(fp);
+            // ORDER MATTERS and this was inverted: cut_sessions resolves the
+            // affected handles via peer_fingerprint, which clear_pins_matching
+            // erases. Clearing first made the outbound teardown a structural
+            // no-op on exactly the path a6ddccb added it for.
             self.cut_sessions(fp);
+            self.client_manager.clear_pins_matching(fp);
         }
         self.sync_frontend();
     }

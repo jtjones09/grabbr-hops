@@ -302,6 +302,10 @@ fn build_ui(app: &Application) {
                     FrontendEvent::IncomingDisconnected(addr) => {
                         window.show_toast(format!("{addr} disconnected").as_str());
                     }
+                    // this frontend has no pairing-code surface; the event is for
+                    // the GUI/TUI only. Handled explicitly rather than with a
+                    // wildcard so a future variant still fails the build here.
+                    FrontendEvent::PairingCode(_) => {}
                 }
             }
         }

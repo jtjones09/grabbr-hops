@@ -214,7 +214,10 @@ pub struct ClientState {
     /// identity — unlike `peer_commit`/`peer_caps` it is NOT cleared on
     /// disconnect (it pins the reconnect dial, see `connect`). It is cleared
     /// only when the target address config changes (hostname / fix_ips) or trust
-    /// in it is revoked, and it is process-local (not persisted to config). Also
+    /// in it is revoked. It IS persisted (`[[clients]] fingerprint`) so the device
+    /// join works from a cold start and the pin survives a restart — meaning a
+    /// restart does NOT clear a bad pin, and the on-disk value is validated on
+    /// read (`hops_ipc::pairing::valid_fingerprint`). Also
     /// the join key a frontend uses to correlate this client with its
     /// `authorized_fingerprints` entry (byte-identical to the allowlist key).
     #[serde(default)]

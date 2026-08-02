@@ -320,7 +320,14 @@ impl AppModel {
                 (Some(x), Some(y)) => x.cmp(&y),
                 (Some(_), None) => std::cmp::Ordering::Less,
                 (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => a.label.to_lowercase().cmp(&b.label.to_lowercase()),
+                // tie-break on fingerprint: `by_fp` is a HashMap, so equal labels
+                // would otherwise fall through to its nondeterministic iteration
+                // order and the rows would swap on every refresh.
+                (None, None) => a
+                    .label
+                    .to_lowercase()
+                    .cmp(&b.label.to_lowercase())
+                    .then_with(|| a.fingerprint.cmp(&b.fingerprint)),
             }
         });
         out
