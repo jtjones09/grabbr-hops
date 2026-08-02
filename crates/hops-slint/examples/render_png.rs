@@ -15,12 +15,12 @@ use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferTyp
 use slint::platform::{Platform, WindowAdapter, WindowEvent};
 use slint::{ComponentHandle, ModelRc, PhysicalSize, VecModel};
 
-// Reuse the lib crate's Slint-generated types (AppWindow, DeviceRow, TrustedRow,
-// Theme, theme_colors) instead of calling `include_modules!()` again here — a
-// second invocation would compile the SAME .slint source into a SECOND, nominally
+// Reuse the lib crate's Slint-generated types (AppWindow, DeviceRow, Theme,
+// theme_colors) instead of calling `include_modules!()` again here — a second
+// invocation would compile the SAME .slint source into a SECOND, nominally
 // distinct set of Rust types, incompatible with the lib's (e.g. two different
 // `ThemeColors` structs), even though they look identical.
-use hops_slint::{theme_colors, AppWindow, CanvasBox, DeviceRow, Theme, TrustedRow};
+use hops_slint::{theme_colors, AppWindow, CanvasBox, DeviceRow, Theme};
 
 /// Headless platform: every window is a MinimalSoftwareWindow (CPU renderer, no OS window).
 struct HeadlessPlatform {
@@ -66,7 +66,9 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
     ui.set_fingerprint("73:90:2a:3c:9d:e5:18:52:7c:aa:c3:de:de:04:cd:ec".into());
     ui.set_pairing_fp("a4:f0:9c:2e:11:bd:77:0c:35:9a".into()); // shows the pairing card
 
+    // Exercise all four merged-card states in one shot.
     ui.set_devices(ModelRc::new(VecModel::from(vec![
+        // send + trusted (we dial it AND it's connected in) — renders as a send row
         DeviceRow {
             handle: "1".into(),
             name: "studio-pc".into(),
@@ -74,7 +76,13 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             pos: "left".into(),
             active: true,
             alive: true,
+            has_send: true,
+            fingerprint: "1e:19:1b".into(),
+            fp_full: "1e:19:1b:c4:a8:44".into(),
+            online: true,
+            trusted: true,
         },
+        // send-only, never connected (provisional — no fingerprint learned yet)
         DeviceRow {
             handle: "2".into(),
             name: "media-rig".into(),
@@ -82,21 +90,39 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             pos: "top".into(),
             active: false,
             alive: false,
-        },
-    ])));
-
-    ui.set_trusted(ModelRc::new(VecModel::from(vec![
-        TrustedRow {
-            name: "windows-pc".into(),
-            fp: "1e:19:1b:c4…".into(),
-            fp_full: "1e:19:1b:c4:a8:44".into(),
-            online: true,
-        },
-        TrustedRow {
-            name: "laptop-air".into(),
-            fp: "b7:2a:55:e1…".into(),
-            fp_full: "b7:2a:55:e1:90:33".into(),
+            has_send: true,
+            fingerprint: "".into(),
+            fp_full: "".into(),
             online: false,
+            trusted: false,
+        },
+        // receive-only trusted peer, connected in
+        DeviceRow {
+            handle: "".into(),
+            name: "windows-pc".into(),
+            addr: "".into(),
+            pos: "".into(),
+            active: false,
+            alive: false,
+            has_send: false,
+            fingerprint: "b7:2a:55".into(),
+            fp_full: "b7:2a:55:e1:90:33".into(),
+            online: true,
+            trusted: true,
+        },
+        // receive-only trusted peer, offline
+        DeviceRow {
+            handle: "".into(),
+            name: "laptop-air".into(),
+            addr: "".into(),
+            pos: "".into(),
+            active: false,
+            alive: false,
+            has_send: false,
+            fingerprint: "c3:de:04".into(),
+            fp_full: "c3:de:04:aa:11:22".into(),
+            online: false,
+            trusted: true,
         },
     ])));
 

@@ -87,8 +87,18 @@ pub struct Service {
     clipboard_alive: bool,
     /// inbound clipboard text received from peers, applied to the local clipboard
     clipboard_in: Receiver<String>,
+    /// fingerprints of RECEIVERS we tried to dial but don't trust (from the
+    /// connect side). Turned into `ConnectionAttempt` below so the UI can offer
+    /// to authorize them — the outbound counterpart of the inbound pairing prompt.
+    untrusted_receivers: Receiver<String>,
+    /// a client's peer_fingerprint was just learned — persist it and republish
+    persist_requests: Receiver<ClientHandle>,
     /// broadcast local clipboard changes to outgoing-connection peers
     clipboard_out_conn: ClipboardSender,
+    /// force-close outgoing sessions to a receiver whose trust was revoked
+    revoke_conn: crate::connect::OutboundRevoker,
+    /// force-close incoming sessions from a sender whose trust was revoked
+    revoke_listen: crate::listen::ConnRevoker,
     /// broadcast local clipboard changes to incoming-connection peers
     clipboard_out_listen: ClipboardSenderListen,
 }
@@ -124,6 +134,8 @@ impl Service {
         // malicious/buggy *authorized* peer flooding valid payloads is not yet
         // back-pressured; a bounded/coalescing channel is the future hardening.
         let (clipboard_in_tx, clipboard_in) = channel();
+        let (untrusted_tx, untrusted_receivers) = channel();
+        let (persist_tx, persist_requests) = channel();
         let clipboard = Clipboard::new();
 
         // listener + connection (both authenticate the peer against the shared
@@ -140,6 +152,8 @@ impl Service {
             client_manager.clone(),
             authorized_keys.clone(),
             clipboard_in_tx,
+            untrusted_tx,
+            persist_tx,
         )
         .map_err(|e| ServiceError::Connect(e.to_string()))?;
 
@@ -147,6 +161,9 @@ impl Service {
         // into capture/emulation below.
         let clipboard_out_conn = conn.clipboard_sender();
         let clipboard_out_listen = listener.clipboard_sender();
+        // revocation handles, grabbed before both are moved into capture/emulation
+        let revoke_conn = conn.revoker();
+        let revoke_listen = listener.revoker();
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
@@ -180,8 +197,12 @@ impl Service {
             clipboard,
             clipboard_alive: true,
             clipboard_in,
+            untrusted_receivers,
+            persist_requests,
             clipboard_out_conn,
             clipboard_out_listen,
+            revoke_conn,
+            revoke_listen,
         };
         Ok(service)
     }
@@ -207,6 +228,26 @@ impl Service {
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
                 event = self.clipboard.changed(), if self.clipboard_alive => self.handle_clipboard_change(event).await,
+                handle = self.persist_requests.recv() => {
+                    if let Some(handle) = handle {
+                        log::debug!("client {handle}: persisting newly-learned peer fingerprint");
+                        // persist so the device join survives a restart, and
+                        // republish so the merged card appears immediately
+                        self.save_config();
+                        self.broadcast_client(handle);
+                    }
+                }
+                fp = self.untrusted_receivers.recv() => {
+                    if let Some(fp) = fp {
+                        // only prompt if it really is untrusted — a racing dial can
+                        // report a fingerprint that was authorized in the meantime
+                        let known = self.authorized_keys.read().expect("lock").contains_key(&fp);
+                        if !known {
+                            log::info!("untrusted receiver {fp} — raising an approval prompt");
+                            self.notify_frontend(FrontendEvent::ConnectionAttempt { fingerprint: fp });
+                        }
+                    }
+                }
                 text = self.clipboard_in.recv() => {
                     if let Some(text) = text {
                         self.clipboard.apply(text);
@@ -320,6 +361,7 @@ impl Service {
                 pos: c.pos,
                 active: s.active,
                 enter_hook: c.cmd,
+                fingerprint: s.peer_fingerprint,
             })
             .collect();
         self.config.set_clients(clients);
@@ -346,11 +388,29 @@ impl Service {
         }
         let release_bind = self.config.release_bind();
         self.capture.set_release_bind(release_bind);
+        // A config reload can drop keys exactly like the revoke button does —
+        // editing config.toml by hand, or a watcher-driven reload. Diff against
+        // the live set and tear down anything that lost trust, or revocation is
+        // silently unenforced through this door.
         let authorized_keys = self.config.authorized_fingerprints();
-        self.authorized_keys
-            .write()
-            .unwrap()
-            .clone_from(&authorized_keys);
+        let revoked: Vec<String> = {
+            let mut live = self.authorized_keys.write().unwrap();
+            let revoked = live
+                .keys()
+                .filter(|k| !authorized_keys.contains_key(*k))
+                .cloned()
+                .collect();
+            live.clone_from(&authorized_keys);
+            revoked
+        };
+        for fp in &revoked {
+            // ORDER MATTERS and this was inverted: cut_sessions resolves the
+            // affected handles via peer_fingerprint, which clear_pins_matching
+            // erases. Clearing first made the outbound teardown a structural
+            // no-op on exactly the path a6ddccb added it for.
+            self.cut_sessions(fp);
+            self.client_manager.clear_pins_matching(fp);
+        }
         self.sync_frontend();
     }
 
@@ -523,6 +583,43 @@ impl Service {
         self.notify_frontend(FrontendEvent::PublicKeyFingerprint(
             self.public_key_fingerprint.clone(),
         ));
+        // this device's own shareable pairing code: its fingerprint + routable
+        // LAN IPv4 addresses + hostname label (empty if there's no shareable
+        // address). IPv4 only — IPv6 link-local is scope-dependent and useless
+        // out-of-band. See hops_ipc::pairing.
+        let pairing_code = {
+            let addrs: Vec<SocketAddr> = if_addrs::get_if_addrs()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|iface| match iface.ip() {
+                    std::net::IpAddr::V4(v4)
+                        if !v4.is_loopback()
+                            && !v4.is_link_local()
+                            && !v4.is_unspecified()
+                            && !v4.is_broadcast() =>
+                    {
+                        Some(SocketAddr::new(std::net::IpAddr::V4(v4), self.port))
+                    }
+                    _ => None,
+                })
+                .take(8) // matches hops_ipc::pairing MAX_ADDRS
+                .collect();
+            if addrs.is_empty() {
+                String::new()
+            } else {
+                let label = hostname::get()
+                    .ok()
+                    .and_then(|h| h.into_string().ok())
+                    .unwrap_or_default();
+                hops_ipc::PairingCode {
+                    fingerprint: self.public_key_fingerprint.clone(),
+                    addrs,
+                    label,
+                }
+                .encode()
+            }
+        };
+        self.notify_frontend(FrontendEvent::PairingCode(pairing_code));
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
         // re-emit current incoming connections so a freshly-attached UI knows
@@ -606,8 +703,40 @@ impl Service {
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
     }
 
+    /// Tear down every live session with `fp`, in both directions.
+    ///
+    /// Peer identity is checked ONCE, at the TLS handshake, so dropping a key
+    /// from the allowlist does nothing to a session that is already up. EVERY
+    /// path that removes trust must call this, or "revoke" only hides the card
+    /// while the peer keeps driving this machine (or we keep driving theirs).
+    fn cut_sessions(&mut self, fp: &str) {
+        // Resolve the handles first: clear_pins_matching erases the fingerprint
+        // that the outbound match is made on.
+        let handles = self.client_manager.handles_with_fingerprint(fp);
+        let (inbound, outbound, revoked) = (
+            self.revoke_listen.clone(),
+            self.revoke_conn.clone(),
+            fp.to_string(),
+        );
+        tokio::task::spawn_local(async move {
+            let cut_in = inbound.close_fingerprint(&revoked).await;
+            let cut_out = outbound.close_handles(&handles).await;
+            if cut_in + cut_out > 0 {
+                log::warn!(
+                    "revoked {revoked}: cut {cut_in} incoming + {cut_out} outgoing session(s)"
+                );
+            }
+        });
+    }
+
     fn remove_authorized_key(&mut self, fp: String) {
         self.authorized_keys.write().expect("lock").remove(&fp);
+        self.cut_sessions(&fp);
+        // Revoking trust in a fingerprint releases any outbound pin on it, so a
+        // client whose receiver re-keyed (e.g. reinstall) can re-learn + re-pin
+        // the new identity on its next dial instead of being stranded on the
+        // dead fingerprint. See the fail-closed pin in `connect::connect`.
+        self.client_manager.clear_pins_matching(&fp);
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
     }

@@ -19,10 +19,12 @@ use serde::{Deserialize, Serialize};
 mod connect;
 mod connect_async;
 mod listen;
+pub mod pairing;
 
 pub use connect::{FrontendEventReader, FrontendRequestWriter, connect};
 pub use connect_async::{AsyncFrontendEventReader, AsyncFrontendRequestWriter, connect_async};
 pub use listen::AsyncFrontendListener;
+pub use pairing::{PairingCode, PairingError};
 
 #[derive(Debug, Error)]
 pub enum ConnectionError {
@@ -206,6 +208,20 @@ pub struct ClientState {
     /// the pre-capability behavior when absent. Mirrors `peer_commit`.
     #[serde(default)]
     pub peer_caps: Option<u32>,
+    /// Leaf-cert SHA-256 fingerprint of the connected peer (the receiver this
+    /// outgoing client dials), read from the completed TLS handshake. `None`
+    /// until a connection completes; then RETAINED as the client's last-known
+    /// identity — unlike `peer_commit`/`peer_caps` it is NOT cleared on
+    /// disconnect (it pins the reconnect dial, see `connect`). It is cleared
+    /// only when the target address config changes (hostname / fix_ips) or trust
+    /// in it is revoked. It IS persisted (`[[clients]] fingerprint`) so the device
+    /// join works from a cold start and the pin survives a restart — meaning a
+    /// restart does NOT clear a bad pin, and the on-disk value is validated on
+    /// read (`hops_ipc::pairing::valid_fingerprint`). Also
+    /// the join key a frontend uses to correlate this client with its
+    /// `authorized_fingerprints` entry (byte-identical to the allowlist key).
+    #[serde(default)]
+    pub peer_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,6 +248,9 @@ pub enum FrontendEvent {
     AuthorizedUpdated(HashMap<String, String>),
     /// public key fingerprint of this device
     PublicKeyFingerprint(String),
+    /// this device's own pairing code (encoded, ready to share out-of-band), or
+    /// empty if no shareable LAN address is available. See `pairing::PairingCode`.
+    PairingCode(String),
     /// new device connected
     DeviceConnected {
         addr: SocketAddr,

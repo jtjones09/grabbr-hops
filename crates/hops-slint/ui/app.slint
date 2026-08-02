@@ -17,20 +17,22 @@ import { ScrollView } from "std-widgets.slint";
 // nominally distinct types.
 export { Theme, OnboardingWindow, CanvasBox, HopsTray }
 
+// One unified device (a physical peer). `has-send` = we dial it (outgoing
+// facet: pos/active/edit/delete); otherwise it's a receive-only trusted peer
+// (fingerprint + connected/offline + revoke). A machine that is both renders
+// once, as a send row. Built from `AppModel::devices()` in the Rust side.
 export struct DeviceRow {
-    handle: string,  // ClientHandle (u64 as text — Slint int is only i32)
-    name: string,    // hostname
-    addr: string,    // "ip:port" or "unresolved"
-    pos: string,     // "left" / "right" / …
-    active: bool,    // capture is routed to this device
-    alive: bool,     // device is reachable
-}
-
-export struct TrustedRow {
-    name: string,
-    fp: string,      // short fingerprint (display)
-    fp-full: string, // full fingerprint (for requests)
-    online: bool,
+    handle: string,      // ClientHandle (u64 as text — Slint int is only i32); "" if receive-only
+    name: string,        // display label
+    addr: string,        // "ip:port" / "unresolved" (send facet)
+    pos: string,         // "left" / "right" / … (send facet)
+    active: bool,        // capture is routed to this device (send facet)
+    alive: bool,         // outgoing connection is reachable (send facet)
+    has-send: bool,      // has an outgoing (send-to) facet
+    fingerprint: string, // short fingerprint (display)
+    fp-full: string,     // full fingerprint (for revoke)
+    online: bool,        // a peer with this fingerprint is connected in
+    trusted: bool,       // its fingerprint is in authorized_fingerprints
 }
 
 export component AppWindow inherits Window {
@@ -56,7 +58,6 @@ export component AppWindow inherits Window {
     in property <string> port: "—";
     in property <string> fingerprint: "—";
     in property <[DeviceRow]> devices: [];
-    in property <[TrustedRow]> trusted: [];
     in property <string> pairing-fp: "";
 
     property <string> confirm-revoke-fp: "";
@@ -240,7 +241,7 @@ export component AppWindow inherits Window {
                 // --- devices ------------------------------------------------------------
                 HorizontalLayout {
                     alignment: space-between;
-                    SectionTitle { text: "devices — cross to"; color: Theme.c.accent; }
+                    SectionTitle { text: "devices"; color: Theme.c.accent; }
                     HorizontalLayout {
                         spacing: Space.sm;
                         PillButton {
@@ -313,7 +314,7 @@ export component AppWindow inherits Window {
                         if root.devices.length == 0: HorizontalLayout {
                             padding: Space.sm;
                             Text {
-                                text: "no outgoing devices — this Mac only receives";
+                                text: "no devices yet — add one, or accept a pairing request";
                                 color: Theme.c.muted;
                                 font-size: Type.small;
                             }
@@ -331,7 +332,7 @@ export component AppWindow inherits Window {
                                 VerticalLayout {
                                     alignment: center;
                                     Dot {
-                                        tint: d.alive
+                                        tint: (d.online || d.alive)
                                             ? Theme.c.success
                                             : (d.active ? Theme.c.warn : Theme.c.muted);
                                     }
@@ -347,7 +348,9 @@ export component AppWindow inherits Window {
                                         overflow: elide;
                                     }
                                     Text {
-                                        text: d.addr;
+                                        // send devices show their dial address; a receive-only
+                                        // (trusted) peer shows its fingerprint instead
+                                        text: d.has-send ? d.addr : d.fingerprint;
                                         color: Theme.c.muted;
                                         font-family: Type.mono;
                                         font-size: Type.caption;
@@ -355,7 +358,9 @@ export component AppWindow inherits Window {
                                         overflow: elide;
                                     }
                                 }
-                                VerticalLayout {
+
+                                // --- send facet: position + active toggle + edit/delete ---
+                                if d.has-send: VerticalLayout {
                                     alignment: center;
                                     Chip {
                                         text: d.pos;
@@ -371,14 +376,14 @@ export component AppWindow inherits Window {
                                         }
                                     }
                                 }
-                                VerticalLayout {
+                                if d.has-send: VerticalLayout {
                                     alignment: center;
                                     Toggle {
                                         checked: d.active;
                                         toggled(v) => { root.activate-device(d.handle, v); }
                                     }
                                 }
-                                if root.confirm-delete-handle != d.handle: VerticalLayout {
+                                if d.has-send && root.confirm-delete-handle != d.handle: VerticalLayout {
                                     alignment: center;
                                     PillButton {
                                         text: "edit";
@@ -386,7 +391,7 @@ export component AppWindow inherits Window {
                                         clicked => { root.editing-device = root.editing-device == d.handle ? "" : d.handle; }
                                     }
                                 }
-                                if root.confirm-delete-handle != d.handle: VerticalLayout {
+                                if d.has-send && root.confirm-delete-handle != d.handle: VerticalLayout {
                                     alignment: center;
                                     PillButton {
                                         text: "delete";
@@ -394,7 +399,7 @@ export component AppWindow inherits Window {
                                         clicked => { root.confirm-delete-handle = d.handle; }
                                     }
                                 }
-                                if root.confirm-delete-handle == d.handle: VerticalLayout {
+                                if d.has-send && root.confirm-delete-handle == d.handle: VerticalLayout {
                                     alignment: center;
                                     Text {
                                         text: "delete?";
@@ -402,7 +407,7 @@ export component AppWindow inherits Window {
                                         font-size: Type.small;
                                     }
                                 }
-                                if root.confirm-delete-handle == d.handle: VerticalLayout {
+                                if d.has-send && root.confirm-delete-handle == d.handle: VerticalLayout {
                                     alignment: center;
                                     PillButton {
                                         text: "yes";
@@ -414,12 +419,58 @@ export component AppWindow inherits Window {
                                         }
                                     }
                                 }
-                                if root.confirm-delete-handle == d.handle: VerticalLayout {
+                                if d.has-send && root.confirm-delete-handle == d.handle: VerticalLayout {
                                     alignment: center;
                                     PillButton {
                                         text: "no";
                                         ghost: true;
                                         clicked => { root.confirm-delete-handle = ""; }
+                                    }
+                                }
+
+                                // --- receive-only facet: trust status + revoke ---
+                                if !d.has-send && root.confirm-revoke-fp != d.fp-full: VerticalLayout {
+                                    alignment: center;
+                                    Text {
+                                        text: d.online ? "connected" : "offline";
+                                        color: d.online ? Theme.c.success : Theme.c.muted;
+                                        font-size: Type.small;
+                                        font-weight: Type.medium;
+                                    }
+                                }
+                                if d.trusted && root.confirm-revoke-fp != d.fp-full: VerticalLayout {
+                                    alignment: center;
+                                    PillButton {
+                                        text: "revoke";
+                                        ghost: true;
+                                        clicked => { root.confirm-revoke-fp = d.fp-full; }
+                                    }
+                                }
+                                if d.trusted && root.confirm-revoke-fp == d.fp-full: VerticalLayout {
+                                    alignment: center;
+                                    Text {
+                                        text: "remove?";
+                                        color: Theme.c.muted;
+                                        font-size: Type.small;
+                                    }
+                                }
+                                if d.trusted && root.confirm-revoke-fp == d.fp-full: VerticalLayout {
+                                    alignment: center;
+                                    PillButton {
+                                        text: "yes";
+                                        danger: true;
+                                        clicked => {
+                                            root.revoke(d.fp-full);
+                                            root.confirm-revoke-fp = "";
+                                        }
+                                    }
+                                }
+                                if d.trusted && root.confirm-revoke-fp == d.fp-full: VerticalLayout {
+                                    alignment: center;
+                                    PillButton {
+                                        text: "no";
+                                        ghost: true;
+                                        clicked => { root.confirm-revoke-fp = ""; }
                                     }
                                 }
                             }
@@ -469,105 +520,6 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                // --- trusted peers ------------------------------------------------------
-                SectionTitle { text: "trusted devices"; color: Theme.c.accent; }
-                Card {
-                    vertical-stretch: 0;
-                    VerticalLayout {
-                        padding: Space.sm;
-                        spacing: 2px;
-                        if root.trusted.length == 0: HorizontalLayout {
-                            padding: Space.sm;
-                            Text {
-                                text: "no trusted devices yet";
-                                color: Theme.c.muted;
-                                font-size: Type.small;
-                            }
-                        }
-                        for t in root.trusted: Rectangle {
-                            height: 46px;
-                            border-radius: Radius.md;
-                            trow := TouchArea {}
-                            background: trow.has-hover ? Theme.c.surface-raised : transparent;
-                            animate background { duration: Motion.fast; }
-                            HorizontalLayout {
-                                padding-left: Space.md;
-                                padding-right: Space.sm;
-                                spacing: Space.md;
-                                VerticalLayout {
-                                    alignment: center;
-                                    Dot { tint: t.online ? Theme.c.success : Theme.c.muted; }
-                                }
-                                VerticalLayout {
-                                    alignment: center;
-                                    horizontal-stretch: 1;
-                                    Text {
-                                        text: t.name;
-                                        color: Theme.c.foreground;
-                                        font-weight: Type.medium;
-                                        overflow: elide;
-                                    }
-                                }
-                                VerticalLayout {
-                                    alignment: center;
-                                    Text {
-                                        text: t.fp;
-                                        color: Theme.c.muted;
-                                        font-family: Type.mono;
-                                        font-size: Type.caption;
-                                        letter-spacing: Type.mono-tracking;
-                                    }
-                                }
-                                // normal: colored status + ghost revoke
-                                if root.confirm-revoke-fp != t.fp-full: VerticalLayout {
-                                    alignment: center;
-                                    Text {
-                                        text: t.online ? "connected" : "offline";
-                                        color: t.online ? Theme.c.success : Theme.c.muted;
-                                        font-size: Type.small;
-                                        font-weight: Type.medium;
-                                    }
-                                }
-                                if root.confirm-revoke-fp != t.fp-full: VerticalLayout {
-                                    alignment: center;
-                                    PillButton {
-                                        text: "revoke";
-                                        ghost: true;
-                                        clicked => { root.confirm-revoke-fp = t.fp-full; }
-                                    }
-                                }
-                                // confirm state
-                                if root.confirm-revoke-fp == t.fp-full: VerticalLayout {
-                                    alignment: center;
-                                    Text {
-                                        text: "remove?";
-                                        color: Theme.c.muted;
-                                        font-size: Type.small;
-                                    }
-                                }
-                                if root.confirm-revoke-fp == t.fp-full: VerticalLayout {
-                                    alignment: center;
-                                    PillButton {
-                                        text: "yes";
-                                        danger: true;
-                                        clicked => {
-                                            root.revoke(t.fp-full);
-                                            root.confirm-revoke-fp = "";
-                                        }
-                                    }
-                                }
-                                if root.confirm-revoke-fp == t.fp-full: VerticalLayout {
-                                    alignment: center;
-                                    PillButton {
-                                        text: "no";
-                                        ghost: true;
-                                        clicked => { root.confirm-revoke-fp = ""; }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
 
             }
         }

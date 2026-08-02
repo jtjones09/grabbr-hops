@@ -7,6 +7,7 @@ use hops_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender, channel};
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig, Connection, Endpoint, SendStream, TransportConfig};
+use rustls::pki_types::CertificateDer;
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -38,6 +39,8 @@ pub(crate) enum LanMouseConnectionError {
     TargetEmulationDisabled,
     #[error("connection timed out")]
     Timeout,
+    #[error("receiver fingerprint did not match the expected identity")]
+    FingerprintMismatch,
 }
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -64,6 +67,11 @@ fn client_config(
         .with_client_auth_cert(vec![identity.cert.clone()], identity.key.clone_key())
         .expect("client auth cert");
     crypto.alpn_protocols = vec![transport::ALPN.to_vec()];
+    // Same hazard, mirrored: a resumed CLIENT handshake skips server-certificate
+    // verification, so `FpServerVerifier` and the fail-closed fingerprint pin would
+    // both be bypassed when redialing a receiver we have since revoked. Refuse
+    // resumption so every dial re-proves the receiver's identity.
+    crypto.resumption = rustls::client::Resumption::disabled();
     let mut config = ClientConfig::new(Arc::new(
         QuicClientConfig::try_from(crypto).expect("quic client config"),
     ));
@@ -76,9 +84,20 @@ fn client_config(
     config
 }
 
+/// Fingerprint of the peer's leaf cert from a completed handshake. quinn hands
+/// the presented chain as `Vec<CertificateDer>`. Reading it off the specific
+/// connection is race-free, unlike the shared `observed` slot (which concurrent
+/// dials to other handles can clobber). Mirrors `listen::peer_fingerprint`.
+fn peer_fingerprint(conn: &Connection) -> Option<String> {
+    let identity = conn.peer_identity()?;
+    let certs = identity.downcast::<Vec<CertificateDer<'static>>>().ok()?;
+    certs.first().map(transport::fingerprint_of)
+}
+
 async fn connect(
     endpoint: Endpoint,
     addr: SocketAddr,
+    expected_fp: Option<String>,
 ) -> Result<(PeerLink, SocketAddr), (SocketAddr, LanMouseConnectionError)> {
     log::info!("connecting to {addr} ...");
     // server_name is the SNI label; trust is by fingerprint, so it is not
@@ -89,6 +108,23 @@ async fn connect(
         Ok(Err(e)) => return Err((addr, e.into())),
         Ok(Ok(conn)) => conn,
     };
+    // Fail-closed fingerprint pin. `FpServerVerifier` only proves the receiver
+    // is *some* allowlisted peer; when this client's identity is already known
+    // (a prior handshake, or later a pairing code), the raced address MUST
+    // present that exact leaf-cert fingerprint — otherwise a poisoned or
+    // ambiguous address that completes an allowlisted handshake could win the
+    // race and receive input meant for a different machine.
+    if let Some(expected) = &expected_fp {
+        let actual = peer_fingerprint(&conn);
+        if actual.as_deref() != Some(expected.as_str()) {
+            log::warn!(
+                "{addr}: receiver fingerprint {} != expected {expected}; rejecting",
+                actual.as_deref().unwrap_or("<none>")
+            );
+            conn.close(0u32.into(), b"fingerprint mismatch");
+            return Err((addr, LanMouseConnectionError::FingerprintMismatch));
+        }
+    }
     let send = conn.open_uni().await.map_err(|e| (addr, e.into()))?;
     Ok((
         PeerLink {
@@ -102,18 +138,34 @@ async fn connect(
 async fn connect_any(
     endpoint: &Endpoint,
     addrs: &[SocketAddr],
+    expected_fp: Option<String>,
 ) -> Result<(PeerLink, SocketAddr), LanMouseConnectionError> {
     let mut joinset = JoinSet::new();
     for &addr in addrs {
         let endpoint = endpoint.clone();
-        joinset.spawn_local(connect(endpoint, addr));
+        let expected = expected_fp.clone();
+        joinset.spawn_local(connect(endpoint, addr, expected));
     }
+    // if every candidate failed the identity pin (not a transport error), surface
+    // that distinctly so the caller logs the right recovery guidance.
+    let mut only_mismatch = !addrs.is_empty();
     loop {
         match joinset.join_next().await {
-            None => return Err(LanMouseConnectionError::NotConnected),
+            None => {
+                return Err(if only_mismatch {
+                    LanMouseConnectionError::FingerprintMismatch
+                } else {
+                    LanMouseConnectionError::NotConnected
+                });
+            }
             Some(r) => match r.expect("join error") {
                 Ok(conn) => return Ok(conn),
-                Err((a, e)) => log::warn!("failed to connect to {a}: `{e}`"),
+                Err((a, e)) => {
+                    if !matches!(e, LanMouseConnectionError::FingerprintMismatch) {
+                        only_mismatch = false;
+                    }
+                    log::warn!("failed to connect to {a}: `{e}`");
+                }
             },
         };
     }
@@ -131,6 +183,17 @@ pub(crate) struct LanMouseConnection {
     observed: Arc<StdMutex<Option<String>>>,
     /// inbound clipboard text received from peers, forwarded to the service.
     clipboard_in: Sender<String>,
+    /// signals the service that this client's peer_fingerprint was just learned,
+    /// so it can persist it AND push the new state to the frontend. Without this
+    /// the join key is in-memory only and never reaches the UI, so every device
+    /// renders as two cards -- one client row, one trusted row.
+    persist_tx: Sender<ClientHandle>,
+    /// fingerprint of a receiver we tried to dial but do not trust. The service
+    /// turns this into a `ConnectionAttempt` so the UI can offer to authorize it
+    /// — without this, an untrusted RECEIVER is only ever a log line and the user
+    /// has no in-app way to trust it (the inbound path has had a prompt all
+    /// along; the outbound path never did).
+    untrusted_tx: Sender<String>,
 }
 
 impl LanMouseConnection {
@@ -139,6 +202,8 @@ impl LanMouseConnection {
         client_manager: ClientManager,
         authorized: Authorized,
         clipboard_in: Sender<String>,
+        untrusted_tx: Sender<String>,
+        persist_tx: Sender<ClientHandle>,
     ) -> Result<Self, LanMouseConnectionError> {
         transport::install_crypto_provider();
         let observed = Arc::new(StdMutex::new(None));
@@ -155,6 +220,8 @@ impl LanMouseConnection {
             ping_response: Default::default(),
             observed,
             clipboard_in,
+            untrusted_tx,
+            persist_tx,
         })
     }
 
@@ -168,6 +235,15 @@ impl LanMouseConnection {
     /// capability-gated emissions fall back to the pre-capability behavior.
     pub(crate) fn peer_supports(&self, handle: ClientHandle, cap: u32) -> bool {
         self.client_manager.peer_caps(handle) & cap != 0
+    }
+
+    /// A handle for force-closing outgoing sessions when trust is revoked.
+    /// Grabbed before this connection is moved into `Capture`.
+    pub(crate) fn revoker(&self) -> OutboundRevoker {
+        OutboundRevoker {
+            conns: self.conns.clone(),
+            client_manager: self.client_manager.clone(),
+        }
     }
 
     /// A handle for broadcasting local clipboard changes to all connected
@@ -221,6 +297,8 @@ impl LanMouseConnection {
                 self.ping_response.clone(),
                 self.observed.clone(),
                 self.clipboard_in.clone(),
+                self.untrusted_tx.clone(),
+                self.persist_tx.clone(),
             ));
         }
         Err(LanMouseConnectionError::NotConnected)
@@ -291,6 +369,8 @@ async fn connect_to_handle(
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
     observed: Arc<StdMutex<Option<String>>>,
     clipboard_in: Sender<String>,
+    untrusted_tx: Sender<String>,
+    persist_tx: Sender<ClientHandle>,
 ) -> Result<(), LanMouseConnectionError> {
     log::info!("client {handle} connecting ...");
     // Swap in a fresh UDP socket before every (re)connect so a sleep/wake or
@@ -303,22 +383,60 @@ async fn connect_to_handle(
             .map(|a| SocketAddr::new(a, port))
             .collect::<Vec<_>>();
         log::info!("client ({handle}) connecting ... (ips: {addrs:?})");
-        let (link, addr) = match connect_any(&endpoint, &addrs).await {
+        // Pin to the client's known identity (if any) so the parallel race
+        // fails closed against a wrong-but-allowlisted receiver at a raced addr.
+        let expected_fp = client_manager.peer_fingerprint(handle);
+        let (link, addr) = match connect_any(&endpoint, &addrs, expected_fp).await {
             Ok(c) => c,
             Err(e) => {
                 connecting.lock().await.remove(&handle);
-                if let Some(fp) = observed.lock().expect("lock").take() {
-                    log::warn!(
-                        "client {handle}: receiver fingerprint {fp} is not authorized — \
-                         add it to authorized_fingerprints to trust this receiver"
-                    );
+                match e {
+                    // handshake succeeded but the identity didn't match the pin —
+                    // NOT an authorization failure (the presented fp IS allowlisted).
+                    LanMouseConnectionError::FingerprintMismatch => log::warn!(
+                        "client {handle}: the receiver answered but its fingerprint did \
+                         not match the pinned identity — the target address may point at \
+                         a different machine, or the receiver re-keyed (reinstall). If it \
+                         re-keyed, remove the old fingerprint from authorized_fingerprints \
+                         and authorize the new one."
+                    ),
+                    _ => {
+                        if let Some(fp) = observed.lock().expect("lock").take() {
+                            log::warn!(
+                                "client {handle}: receiver fingerprint {fp} is not \
+                                 authorized — prompting to trust it"
+                            );
+                            // Hand it to the service, which checks it against the
+                            // allowlist and raises a ConnectionAttempt if it really
+                            // is untrusted. Filtering lives there because that is
+                            // where the allowlist lives.
+                            let _ = untrusted_tx.send(fp);
+                        }
+                    }
                 }
                 return Err(e);
             }
         };
         log::info!("client ({handle}) connected @ {addr}");
-        if let Some(fp) = observed.lock().expect("lock").clone() {
-            log::info!("client {handle} receiver fingerprint: {fp}");
+        // Stamp the receiver's leaf-cert fingerprint from THIS connection — the
+        // pin identity + the key the frontend uses to correlate this client with
+        // its authorized_fingerprints entry. Only overwrite on a real read: a
+        // None from an accepted handshake (shouldn't happen) must NOT wipe a good
+        // prior pin — that would fail OPEN on the next dial.
+        match peer_fingerprint(&link.conn) {
+            Some(fp) => {
+                let is_new = client_manager.peer_fingerprint(handle).as_deref() != Some(fp.as_str());
+                log::info!("client {handle} receiver fingerprint: {fp}");
+                client_manager.set_peer_fingerprint(handle, Some(fp));
+                // persist it so the device view can join from a cold start
+                if is_new {
+                    let _ = persist_tx.send(handle);
+                }
+            }
+            None => log::warn!(
+                "client {handle}: connected but could not read the receiver's \
+                 leaf-cert fingerprint; keeping any prior pin"
+            ),
         }
         client_manager.set_active_addr(handle, Some(addr));
         conns.lock().await.insert(addr, link.clone());
@@ -466,6 +584,34 @@ async fn receive_loop(
     disconnect(&client_manager, handle, addr, &conns).await;
 }
 
+/// Force-closes outgoing sessions when we revoke trust in the receiver.
+///
+/// The mirror of `listen::ConnRevoker`: our own dial is authenticated once, at
+/// handshake, so revoking a receiver we are actively driving must also tear the
+/// session down — otherwise we keep sending it input we no longer trust it to
+/// receive.
+#[derive(Clone)]
+pub(crate) struct OutboundRevoker {
+    conns: Rc<Mutex<HashMap<SocketAddr, PeerLink>>>,
+    client_manager: ClientManager,
+}
+
+impl OutboundRevoker {
+    /// Disconnect each handle's active session. Handles are resolved by the
+    /// caller BEFORE it clears the pins, since clearing erases the fingerprint
+    /// the match is made on.
+    pub(crate) async fn close_handles(&self, handles: &[ClientHandle]) -> usize {
+        let mut closed = 0;
+        for &handle in handles {
+            if let Some(addr) = self.client_manager.active_addr(handle) {
+                disconnect(&self.client_manager, handle, addr, &self.conns).await;
+                closed += 1;
+            }
+        }
+        closed
+    }
+}
+
 async fn disconnect(
     client_manager: &ClientManager,
     handle: ClientHandle,
@@ -479,6 +625,11 @@ async fn disconnect(
     client_manager.set_active_addr(handle, None);
     client_manager.set_peer_commit(handle, None);
     client_manager.set_peer_caps(handle, None);
+    // NB: peer_fingerprint is deliberately NOT cleared here — it's the client's
+    // last-known identity (process-local), used to pin the reconnect dial + join
+    // the device view, not a per-connection value. It's cleared only when the
+    // target address config changes (set_hostname / set_fix_ips) or trust in it
+    // is revoked (remove_authorized_key).
     let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
     log::info!("active connections: {active:?}");
 }
@@ -510,5 +661,129 @@ async fn clipboard_accept_loop(conn: Connection, addr: SocketAddr, clipboard_in:
             // connection closed — the input receive_loop handles disconnect
             Err(_) => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::Identity;
+    use quinn::crypto::rustls::QuicServerConfig;
+    use quinn::Endpoint;
+    use std::collections::HashMap;
+    use std::sync::RwLock;
+
+    fn identity() -> Identity {
+        let key_pair = rcgen::KeyPair::generate().expect("keypair");
+        let mut params =
+            rcgen::CertificateParams::new(vec!["grabbr".to_owned()]).expect("params");
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "grabbr-hop");
+        let cert = params.self_signed(&key_pair).expect("self signed");
+        Identity {
+            cert: cert.der().clone(),
+            key: rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der())
+                .expect("key der"),
+        }
+    }
+
+    /// A server that accepts anyone — we are testing the CLIENT's verification of
+    /// the SERVER, so client auth is deliberately not required here.
+    fn open_server(server: &Identity) -> quinn::ServerConfig {
+        let mut crypto = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![server.cert.clone()], server.key.clone_key())
+            .expect("server cert");
+        crypto.alpn_protocols = vec![transport::ALPN.to_vec()];
+        quinn::ServerConfig::with_crypto(Arc::new(
+            QuicServerConfig::try_from(crypto).expect("quic server"),
+        ))
+    }
+
+    async fn dials_ok(endpoint: &Endpoint, addr: SocketAddr) -> bool {
+        let Ok(connecting) = endpoint.connect(addr, "grabbr") else {
+            return false;
+        };
+        match tokio::time::timeout(Duration::from_secs(5), connecting).await {
+            Ok(Ok(conn)) => {
+                // a rejected SERVER cert surfaces as the connection dying, not as
+                // connect() erroring — so test survival, not the initial future
+                let survived = tokio::time::timeout(Duration::from_millis(1500), conn.closed())
+                    .await
+                    .is_err();
+                conn.close(0u32.into(), b"done");
+                survived
+            }
+            _ => false,
+        }
+    }
+
+    /// The outbound mirror of `listen::tests::revoked_peer_cannot_resume_its_way_back_in`.
+    /// A resumed CLIENT handshake skips SERVER-certificate verification, so without
+    /// `Resumption::disabled()` we would keep driving a receiver we had just revoked
+    /// -- `FpServerVerifier` and the fail-closed pin both silently bypassed.
+    #[test]
+    fn revoked_receiver_cannot_be_redialed_by_resuming() {
+        transport::install_crypto_provider();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let server = identity();
+            let client = identity();
+            let server_fp = transport::fingerprint_of(&server.cert);
+
+            let server_ep = Endpoint::server(
+                open_server(&server),
+                "127.0.0.1:0".parse().expect("addr"),
+            )
+            .expect("server endpoint");
+            let addr = server_ep.local_addr().expect("local addr");
+            spawn_local(async move {
+                while let Some(incoming) = server_ep.accept().await {
+                    spawn_local(async move {
+                        if let Ok(conn) = incoming.await {
+                            // outlive the client's survival probe
+                            tokio::time::sleep(Duration::from_secs(4)).await;
+                            drop(conn);
+                        }
+                    });
+                }
+            });
+
+            // we trust this receiver (as if just approved)
+            let trusted: Authorized = Arc::new(RwLock::new(HashMap::from([(
+                server_fp.clone(),
+                "receiver".to_string(),
+            )])));
+            let observed = Arc::new(StdMutex::new(None));
+
+            // ONE endpoint + config across both dials, so a ticket can be cached
+            let mut client_ep =
+                Endpoint::client("127.0.0.1:0".parse().expect("addr")).expect("client endpoint");
+            client_ep.set_default_client_config(client_config(
+                &client,
+                trusted.clone(),
+                observed,
+            ));
+
+            assert!(
+                dials_ok(&client_ep, addr).await,
+                "a trusted receiver must be dialable"
+            );
+
+            // revoke the receiver — what remove_authorized_key does to the shared map
+            trusted.write().expect("lock").remove(&server_fp);
+
+            assert!(
+                !dials_ok(&client_ep, addr).await,
+                "REGRESSION: kept driving a REVOKED receiver — the outbound handshake \
+                 resumed and skipped FpServerVerifier"
+            );
+        });
     }
 }
