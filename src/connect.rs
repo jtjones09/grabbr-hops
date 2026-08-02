@@ -663,3 +663,127 @@ async fn clipboard_accept_loop(conn: Connection, addr: SocketAddr, clipboard_in:
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::Identity;
+    use quinn::crypto::rustls::QuicServerConfig;
+    use quinn::Endpoint;
+    use std::collections::HashMap;
+    use std::sync::RwLock;
+
+    fn identity() -> Identity {
+        let key_pair = rcgen::KeyPair::generate().expect("keypair");
+        let mut params =
+            rcgen::CertificateParams::new(vec!["grabbr".to_owned()]).expect("params");
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "grabbr-hop");
+        let cert = params.self_signed(&key_pair).expect("self signed");
+        Identity {
+            cert: cert.der().clone(),
+            key: rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der())
+                .expect("key der"),
+        }
+    }
+
+    /// A server that accepts anyone — we are testing the CLIENT's verification of
+    /// the SERVER, so client auth is deliberately not required here.
+    fn open_server(server: &Identity) -> quinn::ServerConfig {
+        let mut crypto = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![server.cert.clone()], server.key.clone_key())
+            .expect("server cert");
+        crypto.alpn_protocols = vec![transport::ALPN.to_vec()];
+        quinn::ServerConfig::with_crypto(Arc::new(
+            QuicServerConfig::try_from(crypto).expect("quic server"),
+        ))
+    }
+
+    async fn dials_ok(endpoint: &Endpoint, addr: SocketAddr) -> bool {
+        let Ok(connecting) = endpoint.connect(addr, "grabbr") else {
+            return false;
+        };
+        match tokio::time::timeout(Duration::from_secs(5), connecting).await {
+            Ok(Ok(conn)) => {
+                // a rejected SERVER cert surfaces as the connection dying, not as
+                // connect() erroring — so test survival, not the initial future
+                let survived = tokio::time::timeout(Duration::from_millis(1500), conn.closed())
+                    .await
+                    .is_err();
+                conn.close(0u32.into(), b"done");
+                survived
+            }
+            _ => false,
+        }
+    }
+
+    /// The outbound mirror of `listen::tests::revoked_peer_cannot_resume_its_way_back_in`.
+    /// A resumed CLIENT handshake skips SERVER-certificate verification, so without
+    /// `Resumption::disabled()` we would keep driving a receiver we had just revoked
+    /// -- `FpServerVerifier` and the fail-closed pin both silently bypassed.
+    #[test]
+    fn revoked_receiver_cannot_be_redialed_by_resuming() {
+        transport::install_crypto_provider();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let server = identity();
+            let client = identity();
+            let server_fp = transport::fingerprint_of(&server.cert);
+
+            let server_ep = Endpoint::server(
+                open_server(&server),
+                "127.0.0.1:0".parse().expect("addr"),
+            )
+            .expect("server endpoint");
+            let addr = server_ep.local_addr().expect("local addr");
+            spawn_local(async move {
+                while let Some(incoming) = server_ep.accept().await {
+                    spawn_local(async move {
+                        if let Ok(conn) = incoming.await {
+                            // outlive the client's survival probe
+                            tokio::time::sleep(Duration::from_secs(4)).await;
+                            drop(conn);
+                        }
+                    });
+                }
+            });
+
+            // we trust this receiver (as if just approved)
+            let trusted: Authorized = Arc::new(RwLock::new(HashMap::from([(
+                server_fp.clone(),
+                "receiver".to_string(),
+            )])));
+            let observed = Arc::new(StdMutex::new(None));
+
+            // ONE endpoint + config across both dials, so a ticket can be cached
+            let mut client_ep =
+                Endpoint::client("127.0.0.1:0".parse().expect("addr")).expect("client endpoint");
+            client_ep.set_default_client_config(client_config(
+                &client,
+                trusted.clone(),
+                observed,
+            ));
+
+            assert!(
+                dials_ok(&client_ep, addr).await,
+                "a trusted receiver must be dialable"
+            );
+
+            // revoke the receiver — what remove_authorized_key does to the shared map
+            trusted.write().expect("lock").remove(&server_fp);
+
+            assert!(
+                !dials_ok(&client_ep, addr).await,
+                "REGRESSION: kept driving a REVOKED receiver — the outbound handshake \
+                 resumed and skipped FpServerVerifier"
+            );
+        });
+    }
+}
