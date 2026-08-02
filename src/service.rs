@@ -388,11 +388,25 @@ impl Service {
         }
         let release_bind = self.config.release_bind();
         self.capture.set_release_bind(release_bind);
+        // A config reload can drop keys exactly like the revoke button does —
+        // editing config.toml by hand, or a watcher-driven reload. Diff against
+        // the live set and tear down anything that lost trust, or revocation is
+        // silently unenforced through this door.
         let authorized_keys = self.config.authorized_fingerprints();
-        self.authorized_keys
-            .write()
-            .unwrap()
-            .clone_from(&authorized_keys);
+        let revoked: Vec<String> = {
+            let mut live = self.authorized_keys.write().unwrap();
+            let revoked = live
+                .keys()
+                .filter(|k| !authorized_keys.contains_key(*k))
+                .cloned()
+                .collect();
+            live.clone_from(&authorized_keys);
+            revoked
+        };
+        for fp in &revoked {
+            self.client_manager.clear_pins_matching(fp);
+            self.cut_sessions(fp);
+        }
         self.sync_frontend();
     }
 
@@ -685,22 +699,35 @@ impl Service {
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
     }
 
-    fn remove_authorized_key(&mut self, fp: String) {
-        self.authorized_keys.write().expect("lock").remove(&fp);
-        // Peer identity is checked ONCE, at the TLS handshake — so dropping the
-        // key does not stop a session that is already up. Cut the live sessions
-        // in BOTH directions, or "revoke" just hides the card while the peer
-        // keeps driving this machine (or we keep driving theirs).
-        // Resolve the handles first: clear_pins_matching below erases the
-        // fingerprint that the outbound match is made on.
-        let handles = self.client_manager.handles_with_fingerprint(&fp);
-        let (inbound, outbound, revoked) =
-            (self.revoke_listen.clone(), self.revoke_conn.clone(), fp.clone());
+    /// Tear down every live session with `fp`, in both directions.
+    ///
+    /// Peer identity is checked ONCE, at the TLS handshake, so dropping a key
+    /// from the allowlist does nothing to a session that is already up. EVERY
+    /// path that removes trust must call this, or "revoke" only hides the card
+    /// while the peer keeps driving this machine (or we keep driving theirs).
+    fn cut_sessions(&mut self, fp: &str) {
+        // Resolve the handles first: clear_pins_matching erases the fingerprint
+        // that the outbound match is made on.
+        let handles = self.client_manager.handles_with_fingerprint(fp);
+        let (inbound, outbound, revoked) = (
+            self.revoke_listen.clone(),
+            self.revoke_conn.clone(),
+            fp.to_string(),
+        );
         tokio::task::spawn_local(async move {
             let cut_in = inbound.close_fingerprint(&revoked).await;
             let cut_out = outbound.close_handles(&handles).await;
-            log::info!("revoked {revoked}: cut {cut_in} incoming + {cut_out} outgoing session(s)");
+            if cut_in + cut_out > 0 {
+                log::warn!(
+                    "revoked {revoked}: cut {cut_in} incoming + {cut_out} outgoing session(s)"
+                );
+            }
         });
+    }
+
+    fn remove_authorized_key(&mut self, fp: String) {
+        self.authorized_keys.write().expect("lock").remove(&fp);
+        self.cut_sessions(&fp);
         // Revoking trust in a fingerprint releases any outbound pin on it, so a
         // client whose receiver re-keyed (e.g. reinstall) can re-learn + re-pin
         // the new identity on its next dial instead of being stranded on the
