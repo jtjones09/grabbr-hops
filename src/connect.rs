@@ -67,6 +67,11 @@ fn client_config(
         .with_client_auth_cert(vec![identity.cert.clone()], identity.key.clone_key())
         .expect("client auth cert");
     crypto.alpn_protocols = vec![transport::ALPN.to_vec()];
+    // Same hazard, mirrored: a resumed CLIENT handshake skips server-certificate
+    // verification, so `FpServerVerifier` and the fail-closed fingerprint pin would
+    // both be bypassed when redialing a receiver we have since revoked. Refuse
+    // resumption so every dial re-proves the receiver's identity.
+    crypto.resumption = rustls::client::Resumption::disabled();
     let mut config = ClientConfig::new(Arc::new(
         QuicClientConfig::try_from(crypto).expect("quic client config"),
     ));

@@ -68,6 +68,16 @@ fn server_config(
         .with_client_cert_verifier(verifier)
         .with_single_cert(vec![identity.cert.clone()], identity.key.clone_key())?;
     crypto.alpn_protocols = vec![transport::ALPN.to_vec()];
+    // REFUSE TLS 1.3 resumption. rustls only calls `verify_client_cert` from the
+    // ExpectCertificate state, which a resumed handshake never enters: it restores
+    // the peer's cert chain from the ticket and sets doing_client_auth = false. So
+    // a resumed connection SKIPS `FpClientVerifier` entirely — the allowlist is
+    // never consulted, and a peer trusted once could reconnect forever, refreshing
+    // its own tickets on every resumption. rustls documents that it enforces no
+    // policy here; enforcing it is our job. Observed on the rig: a revoked peer
+    // reconnected 1s after its session was cut and was accepted.
+    crypto.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    crypto.send_tls13_tickets = 0;
     let mut server_config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(crypto)?));
     let mut transport_config = TransportConfig::default();
@@ -110,6 +120,7 @@ impl LanMouseListener {
         let listen_task: JoinHandle<()> = {
             let listen_tx = listen_tx.clone();
             let attempts = attempts.clone();
+            let authorized_accept = authorized.clone();
             spawn_local(async move {
                 loop {
                     tokio::select! {
@@ -121,14 +132,40 @@ impl LanMouseListener {
                             let listen_tx = listen_tx.clone();
                             let attempts = attempts.clone();
                             let clipboard_in = clipboard_in.clone();
+                            let authorized = authorized_accept.clone();
                             spawn_local(async move {
                                 let remote = incoming.remote_address();
                                 match incoming.await {
                                     Ok(conn) => {
                                         let addr = conn.remote_address();
                                         log::info!("client connected, ip: {addr}");
-                                        let fingerprint = peer_fingerprint(&conn)
-                                            .unwrap_or_else(|| "unknown".to_owned());
+                                        // Defense in depth: re-check the peer against the
+                                        // live allowlist HERE, after the handshake, instead of
+                                        // trusting the TLS layer to have done it. The verifier
+                                        // is skipped on any resumed handshake, and a peer whose
+                                        // identity we cannot even derive must never be admitted
+                                        // -- it was previously accepted as "unknown", which no
+                                        // revocation could ever match.
+                                        let Some(fingerprint) = peer_fingerprint(&conn) else {
+                                            log::warn!(
+                                                "{addr}: rejecting — no peer certificate presented"
+                                            );
+                                            conn.close(0u32.into(), b"unauthorized");
+                                            return;
+                                        };
+                                        if !authorized
+                                            .read()
+                                            .expect("lock")
+                                            .contains_key(&fingerprint)
+                                        {
+                                            log::warn!(
+                                                "{addr}: rejecting {fingerprint} — not authorized"
+                                            );
+                                            conn.close(0u32.into(), b"unauthorized");
+                                            let _ = listen_tx
+                                                .send(ListenEvent::Rejected { fingerprint });
+                                            return;
+                                        }
                                         let send = match conn.open_uni().await {
                                             Ok(s) => Arc::new(AsyncMutex::new(s)),
                                             Err(e) => {
@@ -409,5 +446,140 @@ async fn clipboard_accept_loop(conn: Connection, addr: SocketAddr, clipboard_in:
             // connection closed — the input read_loop handles cleanup
             Err(_) => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::Identity;
+    use crate::transport::FpServerVerifier;
+    use quinn::{ClientConfig, Endpoint};
+    use std::collections::HashMap;
+    use std::sync::RwLock;
+
+    fn identity() -> Identity {
+        let key_pair = rcgen::KeyPair::generate().expect("keypair");
+        let mut params =
+            rcgen::CertificateParams::new(vec!["grabbr".to_owned()]).expect("params");
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "grabbr-hop");
+        let cert = params.self_signed(&key_pair).expect("self signed");
+        Identity {
+            cert: cert.der().clone(),
+            key: rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der())
+                .expect("key der"),
+        }
+    }
+
+    fn allow(fps: &[&str]) -> Authorized {
+        Arc::new(RwLock::new(
+            fps.iter()
+                .map(|f| ((*f).to_string(), "peer".to_string()))
+                .collect::<HashMap<_, _>>(),
+        ))
+    }
+
+    /// One client config, reused across dials — this is what makes the test
+    /// meaningful: rustls caches session tickets per ClientConfig, so the second
+    /// dial offers a PSK and would RESUME if the server allowed it.
+    fn client_config(client: &Identity, trusts: Authorized) -> ClientConfig {
+        let observed = Arc::new(StdMutex::new(None));
+        let verifier = Arc::new(FpServerVerifier::new(trusts, observed));
+        let mut crypto = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_client_auth_cert(vec![client.cert.clone()], client.key.clone_key())
+            .expect("client auth");
+        crypto.alpn_protocols = vec![transport::ALPN.to_vec()];
+        ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(crypto).expect("quic client"),
+        ))
+    }
+
+    /// Full handshake against the listener's real server config. `true` = admitted.
+    ///
+    /// NB: `open_uni()` is NOT an admission test — QUIC opens streams locally with
+    /// no round trip, so it succeeds even against a server that rejected us. A
+    /// client-cert rejection also lands AFTER `connecting.await` resolves (0.5-RTT),
+    /// so the honest signal is whether the connection SURVIVES: a rejected peer's
+    /// connection closes almost immediately, an admitted one stays up.
+    async fn dials_ok(endpoint: &Endpoint, addr: SocketAddr) -> bool {
+        let Ok(connecting) = endpoint.connect(addr, "grabbr") else {
+            return false;
+        };
+        match tokio::time::timeout(Duration::from_secs(5), connecting).await {
+            Ok(Ok(conn)) => {
+                let survived = tokio::time::timeout(Duration::from_millis(1500), conn.closed())
+                    .await
+                    .is_err();
+                conn.close(0u32.into(), b"done");
+                survived
+            }
+            _ => false,
+        }
+    }
+
+    /// The rig bug: a peer trusted ONCE could reconnect after revocation because a
+    /// resumed TLS handshake never re-runs `FpClientVerifier`. Observed live —
+    /// the revoked sender was back in 1s after its session was cut.
+    #[test]
+    fn revoked_peer_cannot_resume_its_way_back_in() {
+        transport::install_crypto_provider();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let server = identity();
+            let client = identity();
+            let client_fp = transport::fingerprint_of(&client.cert);
+            let server_fp = transport::fingerprint_of(&server.cert);
+
+            // server trusts the client (as if just approved)
+            let authorized = allow(&[&client_fp]);
+            let attempts: Arc<StdMutex<VecDeque<String>>> = Default::default();
+            let cfg = server_config(&server, authorized.clone(), attempts).expect("server config");
+            let listen_addr: SocketAddr = "127.0.0.1:0".parse().expect("addr");
+            let server_ep = Endpoint::server(cfg, listen_addr).expect("endpoint");
+            let addr = server_ep.local_addr().expect("local addr");
+
+            // accept loop: mirrors the real listener closely enough to admit peers
+            spawn_local(async move {
+                while let Some(incoming) = server_ep.accept().await {
+                    spawn_local(async move {
+                        if let Ok(conn) = incoming.await {
+                            // hold well past the client's survival probe, so only a
+                            // REJECTION can close the connection early
+                            tokio::time::sleep(Duration::from_secs(4)).await;
+                            drop(conn);
+                        }
+                    });
+                }
+            });
+
+            // ONE endpoint + config for both dials, so a ticket can be cached
+            let mut client_ep =
+                Endpoint::client("127.0.0.1:0".parse().expect("addr")).expect("client endpoint");
+            client_ep.set_default_client_config(client_config(&client, allow(&[&server_fp])));
+
+            assert!(
+                dials_ok(&client_ep, addr).await,
+                "an authorized peer must be admitted"
+            );
+
+            // revoke — exactly what remove_authorized_key does to the shared map
+            authorized.write().expect("lock").remove(&client_fp);
+
+            assert!(
+                !dials_ok(&client_ep, addr).await,
+                "REGRESSION: a revoked peer got back in — the allowlist was not \
+                 consulted, almost certainly because the handshake resumed and \
+                 skipped FpClientVerifier"
+            );
+        });
     }
 }
