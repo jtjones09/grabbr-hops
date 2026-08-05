@@ -50,7 +50,12 @@ pub fn connect() -> Result<(FrontendEventReader, FrontendRequestWriter), Connect
     let tx = rx.try_clone()?;
     let buf_reader = BufReader::new(rx);
     let lines = buf_reader.lines();
-    let line_writer = LineWriter::new(tx);
+    let mut line_writer = LineWriter::new(tx);
+    // The token is the FIRST line on every connection — the daemon hangs up on
+    // anything that opens the socket without it. See `hops_ipc::token`.
+    let token = crate::token::read()?;
+    writeln!(line_writer, "{token}")?;
+    line_writer.flush()?;
     let reader = FrontendEventReader { lines };
     let writer = FrontendRequestWriter { line_writer };
     Ok((reader, writer))
