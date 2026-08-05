@@ -32,13 +32,34 @@ use std::path::PathBuf;
 const TOKEN_FILE: &str = "ipc-token";
 const TOKEN_BYTES: usize = 32;
 
-/// The token lives beside the socket, inside the user-scoped config directory
-/// (`~/.config/lan-mouse` / `%LOCALAPPDATA%\lan-mouse`).
+/// The token lives with `config.toml`, in the user-scoped config directory —
+/// deliberately NOT beside the socket. On macOS the socket is under
+/// `~/Library/Caches`, which the OS may purge; a token that vanishes while the
+/// daemon still holds it in memory would lock every frontend out with no
+/// obvious cause.
+///
+/// Mirrors the path logic in the `hops` crate's config module (that helper is
+/// not reachable from here, and duplicating four lines beats a dependency
+/// inversion for it). Honours `XDG_CONFIG_HOME`, which is also what lets the
+/// tests point a whole instance at a scratch directory.
 pub fn token_path() -> io::Result<PathBuf> {
-    let mut path = crate::default_socket_path()
-        .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e.to_string()))?;
-    path.pop();
-    Ok(path.join(TOKEN_FILE))
+    Ok(config_dir()?.join(TOKEN_FILE))
+}
+
+fn config_dir() -> io::Result<PathBuf> {
+    let missing = |v: &str| io::Error::new(io::ErrorKind::NotFound, format!("{v} is not set"));
+    #[cfg(unix)]
+    let base = match std::env::var("XDG_CONFIG_HOME") {
+        Ok(dir) => PathBuf::from(dir),
+        Err(_) => PathBuf::from(std::env::var("HOME").map_err(|_| missing("HOME"))?).join(".config"),
+    };
+    #[cfg(not(unix))]
+    let base = match std::env::var("LOCALAPPDATA") {
+        Ok(dir) => PathBuf::from(dir),
+        Err(_) => PathBuf::from(std::env::var("USERPROFILE").map_err(|_| missing("USERPROFILE"))?)
+            .join(".config"),
+    };
+    Ok(base.join("lan-mouse"))
 }
 
 /// Read the existing token, or mint one. Called by the daemon at startup.
