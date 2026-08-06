@@ -53,6 +53,12 @@ pub struct Service {
     frontend_listener: AsyncFrontendListener,
     /// authorized public key sha256 fingerprints
     authorized_keys: Arc<RwLock<HashMap<String, String>>>,
+    /// Fingerprints the user deliberately expelled. Not shared with the TLS
+    /// verifiers — enforcement is already the allowlist's job. This exists so a
+    /// revoked peer cannot RAISE A PROMPT: it loses the ability to schedule a
+    /// security decision, which is the part of revocation that is actually worth
+    /// something (it cannot exclude anyone — a peer can always re-key).
+    revoked: HashMap<String, hops_ipc::RevokedEntry>,
     /// (outgoing) client information
     client_manager: ClientManager,
     /// current port
@@ -175,7 +181,9 @@ impl Service {
         let resolver = DnsResolver::new()?;
 
         let port = config.port();
+        let revoked = config.revoked_fingerprints();
         let service = Self {
+            revoked,
             config,
             capture,
             emulation,
@@ -244,7 +252,7 @@ impl Service {
                         let known = self.authorized_keys.read().expect("lock").contains_key(&fp);
                         if !known {
                             log::info!("untrusted receiver {fp} — raising an approval prompt");
-                            self.notify_frontend(FrontendEvent::ConnectionAttempt { fingerprint: fp });
+                            self.raise_connection_attempt(fp);
                         }
                     }
                 }
@@ -299,6 +307,10 @@ impl Service {
         match request {
             FrontendRequest::Activate(handle, active) => {
                 self.set_client_active(handle, active);
+                self.save_config();
+            }
+            FrontendRequest::RestoreRevoked(fp) => {
+                self.restore_revoked(fp);
                 self.save_config();
             }
             FrontendRequest::AuthorizeKey(desc, fp) => {
@@ -367,6 +379,7 @@ impl Service {
         self.config.set_clients(clients);
         let authorized_keys = self.authorized_keys.read().expect("lock").clone();
         self.config.set_authorized_keys(authorized_keys);
+        self.config.set_revoked_fingerprints(self.revoked.clone());
         if let Err(e) = self.config.write_back() {
             log::warn!("failed to write config: {e}");
         }
@@ -392,7 +405,19 @@ impl Service {
         // editing config.toml by hand, or a watcher-driven reload. Diff against
         // the live set and tear down anything that lost trust, or revocation is
         // silently unenforced through this door.
-        let authorized_keys = self.config.authorized_fingerprints();
+        self.revoked = self.config.revoked_fingerprints();
+        let mut authorized_keys = self.config.authorized_fingerprints();
+        // Revocation outranks the allowlist. Re-adding a revoked fingerprint by
+        // hand-editing config.toml is refused and logged, so the denylist cannot
+        // be laundered around by copy-pasting a key back into the other table.
+        for fp in self.revoked.keys() {
+            if authorized_keys.remove(fp).is_some() {
+                log::warn!(
+                    "config lists {fp} as BOTH authorized and revoked — refusing it. \
+                     Restore it from the device list if that is what you meant."
+                );
+            }
+        }
         let revoked: Vec<String> = {
             let mut live = self.authorized_keys.write().unwrap();
             let revoked = live
@@ -423,7 +448,7 @@ impl Service {
     fn handle_emulation_event(&mut self, event: EmulationEvent) {
         match event {
             EmulationEvent::ConnectionAttempt { fingerprint } => {
-                self.notify_frontend(FrontendEvent::ConnectionAttempt { fingerprint });
+                self.raise_connection_attempt(fingerprint);
             }
             EmulationEvent::Entered {
                 addr,
@@ -622,6 +647,10 @@ impl Service {
         self.notify_frontend(FrontendEvent::PairingCode(pairing_code));
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+        // a freshly-attached frontend must learn the denylist too, or it renders
+        // revoked devices as strangers until the next change
+        let revoked = self.revoked.clone();
+        self.notify_frontend(FrontendEvent::RevokedUpdated(revoked));
         // re-emit current incoming connections so a freshly-attached UI knows
         // which trusted peers are connected right now, not just from future events
         let connected: Vec<(SocketAddr, String)> = self
@@ -698,9 +727,61 @@ impl Service {
     }
 
     fn add_authorized_key(&mut self, desc: String, fp: String) {
+        // Trusting a fingerprint retires its expulsion — but note this is only
+        // reachable from a user action, and a revoked peer can no longer provoke
+        // one (see `raise_connection_attempt`).
+        if self.revoked.remove(&fp).is_some() {
+            log::info!("{fp} was revoked and has now been deliberately restored");
+            let revoked = self.revoked.clone();
+            self.notify_frontend(FrontendEvent::RevokedUpdated(revoked));
+        }
         self.authorized_keys.write().expect("lock").insert(fp, desc);
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+    }
+
+    /// Deliberately re-trust a device the user previously expelled.
+    ///
+    /// Separate from `add_authorized_key` so the act is unambiguous in the logs
+    /// and in the UI: it is only reachable from a device row the user is looking
+    /// at, never from a prompt a reconnecting peer caused.
+    fn restore_revoked(&mut self, fp: String) {
+        let Some(entry) = self.revoked.remove(&fp) else {
+            log::warn!("restore requested for {fp}, which is not revoked — ignoring");
+            return;
+        };
+        log::warn!(
+            "restoring trust in {:?} ({fp}), revoked at {} — user-initiated",
+            entry.label,
+            entry.revoked_at
+        );
+        self.authorized_keys
+            .write()
+            .expect("lock")
+            .insert(fp, entry.label);
+        let keys = self.authorized_keys.read().expect("lock").clone();
+        self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+        let revoked = self.revoked.clone();
+        self.notify_frontend(FrontendEvent::RevokedUpdated(revoked));
+    }
+
+    /// The ONLY path from an approval prompt to the allowlist.
+    ///
+    /// A revoked fingerprint is dropped here with a log line and no UI event, so
+    /// a peer that reconnects after being expelled cannot put a dialog on the
+    /// user's screen. That is the whole mechanism: revocation cannot keep an
+    /// attacker out (it can re-key), but it can stop it choosing the moment you
+    /// are asked to let it back in.
+    fn raise_connection_attempt(&mut self, fingerprint: String) {
+        if let Some(entry) = self.revoked.get(&fingerprint) {
+            log::warn!(
+                "ignoring a connection attempt from revoked device {:?} ({fingerprint}) — \
+                 restore it from the device list if this is intended",
+                entry.label
+            );
+            return;
+        }
+        self.notify_frontend(FrontendEvent::ConnectionAttempt { fingerprint });
     }
 
     /// Tear down every live session with `fp`, in both directions.
@@ -730,7 +811,25 @@ impl Service {
     }
 
     fn remove_authorized_key(&mut self, fp: String) {
-        self.authorized_keys.write().expect("lock").remove(&fp);
+        let label = self
+            .authorized_keys
+            .write()
+            .expect("lock")
+            .remove(&fp)
+            .unwrap_or_default();
+        // Remember the expulsion. Without this the peer is a stranger again on
+        // its next dial and raises the ordinary approval prompt, which is how
+        // "revoke" ended up being one click away from undone.
+        self.revoked.insert(
+            fp.clone(),
+            hops_ipc::RevokedEntry {
+                label,
+                revoked_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or_default(),
+            },
+        );
         self.cut_sessions(&fp);
         // Revoking trust in a fingerprint releases any outbound pin on it, so a
         // client whose receiver re-keyed (e.g. reinstall) can re-learn + re-pin
@@ -739,6 +838,8 @@ impl Service {
         self.client_manager.clear_pins_matching(&fp);
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+        let revoked = self.revoked.clone();
+        self.notify_frontend(FrontendEvent::RevokedUpdated(revoked));
     }
 
     fn enumerate(&mut self) {

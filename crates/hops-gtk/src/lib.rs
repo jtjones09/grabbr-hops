@@ -306,6 +306,9 @@ fn build_ui(app: &Application) {
                     // the GUI/TUI only. Handled explicitly rather than with a
                     // wildcard so a future variant still fails the build here.
                     FrontendEvent::PairingCode(_) => {}
+                    // no revoked-device surface in this frontend yet; the daemon
+                    // still enforces it, this UI just cannot show or restore it
+                    FrontendEvent::RevokedUpdated(_) => {}
                 }
             }
         }

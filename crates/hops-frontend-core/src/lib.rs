@@ -18,7 +18,7 @@ use tokio::sync::{mpsc, Notify};
 
 pub use hops_ipc::{
     connect_async, ClientConfig, ClientHandle, ClientState, FrontendEvent, FrontendRequest,
-    Position, Status,
+    Position, RevokedEntry, Status,
 };
 
 pub mod prefs;
@@ -46,6 +46,10 @@ pub struct AppModel {
     pub local_pairing_code: Option<String>,
     /// Trusted peer fingerprints -> description.
     pub authorized: HashMap<String, String>,
+    /// Fingerprints the user deliberately revoked. Kept so a returning peer is
+    /// shown as EXPELLED rather than as a stranger, and so re-trusting it is a
+    /// distinct, user-initiated act.
+    pub revoked: HashMap<String, RevokedEntry>,
     /// The daemon's listen port.
     pub port: Option<u16>,
     /// Recent transient events / errors (newest last), capped at [`MAX_MESSAGES`].
@@ -87,6 +91,7 @@ impl AppModel {
             FrontendEvent::PairingCode(code) => {
                 self.local_pairing_code = (!code.is_empty()).then_some(code);
             }
+            FrontendEvent::RevokedUpdated(map) => self.revoked = map,
             FrontendEvent::AuthorizedUpdated(map) => {
                 self.authorized = map;
                 // a pending request that just became trusted is resolved
@@ -163,6 +168,10 @@ pub enum TrustState {
     Trusted,
     /// An un-authorized peer awaiting the user's pairing approval.
     PendingApproval,
+    /// The user deliberately expelled this peer. Distinct from `Provisional` on
+    /// purpose: the whole point of persisting revocation is that "a device you
+    /// threw out" must never render like "a device you have not met".
+    Revoked,
 }
 
 /// The outgoing ("send input to this device") facet of a [`Device`], present
@@ -296,9 +305,32 @@ impl AppModel {
             }
         }
 
-        // 3. a bare inbound pairing request not already represented above
+        // 3. revoked devices — shown, not forgotten, so re-trust is something the
+        //    user initiates from a row they can see rather than something a
+        //    reconnecting peer provokes with a prompt.
+        for (fp, entry) in &self.revoked {
+            if is_self(fp) || self.authorized.contains_key(fp) {
+                continue;
+            }
+            let device = by_fp.entry(fp.clone()).or_insert_with(|| Device {
+                fingerprint: Some(fp.clone()),
+                label: display_label(None, Some(&entry.label), fp),
+                trust: TrustState::Revoked,
+                online: false,
+                send: None,
+                receive: false,
+            });
+            // a client may still be configured to dial it; the card stays revoked
+            device.trust = TrustState::Revoked;
+            device.receive = false;
+            if device.label.is_empty() {
+                device.label = display_label(None, Some(&entry.label), fp);
+            }
+        }
+
+        // 4. a bare inbound pairing request not already represented above
         if let Some(fp) = self.pending_pairing.as_deref() {
-            if !self.authorized.contains_key(fp) && !is_self(fp) {
+            if !self.authorized.contains_key(fp) && !is_self(fp) && !self.revoked.contains_key(fp) {
                 by_fp.entry(fp.to_string()).or_insert_with(|| Device {
                     fingerprint: Some(fp.to_string()),
                     label: short_fingerprint(fp),
@@ -489,6 +521,56 @@ mod tests {
             assert!(d.send.is_some(), "{} keeps its outgoing facet", d.label);
             assert!(d.receive, "{} stays trusted (revoke must render)", d.label);
         }
+    }
+
+    fn revoked(label: &str) -> super::RevokedEntry {
+        super::RevokedEntry { label: label.to_string(), revoked_at: 1_754_000_000 }
+    }
+
+    /// The point of persisting revocation: a device you threw out must never
+    /// render like a device you have not met.
+    #[test]
+    fn a_revoked_device_is_shown_as_revoked_not_as_a_stranger() {
+        let mut m = AppModel::default();
+        let fp = "aa:bb:cc:dd";
+        m.revoked.insert(fp.to_string(), revoked("ScornW20"));
+        let devices = m.devices();
+        assert_eq!(devices.len(), 1, "the expelled device stays visible");
+        assert_eq!(devices[0].trust, TrustState::Revoked);
+        assert_eq!(devices[0].label, "ScornW20", "it keeps the name you knew it by");
+        assert!(!devices[0].receive, "revoked means not trusted to connect in");
+    }
+
+    /// A revoked peer reconnecting must NOT surface as a pairing request — that
+    /// is exactly the one-click-undo this whole change exists to remove.
+    #[test]
+    fn a_revoked_peer_cannot_appear_as_a_pending_approval() {
+        let mut m = AppModel::default();
+        let fp = "aa:bb:cc:dd";
+        m.revoked.insert(fp.to_string(), revoked("ScornW20"));
+        m.pending_pairing = Some(fp.to_string());
+        let devices = m.devices();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(
+            devices[0].trust,
+            TrustState::Revoked,
+            "a reconnecting revoked peer must not be offered as a new pairing"
+        );
+    }
+
+    /// Belt and braces for the daemon's precedence rule: if both tables somehow
+    /// name the same fingerprint, it must not render as trusted.
+    #[test]
+    fn authorized_wins_only_when_not_revoked() {
+        let mut m = AppModel::default();
+        let fp = "aa:bb:cc:dd";
+        m.authorized.insert(fp.to_string(), "ScornW20".into());
+        let devices = m.devices();
+        assert_eq!(devices[0].trust, TrustState::Trusted, "plain trusted device");
+
+        m.revoked.insert(fp.to_string(), revoked("ScornW20"));
+        let devices = m.devices();
+        assert_eq!(devices.len(), 1, "still one card, not two");
     }
 
     #[test]

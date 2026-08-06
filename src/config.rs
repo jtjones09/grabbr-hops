@@ -16,7 +16,7 @@ use thiserror::Error;
 use toml_edit::{self, DocumentMut};
 
 use hops_cli::CliArgs;
-use hops_ipc::{DEFAULT_PORT, Position};
+use hops_ipc::{DEFAULT_PORT, Position, RevokedEntry};
 
 use input_event::scancode::{
     self,
@@ -90,6 +90,11 @@ struct ConfigToml {
     cert_path: Option<PathBuf>,
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
+    /// Fingerprints the user expelled. Persisted so revocation survives a
+    /// restart — otherwise a revoked peer is a stranger again on next boot and
+    /// can raise the approval prompt exactly as before.
+    #[serde(default)]
+    revoked_fingerprints: Option<HashMap<String, RevokedEntry>>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -484,6 +489,20 @@ impl Config {
 
     pub fn config_path(&self) -> &Path {
         &self.config_path
+    }
+
+    /// fingerprints the user deliberately revoked
+    pub fn revoked_fingerprints(&self) -> HashMap<String, RevokedEntry> {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.revoked_fingerprints.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn set_revoked_fingerprints(&mut self, revoked: HashMap<String, RevokedEntry>) {
+        self.config_toml
+            .get_or_insert_with(Default::default)
+            .revoked_fingerprints = Some(revoked);
     }
 
     /// public key fingerprints authorized for connection
