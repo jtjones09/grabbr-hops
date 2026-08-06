@@ -33,6 +33,7 @@ export struct DeviceRow {
     fp-full: string,     // full fingerprint (for revoke)
     online: bool,        // a peer with this fingerprint is connected in
     trusted: bool,       // its fingerprint is in authorized_fingerprints
+    revoked: bool,       // the user expelled it; shown, not forgotten
 }
 
 export component AppWindow inherits Window {
@@ -61,6 +62,10 @@ export component AppWindow inherits Window {
     in property <string> pairing-fp: "";
 
     property <string> confirm-revoke-fp: "";
+    // restoring an expelled device is security-DECREASING, so it gets at least
+    // the same friction as revoking. It is also the only way back in — a revoked
+    // peer can no longer raise a prompt of its own.
+    in-out property <string> confirm-restore-fp: "";
     // `in-out` so the render_png self-review harness can open it for a look.
     in-out property <string> confirm-delete-handle: "";
     // handle of the device being renamed ("" = none). The rename FIELD lives
@@ -91,6 +96,9 @@ export component AppWindow inherits Window {
     callback rename-device(string /* handle */, string /* new name */);
     callback delete-device(string /* handle */);
     callback revoke(string /* full fingerprint */);
+    // deliberately re-trust an expelled device — only reachable from its row,
+    // never from a prompt a reconnecting peer caused
+    callback restore-device(string /* full fingerprint */);
     callback approve-pairing(string /* name */, string /* full fingerprint */);
     callback deny-pairing(string /* full fingerprint */);
     callback set-theme(int /* palette index */);
@@ -429,13 +437,59 @@ export component AppWindow inherits Window {
                                 }
 
                                 // --- receive-only facet: trust status + revoke ---
-                                if !d.has-send && root.confirm-revoke-fp != d.fp-full: VerticalLayout {
+                                if !d.has-send && !d.revoked && root.confirm-revoke-fp != d.fp-full: VerticalLayout {
                                     alignment: center;
                                     Text {
                                         text: d.online ? "connected" : "offline";
                                         color: d.online ? Theme.c.success : Theme.c.muted;
                                         font-size: Type.small;
                                         font-weight: Type.medium;
+                                    }
+                                }
+                                if d.revoked && root.confirm-restore-fp != d.fp-full: VerticalLayout {
+                                    alignment: center;
+                                    Text {
+                                        text: "revoked";
+                                        color: Theme.c.error;
+                                        font-size: Type.small;
+                                        font-weight: Type.medium;
+                                    }
+                                }
+                                if d.revoked && root.confirm-restore-fp != d.fp-full: VerticalLayout {
+                                    alignment: center;
+                                    PillButton {
+                                        text: "trust again";
+                                        ghost: true;
+                                        clicked => { root.confirm-restore-fp = d.fp-full; }
+                                    }
+                                }
+                                // the confirm names what you are undoing — "you
+                                // revoked this" is the fact that matters here
+                                if d.revoked && root.confirm-restore-fp == d.fp-full: VerticalLayout {
+                                    alignment: center;
+                                    Text {
+                                        text: "you revoked this";
+                                        color: Theme.c.muted;
+                                        font-size: Type.small;
+                                    }
+                                }
+                                if d.revoked && root.confirm-restore-fp == d.fp-full: VerticalLayout {
+                                    alignment: center;
+                                    PillButton {
+                                        text: "restore";
+                                        danger: true;
+                                        clicked => {
+                                            root.restore-device(d.fp-full);
+                                            root.confirm-restore-fp = "";
+                                        }
+                                    }
+                                }
+                                if d.revoked && root.confirm-restore-fp == d.fp-full: VerticalLayout {
+                                    alignment: center;
+                                    PillButton {
+                                        text: "no";
+                                        ghost: true;
+                                        clicked => { root.confirm-restore-fp = ""; }
                                     }
                                 }
                                 if d.trusted && root.confirm-revoke-fp != d.fp-full: VerticalLayout {
