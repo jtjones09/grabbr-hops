@@ -310,10 +310,16 @@ impl Service {
                 self.save_config();
             }
             FrontendRequest::RestoreRevoked(fp) => {
+                if self.refuse_while_remotely_driven("restore a revoked device") {
+                    return;
+                }
                 self.restore_revoked(fp);
                 self.save_config();
             }
             FrontendRequest::AuthorizeKey(desc, fp) => {
+                if self.refuse_while_remotely_driven("grant trust") {
+                    return;
+                }
                 self.add_authorized_key(desc, fp);
                 self.save_config();
             }
@@ -763,6 +769,37 @@ impl Service {
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
         let revoked = self.revoked.clone();
         self.notify_frontend(FrontendEvent::RevokedUpdated(revoked));
+    }
+
+    /// Refuse a trust GRANT while a peer is driving this machine's input.
+    ///
+    /// On a KVM the pointer is not proof of local presence: a peer that still
+    /// holds control can move the cursor onto an approval button and click it,
+    /// manufacturing its own consent. Any proof evaluated on the REQUESTING
+    /// machine is worthless (it is the adversary, and this is GPLv3 source), so
+    /// the only usable check is one this machine makes against state only it
+    /// holds — and it already knows when it is being driven.
+    ///
+    /// Deliberately NOT applied to revocation: refusing to let you revoke while a
+    /// peer is driving you would block the one action you most need in exactly
+    /// the moment you need it.
+    ///
+    /// Honest bound: this defeats the injected-click path and nothing more. A
+    /// peer with sustained keyboard control can do anything a local user can.
+    /// What it buys is that AFTER revocation the peer has no input at all, so it
+    /// cannot click its own way back in, and a still-trusted accomplice cannot
+    /// do it on its behalf.
+    fn refuse_while_remotely_driven(&mut self, what: &str) -> bool {
+        const QUIET: std::time::Duration = std::time::Duration::from_secs(2);
+        if !self.emulation.remotely_driven_within(QUIET) {
+            return false;
+        }
+        log::warn!("refusing to {what} — this machine is being driven by a peer right now");
+        self.notify_frontend(FrontendEvent::Error(format!(
+            "Refused to {what}: this machine is being controlled remotely. \
+             Use its own keyboard and mouse, then try again."
+        )));
+        true
     }
 
     /// The ONLY path from an approval prompt to the allowlist.

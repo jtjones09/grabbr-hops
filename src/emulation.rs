@@ -19,6 +19,8 @@ use tokio::{
 
 /// emulation handling events received from a listener
 pub(crate) struct Emulation {
+    /// shared with the proxy: when a peer last injected input into this machine
+    last_injected: Rc<Cell<Option<Instant>>>,
     task: JoinHandle<()>,
     request_tx: Sender<EmulationRequest>,
     event_rx: Receiver<EmulationEvent>,
@@ -98,6 +100,7 @@ impl Emulation {
         listener: LanMouseListener,
     ) -> Self {
         let emulation_proxy = EmulationProxy::new(backend);
+        let last_injected = emulation_proxy.last_injected.clone();
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let emulation_task = ListenTask {
@@ -108,10 +111,19 @@ impl Emulation {
         };
         let task = spawn_local(emulation_task.run());
         Self {
+            last_injected,
             task,
             request_tx,
             event_rx,
         }
+    }
+
+    /// True if a peer injected input into this machine within `window`.
+    /// See `EmulationProxy::remotely_driven_within`.
+    pub(crate) fn remotely_driven_within(&self, window: Duration) -> bool {
+        self.last_injected
+            .get()
+            .is_some_and(|t| t.elapsed() < window)
     }
 
     pub(crate) fn send_leave_event(&self, addr: SocketAddr) {
@@ -329,6 +341,11 @@ impl ListenTask {
 /// proxy handling the actual input emulation,
 /// discarding events when it is disabled
 pub(crate) struct EmulationProxy {
+    /// When a peer last injected input INTO this machine. Read by the service to
+    /// refuse trust GRANTS while the cursor is not ours — otherwise a peer that
+    /// still holds control can drive the pointer onto an approval button and
+    /// click it, manufacturing its own consent.
+    last_injected: Rc<Cell<Option<Instant>>>,
     emulation_active: Rc<Cell<bool>>,
     exit_requested: Rc<Cell<bool>>,
     request_tx: Sender<ProxyRequest>,
@@ -390,6 +407,7 @@ impl EmulationProxy {
         };
         let task = spawn_local(emulation_task.run());
         Self {
+            last_injected: Rc::new(Cell::new(None)),
             emulation_active,
             exit_requested,
             request_tx,
@@ -397,6 +415,18 @@ impl EmulationProxy {
             event_rx,
             metrics,
         }
+    }
+
+    /// True if a peer injected input into this machine within `window`.
+    ///
+    /// Used to refuse trust GRANTS while the pointer is not ours. Deliberately a
+    /// quiet-window check rather than suspending injection while a prompt is
+    /// open: the latter would hand any LAN peer a KVM freeze by dialling with a
+    /// fresh cert on a timer.
+    pub(crate) fn remotely_driven_within(&self, window: Duration) -> bool {
+        self.last_injected
+            .get()
+            .is_some_and(|t| t.elapsed() < window)
     }
 
     async fn event(&mut self) -> EmulationEvent {
@@ -411,6 +441,9 @@ impl EmulationProxy {
     }
 
     fn consume(&self, event: Event, addr: SocketAddr) {
+        // stamped before the enabled-check: what matters is that a REMOTE peer is
+        // driving, not whether we happened to act on it
+        self.last_injected.set(Some(Instant::now()));
         // ignore events if emulation is currently disabled
         if self.emulation_active.get() {
             self.request_tx
@@ -631,6 +664,38 @@ mod tests {
 
     fn addr(n: u16) -> SocketAddr {
         format!("127.0.0.1:{n}").parse().unwrap()
+    }
+
+    /// The pointer is not proof of local presence on a KVM: a peer that still
+    /// holds control can drive the cursor onto an approval button and click it.
+    /// The daemon refuses trust GRANTS while this reads true.
+    #[test]
+    fn peer_input_marks_the_machine_as_remotely_driven() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let proxy = EmulationProxy::new(None);
+            let window = Duration::from_secs(2);
+            assert!(
+                !proxy.remotely_driven_within(window),
+                "a machine nobody has driven is not remotely driven"
+            );
+
+            proxy.consume(Event::Pointer(PointerEvent::Motion { time: 0, dx: 1.0, dy: 0.0 }), addr(1));
+            assert!(
+                proxy.remotely_driven_within(window),
+                "peer input must mark the machine as remotely driven"
+            );
+
+            // and the window is a window, not a latch
+            assert!(
+                !proxy.remotely_driven_within(Duration::from_nanos(1)),
+                "the check must expire, or trust changes would be blocked forever"
+            );
+        });
     }
 
     #[test]
