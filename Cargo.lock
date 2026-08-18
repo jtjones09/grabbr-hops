@@ -2659,6 +2659,7 @@ version = "0.3.0"
 dependencies = [
  "base64",
  "futures",
+ "getrandom 0.3.4",
  "log",
  "serde",
  "serde_json",

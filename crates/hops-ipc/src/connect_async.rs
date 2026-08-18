@@ -74,8 +74,21 @@ pub async fn connect_async(
     let lines = buf_reader.lines();
     let lines_stream = LinesStream::new(lines);
     let reader = AsyncFrontendEventReader { lines_stream };
-    let writer = AsyncFrontendRequestWriter { tx };
+    let mut writer = AsyncFrontendRequestWriter { tx };
+    // The token is the FIRST line on every connection — the daemon hangs up on
+    // anything that opens the socket without it. See `hops_ipc::token`.
+    writer.authenticate().await?;
     Ok((reader, writer))
+}
+
+impl AsyncFrontendRequestWriter {
+    /// Present the IPC token. Must precede any request on the connection.
+    async fn authenticate(&mut self) -> Result<(), ConnectionError> {
+        let token = crate::token::read()?;
+        self.tx.write_all(format!("{token}\n").as_bytes()).await?;
+        self.tx.flush().await?;
+        Ok(())
+    }
 }
 
 /// wait for the lan-mouse socket to come online

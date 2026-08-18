@@ -20,6 +20,7 @@ mod connect;
 mod connect_async;
 mod listen;
 pub mod pairing;
+pub mod token;
 
 pub use connect::{FrontendEventReader, FrontendRequestWriter, connect};
 pub use connect_async::{AsyncFrontendEventReader, AsyncFrontendRequestWriter, connect_async};

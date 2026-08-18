@@ -9,9 +9,15 @@ repository = "https://github.com/jtjones09/grabbr-hops"
 [dependencies]
 base64 = "0.22"
 futures = "0.3.30"
+getrandom = "0.3"
 log = "0.4.22"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.107"
 thiserror = "2.0.0"
 tokio = { version = "1.32.0", features = ["macros", "net", "io-util", "time"] }
 tokio-stream = { version = "0.1.15", features = ["io-util"] }
+
+[dev-dependencies]
+# the IPC auth tests drive a connection over an in-memory duplex
+tokio = { version = "1.32.0", features = ["rt", "macros", "io-util", "time"] }
+futures = "0.3.30"
