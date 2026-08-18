@@ -96,13 +96,16 @@ fn peer_fingerprint(conn: &Connection) -> Option<String> {
 
 async fn connect(
     endpoint: Endpoint,
+    cfg: ClientConfig,
     addr: SocketAddr,
     expected_fp: Option<String>,
 ) -> Result<(PeerLink, SocketAddr), (SocketAddr, LanMouseConnectionError)> {
     log::info!("connecting to {addr} ...");
     // server_name is the SNI label; trust is by fingerprint, so it is not
     // trust-relevant — a fixed label is fine.
-    let connecting = endpoint.connect(addr, "grabbr").map_err(|e| (addr, e.into()))?;
+    let connecting = endpoint
+        .connect_with(cfg, addr, "grabbr")
+        .map_err(|e| (addr, e.into()))?;
     let conn = match tokio::time::timeout(DEFAULT_CONNECTION_TIMEOUT, connecting).await {
         Err(_) => return Err((addr, LanMouseConnectionError::Timeout)),
         Ok(Err(e)) => return Err((addr, e.into())),
@@ -137,14 +140,16 @@ async fn connect(
 
 async fn connect_any(
     endpoint: &Endpoint,
+    cfg: &ClientConfig,
     addrs: &[SocketAddr],
     expected_fp: Option<String>,
 ) -> Result<(PeerLink, SocketAddr), LanMouseConnectionError> {
     let mut joinset = JoinSet::new();
     for &addr in addrs {
         let endpoint = endpoint.clone();
+        let cfg = cfg.clone();
         let expected = expected_fp.clone();
-        joinset.spawn_local(connect(endpoint, addr, expected));
+        joinset.spawn_local(connect(endpoint, cfg, addr, expected));
     }
     // if every candidate failed the identity pin (not a transport error), surface
     // that distinctly so the caller logs the right recovery guidance.
@@ -179,8 +184,13 @@ pub(crate) struct LanMouseConnection {
     recv_rx: Receiver<(ClientHandle, ProtoEvent)>,
     recv_tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
-    /// last receiver fingerprint observed during a handshake, for logging.
-    observed: Arc<StdMutex<Option<String>>>,
+    /// Material for building a FRESH client config per dial. The observed-
+    /// fingerprint slot MUST NOT be shared: it is written by the TLS verifier and
+    /// read by the failing dial's error path, so one process-wide slot let a
+    /// concurrent dial to another peer overwrite it — losing the trust prompt, or
+    /// raising it for the wrong machine.
+    identity: Arc<Identity>,
+    authorized: Authorized,
     /// inbound clipboard text received from peers, forwarded to the service.
     clipboard_in: Sender<String>,
     /// signals the service that this client's peer_fingerprint was just learned,
@@ -206,9 +216,9 @@ impl LanMouseConnection {
         persist_tx: Sender<ClientHandle>,
     ) -> Result<Self, LanMouseConnectionError> {
         transport::install_crypto_provider();
-        let observed = Arc::new(StdMutex::new(None));
-        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().expect("valid addr"))?;
-        endpoint.set_default_client_config(client_config(&identity, authorized, observed.clone()));
+        let endpoint = Endpoint::client("0.0.0.0:0".parse().expect("valid addr"))?;
+        // deliberately NO set_default_client_config — every dial builds its own so
+        // each carries a private observed-fingerprint slot (see the field docs).
         let (recv_tx, recv_rx) = channel();
         Ok(Self {
             endpoint,
@@ -218,7 +228,8 @@ impl LanMouseConnection {
             recv_rx,
             recv_tx,
             ping_response: Default::default(),
-            observed,
+            identity,
+            authorized,
             clipboard_in,
             untrusted_tx,
             persist_tx,
@@ -295,7 +306,8 @@ impl LanMouseConnection {
                 self.connecting.clone(),
                 self.recv_tx.clone(),
                 self.ping_response.clone(),
-                self.observed.clone(),
+                self.identity.clone(),
+                self.authorized.clone(),
                 self.clipboard_in.clone(),
                 self.untrusted_tx.clone(),
                 self.persist_tx.clone(),
@@ -367,7 +379,8 @@ async fn connect_to_handle(
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
     tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
-    observed: Arc<StdMutex<Option<String>>>,
+    identity: Arc<Identity>,
+    authorized: Authorized,
     clipboard_in: Sender<String>,
     untrusted_tx: Sender<String>,
     persist_tx: Sender<ClientHandle>,
@@ -386,7 +399,12 @@ async fn connect_to_handle(
         // Pin to the client's known identity (if any) so the parallel race
         // fails closed against a wrong-but-allowlisted receiver at a raced addr.
         let expected_fp = client_manager.peer_fingerprint(handle);
-        let (link, addr) = match connect_any(&endpoint, &addrs, expected_fp).await {
+        // One slot per dial attempt. Every address raced below is the SAME
+        // intended peer, so they may share it; a concurrent dial for a different
+        // handle gets its own and cannot clobber this one.
+        let observed = Arc::new(StdMutex::new(None));
+        let cfg = client_config(&identity, authorized.clone(), observed.clone());
+        let (link, addr) = match connect_any(&endpoint, &cfg, &addrs, expected_fp).await {
             Ok(c) => c,
             Err(e) => {
                 connecting.lock().await.remove(&handle);
@@ -718,6 +736,74 @@ mod tests {
             }
             _ => false,
         }
+    }
+
+    /// Two dials in flight at once must each learn THEIR OWN receiver's
+    /// fingerprint. The slot is written by the TLS verifier and read by the
+    /// failing dial's error path to raise the trust prompt, so a single
+    /// process-wide slot (what this replaced) let one dial overwrite another's —
+    /// losing the prompt, or offering to trust the wrong machine.
+    #[test]
+    fn concurrent_dials_keep_their_own_observed_fingerprint() {
+        transport::install_crypto_provider();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let client = identity();
+            // trust NEITHER receiver, so both handshakes are rejected and both
+            // verifiers record what they saw
+            let empty: Authorized = Arc::new(RwLock::new(HashMap::new()));
+
+            let mut addrs = vec![];
+            let mut fps = vec![];
+            for _ in 0..2 {
+                let server = identity();
+                fps.push(transport::fingerprint_of(&server.cert));
+                let ep = Endpoint::server(
+                    open_server(&server),
+                    "127.0.0.1:0".parse().expect("addr"),
+                )
+                .expect("server endpoint");
+                addrs.push(ep.local_addr().expect("local addr"));
+                spawn_local(async move {
+                    while let Some(incoming) = ep.accept().await {
+                        spawn_local(async move {
+                            let _ = incoming.await;
+                        });
+                    }
+                });
+            }
+
+            let client_ep =
+                Endpoint::client("127.0.0.1:0".parse().expect("addr")).expect("client endpoint");
+
+            // one slot per dial — this is the fix
+            let slots: Vec<Arc<StdMutex<Option<String>>>> =
+                (0..2).map(|_| Arc::new(StdMutex::new(None))).collect();
+            let cfgs: Vec<ClientConfig> = slots
+                .iter()
+                .map(|s| client_config(&client, empty.clone(), s.clone()))
+                .collect();
+
+            // genuinely concurrent
+            let _ = tokio::join!(
+                connect(client_ep.clone(), cfgs[0].clone(), addrs[0], None),
+                connect(client_ep.clone(), cfgs[1].clone(), addrs[1], None),
+            );
+
+            for (i, slot) in slots.iter().enumerate() {
+                let seen = slot.lock().expect("lock").clone();
+                assert_eq!(
+                    seen.as_deref(),
+                    Some(fps[i].as_str()),
+                    "dial {i} must observe ITS OWN receiver — a shared slot would \
+                     leave both holding whichever handshake finished last"
+                );
+            }
+        });
     }
 
     /// The outbound mirror of `listen::tests::revoked_peer_cannot_resume_its_way_back_in`.
