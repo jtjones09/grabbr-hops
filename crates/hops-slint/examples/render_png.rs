@@ -3,7 +3,8 @@
 // This is how the GUI's design gets reviewed without a display.
 //
 //   cargo run -p lan-mouse-slint --example render_png -- /path/to/out.png [w] [h] [theme_index] [mode]
-//   mode: normal (default) | settings | add-device | edit-device | delete-confirm | layout-canvas
+//   mode: normal (default) | settings | add-device | edit-device | delete-confirm
+//         | restore-confirm | layout-canvas
 //
 // Requires the crate's slint dep to carry feature "software-renderer-systemfonts"
 // (see Cargo.toml) — without it, AppWindow::new() panics when the embedded
@@ -81,6 +82,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             fp_full: "1e:19:1b:c4:a8:44".into(),
             online: true,
             trusted: true,
+            revoked: false,
         },
         // send-only, never connected (provisional — no fingerprint learned yet)
         DeviceRow {
@@ -95,6 +97,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             fp_full: "".into(),
             online: false,
             trusted: false,
+            revoked: false,
         },
         // receive-only trusted peer, connected in
         DeviceRow {
@@ -109,6 +112,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             fp_full: "b7:2a:55:e1:90:33".into(),
             online: true,
             trusted: true,
+            revoked: false,
         },
         // receive-only trusted peer, offline
         DeviceRow {
@@ -123,6 +127,23 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             fp_full: "c3:de:04:aa:11:22".into(),
             online: false,
             trusted: true,
+            revoked: false,
+        },
+        // the user deliberately expelled this one — it must read as EXPELLED,
+        // not as a stranger, and offer a deliberate way back
+        DeviceRow {
+            handle: "".into(),
+            name: "old-thinkpad".into(),
+            addr: "".into(),
+            pos: "".into(),
+            active: false,
+            alive: false,
+            has_send: false,
+            fingerprint: "9f:04:7c".into(),
+            fp_full: "9f:04:7c:12:aa:03".into(),
+            online: false,
+            trusted: false,
+            revoked: true,
         },
     ])));
 
@@ -131,6 +152,8 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
         Some("add-device") => ui.set_show_add_device(true),
         Some("edit-device") => ui.set_editing_device("1".into()), // matches the mock studio-pc handle
         Some("delete-confirm") => ui.set_confirm_delete_handle("1".into()),
+        // the restore-trust confirmation on an expelled device
+        Some("restore-confirm") => ui.set_confirm_restore_fp("9f:04:7c:12:aa:03".into()),
         Some("layout-canvas") => {
             ui.set_canvas_boxes(ModelRc::new(VecModel::from(vec![
                 CanvasBox { handle: "1".into(), name: "studio-pc".into(), x: 20.0, y: 108.0 },

@@ -20,7 +20,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use hops_frontend_core::{prefs, theme, ClientHandle, FrontendClient, FrontendRequest, Position, Status};
+use hops_frontend_core::{
+    prefs, theme, ClientHandle, FrontendClient, FrontendRequest, Position, Status, TrustState,
+};
 use hops_ipc::{Geometry, DEFAULT_PORT};
 use slint::{ComponentHandle, ModelRc, VecModel};
 use thiserror::Error;
@@ -361,6 +363,12 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
     }
     {
         let c = client.clone();
+        ui.on_restore_device(move |fp| {
+            c.request(FrontendRequest::RestoreRevoked(fp.to_string()));
+        });
+    }
+    {
+        let c = client.clone();
         ui.on_approve_pairing(move |name, fp| {
             let desc = if name.trim().is_empty() {
                 "device".to_string()
@@ -592,6 +600,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                         fp_full: d.fingerprint.clone().unwrap_or_default().into(),
                         online: d.online,
                         trusted: d.receive,
+                        revoked: d.trust == TrustState::Revoked,
                     }
                 })
                 .collect();

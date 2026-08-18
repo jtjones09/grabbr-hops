@@ -252,6 +252,8 @@ pub enum FrontendEvent {
     /// this device's own pairing code (encoded, ready to share out-of-band), or
     /// empty if no shareable LAN address is available. See `pairing::PairingCode`.
     PairingCode(String),
+    /// the set of deliberately-revoked fingerprints changed
+    RevokedUpdated(HashMap<String, RevokedEntry>),
     /// new device connected
     DeviceConnected {
         addr: SocketAddr,
@@ -269,6 +271,25 @@ pub enum FrontendEvent {
     ConnectionAttempt { fingerprint: String },
 }
 
+/// A fingerprint the user deliberately expelled.
+///
+/// Kept so a revoked peer is DISTINGUISHABLE from a stranger. Without it,
+/// re-approving a machine you just kicked out is indistinguishable from
+/// approving a brand-new one — the exact state whose absence has a CVE in
+/// matrix-sdk-crypto (RUSTSEC-2024-0434).
+///
+/// It is NOT an exclusion mechanism and must never be sold as one: a revoked
+/// peer can mint a fresh keypair and return as a stranger for free. What it buys
+/// is that the SAME key can no longer summon an approval dialog — the peer loses
+/// the ability to schedule a security decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevokedEntry {
+    /// what the device was called when trust was withdrawn
+    pub label: String,
+    /// unix seconds, so the UI can say when without a date dependency
+    pub revoked_at: u64,
+}
+
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
 pub enum FrontendRequest {
     /// activate/deactivate client
@@ -281,6 +302,10 @@ pub enum FrontendRequest {
     Delete(ClientHandle),
     /// request an enumeration of all clients
     Enumerate(),
+    /// Restore a fingerprint the user previously revoked. Deliberately NOT
+    /// `AuthorizeKey`: this is a user-initiated act on a device row they can
+    /// see, never something a reconnecting peer can provoke.
+    RestoreRevoked(String),
     /// resolve dns
     ResolveDns(ClientHandle),
     /// update hostname
