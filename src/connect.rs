@@ -641,6 +641,11 @@ async fn disconnect(
         link.conn.close(0u32.into(), b"bye");
     }
     client_manager.set_active_addr(handle, None);
+    // `alive` is only ever SET from the pong path, so without clearing it here
+    // the dot stays green after a real disconnect — the device list telling the
+    // user a dead peer is up. Every other per-connection value is cleared below;
+    // this one was simply missed.
+    client_manager.set_alive(handle, false);
     client_manager.set_peer_commit(handle, None);
     client_manager.set_peer_caps(handle, None);
     // NB: peer_fingerprint is deliberately NOT cleared here — it's the client's
