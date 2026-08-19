@@ -92,6 +92,18 @@ export component AppWindow inherits Window {
     // "left" meant the second device silently evicted the first
     property <string> add-device-position: "left";
     in property <string> free-position: "left";
+    // ONE submit path for the add form, so the button and the Enter key cannot
+    // drift apart. Enter previously did nothing at all, even though it works in
+    // the rename box one panel below.
+    property <string> add-name-text;
+    property <string> add-port-text;
+    function submit-add-device() {
+        root.create-device(root.add-name-text, root.add-port-text, root.add-device-position);
+        root.add-name-text = "";
+        root.add-port-text = "";
+        root.add-device-position = root.free-position;
+        root.show-add-device = false;
+    }
     // `in-out`: Rust sets both together, once, when the canvas opens — NOT
     // re-pushed by the poll timer (see layout_canvas.slint's header note on
     // why a drag would otherwise get fought by the next live update).
@@ -324,13 +336,33 @@ export component AppWindow inherits Window {
                         spacing: Space.sm;
                         HorizontalLayout {
                             spacing: Space.sm;
-                            add-name := TextField {
-                                placeholder: "name (e.g. studio-pc)";
+                            VerticalLayout {
+                                spacing: 2px;
                                 horizontal-stretch: 2;
+                                Text {
+                                    text: "hostname or IP address";
+                                    color: Theme.c.muted;
+                                    font-size: Type.caption;
+                                }
+                                add-name := TextField {
+                                    text <=> root.add-name-text;
+                                    placeholder: "studio-pc  ·  10.0.0.5";
+                                    accepted => { root.submit-add-device(); }
+                                }
                             }
-                            add-port := TextField {
-                                placeholder: "4242";
+                            VerticalLayout {
+                                spacing: 2px;
                                 horizontal-stretch: 1;
+                                Text {
+                                    text: "port";
+                                    color: Theme.c.muted;
+                                    font-size: Type.caption;
+                                }
+                                add-port := TextField {
+                                    text <=> root.add-port-text;
+                                    placeholder: "4242";
+                                    accepted => { root.submit-add-device(); }
+                                }
                             }
                         }
                         HorizontalLayout {
@@ -352,13 +384,7 @@ export component AppWindow inherits Window {
                             PillButton {
                                 text: "add device";
                                 primary: true;
-                                clicked => {
-                                    root.create-device(add-name.text, add-port.text, root.add-device-position);
-                                    add-name.text = "";
-                                    add-port.text = "";
-                                    root.add-device-position = "left";
-                                    root.show-add-device = false;
-                                }
+                                clicked => { root.submit-add-device(); }
                             }
                         }
                     }
