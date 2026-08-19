@@ -443,7 +443,11 @@ export component AppWindow inherits Window {
                                     PillButton {
                                         text: "delete";
                                         ghost: true;
-                                        clicked => { root.confirm-delete-handle = d.handle; }
+                                        clicked => {
+                                            root.confirm-revoke-fp = "";
+                                            root.confirm-restore-fp = "";
+                                            root.confirm-delete-handle = d.handle;
+                                        }
                                     }
                                 }
                                 if d.has-send && root.confirm-delete-handle == d.handle: VerticalLayout {
@@ -499,7 +503,11 @@ export component AppWindow inherits Window {
                                     PillButton {
                                         text: "trust again";
                                         ghost: true;
-                                        clicked => { root.confirm-restore-fp = d.fp-full; }
+                                        clicked => {
+                                            root.confirm-delete-handle = "";
+                                            root.confirm-revoke-fp = "";
+                                            root.confirm-restore-fp = d.fp-full;
+                                        }
                                     }
                                 }
                                 // the confirm names what you are undoing — "you
@@ -536,7 +544,11 @@ export component AppWindow inherits Window {
                                     PillButton {
                                         text: "revoke";
                                         ghost: true;
-                                        clicked => { root.confirm-revoke-fp = d.fp-full; }
+                                        clicked => {
+                                            root.confirm-delete-handle = "";
+                                            root.confirm-restore-fp = "";
+                                            root.confirm-revoke-fp = d.fp-full;
+                                        }
                                     }
                                 }
                                 if d.trusted && root.confirm-revoke-fp == d.fp-full: VerticalLayout {
