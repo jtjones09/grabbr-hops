@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -73,6 +74,7 @@ impl Capture {
         let (event_tx, event_rx) = channel();
         let cancellation_token = CancellationToken::new();
         let capture_task = CaptureTask {
+            held_lock_keys: Default::default(),
             active_client: None,
             backend,
             cancellation_token: cancellation_token.clone(),
@@ -167,6 +169,15 @@ macro_rules! debounce {
     };
 }
 
+/// Caps / Num / Scroll Lock (evdev codes). These TOGGLE on each key-down, so an
+/// OS auto-repeat must never be forwarded — unlike an ordinary key, where repeat
+/// is the point.
+fn is_lock_key(key: u32) -> bool {
+    key == scancode::Linux::KeyCapsLock as u32
+        || key == scancode::Linux::KeyNumlock as u32
+        || key == scancode::Linux::KeyScrollLock as u32
+}
+
 struct CaptureTask {
     active_client: Option<CaptureHandle>,
     backend: Option<input_capture::Backend>,
@@ -177,6 +188,20 @@ struct CaptureTask {
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,
     state: State,
+    /// Lock keys currently held down, so OS auto-repeat can be swallowed.
+    ///
+    /// Holding Caps Lock streams dozens of key-DOWNS per second (measured on the
+    /// rig: 38 downs for one press, no ups between). For an ordinary key that
+    /// repeat is meaningful — holding `a` should type `aaaa`. For a LOCK key it
+    /// carries no information and is actively harmful, because every down
+    /// toggles the lock: the user got dozens of toggles and, with Windows
+    /// ToggleKeys on, a beep for each.
+    ///
+    /// b5834e0 fixed the receiver (macos.rs) so the Mac's lock stops flipping,
+    /// but the SENDER still put every repeat on the wire. Filtering here rather
+    /// than in a platform backend keeps it cross-platform and testable — there
+    /// is no Windows target on the dev machine.
+    held_lock_keys: HashSet<u32>,
     /// Motion coalescing (opt-in via `HOPS_COALESCE_MOTION`). A high-polling mouse
     /// emits ~800 moves/sec; without this we send one Input per move, flooding the
     /// receiver's injection queue (lag) and burning sender CPU. When enabled,
@@ -503,6 +528,20 @@ impl CaptureTask {
             }
         }
 
+        // Lock-key auto-repeat carries no information and toggles the lock on
+        // every down — drop it before it reaches the wire.
+        if let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state, .. })) = &event
+        {
+            if is_lock_key(*key) {
+                if *state == 0 {
+                    self.held_lock_keys.remove(key);
+                } else if !self.held_lock_keys.insert(*key) {
+                    log::trace!("swallowing auto-repeat for lock key {key}");
+                    return Ok(());
+                }
+            }
+        }
+
         let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
 
         let event = match event {
@@ -624,5 +663,38 @@ impl<T> Drop for DropGuard<T> {
         self.tx
             .send(self.on_drop.take().expect("item"))
             .expect("channel closed");
+    }
+}
+
+#[cfg(test)]
+mod lock_key_tests {
+    use super::is_lock_key;
+    use input_event::scancode;
+
+    /// Measured on the rig 2026-08-19: holding Caps Lock produced 38 consecutive
+    /// key-DOWNS with no key-up between, each of which toggles the lock. With
+    /// Windows ToggleKeys on, that is 38 beeps.
+    #[test]
+    fn only_lock_keys_are_repeat_filtered() {
+        for k in [
+            scancode::Linux::KeyCapsLock,
+            scancode::Linux::KeyNumlock,
+            scancode::Linux::KeyScrollLock,
+        ] {
+            assert!(
+                is_lock_key(k as u32),
+                "{k:?} toggles, so repeat must be dropped"
+            );
+        }
+        // ordinary keys MUST keep their auto-repeat — holding `a` types `aaaa`,
+        // and a filter that swallowed those would be a far worse bug
+        for k in [
+            scancode::Linux::KeyA,
+            scancode::Linux::KeySpace,
+            scancode::Linux::KeyLeftShift,
+            scancode::Linux::KeyBackspace,
+        ] {
+            assert!(!is_lock_key(k as u32), "{k:?} must keep auto-repeat");
+        }
     }
 }
