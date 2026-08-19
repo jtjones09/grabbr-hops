@@ -443,7 +443,7 @@ export component AppWindow inherits Window {
                                 }
 
                                 // --- send facet: position + active toggle + edit/delete ---
-                                if d.has-send: VerticalLayout {
+                                if d.has-send && root.confirm-delete-handle != d.handle && root.confirm-revoke-fp != d.fp-full && root.confirm-restore-fp != d.fp-full: VerticalLayout {
                                     alignment: center;
                                     Chip {
                                         text: d.pos;
@@ -459,7 +459,7 @@ export component AppWindow inherits Window {
                                         }
                                     }
                                 }
-                                if d.has-send: VerticalLayout {
+                                if d.has-send && root.confirm-delete-handle != d.handle && root.confirm-revoke-fp != d.fp-full && root.confirm-restore-fp != d.fp-full: VerticalLayout {
                                     alignment: center;
                                     Toggle {
                                         checked: d.active;
@@ -576,7 +576,8 @@ export component AppWindow inherits Window {
                                         clicked => { root.confirm-restore-fp = ""; }
                                     }
                                 }
-                                if d.trusted && root.confirm-revoke-fp != d.fp-full: VerticalLayout {
+                                if d.trusted && root.confirm-revoke-fp != d.fp-full
+                                    && root.confirm-delete-handle != d.handle: VerticalLayout {
                                     alignment: center;
                                     PillButton {
                                         text: "revoke";
