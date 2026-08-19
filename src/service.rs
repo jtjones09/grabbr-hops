@@ -591,6 +591,14 @@ impl Service {
                 self.client_manager.set_resolving(handle, false);
                 if let Err(e) = &ips {
                     log::warn!("could not resolve {hostname}: {e}");
+                    // ...and tell the user. Before this, a typo'd or unresolvable
+                    // name left the card reading "unresolved" forever with the
+                    // reason visible only in the log, so the user's model was
+                    // "hops is still thinking about it".
+                    self.notify_frontend(FrontendEvent::Error(format!(
+                        "Could not find \"{hostname}\" on the network. \
+                         Check the spelling, or use its IP address."
+                    )));
                 }
                 let ips = ips.unwrap_or_default();
                 self.client_manager.set_dns_ips(handle, ips);

@@ -292,6 +292,24 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
     // window's size property is mutable. Set at creation and on every show.
     ui.window()
         .set_size(slint::LogicalSize::new(560.0, 690.0));
+
+    // The notice banner has two sources — the daemon (FrontendEvent::Error) and
+    // local input validation — so they share ONE increasing sequence. The poll
+    // below only writes when the daemon's own seq changes, otherwise it would
+    // overwrite a local validation message on the very next tick.
+    let notice_seq: Rc<std::cell::Cell<i32>> = Rc::new(std::cell::Cell::new(0));
+    let last_daemon_notice: Rc<std::cell::Cell<i32>> = Rc::new(std::cell::Cell::new(0));
+    let notice_sink = {
+        let weak = ui.as_weak();
+        let seq = notice_seq.clone();
+        move |msg: &str| {
+            if let Some(ui) = weak.upgrade() {
+                seq.set(seq.get().wrapping_add(1));
+                ui.set_notice(msg.into());
+                ui.set_notice_seq(seq.get());
+            }
+        }
+    };
     fn show_app_window(ui: &AppWindow) -> Result<(), slint::PlatformError> {
         ui.window()
             .set_size(slint::LogicalSize::new(560.0, 690.0));
@@ -418,9 +436,34 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
     {
         let c = client.clone();
         let pending = pending_new_device.clone();
+        let notice = notice_sink.clone();
         ui.on_create_device(move |name, port, position| {
             let name = name.trim().to_string();
-            let port = port.trim().parse::<u16>().unwrap_or(DEFAULT_PORT);
+            // An empty name produced a permanent "unnamed device / unresolved"
+            // ghost card that could never connect — reachable by a stray
+            // double-click, since the primary button was always live.
+            if name.is_empty() {
+                notice("Enter the other machine's hostname or IP address.");
+                return;
+            }
+            // A port that does not parse was silently replaced with 4242, and the
+            // panel closed as if obeyed. Port 0 was accepted and could never
+            // connect. Say so instead of quietly substituting.
+            let port_raw = port.trim();
+            let port = if port_raw.is_empty() {
+                DEFAULT_PORT
+            } else {
+                match port_raw.parse::<u16>() {
+                    Ok(p) if p > 0 => p,
+                    _ => {
+                        notice(
+                            "That port is not valid. Use a number from 1 to 65535, \
+                             or leave it blank for the default.",
+                        );
+                        return;
+                    }
+                }
+            };
             let position = Position::try_from(position.as_str()).unwrap_or_default();
             *pending.borrow_mut() = Some((name, port, position));
             c.request(FrontendRequest::Create);
@@ -481,6 +524,8 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
     let show_requested_poll = show_requested.clone();
     let last_ui: RefCell<Option<PolledUi>> = RefCell::new(None);
     let timer = slint::Timer::default();
+    let notice_seq_poll = notice_seq.clone();
+    let last_daemon_notice = last_daemon_notice.clone();
     timer.start(
         slint::TimerMode::Repeated,
         Duration::from_millis(250),
@@ -649,8 +694,16 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
             ui.set_port(snap.port.as_str().into());
             ui.set_fingerprint(snap.fingerprint.as_str().into());
             ui.set_pairing_fp(snap.pairing.as_str().into());
-            ui.set_notice(snap.notice.as_str().into());
-            ui.set_notice_seq(snap.notice_seq);
+            // only when the DAEMON has something new — otherwise a local
+            // validation notice would be overwritten on the next poll
+            if snap.notice_seq != last_daemon_notice.get() {
+                last_daemon_notice.set(snap.notice_seq);
+                if !snap.notice.is_empty() {
+                    notice_seq_poll.set(notice_seq_poll.get().wrapping_add(1));
+                    ui.set_notice(snap.notice.as_str().into());
+                    ui.set_notice_seq(notice_seq_poll.get());
+                }
+            }
             ui.set_devices(ModelRc::new(VecModel::from(devices)));
             *last_ui.borrow_mut() = Some(snap);
         },
