@@ -116,12 +116,45 @@ struct Incoming {
     pos: Position,
 }
 
+/// Drop any persisted client pin naming a fingerprint that is not in the
+/// allowlist.
+///
+/// Such a pin can never let anyone in — the outbound dial is fail-closed against
+/// it — but it CAN silently brick a client: hand-editing `hostname` to retarget a
+/// device while leaving the old `fingerprint = ...` behind makes every dial fail
+/// identity verification with no visible cause. Dropping it lets the client
+/// re-learn the identity on its next successful handshake, which is exactly what
+/// a never-connected client does.
+fn drop_untrusted_pins(
+    client_manager: &ClientManager,
+    authorized: &HashMap<String, String>,
+) -> Vec<ClientHandle> {
+    let stale: Vec<(ClientHandle, String)> = client_manager
+        .get_client_states()
+        .into_iter()
+        .filter_map(|(h, _, s)| {
+            s.peer_fingerprint
+                .filter(|fp| !authorized.contains_key(fp))
+                .map(|fp| (h, fp))
+        })
+        .collect();
+    for (h, fp) in &stale {
+        log::warn!(
+            "client {h}: dropping pinned fingerprint {fp} — it is not in \
+             authorized_fingerprints, so it could only ever fail the dial"
+        );
+        client_manager.clear_pins_matching(fp);
+    }
+    stale.into_iter().map(|(h, _)| h).collect()
+}
+
 impl Service {
     pub async fn new(config: Config) -> Result<Self, ServiceError> {
         let client_manager = ClientManager::default();
         for client in config.clients() {
             client_manager.add_with_config(client);
         }
+        drop_untrusted_pins(&client_manager, &config.authorized_fingerprints());
 
         // load identity (cert + key)
         let identity = Arc::new(crypto::load_or_generate_key_and_cert(config.cert_path())?);
@@ -434,6 +467,10 @@ impl Service {
             live.clone_from(&authorized_keys);
             revoked
         };
+        // a hand-edited config is exactly where a stale pin gets reintroduced
+        for h in drop_untrusted_pins(&self.client_manager, &authorized_keys) {
+            self.broadcast_client(h);
+        }
         for fp in &revoked {
             // ORDER MATTERS and this was inverted: cut_sessions resolves the
             // affected handles via peer_fingerprint, which clear_pins_matching
