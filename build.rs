@@ -17,7 +17,21 @@ fn main() {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo::rustc-env=HOPS_SHORT_COMMIT={commit}");
+
+    // Rebuild when the commit changes. Watching .git/HEAD alone is NOT enough:
+    // on a branch, HEAD holds "ref: refs/heads/<branch>" and only changes when
+    // you SWITCH branches — committing updates the ref file it points at. So a
+    // series of commits on one branch kept baking in the hash from whenever
+    // build.rs last ran, and `hops --version` reported a stale commit. That is
+    // load-bearing: it is how a deployed binary is matched to its source.
     println!("cargo::rerun-if-changed=.git/HEAD");
+    if let Ok(head) = std::fs::read_to_string(".git/HEAD") {
+        if let Some(git_ref) = head.strip_prefix("ref:").map(str::trim) {
+            println!("cargo::rerun-if-changed=.git/{git_ref}");
+        }
+    }
+    // refs can live packed rather than as loose files
+    println!("cargo::rerun-if-changed=.git/packed-refs");
 
     let unix = cfg!(unix);
     let macos = cfg!(target_os = "macos");
