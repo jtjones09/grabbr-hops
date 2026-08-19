@@ -348,7 +348,11 @@ impl AppModel {
         //    user initiates from a row they can see rather than something a
         //    reconnecting peer provokes with a prompt.
         for (fp, entry) in &self.revoked {
-            if is_self(fp) || self.authorized.contains_key(fp) {
+            // Revoked OUTRANKS authorized, deliberately. The daemon refuses to
+            // re-authorize an expelled fingerprint, so both tables naming one
+            // means the config was hand-edited — and the safe reading of that is
+            // "expelled", never "trusted".
+            if is_self(fp) {
                 continue;
             }
             let device = by_fp.entry(fp.clone()).or_insert_with(|| Device {
@@ -607,9 +611,18 @@ mod tests {
         let devices = m.devices();
         assert_eq!(devices[0].trust, TrustState::Trusted, "plain trusted device");
 
+        // an expelled identity is a TOMBSTONE: even if both tables somehow name
+        // it, it must never render as trusted, because there is no longer any
+        // path from revoked back to authorized.
         m.revoked.insert(fp.to_string(), revoked("ScornW20"));
         let devices = m.devices();
         assert_eq!(devices.len(), 1, "still one card, not two");
+        assert_eq!(
+            devices[0].trust,
+            TrustState::Revoked,
+            "revoked outranks authorized — a dead identity cannot present as trusted"
+        );
+        assert!(!devices[0].receive, "and it is not trusted to connect in");
     }
 
     /// Regression: the GUI filtered on `send.is_some() || receive`, which drops

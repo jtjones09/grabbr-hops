@@ -4,7 +4,7 @@
 //
 //   cargo run -p lan-mouse-slint --example render_png -- /path/to/out.png [w] [h] [theme_index] [mode]
 //   mode: normal (default) | settings | add-device | edit-device | delete-confirm
-//         | restore-confirm | layout-canvas
+//         | layout-canvas
 //
 // Requires the crate's slint dep to carry feature "software-renderer-systemfonts"
 // (see Cargo.toml) — without it, AppWindow::new() panics when the embedded
@@ -159,8 +159,6 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
         Some("add-device") => ui.set_show_add_device(true),
         Some("edit-device") => ui.set_editing_device("1".into()), // matches the mock studio-pc handle
         Some("delete-confirm") => ui.set_confirm_delete_handle("1".into()),
-        // the restore-trust confirmation on an expelled device
-        Some("restore-confirm") => ui.set_confirm_restore_fp("9f:04:7c:12:aa:03".into()),
         Some("layout-canvas") => {
             ui.set_canvas_boxes(ModelRc::new(VecModel::from(vec![
                 CanvasBox { handle: "1".into(), name: "studio-pc".into(), x: 20.0, y: 108.0 },

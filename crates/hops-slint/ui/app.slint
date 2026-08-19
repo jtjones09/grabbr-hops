@@ -67,10 +67,6 @@ export component AppWindow inherits Window {
     in property <string> pairing-fp: "";
 
     property <string> confirm-revoke-fp: "";
-    // restoring an expelled device is security-DECREASING, so it gets at least
-    // the same friction as revoking. It is also the only way back in — a revoked
-    // peer can no longer raise a prompt of its own.
-    in-out property <string> confirm-restore-fp: "";
     // `in-out` so the render_png self-review harness can open it for a look.
     in-out property <string> confirm-delete-handle: "";
     // handle of the device being renamed ("" = none). The rename FIELD lives
@@ -116,9 +112,6 @@ export component AppWindow inherits Window {
     callback rename-device(string /* handle */, string /* new name */);
     callback delete-device(string /* handle */);
     callback revoke(string /* full fingerprint */);
-    // deliberately re-trust an expelled device — only reachable from its row,
-    // never from a prompt a reconnecting peer caused
-    callback restore-device(string /* full fingerprint */);
     callback approve-pairing(string /* name */, string /* full fingerprint */);
     callback deny-pairing(string /* full fingerprint */);
     callback set-theme(int /* palette index */);
@@ -443,7 +436,7 @@ export component AppWindow inherits Window {
                                 }
 
                                 // --- send facet: position + active toggle + edit/delete ---
-                                if d.has-send && root.confirm-delete-handle != d.handle && root.confirm-revoke-fp != d.fp-full && root.confirm-restore-fp != d.fp-full: VerticalLayout {
+                                if d.has-send && root.confirm-delete-handle != d.handle && root.confirm-revoke-fp != d.fp-full: VerticalLayout {
                                     alignment: center;
                                     Chip {
                                         text: d.pos;
@@ -459,7 +452,7 @@ export component AppWindow inherits Window {
                                         }
                                     }
                                 }
-                                if d.has-send && root.confirm-delete-handle != d.handle && root.confirm-revoke-fp != d.fp-full && root.confirm-restore-fp != d.fp-full: VerticalLayout {
+                                if d.has-send && root.confirm-delete-handle != d.handle && root.confirm-revoke-fp != d.fp-full: VerticalLayout {
                                     alignment: center;
                                     Toggle {
                                         checked: d.active;
@@ -481,7 +474,6 @@ export component AppWindow inherits Window {
                                         ghost: true;
                                         clicked => {
                                             root.confirm-revoke-fp = "";
-                                            root.confirm-restore-fp = "";
                                             root.confirm-delete-handle = d.handle;
                                         }
                                     }
@@ -526,65 +518,31 @@ export component AppWindow inherits Window {
                                         font-weight: Type.medium;
                                     }
                                 }
-                                if d.revoked && root.confirm-restore-fp != d.fp-full: VerticalLayout {
+                                // An expelled device is shown, never re-trustable.
+                                // The identity is a tombstone: re-establishing means
+                                // that machine presenting a NEW one and pairing fresh.
+                                if d.revoked: VerticalLayout {
                                     alignment: center;
                                     Text {
-                                        text: "revoked";
+                                        text: "removed — pair again with a new identity";
                                         color: Theme.c.error;
                                         font-size: Type.small;
                                         font-weight: Type.medium;
+                                        overflow: elide;
                                     }
                                 }
-                                if d.revoked && root.confirm-restore-fp != d.fp-full: VerticalLayout {
-                                    alignment: center;
-                                    PillButton {
-                                        text: "trust again";
-                                        ghost: true;
-                                        clicked => {
-                                            root.confirm-delete-handle = "";
-                                            root.confirm-revoke-fp = "";
-                                            root.confirm-restore-fp = d.fp-full;
-                                        }
-                                    }
-                                }
-                                // the confirm names what you are undoing — "you
-                                // revoked this" is the fact that matters here
-                                if d.revoked && root.confirm-restore-fp == d.fp-full: VerticalLayout {
-                                    alignment: center;
-                                    Text {
-                                        text: "you revoked this";
-                                        color: Theme.c.muted;
-                                        font-size: Type.small;
-                                    }
-                                }
-                                if d.revoked && root.confirm-restore-fp == d.fp-full: VerticalLayout {
-                                    alignment: center;
-                                    PillButton {
-                                        text: "restore";
-                                        danger: true;
-                                        clicked => {
-                                            root.restore-device(d.fp-full);
-                                            root.confirm-restore-fp = "";
-                                        }
-                                    }
-                                }
-                                if d.revoked && root.confirm-restore-fp == d.fp-full: VerticalLayout {
-                                    alignment: center;
-                                    PillButton {
-                                        text: "no";
-                                        ghost: true;
-                                        clicked => { root.confirm-restore-fp = ""; }
-                                    }
-                                }
+                                // NB the handle guard must not fire on receive-only
+                                // rows, whose handle is "" — the same as the
+                                // default confirm-delete-handle, which silently hid
+                                // revoke on every trusted peer.
                                 if d.trusted && root.confirm-revoke-fp != d.fp-full
-                                    && root.confirm-delete-handle != d.handle: VerticalLayout {
+                                    && (d.handle == "" || root.confirm-delete-handle != d.handle): VerticalLayout {
                                     alignment: center;
                                     PillButton {
                                         text: "revoke";
                                         ghost: true;
                                         clicked => {
                                             root.confirm-delete-handle = "";
-                                            root.confirm-restore-fp = "";
                                             root.confirm-revoke-fp = d.fp-full;
                                         }
                                     }

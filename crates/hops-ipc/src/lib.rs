@@ -302,10 +302,6 @@ pub enum FrontendRequest {
     Delete(ClientHandle),
     /// request an enumeration of all clients
     Enumerate(),
-    /// Restore a fingerprint the user previously revoked. Deliberately NOT
-    /// `AuthorizeKey`: this is a user-initiated act on a device row they can
-    /// see, never something a reconnecting peer can provoke.
-    RestoreRevoked(String),
     /// resolve dns
     ResolveDns(ClientHandle),
     /// update hostname

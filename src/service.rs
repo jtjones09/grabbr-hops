@@ -342,13 +342,6 @@ impl Service {
                 self.set_client_active(handle, active);
                 self.save_config();
             }
-            FrontendRequest::RestoreRevoked(fp) => {
-                if self.refuse_while_remotely_driven("restore a revoked device") {
-                    return;
-                }
-                self.restore_revoked(fp);
-                self.save_config();
-            }
             FrontendRequest::AuthorizeKey(desc, fp) => {
                 if self.refuse_while_remotely_driven("grant trust") {
                     return;
@@ -796,42 +789,29 @@ impl Service {
     }
 
     fn add_authorized_key(&mut self, desc: String, fp: String) {
-        // Trusting a fingerprint retires its expulsion — but note this is only
-        // reachable from a user action, and a revoked peer can no longer provoke
-        // one (see `raise_connection_attempt`).
-        if self.revoked.remove(&fp).is_some() {
-            log::info!("{fp} was revoked and has now been deliberately restored");
-            let revoked = self.revoked.clone();
-            self.notify_frontend(FrontendEvent::RevokedUpdated(revoked));
+        // An expelled fingerprint is DEAD. There is deliberately no path from
+        // revoked back to authorized: the record is a tombstone, not a pause.
+        // Re-establishing a deleted device means that machine presenting a NEW
+        // identity and pairing from scratch — "the whole point of issuing new
+        // keys". Refusing here closes the last laundering route, since
+        // raise_connection_attempt already prevents a revoked peer prompting.
+        if let Some(entry) = self.revoked.get(&fp) {
+            log::warn!(
+                "refusing to authorize {fp}: it was expelled as {:?}. That identity \
+                 is permanently dead — the device must present a new one.",
+                entry.label
+            );
+            self.notify_frontend(FrontendEvent::Error(format!(
+                "\"{}\" was removed, and that identity cannot be trusted again. \
+                 Re-install or reset hops on that machine so it generates a new \
+                 identity, then pair it fresh.",
+                entry.label
+            )));
+            return;
         }
         self.authorized_keys.write().expect("lock").insert(fp, desc);
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
-    }
-
-    /// Deliberately re-trust a device the user previously expelled.
-    ///
-    /// Separate from `add_authorized_key` so the act is unambiguous in the logs
-    /// and in the UI: it is only reachable from a device row the user is looking
-    /// at, never from a prompt a reconnecting peer caused.
-    fn restore_revoked(&mut self, fp: String) {
-        let Some(entry) = self.revoked.remove(&fp) else {
-            log::warn!("restore requested for {fp}, which is not revoked — ignoring");
-            return;
-        };
-        log::warn!(
-            "restoring trust in {:?} ({fp}), revoked at {} — user-initiated",
-            entry.label,
-            entry.revoked_at
-        );
-        self.authorized_keys
-            .write()
-            .expect("lock")
-            .insert(fp, entry.label);
-        let keys = self.authorized_keys.read().expect("lock").clone();
-        self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
-        let revoked = self.revoked.clone();
-        self.notify_frontend(FrontendEvent::RevokedUpdated(revoked));
     }
 
     /// Refuse a trust GRANT while a peer is driving this machine's input.
@@ -846,12 +826,6 @@ impl Service {
     /// Deliberately NOT applied to revocation: refusing to let you revoke while a
     /// peer is driving you would block the one action you most need in exactly
     /// the moment you need it.
-    ///
-    /// Honest bound: this defeats the injected-click path and nothing more. A
-    /// peer with sustained keyboard control can do anything a local user can.
-    /// What it buys is that AFTER revocation the peer has no input at all, so it
-    /// cannot click its own way back in, and a still-trusted accomplice cannot
-    /// do it on its behalf.
     fn refuse_while_remotely_driven(&mut self, what: &str) -> bool {
         const QUIET: std::time::Duration = std::time::Duration::from_secs(2);
         if !self.emulation.remotely_driven_within(QUIET) {

@@ -384,12 +384,6 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
     }
     {
         let c = client.clone();
-        ui.on_restore_device(move |fp| {
-            c.request(FrontendRequest::RestoreRevoked(fp.to_string()));
-        });
-    }
-    {
-        let c = client.clone();
         ui.on_approve_pairing(move |name, fp| {
             let desc = if name.trim().is_empty() {
                 "device".to_string()
