@@ -550,7 +550,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
             let devices: Vec<DeviceRow> = m
                 .devices()
                 .into_iter()
-                .filter(|d| d.send.is_some() || d.receive)
+                .filter(|d| d.is_listable())
                 .map(|d| {
                     let (handle, addr, pos, active, alive, has_send) = match &d.send {
                         Some(s) => {

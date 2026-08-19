@@ -72,6 +72,19 @@ pub struct AppModel {
     peer_addrs: HashMap<SocketAddr, String>,
 }
 
+impl Device {
+    /// Should this device occupy a row in the device list?
+    ///
+    /// Excludes ONLY a bare inbound pairing request, which lives in the pairing
+    /// banner instead. A revoked device MUST be listable — being visible as
+    /// expelled is the entire point of persisting revocation, and it has neither
+    /// a send facet nor `receive`, so any "send or receive" test silently drops
+    /// it and the restore UI can never render.
+    pub fn is_listable(&self) -> bool {
+        self.send.is_some() || self.receive || self.trust == TrustState::Revoked
+    }
+}
+
 impl AppModel {
     /// Fold one daemon event into the model.
     pub fn apply(&mut self, event: FrontendEvent) {
@@ -571,6 +584,25 @@ mod tests {
         m.revoked.insert(fp.to_string(), revoked("ScornW20"));
         let devices = m.devices();
         assert_eq!(devices.len(), 1, "still one card, not two");
+    }
+
+    /// Regression: the GUI filtered on `send.is_some() || receive`, which drops
+    /// revoked devices — so the revoked badge and restore button never rendered
+    /// in the real app even though the mock render showed them perfectly.
+    #[test]
+    fn a_revoked_device_survives_the_list_filter() {
+        let mut m = AppModel::default();
+        m.revoked.insert("aa:bb:cc:dd".into(), revoked("old-thinkpad"));
+        let devices = m.devices();
+        assert_eq!(devices.len(), 1);
+        assert!(
+            devices[0].is_listable(),
+            "a revoked device must reach the device list, or the restore UI is unreachable"
+        );
+        assert!(
+            devices.iter().filter(|d| d.is_listable()).count() == 1,
+            "exactly one listable row"
+        );
     }
 
     #[test]
