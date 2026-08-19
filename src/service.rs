@@ -362,6 +362,22 @@ impl Service {
                 self.save_config();
             }
             FrontendRequest::Delete(handle) => {
+                // Deleting a device REVOKES it. hops can read every keystroke on
+                // the machine, so "remove this device" has to mean removed —
+                // previously delete forgot the dial address but left the peer's
+                // key authorized, so a machine the user believed they had removed
+                // could still take their keyboard and mouse.
+                //
+                // Deliberately here and NOT in remove_client(): that is also
+                // called by handle_config_change, which removes every client
+                // before rebuilding them, so revoking there would wipe the entire
+                // trust store on any config reload.
+                if let Some(fp) = self.client_manager.peer_fingerprint(handle) {
+                    if self.authorized_keys.read().expect("lock").contains_key(&fp) {
+                        log::warn!("deleting client {handle}: also revoking its trust ({fp})");
+                        self.remove_authorized_key(fp);
+                    }
+                }
                 self.remove_client(handle);
                 self.save_config();
             }

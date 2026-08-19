@@ -489,7 +489,8 @@ export component AppWindow inherits Window {
                                 if d.has-send && root.confirm-delete-handle == d.handle: VerticalLayout {
                                     alignment: center;
                                     Text {
-                                        text: "delete?";
+                                        // delete now withdraws trust too, so say so
+                                        text: d.trusted ? "delete + untrust?" : "delete?";
                                         color: Theme.c.muted;
                                         font-size: Type.small;
                                     }
