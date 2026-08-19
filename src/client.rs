@@ -350,12 +350,18 @@ impl ClientManager {
             .collect()
     }
 
-    pub(crate) fn clear_pins_matching(&self, fingerprint: &str) {
-        for (_, (_, s)) in self.clients.borrow_mut().iter_mut() {
+    /// Returns the handles whose pin was cleared, so the caller can republish
+    /// them — otherwise the frontend keeps rendering a fingerprint the daemon
+    /// has already dropped.
+    pub(crate) fn clear_pins_matching(&self, fingerprint: &str) -> Vec<ClientHandle> {
+        let mut cleared = vec![];
+        for (h, (_, s)) in self.clients.borrow_mut().iter_mut() {
             if s.peer_fingerprint.as_deref() == Some(fingerprint) {
                 s.peer_fingerprint = None;
+                cleared.push(h as ClientHandle);
             }
         }
+        cleared
     }
 
     /// Capability bits the peer advertised via the Capability handshake, or

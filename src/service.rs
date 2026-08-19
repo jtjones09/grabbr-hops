@@ -440,7 +440,9 @@ impl Service {
             // erases. Clearing first made the outbound teardown a structural
             // no-op on exactly the path a6ddccb added it for.
             self.cut_sessions(fp);
-            self.client_manager.clear_pins_matching(fp);
+            for h in self.client_manager.clear_pins_matching(fp) {
+                self.broadcast_client(h);
+            }
         }
         self.sync_frontend();
     }
@@ -880,7 +882,9 @@ impl Service {
         // client whose receiver re-keyed (e.g. reinstall) can re-learn + re-pin
         // the new identity on its next dial instead of being stranded on the
         // dead fingerprint. See the fail-closed pin in `connect::connect`.
-        self.client_manager.clear_pins_matching(&fp);
+        for h in self.client_manager.clear_pins_matching(&fp) {
+            self.broadcast_client(h);
+        }
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
         let revoked = self.revoked.clone();
