@@ -84,6 +84,10 @@ impl Display for Backend {
 }
 
 pub struct InputEmulation {
+    /// The backend actually selected. `new()` falls back down a list, so this is
+    /// NOT necessarily what was asked for — and a fallback to `Dummy` silently
+    /// discards every event, which the caller must be able to notice.
+    backend: Backend,
     emulation: Box<dyn Emulation>,
     handles: HashSet<EmulationHandle>,
     pressed_keys: HashMap<EmulationHandle, HashSet<u32>>,
@@ -107,10 +111,17 @@ impl InputEmulation {
             Backend::Dummy => Box::new(dummy::DummyEmulation::new()),
         };
         Ok(Self {
+            backend,
             emulation,
             handles: HashSet::new(),
             pressed_keys: HashMap::new(),
         })
+    }
+
+    /// Which backend is actually in use. `Backend::Dummy` means input is being
+    /// accepted and thrown away.
+    pub fn backend(&self) -> Backend {
+        self.backend
     }
 
     pub async fn new(backend: Option<Backend>) -> Result<InputEmulation, EmulationCreationError> {

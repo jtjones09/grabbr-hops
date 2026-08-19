@@ -27,6 +27,9 @@ pub(crate) struct Emulation {
 }
 
 pub(crate) enum EmulationEvent {
+    /// Input emulation fell back to a backend that DISCARDS events. Raised so
+    /// this reaches the user instead of being a log line they never see.
+    BackendDegraded(String),
     Connected {
         addr: SocketAddr,
         fingerprint: String,
@@ -513,6 +516,15 @@ impl EmulationTask {
             // allow termination event while requesting input emulation
             _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
         };
+
+        // A fallback to Dummy accepts every event and throws it away while the
+        // UI still reports "connected" — this project lost hours to exactly that.
+        // Say so loudly instead.
+        if emulation.backend() == input_emulation::Backend::Dummy {
+            let _ = self.event_tx.send(EmulationEvent::BackendDegraded(
+                emulation.backend().to_string(),
+            ));
+        }
 
         // used to send enabled and disabled events
         let _emulation_guard = DropGuard::new(

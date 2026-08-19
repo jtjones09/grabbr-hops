@@ -501,6 +501,17 @@ impl Service {
 
     fn handle_emulation_event(&mut self, event: EmulationEvent) {
         match event {
+            EmulationEvent::BackendDegraded(name) => {
+                log::error!(
+                    "input emulation fell back to the {name} backend — incoming input \
+                     is being DISCARDED"
+                );
+                self.notify_frontend(FrontendEvent::Error(format!(
+                    "This machine cannot inject input (using the \"{name}\" backend), so \
+                     nothing a peer sends will do anything. On macOS this is usually a \
+                     missing Accessibility permission for hops."
+                )));
+            }
             EmulationEvent::ConnectionAttempt { fingerprint } => {
                 self.raise_connection_attempt(fingerprint);
             }
