@@ -140,7 +140,7 @@ impl AppModel {
             }
             FrontendEvent::IncomingDisconnected(addr) => {
                 if let Some(fp) = self.peer_addrs.remove(&addr) {
-                    self.connected_peers.remove(&fp);
+                    self.forget_if_last_addr(&fp);
                 }
                 self.push_message(format!("incoming disconnected: {addr}"));
             }
@@ -161,10 +161,23 @@ impl AppModel {
     fn register_peer(&mut self, addr: SocketAddr, fingerprint: String) {
         if let Some(old) = self.peer_addrs.insert(addr, fingerprint.clone()) {
             if old != fingerprint {
-                self.connected_peers.remove(&old);
+                self.forget_if_last_addr(&old);
             }
         }
         self.connected_peers.insert(fingerprint);
+    }
+
+    /// Drop a fingerprint from `connected_peers` ONLY when no live address still
+    /// maps to it.
+    ///
+    /// A peer that reconnects on a new source port produces DeviceConnected(new)
+    /// followed by IncomingDisconnected(old). Removing unconditionally let the
+    /// OLD address's late disconnect erase the connection the NEW one had just
+    /// established, so a connected peer rendered as "offline".
+    fn forget_if_last_addr(&mut self, fingerprint: &str) {
+        if !self.peer_addrs.values().any(|f| f == fingerprint) {
+            self.connected_peers.remove(fingerprint);
+        }
     }
 
     fn push_message(&mut self, msg: String) {
@@ -639,6 +652,33 @@ mod tests {
             m.message_seq > first,
             "a repeated failure must re-raise the banner"
         );
+    }
+
+    /// A peer that reconnects on a new source port must not be reported offline
+    /// by the OLD address's late disconnect.
+    #[test]
+    fn a_reconnect_on_a_new_port_stays_connected() {
+        use std::net::SocketAddr;
+        let fp = "aa:bb:cc:dd";
+        let old: SocketAddr = "10.0.0.5:50001".parse().unwrap();
+        let new: SocketAddr = "10.0.0.5:50002".parse().unwrap();
+
+        let mut m = AppModel::default();
+        m.apply(super::FrontendEvent::DeviceConnected { addr: old, fingerprint: fp.into() });
+        assert!(m.connected_peers.contains(fp));
+
+        // reconnect lands first, THEN the old socket's disconnect arrives
+        m.apply(super::FrontendEvent::DeviceConnected { addr: new, fingerprint: fp.into() });
+        m.apply(super::FrontendEvent::IncomingDisconnected(old));
+        assert!(
+            m.connected_peers.contains(fp),
+            "the peer is still connected on the new port — a late disconnect for \
+             the old one must not mark it offline"
+        );
+
+        // and the genuine last disconnect DOES clear it
+        m.apply(super::FrontendEvent::IncomingDisconnected(new));
+        assert!(!m.connected_peers.contains(fp), "the last address leaving means offline");
     }
 
     #[test]
