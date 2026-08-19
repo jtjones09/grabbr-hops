@@ -60,6 +60,7 @@ struct PolledUi {
     port: String,
     fingerprint: String,
     pairing: String,
+    free_position: String,
     notice: String,
     notice_seq: i32,
     devices: Vec<(String, String, String, String, bool, bool, bool, String, String, bool, bool)>,
@@ -659,6 +660,17 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                 port: m.port.map(|p| p.to_string()).unwrap_or_else(|| "—".to_string()),
                 fingerprint: m.fingerprint.clone().unwrap_or_else(|| "—".to_string()),
                 pairing,
+                // the first edge nothing active is already using, so adding a
+                // second device does not silently switch off the first
+                free_position: ["left", "right", "top", "bottom"]
+                    .into_iter()
+                    .find(|p| {
+                        !devices
+                            .iter()
+                            .any(|d| d.has_send && d.active && d.pos.as_str() == *p)
+                    })
+                    .unwrap_or("left")
+                    .to_string(),
                 notice: m.latest_message().unwrap_or_default().to_string(),
                 // i32 is Slint's integer; the seq only needs to CHANGE, not be exact
                 notice_seq: (m.message_seq % (i32::MAX as u64)) as i32,
@@ -700,7 +712,8 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                 last_daemon_notice.set(snap.notice_seq);
                 if !snap.notice.is_empty() {
                     notice_seq_poll.set(notice_seq_poll.get().wrapping_add(1));
-                    ui.set_notice(snap.notice.as_str().into());
+                    ui.set_free_position(snap.free_position.as_str().into());
+            ui.set_notice(snap.notice.as_str().into());
                     ui.set_notice_seq(notice_seq_poll.get());
                 }
             }

@@ -88,7 +88,10 @@ export component AppWindow inherits Window {
     // real app's Rust side, which only ever reads them indirectly via clicks.
     in-out property <bool> show-settings: false;
     in-out property <bool> show-add-device: false;
+    // seeded from `free-position` when the panel opens — defaulting every add to
+    // "left" meant the second device silently evicted the first
     property <string> add-device-position: "left";
+    in property <string> free-position: "left";
     // `in-out`: Rust sets both together, once, when the canvas opens — NOT
     // re-pushed by the poll timer (see layout_canvas.slint's header note on
     // why a drag would otherwise get fought by the next live update).
@@ -299,7 +302,14 @@ export component AppWindow inherits Window {
                         PillButton {
                             text: root.show-add-device ? "cancel" : "+ add";
                             ghost: true;
-                            clicked => { root.show-add-device = !root.show-add-device; }
+                            clicked => {
+                                // opening: preselect an edge nothing is using, so
+                                // the second device does not evict the first
+                                if !root.show-add-device {
+                                    root.add-device-position = root.free-position;
+                                }
+                                root.show-add-device = !root.show-add-device;
+                            }
                         }
                     }
                 }

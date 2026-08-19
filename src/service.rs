@@ -929,7 +929,18 @@ impl Service {
 
         if let Some(other) = self.client_manager.client_at(pos) {
             if other != handle {
+                // Silent eviction was a real trap: the user's FIRST machine
+                // stopped working right after they added a second, with its
+                // toggle flipping off by itself and no message anywhere.
+                let name = self
+                    .client_manager
+                    .get_hostname(other)
+                    .unwrap_or_else(|| format!("device {other}"));
                 self.deactivate_client(other);
+                self.notify_frontend(FrontendEvent::Error(format!(
+                    "Switched off \"{name}\" — it was using the {pos} edge, \
+                     and two devices cannot share one edge."
+                )));
             }
         }
 
