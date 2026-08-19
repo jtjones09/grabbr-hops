@@ -277,10 +277,7 @@ mod tests {
     /// is what let an attacker prepend arbitrary lines to a real request.
     #[tokio::test]
     async fn garbage_after_a_good_token_closes_the_connection() {
-        let got = drive(&format!(
-            "{TOKEN}\nnot json at all\n{{\"Enumerate\":[]}}\n"
-        ))
-        .await;
+        let got = drive(&format!("{TOKEN}\nnot json at all\n{{\"Enumerate\":[]}}\n")).await;
         assert!(
             got.is_empty(),
             "the connection must close on the junk line, not skip it"

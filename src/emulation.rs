@@ -1,9 +1,9 @@
 use crate::config::{local_caps, local_commit};
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
 use futures::StreamExt;
+use hops_proto::{Position, ProtoEvent};
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
 use input_event::{Event, PointerEvent};
-use hops_proto::{Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::Cell,
@@ -419,10 +419,10 @@ impl EmulationProxy {
 
     /// True if a peer injected input into this machine within `window`.
     ///
-    /// Used to refuse trust GRANTS while the pointer is not ours. Deliberately a
-    /// quiet-window check rather than suspending injection while a prompt is
-    /// open: the latter would hand any LAN peer a KVM freeze by dialling with a
-    /// fresh cert on a timer.
+    /// Production reads this through `Emulation`, which shares the same cell;
+    /// this exists so the test can drive `consume()` directly without standing up
+    /// a listener, hence `cfg(test)` rather than an allow(dead_code).
+    #[cfg(test)]
     pub(crate) fn remotely_driven_within(&self, window: Duration) -> bool {
         self.last_injected
             .get()
@@ -684,7 +684,14 @@ mod tests {
                 "a machine nobody has driven is not remotely driven"
             );
 
-            proxy.consume(Event::Pointer(PointerEvent::Motion { time: 0, dx: 1.0, dy: 0.0 }), addr(1));
+            proxy.consume(
+                Event::Pointer(PointerEvent::Motion {
+                    time: 0,
+                    dx: 1.0,
+                    dy: 0.0,
+                }),
+                addr(1),
+            );
             assert!(
                 proxy.remotely_driven_within(window),
                 "peer input must mark the machine as remotely driven"

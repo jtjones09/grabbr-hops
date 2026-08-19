@@ -10,12 +10,12 @@ use crate::{
     hop_log::Lifecycle,
     listen::{ClipboardSenderListen, LanMouseListener, ListenerCreationError},
 };
-use local_channel::mpsc::{Receiver, channel};
 use futures::StreamExt;
 use hops_ipc::{
     AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
     IpcListenerCreationError, Position, Status,
 };
+use local_channel::mpsc::{Receiver, channel};
 use log;
 use std::{
     collections::{HashMap, HashSet, VecDeque},

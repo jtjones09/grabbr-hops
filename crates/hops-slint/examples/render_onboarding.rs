@@ -11,7 +11,7 @@ use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferTyp
 use slint::platform::{Platform, WindowAdapter, WindowEvent};
 use slint::{ComponentHandle, ModelRc, PhysicalSize, VecModel};
 
-use hops_slint::{theme_colors, OnboardingWindow, Theme};
+use hops_slint::{OnboardingWindow, Theme, theme_colors};
 
 struct HeadlessPlatform {
     window: Rc<MinimalSoftwareWindow>,
@@ -33,15 +33,25 @@ fn render(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let ui = OnboardingWindow::new()?;
 
     let themes = hops_frontend_core::theme::all_themes();
-    ui.global::<Theme>().set_palettes(ModelRc::new(VecModel::from(
-        themes.iter().map(theme_colors).collect::<Vec<_>>(),
-    )));
-    let theme_idx: i32 = std::env::args().nth(4).and_then(|s| s.parse().ok()).unwrap_or(0);
+    ui.global::<Theme>()
+        .set_palettes(ModelRc::new(VecModel::from(
+            themes.iter().map(theme_colors).collect::<Vec<_>>(),
+        )));
+    let theme_idx: i32 = std::env::args()
+        .nth(4)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     ui.global::<Theme>().set_index(theme_idx);
 
     let scale = 2.0_f32;
-    let w: f32 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(580.0);
-    let h: f32 = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(420.0);
+    let w: f32 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(580.0);
+    let h: f32 = std::env::args()
+        .nth(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(420.0);
     window
         .window()
         .dispatch_event(WindowEvent::ScaleFactorChanged {

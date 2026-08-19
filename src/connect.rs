@@ -443,7 +443,8 @@ async fn connect_to_handle(
         // prior pin — that would fail OPEN on the next dial.
         match peer_fingerprint(&link.conn) {
             Some(fp) => {
-                let is_new = client_manager.peer_fingerprint(handle).as_deref() != Some(fp.as_str());
+                let is_new =
+                    client_manager.peer_fingerprint(handle).as_deref() != Some(fp.as_str());
                 log::info!("client {handle} receiver fingerprint: {fp}");
                 client_manager.set_peer_fingerprint(handle, Some(fp));
                 // persist it so the device view can join from a cold start
@@ -476,9 +477,13 @@ async fn connect_to_handle(
             {
                 log::debug!("hello send to {addr} failed: {e}");
             }
-            if let Err(e) =
-                transport::write_frame(&mut send, ProtoEvent::Capability { flags: local_caps() })
-                    .await
+            if let Err(e) = transport::write_frame(
+                &mut send,
+                ProtoEvent::Capability {
+                    flags: local_caps(),
+                },
+            )
+            .await
             {
                 log::debug!("capability send to {addr} failed: {e}");
             }
@@ -691,15 +696,14 @@ async fn clipboard_accept_loop(conn: Connection, addr: SocketAddr, clipboard_in:
 mod tests {
     use super::*;
     use crate::crypto::Identity;
-    use quinn::crypto::rustls::QuicServerConfig;
     use quinn::Endpoint;
+    use quinn::crypto::rustls::QuicServerConfig;
     use std::collections::HashMap;
     use std::sync::RwLock;
 
     fn identity() -> Identity {
         let key_pair = rcgen::KeyPair::generate().expect("keypair");
-        let mut params =
-            rcgen::CertificateParams::new(vec!["grabbr".to_owned()]).expect("params");
+        let mut params = rcgen::CertificateParams::new(vec!["grabbr".to_owned()]).expect("params");
         params.distinguished_name = rcgen::DistinguishedName::new();
         params
             .distinguished_name
@@ -767,11 +771,9 @@ mod tests {
             for _ in 0..2 {
                 let server = identity();
                 fps.push(transport::fingerprint_of(&server.cert));
-                let ep = Endpoint::server(
-                    open_server(&server),
-                    "127.0.0.1:0".parse().expect("addr"),
-                )
-                .expect("server endpoint");
+                let ep =
+                    Endpoint::server(open_server(&server), "127.0.0.1:0".parse().expect("addr"))
+                        .expect("server endpoint");
                 addrs.push(ep.local_addr().expect("local addr"));
                 spawn_local(async move {
                     while let Some(incoming) = ep.accept().await {
@@ -828,11 +830,9 @@ mod tests {
             let client = identity();
             let server_fp = transport::fingerprint_of(&server.cert);
 
-            let server_ep = Endpoint::server(
-                open_server(&server),
-                "127.0.0.1:0".parse().expect("addr"),
-            )
-            .expect("server endpoint");
+            let server_ep =
+                Endpoint::server(open_server(&server), "127.0.0.1:0".parse().expect("addr"))
+                    .expect("server endpoint");
             let addr = server_ep.local_addr().expect("local addr");
             spawn_local(async move {
                 while let Some(incoming) = server_ep.accept().await {
@@ -856,11 +856,7 @@ mod tests {
             // ONE endpoint + config across both dials, so a ticket can be cached
             let mut client_ep =
                 Endpoint::client("127.0.0.1:0".parse().expect("addr")).expect("client endpoint");
-            client_ep.set_default_client_config(client_config(
-                &client,
-                trusted.clone(),
-                observed,
-            ));
+            client_ep.set_default_client_config(client_config(&client, trusted.clone(), observed));
 
             assert!(
                 dials_ok(&client_ep, addr).await,

@@ -14,11 +14,11 @@ use std::{
 };
 
 use futures::StreamExt;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 
 pub use hops_ipc::{
-    connect_async, ClientConfig, ClientHandle, ClientState, FrontendEvent, FrontendRequest,
-    Position, RevokedEntry, Status,
+    ClientConfig, ClientHandle, ClientState, FrontendEvent, FrontendRequest, Position,
+    RevokedEntry, Status, connect_async,
 };
 
 pub mod prefs;
@@ -532,7 +532,8 @@ mod tests {
         let mut m = AppModel::default();
         let fp = "aa:bb:cc:dd";
         m.clients.insert(0, client(Some("studio-mac"), Some(fp)));
-        m.authorized.insert(fp.to_string(), "studio-mac".to_string());
+        m.authorized
+            .insert(fp.to_string(), "studio-mac".to_string());
         let devices = m.devices();
         assert_eq!(devices.len(), 1, "one machine must render as one card");
         let d = &devices[0];
@@ -550,16 +551,24 @@ mod tests {
         let mut m = AppModel::default();
         let scorn = "73:90:2a:3c:9d:e5";
         let carrier = "2d:65:8f:e6:f8:2b";
-        m.clients.insert(0, client(Some("10.110.20.99"), Some(scorn)));
-        m.clients.insert(1, client(Some("10.110.21.46"), Some(carrier)));
-        m.authorized.insert(scorn.to_string(), "ScornMBP23".to_string());
-        m.authorized.insert(carrier.to_string(), "CarrierMBP".to_string());
+        m.clients
+            .insert(0, client(Some("10.110.20.99"), Some(scorn)));
+        m.clients
+            .insert(1, client(Some("10.110.21.46"), Some(carrier)));
+        m.authorized
+            .insert(scorn.to_string(), "ScornMBP23".to_string());
+        m.authorized
+            .insert(carrier.to_string(), "CarrierMBP".to_string());
 
         let devices = m.devices();
         assert_eq!(devices.len(), 2, "two machines, not four cards");
         let mut labels: Vec<&str> = devices.iter().map(|d| d.label.as_str()).collect();
         labels.sort();
-        assert_eq!(labels, ["CarrierMBP", "ScornMBP23"], "named by peer, not by IP");
+        assert_eq!(
+            labels,
+            ["CarrierMBP", "ScornMBP23"],
+            "named by peer, not by IP"
+        );
         for d in &devices {
             assert!(d.send.is_some(), "{} keeps its outgoing facet", d.label);
             assert!(d.receive, "{} stays trusted (revoke must render)", d.label);
@@ -567,7 +576,10 @@ mod tests {
     }
 
     fn revoked(label: &str) -> super::RevokedEntry {
-        super::RevokedEntry { label: label.to_string(), revoked_at: 1_754_000_000 }
+        super::RevokedEntry {
+            label: label.to_string(),
+            revoked_at: 1_754_000_000,
+        }
     }
 
     /// The point of persisting revocation: a device you threw out must never
@@ -580,8 +592,14 @@ mod tests {
         let devices = m.devices();
         assert_eq!(devices.len(), 1, "the expelled device stays visible");
         assert_eq!(devices[0].trust, TrustState::Revoked);
-        assert_eq!(devices[0].label, "ScornW20", "it keeps the name you knew it by");
-        assert!(!devices[0].receive, "revoked means not trusted to connect in");
+        assert_eq!(
+            devices[0].label, "ScornW20",
+            "it keeps the name you knew it by"
+        );
+        assert!(
+            !devices[0].receive,
+            "revoked means not trusted to connect in"
+        );
     }
 
     /// A revoked peer reconnecting must NOT surface as a pairing request — that
@@ -609,7 +627,11 @@ mod tests {
         let fp = "aa:bb:cc:dd";
         m.authorized.insert(fp.to_string(), "ScornW20".into());
         let devices = m.devices();
-        assert_eq!(devices[0].trust, TrustState::Trusted, "plain trusted device");
+        assert_eq!(
+            devices[0].trust,
+            TrustState::Trusted,
+            "plain trusted device"
+        );
 
         // an expelled identity is a TOMBSTONE: even if both tables somehow name
         // it, it must never render as trusted, because there is no longer any
@@ -631,7 +653,8 @@ mod tests {
     #[test]
     fn a_revoked_device_survives_the_list_filter() {
         let mut m = AppModel::default();
-        m.revoked.insert("aa:bb:cc:dd".into(), revoked("old-thinkpad"));
+        m.revoked
+            .insert("aa:bb:cc:dd".into(), revoked("old-thinkpad"));
         let devices = m.devices();
         assert_eq!(devices.len(), 1);
         assert!(
@@ -653,14 +676,24 @@ mod tests {
         assert_eq!(m.latest_message(), None, "nothing to show at rest");
         assert_eq!(m.message_seq, 0);
 
-        m.apply(super::FrontendEvent::Error("could not resolve studio-pc".into()));
-        assert_eq!(m.latest_message(), Some("error: could not resolve studio-pc"));
+        m.apply(super::FrontendEvent::Error(
+            "could not resolve studio-pc".into(),
+        ));
+        assert_eq!(
+            m.latest_message(),
+            Some("error: could not resolve studio-pc")
+        );
         let first = m.message_seq;
-        assert!(first > 0, "a notice must bump the seq or the UI cannot raise it");
+        assert!(
+            first > 0,
+            "a notice must bump the seq or the UI cannot raise it"
+        );
 
         // a SECOND, identical error must still be distinguishable, or a dismissed
         // banner would stay hidden through a repeat of the same failure
-        m.apply(super::FrontendEvent::Error("could not resolve studio-pc".into()));
+        m.apply(super::FrontendEvent::Error(
+            "could not resolve studio-pc".into(),
+        ));
         assert!(
             m.message_seq > first,
             "a repeated failure must re-raise the banner"
@@ -677,11 +710,17 @@ mod tests {
         let new: SocketAddr = "10.0.0.5:50002".parse().unwrap();
 
         let mut m = AppModel::default();
-        m.apply(super::FrontendEvent::DeviceConnected { addr: old, fingerprint: fp.into() });
+        m.apply(super::FrontendEvent::DeviceConnected {
+            addr: old,
+            fingerprint: fp.into(),
+        });
         assert!(m.connected_peers.contains(fp));
 
         // reconnect lands first, THEN the old socket's disconnect arrives
-        m.apply(super::FrontendEvent::DeviceConnected { addr: new, fingerprint: fp.into() });
+        m.apply(super::FrontendEvent::DeviceConnected {
+            addr: new,
+            fingerprint: fp.into(),
+        });
         m.apply(super::FrontendEvent::IncomingDisconnected(old));
         assert!(
             m.connected_peers.contains(fp),
@@ -691,7 +730,10 @@ mod tests {
 
         // and the genuine last disconnect DOES clear it
         m.apply(super::FrontendEvent::IncomingDisconnected(new));
-        assert!(!m.connected_peers.contains(fp), "the last address leaving means offline");
+        assert!(
+            !m.connected_peers.contains(fp),
+            "the last address leaving means offline"
+        );
     }
 
     #[test]
@@ -704,9 +746,11 @@ mod tests {
             .insert("cc:dd:ee:ff".to_string(), "windows-box".to_string());
         let devices = m.devices();
         assert_eq!(devices.len(), 2, "no fingerprint to join on => two cards");
-        assert!(devices
-            .iter()
-            .any(|d| d.fingerprint.is_none() && d.send.is_some()));
+        assert!(
+            devices
+                .iter()
+                .any(|d| d.fingerprint.is_none() && d.send.is_some())
+        );
         assert!(devices.iter().any(|d| d.receive && d.send.is_none()));
     }
 
@@ -734,7 +778,8 @@ mod tests {
     fn online_reflects_connected_peers() {
         let mut m = AppModel::default();
         let fp = "aa:bb:cc:dd";
-        m.authorized.insert(fp.to_string(), "studio-mac".to_string());
+        m.authorized
+            .insert(fp.to_string(), "studio-mac".to_string());
         m.connected_peers.insert(fp.to_string());
         let devices = m.devices();
         assert_eq!(devices.len(), 1);

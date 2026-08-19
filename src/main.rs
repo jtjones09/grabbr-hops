@@ -1,6 +1,4 @@
 use env_logger::Env;
-use input_capture::InputCaptureError;
-use input_emulation::InputEmulationError;
 use hops::{
     capture_test,
     config::{self, Command, Config, ConfigError},
@@ -11,6 +9,8 @@ use hops_cli::CliError;
 #[cfg(feature = "gtk")]
 use hops_gtk::GtkError;
 use hops_ipc::{IpcError, IpcListenerCreationError};
+use input_capture::InputCaptureError;
+use input_emulation::InputEmulationError;
 use std::{
     future::Future,
     io,
@@ -158,7 +158,7 @@ fn run_tui() -> Result<(), HopsError> {
 #[cfg(all(not(feature = "gtk"), any(feature = "tui", feature = "slint")))]
 fn front_door() -> Result<(), HopsError> {
     use hops_frontend_core::prefs::{
-        load_frontend, onboarding_done, save_frontend, set_onboarding_done, Frontend,
+        Frontend, load_frontend, onboarding_done, save_frontend, set_onboarding_done,
     };
     ensure_daemon_running();
 
@@ -189,8 +189,8 @@ fn front_door() -> Result<(), HopsError> {
 fn run_onboarding_picker() -> Option<hops_frontend_core::prefs::Frontend> {
     #[cfg(all(feature = "slint", feature = "tui"))]
     {
-        let ssh = std::env::var_os("SSH_CONNECTION").is_some()
-            || std::env::var_os("SSH_TTY").is_some();
+        let ssh =
+            std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
         if ssh {
             hops_tui::run_onboarding().ok().flatten()
         } else {
@@ -212,8 +212,7 @@ fn run_onboarding_picker() -> Option<hops_frontend_core::prefs::Frontend> {
 #[cfg(all(not(feature = "gtk"), any(feature = "tui", feature = "slint")))]
 fn default_frontend() -> hops_frontend_core::prefs::Frontend {
     use hops_frontend_core::prefs::Frontend;
-    let ssh = std::env::var_os("SSH_CONNECTION").is_some()
-        || std::env::var_os("SSH_TTY").is_some();
+    let ssh = std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
     if !ssh && cfg!(feature = "slint") {
         Frontend::Gui
     } else if cfg!(feature = "tui") {
@@ -260,7 +259,11 @@ fn daemon_socket_alive() -> bool {
 
 /// Bring up `com.grabbr.hops` via launchd if it isn't already loaded,
 /// self-installing the LaunchAgent plist (pointed at this binary) on first run.
-#[cfg(all(not(feature = "gtk"), target_os = "macos", any(feature = "tui", feature = "slint")))]
+#[cfg(all(
+    not(feature = "gtk"),
+    target_os = "macos",
+    any(feature = "tui", feature = "slint")
+))]
 fn ensure_launchd_daemon() {
     let uid = unsafe { libc::getuid() };
     let service = format!("gui/{uid}/com.grabbr.hops");
@@ -286,7 +289,11 @@ fn ensure_launchd_daemon() {
 /// Write `~/Library/LaunchAgents/com.grabbr.hops.plist` (pointed at the current
 /// binary) if absent; returns its path. Grant is path-bound, so the plist must
 /// point at whatever `hops` binary the user actually launched.
-#[cfg(all(not(feature = "gtk"), target_os = "macos", any(feature = "tui", feature = "slint")))]
+#[cfg(all(
+    not(feature = "gtk"),
+    target_os = "macos",
+    any(feature = "tui", feature = "slint")
+))]
 fn install_launchd_plist_if_missing() -> Option<String> {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
     let plist_path = home.join("Library/LaunchAgents/com.grabbr.hops.plist");

@@ -88,7 +88,7 @@ fn sanitize_label(s: &str) -> String {
                     '\u{200b}'..='\u{200f}'   // zero-width + LRM/RLM
                     | '\u{202a}'..='\u{202e}' // bidi embeddings/overrides
                     | '\u{2066}'..='\u{2069}' // bidi isolates
-                    | '\u{feff}')             // BOM / zero-width no-break
+                    | '\u{feff}') // BOM / zero-width no-break
         })
         .take(MAX_LABEL_LEN)
         .collect()
@@ -110,8 +110,13 @@ impl PairingCode {
         if s.len() > MAX_CODE_LEN {
             return Err(PairingError::OutOfBounds);
         }
-        let body = s.trim().strip_prefix(PREFIX).ok_or(PairingError::BadPrefix)?;
-        let bytes = URL_SAFE_NO_PAD.decode(body).map_err(|_| PairingError::Corrupt)?;
+        let body = s
+            .trim()
+            .strip_prefix(PREFIX)
+            .ok_or(PairingError::BadPrefix)?;
+        let bytes = URL_SAFE_NO_PAD
+            .decode(body)
+            .map_err(|_| PairingError::Corrupt)?;
         let mut code: PairingCode =
             serde_json::from_slice(&bytes).map_err(|_| PairingError::Corrupt)?;
         if !valid_fingerprint(&code.fingerprint) {
@@ -165,7 +170,10 @@ mod tests {
 
     #[test]
     fn rejects_bad_prefix() {
-        assert_eq!(PairingCode::decode("nope").unwrap_err(), PairingError::BadPrefix);
+        assert_eq!(
+            PairingCode::decode("nope").unwrap_err(),
+            PairingError::BadPrefix
+        );
         assert_eq!(
             PairingCode::decode("hops-pair-2.abc").unwrap_err(),
             PairingError::BadPrefix
@@ -206,12 +214,18 @@ mod tests {
     fn rejects_empty_or_oversized_addrs() {
         let mut c = code("x");
         c.addrs.clear();
-        assert_eq!(PairingCode::decode(&c.encode()).unwrap_err(), PairingError::OutOfBounds);
+        assert_eq!(
+            PairingCode::decode(&c.encode()).unwrap_err(),
+            PairingError::OutOfBounds
+        );
         let mut c = code("x");
         c.addrs = (0..MAX_ADDRS + 1)
             .map(|i| format!("10.0.0.{}:4242", i + 1).parse().unwrap())
             .collect();
-        assert_eq!(PairingCode::decode(&c.encode()).unwrap_err(), PairingError::OutOfBounds);
+        assert_eq!(
+            PairingCode::decode(&c.encode()).unwrap_err(),
+            PairingError::OutOfBounds
+        );
     }
 
     #[test]
@@ -224,7 +238,10 @@ mod tests {
     #[test]
     fn rejects_oversized_input() {
         let huge = format!("{PREFIX}{}", "A".repeat(MAX_CODE_LEN));
-        assert_eq!(PairingCode::decode(&huge).unwrap_err(), PairingError::OutOfBounds);
+        assert_eq!(
+            PairingCode::decode(&huge).unwrap_err(),
+            PairingError::OutOfBounds
+        );
     }
 
     #[test]

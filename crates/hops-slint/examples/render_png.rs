@@ -21,7 +21,7 @@ use slint::{ComponentHandle, ModelRc, PhysicalSize, VecModel};
 // invocation would compile the SAME .slint source into a SECOND, nominally
 // distinct set of Rust types, incompatible with the lib's (e.g. two different
 // `ThemeColors` structs), even though they look identical.
-use hops_slint::{theme_colors, AppWindow, CanvasBox, DeviceRow, Theme};
+use hops_slint::{AppWindow, CanvasBox, DeviceRow, Theme, theme_colors};
 
 /// Headless platform: every window is a MinimalSoftwareWindow (CPU renderer, no OS window).
 struct HeadlessPlatform {
@@ -51,12 +51,16 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
     //     .slint) — the real app does this in lib.rs::run(); without it here the
     //     preview would render every color as the struct default (transparent).
     let themes = hops_frontend_core::theme::all_themes();
-    ui.global::<Theme>().set_palettes(ModelRc::new(VecModel::from(
-        themes.iter().map(theme_colors).collect::<Vec<_>>(),
-    )));
+    ui.global::<Theme>()
+        .set_palettes(ModelRc::new(VecModel::from(
+            themes.iter().map(theme_colors).collect::<Vec<_>>(),
+        )));
     // 4th arg picks which theme to render (index into all_themes(): built-ins
     // then any user themes) — handy for reviewing every palette, not just index 0.
-    let theme_idx: i32 = std::env::args().nth(4).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let theme_idx: i32 = std::env::args()
+        .nth(4)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     ui.global::<Theme>().set_index(theme_idx);
 
     // 3) Representative mock data so every region is exercised in one shot.
@@ -161,8 +165,18 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
         Some("delete-confirm") => ui.set_confirm_delete_handle("1".into()),
         Some("layout-canvas") => {
             ui.set_canvas_boxes(ModelRc::new(VecModel::from(vec![
-                CanvasBox { handle: "1".into(), name: "studio-pc".into(), x: 20.0, y: 108.0 },
-                CanvasBox { handle: "2".into(), name: "media-rig".into(), x: 192.0, y: 16.0 },
+                CanvasBox {
+                    handle: "1".into(),
+                    name: "studio-pc".into(),
+                    x: 20.0,
+                    y: 108.0,
+                },
+                CanvasBox {
+                    handle: "2".into(),
+                    name: "media-rig".into(),
+                    x: 192.0,
+                    y: 16.0,
+                },
             ])));
             ui.set_show_layout_canvas(true);
         }
@@ -174,8 +188,14 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
     let scale = 2.0_f32;
     // review height (taller than the app's default so the whole layout incl. footer
     // is visible in one shot); override with args: -- out.png [w] [h]
-    let w: f32 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(560.0);
-    let h: f32 = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(760.0);
+    let w: f32 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(560.0);
+    let h: f32 = std::env::args()
+        .nth(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(760.0);
     window
         .window()
         .dispatch_event(WindowEvent::ScaleFactorChanged {

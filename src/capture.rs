@@ -5,11 +5,11 @@ use std::{
 };
 
 use futures::StreamExt;
+use hops_proto::{ProtoEvent, caps};
 use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
 };
 use input_event::{Event, KeyboardEvent, PointerEvent, scancode};
-use hops_proto::{ProtoEvent, caps};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
@@ -394,7 +394,9 @@ impl CaptureTask {
             // motion (abs_seq == 1 is the first emit after a Begin reset). Makes
             // a two-machine A/B unambiguous: no line ⇒ relative fallback.
             if self.abs_seq == 1 {
-                log::info!("absolute motion active for client {handle} (peer negotiated ABSOLUTE_MOTION)");
+                log::info!(
+                    "absolute motion active for client {handle} (peer negotiated ABSOLUTE_MOTION)"
+                );
             }
             ProtoEvent::PointerMotionAbsolute {
                 seq: self.abs_seq,
@@ -495,7 +497,8 @@ impl CaptureTask {
         // absolute-aware). Matched by reference so `event` stays owned for the
         // generic path below (non-motion events + the Enter re-sends).
         if matches!(self.state, State::Sending) {
-            if let CaptureEvent::Input(Event::Pointer(PointerEvent::Motion { dx, dy, .. })) = &event {
+            if let CaptureEvent::Input(Event::Pointer(PointerEvent::Motion { dx, dy, .. })) = &event
+            {
                 return self.send_motion(capture, handle, *dx, *dy).await;
             }
         }

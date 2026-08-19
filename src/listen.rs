@@ -35,9 +35,17 @@ pub enum ListenerCreationError {
 }
 
 pub(crate) enum ListenEvent {
-    Msg { event: ProtoEvent, addr: SocketAddr },
-    Accept { addr: SocketAddr, fingerprint: String },
-    Rejected { fingerprint: String },
+    Msg {
+        event: ProtoEvent,
+        addr: SocketAddr,
+    },
+    Accept {
+        addr: SocketAddr,
+        fingerprint: String,
+    },
+    Rejected {
+        fingerprint: String,
+    },
 }
 
 /// A live inbound connection plus the reply stream we opened back to the peer
@@ -460,8 +468,7 @@ mod tests {
 
     fn identity() -> Identity {
         let key_pair = rcgen::KeyPair::generate().expect("keypair");
-        let mut params =
-            rcgen::CertificateParams::new(vec!["grabbr".to_owned()]).expect("params");
+        let mut params = rcgen::CertificateParams::new(vec!["grabbr".to_owned()]).expect("params");
         params.distinguished_name = rcgen::DistinguishedName::new();
         params
             .distinguished_name

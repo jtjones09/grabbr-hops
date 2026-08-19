@@ -13,7 +13,7 @@
 //! Raw `objc_msgSend` FFI (same hand-rolled approach as the GTK front-end's
 //! reference module), kept tiny on purpose.
 
-use std::ffi::{c_char, c_void, CStr};
+use std::ffi::{CStr, c_char, c_void};
 
 type Id = *mut c_void;
 type Class = *mut c_void;
@@ -26,7 +26,10 @@ type Bool = i8;
 pub fn set_accessory_policy() {
     unsafe {
         let ns_app = msg_send_id(class(c"NSApplication"), sel(c"sharedApplication"));
-        assert!(!ns_app.is_null(), "NSApplication sharedApplication returned null");
+        assert!(
+            !ns_app.is_null(),
+            "NSApplication sharedApplication returned null"
+        );
         msg_send_bool_usize(ns_app, sel(c"setActivationPolicy:"), 1);
     }
 }

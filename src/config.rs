@@ -59,7 +59,12 @@ pub fn local_caps() -> u32 {
 }
 
 /// `--version` string: package version + short git commit (both compile-time).
-const LONG_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("HOPS_SHORT_COMMIT"), ")");
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("HOPS_SHORT_COMMIT"),
+    ")"
+);
 
 const CONFIG_FILE_NAME: &str = "config.toml";
 const CERT_FILE_NAME: &str = "lan-mouse.pem";

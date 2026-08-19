@@ -89,12 +89,18 @@ impl ServerCertVerifier for FpServerVerifier {
         _now: UnixTime,
     ) -> Result<ServerCertVerified, TlsError> {
         let fingerprint = fingerprint_of(end_entity);
-        let authorized = self.authorized.read().expect("lock").contains_key(&fingerprint);
+        let authorized = self
+            .authorized
+            .read()
+            .expect("lock")
+            .contains_key(&fingerprint);
         *self.observed.lock().expect("lock") = Some(fingerprint);
         if authorized {
             Ok(ServerCertVerified::assertion())
         } else {
-            Err(TlsError::General("receiver fingerprint not authorized".into()))
+            Err(TlsError::General(
+                "receiver fingerprint not authorized".into(),
+            ))
         }
     }
 
@@ -177,11 +183,18 @@ impl ClientCertVerifier for FpClientVerifier {
         _now: UnixTime,
     ) -> Result<ClientCertVerified, TlsError> {
         let fingerprint = fingerprint_of(end_entity);
-        if self.authorized.read().expect("lock").contains_key(&fingerprint) {
+        if self
+            .authorized
+            .read()
+            .expect("lock")
+            .contains_key(&fingerprint)
+        {
             Ok(ClientCertVerified::assertion())
         } else {
             self.attempts.lock().expect("lock").push_back(fingerprint);
-            Err(TlsError::General("sender fingerprint not authorized".into()))
+            Err(TlsError::General(
+                "sender fingerprint not authorized".into(),
+            ))
         }
     }
 
@@ -241,7 +254,10 @@ pub enum FrameError {
 }
 
 /// Write one length-prefixed [`ProtoEvent`] to a reliable stream.
-pub async fn write_frame(send: &mut quinn::SendStream, event: ProtoEvent) -> Result<(), FrameError> {
+pub async fn write_frame(
+    send: &mut quinn::SendStream,
+    event: ProtoEvent,
+) -> Result<(), FrameError> {
     let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
     let mut frame = [0u8; 1 + MAX_EVENT_SIZE];
     frame[0] = len as u8;

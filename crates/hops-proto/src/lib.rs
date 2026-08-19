@@ -406,7 +406,14 @@ mod tests {
 
     #[test]
     fn capability_roundtrips() {
-        for flags in [0u32, 1, 0b1011, caps::ABSOLUTE_MOTION, 0xDEAD_BEEF, u32::MAX] {
+        for flags in [
+            0u32,
+            1,
+            0b1011,
+            caps::ABSOLUTE_MOTION,
+            0xDEAD_BEEF,
+            u32::MAX,
+        ] {
             let (decoded, len) = roundtrip(ProtoEvent::Capability { flags });
             assert!(
                 matches!(decoded, ProtoEvent::Capability { flags: f } if f == flags),
@@ -518,7 +525,9 @@ mod tests {
             ProtoEvent::Ack(42),
             ProtoEvent::Leave(7),
             ProtoEvent::Enter(Position::Right),
-            ProtoEvent::Hello { commit: *b"abc12345" },
+            ProtoEvent::Hello {
+                commit: *b"abc12345",
+            },
             ProtoEvent::Capability {
                 flags: caps::ABSOLUTE_MOTION | caps::TRUELOOP_REPORT,
             },

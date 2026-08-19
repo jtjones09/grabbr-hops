@@ -51,7 +51,9 @@ fn config_dir() -> io::Result<PathBuf> {
     #[cfg(unix)]
     let base = match std::env::var("XDG_CONFIG_HOME") {
         Ok(dir) => PathBuf::from(dir),
-        Err(_) => PathBuf::from(std::env::var("HOME").map_err(|_| missing("HOME"))?).join(".config"),
+        Err(_) => {
+            PathBuf::from(std::env::var("HOME").map_err(|_| missing("HOME"))?).join(".config")
+        }
     };
     #[cfg(not(unix))]
     let base = match std::env::var("LOCALAPPDATA") {

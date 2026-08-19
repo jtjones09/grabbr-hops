@@ -1,0 +1,85 @@
+# Compile and test on every push and PR.
+#
+# Why this exists: `release.yml` builds ONLY `--no-default-features`, and there
+# was no push/PR workflow at all — so nothing anywhere compiled `gtk`, which is
+# a DEFAULT feature and the primary Linux frontend. A new `FrontendEvent`
+# variant made hops-gtk's exhaustive match non-exhaustive and broke bare
+# `cargo check` / `build` / `test` / `install --git` with E0004, while CI stayed
+# green. It was caught only by review.
+#
+# The default feature set is therefore the point of this workflow, not an extra.
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # The configuration a contributor gets from a bare `cargo build`, and the only
+  # one that compiles hops-gtk.
+  default-features:
+    name: default features (incl. gtk)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev libxkbcommon-dev \
+            libwayland-dev libx11-dev libxtst-dev pkg-config
+      - name: cargo check --workspace --all-targets
+        run: cargo check --workspace --all-targets
+
+  # The feature set the releases actually ship.
+  release-features:
+    name: release features (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest,   features: "tui slint" }
+          - { os: windows-latest, features: "tui slint" }
+          - { os: ubuntu-latest,  features: "tui" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: system deps (linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev \
+            libxtst-dev pkg-config
+      - name: check
+        run: cargo check --no-default-features --features "${{ matrix.features }}" --all-targets
+      - name: test
+        run: cargo test --no-default-features --features "${{ matrix.features }}"
+
+  # The trust tests are the ones that must never silently stop running: each was
+  # written to fail without its fix, and several guard a shipped vulnerability.
+  workspace-tests:
+    name: workspace tests
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p hops-ipc -p hops-frontend-core
+
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check

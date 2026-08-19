@@ -103,8 +103,10 @@ pub(crate) fn generate_key_and_cert(path: &Path) -> Result<Identity, Error> {
     // Trust is by fingerprint, not validity dates — use a very wide, fixed
     // window so a persisted cert never becomes a time-bomb and clock skew on
     // either machine is irrelevant.
-    params.not_before = time::OffsetDateTime::from_unix_timestamp(1_577_836_800).expect("2020-01-01");
-    params.not_after = time::OffsetDateTime::from_unix_timestamp(4_733_510_400).expect("2120-01-01");
+    params.not_before =
+        time::OffsetDateTime::from_unix_timestamp(1_577_836_800).expect("2020-01-01");
+    params.not_after =
+        time::OffsetDateTime::from_unix_timestamp(4_733_510_400).expect("2120-01-01");
     let cert = params.self_signed(&key_pair)?;
 
     // Keep the same combined-PEM-on-disk layout (private key then certificate)

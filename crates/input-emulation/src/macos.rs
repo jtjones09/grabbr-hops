@@ -99,11 +99,11 @@ pub(crate) struct MacOSEmulation {
     // per-window travel + speed — the mechanism fingerprint. If the OS accelerates
     // our injected motion, actual travel > requested travel (ratio > 1) and the
     // ratio rises with speed. Pure edge-clamp leaves ratio ~1 mid-screen.
-    probe_req_travel: Cell<f64>,              // Σ|requested delta| this window
-    probe_act_travel: Cell<f64>,              // Σ|actual cursor move| this window
+    probe_req_travel: Cell<f64>, // Σ|requested delta| this window
+    probe_act_travel: Cell<f64>, // Σ|actual cursor move| this window
     probe_prev_pos: Cell<Option<(f64, f64)>>, // last readback, for actual travel
-    probe_peak_speed: Cell<f64>,              // max |delta|/dt this window (px/s)
-    probe_last_evt: Cell<Option<Instant>>,    // last event time, for dt
+    probe_peak_speed: Cell<f64>, // max |delta|/dt this window (px/s)
+    probe_last_evt: Cell<Option<Instant>>, // last event time, for dt
 }
 
 /// Maps an evdev button code to the CGEventType used for drag events.
@@ -198,7 +198,11 @@ impl MacOSEmulation {
             let req = self.probe_req_travel.get();
             // ratio = actual cursor travel / requested travel. ~1 => we command the
             // cursor 1:1; >1 => the OS amplifies our motion (acceleration).
-            let ratio = if req > 1.0 { self.probe_act_travel.get() / req } else { 0.0 };
+            let ratio = if req > 1.0 {
+                self.probe_act_travel.get() / req
+            } else {
+                0.0
+            };
             log::info!(
                 "[trueloop] peak-offset {:.1}px | drift {:+.1}px/min | ratio {:.3} (act/req) | peak-vel {:.0}px/s",
                 self.probe_peak_offset.get(),
@@ -502,10 +506,8 @@ fn request_accessibility_permission() -> bool {
     use core_foundation::string::CFString;
     // kAXTrustedCheckOptionPrompt == CFSTR("AXTrustedCheckOptionPrompt")
     let key = CFString::from_static_string("AXTrustedCheckOptionPrompt");
-    let options = CFDictionary::from_CFType_pairs(&[(
-        key.as_CFType(),
-        CFBoolean::true_value().as_CFType(),
-    )]);
+    let options =
+        CFDictionary::from_CFType_pairs(&[(key.as_CFType(), CFBoolean::true_value().as_CFType())]);
     // SAFETY: `options` outlives the synchronous call. Normalize the `Boolean`
     // (u8) result with != 0 — materializing a non-canonical byte as Rust `bool` is UB.
     unsafe { AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef() as *const c_void) != 0 }
@@ -669,10 +671,14 @@ fn create_power_assertion() -> Option<u32> {
         )
     };
     if result == 0 {
-        log::info!("holding power assertion ({assertion_type}) to keep this Mac reachable over the KVM");
+        log::info!(
+            "holding power assertion ({assertion_type}) to keep this Mac reachable over the KVM"
+        );
         Some(id)
     } else {
-        log::warn!("could not hold a power assertion ({result:#x}); the Mac may sleep and become unreachable");
+        log::warn!(
+            "could not hold a power assertion ({result:#x}); the Mac may sleep and become unreachable"
+        );
         None
     }
 }
@@ -1381,14 +1387,20 @@ fn format_edge_thresholds(t: &[f64; 4]) -> String {
 fn load_edge_thresholds(path: Option<&Path>) -> [f64; 4] {
     let mut t = [DEFAULT_EDGE_THRESHOLD; 4];
     let Some(path) = path else { return t };
-    let Ok(contents) = std::fs::read_to_string(path) else { return t };
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return t;
+    };
     for line in contents.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let Some((k, v)) = line.split_once('=') else { continue };
-        let Ok(val) = v.trim().parse::<f64>() else { continue };
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let Ok(val) = v.trim().parse::<f64>() else {
+            continue;
+        };
         if !val.is_finite() {
             continue;
         }
@@ -1433,8 +1445,15 @@ impl EdgePressureDetector {
             log::info!(
                 "adaptive edge crossing enabled (self-tuning {}; thresholds L/R/T/B = {:.0}/{:.0}/{:.0}/{:.0}px, {}; HOPS_ADAPTIVE_EDGE=off / HOPS_EDGE_LEARN=off to disable)",
                 if learn { "on" } else { "off" },
-                threshold[0], threshold[1], threshold[2], threshold[3],
-                if state_path.is_some() { "persisted" } else { "env-forced, not persisted" }
+                threshold[0],
+                threshold[1],
+                threshold[2],
+                threshold[3],
+                if state_path.is_some() {
+                    "persisted"
+                } else {
+                    "env-forced, not persisted"
+                }
             );
         } else {
             log::info!("adaptive edge crossing DISABLED (HOPS_ADAPTIVE_EDGE)");
@@ -1465,12 +1484,17 @@ impl EdgePressureDetector {
     /// Persist the learned thresholds (no-op when not persisting). Called only
     /// on the rare learning events, never on the per-motion hot path.
     fn save(&self) {
-        let Some(path) = self.state_path.as_deref() else { return };
+        let Some(path) = self.state_path.as_deref() else {
+            return;
+        };
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
         if let Err(e) = std::fs::write(path, format_edge_thresholds(&self.threshold)) {
-            log::warn!("could not persist edge thresholds to {}: {e}", path.display());
+            log::warn!(
+                "could not persist edge thresholds to {}: {e}",
+                path.display()
+            );
         }
     }
 
@@ -1631,7 +1655,11 @@ impl EdgePressureDetector {
             // learning is armed at fire time but only COMMITTED once the
             // teardown confirms the fire actually crossed (a clientless-edge
             // fire never destroys the handle, so it never teaches)
-            let effort_armed = if self.learn { self.on_fire(i, now) } else { false };
+            let effort_armed = if self.learn {
+                self.on_fire(i, now)
+            } else {
+                false
+            };
             self.last_fire = Some((i, now, effort_armed));
             return Some(side);
         }
@@ -1647,10 +1675,7 @@ impl EdgePressureDetector {
         let mut best: Option<(usize, f64)> = None;
         for i in 0..4 {
             let ratio = self.pressure[i] / self.threshold[i];
-            if !self.latched[i]
-                && ratio >= 0.5
-                && best.is_none_or(|(_, r)| ratio > r)
-            {
+            if !self.latched[i] && ratio >= 0.5 && best.is_none_or(|(_, r)| ratio > r) {
                 best = Some((i, ratio));
             }
         }
@@ -1782,8 +1807,7 @@ impl EdgePressureDetector {
         if ids.is_empty() {
             return None;
         }
-        let (mut xmin, mut xmax, mut ymin, mut ymax) =
-            (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+        let (mut xmin, mut xmax, mut ymin, mut ymax) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
         for id in ids {
             let b = CGDisplay::new(id).bounds();
             xmin = xmin.min(b.origin.x);
@@ -1890,12 +1914,14 @@ impl Emulation for MacOSEmulation {
                                 }
                             }
                             self.probe_last_evt.set(Some(pnow));
-                            self.probe_req_travel.set(self.probe_req_travel.get() + dmag);
+                            self.probe_req_travel
+                                .set(self.probe_req_travel.get() + dmag);
                             if let Some((px, py)) = self.probe_prev_pos.get() {
                                 let amag = ((mouse_location.x - px).powi(2)
                                     + (mouse_location.y - py).powi(2))
                                 .sqrt();
-                                self.probe_act_travel.set(self.probe_act_travel.get() + amag);
+                                self.probe_act_travel
+                                    .set(self.probe_act_travel.get() + amag);
                             }
                             self.probe_prev_pos
                                 .set(Some((mouse_location.x, mouse_location.y)));

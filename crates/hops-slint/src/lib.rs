@@ -14,16 +14,17 @@ use std::{
     collections::{HashMap, HashSet},
     rc::Rc,
     sync::{
+        Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc,
+        mpsc,
     },
     time::{Duration, Instant},
 };
 
 use hops_frontend_core::{
-    prefs, theme, ClientHandle, FrontendClient, FrontendRequest, Position, Status, TrustState,
+    ClientHandle, FrontendClient, FrontendRequest, Position, Status, TrustState, prefs, theme,
 };
-use hops_ipc::{Geometry, DEFAULT_PORT};
+use hops_ipc::{DEFAULT_PORT, Geometry};
 use slint::{ComponentHandle, ModelRc, VecModel};
 use thiserror::Error;
 
@@ -63,7 +64,19 @@ struct PolledUi {
     free_position: String,
     notice: String,
     notice_seq: i32,
-    devices: Vec<(String, String, String, String, bool, bool, bool, String, String, bool, bool)>,
+    devices: Vec<(
+        String,
+        String,
+        String,
+        String,
+        bool,
+        bool,
+        bool,
+        String,
+        String,
+        bool,
+        bool,
+    )>,
 }
 
 fn status_text(s: Status) -> &'static str {
@@ -291,8 +304,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
     // constant-folds the size property and set_size (or any winit resize)
     // panics "Constant property being changed" and aborts. A plain resizable
     // window's size property is mutable. Set at creation and on every show.
-    ui.window()
-        .set_size(slint::LogicalSize::new(560.0, 690.0));
+    ui.window().set_size(slint::LogicalSize::new(560.0, 690.0));
 
     // The notice banner has two sources — the daemon (FrontendEvent::Error) and
     // local input validation — so they share ONE increasing sequence. The poll
@@ -312,8 +324,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
         }
     };
     fn show_app_window(ui: &AppWindow) -> Result<(), slint::PlatformError> {
-        ui.window()
-            .set_size(slint::LogicalSize::new(560.0, 690.0));
+        ui.window().set_size(slint::LogicalSize::new(560.0, 690.0));
         ui.show()
     }
 
@@ -321,11 +332,11 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
     // DATA (built-ins + any user themes in ~/.config/lan-mouse/themes/*.toml) —
     // push the whole table into the GUI once, then just flip the index to switch.
     let themes = Rc::new(theme::all_themes());
-    ui.global::<Theme>().set_palettes(ModelRc::new(VecModel::from(
-        themes.iter().map(theme_colors).collect::<Vec<_>>(),
-    )));
-    let theme_name =
-        theme::load_name().unwrap_or_else(|| theme::default_theme().name.to_string());
+    ui.global::<Theme>()
+        .set_palettes(ModelRc::new(VecModel::from(
+            themes.iter().map(theme_colors).collect::<Vec<_>>(),
+        )));
+    let theme_name = theme::load_name().unwrap_or_else(|| theme::default_theme().name.to_string());
     ui.global::<Theme>()
         .set_index(theme::index_of(&themes, &theme_name) as i32);
 
@@ -632,7 +643,14 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                                 true,
                             )
                         }
-                        None => (String::new(), String::new(), String::new(), false, false, false),
+                        None => (
+                            String::new(),
+                            String::new(),
+                            String::new(),
+                            false,
+                            false,
+                            false,
+                        ),
                     };
                     DeviceRow {
                         handle: handle.into(),
@@ -660,7 +678,10 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                 connected: m.connected,
                 capture: status_text(m.capture).to_string(),
                 emulation: status_text(m.emulation).to_string(),
-                port: m.port.map(|p| p.to_string()).unwrap_or_else(|| "—".to_string()),
+                port: m
+                    .port
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "—".to_string()),
                 fingerprint: m.fingerprint.clone().unwrap_or_else(|| "—".to_string()),
                 pairing,
                 // the first edge nothing active is already using, so adding a
@@ -716,7 +737,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                 if !snap.notice.is_empty() {
                     notice_seq_poll.set(notice_seq_poll.get().wrapping_add(1));
                     ui.set_free_position(snap.free_position.as_str().into());
-            ui.set_notice(snap.notice.as_str().into());
+                    ui.set_notice(snap.notice.as_str().into());
                     ui.set_notice_seq(notice_seq_poll.get());
                 }
             }
@@ -780,11 +801,11 @@ pub fn run_onboarding() -> Result<Option<hops_frontend_core::prefs::Frontend>, S
     let ui = OnboardingWindow::new()?;
 
     let themes = theme::all_themes();
-    ui.global::<Theme>().set_palettes(ModelRc::new(VecModel::from(
-        themes.iter().map(theme_colors).collect::<Vec<_>>(),
-    )));
-    let theme_name =
-        theme::load_name().unwrap_or_else(|| theme::default_theme().name.to_string());
+    ui.global::<Theme>()
+        .set_palettes(ModelRc::new(VecModel::from(
+            themes.iter().map(theme_colors).collect::<Vec<_>>(),
+        )));
+    let theme_name = theme::load_name().unwrap_or_else(|| theme::default_theme().name.to_string());
     ui.global::<Theme>()
         .set_index(theme::index_of(&themes, &theme_name) as i32);
 
@@ -812,8 +833,7 @@ pub fn run_onboarding() -> Result<Option<hops_frontend_core::prefs::Frontend>, S
 
     // Force the opening size (preferred alone isn't reliable — see the main
     // window's note); safe because onboarding.slint no longer min==max-locks it.
-    ui.window()
-        .set_size(slint::LogicalSize::new(580.0, 470.0));
+    ui.window().set_size(slint::LogicalSize::new(580.0, 470.0));
     ui.run()?;
     let picked = *choice.borrow();
     Ok(picked)

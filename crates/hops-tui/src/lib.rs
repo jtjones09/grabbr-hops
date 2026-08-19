@@ -19,17 +19,17 @@ use std::{
 };
 
 use hops_frontend_core::{
+    AppModel, ClientHandle, FrontendClient, FrontendRequest, Position, Status,
     prefs::Frontend,
     theme::{self, Rgb, Theme},
-    AppModel, ClientHandle, FrontendClient, FrontendRequest, Position, Status,
 };
 use ratatui::{
+    Frame,
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
-    Frame,
 };
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -102,15 +102,17 @@ pub async fn run() -> Result<(), TuiError> {
 
     // crossterm's event::read() blocks, so read keys on a dedicated OS thread.
     let (key_tx, mut key_rx) = mpsc::unbounded_channel::<KeyEvent>();
-    std::thread::spawn(move || loop {
-        match event::read() {
-            Ok(Event::Key(k)) => {
-                if key_tx.send(k).is_err() {
-                    break;
+    std::thread::spawn(move || {
+        loop {
+            match event::read() {
+                Ok(Event::Key(k)) => {
+                    if key_tx.send(k).is_err() {
+                        break;
+                    }
                 }
+                Ok(_) => {}
+                Err(_) => break,
             }
-            Ok(_) => {}
-            Err(_) => break,
         }
     });
 
@@ -407,8 +409,14 @@ pub fn run_onboarding() -> Result<Option<Frontend>, TuiError> {
         .bg(col(theme.accent));
 
     let options: [(&str, &str); 2] = [
-        ("graphical", "windowed, point-and-click — best on your desktop"),
-        ("terminal (this)", "keyboard-driven — runs anywhere, great over SSH"),
+        (
+            "graphical",
+            "windowed, point-and-click — best on your desktop",
+        ),
+        (
+            "terminal (this)",
+            "keyboard-driven — runs anywhere, great over SSH",
+        ),
     ];
     let mut sel: usize = 1; // we're already in a terminal; sensible default
 
@@ -469,7 +477,11 @@ pub fn run_onboarding() -> Result<Option<Frontend>, TuiError> {
                     KeyCode::Up | KeyCode::Char('k') => sel = sel.saturating_sub(1),
                     KeyCode::Down | KeyCode::Char('j') => sel = (sel + 1).min(options.len() - 1),
                     KeyCode::Enter => {
-                        break Ok(Some(if sel == 0 { Frontend::Gui } else { Frontend::Tui }));
+                        break Ok(Some(if sel == 0 {
+                            Frontend::Gui
+                        } else {
+                            Frontend::Tui
+                        }));
                     }
                     KeyCode::Esc | KeyCode::Char('q') => break Ok(None),
                     _ => {}
@@ -482,11 +494,7 @@ pub fn run_onboarding() -> Result<Option<Frontend>, TuiError> {
 }
 
 fn clamp_sel(sel: usize, count: usize) -> usize {
-    if count == 0 {
-        0
-    } else {
-        sel.min(count - 1)
-    }
+    if count == 0 { 0 } else { sel.min(count - 1) }
 }
 
 /// Cycle a device's edge: left → right → top → bottom → left.
@@ -512,10 +520,18 @@ fn ui(
     show_log: bool,
     theme: &Theme,
 ) {
-    let base = Style::default().bg(col(theme.background)).fg(col(theme.foreground));
-    let border = Style::default().fg(col(theme.muted)).bg(col(theme.background));
-    let accent = Style::default().fg(col(theme.accent)).bg(col(theme.background));
-    let muted = Style::default().fg(col(theme.muted)).bg(col(theme.background));
+    let base = Style::default()
+        .bg(col(theme.background))
+        .fg(col(theme.foreground));
+    let border = Style::default()
+        .fg(col(theme.muted))
+        .bg(col(theme.background));
+    let accent = Style::default()
+        .fg(col(theme.accent))
+        .bg(col(theme.background));
+    let muted = Style::default()
+        .fg(col(theme.muted))
+        .bg(col(theme.background));
     let highlight = Style::default()
         .fg(col(theme.on_accent))
         .bg(col(theme.accent));
@@ -555,7 +571,10 @@ fn ui(
         Span::styled(
             format!(
                 "   port: {}",
-                model.port.map(|p| p.to_string()).unwrap_or_else(|| "—".into())
+                model
+                    .port
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "—".into())
             ),
             muted,
         ),
@@ -595,7 +614,10 @@ fn ui(
                 ListItem::new(Line::from(vec![
                     dot,
                     Span::raw(format!(" [{h}] {host}:{} ", c.port)),
-                    Span::styled(format!("({})", c.pos), Style::default().fg(col(theme.accent))),
+                    Span::styled(
+                        format!("({})", c.pos),
+                        Style::default().fg(col(theme.accent)),
+                    ),
                     Span::styled(
                         if s.active { "  active" } else { "  off" },
                         if s.active {
@@ -623,7 +645,10 @@ fn ui(
     // trusted peers (incoming) — success=connected / error=offline
     let trusted_list = sorted_trusted(model);
     let trusted: Vec<ListItem> = if trusted_list.is_empty() {
-        vec![ListItem::new(Line::from(Span::styled("no trusted devices", muted)))]
+        vec![ListItem::new(Line::from(Span::styled(
+            "no trusted devices",
+            muted,
+        )))]
     } else {
         trusted_list
             .iter()
@@ -699,9 +724,15 @@ fn footer_line(
     focus: Focus,
     theme: &Theme,
 ) -> Line<'static> {
-    let key = Style::default().fg(col(theme.accent)).bg(col(theme.background));
-    let muted = Style::default().fg(col(theme.muted)).bg(col(theme.background));
-    let warn = Style::default().fg(col(theme.warn)).bg(col(theme.background));
+    let key = Style::default()
+        .fg(col(theme.accent))
+        .bg(col(theme.background));
+    let muted = Style::default()
+        .fg(col(theme.muted))
+        .bg(col(theme.background));
+    let warn = Style::default()
+        .fg(col(theme.warn))
+        .bg(col(theme.background));
 
     if let Some(inp) = input {
         let (label, buf) = match inp {
@@ -765,10 +796,18 @@ fn footer_line(
 /// Render a centered approve/deny popup for an untrusted incoming peer.
 fn pairing_popup(f: &mut Frame, fp: &str, theme: &Theme) {
     let area = centered_rect(70, 9, f.area());
-    let base = Style::default().bg(col(theme.background)).fg(col(theme.foreground));
-    let warn = Style::default().fg(col(theme.warn)).bg(col(theme.background));
-    let key = Style::default().fg(col(theme.accent)).bg(col(theme.background));
-    let muted = Style::default().fg(col(theme.muted)).bg(col(theme.background));
+    let base = Style::default()
+        .bg(col(theme.background))
+        .fg(col(theme.foreground));
+    let warn = Style::default()
+        .fg(col(theme.warn))
+        .bg(col(theme.background));
+    let key = Style::default()
+        .fg(col(theme.accent))
+        .bg(col(theme.background));
+    let muted = Style::default()
+        .fg(col(theme.muted))
+        .bg(col(theme.background));
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(warn)
@@ -802,9 +841,15 @@ fn pairing_popup(f: &mut Frame, fp: &str, theme: &Theme) {
 fn log_overlay(f: &mut Frame, messages: &VecDeque<String>, theme: &Theme) {
     let h = f.area().height.saturating_sub(4).max(6);
     let area = centered_rect(80, h, f.area());
-    let base = Style::default().bg(col(theme.background)).fg(col(theme.foreground));
-    let accent = Style::default().fg(col(theme.accent)).bg(col(theme.background));
-    let muted = Style::default().fg(col(theme.muted)).bg(col(theme.background));
+    let base = Style::default()
+        .bg(col(theme.background))
+        .fg(col(theme.foreground));
+    let accent = Style::default()
+        .fg(col(theme.accent))
+        .bg(col(theme.background));
+    let muted = Style::default()
+        .fg(col(theme.muted))
+        .bg(col(theme.background));
     let cap = area.height.saturating_sub(2) as usize;
     let lines: Vec<Line> = if messages.is_empty() {
         vec![Line::from(Span::styled("no activity yet", muted))]

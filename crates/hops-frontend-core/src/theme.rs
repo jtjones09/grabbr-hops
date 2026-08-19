@@ -294,9 +294,11 @@ pub fn load_user_themes() -> Vec<Theme> {
         .filter_map(|e| {
             let path = e.path();
             let raw = std::fs::read_to_string(&path).ok()?;
-            match toml_edit::de::from_str::<ThemeToml>(&raw).map_err(|e| e.to_string()).and_then(|t| {
-                Theme::try_from(t).map_err(|field| format!("invalid color in `{field}`"))
-            }) {
+            match toml_edit::de::from_str::<ThemeToml>(&raw)
+                .map_err(|e| e.to_string())
+                .and_then(|t| {
+                    Theme::try_from(t).map_err(|field| format!("invalid color in `{field}`"))
+                }) {
                 Ok(theme) => Some(theme),
                 Err(e) => {
                     log::warn!("{}: skipping theme file: {e}", path.display());

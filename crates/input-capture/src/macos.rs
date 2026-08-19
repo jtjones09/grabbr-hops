@@ -146,7 +146,11 @@ impl InputCaptureState {
     /// calls — so it is safe to call while holding the state lock.
     fn store_bounds_if_changed(&mut self, bounds: Bounds) {
         if bounds != self.bounds {
-            log::info!("display geometry changed: {:?} -> {:?}", self.bounds, bounds);
+            log::info!(
+                "display geometry changed: {:?} -> {:?}",
+                self.bounds,
+                bounds
+            );
             self.bounds = bounds;
         }
     }

@@ -44,9 +44,14 @@ async fn a_real_frontend_authenticates_and_is_heard() {
 
     // the daemon minted a token when it bound
     let token_file = dir.join(".config/lan-mouse/ipc-token");
-    assert!(token_file.exists(), "the daemon must mint a token at startup");
+    assert!(
+        token_file.exists(),
+        "the daemon must mint a token at startup"
+    );
     assert_eq!(
-        std::fs::read_to_string(&token_file).expect("read token").len(),
+        std::fs::read_to_string(&token_file)
+            .expect("read token")
+            .len(),
         64,
         "32 random bytes, hex encoded"
     );
