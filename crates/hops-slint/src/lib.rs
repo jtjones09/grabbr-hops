@@ -557,6 +557,15 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                             }
                             client.request(FrontendRequest::UpdatePort(new_handle, port));
                             client.request(FrontendRequest::UpdatePosition(new_handle, position));
+                            // ACTUALLY try the machine. Previously "add device"
+                            // created an inert card: nothing was dialed, the other
+                            // machine showed nothing, and two unnamed steps stood
+                            // between "added" and "works" (find the unlabeled
+                            // toggle, then shove the cursor off that edge). The
+                            // form now opens on a free edge, so this cannot evict
+                            // another device, and a name that will not resolve
+                            // now reports itself.
+                            client.request(FrontendRequest::Activate(new_handle, true));
                         }
                         // the Created event hasn't reached a snapshot yet — retry next tick
                         None => *pending_new_device.borrow_mut() = Some((name, port, position)),
