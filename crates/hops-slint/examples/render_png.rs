@@ -66,6 +66,13 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
     ui.set_port("4242".into());
     ui.set_fingerprint("73:90:2a:3c:9d:e5:18:52:7c:aa:c3:de:de:04:cd:ec".into());
     ui.set_pairing_fp("a4:f0:9c:2e:11:bd:77:0c:35:9a".into()); // shows the pairing card
+    // the notice banner — the daemon's only "that didn't work" channel
+    ui.set_notice(
+        "Refused to grant trust: this machine is being controlled remotely. \
+         Use its own keyboard and mouse, then try again."
+            .into(),
+    );
+    ui.set_notice_seq(1);
 
     // Exercise all four merged-card states in one shot.
     ui.set_devices(ModelRc::new(VecModel::from(vec![

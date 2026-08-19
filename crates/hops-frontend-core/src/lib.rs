@@ -54,6 +54,10 @@ pub struct AppModel {
     pub port: Option<u16>,
     /// Recent transient events / errors (newest last), capped at [`MAX_MESSAGES`].
     pub messages: VecDeque<String>,
+    /// Monotonic counter, bumped on every message. Lets a polling frontend tell a
+    /// NEW notice from the same one still on screen, so a dismissed banner stays
+    /// dismissed but a fresh failure re-raises it.
+    pub message_seq: u64,
     /// Fingerprints of peers currently connected *in*, as known from live
     /// connect/disconnect events while this client is attached. CAVEAT: a peer
     /// that connected before we attached is not reflected until the daemon
@@ -168,6 +172,15 @@ impl AppModel {
             self.messages.pop_front();
         }
         self.messages.push_back(msg);
+        self.message_seq += 1;
+    }
+
+    /// The most recent notice, if any. The daemon's only channel for telling the
+    /// user something went wrong; before this was rendered, every failure —
+    /// unresolvable name, refused trust change, failed config write, rejected
+    /// IPC token — reached the user as silence.
+    pub fn latest_message(&self) -> Option<&str> {
+        self.messages.back().map(|s| s.as_str())
     }
 }
 
@@ -602,6 +615,29 @@ mod tests {
         assert!(
             devices.iter().filter(|d| d.is_listable()).count() == 1,
             "exactly one listable row"
+        );
+    }
+
+    /// The daemon's only channel for "that didn't work". Before this was
+    /// rendered, every failure — unresolvable name, refused trust change, failed
+    /// config write, rejected IPC token — reached the user as silence.
+    #[test]
+    fn errors_become_a_notice_the_ui_can_tell_is_new() {
+        let mut m = AppModel::default();
+        assert_eq!(m.latest_message(), None, "nothing to show at rest");
+        assert_eq!(m.message_seq, 0);
+
+        m.apply(super::FrontendEvent::Error("could not resolve studio-pc".into()));
+        assert_eq!(m.latest_message(), Some("error: could not resolve studio-pc"));
+        let first = m.message_seq;
+        assert!(first > 0, "a notice must bump the seq or the UI cannot raise it");
+
+        // a SECOND, identical error must still be distinguishable, or a dismissed
+        // banner would stay hidden through a repeat of the same failure
+        m.apply(super::FrontendEvent::Error("could not resolve studio-pc".into()));
+        assert!(
+            m.message_seq > first,
+            "a repeated failure must re-raise the banner"
         );
     }
 

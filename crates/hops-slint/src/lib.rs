@@ -60,6 +60,8 @@ struct PolledUi {
     port: String,
     fingerprint: String,
     pairing: String,
+    notice: String,
+    notice_seq: i32,
     devices: Vec<(String, String, String, String, bool, bool, bool, String, String, bool, bool)>,
 }
 
@@ -612,6 +614,9 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                 port: m.port.map(|p| p.to_string()).unwrap_or_else(|| "—".to_string()),
                 fingerprint: m.fingerprint.clone().unwrap_or_else(|| "—".to_string()),
                 pairing,
+                notice: m.latest_message().unwrap_or_default().to_string(),
+                // i32 is Slint's integer; the seq only needs to CHANGE, not be exact
+                notice_seq: (m.message_seq % (i32::MAX as u64)) as i32,
                 devices: devices
                     .iter()
                     .map(|d| {
@@ -644,6 +649,8 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
             ui.set_port(snap.port.as_str().into());
             ui.set_fingerprint(snap.fingerprint.as_str().into());
             ui.set_pairing_fp(snap.pairing.as_str().into());
+            ui.set_notice(snap.notice.as_str().into());
+            ui.set_notice_seq(snap.notice_seq);
             ui.set_devices(ModelRc::new(VecModel::from(devices)));
             *last_ui.borrow_mut() = Some(snap);
         },

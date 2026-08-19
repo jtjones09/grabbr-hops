@@ -53,6 +53,11 @@ export component AppWindow inherits Window {
     preferred-height: 690px;
     background: Theme.c.background;
 
+    // The daemon's only way to tell the user something failed. Kept dismissible
+    // and seq-gated: dismissing hides THIS notice, a new one re-raises the bar.
+    in property <string> notice: "";
+    in property <int> notice-seq: 0;
+    property <int> dismissed-seq: 0;
     in property <bool> connected: false;
     in property <string> capture: "—";
     in property <string> emulation: "—";
@@ -196,6 +201,40 @@ export component AppWindow inherits Window {
             VerticalLayout {
                 spacing: Space.lg;
                 alignment: start;
+                // --- notice: the daemon's only channel for "that didn't work" ---------
+                // Before this existed, an unresolvable name, a refused trust
+                // change, a failed config write and a rejected IPC token were all
+                // log lines the user never saw.
+                if root.notice != "" && root.notice-seq != root.dismissed-seq: Rectangle {
+                    vertical-stretch: 0;
+                    background: Theme.c.error.transparentize(0.9);
+                    border-radius: Radius.lg;
+                    border-width: 1px;
+                    border-color: Theme.c.error.transparentize(0.55);
+                    HorizontalLayout {
+                        padding: Space.md;
+                        spacing: Space.sm;
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 1;
+                            Text {
+                                text: root.notice;
+                                color: Theme.c.foreground;
+                                font-size: Type.small;
+                                wrap: word-wrap;
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            PillButton {
+                                text: "dismiss";
+                                ghost: true;
+                                clicked => { root.dismissed-seq = root.notice-seq; }
+                            }
+                        }
+                    }
+                }
+
                 // --- pairing request (Windows wants to pair with this Mac) -------------
                 if root.pairing-fp != "": Rectangle {
                     vertical-stretch: 0;
