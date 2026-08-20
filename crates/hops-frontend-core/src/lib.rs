@@ -250,6 +250,21 @@ fn short_fingerprint(fp: &str) -> String {
     fp.split(':').take(3).collect::<Vec<_>>().join(":")
 }
 
+/// What to call a peer the user approved without typing a name.
+///
+/// Shared so the frontends agree: the GUI used the literal `"device"` and the
+/// TUI used a truncated fingerprint, so the same peer, approved the same way,
+/// came out with two different names depending on which interface was open —
+/// and `"device"` is worse than useless once there are two of them. A short
+/// fingerprint is at least the peer's own identity, and it is what the device
+/// projection already falls back to.
+pub fn fallback_label(fp: &str) -> String {
+    if fp.is_empty() {
+        return "unnamed device".to_string();
+    }
+    short_fingerprint(fp)
+}
+
 /// Pick a display label, preferring the user-typed send-side hostname, then the
 /// trusted description, then a short fingerprint, then a placeholder.
 fn display_label(hostname: Option<&str>, description: Option<&str>, fp: &str) -> String {
@@ -513,7 +528,7 @@ async fn connection_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::{AppModel, ClientConfig, ClientState, TrustState};
+    use super::{AppModel, ClientConfig, ClientState, TrustState, fallback_label};
 
     fn client(hostname: Option<&str>, peer_fp: Option<&str>) -> (ClientConfig, ClientState) {
         let config = ClientConfig {
@@ -784,5 +799,30 @@ mod tests {
         let devices = m.devices();
         assert_eq!(devices.len(), 1);
         assert!(devices[0].online);
+    }
+
+    /// Approving a peer without typing a name must produce the SAME label the
+    /// device projection would have chosen for it, from either frontend. The
+    /// GUI used the literal "device" and the TUI used a 16-char fingerprint
+    /// slice, so the same peer approved the same way was named two different
+    /// things depending on which interface happened to be open — and a second
+    /// unnamed peer made "device" ambiguous as well as uninformative.
+    #[test]
+    fn a_blank_approval_is_named_the_same_way_everywhere() {
+        let fp = "1e:19:1b:2c:3d:4e:5f:60";
+        let label = fallback_label(fp);
+        assert_eq!(label, "1e:19:1b");
+
+        let mut m = AppModel::default();
+        m.authorized.insert(fp.to_string(), label.clone());
+        let d = m.devices();
+        assert_eq!(d.len(), 1);
+        assert_eq!(
+            d[0].label, label,
+            "the stored fallback must match what the projection displays"
+        );
+
+        // an empty fingerprint must still yield something sayable
+        assert_eq!(fallback_label(""), "unnamed device");
     }
 }

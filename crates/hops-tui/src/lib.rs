@@ -344,7 +344,9 @@ pub async fn run() -> Result<(), TuiError> {
                                 }
                                 Input::TrustedName { fp, buf } => {
                                     let desc = if buf.trim().is_empty() {
-                                        short_fp(&fp)
+                                        // same fallback the GUI uses, so a peer
+                                        // approved with no name gets one name
+                                        hops_frontend_core::fallback_label(&fp)
                                     } else {
                                         buf.trim().to_string()
                                     };

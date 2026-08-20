@@ -371,12 +371,26 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
     }
     {
         let c = client.clone();
-        ui.on_rename_device(move |handle, name| {
+        // `id` is the row's stable key: a ClientHandle for a device we dial,
+        // otherwise the peer's fingerprint. A receive-only trusted peer has no
+        // handle, so keying this on the handle alone meant the parse failed and
+        // the rename silently did nothing — which is why the GUI could not name
+        // an inbound peer at all while the TUI could.
+        ui.on_rename_device(move |id, name| {
             let name = name.trim();
-            if let Ok(h) = handle.as_str().parse::<u64>() {
+            if let Ok(h) = id.as_str().parse::<u64>() {
                 let name = (!name.is_empty()).then(|| name.to_string());
                 c.request(FrontendRequest::UpdateHostname(h, name));
+                return;
             }
+            // re-authorizing the same fingerprint with a new description IS the
+            // rename for an inbound peer; the daemon refuses revoked ones.
+            let desc = if name.is_empty() {
+                hops_frontend_core::fallback_label(id.as_str())
+            } else {
+                name.to_string()
+            };
+            c.request(FrontendRequest::AuthorizeKey(desc, id.to_string()));
         });
     }
     {
@@ -397,7 +411,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
         let c = client.clone();
         ui.on_approve_pairing(move |name, fp| {
             let desc = if name.trim().is_empty() {
-                "device".to_string()
+                hops_frontend_core::fallback_label(fp.as_str())
             } else {
                 name.trim().to_string()
             };
