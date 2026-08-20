@@ -459,12 +459,24 @@ export component AppWindow inherits Window {
                                         toggled(v) => { root.activate-device(d.handle, v); }
                                     }
                                 }
-                                if d.has-send && root.confirm-delete-handle != d.handle: VerticalLayout {
+                                // A receive-only trusted peer has no handle, so
+                                // the row is keyed by fingerprint instead —
+                                // without that, "edit" never rendered for an
+                                // inbound peer and it could not be named at all.
+                                // Hidden while this row is mid-confirm, and for
+                                // an expelled row, which is inert by design.
+                                if (d.has-send || d.trusted) && !d.revoked
+                                    && root.confirm-revoke-fp != d.fp-full
+                                    && !(d.has-send && root.confirm-delete-handle == d.handle): VerticalLayout {
                                     alignment: center;
                                     PillButton {
                                         text: "edit";
                                         ghost: true;
-                                        clicked => { root.editing-device = root.editing-device == d.handle ? "" : d.handle; }
+                                        clicked => {
+                                            root.editing-device = root.editing-device == (d.has-send ? d.handle : d.fp-full)
+                                                ? ""
+                                                : (d.has-send ? d.handle : d.fp-full);
+                                        }
                                     }
                                 }
                                 if d.has-send && root.confirm-delete-handle != d.handle: VerticalLayout {
