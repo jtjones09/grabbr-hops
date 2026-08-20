@@ -331,11 +331,23 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
     LRESULT(1)
 }
 
+/// Caps / Num / Scroll Lock, as Windows virtual-key codes.
+///
+/// These need different hook handling from every other key — see `kybrd_proc`.
+fn is_lock_vk(vk: u32) -> bool {
+    const VK_CAPITAL: u32 = 0x14;
+    const VK_NUMLOCK: u32 = 0x90;
+    const VK_SCROLL: u32 = 0x91;
+    matches!(vk, VK_CAPITAL | VK_NUMLOCK | VK_SCROLL)
+}
+
 unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     /* get active client if any */
     let Some(client) = ACTIVE_CLIENT.get() else {
         return CallNextHookEx(None, ncode, wparam, lparam);
     };
+
+    let vk = unsafe { (*(lparam.0 as *const KBDLLHOOKSTRUCT)).vkCode };
 
     /* convert to key event */
     let Some(key_event) = to_key_event(wparam, lparam) else {
@@ -344,6 +356,24 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
 
     if let Err(e) = try_send_event(client, CaptureEvent::Input(Event::Keyboard(key_event))) {
         log::warn!("e: {e}");
+    }
+
+    // Lock keys must NOT be swallowed, unlike every other key.
+    //
+    // Measured on the rig 2026-08-19: holding Caps Lock while crossed made
+    // Windows beep dozens of times (ToggleKeys); holding it while NOT crossed
+    // beeps exactly once. The lock STATE is updated below the hook chain, but
+    // Windows' repeat-SUPPRESSION happens in the normal processing that
+    // LRESULT(1) blocks — so swallowing turns one press into one toggle per
+    // auto-repeat.
+    //
+    // Passing them through restores the uncrossed behaviour (one toggle, one
+    // beep) while the keypress still reaches the peer above. The cost is that a
+    // lock key also reaches local apps and flips this machine's lock state —
+    // which it already did, just repeatedly. Making the local LEDs reflect the
+    // CONTROLLED machine instead is a separate piece of work.
+    if is_lock_vk(vk) {
+        return CallNextHookEx(None, ncode, wparam, lparam);
     }
 
     /* don't pass event to applications */
