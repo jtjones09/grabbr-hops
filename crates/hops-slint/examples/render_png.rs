@@ -3,7 +3,7 @@
 // This is how the GUI's design gets reviewed without a display.
 //
 //   cargo run -p lan-mouse-slint --example render_png -- /path/to/out.png [w] [h] [theme_index] [mode]
-//   mode: normal (default) | settings | add-device | edit-device | delete-confirm
+//   mode: normal (default) | settings | add-device | edit-device | delete-confirm | revoke-confirm | layout-canvas
 //         | layout-canvas
 //
 // Requires the crate's slint dep to carry feature "software-renderer-systemfonts"
@@ -163,6 +163,12 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
         Some("add-device") => ui.set_show_add_device(true),
         Some("edit-device") => ui.set_editing_device("1".into()), // matches the mock studio-pc handle
         Some("delete-confirm") => ui.set_confirm_delete_handle("1".into()),
+        // b7:2a:55 is the mock windows-pc — a trusted, receive-capable peer
+        Some("revoke-confirm") => ui.set_confirm_revoke_fp("b7:2a:55:e1:90:33".into()),
+        // The arrange overlay is a hardcoded 560x420 centred by
+        // (parent.width - 560)/2. Render it at the window's MINIMUM: before the
+        // ScrollView floor the window could open 381px wide, making that offset
+        // -89 and hanging the overlay off all four edges.
         Some("layout-canvas") => {
             ui.set_canvas_boxes(ModelRc::new(VecModel::from(vec![
                 CanvasBox {

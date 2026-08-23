@@ -555,7 +555,11 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
             // a second `hops gui` launch (or the tray on some paths) asked us to
             // surface the window — do it on the UI thread, here.
             if show_requested_poll.swap(false, Ordering::SeqCst) {
-                let _ = ui.show();
+                // via the helper, NOT a bare show(): this was the one show path
+                // of three that did not re-assert the size, so surfacing the
+                // window from a second `hops gui` launch left it at whatever
+                // size the layout happened to compute. See #30.
+                let _ = show_app_window(&ui);
                 #[cfg(target_os = "macos")]
                 macos_app::activate_app();
             }
