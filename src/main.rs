@@ -126,6 +126,7 @@ fn run_daemon(config: config::Config) -> Result<(), HopsError> {
 fn run_gui(hidden: bool) -> Result<(), HopsError> {
     #[cfg(feature = "slint")]
     {
+        install_panic_logger();
         hops_slint::run(hidden)?;
         Ok(())
     }
@@ -135,6 +136,35 @@ fn run_gui(hidden: bool) -> Result<(), HopsError> {
         log::error!("this build has no GUI — rebuild with `--features slint`");
         Ok(())
     }
+}
+
+/// Make a GUI panic diagnosable.
+///
+/// The tray runs under launchd with its output redirected to a log file, and
+/// the release profile is `panic = "abort"` — so a panic is the last thing the
+/// process ever writes. The two aborts that became #4 left exactly this in
+/// gui.log:
+///
+/// ```text
+/// thread 'main' panicked at i-slint-core-1.17.0/properties.rs:788:13:
+/// Constant property being changed
+/// ```
+///
+/// No property name, no backtrace, no frame of ours anywhere in it — the note
+/// says to set `RUST_BACKTRACE`, which nobody can do for a job launchd started
+/// at login. Capturing the backtrace ourselves costs nothing until something
+/// panics and turns "it died again" into a stack that names the caller.
+#[cfg(feature = "slint")]
+fn install_panic_logger() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // keep the standard message, then add what it leaves out
+        previous(info);
+        eprintln!(
+            "hops: panic in the GUI — backtrace follows\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+    }));
 }
 
 /// Open the Ratatui TUI (attach-only). No-op with a hint if this build lacks it.
@@ -313,7 +343,8 @@ fn install_launchd_plist_if_missing() -> Option<String> {
     <key>ProgramArguments</key>
     <array><string>{exe}</string><string>daemon</string></array>
     <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><false/>
+    <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+    <key>ThrottleInterval</key><integer>10</integer>
     <key>ProcessType</key><string>Interactive</string>
     <key>StandardOutPath</key><string>{log}</string>
     <key>StandardErrorPath</key><string>{log}</string>

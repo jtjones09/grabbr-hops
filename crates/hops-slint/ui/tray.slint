@@ -9,6 +9,19 @@
 // assigned, so we ship `tray-icon.png` (the accent-blue pointer badge) — a bare
 // text title won't show on Windows, which renders only the icon.
 export component HopsTray inherits SystemTrayIcon {
+    // `visible` MUST stay bound to a property — do not delete this.
+    //
+    // A SystemTrayIcon that never assigns `visible` gets it const-folded by the
+    // Slint compiler: the generated init sets it true and then calls
+    // `set_constant()` on it. The generated `hide()` still writes `false`, and
+    // writing a constant property panics "Constant property being changed" in
+    // i-slint-core. With `panic = "abort"` (Cargo.toml) that is SIGABRT for the
+    // whole tray app — which is exactly the two aborts in gui.log.
+    //
+    // Binding it to a public `in-out` makes the compiler's `is_constant()`
+    // false, so `set_constant()` is not emitted and `hide()` is safe.
+    in-out property <bool> shown: true;
+    visible: root.shown;
     icon: @image-url("tray-icon.png");
     tooltip: "hops";
 

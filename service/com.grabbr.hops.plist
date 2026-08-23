@@ -28,7 +28,11 @@
         <string>daemon</string>
     </array>
     <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><false/>
+    <!-- Restart on an ABNORMAL exit only, so a crash is not permanent for the
+         rest of the session. Plain KeepAlive:true would be wrong: it also
+         resurrects the app right after a deliberate quit, which exits 0. -->
+    <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+    <key>ThrottleInterval</key><integer>10</integer>
     <key>ProcessType</key><string>Interactive</string>
     <key>EnvironmentVariables</key>
     <dict><key>HOPS_LOG_LEVEL</key><string>info</string></dict>
