@@ -323,9 +323,45 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
             }
         }
     };
-    fn show_app_window(ui: &AppWindow) -> Result<(), slint::PlatformError> {
+    // Set on every show; cleared by the rendering notifier below when a frame
+    // actually reaches the screen. Lets the log distinguish "the window was
+    // shown" from "the window was drawn" — which is the whole of #30.
+    let awaiting_paint = Rc::new(std::cell::Cell::new(false));
+    {
+        let awaiting = awaiting_paint.clone();
+        let notifier = ui.window().set_rendering_notifier(move |state, _| {
+            if matches!(state, slint::RenderingState::AfterRendering) && awaiting.replace(false) {
+                log::info!("window: painted a frame after show");
+            }
+        });
+        if let Err(e) = notifier {
+            log::debug!("this renderer has no rendering notifier: {e}");
+        }
+    }
+
+    /// Show the window AND make sure something is actually drawn in it.
+    ///
+    /// `show()` alone is not enough. It goes to `set_visible(true)` ->
+    /// `WindowVisibility::Shown`, and Slint's winit backend only pre-renders a
+    /// frame for `ShownFirstTime`. A window created early and first shown much
+    /// later — exactly what `--hidden` login autostart does, then opening from
+    /// the tray hours afterwards — misses winit's one initial RedrawRequested
+    /// and **maps blank**: correct size, correct layout, nothing painted, the
+    /// desktop showing through. Dragging the corner "fixed" it only because a
+    /// resize reaches the renderer by a different path.
+    ///
+    /// Slint hit this themselves and patched it for iOS, with a comment saying
+    /// as much (winitwindowadapter.rs, `#[cfg(ios_and_friends)] request_redraw`).
+    /// macOS is not in that cfg. This is the same one-line remedy.
+    fn show_app_window(
+        ui: &AppWindow,
+        awaiting_paint: &std::cell::Cell<bool>,
+    ) -> Result<(), slint::PlatformError> {
         ui.window().set_size(slint::LogicalSize::new(560.0, 690.0));
-        ui.show()
+        ui.show()?;
+        awaiting_paint.set(true);
+        ui.window().request_redraw();
+        Ok(())
     }
 
     // theme is a UI-local preference shared with the TUI. Rust owns the palette
@@ -542,6 +578,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
     // VRR displays). `last_ui` holds the previous pushed state.
     let weak = ui.as_weak();
     let show_requested_poll = show_requested.clone();
+    let awaiting_paint_poll = awaiting_paint.clone();
     let last_ui: RefCell<Option<PolledUi>> = RefCell::new(None);
     let timer = slint::Timer::default();
     let notice_seq_poll = notice_seq.clone();
@@ -559,7 +596,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                 // of three that did not re-assert the size, so surfacing the
                 // window from a second `hops gui` launch left it at whatever
                 // size the layout happened to compute. See #30.
-                let _ = show_app_window(&ui);
+                let _ = show_app_window(&ui, &awaiting_paint_poll);
                 #[cfg(target_os = "macos")]
                 macos_app::activate_app();
             }
@@ -777,9 +814,10 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
         // builtin `clicked`, forwarded to `open-window` in tray.slint) both surface
         // the window.
         let weak = ui.as_weak();
+        let awaiting_paint_tray = awaiting_paint.clone();
         tray.on_open_window(move || {
             if let Some(ui) = weak.upgrade() {
-                let _ = show_app_window(&ui);
+                let _ = show_app_window(&ui, &awaiting_paint_tray);
                 #[cfg(target_os = "macos")]
                 macos_app::activate_app();
             }
@@ -798,7 +836,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
     // `hidden` (login autostart) starts as tray only; the window opens on
     // tray-click / "Open hops" / a second launch. Manual launches show it now.
     if !hidden {
-        show_app_window(&ui)?;
+        show_app_window(&ui, &awaiting_paint)?;
     }
     tray.show()?;
     // This records INTENT, not outcome — it prints identically whether the icon
