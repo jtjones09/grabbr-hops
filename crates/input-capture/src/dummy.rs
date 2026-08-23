@@ -32,7 +32,7 @@ impl Default for DummyInputCapture {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl Capture for DummyInputCapture {
     async fn create(&mut self, _pos: Position) -> Result<(), CaptureError> {
         Ok(())

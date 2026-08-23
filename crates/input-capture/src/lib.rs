@@ -276,7 +276,25 @@ impl Stream for InputCapture {
     }
 }
 
-#[async_trait]
+/// The `(?Send)` is load-bearing, not a style choice — do NOT "tidy" it back to
+/// a bare `#[async_trait]`.
+///
+/// A bare `#[async_trait]` boxes every method as `Pin<Box<dyn Future + Send>>`.
+/// `LayerShellInputCapture` cannot satisfy that: it transitively owns a
+/// wayland `ReadEventsGuard`, which holds a `*mut wl_display` and is `!Send` on
+/// purpose, because libwayland requires prepare_read/read to happen on one
+/// thread. That made the DEFAULT feature set fail to compile on Linux — a bare
+/// `cargo build` or `cargo install --git` — and nothing noticed for months
+/// because no CI job compiled it (see #38, and #8 for the job that finally did).
+///
+/// The `Send` bound was never doing any work. `Box<dyn Capture>` below carries
+/// no `+ Send`, so `InputCapture` is already `!Send`; the whole capture stack
+/// runs on one current_thread runtime inside a `LocalSet` (src/main.rs), is
+/// spawned with `spawn_local` (src/capture.rs), and several backends call
+/// `spawn_local` in their own method bodies — which panics outside a LocalSet.
+/// Single-threaded execution is a hard runtime requirement here; `?Send` just
+/// makes the type system agree with what the code already demanded.
+#[async_trait(?Send)]
 trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + Unpin {
     /// create a new client with the given id
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError>;
