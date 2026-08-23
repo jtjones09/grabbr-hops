@@ -797,13 +797,21 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
         show_app_window(&ui)?;
     }
     tray.show()?;
-    // Slint reports a FAILED platform status-item only through its own
-    // debug_log, and never retries — the process then lives on with no icon,
-    // still holding the single-instance socket, so a later `hops gui` just
-    // signals an invisible primary. There is no API to observe that, so the
-    // least we can do is leave a mark: this line present with no icon on screen
-    // means the status item failed, not that we crashed before asking.
-    log::info!("tray: status item requested");
+    // This records INTENT, not outcome — it prints identically whether the icon
+    // appears or not, so do not read it as "the tray is up".
+    //
+    // Slint reports a FAILED platform status item only through its own
+    // debug_log and never retries; the process then lives on with no icon,
+    // still holding the single-instance socket, so a later `hops gui` merely
+    // signals an invisible primary (#43). Its handler is `#[doc(hidden)]` and
+    // `SlintContext` is not re-exported, so we cannot observe the failure
+    // without reaching into slint internals. What we CAN rely on: with no
+    // `log` feature on i-slint-core, debug_log falls through to stderr, which
+    // launchd sends to this same file. So the diagnostic pair is
+    //   this line + "Failed to create system tray icon"  -> the icon failed
+    //   this line + no icon + no such error              -> something else
+    //   no line at all                                   -> died before asking
+    log::info!("tray: requesting the platform status item");
     slint::run_event_loop_until_quit()?;
 
     ui.hide().ok();
