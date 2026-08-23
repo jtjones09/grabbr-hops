@@ -66,7 +66,10 @@ export component AppWindow inherits Window {
     in property <[DeviceRow]> devices: [];
     in property <string> pairing-fp: "";
 
-    property <string> confirm-revoke-fp: "";
+    // `in-out` so the render_png self-review harness can open it for a look —
+    // the same reason confirm-delete-handle is. A confirm state you cannot
+    // render is a confirm state nobody checks.
+    in-out property <string> confirm-revoke-fp: "";
     // `in-out` so the render_png self-review harness can open it for a look.
     in-out property <string> confirm-delete-handle: "";
     // handle of the device being renamed ("" = none). The rename FIELD lives
@@ -206,6 +209,20 @@ export component AppWindow inherits Window {
         // it scrolls). See the Window size note above.
         ScrollView {
             vertical-stretch: 1;
+            // A ScrollView reports a tiny intrinsic height by design — it expects
+            // its parent to give it a size, not to be asked how tall it wants to
+            // be. Without a floor here the Window's NATURAL size collapses to
+            // 381x223 (measured), which is #30's "opens as just a title bar",
+            // and the only thing standing between the user and that was a
+            // set_size() call racing the first layout pass — which it does not
+            // always win. `vertical-stretch: 1` above lets it grow; this stops
+            // it shrinking. Not a fixed height: the window stays resizable and
+            // the lists still scroll inside it.
+            min-height: 470px;
+            // 512 = the 560px design width minus the root layout's Space.xxl
+            // padding on both sides, so the window's natural WIDTH also lands
+            // on 560 instead of collapsing to 381 (measured).
+            min-width: 512px;
             VerticalLayout {
                 spacing: Space.lg;
                 alignment: start;
@@ -396,6 +413,17 @@ export component AppWindow inherits Window {
                             }
                         }
                         for d in root.devices: Rectangle {
+                            // Named ONCE, because comparing the raw strings per
+                            // guard is a trap: a provisional device (added by
+                            // address, never connected) has no fingerprint, so
+                            // `confirm-revoke-fp != d.fp-full` is "" != "" —
+                            // FALSE — and every control guarded on it silently
+                            // vanished. That row lost its position chip, its
+                            // on/off toggle and its edit button, leaving a
+                            // device you could not name, aim or switch off.
+                            property <bool> revoking: d.fp-full != "" && root.confirm-revoke-fp == d.fp-full;
+                            property <bool> deleting: d.has-send && root.confirm-delete-handle == d.handle;
+                            property <bool> confirming: revoking || deleting;
                             height: 56px;
                             border-radius: Radius.md;
                             drow := TouchArea {}
@@ -436,7 +464,7 @@ export component AppWindow inherits Window {
                                 }
 
                                 // --- send facet: position + active toggle + edit/delete ---
-                                if d.has-send && root.confirm-delete-handle != d.handle && root.confirm-revoke-fp != d.fp-full: VerticalLayout {
+                                if d.has-send && !confirming: VerticalLayout {
                                     alignment: center;
                                     Chip {
                                         text: d.pos;
@@ -452,7 +480,7 @@ export component AppWindow inherits Window {
                                         }
                                     }
                                 }
-                                if d.has-send && root.confirm-delete-handle != d.handle && root.confirm-revoke-fp != d.fp-full: VerticalLayout {
+                                if d.has-send && !confirming: VerticalLayout {
                                     alignment: center;
                                     Toggle {
                                         checked: d.active;
@@ -465,9 +493,7 @@ export component AppWindow inherits Window {
                                 // inbound peer and it could not be named at all.
                                 // Hidden while this row is mid-confirm, and for
                                 // an expelled row, which is inert by design.
-                                if (d.has-send || d.trusted) && !d.revoked
-                                    && root.confirm-revoke-fp != d.fp-full
-                                    && !(d.has-send && root.confirm-delete-handle == d.handle): VerticalLayout {
+                                if (d.has-send || d.trusted) && !d.revoked && !confirming: VerticalLayout {
                                     alignment: center;
                                     PillButton {
                                         text: "edit";
@@ -521,7 +547,7 @@ export component AppWindow inherits Window {
                                 }
 
                                 // --- receive-only facet: trust status + revoke ---
-                                if !d.has-send && !d.revoked && root.confirm-revoke-fp != d.fp-full: VerticalLayout {
+                                if !d.has-send && !d.revoked && !revoking: VerticalLayout {
                                     alignment: center;
                                     Text {
                                         text: d.online ? "connected" : "offline";
@@ -547,7 +573,7 @@ export component AppWindow inherits Window {
                                 // rows, whose handle is "" — the same as the
                                 // default confirm-delete-handle, which silently hid
                                 // revoke on every trusted peer.
-                                if d.trusted && root.confirm-revoke-fp != d.fp-full
+                                if d.trusted && !revoking
                                     && (d.handle == "" || root.confirm-delete-handle != d.handle): VerticalLayout {
                                     alignment: center;
                                     PillButton {
@@ -559,7 +585,7 @@ export component AppWindow inherits Window {
                                         }
                                     }
                                 }
-                                if d.trusted && root.confirm-revoke-fp == d.fp-full: VerticalLayout {
+                                if d.trusted && revoking: VerticalLayout {
                                     alignment: center;
                                     Text {
                                         text: "remove?";
@@ -567,7 +593,7 @@ export component AppWindow inherits Window {
                                         font-size: Type.small;
                                     }
                                 }
-                                if d.trusted && root.confirm-revoke-fp == d.fp-full: VerticalLayout {
+                                if d.trusted && revoking: VerticalLayout {
                                     alignment: center;
                                     PillButton {
                                         text: "yes";
@@ -578,7 +604,7 @@ export component AppWindow inherits Window {
                                         }
                                     }
                                 }
-                                if d.trusted && root.confirm-revoke-fp == d.fp-full: VerticalLayout {
+                                if d.trusted && revoking: VerticalLayout {
                                     alignment: center;
                                     PillButton {
                                         text: "no";
