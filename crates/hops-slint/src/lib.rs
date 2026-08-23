@@ -797,6 +797,13 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
         show_app_window(&ui)?;
     }
     tray.show()?;
+    // Slint reports a FAILED platform status-item only through its own
+    // debug_log, and never retries — the process then lives on with no icon,
+    // still holding the single-instance socket, so a later `hops gui` just
+    // signals an invisible primary. There is no API to observe that, so the
+    // least we can do is leave a mark: this line present with no icon on screen
+    // means the status item failed, not that we crashed before asking.
+    log::info!("tray: status item requested");
     slint::run_event_loop_until_quit()?;
 
     ui.hide().ok();
@@ -851,4 +858,49 @@ pub fn run_onboarding() -> Result<Option<hops_frontend_core::prefs::Frontend>, S
     ui.run()?;
     let picked = *choice.borrow();
     Ok(picked)
+}
+
+#[cfg(test)]
+mod tray_const_property {
+    /// The tray must never let the Slint compiler const-fold `visible`.
+    ///
+    /// If it does, the generated `HopsTray::hide()` writes a constant property,
+    /// i-slint-core panics "Constant property being changed", and `panic =
+    /// "abort"` turns that into SIGABRT for the whole tray app — the two aborts
+    /// in gui.log, and issue #4.
+    ///
+    /// This asserts on the GENERATED code rather than by calling `hide()`,
+    /// deliberately: constructing a real `SystemTrayIcon` needs a live platform
+    /// backend, so a behavioural test could not run on a headless CI box — and
+    /// a guard that does not run in CI is how this shipped in the first place.
+    /// `examples/tray_hide_repro.rs` is the behavioural check, for a machine
+    /// with a desktop.
+    #[test]
+    fn tray_visible_is_not_const_folded() {
+        let generated = std::fs::read_to_string(concat!(env!("OUT_DIR"), "/app.rs"))
+            .expect("the slint build script must have generated app.rs");
+
+        // narrow to the tray's own init, so an unrelated component's constant
+        // `visible` cannot mask a regression here
+        let start = generated
+            .find("impl InnerHopsTray")
+            .expect("generated code should contain InnerHopsTray");
+        let body = &generated[start..];
+        let end = body.find("impl ").map(|i| i + 5).unwrap_or(0);
+        let init = &body[..body[end..]
+            .find("\n    impl ")
+            .map_or(body.len(), |i| end + i)];
+
+        let offending: Vec<&str> = init
+            .lines()
+            .filter(|l| l.contains("r#visible") && l.contains("set_constant"))
+            .collect();
+
+        assert!(
+            offending.is_empty(),
+            "HopsTray::visible is const-folded again — hide() will abort the app (#4). \
+             Re-bind it in ui/tray.slint (`in-out property <bool> shown: true; visible: root.shown;`). \
+             Offending generated line(s): {offending:?}"
+        );
+    }
 }

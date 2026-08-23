@@ -23,8 +23,13 @@ case "$(uname -s)" in
     for kind in daemon gui; do
       if [ "$kind" = daemon ]; then
         label="com.grabbr.hops"; args="<string>daemon</string>"; log="daemon.log"
+        session=""
       else
         label="com.grabbr.hops.gui"; args="<string>gui</string><string>--hidden</string>"; log="gui.log"
+        # The tray needs a window server. Saying so is better than starting and
+        # failing: launchd loads an Aqua-only job when a real GUI session
+        # appears. NEVER put this on the daemon, which must run headless.
+        session="<key>LimitLoadToSessionType</key><string>Aqua</string>"
       fi
       plist="$HOME/Library/LaunchAgents/${label}.plist"
       cat > "$plist" <<PLIST
@@ -34,8 +39,15 @@ case "$(uname -s)" in
   <key>Label</key><string>${label}</string>
   <key>ProgramArguments</key><array><string>${BIN}</string>${args}</array>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><false/>
+  <!-- Restart on an ABNORMAL exit only. A crash at login used to be permanent
+       for the rest of the session (#4); plain KeepAlive:true would be wrong,
+       since it also resurrects the app right after the user picks "Quit hops",
+       which exits 0. ThrottleInterval names launchd's 10s floor explicitly so a
+       crash loop cannot spin. -->
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>10</integer>
   <key>ProcessType</key><string>Interactive</string>
+  ${session}
   <key>StandardOutPath</key><string>${HOME}/hops/logs/${log}</string>
   <key>StandardErrorPath</key><string>${HOME}/hops/logs/${log}</string>
 </dict></plist>
