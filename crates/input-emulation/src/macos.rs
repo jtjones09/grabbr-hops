@@ -1139,6 +1139,70 @@ fn natural_scroll_enabled() -> bool {
     if exists != 0 { enabled != 0 } else { true }
 }
 
+/// Diagnostic override for the receiver-side scroll sign policy.
+///
+/// `HOPS_SCROLL_MODE`:
+///   * unset / `pref`  — DEFAULT, current shipped behaviour: flip iff the
+///                       receiver's natural-scroll preference is on.
+///   * `passthrough`   — hand the wire delta to CGEvent unchanged.
+///   * `negate`        — always flip (the approach four closed upstream PRs took).
+///
+/// This exists to settle a question that six pull requests have argued from
+/// reasoning and none has measured: **does macOS apply its natural-scroll
+/// transform to a CGEvent we post at the HID tap, or not?** Run `passthrough`
+/// and toggle the receiver's preference. If the on-screen direction CHANGES,
+/// macOS is applying it and the "injected scroll bypasses the transform"
+/// premise — which both our own doc comment and upstream #470 rest on — is
+/// false. If it does not change, the premise holds.
+///
+/// Temporary, like `GRABBR_SCROLL_GUEST_NEGATE` before it: delete once the
+/// answer is recorded in DECISIONS.md.
+#[derive(Clone, Copy, PartialEq)]
+enum ScrollMode {
+    Pref,
+    Passthrough,
+    Negate,
+}
+
+fn scroll_mode() -> ScrollMode {
+    static M: std::sync::OnceLock<ScrollMode> = std::sync::OnceLock::new();
+    *M.get_or_init(|| match std::env::var("HOPS_SCROLL_MODE").as_deref() {
+        Ok("passthrough") => ScrollMode::Passthrough,
+        Ok("negate") => ScrollMode::Negate,
+        _ => ScrollMode::Pref,
+    })
+}
+
+/// Apply the configured policy. `vm` keeps the documented guest exception: a
+/// Parallels macOS guest applies its OWN natural-scroll to injected scroll, so
+/// negating here as well double-inverts it (verified 2026-06-25, acaa5d0).
+fn scroll_sign(value: i32, vm: bool) -> i32 {
+    match scroll_mode() {
+        ScrollMode::Passthrough => value,
+        ScrollMode::Negate => value.saturating_neg(),
+        ScrollMode::Pref => {
+            if vm {
+                value
+            } else {
+                apply_natural_scroll(value)
+            }
+        }
+    }
+}
+
+/// Diagnostic: trace the scroll sign at each hop. Off unless `HOPS_SCROLL_TRACE`
+/// is set to something other than `0`.
+///
+/// This exists because the correct wire->CGEvent scroll conversion depends on
+/// three facts nobody in this project or upstream has actually MEASURED:
+/// whether each sender's OS bakes its own natural-scroll preference in before
+/// we capture, and whether the receiver's does on injection. Every argument so
+/// far has been sign algebra over those unknowns. Numbers settle it.
+fn scroll_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("HOPS_SCROLL_TRACE").is_ok_and(|v| v != "0"))
+}
+
 /// Applies the receiver's natural-scroll preference to a scroll delta.
 ///
 /// `saturating_neg` guards against a malformed `i32::MIN` arriving from the wire
@@ -2123,12 +2187,16 @@ impl Emulation for MacOSEmulation {
                         // injected scroll, so negating here too double-inverts it
                         // (the "scroll is backwards inside the guest" bug). Let
                         // the guest own it; negate only for native targets.
-                        let value = value as i32;
-                        let value = if self.target_is_vm_guest() {
-                            value
-                        } else {
-                            apply_natural_scroll(value)
-                        };
+                        let wire = value as i32;
+                        let vm = self.target_is_vm_guest();
+                        let value = scroll_sign(wire, vm);
+                        if scroll_trace() {
+                            log::info!(
+                                "scroll-trace INJECT axis={axis} path=pixel wire={wire} \
+                                 ns_pref={} vm_guest={vm} -> cgevent={value}",
+                                natural_scroll_enabled()
+                            );
+                        }
                         let (count, wheel1, wheel2, wheel3) = match axis {
                             0 => (1, value, 0, 0), // 0 = vertical => 1 scroll wheel device (y axis)
                             1 => (2, 0, value, 0), // 1 = horizontal => 2 scroll wheel devices (y, x) -> (0, x)
@@ -2158,11 +2226,16 @@ impl Emulation for MacOSEmulation {
                         // Same guest exception as the Axis handler above: don't
                         // double-invert inside a VM guest (it applies its own
                         // natural-scroll to the injected scroll).
-                        let value = if self.target_is_vm_guest() {
-                            value
-                        } else {
-                            apply_natural_scroll(value)
-                        };
+                        let wire = value;
+                        let vm = self.target_is_vm_guest();
+                        let value = scroll_sign(wire, vm);
+                        if scroll_trace() {
+                            log::info!(
+                                "scroll-trace INJECT axis={axis} path=v120 wire={wire} \
+                                 ns_pref={} vm_guest={vm} -> cgevent={value}",
+                                natural_scroll_enabled()
+                            );
+                        }
                         let (count, wheel1, wheel2, wheel3) = match axis {
                             0 => (1, value / (120 / LINES_PER_STEP), 0, 0), // 0 = vertical => 1 scroll wheel device (y axis)
                             1 => (2, 0, value / (120 / LINES_PER_STEP), 0), // 1 = horizontal => 2 scroll wheel devices (y, x) -> (0, x)

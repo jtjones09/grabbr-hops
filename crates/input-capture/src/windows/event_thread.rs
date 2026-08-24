@@ -534,6 +534,12 @@ fn media_vk_to_evdev(vk: u32) -> Option<u32> {
     })
 }
 
+/// Diagnostic: see `HOPS_SCROLL_TRACE` in the input-emulation macOS backend.
+fn scroll_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("HOPS_SCROLL_TRACE").is_ok_and(|v| v != "0"))
+}
+
 fn to_mouse_event(wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
     let mouse_low_level: MSLLHOOKSTRUCT = unsafe { *(lparam.0 as *const MSLLHOOKSTRUCT) };
     match wparam {
@@ -574,10 +580,21 @@ fn to_mouse_event(wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
             let (dx, dy) = (dx as f64, dy as f64);
             Some(PointerEvent::Motion { time: 0, dx, dy })
         }
-        WPARAM(p) if p == WM_MOUSEWHEEL as usize => Some(PointerEvent::AxisDiscrete120 {
-            axis: 0,
-            value: -(mouse_low_level.mouseData as i32 >> 16),
-        }),
+        WPARAM(p) if p == WM_MOUSEWHEEL as usize => {
+            let raw = mouse_low_level.mouseData as i32 >> 16;
+            let wire = -raw;
+            if scroll_trace() {
+                // Compare `raw` between Windows' scroll-direction setting ON and
+                // OFF for the same physical gesture. If it flips, the sender's
+                // preference is already baked in before our hook sees it — which
+                // decides whether the receiver may apply one of its own.
+                log::info!("scroll-trace CAPTURE(win) axis=0 raw={raw} -> wire={wire}");
+            }
+            Some(PointerEvent::AxisDiscrete120 {
+                axis: 0,
+                value: wire,
+            })
+        }
         WPARAM(p) if p == WM_XBUTTONDOWN as usize || p == WM_XBUTTONUP as usize => {
             let hb = mouse_low_level.mouseData >> 16;
             let button = match hb {

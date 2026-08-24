@@ -242,6 +242,12 @@ impl InputCaptureState {
     }
 }
 
+/// Diagnostic: see `HOPS_SCROLL_TRACE` in input-emulation's macos backend.
+fn scroll_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("HOPS_SCROLL_TRACE").is_ok_and(|v| v != "0"))
+}
+
 fn get_events(
     ev_type: &CGEventType,
     ev: &CGEvent,
@@ -392,6 +398,19 @@ fn get_events(
             })))
         }
         CGEventType::ScrollWheel => {
+            if scroll_trace() {
+                // The sign of these raw deltas, compared between this Mac's
+                // natural-scroll ON and OFF for the SAME gesture, says whether our
+                // Session-level tap sees the preference already applied.
+                log::info!(
+                    "scroll-trace CAPTURE continuous={} px_v={} px_h={} line_v={} line_h={}",
+                    ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS),
+                    ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1),
+                    ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2),
+                    ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1),
+                    ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2),
+                );
+            }
             if ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS) != 0 {
                 let v =
                     ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1);
