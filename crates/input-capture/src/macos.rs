@@ -242,6 +242,21 @@ impl InputCaptureState {
     }
 }
 
+/// `kCGScrollWheelEventIsDirectionInvertedFromDevice` — macOS telling us, PER
+/// EVENT, whether it already applied the "Natural scrolling" transform to this
+/// scroll before handing it to our tap.
+///
+/// Not exposed by the `core-graphics` crate's `EventField`, so the raw value is
+/// declared here. Provenance: upstream lan-mouse PR #452 (Oseenix) declares the
+/// same constant and uses it to un-apply the transform at capture — the only
+/// one of seven attempts at this problem that normalises rather than flipping a
+/// sign. That PR was closed by its author with "need more testing to verify the
+/// fix is reliable", and the obvious thing to doubt is whether this flag is set
+/// consistently across device types (wheel mouse vs Magic Mouse vs trackpad)
+/// and across the continuous/discrete paths. Hence: measure it before trusting
+/// it.
+const DIRECTION_INVERTED_FROM_DEVICE: core_graphics::event::CGEventField = 137;
+
 /// Diagnostic: see `HOPS_SCROLL_TRACE` in input-emulation's macos backend.
 fn scroll_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -403,8 +418,9 @@ fn get_events(
                 // natural-scroll ON and OFF for the SAME gesture, says whether our
                 // Session-level tap sees the preference already applied.
                 log::info!(
-                    "scroll-trace CAPTURE continuous={} px_v={} px_h={} line_v={} line_h={}",
+                    "scroll-trace CAPTURE continuous={} inverted_from_device={} px_v={} px_h={} line_v={} line_h={}",
                     ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS),
+                    ev.get_integer_value_field(DIRECTION_INVERTED_FROM_DEVICE),
                     ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1),
                     ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2),
                     ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1),
