@@ -16,3 +16,8 @@ repo
 # local Claude Code settings (machine-specific)
 .claude/settings.local.json
 /dist/
+
+# Volatile post-compaction session state written by the `/handoff` skill.
+# The durable record is nisaba (projects/grabbr-hops/JOURNAL.md + DECISIONS.md);
+# this file is working state for the next context window, not project history.
+HandoffSessionCompact.md
