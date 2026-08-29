@@ -74,6 +74,39 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p hops-ipc -p hops-frontend-core
 
+  # hops commits to NOT reading raw input devices on Linux. Capture is
+  # portal-mediated (xdg-desktop-portal InputCapture / libei), which is
+  # consent-gated and revocable; /dev/input is neither.
+  #
+  # This exists because the installer used to tell every Linux user to run
+  # `sudo usermod -aG input $USER` — granting system-wide keylogging, on a
+  # machine running a KVM, for a capability no hops code ever used. A
+  # commitment about what software does NOT do is worth nothing unless
+  # something fails when it stops being true.
+  no-raw-input-devices:
+    name: no /dev/input access
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: the input path must stay portal-mediated
+        run: |
+          if grep -rnE '/dev/(input|uinput)|EVIOCGRAB|\bevdev::' \
+               crates/input-capture/src crates/input-emulation/src src \
+               --include='*.rs' ; then
+            echo "::error::hops must not open raw input devices — see SECURITY-MODEL.md."
+            echo "If this is a deliberate, privileged, opt-in backend, update this"
+            echo "job and the security model in the same PR, not afterwards."
+            exit 1
+          fi
+          echo "OK: no raw input-device access."
+      - name: the installer must not tell users to grant one
+        run: |
+          if grep -nE 'usermod .*-aG .*input|gpasswd .*input' install.sh ; then
+            echo "::error::install.sh must not instruct users into the input group."
+            exit 1
+          fi
+          echo "OK: installer grants no input-group membership."
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest

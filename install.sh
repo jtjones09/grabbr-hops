@@ -78,8 +78,15 @@ UNIT
     systemctl --user enable --now hops.service
     echo
     echo "✅  hops daemon installed and running."
-    echo "⚠️  Let it inject input without root — add yourself to the input group:"
-    echo "      sudo usermod -aG input \"\$USER\"   # then log out and back in"
+    # Deliberately NO "add yourself to the input group" instruction here.
+    # /dev/input/event* is root:input 0660, so that group grants read access to
+    # EVERY input device on the machine — system-wide keylogging for anything
+    # running as this user, permanently and in practice unrevoked. hops does not
+    # need it: input is portal-mediated (xdg-desktop-portal InputCapture / libei)
+    # and no hops code opens /dev/input or /dev/uinput. Enforced by CI, see
+    # .github/workflows/check.yml.
+    echo "ℹ️  Input is mediated by your desktop's portal — no root, no group changes."
+    echo "    The first time hops captures input you will get a consent prompt."
     echo "    Configure it with:  hops gui   (or  hops tui  over SSH)"
     ;;
   *)
