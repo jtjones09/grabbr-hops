@@ -519,11 +519,25 @@ impl EmulationTask {
 
         // A fallback to Dummy accepts every event and throws it away while the
         // UI still reports "connected" — this project lost hours to exactly that.
-        // Say so loudly instead.
+        //
+        // Choosing dummy deliberately (config/CLI) is legitimate and stays
+        // supported. FALLING INTO it is not: it means every real backend was
+        // unavailable, and the honest response is to refuse rather than pretend.
+        // The Linux release shipped exactly this for months (#47) — built with
+        // no backend features at all, so selection had nowhere to go.
         if emulation.backend() == input_emulation::Backend::Dummy {
+            let asked_for_dummy = self.backend == Some(input_emulation::Backend::Dummy);
+            let overridden = std::env::var("HOPS_ALLOW_DUMMY").is_ok_and(|v| v != "0");
             let _ = self.event_tx.send(EmulationEvent::BackendDegraded(
                 emulation.backend().to_string(),
             ));
+            if !asked_for_dummy && !overridden {
+                log::error!(
+                    "input emulation fell back to `dummy` — all input would be silently \
+                     discarded. Refusing. Set HOPS_ALLOW_DUMMY=1 to override."
+                );
+                return Err(InputEmulationError::NoUsableBackend);
+            }
         }
 
         // used to send enabled and disabled events

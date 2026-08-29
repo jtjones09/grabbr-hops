@@ -4,6 +4,17 @@ pub enum InputEmulationError {
     Create(#[from] EmulationCreationError),
     #[error("error emulating input: `{0}`")]
     Emulate(#[from] EmulationError),
+    /// Every real backend failed and selection fell through to `Dummy`, which
+    /// accepts every event and discards it. Refused rather than run, because a
+    /// KVM that cannot move a cursor has no valid non-test use and the UI
+    /// otherwise reports a healthy connection while nothing happens.
+    #[error(
+        "no usable input-emulation backend — every real backend was unavailable and \
+         selection fell through to `dummy`, which discards all input. Refusing to run. \
+         On Linux this usually means the binary was built without the backend features \
+         (see release.yml). Set HOPS_ALLOW_DUMMY=1 to override for testing."
+    )]
+    NoUsableBackend,
 }
 
 #[cfg(any(libei, rdp))]

@@ -40,7 +40,13 @@ jobs:
         include:
           - { os: macos-latest,   name: macos-universal,  features: "tui slint" }
           - { os: windows-latest, name: windows-x86_64,    features: "tui slint" }
-          - { os: ubuntu-latest,  name: linux-x86_64,      features: "tui" }
+          # The Linux backends are FEATURE-gated while macOS/Windows backends are
+          # PLATFORM-gated (`#[cfg(windows)]`, `#[cfg(target_os = "macos")]`), so
+          # the same `--no-default-features` line produced a working binary on two
+          # platforms and an inert one on the third. Built with "tui" alone this
+          # shipped a KVM containing only the `dummy` backend — it accepted input
+          # and discarded it, from 2026-07-06 through v0.12.0 (#47).
+          - { os: ubuntu-latest,  name: linux-x86_64,      features: "tui libei_capture libei_emulation layer_shell_capture wlroots_emulation x11_capture x11_emulation rdp_emulation" }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -97,10 +103,38 @@ jobs:
           # TODO(signing): signtool sign /fd SHA256 /tr <timestamp-url> /td SHA256 /a dist\hops.exe
           Compress-Archive -Path dist\hops.exe -DestinationPath hops-${{ matrix.name }}.zip
 
+      - name: System deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev \
+            libxtst-dev pkg-config
+
       - name: Build (Linux)
         if: runner.os == 'Linux'
         run: |
           cargo build --release --no-default-features --features "${{ matrix.features }}"
+
+          # A Linux build with no input backends compiles, links, runs, connects,
+          # and silently discards every event. It shipped for months (#47). Assert
+          # the real backends are actually IN the artifact — a green build is not
+          # evidence that the KVM can move a cursor.
+          missing=0
+          for f in input-capture/src/libei.rs \
+                   input-emulation/src/libei.rs \
+                   input-capture/src/layer_shell.rs \
+                   input-emulation/src/wlroots.rs ; do
+            if ! strings target/release/hops | grep -q "$f" ; then
+              echo "::error::$f is NOT in the binary — this build would fall back to the dummy backend and discard all input."
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "Refusing to publish a Linux artifact with no usable input backend."
+            exit 1
+          fi
+          echo "OK: real capture and emulation backends are present in the binary."
+
           mkdir -p dist
           cp target/release/hops dist/hops
           tar -C dist -czf hops-${{ matrix.name }}.tar.gz hops
