@@ -33,8 +33,8 @@ fn main() {
     // refs can live packed rather than as loose files
     println!("cargo::rerun-if-changed=.git/packed-refs");
 
-    let unix = cfg!(unix);
-    let macos = cfg!(target_os = "macos");
+    let unix = target_is("unix");
+    let macos = target_os() == "macos";
 
     let layer_shell_capture = cfg!(feature = "layer_shell_capture");
     let libei_capture = cfg!(feature = "libei_capture");
@@ -85,4 +85,18 @@ fn main() {
     if x11_emulation {
         println!("cargo::rustc-cfg=x11_emulation");
     }
+}
+
+// See crates/input-capture/build.rs for why these read the environment rather
+// than `cfg!`: a build script runs on the HOST, so host predicates silently
+// mis-configure every cross-compile (#44).
+fn target_is(family: &str) -> bool {
+    std::env::var("CARGO_CFG_TARGET_FAMILY")
+        .unwrap_or_default()
+        .split(',')
+        .any(|f| f == family)
+}
+
+fn target_os() -> String {
+    std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default()
 }
