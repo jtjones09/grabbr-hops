@@ -1390,3 +1390,110 @@ mod set_label_cannot_grant {
         }
     }
 }
+
+#[cfg(test)]
+mod one_trust_write_site {
+    //! Only the named trust doors may write the allowlist or the denylist.
+    //!
+    //! Layer 1 of `CONSENT-ARCHITECTURE.md` asks for exactly one place that
+    //! mutates trust. This guards the property before the refactor that makes it
+    //! structural, because the property is what matters and a fifth writer added
+    //! next month is the actual risk.
+    //!
+    //! It is not hypothetical. #105's guard — written to enforce "one allowlist
+    //! READER" — failed on its first run against a third reader nobody had
+    //! counted (`drop_untrusted_pins` taking the raw allowlist at startup),
+    //! after two reviews had already missed it.
+
+    /// Non-test source with comments stripped: this guard names what it forbids.
+    fn production() -> String {
+        include_str!("service.rs")
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap_or_default()
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Which `fn` encloses a given byte offset.
+    fn enclosing_fn(src: &str, at: usize) -> String {
+        src[..at]
+            .rmatch_indices("fn ")
+            .map(|(i, _)| {
+                let rest = &src[i..];
+                rest[..rest.find('(').unwrap_or(rest.len())]
+                    .trim()
+                    .to_string()
+            })
+            .next()
+            .unwrap_or_else(|| "<top level>".to_string())
+    }
+
+    /// The doors that are ALLOWED to mutate trust. Adding to this list is a
+    /// deliberate act; arriving here by accident is what the guard prevents.
+    const DOORS: &[&str] = &[
+        "fn add_authorized_key",    // grant
+        "fn remove_authorized_key", // revoke + tombstone
+        "fn set_label",             // rename, refuses unknown fingerprints
+        "fn handle_config_change",  // reload: the config file is a door too
+        "fn new",                   // startup load
+    ];
+
+    #[test]
+    fn nothing_outside_the_named_doors_writes_the_allowlist() {
+        let src = production();
+        let mut offenders = vec![];
+        for (at, _) in src.match_indices("authorized_keys.write()") {
+            let f = enclosing_fn(&src, at);
+            if !DOORS.iter().any(|d| f.starts_with(d)) {
+                offenders.push(f);
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these write the allowlist and are not a named trust door: {offenders:?}. \
+             Trust must change in one place — see CONSENT-ARCHITECTURE.md Layer 1. If a \
+             new door is genuinely needed, add it to DOORS in the same commit and say why."
+        );
+    }
+
+    #[test]
+    fn nothing_outside_the_named_doors_writes_the_denylist() {
+        let src = production();
+        let mut offenders = vec![];
+        for pat in [
+            "self.revoked.insert",
+            "self.revoked.remove",
+            "self.revoked =",
+        ] {
+            for (at, _) in src.match_indices(pat) {
+                let f = enclosing_fn(&src, at);
+                if !DOORS.iter().any(|d| f.starts_with(d)) {
+                    offenders.push(format!("{f} ({pat})"));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these write the denylist and are not a named trust door: {offenders:?}. \
+             A revocation tombstone is irreversible; it must not be written from \
+             somewhere nobody is looking."
+        );
+    }
+
+    #[test]
+    fn the_door_list_still_matches_reality() {
+        // A door that no longer exists means the guard has quietly stopped
+        // covering something, which is worse than not having it.
+        let src = production();
+        for d in DOORS {
+            assert!(
+                src.contains(d),
+                "{d} is listed as a trust door but no longer exists — the guard is \
+                 now covering less than it claims"
+            );
+        }
+    }
+}
