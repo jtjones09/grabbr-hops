@@ -26,6 +26,12 @@ it is the previous context window's state. See `.claude/skills/handoff/`.
 - **Prove a fix falsifiable.** Show the test fails without the change. Checking that your own
   new log line appeared proves your code ran, not that the bug is fixed. Mutation-test guards:
   reintroduce the defect and confirm the guard fires.
+- **Never let a summary be the only record of research.** If a Workflow or subagent run
+  produced output, the raw per-agent returns are the **primary source**: preserve them
+  verbatim in nisaba `projects/grabbr-hops/research/<date>-<topic>-artifact.md`, with the
+  workflow script as `-protocol.js`, *before* writing the synthesis — then check the
+  synthesis against them. Standing rule: nisaba `positions/research-folder-discipline.md`.
+  Transcripts survive at `~/.claude/projects/<slug>/<session>/subagents/workflows/wf_*/`.
 - **Never `cd` into a path in scripts; run from the repo root.**
 - **Dates are absolute.** Sessions here are days apart — say `2026-08-29`, never "today".
 - **Verify machine state, never assume it.** Which build is running on which box has been

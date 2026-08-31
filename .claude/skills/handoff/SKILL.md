@@ -54,6 +54,44 @@ Respect nisaba's `CLAUDE.md`: do not rename/move/delete files under `projects/`,
 `atoms/`, `positions/`; no new root-level dirs; do not touch root canon unless
 explicitly asked.
 
+### Step 1b — preserve research artifacts BEFORE synthesizing
+
+If this session ran a **Workflow or subagents**, the raw per-agent output is the
+**primary source** and must be preserved verbatim. A summary is never the only
+record. Standing rule: nisaba `positions/research-folder-discipline.md`.
+
+Per run, write two files into `nisaba/projects/grabbr-hops/research/`:
+
+- `<date>-<topic>-artifact.md` — every agent's return verbatim, all schema fields,
+  with the agent→role mapping and a provenance header (runId, date, phase shape).
+- `<date>-<topic>-protocol.js` — the workflow script. A ranking is uninterpretable
+  without knowing the agent was *told* to argue that side.
+
+Where they live:
+
+```bash
+SESS=~/.claude/projects/-Users-scorndraco-Documents-GitHub-grabbr-hops/<session-id>
+ls $SESS/subagents/workflows/wf_*/journal.jsonl   # type:"result" = verbatim returns
+ls $SESS/workflows/scripts/                       # the protocols
+```
+
+Map agent→role by grepping each sibling `agent-*.jsonl` for its assigned prompt —
+`meta.json` carries no label.
+
+**Then diff the synthesis against the artifact.** A synthesis may not assert anything
+its own artifact contradicts. On 2026-08-30 this check caught a synthesis claiming
+"all three judges ranked it last" when one had ranked it third — and caught that the
+run's actual #1 recommendation had never been written down at all.
+
+**Also sweep the scratchpad**, which is genuinely volatile and dies with the session:
+
+```bash
+ls -la /private/tmp/claude-*/-Users-scorndraco-Documents-GitHub-grabbr-hops/<session-id>/scratchpad/
+```
+
+Measured numbers die there. On 2026-08-30 the per-option dependency counts and a
+Linux build log survived only in scratch and were nearly lost.
+
 ### Step 2 — gather live state, do not recall it
 
 Run these; do not write from memory:
@@ -125,3 +163,5 @@ versioned, that is his call to make explicitly.
 - **Record retractions.** When a claim was made and withdrawn, write down the
   withdrawal. Otherwise the next window re-derives the wrong answer.
 - **Prefer "unverified" over a confident guess.** Mark anything not measured.
+- **A summary is never the only record of research.** Preserve the artifact first,
+  synthesize second, and check the synthesis against the artifact before committing.
