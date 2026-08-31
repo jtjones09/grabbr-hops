@@ -224,7 +224,8 @@ fn linux_keycode_to_windows_scancode(linux_keycode: u32) -> Option<u16> {
             return None;
         }
     };
-    log::trace!("linux code: {linux_scancode:?}");
+    // The sender's keystrokes, on a receiver. Same gate (#117).
+    input_event::keylog::key(0, 0, &format!("linux:{linux_scancode:?}"));
     let windows_scancode = match scancode::Windows::try_from(linux_scancode) {
         Ok(s) => s,
         Err(_) => {
@@ -232,6 +233,6 @@ fn linux_keycode_to_windows_scancode(linux_keycode: u32) -> Option<u16> {
             return None;
         }
     };
-    log::trace!("windows code: {windows_scancode:?}");
+    input_event::keylog::key(0, 0, &format!("windows:{windows_scancode:?}"));
     Some(windows_scancode as u16)
 }

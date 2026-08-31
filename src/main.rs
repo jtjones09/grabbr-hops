@@ -415,3 +415,66 @@ async fn run_service(config: Config) -> Result<(), ServiceError> {
     log::info!("service exited!");
     Ok(())
 }
+
+#[cfg(test)]
+mod keylog_is_never_shipped {
+    //! Keystroke logging must not reach a release artifact.
+    //!
+    //! hops needs the capability — scancode mapping is not debuggable without key
+    //! identity. What it must never be is something a user ends up running by
+    //! accident. Before #117 it rode along with `HOPS_LOG_LEVEL=debug`, which the
+    //! Windows dev launcher had set since 2026-07-21; the resulting log was
+    //! 4.4 GB of one person's typing in cleartext.
+    //!
+    //! The runtime gates (a duration, a cap, its own file) live in
+    //! `input_event::keylog`. This guards the one property they cannot: that the
+    //! code is absent from what we ship.
+
+    const ROOT_MANIFEST: &str = include_str!("../Cargo.toml");
+    const RELEASE_WF: &str = include_str!("../.github/workflows/release.yml");
+    const CHECK_WF: &str = include_str!("../.github/workflows/check.yml");
+
+    /// The `default = [ ... ]` list from the root manifest.
+    fn default_features() -> &'static str {
+        let start = ROOT_MANIFEST
+            .find("\ndefault = [")
+            .expect("a default feature list must exist");
+        let rest = &ROOT_MANIFEST[start..];
+        &rest[..rest.find("\n]").map(|i| i + 2).unwrap_or(rest.len())]
+    }
+
+    #[test]
+    fn keylog_is_not_a_default_feature() {
+        assert!(
+            !default_features().contains("keylog"),
+            "`keylog` must never be in `default`. A bare `cargo build` would then \
+             produce a binary that can record every key the user presses."
+        );
+    }
+
+    #[test]
+    fn no_workflow_builds_with_keylog() {
+        for (name, wf) in [("release.yml", RELEASE_WF), ("check.yml", CHECK_WF)] {
+            for line in wf.lines() {
+                let code = line.split('#').next().unwrap_or("");
+                assert!(
+                    !code.contains("keylog"),
+                    "{name} names `keylog`: {}\n\
+                     Nothing we build in CI — and above all nothing we release — may \
+                     carry keystroke recording.",
+                    line.trim()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_feature_exists_and_forwards() {
+        // It has to be reachable deliberately, or the capability is gone rather
+        // than gated — and then the next person needing it re-adds a log line.
+        assert!(
+            ROOT_MANIFEST.contains(r#"keylog = ["input-event/keylog"]"#),
+            "the `keylog` feature must still exist and forward to input-event"
+        );
+    }
+}

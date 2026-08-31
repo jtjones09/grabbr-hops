@@ -1,3 +1,4 @@
+pub mod keylog;
 use std::fmt::{self, Display};
 
 pub mod error;
