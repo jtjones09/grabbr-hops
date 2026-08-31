@@ -419,14 +419,15 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                 c.request(FrontendRequest::UpdateHostname(h, name));
                 return;
             }
-            // re-authorizing the same fingerprint with a new description IS the
-            // rename for an inbound peer; the daemon refuses revoked ones.
+            // A rename is a rename. This used to re-send AuthorizeKey, so the
+            // wire could not tell relabelling from granting trust; SetLabel
+            // refuses a fingerprint that is not already authorized.
             let desc = if name.is_empty() {
                 hops_frontend_core::fallback_label(id.as_str())
             } else {
                 name.to_string()
             };
-            c.request(FrontendRequest::AuthorizeKey(desc, id.to_string()));
+            c.request(FrontendRequest::SetLabel(id.to_string(), desc));
         });
     }
     {

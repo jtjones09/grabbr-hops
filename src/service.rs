@@ -414,6 +414,10 @@ impl Service {
                 self.remove_authorized_key(key);
                 self.save_config();
             }
+            FrontendRequest::SetLabel(fp, label) => {
+                self.set_label(fp, label);
+                self.save_config();
+            }
             FrontendRequest::SaveConfiguration => self.save_config(),
         }
     }
@@ -914,6 +918,41 @@ impl Service {
         });
     }
 
+    /// Rename a device that is ALREADY trusted. This must never be able to
+    /// grant trust.
+    ///
+    /// Before this existed, both frontends renamed an inbound peer by re-sending
+    /// `AuthorizeKey` with a new description — so the wire could not tell a
+    /// rename from a trust grant, and a console that should only be able to
+    /// relabel had, in practice, the ability to authorize.
+    fn set_label(&mut self, fp: String, label: String) {
+        let Some(fp) = hops_ipc::pairing::canonical_fingerprint(&fp) else {
+            log::warn!("refusing to relabel {fp:?}: not a valid fingerprint");
+            return;
+        };
+        let known = self.authorized_keys.read().expect("lock").contains_key(&fp);
+        if !known {
+            // Refuse, do NOT insert. Inserting here would make this verb a
+            // trust grant wearing a different name, which is the whole point of
+            // separating them.
+            log::warn!(
+                "refusing to relabel {fp}: it is not an authorized device. \
+                 Renaming cannot grant trust."
+            );
+            self.notify_frontend(FrontendEvent::Error(
+                "That device is not trusted, so it cannot be renamed.".to_string(),
+            ));
+            return;
+        }
+        let label = hops_ipc::pairing::sanitize_label(&label);
+        self.authorized_keys
+            .write()
+            .expect("lock")
+            .insert(fp, label);
+        let keys = self.authorized_keys.read().expect("lock").clone();
+        self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+    }
+
     fn remove_authorized_key(&mut self, fp: String) {
         // Canonicalise here too, or a tombstone can be written under a spelling
         // that `add_authorized_key` will never match (issue #67). An invalid
@@ -1268,6 +1307,85 @@ mod trust_door_guard {
                 "{door} must canonicalise before touching the trust maps. An uppercased \
                  spelling of an expelled fingerprint missed the tombstone and was folded \
                  back to canonical form on the next config read — issue #67."
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod set_label_cannot_grant {
+    //! Renaming a device must never be a way to trust one.
+    //!
+    //! Both frontends used to rename an inbound peer by re-sending
+    //! `AuthorizeKey` with a new description, so on the wire a rename and a
+    //! trust grant were the same request. A console that should only be able to
+    //! relabel had, in practice, the ability to authorize — which is the shape
+    //! Layer 1 of `CONSENT-ARCHITECTURE.md` exists to remove.
+
+    /// Non-test source only: these guards name the very calls they forbid.
+    fn production(src: &str) -> String {
+        src.split("\n#[cfg(test)]")
+            .next()
+            .unwrap_or(src)
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn body_of(src: &str, sig: &str) -> String {
+        let start = src
+            .find(sig)
+            .unwrap_or_else(|| panic!("{sig} must exist; if it was renamed, update this guard"));
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    fn ")
+            .or_else(|| rest[1..].find("\n    pub fn "))
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        rest[..end].to_string()
+    }
+
+    #[test]
+    fn set_label_refuses_an_unknown_fingerprint_rather_than_inserting_it() {
+        let src = production(include_str!("service.rs"));
+        let body = body_of(&src, "fn set_label(");
+        assert!(
+            body.contains("contains_key"),
+            "set_label must CHECK that the fingerprint is already authorized"
+        );
+        // The refusal must come before any write. If the only `insert` is
+        // reachable unconditionally, this verb is a trust grant in disguise.
+        let check = body.find("contains_key").expect("checked above");
+        let insert = body.find(".insert(").expect("set_label must write a label");
+        assert!(
+            check < insert,
+            "set_label must refuse an unknown fingerprint BEFORE writing — otherwise \
+             renaming is a way to authorize"
+        );
+        assert!(
+            body.contains("return"),
+            "the unknown-fingerprint path must return, not fall through"
+        );
+    }
+
+    #[test]
+    fn renaming_in_the_frontends_no_longer_sends_authorize_key() {
+        for (name, src) in [
+            (
+                "hops-slint",
+                production(include_str!("../crates/hops-slint/src/lib.rs")),
+            ),
+            (
+                "hops-tui",
+                production(include_str!("../crates/hops-tui/src/lib.rs")),
+            ),
+        ] {
+            // AuthorizeKey may still appear — approving a NEW device is a genuine
+            // trust grant. What must not appear is a rename path that uses it.
+            assert!(
+                src.contains("SetLabel"),
+                "{name} must have a rename path that is not a trust grant"
             );
         }
     }
