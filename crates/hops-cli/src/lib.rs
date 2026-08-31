@@ -33,8 +33,6 @@ struct Client {
     port: Option<u16>,
     #[arg(long)]
     ips: Option<Vec<IpAddr>>,
-    #[arg(long)]
-    enter_hook: Option<String>,
 }
 
 #[derive(Clone, Subcommand, Debug, PartialEq, Eq)]
@@ -87,7 +85,6 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
             hostname,
             port,
             ips,
-            enter_hook,
         }) => {
             tx.request(FrontendRequest::Create).await?;
             while let Some(e) = rx.next().await {
@@ -102,10 +99,6 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                     }
                     if let Some(ips) = ips {
                         tx.request(FrontendRequest::UpdateFixIps(handle, ips))
-                            .await?;
-                    }
-                    if let Some(enter_hook) = enter_hook {
-                        tx.request(FrontendRequest::UpdateEnterHook(handle, Some(enter_hook)))
                             .await?;
                     }
                     break;

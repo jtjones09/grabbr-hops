@@ -325,8 +325,12 @@ pub enum FrontendRequest {
     AuthorizeKey(String, String),
     /// remove fingerprint (fingerprint)
     RemoveAuthorizedKey(String),
-    /// change the hook command
-    UpdateEnterHook(u64, Option<String>),
+    // NOTE: there is deliberately NO verb here for the enter hook. It is
+    // executed with `sh -c` (src/service.rs), so exposing it on this channel
+    // made reaching the frontend socket equivalent to arbitrary command
+    // execution. `enter_hook` is a CONFIG-FILE-ONLY field; setting it requires
+    // write access to the config directory. See issue #56, and the guard test
+    // in src/service.rs that fails if a shell becomes reachable from here again.
     /// save config file
     SaveConfiguration,
 }
