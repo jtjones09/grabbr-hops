@@ -280,15 +280,30 @@ impl LanMouseConnection {
                 if !self.client_manager.alive(handle) {
                     return Err(LanMouseConnectionError::TargetEmulationDisabled);
                 }
-                let result = {
+                // Bounded, or a peer that stops reading freezes the capture task
+                // that is draining this machine's own input (#64). Dropping the
+                // future on timeout abandons the stalled write rather than
+                // pinning the task; the peer is then disconnected exactly as a
+                // write error would.
+                let result = tokio::time::timeout(transport::INPUT_SEND_TIMEOUT, async {
                     let mut send = link.send.lock().await;
                     transport::write_frame(&mut send, event).await
-                };
-                if let Err(e) = result {
-                    log::warn!("client {handle} failed to send: {e}");
-                    disconnect(&self.client_manager, handle, addr, &self.conns).await;
-                } else {
-                    log::trace!("{event} >->->->->- {addr}");
+                })
+                .await;
+                match result {
+                    Ok(Ok(())) => log::trace!("{event} >->->->->- {addr}"),
+                    Ok(Err(e)) => {
+                        log::warn!("client {handle} failed to send: {e}");
+                        disconnect(&self.client_manager, handle, addr, &self.conns).await;
+                    }
+                    Err(_) => {
+                        log::warn!(
+                            "client {handle} stopped reading its input stream for {:?} — \
+                             dropping it rather than letting it freeze capture on this machine",
+                            transport::INPUT_SEND_TIMEOUT
+                        );
+                        disconnect(&self.client_manager, handle, addr, &self.conns).await;
+                    }
                 }
                 return Ok(());
             }
@@ -811,6 +826,133 @@ mod tests {
                 );
             }
         });
+    }
+
+    /// A peer that stops reading its input stream must NOT be able to freeze the
+    /// sender's capture task.
+    ///
+    /// That task is the sole consumer of `capture.next()`, and it awaits this
+    /// write inline. Unbounded, a hostile peer advertising a tiny stream receive
+    /// window pends the write within milliseconds, the user's own input stops
+    /// being drained, and on macOS the event tap blocks behind a 32-slot channel
+    /// until the kernel disables it — with the re-enable path inside the blocked
+    /// callback, so capture is then silently and permanently gone (#64).
+    ///
+    /// The hostile peer here is one line: a server whose `stream_receive_window`
+    /// is 64 bytes. That is the attack as issue #64 describes it, not an
+    /// approximation of it.
+    #[test]
+    fn a_peer_that_stops_reading_cannot_pin_the_sender() {
+        transport::install_crypto_provider();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let server = identity();
+
+            // A hostile receiver: accepts the connection, advertises almost no
+            // stream credit, and NEVER reads.
+            let mut cfg = open_server(&server);
+            let mut tc = quinn::TransportConfig::default();
+            tc.stream_receive_window(64u32.into());
+            cfg.transport_config(Arc::new(tc));
+
+            let ep = Endpoint::server(cfg, "127.0.0.1:0".parse().expect("addr"))
+                .expect("server endpoint");
+            let addr = ep.local_addr().expect("local addr");
+            spawn_local(async move {
+                while let Some(incoming) = ep.accept().await {
+                    spawn_local(async move {
+                        // accept, then deliberately never read a byte
+                        if let Ok(conn) = incoming.await {
+                            std::future::pending::<()>().await;
+                            drop(conn);
+                        }
+                    });
+                }
+            });
+
+            let client = identity();
+            let trusted: Authorized = Arc::new(RwLock::new(HashMap::from([(
+                transport::fingerprint_of(&server.cert),
+                "hostile".to_string(),
+            )])));
+            let observed = Arc::new(StdMutex::new(None));
+            let client_ep =
+                Endpoint::client("127.0.0.1:0".parse().expect("addr")).expect("client endpoint");
+            let cfg = client_config(&client, trusted, observed);
+            let conn = client_ep
+                .connect_with(cfg, addr, "grabbr")
+                .expect("connect")
+                .await
+                .expect("handshake");
+            let mut send = conn.open_uni().await.expect("open uni");
+
+            // Write until the peer's credit runs out. Every write is bounded, so
+            // this must terminate; unbounded, the first stalled write never
+            // returns and this test hangs forever — which is the bug.
+            let started = tokio::time::Instant::now();
+            let mut stalled = false;
+            for _ in 0..2000 {
+                let r = tokio::time::timeout(
+                    transport::INPUT_SEND_TIMEOUT,
+                    transport::write_frame(&mut send, ProtoEvent::Ping),
+                )
+                .await;
+                if r.is_err() {
+                    stalled = true;
+                    break;
+                }
+                if r.expect("timeout").is_err() {
+                    break;
+                }
+            }
+            let elapsed = started.elapsed();
+
+            assert!(
+                stalled,
+                "a peer advertising 64 bytes of credit and never reading must stall \
+                 the send — if it did not, this test is not exercising #64"
+            );
+            assert!(
+                elapsed < transport::INPUT_SEND_TIMEOUT * 8,
+                "the stall must be REAPED, not merely survived: {elapsed:?}"
+            );
+            conn.close(0u32.into(), b"done");
+        });
+    }
+
+    /// The runtime test above proves the stall is real and that the timeout reaps
+    /// it. This proves the SEND PATH ACTUALLY USES IT — the wiring, which no
+    /// runtime test here reaches without standing up a full `LanMouseConnection`.
+    #[test]
+    fn the_input_send_path_is_bounded() {
+        let src = include_str!("connect.rs");
+        let start = src
+            .find("pub(crate) async fn send(")
+            .expect("send() must exist; if it was renamed, update this guard");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    pub(crate) async fn ")
+            .or_else(|| rest[1..].find("\n    async fn "))
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        let body: String = rest[..end]
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // The WRAPPING, not a mention: the constant also appears in the log line
+        // for the timeout arm, so `contains("INPUT_SEND_TIMEOUT")` passes even
+        // with the bound removed. That false pass is why this is spelled out.
+        assert!(
+            body.contains("timeout(transport::INPUT_SEND_TIMEOUT"),
+            "the input send must be WRAPPED in `timeout(transport::INPUT_SEND_TIMEOUT, ..)`. \
+             Unbounded, a peer that stops reading freezes the capture task that drains \
+             THIS machine's input, and on macOS the event tap dies with it — issue #64."
+        );
     }
 
     /// The outbound mirror of `listen::tests::revoked_peer_cannot_resume_its_way_back_in`.
