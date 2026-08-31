@@ -147,13 +147,29 @@ impl InputCapture {
 
     /// destroy the client with the given id, if it exists
     pub async fn destroy(&mut self, id: CaptureHandle) -> Result<(), CaptureError> {
-        let pos = self
-            .id_map
-            .remove(&id)
-            .expect("no position for this handle");
+        // Drop anything already queued FOR THIS HANDLE. When two handles share a
+        // position — the ordinary bidirectional setup, an outgoing client and an
+        // inbound peer on the same edge — `poll_next` fans one backend event into
+        // `pending`, one copy per handle, and `pending` is drained ahead of the
+        // backend. Destroying only cleared `id_map` and `position_map`, so a copy
+        // for a handle the consumer had ALREADY forgotten still came back out,
+        // and the consumer looks handles up with `.expect()`. With
+        // `panic = "abort"` that ended the process (#63).
+        self.pending.retain(|&(queued, _)| queued != id);
+
+        // A handle we do not know is not an error worth aborting over. It is the
+        // shape of a double-destroy, and `update_incoming` does
+        // remove-then-create back to back on the hot path.
+        let Some(pos) = self.id_map.remove(&id) else {
+            log::debug!("destroy: no capture {id} — already gone");
+            return Ok(());
+        };
 
         log::debug!("destroying capture {id} @ {pos}");
-        let remaining = self.position_map.get_mut(&pos).expect("id vector");
+        let Some(remaining) = self.position_map.get_mut(&pos) else {
+            log::debug!("destroy: no ids registered @ {pos}");
+            return Ok(());
+        };
         remaining.retain(|&i| i != id);
 
         log::debug!("remaining ids @ {pos}: {remaining:?}");
@@ -366,4 +382,86 @@ async fn create(
         }
     }
     Err(CaptureCreationError::NoAvailableBackend)
+}
+
+#[cfg(test)]
+mod destroy_purges_pending {
+    //! `destroy` must forget a handle's QUEUED events, not just its registration.
+    //!
+    //! When two handles share a position — an outgoing client and an inbound
+    //! peer on the same edge, the ordinary bidirectional setup — `poll_next`
+    //! fans one backend event into `pending`, one copy per handle, and `pending`
+    //! is drained ahead of the backend. `destroy` cleared `id_map` and
+    //! `position_map` and left `pending` alone, so a copy for a handle the
+    //! consumer had already forgotten still came back out of the stream. The
+    //! consumer looks handles up by `.expect()`, and with `panic = "abort"` in
+    //! the release profile that ended the process outright — stranding every
+    //! key and button any peer was holding (#63).
+    //!
+    //! This is the first test in this crate. It is possible because
+    //! `Backend::Dummy` needs no display, no compositor and no permissions.
+
+    use super::*;
+
+    async fn capture() -> InputCapture {
+        InputCapture::new(Some(Backend::Dummy))
+            .await
+            .expect("the dummy backend needs no display")
+    }
+
+    #[tokio::test]
+    async fn a_destroyed_handle_leaves_no_queued_events_behind() {
+        let mut c = capture().await;
+        c.create(1, Position::Left).await.expect("create 1");
+        c.create(2, Position::Left).await.expect("create 2");
+
+        // Exactly what the fan-out does when two handles share a position.
+        c.pending.push_back((1, CaptureEvent::Begin));
+        c.pending.push_back((2, CaptureEvent::Begin));
+
+        c.destroy(2).await.expect("destroy 2");
+
+        assert!(
+            !c.id_map.contains_key(&2),
+            "precondition: the handle is deregistered"
+        );
+        assert!(
+            c.pending.iter().all(|&(h, _)| h != 2),
+            "a destroyed handle must leave nothing queued — the consumer has already \
+             forgotten it and looks handles up fallibly"
+        );
+        assert!(
+            c.pending.iter().any(|&(h, _)| h == 1),
+            "and the surviving handle's events must be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn destroying_an_unknown_handle_is_not_fatal() {
+        // `update_incoming` does remove-then-create back to back on the hot path,
+        // so a double-destroy is a shape that actually occurs. It used to
+        // `.expect("no position for this handle")`.
+        let mut c = capture().await;
+        c.create(1, Position::Left).await.expect("create");
+        c.destroy(1).await.expect("first destroy");
+        c.destroy(1)
+            .await
+            .expect("a second destroy must be a no-op, not an abort");
+        c.destroy(99)
+            .await
+            .expect("an unknown handle must be a no-op, not an abort");
+    }
+
+    #[tokio::test]
+    async fn destroying_one_of_two_leaves_the_position_alive() {
+        let mut c = capture().await;
+        c.create(1, Position::Right).await.expect("create 1");
+        c.create(2, Position::Right).await.expect("create 2");
+        c.destroy(1).await.expect("destroy 1");
+        assert_eq!(
+            c.position_map.get(&Position::Right).map(|v| v.as_slice()),
+            Some([2].as_slice()),
+            "the other handle keeps the position registered"
+        );
+    }
 }
