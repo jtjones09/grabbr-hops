@@ -669,6 +669,24 @@ fn send_addr(s: &DeviceSend) -> String {
         .unwrap_or_else(|| "unresolved".into())
 }
 
+/// The peer's build id, from the `Hello` proto event.
+///
+/// The daemon has always known what build the machine on the other end is
+/// running, and no frontend showed it. Every "which build is each box on?"
+/// question this month cost an SSH round trip to go and ask — and on the night
+/// the Windows box's SSH was unreachable, the answer was sitting in memory on
+/// this side the whole time (#45).
+///
+/// `None` means no `Hello` yet: a fresh connection, or a peer predating the
+/// event. Render that as `build ?` rather than blank, so "we do not know" is
+/// visibly different from "there is nothing to show".
+fn peer_build(d: &Device) -> String {
+    match d.send.as_ref().and_then(|s| s.state.peer_commit) {
+        Some(c) => format!("@{}", String::from_utf8_lossy(&c)),
+        None => "@?".to_string(),
+    }
+}
+
 /// One row of the unified device list.
 ///
 /// The two facets a device can have — we cross *to* it, it may connect *in* to
@@ -736,6 +754,7 @@ fn device_row(d: &Device, theme: &Theme) -> ListItem<'static> {
     ));
 
     if let Some(s) = &d.send {
+        spans.push(Span::styled(format!("{} ", peer_build(d)), muted));
         spans.push(Span::raw(format!("{} ", send_addr(s))));
         spans.push(Span::styled(
             format!("({}) ", s.config.pos),
@@ -1412,5 +1431,52 @@ mod tests {
             !model.clients.values().any(|(c, _)| c.pos == third),
             "third device must not collide"
         );
+    }
+
+    /// The peer's build must be visible without an SSH round trip (#45).
+    #[test]
+    fn a_connected_peer_shows_the_build_it_is_running() {
+        let mut model = AppModel::default();
+        model.clients.insert(
+            0,
+            (
+                ClientConfig {
+                    hostname: Some("ScornW20".into()),
+                    ..Default::default()
+                },
+                ClientState {
+                    peer_fingerprint: Some(FP.into()),
+                    peer_commit: Some(*b"9061273c"),
+                    active: true,
+                    alive: true,
+                    ..Default::default()
+                },
+            ),
+        );
+        let out = screen(&model, 0);
+        assert!(
+            out.contains("@9061273c"),
+            "the peer's build should be on the row:\n{out}"
+        );
+    }
+
+    /// "we have not been told" must look different from "nothing to show" —
+    /// a blank would read as agreement.
+    #[test]
+    fn an_unknown_peer_build_is_shown_as_unknown_not_blank() {
+        let mut model = AppModel::default();
+        model.clients.insert(
+            0,
+            (
+                ClientConfig {
+                    hostname: Some("new-box".into()),
+                    ..Default::default()
+                },
+                // no Hello yet -> peer_commit is None
+                ClientState::default(),
+            ),
+        );
+        let out = screen(&model, 0);
+        assert!(out.contains("@?"), "unknown build must be explicit:\n{out}");
     }
 }
