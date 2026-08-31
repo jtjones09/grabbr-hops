@@ -325,6 +325,14 @@ pub enum FrontendRequest {
     AuthorizeKey(String, String),
     /// remove fingerprint (fingerprint)
     RemoveAuthorizedKey(String),
+    /// rename an ALREADY-authorized device: (fingerprint, label)
+    ///
+    /// Renaming used to re-send `AuthorizeKey`, so on this wire a rename and a
+    /// trust grant were the same request — a UI could not express "call this
+    /// device something else" without also expressing "trust this fingerprint".
+    /// This verb deliberately CANNOT grant: an unknown fingerprint is refused,
+    /// not inserted (#117-adjacent, Layer 1 of CONSENT-ARCHITECTURE.md).
+    SetLabel(String, String),
     // NOTE: there is deliberately NO verb here for the enter hook. It is
     // executed with `sh -c` (src/service.rs), so exposing it on this channel
     // made reaching the frontend socket equivalent to arbitrary command

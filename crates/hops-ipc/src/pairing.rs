@@ -99,7 +99,7 @@ pub fn valid_fingerprint(fp: &str) -> bool {
 /// Strip control / bidi / zero-width characters and clamp length — the label is
 /// attacker-influenced and gets rendered + logged, so defeat homoglyph/bidi
 /// spoofing of a trusted name.
-fn sanitize_label(s: &str) -> String {
+pub fn sanitize_label(s: &str) -> String {
     s.chars()
         .filter(|c| {
             !c.is_control()

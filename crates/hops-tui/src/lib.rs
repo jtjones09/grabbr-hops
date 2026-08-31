@@ -75,8 +75,15 @@ enum Input {
     Add { buf: String },
     /// Editing an outgoing client's hostname.
     Hostname { handle: ClientHandle, buf: String },
-    /// Naming a trusted peer (new pairing approval, or rename existing).
-    TrustedName { fp: String, buf: String },
+    /// Naming a peer. `granting` distinguishes the two things this used to
+    /// conflate: approving a NEW device (a trust grant) versus renaming one that
+    /// is already trusted. They were the same wire request, so a rename could
+    /// not be expressed without also expressing "trust this fingerprint".
+    TrustedName {
+        fp: String,
+        buf: String,
+        granting: bool,
+    },
     /// Editing the daemon's listen port.
     Port { buf: String },
 }
@@ -342,7 +349,7 @@ pub async fn run() -> Result<(), TuiError> {
                                     let val = (!buf.trim().is_empty()).then_some(buf);
                                     client.request(FrontendRequest::UpdateHostname(handle, val));
                                 }
-                                Input::TrustedName { fp, buf } => {
+                                Input::TrustedName { fp, buf, granting } => {
                                     let desc = if buf.trim().is_empty() {
                                         // same fallback the GUI uses, so a peer
                                         // approved with no name gets one name
@@ -350,7 +357,11 @@ pub async fn run() -> Result<(), TuiError> {
                                     } else {
                                         buf.trim().to_string()
                                     };
-                                    client.request(FrontendRequest::AuthorizeKey(desc, fp));
+                                    if granting {
+                                        client.request(FrontendRequest::AuthorizeKey(desc, fp));
+                                    } else {
+                                        client.request(FrontendRequest::SetLabel(fp, desc));
+                                    }
                                 }
                                 Input::Port { buf } => {
                                     if let Ok(port) = buf.trim().parse::<u16>() {
@@ -397,7 +408,11 @@ pub async fn run() -> Result<(), TuiError> {
                         // ---- pairing-approval prompt ----
                         match k.code {
                             KeyCode::Char('y') => {
-                                input = Some(Input::TrustedName { fp, buf: String::new() });
+                                input = Some(Input::TrustedName {
+                                    fp,
+                                    buf: String::new(),
+                                    granting: true,
+                                });
                             }
                             KeyCode::Char('n') | KeyCode::Esc => {
                                 dismissed.insert(fp, Instant::now());
@@ -469,6 +484,7 @@ pub async fn run() -> Result<(), TuiError> {
                                         input = Some(Input::TrustedName {
                                             fp,
                                             buf: d.label.clone(),
+                                            granting: false,
                                         });
                                     }
                                 }
