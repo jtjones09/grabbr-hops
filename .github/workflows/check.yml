@@ -107,6 +107,30 @@ jobs:
           fi
           echo "OK: installer grants no input-group membership."
 
+  # A build script runs on the HOST. `cfg!(unix)` / `cfg!(target_os = ...)` inside
+  # one therefore describes the build machine, not the target — which silently
+  # disabled every Unix input backend on any cross-compile while still reporting
+  # success (#44). The correct source is CARGO_CFG_TARGET_OS / _TARGET_FAMILY.
+  #
+  # `cfg!(feature = ...)` is fine and stays allowed: features ARE passed through.
+  build-scripts-read-the-target:
+    name: build scripts read the target, not the host
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: no host platform predicates in build.rs
+        run: |
+          # strip comment lines first — the fixed scripts explain the trap in prose
+          if grep -rnE '^[^/]*cfg!\((unix|windows|target_os|target_family|target_arch)' \
+               --include='build.rs' . ; then
+            echo "::error::A build script is reading a HOST cfg. Build scripts run on the"
+            echo "host, so this describes the build machine, not the target — it silently"
+            echo "mis-configures every cross-compile. Use CARGO_CFG_TARGET_OS /"
+            echo "CARGO_CFG_TARGET_FAMILY instead. cfg!(feature = ...) is fine."
+            exit 1
+          fi
+          echo "OK: build scripts derive platform from the target."
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
