@@ -395,6 +395,62 @@ pub enum ConfigError {
 const DEFAULT_RELEASE_KEYS: [scancode::Linux; 4] =
     [KeyLeftCtrl, KeyLeftShift, KeyLeftMeta, KeyLeftAlt];
 
+/// Create (or truncate) a file that is private to the owner from the moment it
+/// exists. Never create-then-chmod: that leaves a window in which the file is
+/// world-readable, and the file this is used for holds `[authorized_fingerprints]`
+/// — the list of keys allowed to take this machine's keyboard and mouse.
+///
+/// Same pattern, and the same reason, as `hops_ipc::token::write_private`.
+fn create_private(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        File::create(path)
+    }
+}
+
+/// Tighten an existing config directory and config file that were created before
+/// this was enforced.
+///
+/// Measured on 2026-08-30: `~/.config/lan-mouse` was `drwxr-xr-x` and
+/// `config.toml` was `-rw-r--r--`, while the private key was `0400` and the IPC
+/// token `0600`. The most permissive file in the directory was the one that
+/// grants keyboard control. New files are created correctly by `create_private`;
+/// this repairs the installs that already exist, because a fix that only applies
+/// going forward leaves every current user exposed.
+///
+/// Best-effort by design: a failure here must not stop the daemon from starting.
+#[cfg(unix)]
+fn harden_existing(config_dir: &Path, config_path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let tighten = |p: &Path, want: u32| {
+        let Ok(meta) = fs::metadata(p) else { return };
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & !want != 0 {
+            let mut perm = meta.permissions();
+            perm.set_mode(want);
+            match fs::set_permissions(p, perm) {
+                Ok(()) => log::info!("tightened {} from {:o} to {:o}", p.display(), mode, want),
+                Err(e) => log::warn!("could not tighten {}: {e}", p.display()),
+            }
+        }
+    };
+    tighten(config_dir, 0o700);
+    tighten(config_path, 0o600);
+}
+
+#[cfg(not(unix))]
+fn harden_existing(_config_dir: &Path, _config_path: &Path) {}
+
 impl Config {
     pub fn new() -> Result<Self, ConfigError> {
         let args = Args::parse();
@@ -419,8 +475,11 @@ impl Config {
         if !config_path.exists() {
             let default_toml = toml_edit::ser::to_string_pretty(&ConfigToml::default())
                 .expect("default ConfigToml serialization cannot fail");
-            fs::write(&config_path, default_toml)?;
+            let mut f = create_private(&config_path)?;
+            f.write_all(default_toml.as_bytes())?;
         }
+        // Repair installs created before the modes above were enforced.
+        harden_existing(&config_dir, &config_path);
 
         let config_toml = match ConfigToml::new(&config_path) {
             Err(e) => {
@@ -649,7 +708,7 @@ impl Config {
             fs::create_dir_all(p)?;
         }
         {
-            let mut f = File::create(self.config_path())?;
+            let mut f = create_private(&self.config_path())?;
             f.write_all(new_config.as_bytes())?;
             f.sync_all()?;
         }
@@ -657,5 +716,99 @@ impl Config {
         let _ = self.watch();
 
         Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod permission_tests {
+    //! The trust store must not be world-readable.
+    //!
+    //! `config.toml` holds `[authorized_fingerprints]` — the keys allowed to take
+    //! this machine's keyboard and mouse. Before 2026-08-30 it was written with a
+    //! bare `File::create`, landing at umask (0644 on the developer's own Mac)
+    //! while the private key was 0400 and the IPC token 0600.
+
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode_of(p: &Path) -> u32 {
+        fs::metadata(p).expect("exists").permissions().mode() & 0o777
+    }
+
+    fn tmpdir(name: &str) -> PathBuf {
+        let mut d = std::env::temp_dir();
+        d.push(format!("hops-perm-test-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).expect("mkdir");
+        d
+    }
+
+    #[test]
+    fn a_new_config_file_is_owner_only() {
+        let d = tmpdir("new");
+        let p = d.join("config.toml");
+        let mut f = create_private(&p).expect("create");
+        f.write_all(b"[authorized_fingerprints]\n").expect("write");
+        drop(f);
+        assert_eq!(
+            mode_of(&p),
+            0o600,
+            "the trust store must be 0600 from the moment it exists"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn create_private_tightens_a_world_readable_file() {
+        // The create-then-chmod window this exists to avoid: prove that even when
+        // a permissive file is already there, reopening it lands owner-only.
+        let d = tmpdir("existing");
+        let p = d.join("config.toml");
+        fs::write(&p, b"old").expect("seed");
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).expect("chmod");
+        assert_eq!(mode_of(&p), 0o644, "precondition");
+
+        let mut f = create_private(&p).expect("create");
+        f.write_all(b"new").expect("write");
+        drop(f);
+        harden_existing(&d, &p);
+
+        assert_eq!(
+            mode_of(&p),
+            0o600,
+            "an existing 0644 trust store must be repaired"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn harden_existing_repairs_a_world_readable_install() {
+        let d = tmpdir("repair");
+        let p = d.join("config.toml");
+        fs::write(&p, b"[authorized_fingerprints]\n").expect("seed");
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).expect("chmod dir");
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).expect("chmod file");
+        assert_eq!((mode_of(&d), mode_of(&p)), (0o755, 0o644), "precondition");
+
+        harden_existing(&d, &p);
+
+        assert_eq!(mode_of(&d), 0o700, "config dir must end up owner-only");
+        assert_eq!(mode_of(&p), 0o600, "trust store must end up owner-only");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn harden_existing_does_not_loosen_a_stricter_install() {
+        let d = tmpdir("strict");
+        let p = d.join("config.toml");
+        fs::write(&p, b"x").expect("seed");
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o400)).expect("chmod");
+        harden_existing(&d, &p);
+        assert_eq!(
+            mode_of(&p),
+            0o400,
+            "must never widen an already-stricter mode"
+        );
+        let _ = fs::remove_dir_all(&d);
     }
 }
