@@ -138,16 +138,67 @@ async fn connect(
     ))
 }
 
+/// What to do with the fingerprints a failed parallel dial observed.
+#[derive(Debug, PartialEq)]
+enum TrustPrompt {
+    /// nothing answered
+    Nothing,
+    /// every address that answered agrees on one identity — offer it
+    Offer { addr: SocketAddr, fp: String },
+    /// the addresses answered as DIFFERENT machines
+    Conflict,
+}
+
+/// Decide from what the addresses actually said, not from which one spoke last.
+///
+/// With a shared observed-slot this was implicitly `Offer(whatever finished
+/// last)`, so an impostor that simply answers slower than the real receiver
+/// decided which fingerprint the user was asked to trust — and the user, who
+/// just added this device and is expecting a prompt, approves it (#72).
+///
+/// A conflict is not a tie to be broken. Two machines answering for one name is
+/// the alarm, and it cannot be resolved by a prompt that names neither address.
+fn decide_trust_prompt(seen: &[(SocketAddr, String)]) -> TrustPrompt {
+    let mut distinct: Vec<&String> = seen.iter().map(|(_, fp)| fp).collect();
+    distinct.sort();
+    distinct.dedup();
+    match distinct.len() {
+        0 => TrustPrompt::Nothing,
+        1 => {
+            let (addr, fp) = &seen[0];
+            TrustPrompt::Offer {
+                addr: *addr,
+                fp: fp.clone(),
+            }
+        }
+        _ => TrustPrompt::Conflict,
+    }
+}
+
+/// One address in a parallel dial, with the fingerprint slot for THAT address.
+///
+/// The slots must not be shared. A hostname resolving to several addresses does
+/// NOT mean they are the same machine — an extra A record, an mDNS spoof or a
+/// stale DHCP lease now held by someone else all produce exactly that shape, and
+/// that is the case where knowing which address answered with which identity
+/// matters most (#72).
+struct Dial {
+    addr: SocketAddr,
+    cfg: ClientConfig,
+    observed: Arc<StdMutex<Option<String>>>,
+}
+
 async fn connect_any(
     endpoint: &Endpoint,
-    cfg: &ClientConfig,
-    addrs: &[SocketAddr],
+    dials: &[Dial],
     expected_fp: Option<String>,
 ) -> Result<(PeerLink, SocketAddr), LanMouseConnectionError> {
+    let addrs: Vec<SocketAddr> = dials.iter().map(|d| d.addr).collect();
     let mut joinset = JoinSet::new();
-    for &addr in addrs {
+    for d in dials {
         let endpoint = endpoint.clone();
-        let cfg = cfg.clone();
+        let cfg = d.cfg.clone();
+        let addr = d.addr;
         let expected = expected_fp.clone();
         joinset.spawn_local(connect(endpoint, cfg, addr, expected));
     }
@@ -414,12 +465,26 @@ async fn connect_to_handle(
         // Pin to the client's known identity (if any) so the parallel race
         // fails closed against a wrong-but-allowlisted receiver at a raced addr.
         let expected_fp = client_manager.peer_fingerprint(handle);
-        // One slot per dial attempt. Every address raced below is the SAME
-        // intended peer, so they may share it; a concurrent dial for a different
-        // handle gets its own and cannot clobber this one.
-        let observed = Arc::new(StdMutex::new(None));
-        let cfg = client_config(&identity, authorized.clone(), observed.clone());
-        let (link, addr) = match connect_any(&endpoint, &cfg, &addrs, expected_fp).await {
+        // ONE SLOT PER ADDRESS. The previous comment here reasoned that "every
+        // address raced below is the SAME intended peer, so they may share it".
+        // That is the assumption #72 breaks: a hostname resolving to two
+        // addresses does not mean two addresses of one machine. With a shared
+        // slot the LAST verifier to run wins, so an impostor that simply answers
+        // slower than the real receiver decides which fingerprint the user is
+        // asked to trust — and the user, who just added this device and is
+        // expecting a prompt, approves it.
+        let dials: Vec<Dial> = addrs
+            .iter()
+            .map(|&addr| {
+                let observed = Arc::new(StdMutex::new(None));
+                Dial {
+                    addr,
+                    cfg: client_config(&identity, authorized.clone(), observed.clone()),
+                    observed,
+                }
+            })
+            .collect();
+        let (link, addr) = match connect_any(&endpoint, &dials, expected_fp).await {
             Ok(c) => c,
             Err(e) => {
                 connecting.lock().await.remove(&handle);
@@ -434,16 +499,42 @@ async fn connect_to_handle(
                          and authorize the new one."
                     ),
                     _ => {
-                        if let Some(fp) = observed.lock().expect("lock").take() {
-                            log::warn!(
-                                "client {handle}: receiver fingerprint {fp} is not \
-                                 authorized — prompting to trust it"
-                            );
-                            // Hand it to the service, which checks it against the
-                            // allowlist and raises a ConnectionAttempt if it really
-                            // is untrusted. Filtering lives there because that is
-                            // where the allowlist lives.
-                            let _ = untrusted_tx.send(fp);
+                        let seen: Vec<(SocketAddr, String)> = dials
+                            .iter()
+                            .filter_map(|d| {
+                                d.observed
+                                    .lock()
+                                    .expect("lock")
+                                    .take()
+                                    .map(|fp| (d.addr, fp))
+                            })
+                            .collect();
+                        match decide_trust_prompt(&seen) {
+                            TrustPrompt::Nothing => {}
+                            TrustPrompt::Offer { addr, fp } => {
+                                log::warn!(
+                                    "client {handle}: {addr} answered with fingerprint {fp}, \
+                                     which is not authorized — prompting to trust it"
+                                );
+                                // Hand it to the service, which checks it against
+                                // the allowlist and raises a ConnectionAttempt if it
+                                // really is untrusted. Filtering lives there because
+                                // that is where the allowlist lives.
+                                let _ = untrusted_tx.send(fp);
+                            }
+                            TrustPrompt::Conflict => {
+                                log::error!(
+                                    "client {handle}: the addresses for this device answered \
+                                     with DIFFERENT identities, so hops will not offer to \
+                                     trust any of them. This is what a spoofed record, a \
+                                     stale DHCP lease, or two machines sharing a name looks \
+                                     like. Seen: {}",
+                                    seen.iter()
+                                        .map(|(a, f)| format!("{a} -> {f}"))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                );
+                            }
                         }
                     }
                 }
@@ -953,6 +1044,146 @@ mod tests {
              Unbounded, a peer that stops reading freezes the capture task that drains \
              THIS machine's input, and on macOS the event tap dies with it — issue #64."
         );
+    }
+
+    fn seen(pairs: &[(&str, &str)]) -> Vec<(SocketAddr, String)> {
+        pairs
+            .iter()
+            .map(|(a, f)| (a.parse().expect("addr"), f.to_string()))
+            .collect()
+    }
+
+    /// A hostname resolving to two addresses does NOT mean two addresses of one
+    /// machine. An extra A record, an mDNS spoof, or a stale DHCP lease now held
+    /// by someone else all produce exactly that shape.
+    ///
+    /// With one shared observed-slot the LAST verifier to run won, so an impostor
+    /// that simply answers SLOWER than the real receiver decided which fingerprint
+    /// the user was asked to trust — and the user, who just added this device and
+    /// is expecting a prompt, approves it. Approving it authorizes the attacker in
+    /// BOTH directions: outbound so every keystroke goes to them, and inbound so
+    /// their input is injected here (#72).
+    #[test]
+    fn addresses_that_disagree_produce_no_prompt() {
+        let d = decide_trust_prompt(&seen(&[
+            ("10.0.0.5:4242", "aa:aa"),
+            ("10.0.0.99:4242", "bb:bb"),
+        ]));
+        assert_eq!(
+            d,
+            TrustPrompt::Conflict,
+            "two identities for one device must never be resolved by offering one of \
+             them — the disagreement IS the finding, and a prompt naming neither \
+             address cannot convey it"
+        );
+    }
+
+    #[test]
+    fn a_slower_impostor_does_not_win() {
+        // Order here is arrival order. Last-write-wins would offer bb:bb.
+        let d = decide_trust_prompt(&seen(&[
+            ("10.0.0.5:4242", "aa:aa"),
+            ("10.0.0.99:4242", "bb:bb"),
+        ]));
+        assert_ne!(
+            d,
+            TrustPrompt::Offer {
+                addr: "10.0.0.99:4242".parse().expect("addr"),
+                fp: "bb:bb".into()
+            },
+            "answering last must not decide who the user is asked to trust"
+        );
+    }
+
+    #[test]
+    fn agreeing_addresses_still_prompt() {
+        // The ordinary case — one machine, several addresses — must keep working,
+        // or this hardening has broken first-contact pairing instead.
+        let d = decide_trust_prompt(&seen(&[
+            ("10.0.0.5:4242", "aa:aa"),
+            ("10.0.0.5:4243", "aa:aa"),
+        ]));
+        assert_eq!(
+            d,
+            TrustPrompt::Offer {
+                addr: "10.0.0.5:4242".parse().expect("addr"),
+                fp: "aa:aa".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_single_address_still_prompts() {
+        let d = decide_trust_prompt(&seen(&[("10.0.0.5:4242", "aa:aa")]));
+        assert!(matches!(d, TrustPrompt::Offer { .. }));
+    }
+
+    #[test]
+    fn nothing_answering_prompts_for_nothing() {
+        assert_eq!(decide_trust_prompt(&[]), TrustPrompt::Nothing);
+    }
+
+    /// The mechanism behind the decision: within ONE dial, each address must
+    /// record its own receiver's fingerprint. A shared slot leaves both holding
+    /// whichever handshake finished last, which is what made the impostor's
+    /// slowness decisive.
+    #[test]
+    fn each_address_in_one_dial_records_its_own_fingerprint() {
+        transport::install_crypto_provider();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let client = identity();
+            let empty: Authorized = Arc::new(RwLock::new(HashMap::new()));
+
+            let mut addrs = vec![];
+            let mut fps = vec![];
+            for _ in 0..2 {
+                let server = identity();
+                fps.push(transport::fingerprint_of(&server.cert));
+                let ep =
+                    Endpoint::server(open_server(&server), "127.0.0.1:0".parse().expect("addr"))
+                        .expect("server endpoint");
+                addrs.push(ep.local_addr().expect("local addr"));
+                spawn_local(async move {
+                    while let Some(incoming) = ep.accept().await {
+                        spawn_local(async move {
+                            let _ = incoming.await;
+                        });
+                    }
+                });
+            }
+
+            let client_ep =
+                Endpoint::client("127.0.0.1:0".parse().expect("addr")).expect("client endpoint");
+
+            // built exactly as connect_client builds them
+            let dials: Vec<Dial> = addrs
+                .iter()
+                .map(|&addr| {
+                    let observed = Arc::new(StdMutex::new(None));
+                    Dial {
+                        addr,
+                        cfg: client_config(&client, empty.clone(), observed.clone()),
+                        observed,
+                    }
+                })
+                .collect();
+
+            let _ = connect_any(&client_ep, &dials, None).await;
+
+            for (i, d) in dials.iter().enumerate() {
+                assert_eq!(
+                    d.observed.lock().expect("lock").clone().as_deref(),
+                    Some(fps[i].as_str()),
+                    "address {i} must record ITS OWN receiver — a shared slot would leave \
+                     both holding whichever handshake finished last"
+                );
+            }
+        });
     }
 
     /// The outbound mirror of `listen::tests::revoked_peer_cannot_resume_its_way_back_in`.
