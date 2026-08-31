@@ -42,6 +42,28 @@ pub enum ProtocolError {
     /// position type does not exist
     #[error("invalid event id: `{0}`")]
     InvalidPosition(#[from] TryFromPrimitiveError<Position>),
+    /// a field decoded cleanly but carries a value outside its defined domain
+    ///
+    /// Rejecting here, at the one choke point every backend sits behind, is what
+    /// stops a single malformed byte from an admitted peer reaching a backend
+    /// that converts it fallibly and panics. `wlroots.rs` did exactly that, and
+    /// with `panic = "abort"` it killed the receiver outright — no unwinding, so
+    /// every key and button the peer was holding stayed latched (#68, #73).
+    #[error("{field} is {value}, outside its domain 0..={max}")]
+    OutOfDomain {
+        field: &'static str,
+        value: u32,
+        max: u32,
+    },
+}
+
+/// Reject a field whose value is outside the domain every backend assumes.
+fn in_domain(field: &'static str, value: u32, max: u32) -> Result<u32, ProtocolError> {
+    if value > max {
+        Err(ProtocolError::OutOfDomain { field, value, max })
+    } else {
+        Ok(value)
+    }
 }
 
 /// Position of a client
@@ -202,28 +224,42 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
                 })))
             }
             EventType::PointerButton => {
+                let time = decode_u32(&mut buf)?;
+                let button = decode_u32(&mut buf)?;
+                let state = in_domain("pointer button state", decode_u32(&mut buf)?, 1)?;
                 Ok(Self::Input(InputEvent::Pointer(PointerEvent::Button {
-                    time: decode_u32(&mut buf)?,
-                    button: decode_u32(&mut buf)?,
-                    state: decode_u32(&mut buf)?,
+                    time,
+                    button,
+                    state,
                 })))
             }
-            EventType::PointerAxis => Ok(Self::Input(InputEvent::Pointer(PointerEvent::Axis {
-                time: decode_u32(&mut buf)?,
-                axis: decode_u8(&mut buf)?,
-                value: decode_f64(&mut buf)?,
-            }))),
-            EventType::PointerAxisValue120 => Ok(Self::Input(InputEvent::Pointer(
-                PointerEvent::AxisDiscrete120 {
-                    axis: decode_u8(&mut buf)?,
-                    value: decode_i32(&mut buf)?,
-                },
-            ))),
-            EventType::KeyboardKey => Ok(Self::Input(InputEvent::Keyboard(KeyboardEvent::Key {
-                time: decode_u32(&mut buf)?,
-                key: decode_u32(&mut buf)?,
-                state: decode_u8(&mut buf)?,
-            }))),
+            EventType::PointerAxis => {
+                let time = decode_u32(&mut buf)?;
+                let axis = in_domain("pointer axis", decode_u8(&mut buf)? as u32, 1)? as u8;
+                let value = decode_f64(&mut buf)?;
+                Ok(Self::Input(InputEvent::Pointer(PointerEvent::Axis {
+                    time,
+                    axis,
+                    value,
+                })))
+            }
+            EventType::PointerAxisValue120 => {
+                let axis = in_domain("pointer axis", decode_u8(&mut buf)? as u32, 1)? as u8;
+                let value = decode_i32(&mut buf)?;
+                Ok(Self::Input(InputEvent::Pointer(
+                    PointerEvent::AxisDiscrete120 { axis, value },
+                )))
+            }
+            EventType::KeyboardKey => {
+                let time = decode_u32(&mut buf)?;
+                let key = decode_u32(&mut buf)?;
+                let state = in_domain("key state", decode_u8(&mut buf)? as u32, 1)? as u8;
+                Ok(Self::Input(InputEvent::Keyboard(KeyboardEvent::Key {
+                    time,
+                    key,
+                    state,
+                })))
+            }
             EventType::KeyboardModifiers => Ok(Self::Input(InputEvent::Keyboard(
                 KeyboardEvent::Modifiers {
                     depressed: decode_u32(&mut buf)?,
@@ -534,6 +570,113 @@ mod tests {
         ] {
             let (decoded, _) = roundtrip(ev);
             assert_eq!(format!("{decoded}"), format!("{ev}"));
+        }
+    }
+
+    /// The frames issue #73 MEASURED decoding cleanly, which then reached a
+    /// backend that converts them fallibly and panicked. With `panic = "abort"`
+    /// that killed the receiver outright on one packet from an admitted peer.
+    ///
+    /// Each of these must now be REFUSED here, at the one choke point every
+    /// backend sits behind. `src/listen.rs` already drops a frame that fails to
+    /// decode and keeps the connection alive, so no new plumbing is needed.
+    mod out_of_domain {
+        use super::*;
+
+        /// Build a wire frame the way a peer would: tag byte then payload.
+        fn frame(bytes: &[u8]) -> [u8; MAX_EVENT_SIZE] {
+            let mut buf = [0u8; MAX_EVENT_SIZE];
+            buf[..bytes.len()].copy_from_slice(bytes);
+            buf
+        }
+
+        fn err(bytes: &[u8]) -> ProtocolError {
+            ProtoEvent::try_from(frame(bytes))
+                .expect_err("this frame must be refused — it is the #73 abort primitive")
+        }
+
+        #[test]
+        fn pointer_axis_value120_above_one_is_refused() {
+            // tag 3 = PointerAxisValue120, axis = 2. Seven bytes on the wire.
+            assert!(matches!(
+                err(&[3, 2, 0, 0, 0, 0]),
+                ProtocolError::OutOfDomain {
+                    value: 2,
+                    max: 1,
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn pointer_button_state_above_one_is_refused() {
+            // tag 1 = PointerButton, state = 2.
+            assert!(matches!(
+                err(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
+                ProtocolError::OutOfDomain {
+                    value: 2,
+                    max: 1,
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn pointer_axis_above_one_is_refused() {
+            // tag 2 = PointerAxis, axis = 2.
+            assert!(matches!(
+                err(&[2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0]),
+                ProtocolError::OutOfDomain {
+                    value: 2,
+                    max: 1,
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn key_state_above_one_is_refused() {
+            // tag 4 = KeyboardKey, state = 200.
+            assert!(matches!(
+                err(&[4, 0, 0, 0, 0, 0, 0, 0, 0, 200]),
+                ProtocolError::OutOfDomain {
+                    value: 200,
+                    max: 1,
+                    ..
+                }
+            ));
+        }
+
+        /// The domain is 0..=1 and BOTH ends must still work, or this fix has
+        /// broken scrolling and clicking rather than hardened them.
+        #[test]
+        fn every_legal_value_still_decodes() {
+            for axis in [0u8, 1] {
+                for state in [0u32, 1] {
+                    roundtrip(ProtoEvent::Input(InputEvent::Pointer(PointerEvent::Axis {
+                        time: 7,
+                        axis,
+                        value: 1.5,
+                    })));
+                    roundtrip(ProtoEvent::Input(InputEvent::Pointer(
+                        PointerEvent::AxisDiscrete120 { axis, value: -120 },
+                    )));
+                    roundtrip(ProtoEvent::Input(InputEvent::Pointer(
+                        PointerEvent::Button {
+                            time: 7,
+                            button: 272,
+                            state,
+                        },
+                    )));
+                    roundtrip(ProtoEvent::Input(InputEvent::Keyboard(
+                        KeyboardEvent::Key {
+                            time: 7,
+                            key: 30,
+                            state: state as u8,
+                        },
+                    )));
+                }
+            }
         }
     }
 }

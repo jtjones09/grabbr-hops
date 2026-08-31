@@ -94,15 +94,23 @@ impl WlrootsEmulation {
 
 impl State {
     fn add_client(&mut self, client: EmulationHandle) {
+        // Check BEFORE creating protocol objects, and refuse rather than abort.
+        // `add_client` runs when a peer connects, so panicking here let a peer
+        // end the process on a session that never produced a keymap — with
+        // `panic = "abort"`, taking every other peer's held keys with it.
+        // Without a registered VirtualInput the existing `input_for_client`
+        // lookup drops this client's events, which is the right degradation.
+        let Some((format, fd, size)) = self.keymap.as_ref() else {
+            log::error!(
+                "no keymap from the compositor — refusing to register client {client}. \
+                 Input from that peer will be discarded rather than injected."
+            );
+            return;
+        };
+
         let pointer: Vp = self.vpm.create_virtual_pointer(None, &self.qh, ());
         let keyboard: Vk = self.vkm.create_virtual_keyboard(&self.seat, &self.qh, ());
-
-        // TODO: use server side keymap
-        if let Some((format, fd, size)) = self.keymap.as_ref() {
-            keyboard.keymap(*format, fd.as_fd(), *size);
-        } else {
-            panic!("no keymap");
-        }
+        keyboard.keymap(*format, fd.as_fd(), *size);
 
         let vinput = VirtualInput {
             pointer,
@@ -143,15 +151,32 @@ impl Emulation for WlrootsEmulation {
                     _ => {}
                 }
             }
-            virtual_input
-                .consume_event(event)
-                .unwrap_or_else(|_| panic!("failed to convert event: {event:?}"));
+            // NEVER panic on peer-supplied data. `consume_event` fails when a
+            // field is outside the wayland enum's domain — an axis above 1, a
+            // button state above 1 — and with `panic = "abort"` that killed the
+            // whole receiver on one packet from an admitted peer, with no
+            // unwinding, so every key and button that peer held stayed latched
+            // (#68, #73). hops-proto now rejects those values at the decoder;
+            // this is the second gate, because a backend must not be one
+            // conversion away from ending the process.
+            if virtual_input.consume_event(event).is_err() {
+                log::warn!(
+                    "dropping an event this backend cannot represent: {event:?} \
+                     (from client {handle})"
+                );
+                return Ok(());
+            }
             match self.queue.flush() {
                 Err(WaylandError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
                     self.last_flush_failed = true;
                     log::warn!("can't keep up, discarding event: ({handle}) - {event:?}");
                 }
-                Err(WaylandError::Protocol(e)) => panic!("wayland protocol violation: {e}"),
+                // A protocol violation is a broken connection, not a reason to
+                // abort the process and strand every other peer's held keys.
+                Err(WaylandError::Protocol(e)) => {
+                    log::error!("wayland protocol violation, emulation is now unusable: {e}");
+                    Err(WaylandError::Protocol(e))?
+                }
                 Ok(()) => self.last_flush_failed = false,
                 Err(e) => Err(e)?,
             }
