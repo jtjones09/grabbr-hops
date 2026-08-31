@@ -243,13 +243,6 @@ impl ClientManager {
         }
     }
 
-    /// update the enter hook command of the client
-    pub(crate) fn set_enter_hook(&self, handle: ClientHandle, enter_hook: Option<String>) {
-        if let Some((c, _s)) = self.clients.borrow_mut().get_mut(handle as usize) {
-            c.cmd = enter_hook;
-        }
-    }
-
     /// update the spatial layout rect of the client (the drag-to-arrange
     /// canvas). Purely additive/storage — unlike `set_pos`, this does NOT
     /// affect capture activation; coordinate-based crossing is a separate,

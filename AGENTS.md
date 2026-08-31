@@ -84,6 +84,11 @@ and there is **no restore path**. Do not add one.
   keylogging for a capability hops does not have. Enforced by the `no /dev/input access` CI
   job. If a privileged backend is ever wanted, update the guard and the security model **in
   the same PR**.
+- **The frontend IPC channel must never reach a shell.** `spawn_hook_command` runs `sh -c`;
+  `enter_hook` is therefore **config-file-only**, and no `FrontendRequest` variant may set it or
+  otherwise reach command execution. Enforced by the `ipc_shell_guard` tests in `src/service.rs`,
+  both mutation-tested. If a privileged verb is ever genuinely needed, update the security model
+  in the **same** PR (issue #56).
 - **Never contact any lan-mouse remote** (fetch or push). Reading a public PR via the GitHub
   API is fine; pulling code in is not.
 - **GUI changes must be rendered and looked at** before shipping or describing. Use the

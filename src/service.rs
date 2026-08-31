@@ -403,9 +403,6 @@ impl Service {
                 self.remove_authorized_key(key);
                 self.save_config();
             }
-            FrontendRequest::UpdateEnterHook(handle, enter_hook) => {
-                self.update_enter_hook(handle, enter_hook)
-            }
             FrontendRequest::SaveConfiguration => self.save_config(),
         }
     }
@@ -1047,11 +1044,6 @@ impl Service {
         self.broadcast_client(handle);
     }
 
-    fn update_enter_hook(&mut self, handle: ClientHandle, enter_hook: Option<String>) {
-        self.client_manager.set_enter_hook(handle, enter_hook);
-        self.broadcast_client(handle);
-    }
-
     fn broadcast_client(&mut self, handle: ClientHandle) {
         let event = self
             .client_manager
@@ -1085,5 +1077,70 @@ impl Service {
                 Err(e) => log::warn!("{cmd}: {e}"),
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod ipc_shell_guard {
+    //! Guard for #56: **the frontend IPC channel must never reach a shell.**
+    //!
+    //! `spawn_hook_command` runs `sh -c` with a config-supplied string. While a
+    //! `FrontendRequest` variant could set that string, reaching the frontend
+    //! socket was equivalent to arbitrary command execution — the boundary was
+    //! protecting a shell, not a settings pane. `enter_hook` is now config-file
+    //! only, so setting it requires write access to the config directory.
+    //!
+    //! These read our own source because the property is structural: no runtime
+    //! test can prove a *future* variant will not be wired to a shell. Both are
+    //! mutation-tested — reintroduce the arm and they fail.
+
+    const SERVICE_RS: &str = include_str!("service.rs");
+    const IPC_RS: &str = include_str!("../crates/hops-ipc/src/lib.rs");
+
+    /// Body of `handle_frontend_request` — from its signature to the next method
+    /// at the same indentation.
+    fn dispatch_body() -> &'static str {
+        let start = SERVICE_RS
+            .find("fn handle_frontend_request")
+            .expect("handle_frontend_request must exist; if it was renamed, update this guard");
+        let rest = &SERVICE_RS[start..];
+        let end = rest[1..]
+            .find("\n    fn ")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn ipc_dispatch_cannot_reach_a_shell() {
+        let body = dispatch_body();
+        for forbidden in ["spawn_hook_command", "Command::new", "process::Command"] {
+            assert!(
+                !body.contains(forbidden),
+                "`{forbidden}` is reachable from handle_frontend_request. A FrontendRequest \
+                 must never reach command execution — see issue #56. If a privileged verb is \
+                 genuinely needed, update the security model in the SAME change."
+            );
+        }
+    }
+
+    #[test]
+    fn no_frontend_request_verb_sets_the_enter_hook() {
+        let start = IPC_RS
+            .find("pub enum FrontendRequest")
+            .expect("FrontendRequest must exist; if it moved, update this guard");
+        let rest = &IPC_RS[start..];
+        let end = rest.find("\n}").map(|i| i + 2).unwrap_or(rest.len());
+        let variants = &rest[..end];
+        // Match the variant, not the explanatory comment that references it.
+        for line in variants.lines() {
+            let code = line.split("//").next().unwrap_or("");
+            assert!(
+                !code.contains("EnterHook"),
+                "FrontendRequest gained an enter-hook verb: `{}`. That string is executed \
+                 with `sh -c`, so this reopens the RCE path closed in #56.",
+                line.trim()
+            );
+        }
     }
 }
