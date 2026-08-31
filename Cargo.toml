@@ -111,6 +111,12 @@ tui = ["dep:hops-tui", "dep:hops-frontend-core"]
 slint = ["dep:hops-slint", "dep:hops-frontend-core"]
 layer_shell_capture = ["input-capture/layer_shell"]
 x11_capture = ["input-capture/x11"]
+# Keystroke logging, for scancode work. DELIBERATELY NOT IN `default` AND NOT IN
+# ANY RELEASE FEATURE SET — a shipped hops must not be able to record key content
+# at all. Enabling it is still not sufficient: HOPS_LOG_KEYS must name a duration,
+# there is no unlimited mode, and the output goes to its own 0600 file rather than
+# the daemon log. Guarded by a test in src/main.rs. See #117.
+keylog = ["input-event/keylog"]
 libei_capture = ["input-event/libei", "input-capture/libei"]
 libei_emulation = ["input-event/libei", "input-emulation/libei"]
 wlroots_emulation = ["input-emulation/wlroots"]

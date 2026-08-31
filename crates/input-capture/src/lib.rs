@@ -224,7 +224,10 @@ impl InputCapture {
 
     fn update_pressed_keys(&mut self, key: u32, state: u8) {
         if let Ok(scancode) = scancode::Linux::try_from(key) {
-            log::debug!("key: {key}, state: {state}, scancode: {scancode:?}");
+            // NOT log::debug!. Key identity goes to its own opt-in, time-boxed
+            // file so that raising the log level to look at something else does
+            // not start recording what the user types (#117).
+            input_event::keylog::key(key, state as u8, &format!("{scancode:?}"));
             match state {
                 1 => self.pressed_keys.insert(scancode),
                 _ => self.pressed_keys.remove(&scancode),
