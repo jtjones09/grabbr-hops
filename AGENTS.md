@@ -60,8 +60,7 @@ it is the previous context window's state. See `.claude/skills/handoff/`.
 | crate | status |
 |---|---|
 | `hops-slint` | the real GUI — macOS/Windows. Uses the unified `Device` projection. |
-| `hops-tui` | Ratatui. The **only** frontend shipped on Linux. Also on the `Device` model. |
-| `hops-gtk` | **stale, not shipped.** Never adopted the `Device` model; no revoked-device surface. Do not build on it — see issue #21. |
+| `hops-tui` | Ratatui. The **only** frontend shipped on Linux, and the `default` feature. Also on the `Device` model. |
 
 ### The device model
 
@@ -97,7 +96,7 @@ and there is **no restore path**. Do not add one.
 ## Commands
 
 ```sh
-# what CI actually builds — default features include gtk and need system deps on Linux
+# what CI actually builds
 cargo check --workspace --all-targets
 RUSTFLAGS="-D warnings" cargo check --workspace --all-targets --no-default-features --features "tui slint"
 cargo test --workspace --no-default-features --features "tui slint"
@@ -105,8 +104,9 @@ cargo fmt --all --check
 HOPS_LOG_LEVEL=debug cargo run -- daemon
 ```
 
-Avoid `--all-features`: it pulls in `gtk`, which needs `libgtk-4-dev`/`libadwaita-1-dev` and
-is not shipped anywhere.
+`hops-gtk` was retired on 2026-08-30 (2,585 LOC, never adopted the `Device` model, shipped by
+no workflow, yet held `default` and first pick in `src/main.rs` dispatch — so a bare `cargo build`
+produced the one frontend nobody ran). `tui` holds the `default` slot now.
 
 **Linux backends are feature-gated; macOS/Windows backends are platform-gated** (`#[cfg(windows)]`,
 `#[cfg(target_os = "macos")]`). That asymmetry once shipped a Linux release with no input
@@ -115,8 +115,7 @@ silently drops every Unix backend and reports success — build Linux natively (
 
 ## CI
 
-`check.yml` runs on every push to `main` and every PR: default features (the only job that
-compiles `gtk`), the three release feature sets, workspace tests, rustfmt, and the
+`check.yml` runs on every push to `main` and every PR: default features, the three release feature sets, workspace tests, rustfmt, and the
 `no /dev/input access` guard. `release.yml` runs on `v*` tags and asserts the built Linux
 binary actually contains real input backends.
 
