@@ -318,6 +318,26 @@ pub const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
 /// hostile peer) cannot pin a task or a slot for the life of the connection.
 /// QUIC keep-alive defeats the connection idle timeout, so this is the only
 /// thing that reaps such streams. 10s is far above any real LAN transfer.
+/// Abandon a single INPUT frame that stalls longer than this, and drop the peer.
+///
+/// The sender's capture task awaits this write inline — it is one arm of the
+/// `do_capture_session` select, and the sole consumer of `capture.next()`. With
+/// no bound, an authorized peer that stops reading its input stream freezes that
+/// task: the user's own input stops being drained, and on macOS the event tap
+/// blocks behind a 32-slot channel until the kernel disables it with
+/// `kCGEventTapDisabledByTimeout`. The re-enable path lives inside the blocked
+/// callback, so capture is then silently and permanently gone, with no log line
+/// explaining it (#64).
+///
+/// At the fork base this send was a UDP datagram and physically could not block,
+/// which is why the inherited loop awaits it inline. The wire became a reliable
+/// QUIC stream in `4daa6125` and the loop was left alone.
+///
+/// 250 ms is ~200 events of backlog at 800 Hz. A peer that cannot accept 21
+/// bytes in that time on a LAN is not recovering, and every millisecond spent
+/// waiting is a millisecond of the user's own input frozen.
+pub const INPUT_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
 pub const CLIPBOARD_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Debug, Error)]
