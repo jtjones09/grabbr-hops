@@ -451,6 +451,29 @@ fn harden_existing(config_dir: &Path, config_path: &Path) {
 #[cfg(not(unix))]
 fn harden_existing(_config_dir: &Path, _config_path: &Path) {}
 
+/// Subtract the tombstones from the allowlist. Pure, so the rule can be tested
+/// without standing up a `Config`; see [`Config::effective_allowlist`], which is
+/// the only caller and the only door.
+///
+/// Both maps arrive lowercased by their readers. That is load-bearing: when only
+/// the authorized table was normalised, the two could name the same peer in two
+/// spellings and never match (issue #67).
+fn subtract_revoked(
+    mut authorized: HashMap<String, String>,
+    revoked: &HashMap<String, RevokedEntry>,
+) -> (HashMap<String, String>, Vec<String>) {
+    let mut refused: Vec<String> = revoked
+        .keys()
+        .filter(|fp| authorized.contains_key(*fp))
+        .cloned()
+        .collect();
+    refused.sort();
+    for fp in &refused {
+        authorized.remove(fp);
+    }
+    (authorized, refused)
+}
+
 impl Config {
     pub fn new() -> Result<Self, ConfigError> {
         let args = Args::parse();
@@ -556,11 +579,34 @@ impl Config {
     }
 
     /// fingerprints the user deliberately revoked
+    ///
+    /// Keys are lowercased on read for exactly the same reason
+    /// [`Self::authorized_fingerprints`] does it: the two tables are compared
+    /// against each other, and normalising only one of them is what let an
+    /// expelled fingerprint be re-authorized in uppercase (issue #67).
     pub fn revoked_fingerprints(&self) -> HashMap<String, RevokedEntry> {
         self.config_toml
             .as_ref()
             .and_then(|c| c.revoked_fingerprints.clone())
             .unwrap_or_default()
+            .into_iter()
+            .map(|(k, v)| (k.to_lowercase(), v))
+            .collect()
+    }
+
+    /// The allowlist the daemon may actually act on: everything authorized,
+    /// **minus** everything revoked. Returns the refused fingerprints so the
+    /// caller can say so.
+    ///
+    /// This is the ONLY door. Revocation outranks the allowlist, and before
+    /// this existed that rule was enforced on the config-reload path and not on
+    /// the startup path — so a revoked fingerprint put back into
+    /// `[authorized_fingerprints]` (a dotfiles restore, a Time Machine
+    /// rollback, a hand-edit) was refused while the daemon ran and silently
+    /// honoured on the next boot. Reboot is the most common state transition in
+    /// the system and it was the one that failed open (issue #66).
+    pub fn effective_allowlist(&self) -> (HashMap<String, String>, Vec<String>) {
+        subtract_revoked(self.authorized_fingerprints(), &self.revoked_fingerprints())
     }
 
     pub fn set_revoked_fingerprints(&mut self, revoked: HashMap<String, RevokedEntry>) {
@@ -810,5 +856,87 @@ mod permission_tests {
             "must never widen an already-stricter mode"
         );
         let _ = fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod effective_allowlist_tests {
+    //! Revocation outranks the allowlist, at EVERY door.
+    //!
+    //! Before 2026-08-31 the subtraction happened on the config-reload path and
+    //! not at startup, so a revoked fingerprint restored into
+    //! `[authorized_fingerprints]` was refused while the daemon ran and silently
+    //! honoured on the next boot (issue #66). And because only the authorized
+    //! table was lowercased on read, the two tables could name the same peer in
+    //! two spellings and never match (issue #67).
+
+    use super::*;
+
+    const A: &str = "00:01:02:03:04:05:06:07:08:09:0a:0b:0c:0d:0e:0f:\
+10:11:12:13:14:15:16:17:18:19:1a:1b:1c:1d:1e:1f";
+
+    /// Mirrors what `Config::authorized_fingerprints` does on read.
+    fn allow(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_lowercase(), v.to_string()))
+            .collect()
+    }
+
+    /// Mirrors what `Config::revoked_fingerprints` does on read.
+    fn revoked(fps: &[&str]) -> HashMap<String, RevokedEntry> {
+        fps.iter()
+            .map(|k| {
+                (
+                    k.to_lowercase(),
+                    RevokedEntry {
+                        label: "expelled".into(),
+                        revoked_at: 0,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_revoked_fingerprint_is_not_in_the_effective_allowlist() {
+        let (a, refused) = subtract_revoked(allow(&[(A, "old-thinkpad")]), &revoked(&[A]));
+        assert!(
+            a.is_empty(),
+            "a fingerprint in BOTH tables must not be trusted at startup"
+        );
+        assert_eq!(
+            refused,
+            vec![A.to_string()],
+            "and the refusal must be reportable"
+        );
+    }
+
+    #[test]
+    fn case_does_not_launder_a_tombstone() {
+        // The exact shape of issue #67: expelled in lowercase, re-added upper.
+        let (a, refused) =
+            subtract_revoked(allow(&[(&A.to_uppercase(), "attacker")]), &revoked(&[A]));
+        assert!(
+            a.is_empty(),
+            "uppercasing a revoked fingerprint must not resurrect it"
+        );
+        assert_eq!(refused, vec![A.to_string()]);
+    }
+
+    #[test]
+    fn a_tombstone_written_in_uppercase_still_bites() {
+        let (a, _) = subtract_revoked(allow(&[(A, "attacker")]), &revoked(&[&A.to_uppercase()]));
+        assert!(
+            a.is_empty(),
+            "revoked_fingerprints must lowercase on read too"
+        );
+    }
+
+    #[test]
+    fn an_unrevoked_fingerprint_survives() {
+        let (a, refused) = subtract_revoked(allow(&[(A, "laptop")]), &revoked(&[]));
+        assert_eq!(a.len(), 1, "the ordinary case must still work");
+        assert!(refused.is_empty());
     }
 }

@@ -61,6 +61,25 @@ pub enum PairingError {
 /// True iff `fp` is a lowercase, colon-separated 32-byte hex fingerprint — the
 /// exact shape used as the allowlist key. Rejects uppercase / short / non-hex so
 /// a pasted code can't smuggle in a bogus identity string.
+/// Canonicalise a fingerprint arriving from ANY untrusted door — the IPC
+/// channel, the CLI, a hand-edited config — into the one form the rest of the
+/// system compares against, or reject it.
+///
+/// Computed leaf-cert fingerprints are lowercase `aa:bb:..`. Two of our own
+/// hardening commits once disagreed about where that normalisation happens:
+/// `Config::authorized_fingerprints` lowercased on READ while the revocation
+/// tombstone was looked up case-SENSITIVELY, so re-authorizing an expelled
+/// fingerprint with `A-F` uppercased missed the tombstone, and the next config
+/// read folded it back to canonical form. The expelled device was trusted
+/// again. Neither commit was wrong on its own; they were wrong together
+/// (issue #67).
+///
+/// So: normalise where a fingerprint ENTERS the system, never at each reader.
+pub fn canonical_fingerprint(fp: &str) -> Option<String> {
+    let lowered = fp.trim().to_lowercase();
+    valid_fingerprint(&lowered).then_some(lowered)
+}
+
 pub fn valid_fingerprint(fp: &str) -> bool {
     let mut groups = 0usize;
     for g in fp.split(':') {
@@ -249,5 +268,51 @@ mod tests {
         let c = code(&"n".repeat(200));
         let decoded = PairingCode::decode(&c.encode()).unwrap();
         assert_eq!(decoded.label.chars().count(), MAX_LABEL_LEN);
+    }
+}
+
+#[cfg(test)]
+mod canonical_fingerprint_tests {
+    use super::*;
+
+    fn fp(case: fn(&str) -> String) -> String {
+        case(
+            &(0..32)
+                .map(|i| format!("{:02x}", i))
+                .collect::<Vec<_>>()
+                .join(":"),
+        )
+    }
+
+    #[test]
+    fn uppercase_and_lowercase_spellings_canonicalise_to_the_same_string() {
+        let lower = fp(|s| s.to_string());
+        let upper = fp(|s| s.to_uppercase());
+        assert_ne!(lower, upper, "precondition: the two spellings differ");
+        assert_eq!(
+            canonical_fingerprint(&upper),
+            canonical_fingerprint(&lower),
+            "an uppercased fingerprint must not be a different identity — that is issue #67"
+        );
+        assert_eq!(canonical_fingerprint(&upper), Some(lower));
+    }
+
+    #[test]
+    fn canonicalisation_is_idempotent() {
+        let c = canonical_fingerprint(&fp(|s| s.to_uppercase())).expect("valid");
+        assert_eq!(canonical_fingerprint(&c), Some(c.clone()));
+    }
+
+    #[test]
+    fn junk_is_rejected_rather_than_normalised() {
+        for bad in [
+            "",
+            "not-a-fingerprint",
+            "00:01",
+            &fp(|s| s.to_string())[..90],
+            "zz:01",
+        ] {
+            assert_eq!(canonical_fingerprint(bad), None, "must reject {bad:?}");
+        }
     }
 }
