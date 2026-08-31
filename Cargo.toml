@@ -5,7 +5,6 @@ members = [
     "crates/input-event",
     "crates/hops-ipc",
     "crates/hops-cli",
-    "crates/hops-gtk",
     "crates/hops-proto",
     "crates/hops-frontend-core",
     "crates/hops-tui",
@@ -43,7 +42,6 @@ input-event = { path = "crates/input-event", version = "0.4.0" }
 input-emulation = { path = "crates/input-emulation", version = "0.4.0", default-features = false }
 input-capture = { path = "crates/input-capture", version = "0.4.0", default-features = false }
 hops-cli = { path = "crates/hops-cli", version = "0.3.0" }
-hops-gtk = { path = "crates/hops-gtk", version = "0.3.0", optional = true }
 hops-tui = { path = "crates/hops-tui", version = "0.1.0", optional = true }
 hops-slint = { path = "crates/hops-slint", version = "0.1.0", optional = true }
 hops-frontend-core = { path = "crates/hops-frontend-core", version = "0.1.0", optional = true }
@@ -96,7 +94,11 @@ libc = "0.2.148"
 
 [features]
 default = [
-    "gtk",
+    # The TUI is the default front-end: it needs no system GUI libraries and builds
+    # on every platform. Before 2026-08-30 this slot held "gtk", so a bare `cargo build`
+    # produced the one front-end no workflow shipped. Leaving it empty would be worse
+    # still — a silently daemon-only binary.
+    "tui",
     "layer_shell_capture",
     "x11_capture",
     "libei_capture",
@@ -105,7 +107,6 @@ default = [
     "rdp_emulation",
     "x11_emulation",
 ]
-gtk = ["dep:hops-gtk"]
 tui = ["dep:hops-tui", "dep:hops-frontend-core"]
 slint = ["dep:hops-slint", "dep:hops-frontend-core"]
 layer_shell_capture = ["input-capture/layer_shell"]
@@ -118,8 +119,7 @@ rdp_emulation = ["input-emulation/remote_desktop_portal"]
 
 [package.metadata.bundle]
 name = "hops"
-icon = ["target/icon.icns", "crates/hops-gtk/resources/de.feschber.LanMouse.svg"]
+icon = ["target/icon.icns", "resources/de.feschber.LanMouse.svg"]
 identifier = "com.grabbr.hops"
-deb_depends = [ "libadwaita-1-0" ]
 osx_info_plist_exts = ["build-aux/macos-lsui-element.plist"]
 resources = ["target/menubar-template.png"]

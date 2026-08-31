@@ -1,13 +1,15 @@
 # Compile and test on every push and PR.
 #
 # Why this exists: `release.yml` builds ONLY `--no-default-features`, and there
-# was no push/PR workflow at all — so nothing anywhere compiled `gtk`, which is
-# a DEFAULT feature and the primary Linux frontend. A new `FrontendEvent`
-# variant made hops-gtk's exhaustive match non-exhaustive and broke bare
-# `cargo check` / `build` / `test` / `install --git` with E0004, while CI stayed
-# green. It was caught only by review.
+# was no push/PR workflow at all — so nothing anywhere compiled the DEFAULT
+# feature set. A new `FrontendEvent` variant made the then-default front-end's
+# exhaustive match non-exhaustive and broke bare `cargo check` / `build` /
+# `test` / `install --git` with E0004, while CI stayed green. It was caught only
+# by review.
 #
 # The default feature set is therefore the point of this workflow, not an extra.
+# (That front-end, hops-gtk, was retired on 2026-08-30; `tui` holds the slot now.
+# The job below still exists to keep a bare `cargo build` honest.)
 name: check
 
 on:
@@ -20,10 +22,9 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  # The configuration a contributor gets from a bare `cargo build`, and the only
-  # one that compiles hops-gtk.
+  # The configuration a contributor gets from a bare `cargo build`.
   default-features:
-    name: default features (incl. gtk)
+    name: default features
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,7 +33,7 @@ jobs:
       - name: system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev libxkbcommon-dev \
+          sudo apt-get install -y libxkbcommon-dev \
             libwayland-dev libx11-dev libxtst-dev pkg-config
       - name: cargo check --workspace --all-targets
         run: cargo check --workspace --all-targets

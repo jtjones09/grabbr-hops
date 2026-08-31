@@ -6,16 +6,10 @@ use hops::{
     service::{Service, ServiceError},
 };
 use hops_cli::CliError;
-#[cfg(feature = "gtk")]
-use hops_gtk::GtkError;
 use hops_ipc::{IpcError, IpcListenerCreationError};
 use input_capture::InputCaptureError;
 use input_emulation::InputEmulationError;
-use std::{
-    future::Future,
-    io,
-    process::{self, Child},
-};
+use std::{future::Future, io, process};
 use thiserror::Error;
 use tokio::task::LocalSet;
 
@@ -33,9 +27,6 @@ enum HopsError {
     Capture(#[from] InputCaptureError),
     #[error(transparent)]
     Emulation(#[from] InputEmulationError),
-    #[cfg(feature = "gtk")]
-    #[error(transparent)]
-    Gtk(#[from] GtkError),
     #[cfg(feature = "tui")]
     #[error(transparent)]
     Tui(#[from] hops_tui::TuiError),
@@ -71,34 +62,18 @@ fn run() -> Result<(), HopsError> {
         None => {
             //  otherwise start the service as a child process and
             //  run a frontend
-            #[cfg(feature = "gtk")]
-            {
-                let mut service = start_service()?;
-                let res = hops_gtk::run(config::local_commit());
-                #[cfg(unix)]
-                {
-                    // on unix we give the service a chance to terminate gracefully
-                    let pid = service.id() as libc::pid_t;
-                    unsafe {
-                        libc::kill(pid, libc::SIGINT);
-                    }
-                    service.wait()?;
-                }
-                service.kill()?;
-                res?;
-            }
-            // The `hops` front door (any build with a front-end, non-gtk): make
+            // The `hops` front door (any build with a front-end): make
             // sure the receiver daemon is up, then open the user's chosen
             // interface. Front-ends are attach-only — they never spawn the daemon
             // themselves (a front-end-spawned daemon can land on the dummy backend
             // if its path lacks the Accessibility grant); `ensure_daemon_running`
             // brings up the GRANTED launchd service instead.
-            #[cfg(all(not(feature = "gtk"), any(feature = "tui", feature = "slint")))]
+            #[cfg(any(feature = "tui", feature = "slint"))]
             {
                 front_door()?;
             }
             // no front-end compiled in: just run the daemon
-            #[cfg(not(any(feature = "gtk", feature = "tui", feature = "slint")))]
+            #[cfg(not(any(feature = "tui", feature = "slint")))]
             {
                 run_daemon(config)?;
             }
@@ -185,7 +160,7 @@ fn run_tui() -> Result<(), HopsError> {
 /// preferred front-end (or the sensible default for this environment). On the
 /// very first launch, show the "choose your interface" onboarding screen first
 /// and persist the pick, so every launch after that is a single, silent step.
-#[cfg(all(not(feature = "gtk"), any(feature = "tui", feature = "slint")))]
+#[cfg(any(feature = "tui", feature = "slint"))]
 fn front_door() -> Result<(), HopsError> {
     use hops_frontend_core::prefs::{
         Frontend, load_frontend, onboarding_done, save_frontend, set_onboarding_done,
@@ -215,7 +190,7 @@ fn front_door() -> Result<(), HopsError> {
 /// environment — the same GUI-on-desktop/TUI-over-SSH question as
 /// [`default_frontend`], since which picker CAN run is the same question as
 /// which front-end runs by default.
-#[cfg(all(not(feature = "gtk"), any(feature = "tui", feature = "slint")))]
+#[cfg(any(feature = "tui", feature = "slint"))]
 fn run_onboarding_picker() -> Option<hops_frontend_core::prefs::Frontend> {
     #[cfg(all(feature = "slint", feature = "tui"))]
     {
@@ -239,7 +214,7 @@ fn run_onboarding_picker() -> Option<hops_frontend_core::prefs::Frontend> {
 
 /// Default front-end when the user hasn't chosen: GUI on a local desktop, TUI
 /// over SSH / when only the TUI is compiled in.
-#[cfg(all(not(feature = "gtk"), any(feature = "tui", feature = "slint")))]
+#[cfg(any(feature = "tui", feature = "slint"))]
 fn default_frontend() -> hops_frontend_core::prefs::Frontend {
     use hops_frontend_core::prefs::Frontend;
     let ssh = std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
@@ -255,7 +230,7 @@ fn default_frontend() -> hops_frontend_core::prefs::Frontend {
 /// Make sure the GRANTED receiver daemon is running, without spawning it as our
 /// own child (which could land on the dummy backend). On macOS that means the
 /// launchd service; elsewhere a detached background process.
-#[cfg(all(not(feature = "gtk"), any(feature = "tui", feature = "slint")))]
+#[cfg(any(feature = "tui", feature = "slint"))]
 fn ensure_daemon_running() {
     // If a receiver is already listening (e.g. the granted daemon under any
     // identity), do nothing — never start a second one, and don't (re)install a
@@ -272,7 +247,7 @@ fn ensure_daemon_running() {
 }
 
 /// True if a daemon is already listening on the IPC socket.
-#[cfg(all(not(feature = "gtk"), any(feature = "tui", feature = "slint")))]
+#[cfg(any(feature = "tui", feature = "slint"))]
 fn daemon_socket_alive() -> bool {
     #[cfg(unix)]
     {
@@ -289,11 +264,7 @@ fn daemon_socket_alive() -> bool {
 
 /// Bring up `com.grabbr.hops` via launchd if it isn't already loaded,
 /// self-installing the LaunchAgent plist (pointed at this binary) on first run.
-#[cfg(all(
-    not(feature = "gtk"),
-    target_os = "macos",
-    any(feature = "tui", feature = "slint")
-))]
+#[cfg(all(target_os = "macos", any(feature = "tui", feature = "slint")))]
 fn ensure_launchd_daemon() {
     let uid = unsafe { libc::getuid() };
     let service = format!("gui/{uid}/com.grabbr.hops");
@@ -319,11 +290,7 @@ fn ensure_launchd_daemon() {
 /// Write `~/Library/LaunchAgents/com.grabbr.hops.plist` (pointed at the current
 /// binary) if absent; returns its path. Grant is path-bound, so the plist must
 /// point at whatever `hops` binary the user actually launched.
-#[cfg(all(
-    not(feature = "gtk"),
-    target_os = "macos",
-    any(feature = "tui", feature = "slint")
-))]
+#[cfg(all(target_os = "macos", any(feature = "tui", feature = "slint")))]
 fn install_launchd_plist_if_missing() -> Option<String> {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
     let plist_path = home.join("Library/LaunchAgents/com.grabbr.hops.plist");
@@ -376,25 +343,12 @@ where
     Ok(runtime.block_on(LocalSet::new().run_until(f))?)
 }
 
-#[cfg_attr(not(feature = "gtk"), allow(dead_code))]
-fn start_service() -> Result<Child, io::Error> {
-    let child = process::Command::new(std::env::current_exe()?)
-        .args(std::env::args().skip(1))
-        .arg("daemon")
-        .spawn()?;
-    Ok(child)
-}
-
 /// Start the daemon as a DETACHED background process (its own session, with
 /// stdio sent to a contained log file) if one isn't already running, then return
 /// without owning it. Used by the front door on non-macOS (macOS uses launchd):
 /// the daemon is the persistent core engine and must survive the front-end — and
 /// its terminal — going away. A redundant daemon self-exits (`AlreadyRunning`).
-#[cfg(all(
-    not(feature = "gtk"),
-    not(target_os = "macos"),
-    any(feature = "tui", feature = "slint")
-))]
+#[cfg(all(not(target_os = "macos"), any(feature = "tui", feature = "slint")))]
 fn start_detached_daemon() -> Result<(), io::Error> {
     use std::process::Stdio;
     // contained daemon log (never the home root)
