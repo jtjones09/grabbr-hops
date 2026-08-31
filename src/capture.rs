@@ -238,20 +238,32 @@ impl CaptureTask {
             .any(|&(_, p, t)| p == pos && t == CaptureType::Default)
     }
 
+    /// Position of a capture, or `Left` if the handle is unknown.
+    ///
+    /// Both of these used to `.expect()`. `InputCapture::destroy` did not purge
+    /// already-queued events, so an event for a handle the consumer had already
+    /// forgotten reached here and, with `panic = "abort"`, ended the process
+    /// (#63). That hole is closed at the source in `input-capture`; these stay
+    /// non-fatal because a lookup returning nothing must never be a reason for a
+    /// KVM daemon to die — it strands every peer's held keys.
     fn get_pos(&self, handle: CaptureHandle) -> Position {
-        self.captures
-            .iter()
-            .find(|(h, ..)| *h == handle)
-            .expect("no such capture")
-            .1
+        match self.captures.iter().find(|(h, ..)| *h == handle) {
+            Some(&(_, pos, _)) => pos,
+            None => {
+                log::warn!("get_pos: no capture {handle} — it was probably just destroyed");
+                Position::Left
+            }
+        }
     }
 
     fn get_type(&self, handle: CaptureHandle) -> CaptureType {
-        self.captures
-            .iter()
-            .find(|(h, ..)| *h == handle)
-            .expect("no such capture")
-            .2
+        match self.captures.iter().find(|(h, ..)| *h == handle) {
+            Some(&(_, _, ty)) => ty,
+            None => {
+                log::warn!("get_type: no capture {handle} — it was probably just destroyed");
+                CaptureType::Default
+            }
+        }
     }
 
     async fn run(mut self) {
