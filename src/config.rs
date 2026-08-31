@@ -458,6 +458,40 @@ fn harden_existing(_config_dir: &Path, _config_path: &Path) {}
 /// Both maps arrive lowercased by their readers. That is load-bearing: when only
 /// the authorized table was normalised, the two could name the same peer in two
 /// spellings and never match (issue #67).
+/// Replace a file's contents atomically: write a sibling temp, flush it, rename.
+///
+/// The trust store used to be opened with `truncate(true)` and only then written,
+/// so any kill inside that window — a launchd `KeepAlive` bounce, power loss,
+/// OOM — left a partial file. A partial TOML is an unparseable TOML, which used
+/// to mean the next start came up with an empty allowlist and an empty revocation
+/// table (issue #69).
+///
+/// `rename(2)` is atomic within a filesystem and the temp file is a sibling, so it
+/// is always the same one. A reader sees the whole old file or the whole new one,
+/// never a truncated one. The temp inherits [`create_private`]'s `0600`, so the
+/// contents are never briefly world-readable either.
+fn write_atomically(path: &Path, contents: &[u8]) -> Result<(), io::Error> {
+    let tmp = path.with_extension("toml.tmp");
+    {
+        let mut f = create_private(&tmp)?;
+        f.write_all(contents)?;
+        f.sync_all()?;
+    }
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    // Durability of the rename itself. Without this the directory entry can still
+    // be lost to a crash even though the file's contents were synced.
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
+}
+
 fn subtract_revoked(
     mut authorized: HashMap<String, String>,
     revoked: &HashMap<String, RevokedEntry>,
@@ -504,11 +538,24 @@ impl Config {
         // Repair installs created before the modes above were enforced.
         harden_existing(&config_dir, &config_path);
 
+        // A config file that EXISTS but does not parse is a hard error, not an
+        // absent one. Treating the two the same came in from upstream and meant a
+        // single type error — `port = "4242"` — brought the daemon up with an
+        // empty allowlist AND an empty revocation table, and the first
+        // `save_config()` after that persisted the emptiness. The user was left
+        // believing both that hops had forgotten their devices and that
+        // revocations they performed were still in force. Neither was true.
+        //
+        // An absent file legitimately means defaults. A corrupt one never does.
         let config_toml = match ConfigToml::new(&config_path) {
             Err(e) => {
-                log::warn!("{config_path:?}: {e}");
-                log::warn!("Continuing without config file ...");
-                None
+                log::error!(
+                    "{config_path:?} exists but could not be parsed: {e}\n\
+                     Refusing to start. Continuing would discard every authorized \
+                     device AND every revocation on the next save. Fix the file, or \
+                     move it aside to start fresh."
+                );
+                return Err(e);
             }
             Ok(c) => Some(c),
         };
@@ -736,7 +783,18 @@ impl Config {
     pub fn write_back(&mut self) -> Result<(), io::Error> {
         log::info!("writing config to {:?}", &self.config_path);
         /* the new config */
-        let new_config = self.config_toml.clone().unwrap_or_default();
+        // Never serialise `unwrap_or_default()`. If there is no parsed config in
+        // memory, writing is the one thing this must not do — that is how a parse
+        // failure became a zero-byte trust store. Unreachable since a corrupt
+        // config is now fatal at startup, and kept as the second gate anyway.
+        let Some(new_config) = self.config_toml.clone() else {
+            log::error!(
+                "refusing to write {:?}: there is no parsed config in memory, and \
+                 writing defaults here would erase the trust store",
+                self.config_path
+            );
+            return Ok(());
+        };
         let new_config = toml_edit::ser::to_string_pretty(&new_config).expect("config");
 
         /*
@@ -753,12 +811,20 @@ impl Config {
         if let Some(p) = self.config_path().parent() {
             fs::create_dir_all(p)?;
         }
-        {
-            let mut f = create_private(&self.config_path())?;
-            f.write_all(new_config.as_bytes())?;
-            f.sync_all()?;
+        // Write to a sibling temp file, flush it, then RENAME over the real one.
+        // The previous code opened the trust store with `truncate(true)` and only
+        // then wrote it, so any kill inside that window — a launchd KeepAlive
+        // bounce, power loss, OOM — left a partial file on disk. A partial TOML
+        // is an unparseable TOML, which used to mean the next start came up with
+        // an empty allowlist and an empty revocation table.
+        //
+        // rename(2) is atomic within a filesystem, and the temp file is a sibling
+        // so it is always the same one. A reader sees either the whole old file
+        // or the whole new one, never a truncated one.
+        if let Err(e) = write_atomically(self.config_path(), new_config.as_bytes()) {
+            let _ = self.watch();
+            return Err(e);
         }
-
         let _ = self.watch();
 
         Ok(())
@@ -938,5 +1004,139 @@ mod effective_allowlist_tests {
         let (a, refused) = subtract_revoked(allow(&[(A, "laptop")]), &revoked(&[]));
         assert_eq!(a.len(), 1, "the ordinary case must still work");
         assert!(refused.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod fail_closed_tests {
+    //! A corrupt config must never become an empty trust store.
+    //!
+    //! Before 2026-08-31, `Config::new` treated a file that existed but did not
+    //! parse exactly like an absent one — logged two `warn` lines and continued
+    //! with `None`. The daemon came up with an empty allowlist AND an empty
+    //! revocation table, and the first `save_config()` persisted that as a
+    //! zero-byte file. The user was left believing both that hops had forgotten
+    //! their devices and that revocations they had performed were still in
+    //! force. Neither was true (issue #69).
+
+    use super::*;
+
+    fn tmpdir(name: &str) -> PathBuf {
+        let mut d = std::env::temp_dir();
+        d.push(format!("hops-failclosed-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).expect("mkdir");
+        d
+    }
+
+    #[test]
+    fn a_corrupt_config_is_a_hard_error_not_an_empty_one() {
+        let d = tmpdir("parse");
+        let p = d.join("config.toml");
+        // The exact shape from the issue: a type error, not a syntax error.
+        fs::write(&p, b"port = \"4242\"\n").expect("seed");
+        let err = ConfigToml::new(&p).expect_err("a type error must not parse");
+        assert!(
+            format!("{err}").contains("4242") || format!("{err}").contains("invalid type"),
+            "unexpected error: {err}"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn config_new_propagates_a_parse_failure_rather_than_swallowing_it() {
+        // Structural: no runtime test can construct a `Config` here (it parses
+        // argv and installs a watcher), and the property is about which arm the
+        // parse failure takes.
+        let src = include_str!("config.rs");
+        let start = src
+            .find("let config_toml = match ConfigToml::new(&config_path)")
+            .expect("the parse site must exist; if it moved, update this guard");
+        let arm = &src[start..start + 900];
+        let err_arm = arm.split("Err(e) =>").nth(1).expect("an Err arm");
+        let err_arm = &err_arm[..err_arm.find("Ok(c)").unwrap_or(err_arm.len())];
+        assert!(
+            err_arm.contains("return Err"),
+            "a config that exists but does not parse must abort startup. Falling \
+             through to `None` is how a typo erased the trust store — issue #69."
+        );
+        assert!(
+            !err_arm.contains("None"),
+            "the parse failure arm must not yield `None`: that is indistinguishable \
+             from an absent config, and an absent config legitimately means defaults."
+        );
+    }
+
+    #[test]
+    fn write_back_refuses_to_serialise_a_missing_config() {
+        let src = include_str!("config.rs");
+        let start = src
+            .find("pub fn write_back(")
+            .expect("write_back must exist; if it was renamed, update this guard");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    pub fn ")
+            .or_else(|| rest[1..].find("\n    fn "))
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        // Strip comments: this guard names the very call it forbids, and the
+        // function's own doc comment explains why it is forbidden.
+        let body: String = rest[..end]
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !body.contains("unwrap_or_default()"),
+            "write_back must never serialise a default config. If there is no parsed \
+             config in memory, writing is the one thing it must not do — that is how \
+             a parse failure became a zero-byte trust store."
+        );
+    }
+
+    #[test]
+    fn the_write_is_atomic_and_leaves_no_debris() {
+        let d = tmpdir("atomic");
+        let p = d.join("config.toml");
+        fs::write(&p, b"old contents that must be replaced whole").expect("seed");
+
+        let new = b"[authorized_fingerprints]\n\"aa:bb\" = \"laptop\"\n";
+        write_atomically(&p, new).expect("write");
+
+        assert_eq!(
+            fs::read(&p).expect("read"),
+            new,
+            "the target must be replaced whole"
+        );
+        let leftovers: Vec<_> = fs::read_dir(&d)
+            .expect("readdir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the temp file must not survive a successful write: {leftovers:?}"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_replacement_is_owner_only_from_the_moment_it_exists() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmpdir("mode");
+        let p = d.join("config.toml");
+        fs::write(&p, b"x").expect("seed");
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        write_atomically(&p, b"y").expect("write");
+
+        let mode = fs::metadata(&p).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "renaming a temp over the trust store must not restore a world-readable mode"
+        );
+        let _ = fs::remove_dir_all(&d);
     }
 }
