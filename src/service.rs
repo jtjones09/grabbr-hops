@@ -154,7 +154,18 @@ impl Service {
         for client in config.clients() {
             client_manager.add_with_config(client);
         }
-        drop_untrusted_pins(&client_manager, &config.authorized_fingerprints());
+        // Revocation outranks the allowlist HERE TOO, not only on reload. A
+        // fingerprint sitting in BOTH tables is untrusted, so it must also lose
+        // its outbound pin — passing the RAW allowlist here would keep the pin
+        // alive for a device its owner expelled (issue #66).
+        let (allowlist, refused) = config.effective_allowlist();
+        for fp in &refused {
+            log::warn!(
+                "config lists {fp} as BOTH authorized and revoked — refusing it at startup. \
+                 That identity is permanently dead; the device must present a new one."
+            );
+        }
+        drop_untrusted_pins(&client_manager, &allowlist);
 
         // load identity (cert + key)
         let identity = Arc::new(crypto::load_or_generate_key_and_cert(config.cert_path())?);
@@ -163,7 +174,7 @@ impl Service {
         // create frontend communication adapter, exit if already running
         let frontend_listener = AsyncFrontendListener::new().await?;
 
-        let authorized_keys = Arc::new(RwLock::new(config.authorized_fingerprints()));
+        let authorized_keys = Arc::new(RwLock::new(allowlist));
 
         // clipboard sync: a single inbound channel both transports push received
         // payloads into, plus the local monitor/apply backend. The channel is
@@ -451,17 +462,16 @@ impl Service {
         // the live set and tear down anything that lost trust, or revocation is
         // silently unenforced through this door.
         self.revoked = self.config.revoked_fingerprints();
-        let mut authorized_keys = self.config.authorized_fingerprints();
-        // Revocation outranks the allowlist. Re-adding a revoked fingerprint by
-        // hand-editing config.toml is refused and logged, so the denylist cannot
-        // be laundered around by copy-pasting a key back into the other table.
-        for fp in self.revoked.keys() {
-            if authorized_keys.remove(fp).is_some() {
-                log::warn!(
-                    "config lists {fp} as BOTH authorized and revoked — refusing it. \
-                     Restore it from the device list if that is what you meant."
-                );
-            }
+        // Same door as startup: revocation outranks the allowlist. Re-adding a
+        // revoked fingerprint by hand-editing config.toml is refused and logged,
+        // so the denylist cannot be laundered by copy-pasting a key back into
+        // the other table.
+        let (authorized_keys, refused) = self.config.effective_allowlist();
+        for fp in &refused {
+            log::warn!(
+                "config lists {fp} as BOTH authorized and revoked — refusing it. \
+                 Restore it from the device list if that is what you meant."
+            );
         }
         let revoked: Vec<String> = {
             let mut live = self.authorized_keys.write().unwrap();
@@ -797,6 +807,18 @@ impl Service {
     }
 
     fn add_authorized_key(&mut self, desc: String, fp: String) {
+        // Canonicalise BEFORE the tombstone lookup. The check below is an exact
+        // map lookup, so an uppercased spelling of an expelled fingerprint used
+        // to miss it — and `Config::authorized_fingerprints` then folded that
+        // spelling back to canonical form on the next read, resurrecting the
+        // expelled device (issue #67).
+        let Some(fp) = hops_ipc::pairing::canonical_fingerprint(&fp) else {
+            log::warn!("refusing to authorize {fp:?}: not a valid fingerprint");
+            self.notify_frontend(FrontendEvent::Error(
+                "That is not a valid device fingerprint.".to_string(),
+            ));
+            return;
+        };
         // An expelled fingerprint is DEAD. There is deliberately no path from
         // revoked back to authorized: the record is a tombstone, not a pause.
         // Re-establishing a deleted device means that machine presenting a NEW
@@ -893,6 +915,12 @@ impl Service {
     }
 
     fn remove_authorized_key(&mut self, fp: String) {
+        // Canonicalise here too, or a tombstone can be written under a spelling
+        // that `add_authorized_key` will never match (issue #67). An invalid
+        // fingerprint is still tombstoned under its lowercased form rather than
+        // dropped: refusing to revoke is the more dangerous failure.
+        let fp = hops_ipc::pairing::canonical_fingerprint(&fp)
+            .unwrap_or_else(|| fp.trim().to_lowercase());
         let label = self
             .authorized_keys
             .write()
@@ -1140,6 +1168,106 @@ mod ipc_shell_guard {
                 "FrontendRequest gained an enter-hook verb: `{}`. That string is executed \
                  with `sh -c`, so this reopens the RCE path closed in #56.",
                 line.trim()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod trust_door_guard {
+    //! **Revocation outranks the allowlist at every door, and fingerprints are
+    //! canonicalised where they enter.**
+    //!
+    //! These read our own source because the property is structural: no runtime
+    //! test can prove that a *future* call site will remember. Issue #66 existed
+    //! precisely because the rule was enforced at two of three doors, and the
+    //! one it missed was the one every daemon walks through on every boot.
+
+    /// Non-test source only. These guards mention the very strings they forbid,
+    /// so scanning the whole file would make them fail on themselves.
+    fn production_source(src: &str) -> String {
+        src.split("\n#[cfg(test)]")
+            .next()
+            .unwrap_or(src)
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    const SERVICE_RS_ALL: &str = include_str!("service.rs");
+    const CONFIG_RS_ALL: &str = include_str!("config.rs");
+
+    /// Body of a `fn name(` up to the next item at the same indentation.
+    fn body_of<'a>(src: &'a str, sig: &str) -> &'a str {
+        let start = src
+            .find(sig)
+            .unwrap_or_else(|| panic!("{sig} must exist; if it was renamed, update this guard"));
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    pub fn ")
+            .or_else(|| rest[1..].find("\n    fn "))
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn the_daemon_never_reads_the_raw_allowlist() {
+        assert!(
+            !production_source(SERVICE_RS_ALL).contains("authorized_fingerprints()"),
+            "service.rs must obtain the allowlist only via Config::effective_allowlist(), \
+             which subtracts revocation tombstones. Calling authorized_fingerprints() \
+             directly is how a revoked device came back after a reboot — issue #66."
+        );
+    }
+
+    #[test]
+    fn effective_allowlist_is_the_only_reader_of_the_raw_allowlist() {
+        let calls = production_source(CONFIG_RS_ALL)
+            .matches("self.authorized_fingerprints()")
+            .count();
+        assert_eq!(
+            calls, 1,
+            "exactly one caller of the raw allowlist is allowed, and it must be \
+             effective_allowlist(). Found {calls}."
+        );
+        assert!(
+            body_of(
+                &production_source(CONFIG_RS_ALL),
+                "pub fn effective_allowlist("
+            )
+            .contains("self.authorized_fingerprints()"),
+            "the one caller must be effective_allowlist()"
+        );
+    }
+
+    #[test]
+    fn both_fingerprint_tables_are_lowercased_on_read() {
+        // Normalising only ONE of the two tables is the whole of issue #67:
+        // they are compared against each other, so they must agree on form.
+        let src = production_source(CONFIG_RS_ALL);
+        for reader in [
+            "pub fn authorized_fingerprints(",
+            "pub fn revoked_fingerprints(",
+        ] {
+            assert!(
+                body_of(&src, reader).contains("to_lowercase()"),
+                "{reader} must lowercase its keys. When only the authorized table did, an \
+                 expelled fingerprint re-added in uppercase missed the tombstone and was \
+                 then folded back to canonical form on the next read — issue #67."
+            );
+        }
+    }
+
+    #[test]
+    fn both_trust_doors_canonicalise_the_fingerprint() {
+        for door in ["fn add_authorized_key(", "fn remove_authorized_key("] {
+            assert!(
+                body_of(&production_source(SERVICE_RS_ALL), door).contains("canonical_fingerprint"),
+                "{door} must canonicalise before touching the trust maps. An uppercased \
+                 spelling of an expelled fingerprint missed the tombstone and was folded \
+                 back to canonical form on the next config read — issue #67."
             );
         }
     }
