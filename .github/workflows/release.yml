@@ -53,7 +53,7 @@ jobs:
         with:
           fetch-depth: 0   # so build.rs can read the git commit
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
 
       # --- build ---
       - name: Build (macOS universal)
