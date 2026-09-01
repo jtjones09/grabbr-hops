@@ -1150,7 +1150,9 @@ mod fail_closed_tests {
     }
 }
 
-#[cfg(all(test, unix))]
+// Not unix-gated: these read source text, so they are worth running on the
+// Windows runner too — that is where the last source-scanning guard broke.
+#[cfg(test)]
 mod watcher_rearm_tests {
     //! A failed write must never leave the config watcher dead.
     //!
@@ -1165,8 +1167,6 @@ mod watcher_rearm_tests {
     //! on `create_dir_all` above it still returned early with the watcher off,
     //! so the bug survived in a narrower form. The lesson is that "remember to
     //! re-arm before each return" is not a fix — one exit point is.
-
-    use super::*;
 
     /// Everything between `unwatch` and `watch` lives in `write_config_file`,
     /// so `write_back` itself must contain no early exit after the unwatch.
