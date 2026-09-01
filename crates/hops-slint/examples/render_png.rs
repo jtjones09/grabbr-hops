@@ -21,7 +21,7 @@ use slint::{ComponentHandle, ModelRc, PhysicalSize, VecModel};
 // invocation would compile the SAME .slint source into a SECOND, nominally
 // distinct set of Rust types, incompatible with the lib's (e.g. two different
 // `ThemeColors` structs), even though they look identical.
-use hops_slint::{AppWindow, CanvasBox, DeviceRow, Theme, theme_colors};
+use hops_slint::{AppWindow, CanvasBox, DeviceRow, DiscoveredRow, Theme, theme_colors};
 
 /// Headless platform: every window is a MinimalSoftwareWindow (CPU renderer, no OS window).
 struct HeadlessPlatform {
@@ -69,6 +69,23 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
     ui.set_emulation("enabled".into());
     ui.set_port("4242".into());
     ui.set_fingerprint("73:90:2a:3c:9d:e5:18:52:7c:aa:c3:de:de:04:cd:ec".into());
+    let first_run = std::env::var_os("PREVIEW_FIRST_RUN").is_some();
+    ui.set_discovered(ModelRc::new(VecModel::from(vec![
+        DiscoveredRow {
+            label: "linux-box".into(),
+            fingerprint: "9c:2e:11".into(),
+            addr_summary: "10.110.20.51 +2 more".into(),
+            ips: "10.110.20.51,10.110.21.51,172.26.141.9".into(),
+            port: "4242".into(),
+        },
+        DiscoveredRow {
+            label: "jk-mbp-m4-max".into(),
+            fingerprint: "".into(),
+            addr_summary: "10.110.20.99".into(),
+            ips: "10.110.20.99".into(),
+            port: "4242".into(),
+        },
+    ])));
     ui.set_pairing_fp("a4:f0:9c:2e:11:bd:77:0c:35:9a".into()); // shows the pairing card
     // the notice banner — the daemon's only "that didn't work" channel
     ui.set_notice(
@@ -157,6 +174,15 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             revoked: true,
         },
     ])));
+
+    // PREVIEW_FIRST_RUN=1 shows the case discovery exists FOR: a fresh install
+    // with nothing configured, where "on your network" is the whole screen.
+    // Applied after the seeded state above so it actually wins.
+    if first_run {
+        ui.set_devices(ModelRc::new(VecModel::from(Vec::<DeviceRow>::new())));
+        ui.set_notice("".into());
+        ui.set_pairing_fp("".into());
+    }
 
     match std::env::args().nth(5).as_deref() {
         Some("settings") => ui.set_show_settings(true),

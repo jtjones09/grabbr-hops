@@ -267,8 +267,33 @@ pub enum FrontendEvent {
     },
     /// incoming disconnected
     IncomingDisconnected(SocketAddr),
+    /// Machines seen on the local network that are not already configured or
+    /// trusted. Replaces the whole list each time rather than diffing, because
+    /// mDNS records come and go and a frontend that missed one event would
+    /// otherwise show a device that is no longer there.
+    ///
+    /// NOTHING here is authenticated. `claimed_fingerprint` is an assertion by
+    /// whatever is on the LAN, kept for labelling and for spotting a mismatch
+    /// against the certificate actually presented. A frontend must never treat
+    /// it as identity, and approving one of these still goes through the
+    /// ordinary trust prompt (#136).
+    Discovered(Vec<DiscoveredDevice>),
     /// failed connection attempt (approval for fingerprint required)
     ConnectionAttempt { fingerprint: String },
+}
+
+/// A machine advertising itself on the local network.
+///
+/// A suggestion of somewhere to dial, not a device and not an identity. See
+/// `FrontendEvent::Discovered`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveredDevice {
+    /// Advertised instance name. Display only — chosen by the announcer.
+    pub label: String,
+    /// The fingerprint it CLAIMS. Unauthenticated.
+    pub claimed_fingerprint: Option<String>,
+    /// Addresses it advertised, all of them.
+    pub addrs: Vec<SocketAddr>,
 }
 
 /// A fingerprint the user deliberately expelled.

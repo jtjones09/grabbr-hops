@@ -100,6 +100,19 @@ struct ConfigToml {
     /// can raise the approval prompt exactly as before.
     #[serde(default)]
     revoked_fingerprints: Option<HashMap<String, RevokedEntry>>,
+    /// Announce this machine on the local network over mDNS, and look for
+    /// others. Default ON — without it there is no way to add a device except
+    /// typing an address, which is the hardest rung of the ladder, not the
+    /// easiest (#136).
+    ///
+    /// What advertising discloses: this machine runs hops, its hostname, its
+    /// LAN addresses, and its public certificate fingerprint. On a home LAN
+    /// that is comparable to what Bonjour already announces about every Mac,
+    /// and the listener on this port is findable by a scan regardless. On a
+    /// network where "this machine runs a KVM" is itself sensitive, set
+    /// `discovery = false` — hops still works, you just type addresses.
+    #[serde(default)]
+    discovery: Option<bool>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -716,6 +729,15 @@ impl Config {
     }
 
     /// release bind for returning control to the host
+    /// Whether to advertise on and browse the local network. See
+    /// `ConfigToml::discovery` for what advertising discloses.
+    pub fn discovery(&self) -> bool {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.discovery)
+            .unwrap_or(true)
+    }
+
     pub fn release_bind(&self) -> Vec<scancode::Linux> {
         self.config_toml
             .as_ref()

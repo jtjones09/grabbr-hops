@@ -36,6 +36,18 @@ export struct DeviceRow {
     revoked: bool,       // the user expelled it; shown, not forgotten
 }
 
+// A machine announcing itself on the LAN. NOT a device and NOT an identity —
+// the fingerprint is a claim by whatever is on the network, shown so a row can
+// be labelled. Adding one dials it and goes through the ordinary approval
+// prompt, exactly as typing an address does (#136).
+export struct DiscoveredRow {
+    label: string,        // advertised name, display only
+    fingerprint: string,  // short claimed fingerprint, display only
+    ips: string,          // comma-separated addresses, for the add callback
+    addr-summary: string, // "10.0.0.5 +2 more" for display
+    port: string,
+}
+
 export component AppWindow inherits Window {
     title: "hops";
     default-font-family: Type.sans;
@@ -55,6 +67,9 @@ export component AppWindow inherits Window {
 
     // The daemon's only way to tell the user something failed. Kept dismissible
     // and seq-gated: dismissing hides THIS notice, a new one re-raises the bar.
+    // Machines announcing themselves on the LAN that are not already added or
+    // trusted. Not devices and not identities — see DiscoveredRow (#136).
+    in property <[DiscoveredRow]> discovered: [];
     in property <string> notice: "";
     in property <int> notice-seq: 0;
     property <int> dismissed-seq: 0;
@@ -119,6 +134,9 @@ export component AppWindow inherits Window {
     callback deny-pairing(string /* full fingerprint */);
     callback set-theme(int /* palette index */);
     callback create-device(string /* name */, string /* port */, string /* position */);
+    // add a machine picked off the network list: label, comma-separated IPs,
+    // port, edge. Discovery supplies the address, never the trust (#136).
+    callback add-discovered(string /* label */, string /* ips */, string /* port */, string /* position */);
     callback switch-interface();
     callback open-layout-canvas();
     callback update-device-geometry(string /* handle */, float /* x */, float /* y */);
@@ -659,6 +677,63 @@ export component AppWindow inherits Window {
                     }
                 }
 
+                // --- on your network ---------------------------------------------------
+                // The easiest rung of the pairing ladder: click a machine instead of
+                // typing its address. Only shown when there is something to add — an
+                // empty "nothing found" panel is worse than no panel (#136).
+                //
+                // NOTHING here is trusted. The fingerprint is a claim by whatever is on
+                // the LAN, shown so a row is recognisable. "add" dials the machine and
+                // raises the ordinary approval prompt, exactly as a typed address does.
+                if root.discovered.length > 0: VerticalLayout {
+                    spacing: 6px;
+                    SectionTitle { text: "on your network"; color: Theme.c.accent; }
+                    Card {
+                        VerticalLayout {
+                            for n in root.discovered: Rectangle {
+                                height: 52px;
+                                border-radius: Radius.md;
+                                nrow := TouchArea {}
+                                background: nrow.has-hover ? Theme.c.surface-raised : transparent;
+                                animate background { duration: Motion.fast; }
+                                HorizontalLayout {
+                                    padding-left: Space.md;
+                                    padding-right: Space.md;
+                                    spacing: Space.md;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 2px;
+                                        horizontal-stretch: 1;
+                                        Text {
+                                            text: n.label;
+                                            color: Theme.c.foreground;
+                                            font-weight: Type.medium;
+                                            overflow: elide;
+                                        }
+                                        Text {
+                                            text: n.addr-summary + "  " + n.fingerprint;
+                                            color: Theme.c.muted;
+                                            font-family: Type.mono;
+                                            font-size: Type.caption;
+                                            letter-spacing: Type.mono-tracking;
+                                            overflow: elide;
+                                        }
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        PillButton {
+                                            text: "add";
+                                            clicked => {
+                                                root.add-discovered(
+                                                    n.label, n.ips, n.port, root.free-position);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
             }
         }

@@ -5,6 +5,7 @@ use crate::{
     config::{Config, ConfigClient},
     connect::{ClipboardSender, LanMouseConnection},
     crypto,
+    discovery::{DiscoveredPeer, Discovery, DiscoveryEvent},
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
     hop_log::Lifecycle,
@@ -12,8 +13,8 @@ use crate::{
 };
 use futures::StreamExt;
 use hops_ipc::{
-    AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
-    IpcListenerCreationError, Position, Status,
+    AsyncFrontendListener, ClientHandle, DiscoveredDevice, FrontendEvent, FrontendRequest,
+    IpcError, IpcListenerCreationError, Position, Status,
 };
 use local_channel::mpsc::{Receiver, channel};
 use log;
@@ -49,6 +50,15 @@ pub struct Service {
     emulation: Emulation,
     /// dns resolver
     resolver: DnsResolver,
+    /// LAN discovery: advertise this machine and browse for others. `None` when
+    /// switched off in config or when mDNS could not start — discovery is a
+    /// convenience, never a precondition for hops running (#136).
+    discovery: Option<Discovery>,
+    /// Peers seen on the network, keyed by advertised label. Not trusted: a
+    /// claimed fingerprint here is an unauthenticated assertion by whatever is
+    /// on the LAN, useful only for labelling and for spotting a mismatch when
+    /// the TLS certificate actually arrives.
+    discovered: HashMap<String, DiscoveredPeer>,
     /// frontend listener
     frontend_listener: AsyncFrontendListener,
     /// authorized public key sha256 fingerprints
@@ -224,6 +234,18 @@ impl Service {
         // create dns resolver
         let resolver = DnsResolver::new()?;
 
+        // announce this machine on the LAN and look for others
+        let instance = hostname::get()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .unwrap_or_else(|| "hops".to_string());
+        let discovery = Discovery::new(
+            config.discovery(),
+            config.port(),
+            &public_key_fingerprint,
+            &instance,
+        );
+
         let port = config.port();
         let revoked = config.revoked_fingerprints();
         let service = Self {
@@ -233,6 +255,8 @@ impl Service {
             emulation,
             frontend_listener,
             resolver,
+            discovery,
+            discovered: HashMap::new(),
             authorized_keys,
             public_key_fingerprint,
             client_manager,
@@ -279,6 +303,13 @@ impl Service {
                 event = self.emulation.event() => self.handle_emulation_event(event),
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
+                event = async {
+                    match self.discovery.as_mut() {
+                        Some(d) => d.event().await,
+                        // discovery off: never resolve, so this arm never wins
+                        None => std::future::pending().await,
+                    }
+                } => self.handle_discovery_event(event),
                 event = self.clipboard.changed(), if self.clipboard_alive => self.handle_clipboard_change(event).await,
                 handle = self.persist_requests.recv() => {
                     if let Some(handle) = handle {
@@ -315,6 +346,10 @@ impl Service {
         self.capture.terminate().await;
         log::debug!("terminating emulation ...");
         self.emulation.terminate().await;
+        if let Some(d) = self.discovery.as_mut() {
+            log::debug!("withdrawing the network announcement ...");
+            d.terminate().await;
+        }
         log::debug!("terminating dns resolver ...");
         self.resolver.terminate().await;
 
@@ -649,6 +684,92 @@ impl Service {
                 self.spawn_hook_command(handle);
             }
         }
+    }
+
+    /// A machine appeared on or vanished from the local network.
+    ///
+    /// Nothing here grants anything. The claimed fingerprint is an
+    /// unauthenticated assertion by whatever is on the LAN — it is kept so the
+    /// UI can label a row and hide devices already paired, and so a mismatch
+    /// against the certificate actually presented is visible. Trust is still
+    /// decided by the TLS leaf on connect.
+    fn handle_discovery_event(&mut self, event: Option<DiscoveryEvent>) {
+        let Some(event) = event else { return };
+        match event {
+            DiscoveryEvent::Found(peer) => {
+                let key = crate::discovery::peer_key(&peer);
+                let changed = match self.discovered.get_mut(&key) {
+                    // mDNS re-announces constantly, per interface, with
+                    // different address subsets each time. Only a real change
+                    // is worth telling the frontend about.
+                    Some(known) => crate::discovery::merge(known, peer),
+                    None => {
+                        log::info!(
+                            "found {:?} on the local network at {:?}{}",
+                            peer.label,
+                            peer.addrs,
+                            match &peer.claimed_fingerprint {
+                                Some(fp) => format!(" claiming {fp}"),
+                                None => String::new(),
+                            }
+                        );
+                        self.discovered.insert(key, peer);
+                        true
+                    }
+                };
+                if !changed {
+                    return;
+                }
+            }
+            DiscoveryEvent::Lost(label) => {
+                // Filed by fingerprint, but withdrawn by name — so find the
+                // entry whose label matches rather than assuming the key.
+                let key = self
+                    .discovered
+                    .iter()
+                    .find(|(_, p)| p.label == label)
+                    .map(|(k, _)| k.clone());
+                match key.and_then(|k| self.discovered.remove(&k)) {
+                    Some(p) => {
+                        log::info!(
+                            "{:?} stopped announcing itself on the local network",
+                            p.label
+                        )
+                    }
+                    None => return,
+                }
+            }
+        }
+        self.publish_discovered();
+    }
+
+    /// Send the current network list to the frontend, minus anything already
+    /// configured or already trusted — a machine you have is not a machine to
+    /// add. Matching is by CLAIMED fingerprint, which is safe here because the
+    /// failure mode is only that an already-paired device is offered again.
+    fn publish_discovered(&mut self) {
+        let configured: HashSet<String> = self
+            .client_manager
+            .get_client_states()
+            .into_iter()
+            .filter_map(|(_, _, s)| s.peer_fingerprint)
+            .collect();
+        let authorized = self.authorized_keys.read().expect("lock");
+        let peers: Vec<DiscoveredDevice> = self
+            .discovered
+            .values()
+            .filter(|p| match &p.claimed_fingerprint {
+                Some(fp) => !configured.contains(fp) && !authorized.contains_key(fp),
+                None => true,
+            })
+            .map(|p| DiscoveredDevice {
+                label: p.label.clone(),
+                claimed_fingerprint: p.claimed_fingerprint.clone(),
+                addrs: p.addrs.clone(),
+            })
+            .collect();
+        drop(authorized);
+        self.notify_frontend(FrontendEvent::Discovered(peers));
     }
 
     fn handle_resolver_event(&mut self, event: DnsEvent) {

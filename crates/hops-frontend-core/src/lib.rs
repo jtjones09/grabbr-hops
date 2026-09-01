@@ -17,8 +17,8 @@ use futures::StreamExt;
 use tokio::sync::{Notify, mpsc};
 
 pub use hops_ipc::{
-    ClientConfig, ClientHandle, ClientState, FrontendEvent, FrontendRequest, Position,
-    RevokedEntry, Status, connect_async,
+    ClientConfig, ClientHandle, ClientState, DiscoveredDevice, FrontendEvent, FrontendRequest,
+    Position, RevokedEntry, Status, connect_async,
 };
 
 pub mod prefs;
@@ -63,6 +63,14 @@ pub struct AppModel {
     /// that connected before we attached is not reflected until the daemon
     /// reports current connections on `Sync` (a planned additive event).
     pub connected_peers: HashSet<String>,
+    /// Machines seen on the local network that are not already configured or
+    /// trusted — the "click a name instead of typing an address" list (#136).
+    ///
+    /// NOT trusted and NOT identified. `claimed_fingerprint` is an assertion by
+    /// whatever is on the LAN. Selecting one of these dials it and goes through
+    /// the ordinary approval prompt exactly as a typed address does; it must
+    /// never shortcut that.
+    pub discovered: Vec<DiscoveredDevice>,
     /// An untrusted peer's fingerprint awaiting the user's pairing approval. Set
     /// on `ConnectionAttempt`; cleared once it becomes authorized or the daemon
     /// link drops. The UI surfaces this as an approve/deny prompt.
@@ -151,6 +159,7 @@ impl AppModel {
                     self.pending_pairing_since = Some(Instant::now());
                 }
             }
+            FrontendEvent::Discovered(peers) => self.discovered = peers,
             FrontendEvent::NoSuchClient(_) => {}
         }
     }
