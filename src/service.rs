@@ -1536,11 +1536,37 @@ mod attempt_origin_guard {
     /// Only the code *above* the test modules. Scanning our own text would
     /// otherwise match the string literals in these very assertions.
     fn src() -> &'static str {
-        const FULL: &str = include_str!("service.rs");
-        let marker = "\n#[cfg(test)]\n";
-        FULL.split_once(marker)
-            .map(|(head, _)| head)
-            .unwrap_or(FULL)
+        before_tests(include_str!("service.rs"))
+    }
+
+    /// Split at the first test module.
+    ///
+    /// Must not assume LF. `include_str!` preserves whatever the checkout has,
+    /// and git on Windows checks out CRLF — so a marker ending in `\n` matches a
+    /// `\r` there and never fires. This guard shipped with exactly that bug and
+    /// only Windows CI caught it: the split silently returned the WHOLE file,
+    /// the guard scanned its own assertions, and it failed on its own string
+    /// literal. `before_tests_survives_crlf` is the local version of that
+    /// Windows run.
+    fn before_tests(full: &str) -> &str {
+        full.split("\n#[cfg(test)]").next().unwrap_or(full)
+    }
+
+    #[test]
+    fn before_tests_survives_crlf() {
+        let lf = "fn real() {}\n#[cfg(test)]\nmod t { fn fake() {} }";
+        let crlf = "fn real() {}\r\n#[cfg(test)]\r\nmod t { fn fake() {} }";
+        for (name, s) in [("lf", lf), ("crlf", crlf)] {
+            assert!(
+                !before_tests(s).contains("fake"),
+                "{name}: test-module source leaked into the scanned region, so every \
+                 guard built on this silently scans its own assertions"
+            );
+            assert!(
+                before_tests(s).contains("real"),
+                "{name}: real source was cut"
+            );
+        }
     }
 
     /// The lines that actually CALL it — not the definition, not prose.
