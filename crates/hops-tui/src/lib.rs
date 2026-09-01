@@ -37,8 +37,8 @@ use std::{
 };
 
 use hops_frontend_core::{
-    AppModel, ClientHandle, Device, DeviceSend, FrontendClient, FrontendRequest, Position, Status,
-    TrustState,
+    AppModel, AttemptOrigin, ClientHandle, Device, DeviceSend, FrontendClient, FrontendRequest,
+    Position, Status, TrustState,
     prefs::Frontend,
     theme::{self, Rgb, Theme},
 };
@@ -926,7 +926,7 @@ fn ui(
     // overlays (only when nothing else is capturing input): pairing takes priority
     if let Some(fp) = pairing {
         if input.is_none() && confirm.is_none() {
-            pairing_popup(f, fp, theme);
+            pairing_popup(f, fp, model.pending_pairing_origin, theme);
         }
     } else if show_log && input.is_none() && confirm.is_none() {
         log_overlay(f, &model.messages, theme);
@@ -1034,7 +1034,8 @@ fn footer_line(
 }
 
 /// Render a centered approve/deny popup for an untrusted incoming peer.
-fn pairing_popup(f: &mut Frame, fp: &str, theme: &Theme) {
+fn pairing_popup(f: &mut Frame, fp: &str, origin: Option<AttemptOrigin>, theme: &Theme) {
+    let ours = origin == Some(AttemptOrigin::OutboundDial);
     let area = centered_rect(70, 9, f.area());
     let base = Style::default()
         .bg(col(theme.background))
@@ -1052,10 +1053,24 @@ fn pairing_popup(f: &mut Frame, fp: &str, theme: &Theme) {
         .borders(Borders::ALL)
         .border_style(warn)
         .style(base)
-        .title(Span::styled(" pairing request ", warn));
+        .title(Span::styled(
+            // Say which. A prompt the console SUMMONED by dialling out must not
+            // read the same as a peer knocking (#61).
+            if ours {
+                " we dialled this device "
+            } else {
+                " pairing request "
+            },
+            warn,
+        ));
     let body = vec![
         Line::from(Span::styled(
-            "An untrusted device wants to control this machine:",
+            if ours {
+                // We went looking for it. Nobody knocked — do not imply they did.
+                "This machine dialled out and found an untrusted device:"
+            } else {
+                "An untrusted device wants to control this machine:"
+            },
             base,
         )),
         Line::from(Span::styled(fp.to_string(), key)),

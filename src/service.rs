@@ -12,7 +12,7 @@ use crate::{
 };
 use futures::StreamExt;
 use hops_ipc::{
-    AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
+    AsyncFrontendListener, AttemptOrigin, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
     IpcListenerCreationError, Position, Status,
 };
 use local_channel::mpsc::{Receiver, channel};
@@ -296,7 +296,7 @@ impl Service {
                         let known = self.authorized_keys.read().expect("lock").contains_key(&fp);
                         if !known {
                             log::info!("untrusted receiver {fp} — raising an approval prompt");
-                            self.raise_connection_attempt(fp);
+                            self.raise_connection_attempt(fp, AttemptOrigin::OutboundDial);
                         }
                     }
                 }
@@ -524,7 +524,7 @@ impl Service {
                 )));
             }
             EmulationEvent::ConnectionAttempt { fingerprint } => {
-                self.raise_connection_attempt(fingerprint);
+                self.raise_connection_attempt(fingerprint, AttemptOrigin::Inbound);
             }
             EmulationEvent::Entered {
                 addr,
@@ -880,7 +880,7 @@ impl Service {
     /// user's screen. That is the whole mechanism: revocation cannot keep an
     /// attacker out (it can re-key), but it can stop it choosing the moment you
     /// are asked to let it back in.
-    fn raise_connection_attempt(&mut self, fingerprint: String) {
+    fn raise_connection_attempt(&mut self, fingerprint: String, origin: AttemptOrigin) {
         if let Some(entry) = self.revoked.get(&fingerprint) {
             log::warn!(
                 "ignoring a connection attempt from revoked device {:?} ({fingerprint}) — \
@@ -889,7 +889,18 @@ impl Service {
             );
             return;
         }
-        self.notify_frontend(FrontendEvent::ConnectionAttempt { fingerprint });
+        if origin == AttemptOrigin::OutboundDial {
+            // Say so. A console verb can cause this, and a prompt the console
+            // summoned must not look like a peer knocking (#61).
+            log::info!(
+                "{fingerprint} was reached by OUR OWN dial, not by an unsolicited \
+                 connection — the prompt will say so"
+            );
+        }
+        self.notify_frontend(FrontendEvent::ConnectionAttempt {
+            fingerprint,
+            origin,
+        });
     }
 
     /// Tear down every live session with `fp`, in both directions.
@@ -1495,5 +1506,70 @@ mod one_trust_write_site {
                  now covering less than it claims"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod attempt_origin_guard {
+    //! Both `raise_connection_attempt` call sites must declare where the attempt
+    //! came from, and they must not declare the same thing.
+    //!
+    //! #61: a console holding the IPC token can run `Create` →
+    //! `UpdateFixIps(attacker_ip)` → `Activate` and make the daemon dial an
+    //! address it chose. The receiver answers, its fingerprint is not on our
+    //! allowlist, and the daemon raises a *genuine* approval prompt — for a key
+    //! the attacker picked, at a moment the attacker picked. The prompt is real;
+    //! what is forged is its provenance.
+    //!
+    //! We cannot prove where a keystroke came from. We can prove where a prompt
+    //! came from, because hops itself caused it — it is a property of our own
+    //! state machine. This guard keeps that property from being erased by a
+    //! later refactor that "simplifies" the two sites back into one.
+
+    /// Only the code *above* the test modules. Scanning our own text would
+    /// otherwise match the string literals in these very assertions.
+    fn src() -> &'static str {
+        const FULL: &str = include_str!("service.rs");
+        let marker = "\n#[cfg(test)]\n";
+        FULL.split_once(marker)
+            .map(|(head, _)| head)
+            .unwrap_or(FULL)
+    }
+
+    /// Every call must pass an origin — no defaulting, no inference downstream.
+    #[test]
+    fn every_raise_site_names_its_origin() {
+        let calls: Vec<&str> = src()
+            .lines()
+            .map(str::trim)
+            // the definition and this guard's own text are not call sites
+            .filter(|l| l.contains("self.raise_connection_attempt("))
+            .collect();
+        assert!(
+            !calls.is_empty(),
+            "the raise sites vanished — this guard is now testing nothing"
+        );
+        for c in &calls {
+            assert!(
+                c.contains("AttemptOrigin::"),
+                "a ConnectionAttempt is raised without saying where it came from: {c:?}. \
+                 An attacker-summoned dial would then be indistinguishable from a peer \
+                 knocking (#61)."
+            );
+        }
+    }
+
+    /// And the two must stay distinguishable. One `Inbound`, one `OutboundDial`:
+    /// collapsing them is precisely the defect.
+    #[test]
+    fn the_two_provenances_are_still_distinct() {
+        let inbound = src().matches("AttemptOrigin::Inbound)").count();
+        let dialled = src().matches("AttemptOrigin::OutboundDial)").count();
+        assert!(
+            inbound >= 1 && dialled >= 1,
+            "expected both provenances to be raised somewhere (inbound={inbound}, \
+             outbound={dialled}). If one is gone, either a path stopped prompting or \
+             both paths now claim the same origin — the second is the #61 defect."
+        );
     }
 }

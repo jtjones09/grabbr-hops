@@ -61,6 +61,9 @@ struct PolledUi {
     port: String,
     fingerprint: String,
     pairing: String,
+    /// Whether that pairing prompt came from OUR outbound dial rather than a
+    /// peer connecting in (#61) — the card says which.
+    pairing_from_our_dial: bool,
     free_position: String,
     notice: String,
     notice_seq: i32,
@@ -658,6 +661,9 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                 })
                 .cloned()
                 .unwrap_or_default();
+            let pairing_from_our_dial = !pairing.is_empty()
+                && m.pending_pairing_origin
+                    == Some(hops_frontend_core::AttemptOrigin::OutboundDial);
 
             // unified device view: one row per physical peer. AppModel::devices()
             // joins the outgoing clients with the trusted-fingerprint set by
@@ -740,6 +746,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                     .unwrap_or_else(|| "—".to_string()),
                 fingerprint: m.fingerprint.clone().unwrap_or_else(|| "—".to_string()),
                 pairing,
+                pairing_from_our_dial,
                 // the first edge nothing active is already using, so adding a
                 // second device does not silently switch off the first
                 free_position: ["left", "right", "top", "bottom"]
@@ -786,6 +793,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
             ui.set_port(snap.port.as_str().into());
             ui.set_fingerprint(snap.fingerprint.as_str().into());
             ui.set_pairing_fp(snap.pairing.as_str().into());
+            ui.set_pairing_from_our_dial(snap.pairing_from_our_dial);
             // only when the DAEMON has something new — otherwise a local
             // validation notice would be overwritten on the next poll
             if snap.notice_seq != last_daemon_notice.get() {

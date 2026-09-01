@@ -65,6 +65,10 @@ export component AppWindow inherits Window {
     in property <string> fingerprint: "—";
     in property <[DeviceRow]> devices: [];
     in property <string> pairing-fp: "";
+    // true when WE dialled out and found this untrusted receiver, rather than it
+    // connecting to us. A console verb can cause the former, so the card must not
+    // present it as a peer knocking (#61).
+    in property <bool> pairing-from-our-dial: false;
 
     // `in-out` so the render_png self-review harness can open it for a look —
     // the same reason confirm-delete-handle is. A confirm state you cannot
@@ -260,7 +264,13 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                // --- pairing request (Windows wants to pair with this Mac) -------------
+                // --- pairing request ---------------------------------------------------
+                // Two ways to get here, and they are NOT the same event (#61):
+                //   inbound       — a peer connected to us, unsolicited
+                //   our own dial  — we went looking, because something asked us to
+                // The second can be caused by a console holding the IPC token, so the
+                // card says which, and — for the dial case — states the falsifier: if
+                // you did not just ask for this, something else did.
                 if root.pairing-fp != "": Rectangle {
                     vertical-stretch: 0;
                     background: Theme.c.warn.transparentize(0.9);
@@ -271,10 +281,20 @@ export component AppWindow inherits Window {
                         padding: Space.md;
                         spacing: Space.sm;
                         Text {
-                            text: "pairing request";
+                            text: root.pairing-from-our-dial
+                                ? "we dialled this device"
+                                : "pairing request";
                             color: Theme.c.warn;
                             font-size: Type.small;
                             font-weight: Type.semibold;
+                        }
+                        if root.pairing-from-our-dial: Text {
+                            text: "hops went looking for this device — you should only see "
+                                + "this if you just asked to connect one. If you did not, "
+                                + "deny it.";
+                            color: Theme.c.muted;
+                            font-size: Type.caption;
+                            wrap: word-wrap;
                         }
                         Text {
                             text: root.pairing-fp;

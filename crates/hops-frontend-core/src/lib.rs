@@ -17,8 +17,8 @@ use futures::StreamExt;
 use tokio::sync::{Notify, mpsc};
 
 pub use hops_ipc::{
-    ClientConfig, ClientHandle, ClientState, FrontendEvent, FrontendRequest, Position,
-    RevokedEntry, Status, connect_async,
+    AttemptOrigin, ClientConfig, ClientHandle, ClientState, FrontendEvent, FrontendRequest,
+    Position, RevokedEntry, Status, connect_async,
 };
 
 pub mod prefs;
@@ -67,6 +67,10 @@ pub struct AppModel {
     /// on `ConnectionAttempt`; cleared once it becomes authorized or the daemon
     /// link drops. The UI surfaces this as an approve/deny prompt.
     pub pending_pairing: Option<String>,
+    /// How the pending attempt arrived. `OutboundDial` means WE dialled and
+    /// found an untrusted receiver — which a console verb can cause, so the UI
+    /// must not present it as a peer knocking (#61).
+    pub pending_pairing_origin: Option<AttemptOrigin>,
     /// When `pending_pairing` was last (re)asserted by a `ConnectionAttempt`.
     /// A front-end can treat the prompt as stale (the peer gave up) once this is
     /// older than a small TTL, since the daemon emits no retraction event.
@@ -144,10 +148,19 @@ impl AppModel {
                 }
                 self.push_message(format!("incoming disconnected: {addr}"));
             }
-            FrontendEvent::ConnectionAttempt { fingerprint } => {
-                self.push_message(format!("pairing request: {fingerprint}"));
+            FrontendEvent::ConnectionAttempt {
+                fingerprint,
+                origin,
+            } => {
+                self.push_message(match origin {
+                    AttemptOrigin::Inbound => format!("pairing request: {fingerprint}"),
+                    AttemptOrigin::OutboundDial => {
+                        format!("we dialled an untrusted receiver: {fingerprint}")
+                    }
+                });
                 if !self.authorized.contains_key(&fingerprint) {
                     self.pending_pairing = Some(fingerprint);
+                    self.pending_pairing_origin = Some(origin);
                     self.pending_pairing_since = Some(Instant::now());
                 }
             }
@@ -824,5 +837,65 @@ mod tests {
 
         // an empty fingerprint must still yield something sayable
         assert_eq!(fallback_label(""), "unnamed device");
+    }
+}
+
+#[cfg(test)]
+mod attempt_origin {
+    //! A prompt we caused by dialling out must not reach the user looking like a
+    //! peer knocking (#61). The daemon knows which it was; the model has to
+    //! carry that, because the UI cannot re-derive it.
+    use super::{AppModel, AttemptOrigin, FrontendEvent};
+
+    fn attempt(origin: AttemptOrigin) -> AppModel {
+        let mut m = AppModel::default();
+        m.apply(FrontendEvent::ConnectionAttempt {
+            fingerprint: "AA:BB".into(),
+            origin,
+        });
+        m
+    }
+
+    #[test]
+    fn the_origin_reaches_the_model() {
+        assert_eq!(
+            attempt(AttemptOrigin::Inbound).pending_pairing_origin,
+            Some(AttemptOrigin::Inbound)
+        );
+        assert_eq!(
+            attempt(AttemptOrigin::OutboundDial).pending_pairing_origin,
+            Some(AttemptOrigin::OutboundDial)
+        );
+    }
+
+    /// Both still raise a prompt — a console-caused dial is not silently
+    /// swallowed. It is *labelled*, not suppressed. Suppressing it would break
+    /// the outbound pairing flow, which is how a device is actually paired.
+    #[test]
+    fn both_origins_still_prompt() {
+        for o in [AttemptOrigin::Inbound, AttemptOrigin::OutboundDial] {
+            assert_eq!(
+                attempt(o).pending_pairing.as_deref(),
+                Some("AA:BB"),
+                "{o:?} must still raise a prompt"
+            );
+        }
+    }
+
+    /// And the user-visible sentence differs. If these ever converge, the whole
+    /// point of carrying the provenance is lost.
+    #[test]
+    fn the_two_read_differently() {
+        let inbound = attempt(AttemptOrigin::Inbound).messages.pop_back().unwrap();
+        let dialled = attempt(AttemptOrigin::OutboundDial)
+            .messages
+            .pop_back()
+            .unwrap();
+        assert_ne!(
+            inbound, dialled,
+            "a prompt we summoned by dialling out reads identically to a peer \
+             knocking — that is the #61 defect, and it is what makes a forged \
+             provenance invisible"
+        );
     }
 }
