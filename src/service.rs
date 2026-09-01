@@ -449,6 +449,9 @@ impl Service {
         for h in self.client_manager.registered_clients() {
             self.remove_client(h);
         }
+        // Every client is gone; hand out 0,1,2… again rather than letting the
+        // slab's LIFO free list reverse the numbering (#94).
+        self.client_manager.reset_handle_allocation();
         for c in self.config.clients() {
             let handle = self.client_manager.add_with_config(c);
             log::info!("added client {handle}");
@@ -1627,6 +1630,81 @@ mod attempt_origin_guard {
             "the raise sites pass {passed:?}. Both provenances must still be raised: \
              if they all pass the same one, a prompt our own dial summoned is \
              indistinguishable from a peer knocking — the #61 defect."
+        );
+    }
+}
+
+#[cfg(test)]
+mod reload_resets_handles {
+    //! The reload path itself must reset handle allocation.
+    //!
+    //! `client::reload_permutation` proves `ClientManager` behaves once the
+    //! reset is called. It cannot prove `handle_config_change` calls it — that
+    //! test drives the manager directly, so dropping the call here would leave
+    //! it green while the real reload renumbered every device again (#94).
+    //!
+    //! That is the false-pass shape this project keeps producing, so it gets its
+    //! own guard.
+
+    /// Non-test source only. Split on the marker WITHOUT a trailing newline:
+    /// `include_str!` keeps CRLF on a Windows checkout, and a trailing `\n`
+    /// there matches a `\r` and never fires.
+    fn production() -> &'static str {
+        const FULL: &str = include_str!("service.rs");
+        FULL.split("\n#[cfg(test)]").next().unwrap_or(FULL)
+    }
+
+    #[test]
+    fn handle_config_change_resets_handle_allocation() {
+        let src = production();
+        let body = src
+            .split("fn handle_config_change(")
+            .nth(1)
+            .expect("handle_config_change must exist; if renamed, update this guard");
+        let body = &body[..body.find("\n    fn ").unwrap_or(body.len())];
+        // Strip comments: the prose here explains the reset and would otherwise
+        // satisfy the search on its own.
+        let code: String = body
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("reset_handle_allocation()"),
+            "handle_config_change removes every client and re-adds them, and Slab \
+             reuses freed keys from a LIFO free list — so without resetting, a \
+             reload REVERSES the device numbering and reverses it back on the \
+             next one. Delete is keyed by handle and tombstones irreversibly, so \
+             this silently aims an irreversible verb at the wrong machine (#94)."
+        );
+    }
+
+    /// And the reset must come after the removals, never before — resetting
+    /// first would drop live clients without tearing down their capture.
+    #[test]
+    fn the_reset_comes_after_the_removals() {
+        let src = production();
+        let body = src
+            .split("fn handle_config_change(")
+            .nth(1)
+            .expect("exists");
+        let body = &body[..body.find("\n    fn ").unwrap_or(body.len())];
+        let code: String = body
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let remove = code
+            .find("self.remove_client(")
+            .expect("the reload must still tear clients down");
+        let reset = code
+            .find("reset_handle_allocation()")
+            .expect("the reload must still reset handle allocation");
+        assert!(
+            remove < reset,
+            "reset_handle_allocation clears the slab outright; running it before \
+             the removals would drop live clients without destroying their \
+             capture."
         );
     }
 }
