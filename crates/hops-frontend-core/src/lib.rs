@@ -253,6 +253,30 @@ pub struct Device {
     pub receive: bool,
 }
 
+/// The hostname to store for a machine picked off the network list.
+///
+/// mDNS advertises a host as `<instance>.local.`, and a bare `ScornMBP23` does
+/// not resolve while `ScornMBP23.local` does — through the OS name stack
+/// (Bonjour on macOS, Avahi via nsswitch on Linux), which `src/dns.rs` uses
+/// deliberately for exactly this.
+///
+/// This is what makes a discovered device **self-healing**. The addresses
+/// pinned at add-time are a snapshot: if the peer's DHCP lease changes, they go
+/// stale. hops dials the union of pinned and freshly-resolved addresses on
+/// every reconnect, so a resolvable `.local` name keeps the device working
+/// after every address it was added with has changed.
+///
+/// A label that already contains a dot is left alone — it is either already
+/// qualified or something the user typed.
+pub fn discovered_hostname(label: &str) -> String {
+    let label = label.trim();
+    if label.is_empty() || label.contains('.') {
+        label.to_string()
+    } else {
+        format!("{label}.local")
+    }
+}
+
 /// A compact, human-comparable rendering of a colon-separated fingerprint
 /// (first three groups, e.g. `1e:19:1b`) for use as a fallback label.
 fn short_fingerprint(fp: &str) -> String {
@@ -833,5 +857,39 @@ mod tests {
 
         // an empty fingerprint must still yield something sayable
         assert_eq!(fallback_label(""), "unnamed device");
+    }
+}
+
+#[cfg(test)]
+mod discovered_hostnames {
+    //! A discovered device must survive its addresses changing.
+    //!
+    //! Jeremy's case, and the reason this matters: *"if my switch goes down, it
+    //! could still connect to my wifi without having to redo the connection,
+    //! which I have run into with Synergy."* hops already races every known
+    //! address and keys trust on the fingerprint rather than the address, so a
+    //! path change is not a new device. The remaining gap was that addresses
+    //! pinned at add-time are a snapshot — a `.local` name closes it, because
+    //! the resolved set is refreshed on every reconnect.
+    use super::discovered_hostname;
+
+    #[test]
+    fn a_bare_mdns_label_becomes_resolvable() {
+        assert_eq!(discovered_hostname("ScornMBP23"), "ScornMBP23.local");
+    }
+
+    /// Already-qualified names are left alone rather than becoming
+    /// `host.local.local`, which resolves to nothing.
+    #[test]
+    fn an_already_qualified_name_is_untouched() {
+        for n in ["ScornMBP23.local", "box.lan", "10.110.20.99"] {
+            assert_eq!(discovered_hostname(n), n, "{n:?} must not be re-suffixed");
+        }
+    }
+
+    #[test]
+    fn whitespace_and_empty_are_handled() {
+        assert_eq!(discovered_hostname("  rig  "), "rig.local");
+        assert_eq!(discovered_hostname("   "), "");
     }
 }

@@ -517,8 +517,18 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
             }
             let port = port.trim().parse::<u16>().unwrap_or(DEFAULT_PORT);
             let position = Position::try_from(position.as_str()).unwrap_or_default();
-            let label = label.trim().to_string();
-            *pending.borrow_mut() = Some((label, port, position, addrs));
+            // Store the mDNS hostname, not the bare label. `ScornMBP23` does not
+            // resolve; `ScornMBP23.local` does, through the OS name stack
+            // (Bonjour on macOS, Avahi via nsswitch on Linux) -- see
+            // resolve_hostname in src/dns.rs.
+            //
+            // This is what makes a discovered device SELF-HEALING. The pinned
+            // addresses are a snapshot, so if the peer's DHCP lease changes they
+            // go stale. hops dials the union of pinned addresses and freshly
+            // resolved ones on every reconnect, so a resolvable `.local` name
+            // keeps working after every address it was added with has changed.
+            let hostname = hops_frontend_core::discovered_hostname(&label);
+            *pending.borrow_mut() = Some((hostname, port, position, addrs));
         });
     }
     {
