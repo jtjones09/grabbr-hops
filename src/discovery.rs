@@ -176,7 +176,15 @@ async fn pump(
 ) {
     while let Ok(event) = browse.recv_async().await {
         match event {
-            ServiceEvent::ServiceResolved(info) => {
+            ServiceEvent::ServiceResolved(ref info) => {
+                log::debug!(
+                    "discovery: raw ServiceResolved {} host={} port={} addrs={:?} txt={:?}",
+                    info.get_fullname(),
+                    info.get_hostname(),
+                    info.get_port(),
+                    info.get_addresses(),
+                    info.get_properties()
+                );
                 let port = info.get_port();
                 let announcement = Announcement {
                     fullname: info.get_fullname().to_string(),
@@ -197,7 +205,9 @@ async fn pump(
                     return;
                 }
             }
-            ServiceEvent::ServiceRemoved(_, fullname) => {
+            ServiceEvent::ServiceRemoved(_, ref fullname) => {
+                log::debug!("discovery: raw ServiceRemoved {fullname}");
+                let fullname = fullname.clone();
                 if event_tx
                     .send(DiscoveryEvent::Lost(instance_label(&fullname)))
                     .is_err()
@@ -205,7 +215,7 @@ async fn pump(
                     return;
                 }
             }
-            _ => {}
+            other => log::debug!("discovery: raw event {other:?}"),
         }
     }
 }
@@ -234,17 +244,27 @@ pub(crate) fn classify(a: Announcement, our_fingerprint: &str) -> Option<Discove
     let claimed = a.claimed_fingerprint.map(|f| f.trim().to_lowercase());
     // Our own announcement comes back to us; it is not a peer.
     if claimed.as_deref() == Some(our_fingerprint) {
+        log::debug!("discovery: ignoring {} — it is our own echo", a.fullname);
         return None;
     }
     if a.version.as_deref() != Some(PROTOCOL_VERSION) {
         log::debug!(
-            "ignoring {} — it announces protocol version {:?}, we speak {PROTOCOL_VERSION}",
+            "discovery: ignoring {} — it announces protocol version {:?}, we speak \
+             {PROTOCOL_VERSION}",
             a.fullname,
             a.version
         );
         return None;
     }
     if a.addrs.is_empty() {
+        // Worth saying out loud: a service that resolves with NO address is the
+        // shape of an mDNS record arriving without its A/AAAA, which looks
+        // exactly like "discovery found nothing" from the outside.
+        log::debug!(
+            "discovery: ignoring {} — it resolved with no address to dial (claimed {:?})",
+            a.fullname,
+            claimed
+        );
         return None;
     }
     Some(DiscoveredPeer {
@@ -252,6 +272,24 @@ pub(crate) fn classify(a: Announcement, our_fingerprint: &str) -> Option<Discove
         label: instance_label(&a.fullname),
         addrs: a.addrs,
     })
+}
+
+/// Strip mDNS's conflict suffix: `studio-pc (2)` -> `studio-pc`.
+///
+/// mDNS renames on collision, and a machine can ANNOUNCE under one form and be
+/// WITHDRAWN under another — observed on the rig as `LOST SCORNW20SIM (2)` for
+/// a peer filed as `SCORNW20SIM`. Comparing raw labels there misses the removal
+/// and the row never disappears.
+pub fn base_label(label: &str) -> &str {
+    let t = label.trim_end();
+    let Some(open) = t.rfind(" (") else {
+        return label;
+    };
+    let inner = &t[open + 2..];
+    match inner.strip_suffix(')') {
+        Some(n) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => &t[..open],
+        _ => label,
+    }
 }
 
 /// The key a discovered peer is filed under.
@@ -288,8 +326,8 @@ pub fn merge(into: &mut DiscoveredPeer, new: DiscoveredPeer) -> bool {
     }
     into.addrs.sort();
     // Prefer the un-suffixed name: mDNS appends " (2)", " (3)" on conflict.
-    if new.label.len() < into.label.len() {
-        into.label = new.label;
+    if base_label(&new.label).len() < into.label.len() {
+        into.label = base_label(&new.label).to_string();
     }
     if into.claimed_fingerprint.is_none() {
         into.claimed_fingerprint = new.claimed_fingerprint;
@@ -483,5 +521,31 @@ mod tests {
     #[test]
     fn a_name_without_the_service_suffix_survives_intact() {
         assert_eq!(instance_label("bare-name"), "bare-name");
+    }
+}
+
+#[cfg(test)]
+mod suffix {
+    use super::base_label;
+
+    /// Observed on the rig: a peer filed as `SCORNW20SIM` was withdrawn as
+    /// `SCORNW20SIM (2)`. Matching raw labels missed it and left a stale row.
+    #[test]
+    fn the_mdns_conflict_suffix_is_stripped() {
+        assert_eq!(base_label("SCORNW20SIM (2)"), "SCORNW20SIM");
+        assert_eq!(base_label("peer-alpha (13)"), "peer-alpha");
+    }
+
+    /// A name that merely CONTAINS parentheses is the user's, not mDNS's.
+    #[test]
+    fn a_real_parenthetical_name_survives() {
+        for name in ["office (spare)", "rig (2", "box ()", "lab (2a)", "(3)"] {
+            assert_eq!(base_label(name), name, "{name:?} must not be rewritten");
+        }
+    }
+
+    #[test]
+    fn an_unsuffixed_name_is_untouched() {
+        assert_eq!(base_label("studio-pc"), "studio-pc");
     }
 }

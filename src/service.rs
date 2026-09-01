@@ -724,10 +724,14 @@ impl Service {
             DiscoveryEvent::Lost(label) => {
                 // Filed by fingerprint, but withdrawn by name — so find the
                 // entry whose label matches rather than assuming the key.
+                // Compare BASE labels: mDNS can announce a peer as `name` and
+                // withdraw it as `name (2)`, and a raw comparison then never
+                // matches, leaving the row on screen forever.
+                let want = crate::discovery::base_label(&label);
                 let key = self
                     .discovered
                     .iter()
-                    .find(|(_, p)| p.label == label)
+                    .find(|(_, p)| crate::discovery::base_label(&p.label) == want)
                     .map(|(k, _)| k.clone());
                 match key.and_then(|k| self.discovered.remove(&k)) {
                     Some(p) => {

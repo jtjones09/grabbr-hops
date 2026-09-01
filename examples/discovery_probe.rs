@@ -13,7 +13,13 @@
 use std::time::Duration;
 
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // Debug by default for the discovery module: a probe that says nothing when
+    // it finds nothing is unfalsifiable. Rejections and raw mDNS events are the
+    // whole point of running this.
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info,hops::discovery=debug"),
+    )
+    .init();
     let args: Vec<String> = std::env::args().collect();
     let arg = |k: &str, d: &str| {
         args.iter()
@@ -22,7 +28,6 @@ fn main() {
             .cloned()
             .unwrap_or_else(|| d.to_string())
     };
-    let fp = arg("--fingerprint", "probe:00:00:00");
     let name = arg(
         "--name",
         &hostname::get()
@@ -30,9 +35,37 @@ fn main() {
             .and_then(|h| h.into_string().ok())
             .unwrap_or_else(|| "probe".into()),
     );
+    // Derive the default fingerprint FROM THE NAME so two machines never share
+    // one. A fixed default (`probe:00:00:00`) made every probe look like every
+    // other probe's own echo, so each machine silently discarded the other and
+    // printed nothing — while still printing LOST on withdrawal, because
+    // removals are not filtered. That produced "they cannot see each other"
+    // when discovery was in fact working perfectly.
+    let default_fp = {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a, enough to disambiguate
+        for b in name.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+        h.to_be_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(":")
+    };
+    let fp = arg("--fingerprint", &default_fp);
     let secs: u64 = arg("--seconds", "20").parse().unwrap_or(20);
 
-    println!("announcing as {name:?} with fingerprint {fp}; listening {secs}s");
+    // Say what WE are announcing, so a one-sided run still tells you which
+    // interfaces this machine is putting on the wire.
+    if let Ok(ifs) = if_addrs::get_if_addrs() {
+        println!("this machine's addresses:");
+        for i in ifs.iter().filter(|i| !i.is_loopback()) {
+            println!("   {:<12} {}", i.name, i.ip());
+        }
+    }
+    println!("\nannouncing as {name:?} with fingerprint {fp}; listening {secs}s");
+    println!("(the fingerprint is derived from the name, so two machines differ)");
     println!("run this on a SECOND machine at the same time — each should list the other\n");
 
     let local = tokio::task::LocalSet::new();
@@ -51,6 +84,8 @@ fn main() {
         // those raw made one machine look like several.
         let mut peers: std::collections::HashMap<String, hops::discovery::DiscoveredPeer> =
             Default::default();
+        // Labels that withdrew before we finished. Reported, not deleted.
+        let mut withdrawn: std::collections::HashSet<String> = Default::default();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
         loop {
             tokio::select! {
@@ -73,28 +108,38 @@ fn main() {
                         }
                     }
                     Some(hops::discovery::DiscoveryEvent::Lost(l)) => {
-                        peers.retain(|_, p| p.label != l);
-                        println!("LOST   {l}");
+                        // Withdrawn, but STILL SEEN. Dropping it from the summary
+                        // made a peer that merely exited first read as "nothing
+                        // found", which is the opposite of what happened.
+                        withdrawn.insert(l.clone());
+                        println!("LOST   {l}  (stopped announcing — still counts as seen)");
                     }
                     None => break,
                 },
             }
         }
         d.terminate().await;
-        println!("\n--- what the device list would show ---");
+        println!("\n--- every machine seen during this run ---");
         for p in peers.values() {
             println!(
-                "  {:<24} {:<20} {:?}",
+                "  {:<24} {:<20} {:?}{}",
                 p.label,
                 p.claimed_fingerprint.as_deref().unwrap_or("(no claim)"),
-                p.addrs
+                p.addrs,
+                if withdrawn.contains(&p.label) {
+                    "   [stopped before we did]"
+                } else {
+                    ""
+                }
             );
         }
         println!(
-            "\n{} distinct machine(s). {}",
+            "\n{} distinct machine(s) seen. {}",
             peers.len(),
             if peers.is_empty() {
-                "Nothing found — expected if no other machine is running this."
+                "Nothing found. If the other machine printed LOST for THIS one, \
+                 multicast is fine and something filtered it — re-run and read the \
+                 DEBUG lines for the reason."
             } else {
                 "Discovery is working on this network."
             }
