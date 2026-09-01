@@ -72,6 +72,9 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
     ui.set_pairing_fp("a4:f0:9c:2e:11:bd:77:0c:35:9a".into()); // shows the pairing card
     // flip to true to review the "we dialled this device" wording (#61)
     ui.set_pairing_from_our_dial(std::env::var_os("PREVIEW_OUR_DIAL").is_some());
+    if std::env::var_os("PREVIEW_OUR_DIAL").is_some() {
+        ui.set_pairing_addr("10.0.0.5:4242".into());
+    }
     // the notice banner — the daemon's only "that didn't work" channel
     ui.set_notice(
         "Refused to grant trust: this machine is being controlled remotely. \

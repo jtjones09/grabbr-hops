@@ -926,7 +926,13 @@ fn ui(
     // overlays (only when nothing else is capturing input): pairing takes priority
     if let Some(fp) = pairing {
         if input.is_none() && confirm.is_none() {
-            pairing_popup(f, fp, model.pending_pairing_origin, theme);
+            pairing_popup(
+                f,
+                fp,
+                model.pending_pairing_origin,
+                model.pending_pairing_addr,
+                theme,
+            );
         }
     } else if show_log && input.is_none() && confirm.is_none() {
         log_overlay(f, &model.messages, theme);
@@ -1034,9 +1040,16 @@ fn footer_line(
 }
 
 /// Render a centered approve/deny popup for an untrusted incoming peer.
-fn pairing_popup(f: &mut Frame, fp: &str, origin: Option<AttemptOrigin>, theme: &Theme) {
+fn pairing_popup(
+    f: &mut Frame,
+    fp: &str,
+    origin: Option<AttemptOrigin>,
+    addr: Option<std::net::SocketAddr>,
+    theme: &Theme,
+) {
     let ours = origin == Some(AttemptOrigin::OutboundDial);
-    let area = centered_rect(70, 9, f.area());
+    // one extra row when there is an address line to render
+    let area = centered_rect(70, if addr.is_some() { 10 } else { 9 }, f.area());
     let base = Style::default()
         .bg(col(theme.background))
         .fg(col(theme.foreground));
@@ -1063,7 +1076,7 @@ fn pairing_popup(f: &mut Frame, fp: &str, origin: Option<AttemptOrigin>, theme: 
             },
             warn,
         ));
-    let body = vec![
+    let mut body = vec![
         Line::from(Span::styled(
             if ours {
                 // We went looking for it. Nobody knocked — do not imply they did.
@@ -1073,7 +1086,10 @@ fn pairing_popup(f: &mut Frame, fp: &str, origin: Option<AttemptOrigin>, theme: 
             },
             base,
         )),
-        Line::from(Span::styled(fp.to_string(), key)),
+        // Before the fingerprint, and brighter than it: the address is the only
+        // part of this a human can check against what they typed (#93). The
+        // fingerprint is opaque to them.
+        Line::from(Span::styled(fp.to_string(), muted)),
         Line::from(Span::raw("")),
         Line::from(vec![
             Span::styled("y", key),
@@ -1082,6 +1098,9 @@ fn pairing_popup(f: &mut Frame, fp: &str, origin: Option<AttemptOrigin>, theme: 
             Span::styled(" deny (for now)", muted),
         ]),
     ];
+    if let Some(a) = addr {
+        body.insert(1, Line::from(Span::styled(format!("{a} answered"), key)));
+    }
     f.render_widget(Clear, area);
     f.render_widget(
         Paragraph::new(body)

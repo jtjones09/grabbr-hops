@@ -69,6 +69,9 @@ export component AppWindow inherits Window {
     // connecting to us. A console verb can cause the former, so the card must not
     // present it as a peer knocking (#61).
     in property <bool> pairing-from-our-dial: false;
+    // the address that actually answered our dial — the user typed one, and the
+    // machine that replies is not always the one they meant (#93)
+    in property <string> pairing-addr: "";
 
     // `in-out` so the render_png self-review harness can open it for a look —
     // the same reason confirm-delete-handle is. A confirm state you cannot
@@ -291,10 +294,17 @@ export component AppWindow inherits Window {
                         if root.pairing-from-our-dial: Text {
                             text: "hops went looking for this device — you should only see "
                                 + "this if you just asked to connect one. If you did not, "
-                                + "deny it.";
+                                + "deny it. Check the address below is the one you typed.";
                             color: Theme.c.muted;
                             font-size: Type.caption;
                             wrap: word-wrap;
+                        }
+                        if root.pairing-addr != "": Text {
+                            text: root.pairing-addr + " answered";
+                            color: Theme.c.foreground;
+                            font-family: Type.mono;
+                            font-size: Type.caption;
+                            letter-spacing: Type.mono-tracking;
                         }
                         Text {
                             text: root.pairing-fp;

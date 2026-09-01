@@ -96,7 +96,7 @@ pub struct Service {
     /// fingerprints of RECEIVERS we tried to dial but don't trust (from the
     /// connect side). Turned into `ConnectionAttempt` below so the UI can offer
     /// to authorize them — the outbound counterpart of the inbound pairing prompt.
-    untrusted_receivers: Receiver<String>,
+    untrusted_receivers: Receiver<(String, SocketAddr)>,
     /// a client's peer_fingerprint was just learned — persist it and republish
     persist_requests: Receiver<ClientHandle>,
     /// broadcast local clipboard changes to outgoing-connection peers
@@ -290,13 +290,13 @@ impl Service {
                     }
                 }
                 fp = self.untrusted_receivers.recv() => {
-                    if let Some(fp) = fp {
+                    if let Some((fp, addr)) = fp {
                         // only prompt if it really is untrusted — a racing dial can
                         // report a fingerprint that was authorized in the meantime
                         let known = self.authorized_keys.read().expect("lock").contains_key(&fp);
                         if !known {
                             log::info!("untrusted receiver {fp} — raising an approval prompt");
-                            self.raise_connection_attempt(fp, AttemptOrigin::OutboundDial);
+                            self.raise_connection_attempt(fp, AttemptOrigin::OutboundDial, Some(addr));
                         }
                     }
                 }
@@ -524,7 +524,7 @@ impl Service {
                 )));
             }
             EmulationEvent::ConnectionAttempt { fingerprint } => {
-                self.raise_connection_attempt(fingerprint, AttemptOrigin::Inbound);
+                self.raise_connection_attempt(fingerprint, AttemptOrigin::Inbound, None);
             }
             EmulationEvent::Entered {
                 addr,
@@ -880,7 +880,12 @@ impl Service {
     /// user's screen. That is the whole mechanism: revocation cannot keep an
     /// attacker out (it can re-key), but it can stop it choosing the moment you
     /// are asked to let it back in.
-    fn raise_connection_attempt(&mut self, fingerprint: String, origin: AttemptOrigin) {
+    fn raise_connection_attempt(
+        &mut self,
+        fingerprint: String,
+        origin: AttemptOrigin,
+        addr: Option<SocketAddr>,
+    ) {
         if let Some(entry) = self.revoked.get(&fingerprint) {
             log::warn!(
                 "ignoring a connection attempt from revoked device {:?} ({fingerprint}) — \
@@ -893,13 +898,15 @@ impl Service {
             // Say so. A console verb can cause this, and a prompt the console
             // summoned must not look like a peer knocking (#61).
             log::info!(
-                "{fingerprint} was reached by OUR OWN dial, not by an unsolicited \
-                 connection — the prompt will say so"
+                "{fingerprint} at {addr:?} was reached by OUR OWN dial, not by an \
+                 unsolicited connection — the prompt will say so, and will show the \
+                 address so it can be compared with the one that was typed"
             );
         }
         self.notify_frontend(FrontendEvent::ConnectionAttempt {
             fingerprint,
             origin,
+            addr,
         });
     }
 
@@ -1536,15 +1543,19 @@ mod attempt_origin_guard {
             .unwrap_or(FULL)
     }
 
+    /// The lines that actually CALL it — not the definition, not prose.
+    fn raise_sites() -> Vec<&'static str> {
+        src()
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains("self.raise_connection_attempt("))
+            .collect()
+    }
+
     /// Every call must pass an origin — no defaulting, no inference downstream.
     #[test]
     fn every_raise_site_names_its_origin() {
-        let calls: Vec<&str> = src()
-            .lines()
-            .map(str::trim)
-            // the definition and this guard's own text are not call sites
-            .filter(|l| l.contains("self.raise_connection_attempt("))
-            .collect();
+        let calls = raise_sites();
         assert!(
             !calls.is_empty(),
             "the raise sites vanished — this guard is now testing nothing"
@@ -1561,15 +1572,35 @@ mod attempt_origin_guard {
 
     /// And the two must stay distinguishable. One `Inbound`, one `OutboundDial`:
     /// collapsing them is precisely the defect.
+    ///
+    /// Count what the CALL SITES pass, not how often the variants are named.
+    /// Two earlier versions of this were wrong in opposite directions: keying on
+    /// a trailing `)` broke when `addr` became an argument, and then counting
+    /// bare mentions silently stopped catching anything, because
+    /// `if origin == AttemptOrigin::OutboundDial` inside this very function
+    /// survives the mutation and keeps the count at one.
     #[test]
     fn the_two_provenances_are_still_distinct() {
-        let inbound = src().matches("AttemptOrigin::Inbound)").count();
-        let dialled = src().matches("AttemptOrigin::OutboundDial)").count();
+        let passed: Vec<&str> = raise_sites()
+            .into_iter()
+            .filter_map(|l| {
+                l.split("AttemptOrigin::")
+                    .nth(1)
+                    .map(|rest| rest.trim_end_matches(|c: char| !c.is_alphanumeric()))
+                    .map(|v| {
+                        if v.starts_with("Inbound") {
+                            "Inbound"
+                        } else {
+                            "OutboundDial"
+                        }
+                    })
+            })
+            .collect();
         assert!(
-            inbound >= 1 && dialled >= 1,
-            "expected both provenances to be raised somewhere (inbound={inbound}, \
-             outbound={dialled}). If one is gone, either a path stopped prompting or \
-             both paths now claim the same origin — the second is the #61 defect."
+            passed.contains(&"Inbound") && passed.contains(&"OutboundDial"),
+            "the raise sites pass {passed:?}. Both provenances must still be raised: \
+             if they all pass the same one, a prompt our own dial summoned is \
+             indistinguishable from a peer knocking — the #61 defect."
         );
     }
 }

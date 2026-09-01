@@ -292,6 +292,12 @@ pub enum FrontendEvent {
     ConnectionAttempt {
         fingerprint: String,
         origin: AttemptOrigin,
+        /// The address that answered, when we know it. Present for
+        /// `OutboundDial` — the user typed an address and something answered,
+        /// and they cannot judge the fingerprint without seeing which address
+        /// it came from (#93). `None` inbound, because `ListenEvent::Rejected`
+        /// does not carry one (see #83).
+        addr: Option<SocketAddr>,
     },
 }
 

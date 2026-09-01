@@ -64,6 +64,9 @@ struct PolledUi {
     /// Whether that pairing prompt came from OUR outbound dial rather than a
     /// peer connecting in (#61) — the card says which.
     pairing_from_our_dial: bool,
+    /// The address that answered our dial, so the user can compare it with the
+    /// one they typed (#93). Empty when unknown (every inbound attempt).
+    pairing_addr: String,
     free_position: String,
     notice: String,
     notice_seq: i32,
@@ -661,6 +664,13 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                 })
                 .cloned()
                 .unwrap_or_default();
+            let pairing_addr = if pairing.is_empty() {
+                String::new()
+            } else {
+                m.pending_pairing_addr
+                    .map(|a| a.to_string())
+                    .unwrap_or_default()
+            };
             let pairing_from_our_dial = !pairing.is_empty()
                 && m.pending_pairing_origin
                     == Some(hops_frontend_core::AttemptOrigin::OutboundDial);
@@ -747,6 +757,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                 fingerprint: m.fingerprint.clone().unwrap_or_else(|| "—".to_string()),
                 pairing,
                 pairing_from_our_dial,
+                pairing_addr,
                 // the first edge nothing active is already using, so adding a
                 // second device does not silently switch off the first
                 free_position: ["left", "right", "top", "bottom"]
@@ -794,6 +805,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
             ui.set_fingerprint(snap.fingerprint.as_str().into());
             ui.set_pairing_fp(snap.pairing.as_str().into());
             ui.set_pairing_from_our_dial(snap.pairing_from_our_dial);
+            ui.set_pairing_addr(snap.pairing_addr.as_str().into());
             // only when the DAEMON has something new — otherwise a local
             // validation notice would be overwritten on the next poll
             if snap.notice_seq != last_daemon_notice.get() {

@@ -254,7 +254,7 @@ pub(crate) struct LanMouseConnection {
     /// — without this, an untrusted RECEIVER is only ever a log line and the user
     /// has no in-app way to trust it (the inbound path has had a prompt all
     /// along; the outbound path never did).
-    untrusted_tx: Sender<String>,
+    untrusted_tx: Sender<(String, SocketAddr)>,
 }
 
 impl LanMouseConnection {
@@ -263,7 +263,7 @@ impl LanMouseConnection {
         client_manager: ClientManager,
         authorized: Authorized,
         clipboard_in: Sender<String>,
-        untrusted_tx: Sender<String>,
+        untrusted_tx: Sender<(String, SocketAddr)>,
         persist_tx: Sender<ClientHandle>,
     ) -> Result<Self, LanMouseConnectionError> {
         transport::install_crypto_provider();
@@ -448,7 +448,7 @@ async fn connect_to_handle(
     identity: Arc<Identity>,
     authorized: Authorized,
     clipboard_in: Sender<String>,
-    untrusted_tx: Sender<String>,
+    untrusted_tx: Sender<(String, SocketAddr)>,
     persist_tx: Sender<ClientHandle>,
 ) -> Result<(), LanMouseConnectionError> {
     log::info!("client {handle} connecting ...");
@@ -520,7 +520,9 @@ async fn connect_to_handle(
                                 // the allowlist and raises a ConnectionAttempt if it
                                 // really is untrusted. Filtering lives there because
                                 // that is where the allowlist lives.
-                                let _ = untrusted_tx.send(fp);
+                                // keep the addr: the user typed an address and
+                                // needs to see WHICH one answered (#93)
+                                let _ = untrusted_tx.send((fp, addr));
                             }
                             TrustPrompt::Conflict => {
                                 log::error!(
