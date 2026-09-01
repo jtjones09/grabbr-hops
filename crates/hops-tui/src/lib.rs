@@ -714,6 +714,11 @@ fn device_row(d: &Device, theme: &Theme) -> ListItem<'static> {
 
     let dot = if revoked {
         Span::styled("⊘", Style::default().fg(col(theme.error)))
+    } else if d.refuses_our_input() {
+        // Checked BEFORE the green arm. `online` is about the inbound
+        // direction and must not mask a device that will refuse our input
+        // (#92).
+        Span::styled("●", Style::default().fg(col(theme.error)))
     } else if d.online || d.send.as_ref().is_some_and(|s| s.state.alive) {
         Span::styled("●", Style::default().fg(col(theme.success)))
     } else if d.send.as_ref().is_some_and(|s| s.state.active) {
@@ -777,8 +782,18 @@ fn device_row(d: &Device, theme: &Theme) -> ListItem<'static> {
             Style::default().fg(col(theme.accent)),
         ));
         spans.push(Span::styled(
-            if s.state.active { " active" } else { " off" },
-            if s.state.active {
+            if d.refuses_our_input() {
+                // The dot alone cannot say WHY. This is the fact the user needs:
+                // the far end is up and refusing, not unreachable (#92).
+                " not accepting input"
+            } else if s.state.active {
+                " active"
+            } else {
+                " off"
+            },
+            if d.refuses_our_input() {
+                Style::default().fg(col(theme.error))
+            } else if s.state.active {
                 Style::default().fg(col(theme.foreground))
             } else {
                 muted
