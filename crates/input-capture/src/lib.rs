@@ -227,7 +227,7 @@ impl InputCapture {
             // NOT log::debug!. Key identity goes to its own opt-in, time-boxed
             // file so that raising the log level to look at something else does
             // not start recording what the user types (#117).
-            input_event::keylog::key(key, state as u8, &format!("{scancode:?}"));
+            input_event::keylog::key(key, state, &format!("{scancode:?}"));
             match state {
                 1 => self.pressed_keys.insert(scancode),
                 _ => self.pressed_keys.remove(&scancode),

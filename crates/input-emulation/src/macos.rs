@@ -976,7 +976,7 @@ fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods)
     event.set_flags(flags);
     event.post(CGEventTapLocation::HID);
     // The sender's keystrokes, on a receiver. Same gate (#117).
-    input_event::keylog::key(key as u32, state as u8, "macos-key");
+    input_event::keylog::key(key as u32, state, "macos-key");
 }
 
 /// Posts a `FlagsChanged` event for a modifier key.
