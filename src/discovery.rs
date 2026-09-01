@@ -346,19 +346,32 @@ pub(crate) fn instance_label(fullname: &str) -> String {
         .to_string()
 }
 
-/// Every non-loopback local address.
+/// Every non-loopback local **IPv4** address.
 ///
 /// Deliberately not "the best" address: hops already dials several addresses
 /// for one device and reconciles which identity answers, and on this rig a
-/// single machine legitimately has three (two LAN subnets plus a tunnel).
-/// Choosing one here would be guessing which the peer can reach.
+/// single machine legitimately has several. Choosing one here would be guessing
+/// which the peer can reach.
+///
+/// IPv4 ONLY, and that is not a preference — it is what the listener binds.
+/// `LanMouseListener` binds `0.0.0.0` (src/listen.rs), which is the IPv4
+/// wildcard and accepts nothing on IPv6. Advertising an IPv6 address therefore
+/// hands every peer a destination that CANNOT work.
+///
+/// Measured on the rig before this filter existed: each machine advertised five
+/// addresses and three were IPv6 — a global `2603:…`, a ULA `fdcb:…`, and
+/// link-local `fe80::…` entries that are unusable without a zone id in any
+/// case. A peer would have spent dials on all three, every time, forever.
+///
+/// If hops ever binds `[::]` for dual-stack, this filter must be relaxed in the
+/// same commit — `advertised_family_matches_the_bind` below fails until it is.
 fn local_addresses() -> Vec<IpAddr> {
     let Ok(ifaces) = if_addrs::get_if_addrs() else {
         return Vec::new();
     };
     let mut seen = HashMap::new();
     for i in ifaces {
-        if i.is_loopback() {
+        if i.is_loopback() || !i.ip().is_ipv4() {
             continue;
         }
         seen.insert(i.ip(), ());
@@ -521,6 +534,62 @@ mod tests {
     #[test]
     fn a_name_without_the_service_suffix_survives_intact() {
         assert_eq!(instance_label("bare-name"), "bare-name");
+    }
+}
+
+#[cfg(test)]
+mod bind_family {
+    //! What we advertise must match what the listener binds.
+    //!
+    //! `local_addresses` filters to IPv4 because `LanMouseListener` binds
+    //! `0.0.0.0` — the IPv4 wildcard, which accepts nothing on IPv6. Measured
+    //! on the rig before the filter: each machine advertised five addresses,
+    //! three of them IPv6 (a global `2603:…`, a ULA `fdcb:…`, and link-local
+    //! `fe80::…` that is unusable without a zone id regardless). Every peer
+    //! would have burned dials on all three, forever.
+    //!
+    //! These two facts live in different files, so they can drift apart
+    //! silently. This fails when they do.
+
+    /// Non-test source only; no trailing newline in the marker, so a CRLF
+    /// checkout still matches.
+    fn production(src: &str) -> String {
+        let head = src.split("\n#[cfg(test)]").next().unwrap_or(src);
+        head.lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn advertised_family_matches_the_bind() {
+        let listen = production(include_str!("listen.rs"));
+        let disc = production(include_str!("discovery.rs"));
+
+        let binds_v4_only = listen.contains("\"0.0.0.0\"");
+        let binds_dual = listen.contains("\"[::]\"") || listen.contains("\"::\"");
+        assert!(
+            binds_v4_only || binds_dual,
+            "could not tell what listen.rs binds — this guard is testing nothing; \
+             update it to match however the listener now chooses its address"
+        );
+
+        let filters_to_v4 = disc.contains("is_ipv4()");
+        if binds_v4_only && !binds_dual {
+            assert!(
+                filters_to_v4,
+                "the listener binds 0.0.0.0 (IPv4 only) but discovery advertises \
+                 IPv6 addresses too. Every peer is then handed destinations that \
+                 CANNOT accept a connection — measured as 3 dead addresses out of \
+                 5 on the rig."
+            );
+        } else {
+            assert!(
+                !filters_to_v4,
+                "the listener now binds dual-stack, so discovery must stop \
+                 filtering IPv6 out of what it advertises"
+            );
+        }
     }
 }
 
