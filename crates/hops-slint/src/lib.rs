@@ -955,3 +955,50 @@ mod tray_const_property {
         );
     }
 }
+
+#[cfg(test)]
+mod destructive_actions_say_so {
+    //! The confirm text for delete and revoke must say the change is permanent.
+    //!
+    //! Both write a tombstone: the fingerprint can never be trusted again, and
+    //! the device has to present a NEW identity to return. The GUI said
+    //! "delete + untrust?" and "remove?", neither of which reads as irreversible
+    //! — and on 2026-08-31 both machines on the rig were permanently expelled by
+    //! accident, needing hand-edited config files to recover. The TUI had said
+    //! "permanently ... NEW identity" all along; the GUI had not (#33, #125).
+    //!
+    //! This is a source guard because Slint draws its own pixels — there is no
+    //! runtime assertion that reaches this text.
+
+    const APP_SLINT: &str = include_str!("../ui/app.slint");
+
+    #[test]
+    fn the_delete_confirm_says_it_is_permanent() {
+        assert!(
+            APP_SLINT.contains(r#""delete permanently?""#),
+            "the delete confirm must say `permanently`. `delete + untrust?` reads as \
+             reversible, and it is not."
+        );
+    }
+
+    #[test]
+    fn the_revoke_confirm_says_it_is_permanent() {
+        assert!(
+            APP_SLINT.contains(r#""remove permanently?""#),
+            "the revoke confirm must say `permanently` — it writes a tombstone"
+        );
+    }
+
+    #[test]
+    fn both_confirms_explain_the_consequence() {
+        // Saying "permanently" is not enough on its own: the user needs to know
+        // what it costs them, which is a fresh identity on the other machine.
+        let n = APP_SLINT
+            .matches("it must pair again with a NEW identity")
+            .count();
+        assert_eq!(
+            n, 2,
+            "delete and revoke must BOTH explain the consequence; found {n} of 2"
+        );
+    }
+}
