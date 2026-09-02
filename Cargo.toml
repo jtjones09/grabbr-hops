@@ -88,6 +88,7 @@ time = "0.3"
 notify = "8.2.0"
 if-addrs = "0.13"
 hostname = "0.4"
+mdns-sd = "0.21"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.148"

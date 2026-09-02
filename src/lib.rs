@@ -5,6 +5,7 @@ mod clipboard;
 pub mod config;
 mod connect;
 mod crypto;
+pub mod discovery;
 mod dns;
 mod emulation;
 pub mod emulation_test;

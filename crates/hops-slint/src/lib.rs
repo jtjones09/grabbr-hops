@@ -61,6 +61,9 @@ struct PolledUi {
     port: String,
     fingerprint: String,
     pairing: String,
+    /// Machines announcing themselves on the LAN that are not already added or
+    /// trusted. Not devices and not identities (#136).
+    discovered: Vec<DiscoveredRow>,
     /// Whether that pairing prompt came from OUR outbound dial rather than a
     /// peer connecting in (#61) — the card says which.
     pairing_from_our_dial: bool,
@@ -493,9 +496,47 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
     // assigns (Create is fire-and-forget; the handle only appears once the
     // resulting `Created` event reaches the next snapshot). Applied by the poll
     // loop below as soon as a handle absent from `known_handles` shows up.
-    let pending_new_device: Rc<RefCell<Option<(String, u16, Position)>>> =
-        Rc::new(RefCell::new(None));
+    // name, port, position, and addresses to pin. The last is empty for a
+    // hand-typed device (resolve the name) and populated for one picked off the
+    // network list, where we already know exactly where it is and should not
+    // make DNS agree with mDNS before it will connect (#136).
+    #[allow(clippy::type_complexity)]
+    let pending_new_device: Rc<
+        RefCell<Option<(String, u16, Position, Vec<std::net::IpAddr>)>>,
+    > = Rc::new(RefCell::new(None));
     let known_handles: Rc<RefCell<HashSet<ClientHandle>>> = Rc::new(RefCell::new(HashSet::new()));
+    {
+        // Add a machine picked off the network list. Same create sequence as a
+        // hand-typed device -- it still dials, and it still goes through the
+        // ordinary approval prompt. Discovery supplies the address; it does not
+        // supply trust (#136).
+        let pending = pending_new_device.clone();
+        let notice = notice_sink.clone();
+        ui.on_add_discovered(move |label, ips, port, position| {
+            let addrs: Vec<std::net::IpAddr> = ips
+                .split(',')
+                .filter_map(|a| a.trim().parse().ok())
+                .collect();
+            if addrs.is_empty() {
+                notice("That machine did not advertise an address hops can use.");
+                return;
+            }
+            let port = port.trim().parse::<u16>().unwrap_or(DEFAULT_PORT);
+            let position = Position::try_from(position.as_str()).unwrap_or_default();
+            // Store the mDNS hostname, not the bare label. `ScornMBP23` does not
+            // resolve; `ScornMBP23.local` does, through the OS name stack
+            // (Bonjour on macOS, Avahi via nsswitch on Linux) -- see
+            // resolve_hostname in src/dns.rs.
+            //
+            // This is what makes a discovered device SELF-HEALING. The pinned
+            // addresses are a snapshot, so if the peer's DHCP lease changes they
+            // go stale. hops dials the union of pinned addresses and freshly
+            // resolved ones on every reconnect, so a resolvable `.local` name
+            // keeps working after every address it was added with has changed.
+            let hostname = hops_frontend_core::discovered_hostname(&label);
+            *pending.borrow_mut() = Some((hostname, port, position, addrs));
+        });
+    }
     {
         let c = client.clone();
         let pending = pending_new_device.clone();
@@ -528,7 +569,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                 }
             };
             let position = Position::try_from(position.as_str()).unwrap_or_default();
-            *pending.borrow_mut() = Some((name, port, position));
+            *pending.borrow_mut() = Some((name, port, position, Vec::new()));
             c.request(FrontendRequest::Create);
         });
     }
@@ -613,13 +654,23 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
             // apply a pending create's name/port/position once its handle shows up
             {
                 let current: HashSet<ClientHandle> = m.clients.keys().copied().collect();
-                if let Some((name, port, position)) = pending_new_device.borrow_mut().take() {
+                if let Some((name, port, position, fix_ips)) =
+                    pending_new_device.borrow_mut().take()
+                {
                     match current.difference(&known_handles.borrow()).next() {
                         Some(&new_handle) => {
                             if !name.is_empty() {
                                 client.request(FrontendRequest::UpdateHostname(
                                     new_handle,
                                     Some(name),
+                                ));
+                            }
+                            if !fix_ips.is_empty() {
+                                // Picked off the network list: pin what mDNS
+                                // told us rather than hoping the name resolves.
+                                client.request(FrontendRequest::UpdateFixIps(
+                                    new_handle,
+                                    fix_ips.clone(),
                                 ));
                             }
                             client.request(FrontendRequest::UpdatePort(new_handle, port));
@@ -635,7 +686,9 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                             client.request(FrontendRequest::Activate(new_handle, true));
                         }
                         // the Created event hasn't reached a snapshot yet — retry next tick
-                        None => *pending_new_device.borrow_mut() = Some((name, port, position)),
+                        None => {
+                            *pending_new_device.borrow_mut() = Some((name, port, position, fix_ips))
+                        }
                     }
                 }
                 *known_handles.borrow_mut() = current;
@@ -757,6 +810,35 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                     .unwrap_or_else(|| "—".to_string()),
                 fingerprint: m.fingerprint.clone().unwrap_or_else(|| "—".to_string()),
                 pairing,
+                discovered: m
+                    .discovered
+                    .iter()
+                    .map(|d| {
+                        let ips: Vec<String> = d.addrs.iter().map(|a| a.ip().to_string()).collect();
+                        DiscoveredRow {
+                            label: d.label.as_str().into(),
+                            fingerprint: d
+                                .claimed_fingerprint
+                                .as_deref()
+                                .map(short_fp)
+                                .unwrap_or_default()
+                                .into(),
+                            addr_summary: match ips.len() {
+                                0 => String::new(),
+                                1 => ips[0].clone(),
+                                n => format!("{} +{} more", ips[0], n - 1),
+                            }
+                            .into(),
+                            ips: ips.join(",").into(),
+                            port: d
+                                .addrs
+                                .first()
+                                .map(|a| a.port().to_string())
+                                .unwrap_or_default()
+                                .into(),
+                        }
+                    })
+                    .collect(),
                 pairing_from_our_dial,
                 pairing_addr,
                 // the first edge nothing active is already using, so adding a
@@ -805,6 +887,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
             ui.set_port(snap.port.as_str().into());
             ui.set_fingerprint(snap.fingerprint.as_str().into());
             ui.set_pairing_fp(snap.pairing.as_str().into());
+            ui.set_discovered(ModelRc::new(VecModel::from(snap.discovered.clone())));
             ui.set_pairing_from_our_dial(snap.pairing_from_our_dial);
             ui.set_pairing_addr(snap.pairing_addr.as_str().into());
             // only when the DAEMON has something new — otherwise a local

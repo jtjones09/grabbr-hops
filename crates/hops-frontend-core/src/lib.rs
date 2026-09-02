@@ -17,8 +17,8 @@ use futures::StreamExt;
 use tokio::sync::{Notify, mpsc};
 
 pub use hops_ipc::{
-    AttemptOrigin, ClientConfig, ClientHandle, ClientState, FrontendEvent, FrontendRequest,
-    Position, RevokedEntry, Status, connect_async,
+    AttemptOrigin, ClientConfig, ClientHandle, ClientState, DiscoveredDevice, FrontendEvent,
+    FrontendRequest, Position, RevokedEntry, Status, connect_async,
 };
 
 pub mod prefs;
@@ -63,6 +63,14 @@ pub struct AppModel {
     /// that connected before we attached is not reflected until the daemon
     /// reports current connections on `Sync` (a planned additive event).
     pub connected_peers: HashSet<String>,
+    /// Machines seen on the local network that are not already configured or
+    /// trusted — the "click a name instead of typing an address" list (#136).
+    ///
+    /// NOT trusted and NOT identified. `claimed_fingerprint` is an assertion by
+    /// whatever is on the LAN. Selecting one of these dials it and goes through
+    /// the ordinary approval prompt exactly as a typed address does; it must
+    /// never shortcut that.
+    pub discovered: Vec<DiscoveredDevice>,
     /// An untrusted peer's fingerprint awaiting the user's pairing approval. Set
     /// on `ConnectionAttempt`; cleared once it becomes authorized or the daemon
     /// link drops. The UI surfaces this as an approve/deny prompt.
@@ -171,6 +179,7 @@ impl AppModel {
                     self.pending_pairing_since = Some(Instant::now());
                 }
             }
+            FrontendEvent::Discovered(peers) => self.discovered = peers,
             FrontendEvent::NoSuchClient(_) => {}
         }
     }
@@ -262,6 +271,30 @@ pub struct Device {
     /// True iff the device's fingerprint is in the authorized allowlist
     /// (trusted to connect *in*).
     pub receive: bool,
+}
+
+/// The hostname to store for a machine picked off the network list.
+///
+/// mDNS advertises a host as `<instance>.local.`, and a bare `ScornMBP23` does
+/// not resolve while `ScornMBP23.local` does — through the OS name stack
+/// (Bonjour on macOS, Avahi via nsswitch on Linux), which `src/dns.rs` uses
+/// deliberately for exactly this.
+///
+/// This is what makes a discovered device **self-healing**. The addresses
+/// pinned at add-time are a snapshot: if the peer's DHCP lease changes, they go
+/// stale. hops dials the union of pinned and freshly-resolved addresses on
+/// every reconnect, so a resolvable `.local` name keeps the device working
+/// after every address it was added with has changed.
+///
+/// A label that already contains a dot is left alone — it is either already
+/// qualified or something the user typed.
+pub fn discovered_hostname(label: &str) -> String {
+    let label = label.trim();
+    if label.is_empty() || label.contains('.') {
+        label.to_string()
+    } else {
+        format!("{label}.local")
+    }
 }
 
 impl Device {
@@ -710,5 +743,39 @@ mod refusal_is_not_maskable {
         let mut d = dev(true, true, false);
         d.send = None;
         assert!(!d.refuses_our_input());
+    }
+}
+
+#[cfg(test)]
+mod discovered_hostnames {
+    //! A discovered device must survive its addresses changing.
+    //!
+    //! Jeremy's case, and the reason this matters: *"if my switch goes down, it
+    //! could still connect to my wifi without having to redo the connection,
+    //! which I have run into with Synergy."* hops already races every known
+    //! address and keys trust on the fingerprint rather than the address, so a
+    //! path change is not a new device. The remaining gap was that addresses
+    //! pinned at add-time are a snapshot — a `.local` name closes it, because
+    //! the resolved set is refreshed on every reconnect.
+    use super::discovered_hostname;
+
+    #[test]
+    fn a_bare_mdns_label_becomes_resolvable() {
+        assert_eq!(discovered_hostname("ScornMBP23"), "ScornMBP23.local");
+    }
+
+    /// Already-qualified names are left alone rather than becoming
+    /// `host.local.local`, which resolves to nothing.
+    #[test]
+    fn an_already_qualified_name_is_untouched() {
+        for n in ["ScornMBP23.local", "box.lan", "10.110.20.99"] {
+            assert_eq!(discovered_hostname(n), n, "{n:?} must not be re-suffixed");
+        }
+    }
+
+    #[test]
+    fn whitespace_and_empty_are_handled() {
+        assert_eq!(discovered_hostname("  rig  "), "rig.local");
+        assert_eq!(discovered_hostname("   "), "");
     }
 }
