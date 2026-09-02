@@ -806,7 +806,22 @@ impl Config {
          * For now we just override the config file.
          */
 
+        // Bracket the write. EVERY exit between unwatch and watch must re-arm,
+        // and the way to guarantee that is to have exactly one exit — not to
+        // remember a `self.watch()` before each `return`. #85/#90 were filed
+        // because a failed write left the watcher dead for the life of the
+        // process ("4 reloads before, 0 after"), and the fix at the time added
+        // the re-arm to the write-error path only. The `?` on create_dir_all
+        // above it still returned early with the watcher off.
         let _ = self.unwatch();
+        let result = self.write_config_file(&new_config);
+        let _ = self.watch();
+        result
+    }
+
+    /// The actual write. Called only between `unwatch` and `watch`, so it is
+    /// free to use `?` — its caller re-arms on every path.
+    fn write_config_file(&mut self, new_config: &str) -> Result<(), io::Error> {
         /* write new config to file */
         if let Some(p) = self.config_path().parent() {
             fs::create_dir_all(p)?;
@@ -821,13 +836,7 @@ impl Config {
         // rename(2) is atomic within a filesystem, and the temp file is a sibling
         // so it is always the same one. A reader sees either the whole old file
         // or the whole new one, never a truncated one.
-        if let Err(e) = write_atomically(self.config_path(), new_config.as_bytes()) {
-            let _ = self.watch();
-            return Err(e);
-        }
-        let _ = self.watch();
-
-        Ok(())
+        write_atomically(self.config_path(), new_config.as_bytes())
     }
 }
 
@@ -1138,5 +1147,83 @@ mod fail_closed_tests {
             "renaming a temp over the trust store must not restore a world-readable mode"
         );
         let _ = fs::remove_dir_all(&d);
+    }
+}
+
+// Not unix-gated: these read source text, so they are worth running on the
+// Windows runner too — that is where the last source-scanning guard broke.
+#[cfg(test)]
+mod watcher_rearm_tests {
+    //! A failed write must never leave the config watcher dead.
+    //!
+    //! #85/#90: the watcher is unwatched for the duration of a `write_back` so
+    //! hops does not react to its own write. If the write fails, the re-arm has
+    //! to happen anyway — otherwise the daemon stops noticing hand-edits for the
+    //! rest of the process's life. That was measured once as "4 reloads before,
+    //! 0 after", followed by the daemon overwriting three hand-edits from stale
+    //! memory.
+    //!
+    //! The first fix added `self.watch()` to the write-error path only. The `?`
+    //! on `create_dir_all` above it still returned early with the watcher off,
+    //! so the bug survived in a narrower form. The lesson is that "remember to
+    //! re-arm before each return" is not a fix — one exit point is.
+
+    /// Everything between `unwatch` and `watch` lives in `write_config_file`,
+    /// so `write_back` itself must contain no early exit after the unwatch.
+    ///
+    /// This is structural on purpose. Reproducing a failed write needs a
+    /// read-only config dir, and a test that chmods a directory it does not own
+    /// is worse than one that reads the source. What it pins is the shape that
+    /// made the bug possible, which is the part that regressed once already.
+    #[test]
+    fn write_back_has_one_exit_after_unwatch() {
+        const SRC: &str = include_str!("config.rs");
+        // Non-test source only: split on the marker WITHOUT a trailing newline —
+        // `include_str!` keeps CRLF on a Windows checkout, and a trailing \n
+        // there matches a \r and never fires (that bug shipped once already).
+        let src = SRC.split("\n#[cfg(test)]").next().unwrap_or(SRC);
+        let body = src
+            .split("fn write_back(")
+            .nth(1)
+            .expect("write_back must exist; if renamed, update this guard");
+        let body = &body[..body.find("\n    fn ").unwrap_or(body.len())];
+        let after = body
+            .split("self.unwatch()")
+            .nth(1)
+            .expect("write_back must still unwatch before writing");
+        for (n, line) in after.lines().enumerate() {
+            let l = line.split("//").next().unwrap_or("");
+            assert!(
+                !l.contains('?') && !l.trim_start().starts_with("return "),
+                "write_back line {n} after unwatch can exit early without re-arming \
+                 the watcher: {line:?}. Put the fallible work in write_config_file \
+                 instead — the bracket is what makes the re-arm unconditional \
+                 (#85, #90)."
+            );
+        }
+    }
+
+    /// And the bracket itself must still be there.
+    #[test]
+    fn the_bracket_still_re_arms() {
+        const SRC: &str = include_str!("config.rs");
+        let src = SRC.split("\n#[cfg(test)]").next().unwrap_or(SRC);
+        let body = src.split("fn write_back(").nth(1).expect("write_back");
+        let body = &body[..body.find("\n    fn ").unwrap_or(body.len())];
+        // Strip comments before searching. The prose in write_back explains the
+        // re-arm and therefore CONTAINS `self.watch()` — searching raw source
+        // found the comment first and read the order backwards.
+        let body: String = body
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = body.as_str();
+        let u = body.find("self.unwatch()").expect("must unwatch");
+        let w = body.find("self.watch()").expect(
+            "write_back must re-arm the watcher; without it a single failed write \
+             stops the daemon noticing hand-edits for the rest of its life",
+        );
+        assert!(u < w, "the re-arm must come after the unwatch, not before");
     }
 }
