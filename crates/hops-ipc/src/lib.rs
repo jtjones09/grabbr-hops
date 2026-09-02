@@ -225,6 +225,27 @@ pub struct ClientState {
     pub peer_fingerprint: Option<String>,
 }
 
+/// Who caused a connection attempt to be raised.
+///
+/// Both origins used to emit an identical event, so nothing downstream — the UI
+/// included — could tell "a peer knocked on my door" from "something asked me to
+/// go find them". That distinction is not cosmetic: `Create`, `UpdateFixIps` and
+/// `Activate` are all unguarded console verbs, so anything holding the IPC token
+/// can make the daemon DIAL an address of its choosing and thereby manufacture a
+/// genuine-looking prompt for a fingerprint it picked, at a moment it picked
+/// (#61).
+///
+/// You cannot prove where a keystroke came from. You CAN prove where a prompt
+/// came from, because hops caused it — this is that proof, carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttemptOrigin {
+    /// A peer connected to us unsolicited. Nothing local chose this moment.
+    Inbound,
+    /// We dialled out and the receiver was not trusted. A console verb can cause
+    /// this, so it must never be sufficient on its own to grant trust.
+    OutboundDial,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FrontendEvent {
     /// a client was created
@@ -268,7 +289,16 @@ pub enum FrontendEvent {
     /// incoming disconnected
     IncomingDisconnected(SocketAddr),
     /// failed connection attempt (approval for fingerprint required)
-    ConnectionAttempt { fingerprint: String },
+    ConnectionAttempt {
+        fingerprint: String,
+        origin: AttemptOrigin,
+        /// The address that answered, when we know it. Present for
+        /// `OutboundDial` — the user typed an address and something answered,
+        /// and they cannot judge the fingerprint without seeing which address
+        /// it came from (#93). `None` inbound, because `ListenEvent::Rejected`
+        /// does not carry one (see #83).
+        addr: Option<SocketAddr>,
+    },
 }
 
 /// A fingerprint the user deliberately expelled.

@@ -17,8 +17,8 @@ use futures::StreamExt;
 use tokio::sync::{Notify, mpsc};
 
 pub use hops_ipc::{
-    ClientConfig, ClientHandle, ClientState, FrontendEvent, FrontendRequest, Position,
-    RevokedEntry, Status, connect_async,
+    AttemptOrigin, ClientConfig, ClientHandle, ClientState, FrontendEvent, FrontendRequest,
+    Position, RevokedEntry, Status, connect_async,
 };
 
 pub mod prefs;
@@ -67,6 +67,14 @@ pub struct AppModel {
     /// on `ConnectionAttempt`; cleared once it becomes authorized or the daemon
     /// link drops. The UI surfaces this as an approve/deny prompt.
     pub pending_pairing: Option<String>,
+    /// How the pending attempt arrived. `OutboundDial` means WE dialled and
+    /// found an untrusted receiver — which a console verb can cause, so the UI
+    /// must not present it as a peer knocking (#61).
+    pub pending_pairing_origin: Option<AttemptOrigin>,
+    /// The address that answered, for an `OutboundDial` attempt. The user typed
+    /// an address; this is the one that actually replied, and the two are not
+    /// always the same machine (#93).
+    pub pending_pairing_addr: Option<std::net::SocketAddr>,
     /// When `pending_pairing` was last (re)asserted by a `ConnectionAttempt`.
     /// A front-end can treat the prompt as stale (the peer gave up) once this is
     /// older than a small TTL, since the daemon emits no retraction event.
@@ -144,10 +152,22 @@ impl AppModel {
                 }
                 self.push_message(format!("incoming disconnected: {addr}"));
             }
-            FrontendEvent::ConnectionAttempt { fingerprint } => {
-                self.push_message(format!("pairing request: {fingerprint}"));
+            FrontendEvent::ConnectionAttempt {
+                fingerprint,
+                origin,
+                addr,
+            } => {
+                self.push_message(match origin {
+                    AttemptOrigin::Inbound => format!("pairing request: {fingerprint}"),
+                    AttemptOrigin::OutboundDial => match addr {
+                        Some(a) => format!("{a} answered our dial, untrusted: {fingerprint}"),
+                        None => format!("we dialled an untrusted receiver: {fingerprint}"),
+                    },
+                });
                 if !self.authorized.contains_key(&fingerprint) {
                     self.pending_pairing = Some(fingerprint);
+                    self.pending_pairing_origin = Some(origin);
+                    self.pending_pairing_addr = addr;
                     self.pending_pairing_since = Some(Instant::now());
                 }
             }
@@ -824,5 +844,87 @@ mod tests {
 
         // an empty fingerprint must still yield something sayable
         assert_eq!(fallback_label(""), "unnamed device");
+    }
+}
+
+#[cfg(test)]
+mod attempt_origin {
+    //! A prompt we caused by dialling out must not reach the user looking like a
+    //! peer knocking (#61). The daemon knows which it was; the model has to
+    //! carry that, because the UI cannot re-derive it.
+    use super::{AppModel, AttemptOrigin, FrontendEvent};
+    use std::net::SocketAddr;
+
+    fn attempt(origin: AttemptOrigin) -> AppModel {
+        attempt_from(origin, None)
+    }
+
+    fn attempt_from(origin: AttemptOrigin, addr: Option<SocketAddr>) -> AppModel {
+        let mut m = AppModel::default();
+        m.apply(FrontendEvent::ConnectionAttempt {
+            fingerprint: "AA:BB".into(),
+            origin,
+            addr,
+        });
+        m
+    }
+
+    /// The address that answered has to reach the user. They typed one address;
+    /// a different machine can be the one that replies (a typo, a recycled DHCP
+    /// lease, a machine that took the address while the intended one slept), and
+    /// the fingerprint alone gives them nothing to compare against (#93).
+    #[test]
+    fn the_answering_address_reaches_the_user() {
+        let a: SocketAddr = "10.0.0.5:4242".parse().unwrap();
+        let m = attempt_from(AttemptOrigin::OutboundDial, Some(a));
+        assert_eq!(m.pending_pairing_addr, Some(a));
+        assert!(
+            m.messages.back().unwrap().contains("10.0.0.5:4242"),
+            "the log line must name the address that answered, got {:?}",
+            m.messages.back()
+        );
+    }
+
+    #[test]
+    fn the_origin_reaches_the_model() {
+        assert_eq!(
+            attempt(AttemptOrigin::Inbound).pending_pairing_origin,
+            Some(AttemptOrigin::Inbound)
+        );
+        assert_eq!(
+            attempt(AttemptOrigin::OutboundDial).pending_pairing_origin,
+            Some(AttemptOrigin::OutboundDial)
+        );
+    }
+
+    /// Both still raise a prompt — a console-caused dial is not silently
+    /// swallowed. It is *labelled*, not suppressed. Suppressing it would break
+    /// the outbound pairing flow, which is how a device is actually paired.
+    #[test]
+    fn both_origins_still_prompt() {
+        for o in [AttemptOrigin::Inbound, AttemptOrigin::OutboundDial] {
+            assert_eq!(
+                attempt(o).pending_pairing.as_deref(),
+                Some("AA:BB"),
+                "{o:?} must still raise a prompt"
+            );
+        }
+    }
+
+    /// And the user-visible sentence differs. If these ever converge, the whole
+    /// point of carrying the provenance is lost.
+    #[test]
+    fn the_two_read_differently() {
+        let inbound = attempt(AttemptOrigin::Inbound).messages.pop_back().unwrap();
+        let dialled = attempt(AttemptOrigin::OutboundDial)
+            .messages
+            .pop_back()
+            .unwrap();
+        assert_ne!(
+            inbound, dialled,
+            "a prompt we summoned by dialling out reads identically to a peer \
+             knocking — that is the #61 defect, and it is what makes a forged \
+             provenance invisible"
+        );
     }
 }
