@@ -776,7 +776,10 @@ impl Service {
             })
             .collect();
         drop(authorized);
-        self.notify_frontend(FrontendEvent::Discovered(peers));
+        self.notify_frontend(FrontendEvent::Discovered {
+            active: self.discovery.is_some(),
+            peers,
+        });
     }
 
     fn handle_resolver_event(&mut self, event: DnsEvent) {

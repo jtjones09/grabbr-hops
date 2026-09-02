@@ -71,6 +71,12 @@ pub struct AppModel {
     /// the ordinary approval prompt exactly as a typed address does; it must
     /// never shortcut that.
     pub discovered: Vec<DiscoveredDevice>,
+    /// Whether hops is actually looking for machines on the network.
+    ///
+    /// Needed because an empty `discovered` is ambiguous — off, still looking,
+    /// or genuinely nothing there. Rendering the same silence for all three is
+    /// how a working feature looks broken (#141).
+    pub discovery_active: bool,
     /// An untrusted peer's fingerprint awaiting the user's pairing approval. Set
     /// on `ConnectionAttempt`; cleared once it becomes authorized or the daemon
     /// link drops. The UI surfaces this as an approve/deny prompt.
@@ -179,7 +185,10 @@ impl AppModel {
                     self.pending_pairing_since = Some(Instant::now());
                 }
             }
-            FrontendEvent::Discovered(peers) => self.discovered = peers,
+            FrontendEvent::Discovered { active, peers } => {
+                self.discovery_active = active;
+                self.discovered = peers;
+            }
             FrontendEvent::NoSuchClient(_) => {}
         }
     }

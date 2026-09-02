@@ -74,6 +74,11 @@ export component AppWindow inherits Window {
     // Machines announcing themselves on the LAN that are not already added or
     // trusted. Not devices and not identities — see DiscoveredRow (#136).
     in property <[DiscoveredRow]> discovered: [];
+    // Whether hops is actually looking. An empty list alone cannot say whether
+    // discovery is off, still searching, or has genuinely found nothing — and
+    // rendering the same silence for all three is how a working feature looks
+    // broken (#141).
+    in property <bool> discovery-active: false;
     in property <string> notice: "";
     in property <int> notice-seq: 0;
     property <int> dismissed-seq: 0;
@@ -459,7 +464,13 @@ export component AppWindow inherits Window {
                         if root.devices.length == 0: HorizontalLayout {
                             padding: Space.sm;
                             Text {
-                                text: "no devices yet — add one, or accept a pairing request";
+                                // BOTH conditions: the list is only rendered when
+                                // discovery is active, so pointing at it on the
+                                // strength of the list alone promises a section
+                                // that is not on screen.
+                                text: root.discovery-active && root.discovered.length > 0
+                                    ? "no devices yet — pick one from your network below, or add by address"
+                                    : "no devices yet — add one, or accept a pairing request";
                                 color: Theme.c.muted;
                                 font-size: Type.small;
                             }
@@ -761,10 +772,24 @@ export component AppWindow inherits Window {
                 // NOTHING here is trusted. The fingerprint is a claim by whatever is on
                 // the LAN, shown so a row is recognisable. "add" dials the machine and
                 // raises the ordinary approval prompt, exactly as a typed address does.
-                if root.discovered.length > 0: VerticalLayout {
+                // Shown whenever hops is LOOKING, not only when it has found
+                // something. An empty list is ambiguous — off, still searching,
+                // or genuinely nothing — and rendering the same absence for all
+                // three is how a working feature looks broken (#141).
+                if root.discovery-active: VerticalLayout {
                     spacing: 6px;
                     SectionTitle { text: "on your network"; color: Theme.c.accent; }
-                    Card {
+                    if root.discovered.length == 0: HorizontalLayout {
+                        padding: Space.sm;
+                        Text {
+                            text: "looking — no other machines yet. They need hops "
+                                + "running and to be on this network.";
+                            color: Theme.c.muted;
+                            font-size: Type.small;
+                            wrap: word-wrap;
+                        }
+                    }
+                    if root.discovered.length > 0: Card {
                         VerticalLayout {
                             for n in root.discovered: Rectangle {
                                 height: 52px;
