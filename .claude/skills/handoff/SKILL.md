@@ -118,6 +118,27 @@ Vague handoffs are worse than none because they invite re-derivation.
 **Written:** <YYYY-MM-DD HH:MM> · **main:** <sha> · **CI:** <status>
 > Re-verify anything below before relying on it. Sessions here are days apart.
 
+## TL;DR
+
+### Decisions needed from Jeremy
+Numbered, one sentence each, with a recommendation. "None" if none.
+**Never drop this section** — it decays first when the news is good.
+
+### What you're getting (CX/UX)
+What a *person using hops* experiences differently, in their words. Not
+"carried `AttemptOrigin` through the wire" but "the prompt now tells you
+whether a machine knocked or whether hops went looking for it." Group by what
+the user notices; say plainly which items are invisible to them; and **always
+state what they are NOT getting yet** — unmerged, unreleased, not on their
+machines. If a change cannot be written as a sentence a user would say, that is
+worth noticing out loud rather than padding.
+
+### Next steps
+Ordered.
+
+### Blocked
+On him, on hardware, on a run — and why.
+
 ## Right now
 One paragraph: what we are in the middle of, and the immediate next action.
 
@@ -163,5 +184,9 @@ versioned, that is his call to make explicitly.
 - **Record retractions.** When a claim was made and withdrawn, write down the
   withdrawal. Otherwise the next window re-derives the wrong answer.
 - **Prefer "unverified" over a confident guess.** Mark anything not measured.
+- **The TL;DR has four headings and the CX/UX one is not optional.** Jeremy is
+  building a product; a list of green PRs does not answer "what am I getting."
+  He has caught this format decaying mid-session — check all four are present
+  before sending.
 - **A summary is never the only record of research.** Preserve the artifact first,
   synthesize second, and check the synthesis against the artifact before committing.
