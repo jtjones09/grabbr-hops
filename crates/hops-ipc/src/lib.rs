@@ -298,7 +298,18 @@ pub enum FrontendEvent {
     /// against the certificate actually presented. A frontend must never treat
     /// it as identity, and approving one of these still goes through the
     /// ordinary trust prompt (#136).
-    Discovered(Vec<DiscoveredDevice>),
+    Discovered {
+        /// Whether hops is actually looking. False when discovery is off in
+        /// config, or when mDNS could not start.
+        ///
+        /// Carried alongside the list rather than inferred from it, because an
+        /// EMPTY LIST IS AMBIGUOUS: "switched off", "looking and nothing has
+        /// answered yet", and "looking and there is genuinely nothing" are
+        /// three different things a user needs told apart, and a frontend that
+        /// only sees `[]` renders the same silence for all three (#141).
+        active: bool,
+        peers: Vec<DiscoveredDevice>,
+    },
     /// failed connection attempt (approval for fingerprint required)
     ConnectionAttempt {
         fingerprint: String,

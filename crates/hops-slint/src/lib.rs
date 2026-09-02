@@ -64,6 +64,8 @@ struct PolledUi {
     /// Machines announcing themselves on the LAN that are not already added or
     /// trusted. Not devices and not identities (#136).
     discovered: Vec<DiscoveredRow>,
+    /// Whether hops is looking at all — see `AppModel::discovery_active`.
+    discovery_active: bool,
     /// Whether that pairing prompt came from OUR outbound dial rather than a
     /// peer connecting in (#61) — the card says which.
     pairing_from_our_dial: bool,
@@ -810,6 +812,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                     .unwrap_or_else(|| "—".to_string()),
                 fingerprint: m.fingerprint.clone().unwrap_or_else(|| "—".to_string()),
                 pairing,
+                discovery_active: m.discovery_active,
                 discovered: m
                     .discovered
                     .iter()
@@ -888,6 +891,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
             ui.set_fingerprint(snap.fingerprint.as_str().into());
             ui.set_pairing_fp(snap.pairing.as_str().into());
             ui.set_discovered(ModelRc::new(VecModel::from(snap.discovered.clone())));
+            ui.set_discovery_active(snap.discovery_active);
             ui.set_pairing_from_our_dial(snap.pairing_from_our_dial);
             ui.set_pairing_addr(snap.pairing_addr.as_str().into());
             // only when the DAEMON has something new — otherwise a local
@@ -1129,6 +1133,55 @@ mod refusal_reaches_the_ui {
             refuses < green,
             "the TUI row reaches its green arm before checking the refusal, so a \
              peer connected inbound masks one that refuses our input (#92)."
+        );
+    }
+}
+
+#[cfg(test)]
+mod discovery_states {
+    //! Three states, three different sentences.
+    //!
+    //! An empty peer list cannot say whether discovery is **off**, **looking**,
+    //! or **looking and there is genuinely nothing** — and #138 rendered the
+    //! same absence for all three: the section simply did not appear. On a
+    //! network where multicast is filtered, the feature was indistinguishable
+    //! from a bug. Jeremy hit exactly this shape with the probe ("I am not sure
+    //! what should happen"), and the fix there was the same: make silence
+    //! explain itself.
+
+    const UI: &str = include_str!("../ui/app.slint");
+
+    /// The section keys on "are we looking", not "did we find something".
+    #[test]
+    fn the_section_shows_while_looking_not_only_when_found() {
+        assert!(
+            UI.contains("if root.discovery-active: VerticalLayout"),
+            "the network section must render whenever discovery is ACTIVE. Keying \
+             it on a non-empty list means a user on a network where mDNS is \
+             blocked sees nothing at all and cannot tell the feature from a bug."
+        );
+    }
+
+    /// And says so when it has found nothing yet.
+    #[test]
+    fn an_empty_result_is_stated_not_left_blank() {
+        assert!(
+            UI.contains("if root.discovered.length == 0"),
+            "an active search with no results must say so; an absent section is \
+             not an answer"
+        );
+    }
+
+    /// The empty-devices line may only point at the network list when that list
+    /// is actually on screen — which needs BOTH conditions, since the section is
+    /// hidden while discovery is off regardless of what the list holds.
+    #[test]
+    fn the_empty_state_never_points_at_a_hidden_section() {
+        assert!(
+            UI.contains("root.discovery-active && root.discovered.length > 0"),
+            "\"pick one from your network below\" must be guarded on discovery \
+             being active AND the list being non-empty. Guarded on the list \
+             alone, it promises a section that is not rendered."
         );
     }
 }

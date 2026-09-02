@@ -70,22 +70,34 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
     ui.set_port("4242".into());
     ui.set_fingerprint("73:90:2a:3c:9d:e5:18:52:7c:aa:c3:de:de:04:cd:ec".into());
     let first_run = std::env::var_os("PREVIEW_FIRST_RUN").is_some();
-    ui.set_discovered(ModelRc::new(VecModel::from(vec![
-        DiscoveredRow {
-            label: "linux-box".into(),
-            fingerprint: "9c:2e:11".into(),
-            addr_summary: "10.110.20.51 +2 more".into(),
-            ips: "10.110.20.51,10.110.21.51,172.26.141.9".into(),
-            port: "4242".into(),
-        },
-        DiscoveredRow {
-            label: "jk-mbp-m4-max".into(),
-            fingerprint: "".into(),
-            addr_summary: "10.110.20.99".into(),
-            ips: "10.110.20.99".into(),
-            port: "4242".into(),
-        },
-    ])));
+    ui.set_discovery_active(std::env::var("PREVIEW_DISCOVERY").as_deref() != Ok("off"));
+    // "off" implies an empty list, as the daemon sends: it stops publishing
+    // peers when discovery is not running. A harness that shows rows while
+    // inactive would exercise a state the product cannot produce.
+    let nothing_found = matches!(
+        std::env::var("PREVIEW_DISCOVERY").as_deref(),
+        Ok("empty") | Ok("off")
+    );
+    ui.set_discovered(ModelRc::new(VecModel::from(if nothing_found {
+        vec![]
+    } else {
+        vec![
+            DiscoveredRow {
+                label: "linux-box".into(),
+                fingerprint: "9c:2e:11".into(),
+                addr_summary: "10.110.20.51 +2 more".into(),
+                ips: "10.110.20.51,10.110.21.51,172.26.141.9".into(),
+                port: "4242".into(),
+            },
+            DiscoveredRow {
+                label: "jk-mbp-m4-max".into(),
+                fingerprint: "".into(),
+                addr_summary: "10.110.20.99".into(),
+                ips: "10.110.20.99".into(),
+                port: "4242".into(),
+            },
+        ]
+    })));
     ui.set_pairing_fp("a4:f0:9c:2e:11:bd:77:0c:35:9a".into()); // shows the pairing card
     // flip to true to review the "we dialled this device" wording (#61)
     ui.set_pairing_from_our_dial(std::env::var_os("PREVIEW_OUR_DIAL").is_some());
