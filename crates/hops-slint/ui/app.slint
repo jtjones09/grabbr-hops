@@ -518,11 +518,23 @@ export component AppWindow inherits Window {
                                 }
                                 if d.has-send && root.confirm-delete-handle == d.handle: VerticalLayout {
                                     alignment: center;
+                                    spacing: 1px;
+                                    // Say what this DOES. "delete + untrust" read as
+                                    // reversible; it is not — the fingerprint is
+                                    // tombstoned and that identity can never be
+                                    // trusted again. The TUI has always said so and
+                                    // the GUI did not, which is how both machines on
+                                    // the rig got permanently expelled by accident
+                                    // on 2026-08-31 (#33, #125).
                                     Text {
-                                        // delete now withdraws trust too, so say so
-                                        text: d.trusted ? "delete + untrust?" : "delete?";
+                                        text: d.trusted ? "delete permanently?" : "delete?";
                                         color: Theme.c.muted;
                                         font-size: Type.small;
+                                    }
+                                    if d.trusted: Text {
+                                        text: "it must pair again with a NEW identity";
+                                        color: Theme.c.error;
+                                        font-size: Type.caption;
                                     }
                                 }
                                 if d.has-send && root.confirm-delete-handle == d.handle: VerticalLayout {
@@ -587,10 +599,19 @@ export component AppWindow inherits Window {
                                 }
                                 if d.trusted && revoking: VerticalLayout {
                                     alignment: center;
+                                    spacing: 1px;
+                                    // Same honesty as delete: revoking writes a
+                                    // permanent tombstone, and "remove?" did not say
+                                    // that (#33, #125).
                                     Text {
-                                        text: "remove?";
+                                        text: "remove permanently?";
                                         color: Theme.c.muted;
                                         font-size: Type.small;
+                                    }
+                                    Text {
+                                        text: "it must pair again with a NEW identity";
+                                        color: Theme.c.error;
+                                        font-size: Type.caption;
                                     }
                                 }
                                 if d.trusted && revoking: VerticalLayout {
