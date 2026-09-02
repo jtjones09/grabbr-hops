@@ -1,0 +1,21 @@
+# Pin the compiler.
+#
+# CI used `dtolnay/rust-toolchain@stable`, unpinned, WITH `RUSTFLAGS: -D warnings`.
+# Those two together mean a Rust release can turn `main` red with nobody having
+# touched the repo: a new stable adds a lint, the lint fires on existing code,
+# and `-D warnings` makes it a hard failure. `release.yml` was exposed the same
+# way, so a release build could fail for the same reason.
+#
+# This is not hypothetical. On 2026-09-01 a macOS runner reported
+# `stable-aarch64-apple-darwin updated - rustc 1.98.0 (from rustc 1.97.1)` —
+# the toolchain moved underneath a run, mid-run, unannounced.
+#
+# Pinned to what CI was already using, so this changes nothing about how the
+# code is built today; it only stops the version drifting on its own. Bumping is
+# now a deliberate one-line PR that CI proves before it lands.
+#
+# `.github/workflows/*.yml` name the same version. `chore::toolchain_pin` in
+# src/lib.rs fails if they disagree.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt"]

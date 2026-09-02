@@ -13,8 +13,8 @@ use crate::{
 };
 use futures::StreamExt;
 use hops_ipc::{
-    AsyncFrontendListener, ClientHandle, DiscoveredDevice, FrontendEvent, FrontendRequest,
-    IpcError, IpcListenerCreationError, Position, Status,
+    AsyncFrontendListener, AttemptOrigin, ClientHandle, DiscoveredDevice, FrontendEvent,
+    FrontendRequest, IpcError, IpcListenerCreationError, Position, Status,
 };
 use local_channel::mpsc::{Receiver, channel};
 use log;
@@ -106,7 +106,7 @@ pub struct Service {
     /// fingerprints of RECEIVERS we tried to dial but don't trust (from the
     /// connect side). Turned into `ConnectionAttempt` below so the UI can offer
     /// to authorize them — the outbound counterpart of the inbound pairing prompt.
-    untrusted_receivers: Receiver<String>,
+    untrusted_receivers: Receiver<(String, SocketAddr)>,
     /// a client's peer_fingerprint was just learned — persist it and republish
     persist_requests: Receiver<ClientHandle>,
     /// broadcast local clipboard changes to outgoing-connection peers
@@ -321,13 +321,13 @@ impl Service {
                     }
                 }
                 fp = self.untrusted_receivers.recv() => {
-                    if let Some(fp) = fp {
+                    if let Some((fp, addr)) = fp {
                         // only prompt if it really is untrusted — a racing dial can
                         // report a fingerprint that was authorized in the meantime
                         let known = self.authorized_keys.read().expect("lock").contains_key(&fp);
                         if !known {
                             log::info!("untrusted receiver {fp} — raising an approval prompt");
-                            self.raise_connection_attempt(fp);
+                            self.raise_connection_attempt(fp, AttemptOrigin::OutboundDial, Some(addr));
                         }
                     }
                 }
@@ -484,6 +484,9 @@ impl Service {
         for h in self.client_manager.registered_clients() {
             self.remove_client(h);
         }
+        // Every client is gone; hand out 0,1,2… again rather than letting the
+        // slab's LIFO free list reverse the numbering (#94).
+        self.client_manager.reset_handle_allocation();
         for c in self.config.clients() {
             let handle = self.client_manager.add_with_config(c);
             log::info!("added client {handle}");
@@ -559,7 +562,7 @@ impl Service {
                 )));
             }
             EmulationEvent::ConnectionAttempt { fingerprint } => {
-                self.raise_connection_attempt(fingerprint);
+                self.raise_connection_attempt(fingerprint, AttemptOrigin::Inbound, None);
             }
             EmulationEvent::Entered {
                 addr,
@@ -1005,7 +1008,12 @@ impl Service {
     /// user's screen. That is the whole mechanism: revocation cannot keep an
     /// attacker out (it can re-key), but it can stop it choosing the moment you
     /// are asked to let it back in.
-    fn raise_connection_attempt(&mut self, fingerprint: String) {
+    fn raise_connection_attempt(
+        &mut self,
+        fingerprint: String,
+        origin: AttemptOrigin,
+        addr: Option<SocketAddr>,
+    ) {
         if let Some(entry) = self.revoked.get(&fingerprint) {
             log::warn!(
                 "ignoring a connection attempt from revoked device {:?} ({fingerprint}) — \
@@ -1014,7 +1022,20 @@ impl Service {
             );
             return;
         }
-        self.notify_frontend(FrontendEvent::ConnectionAttempt { fingerprint });
+        if origin == AttemptOrigin::OutboundDial {
+            // Say so. A console verb can cause this, and a prompt the console
+            // summoned must not look like a peer knocking (#61).
+            log::info!(
+                "{fingerprint} at {addr:?} was reached by OUR OWN dial, not by an \
+                 unsolicited connection — the prompt will say so, and will show the \
+                 address so it can be compared with the one that was typed"
+            );
+        }
+        self.notify_frontend(FrontendEvent::ConnectionAttempt {
+            fingerprint,
+            origin,
+            addr,
+        });
     }
 
     /// Tear down every live session with `fp`, in both directions.
@@ -1620,5 +1641,195 @@ mod one_trust_write_site {
                  now covering less than it claims"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod attempt_origin_guard {
+    //! Both `raise_connection_attempt` call sites must declare where the attempt
+    //! came from, and they must not declare the same thing.
+    //!
+    //! #61: a console holding the IPC token can run `Create` →
+    //! `UpdateFixIps(attacker_ip)` → `Activate` and make the daemon dial an
+    //! address it chose. The receiver answers, its fingerprint is not on our
+    //! allowlist, and the daemon raises a *genuine* approval prompt — for a key
+    //! the attacker picked, at a moment the attacker picked. The prompt is real;
+    //! what is forged is its provenance.
+    //!
+    //! We cannot prove where a keystroke came from. We can prove where a prompt
+    //! came from, because hops itself caused it — it is a property of our own
+    //! state machine. This guard keeps that property from being erased by a
+    //! later refactor that "simplifies" the two sites back into one.
+
+    /// Only the code *above* the test modules. Scanning our own text would
+    /// otherwise match the string literals in these very assertions.
+    fn src() -> &'static str {
+        before_tests(include_str!("service.rs"))
+    }
+
+    /// Split at the first test module.
+    ///
+    /// Must not assume LF. `include_str!` preserves whatever the checkout has,
+    /// and git on Windows checks out CRLF — so a marker ending in `\n` matches a
+    /// `\r` there and never fires. This guard shipped with exactly that bug and
+    /// only Windows CI caught it: the split silently returned the WHOLE file,
+    /// the guard scanned its own assertions, and it failed on its own string
+    /// literal. `before_tests_survives_crlf` is the local version of that
+    /// Windows run.
+    fn before_tests(full: &str) -> &str {
+        full.split("\n#[cfg(test)]").next().unwrap_or(full)
+    }
+
+    #[test]
+    fn before_tests_survives_crlf() {
+        let lf = "fn real() {}\n#[cfg(test)]\nmod t { fn fake() {} }";
+        let crlf = "fn real() {}\r\n#[cfg(test)]\r\nmod t { fn fake() {} }";
+        for (name, s) in [("lf", lf), ("crlf", crlf)] {
+            assert!(
+                !before_tests(s).contains("fake"),
+                "{name}: test-module source leaked into the scanned region, so every \
+                 guard built on this silently scans its own assertions"
+            );
+            assert!(
+                before_tests(s).contains("real"),
+                "{name}: real source was cut"
+            );
+        }
+    }
+
+    /// The lines that actually CALL it — not the definition, not prose.
+    fn raise_sites() -> Vec<&'static str> {
+        src()
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains("self.raise_connection_attempt("))
+            .collect()
+    }
+
+    /// Every call must pass an origin — no defaulting, no inference downstream.
+    #[test]
+    fn every_raise_site_names_its_origin() {
+        let calls = raise_sites();
+        assert!(
+            !calls.is_empty(),
+            "the raise sites vanished — this guard is now testing nothing"
+        );
+        for c in &calls {
+            assert!(
+                c.contains("AttemptOrigin::"),
+                "a ConnectionAttempt is raised without saying where it came from: {c:?}. \
+                 An attacker-summoned dial would then be indistinguishable from a peer \
+                 knocking (#61)."
+            );
+        }
+    }
+
+    /// And the two must stay distinguishable. One `Inbound`, one `OutboundDial`:
+    /// collapsing them is precisely the defect.
+    ///
+    /// Count what the CALL SITES pass, not how often the variants are named.
+    /// Two earlier versions of this were wrong in opposite directions: keying on
+    /// a trailing `)` broke when `addr` became an argument, and then counting
+    /// bare mentions silently stopped catching anything, because
+    /// `if origin == AttemptOrigin::OutboundDial` inside this very function
+    /// survives the mutation and keeps the count at one.
+    #[test]
+    fn the_two_provenances_are_still_distinct() {
+        let passed: Vec<&str> = raise_sites()
+            .into_iter()
+            .filter_map(|l| {
+                l.split("AttemptOrigin::")
+                    .nth(1)
+                    .map(|rest| rest.trim_end_matches(|c: char| !c.is_alphanumeric()))
+                    .map(|v| {
+                        if v.starts_with("Inbound") {
+                            "Inbound"
+                        } else {
+                            "OutboundDial"
+                        }
+                    })
+            })
+            .collect();
+        assert!(
+            passed.contains(&"Inbound") && passed.contains(&"OutboundDial"),
+            "the raise sites pass {passed:?}. Both provenances must still be raised: \
+             if they all pass the same one, a prompt our own dial summoned is \
+             indistinguishable from a peer knocking — the #61 defect."
+        );
+    }
+}
+
+#[cfg(test)]
+mod reload_resets_handles {
+    //! The reload path itself must reset handle allocation.
+    //!
+    //! `client::reload_permutation` proves `ClientManager` behaves once the
+    //! reset is called. It cannot prove `handle_config_change` calls it — that
+    //! test drives the manager directly, so dropping the call here would leave
+    //! it green while the real reload renumbered every device again (#94).
+    //!
+    //! That is the false-pass shape this project keeps producing, so it gets its
+    //! own guard.
+
+    /// Non-test source only. Split on the marker WITHOUT a trailing newline:
+    /// `include_str!` keeps CRLF on a Windows checkout, and a trailing `\n`
+    /// there matches a `\r` and never fires.
+    fn production() -> &'static str {
+        const FULL: &str = include_str!("service.rs");
+        FULL.split("\n#[cfg(test)]").next().unwrap_or(FULL)
+    }
+
+    #[test]
+    fn handle_config_change_resets_handle_allocation() {
+        let src = production();
+        let body = src
+            .split("fn handle_config_change(")
+            .nth(1)
+            .expect("handle_config_change must exist; if renamed, update this guard");
+        let body = &body[..body.find("\n    fn ").unwrap_or(body.len())];
+        // Strip comments: the prose here explains the reset and would otherwise
+        // satisfy the search on its own.
+        let code: String = body
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("reset_handle_allocation()"),
+            "handle_config_change removes every client and re-adds them, and Slab \
+             reuses freed keys from a LIFO free list — so without resetting, a \
+             reload REVERSES the device numbering and reverses it back on the \
+             next one. Delete is keyed by handle and tombstones irreversibly, so \
+             this silently aims an irreversible verb at the wrong machine (#94)."
+        );
+    }
+
+    /// And the reset must come after the removals, never before — resetting
+    /// first would drop live clients without tearing down their capture.
+    #[test]
+    fn the_reset_comes_after_the_removals() {
+        let src = production();
+        let body = src
+            .split("fn handle_config_change(")
+            .nth(1)
+            .expect("exists");
+        let body = &body[..body.find("\n    fn ").unwrap_or(body.len())];
+        let code: String = body
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let remove = code
+            .find("self.remove_client(")
+            .expect("the reload must still tear clients down");
+        let reset = code
+            .find("reset_handle_allocation()")
+            .expect("the reload must still reset handle allocation");
+        assert!(
+            remove < reset,
+            "reset_handle_allocation clears the slab outright; running it before \
+             the removals would drop live clients without destroying their \
+             capture."
+        );
     }
 }

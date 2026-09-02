@@ -27,7 +27,11 @@ export struct DeviceRow {
     addr: string,        // "ip:port" / "unresolved" (send facet)
     pos: string,         // "left" / "right" / … (send facet)
     active: bool,        // capture is routed to this device (send facet)
-    alive: bool,         // outgoing connection is reachable (send facet)
+    alive: bool,         // the peer's Pong says its emulation is ON (send facet)
+    refuses-input: bool, // we are routed to it and it says emulation is OFF, so
+                         // every event we send is refused before it is written.
+                         // NOT the same as offline, and `online` must not mask
+                         // it — that is the inbound direction (#92).
     has-send: bool,      // has an outgoing (send-to) facet
     fingerprint: string, // short fingerprint (display)
     fp-full: string,     // full fingerprint (for revoke)
@@ -80,6 +84,13 @@ export component AppWindow inherits Window {
     in property <string> fingerprint: "—";
     in property <[DeviceRow]> devices: [];
     in property <string> pairing-fp: "";
+    // true when WE dialled out and found this untrusted receiver, rather than it
+    // connecting to us. A console verb can cause the former, so the card must not
+    // present it as a peer knocking (#61).
+    in property <bool> pairing-from-our-dial: false;
+    // the address that actually answered our dial — the user typed one, and the
+    // machine that replies is not always the one they meant (#93)
+    in property <string> pairing-addr: "";
 
     // `in-out` so the render_png self-review harness can open it for a look —
     // the same reason confirm-delete-handle is. A confirm state you cannot
@@ -278,7 +289,13 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                // --- pairing request (Windows wants to pair with this Mac) -------------
+                // --- pairing request ---------------------------------------------------
+                // Two ways to get here, and they are NOT the same event (#61):
+                //   inbound       — a peer connected to us, unsolicited
+                //   our own dial  — we went looking, because something asked us to
+                // The second can be caused by a console holding the IPC token, so the
+                // card says which, and — for the dial case — states the falsifier: if
+                // you did not just ask for this, something else did.
                 if root.pairing-fp != "": Rectangle {
                     vertical-stretch: 0;
                     background: Theme.c.warn.transparentize(0.9);
@@ -289,10 +306,27 @@ export component AppWindow inherits Window {
                         padding: Space.md;
                         spacing: Space.sm;
                         Text {
-                            text: "pairing request";
+                            text: root.pairing-from-our-dial
+                                ? "we dialled this device"
+                                : "pairing request";
                             color: Theme.c.warn;
                             font-size: Type.small;
                             font-weight: Type.semibold;
+                        }
+                        if root.pairing-from-our-dial: Text {
+                            text: "hops went looking for this device — you should only see "
+                                + "this if you just asked to connect one. If you did not, "
+                                + "deny it. Check the address below is the one you typed.";
+                            color: Theme.c.muted;
+                            font-size: Type.caption;
+                            wrap: word-wrap;
+                        }
+                        if root.pairing-addr != "": Text {
+                            text: root.pairing-addr + " answered";
+                            color: Theme.c.foreground;
+                            font-family: Type.mono;
+                            font-size: Type.caption;
+                            letter-spacing: Type.mono-tracking;
                         }
                         Text {
                             text: root.pairing-fp;
@@ -454,7 +488,14 @@ export component AppWindow inherits Window {
                                 VerticalLayout {
                                     alignment: center;
                                     Dot {
-                                        tint: (d.online || d.alive)
+                                        // refuses-input is checked FIRST. `online`
+                                        // is about the inbound direction and used
+                                        // to OR this away, so a machine silently
+                                        // rejecting everything we sent showed
+                                        // green (#92).
+                                        tint: d.refuses-input
+                                            ? Theme.c.error
+                                            : (d.online || d.alive)
                                             ? Theme.c.success
                                             : (d.active ? Theme.c.warn : Theme.c.muted);
                                     }
@@ -477,6 +518,20 @@ export component AppWindow inherits Window {
                                         font-family: Type.mono;
                                         font-size: Type.caption;
                                         letter-spacing: Type.mono-tracking;
+                                        overflow: elide;
+                                    }
+                                    // The dot alone cannot say WHY, and a green
+                                    // "active" toggle beside a red dot reads as a
+                                    // contradiction. Say the fact: the far end is
+                                    // up and refusing, not unreachable (#92).
+                                    // One line, elided, NEVER wrapped: the row is
+                                    // a fixed 56px and a wrapped block overflows
+                                    // into the row below it.
+                                    if d.refuses-input: Text {
+                                        text: "not accepting input";
+                                        color: Theme.c.error;
+                                        font-size: Type.caption;
+                                        font-weight: Type.medium;
                                         overflow: elide;
                                     }
                                 }
@@ -536,11 +591,23 @@ export component AppWindow inherits Window {
                                 }
                                 if d.has-send && root.confirm-delete-handle == d.handle: VerticalLayout {
                                     alignment: center;
+                                    spacing: 1px;
+                                    // Say what this DOES. "delete + untrust" read as
+                                    // reversible; it is not — the fingerprint is
+                                    // tombstoned and that identity can never be
+                                    // trusted again. The TUI has always said so and
+                                    // the GUI did not, which is how both machines on
+                                    // the rig got permanently expelled by accident
+                                    // on 2026-08-31 (#33, #125).
                                     Text {
-                                        // delete now withdraws trust too, so say so
-                                        text: d.trusted ? "delete + untrust?" : "delete?";
+                                        text: d.trusted ? "delete permanently?" : "delete?";
                                         color: Theme.c.muted;
                                         font-size: Type.small;
+                                    }
+                                    if d.trusted: Text {
+                                        text: "it must pair again with a NEW identity";
+                                        color: Theme.c.error;
+                                        font-size: Type.caption;
                                     }
                                 }
                                 if d.has-send && root.confirm-delete-handle == d.handle: VerticalLayout {
@@ -605,10 +672,19 @@ export component AppWindow inherits Window {
                                 }
                                 if d.trusted && revoking: VerticalLayout {
                                     alignment: center;
+                                    spacing: 1px;
+                                    // Same honesty as delete: revoking writes a
+                                    // permanent tombstone, and "remove?" did not say
+                                    // that (#33, #125).
                                     Text {
-                                        text: "remove?";
+                                        text: "remove permanently?";
                                         color: Theme.c.muted;
                                         font-size: Type.small;
+                                    }
+                                    Text {
+                                        text: "it must pair again with a NEW identity";
+                                        color: Theme.c.error;
+                                        font-size: Type.caption;
                                     }
                                 }
                                 if d.trusted && revoking: VerticalLayout {

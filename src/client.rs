@@ -269,6 +269,30 @@ impl ClientManager {
     }
 
     /// returns all clients that are currently registered
+    /// Reset handle allocation so the next `add_client` hands out 0 again.
+    ///
+    /// `Slab` reuses freed keys from a LIFO free list, so removing 0,1,2 and
+    /// re-inserting three clients hands back 2,1,0 — a config reload REVERSED
+    /// the device numbering, and reversed it back on the next reload, so it was
+    /// wrong roughly half the time forever (#94). Every destructive verb is
+    /// keyed by handle and `Delete` tombstones the fingerprint irreversibly, so
+    /// a frontend that armed "delete handle 0" before a reload aimed it at a
+    /// different machine after one, silently.
+    ///
+    /// `clear()` resets the free-list head as well as the contents, which makes
+    /// the next allocations 0,1,2… in insertion order. Called only from the
+    /// reload path, after every client has already been removed through the
+    /// normal teardown — this changes the NUMBERING, not the lifecycle.
+    pub(crate) fn reset_handle_allocation(&self) {
+        let mut clients = self.clients.borrow_mut();
+        debug_assert!(
+            clients.is_empty(),
+            "reset_handle_allocation drops any remaining clients without tearing \
+             them down; remove them first"
+        );
+        clients.clear();
+    }
+
     pub(crate) fn registered_clients(&self) -> Vec<ClientHandle> {
         self.clients
             .borrow()
@@ -395,5 +419,104 @@ impl ClientManager {
             .borrow()
             .get(handle as usize)
             .map(|(_, s)| s.ips.clone())
+    }
+}
+
+#[cfg(test)]
+mod reload_permutation {
+    //! A config reload must not renumber the devices.
+    //!
+    //! #94: `handle_config_change` removes every client and re-adds them from
+    //! the config file. `Slab`'s free list is LIFO, so removing 0,1,2 and
+    //! re-inserting three entries hands back 2,1,0 — the mapping is **reversed**,
+    //! and because it reverses again on the next reload it is wrong roughly half
+    //! the time, forever, rather than settling.
+    //!
+    //! That matters because every destructive verb in `FrontendRequest` is keyed
+    //! by handle, and `Delete` now tombstones the fingerprint irreversibly. A
+    //! frontend that armed "delete device 0" before a reload aims it at a
+    //! different machine after one, with no warning logged.
+    //!
+    //! An external write to `config.toml` is the reachable trigger — a hand
+    //! edit, an editor save, a synced home directory. hops' own saves unwatch
+    //! first, so they do not fire it.
+
+    use super::*;
+
+    fn mapping(m: &ClientManager) -> Vec<(ClientHandle, Option<String>)> {
+        let mut v: Vec<_> = m
+            .registered_clients()
+            .into_iter()
+            .map(|h| (h, m.get_state(h).and_then(|(c, _)| c.hostname)))
+            .collect();
+        v.sort_by_key(|(h, _)| *h);
+        v
+    }
+
+    fn seed(m: &ClientManager, names: &[&str]) {
+        for n in names {
+            let h = m.add_client();
+            m.set_config(
+                h,
+                ClientConfig {
+                    hostname: Some((*n).to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
+    /// Exactly what `handle_config_change` does: drop every client, then re-add
+    /// them in config-file order (which is slab-ascending, since `save_config`
+    /// writes `clients()` in that order).
+    fn reload(m: &ClientManager) {
+        let names: Vec<Option<String>> = m
+            .registered_clients()
+            .into_iter()
+            .map(|h| m.get_state(h).and_then(|(c, _)| c.hostname))
+            .collect();
+        for h in m.registered_clients() {
+            m.remove_client(h);
+        }
+        m.reset_handle_allocation();
+        for n in names {
+            let h = m.add_client();
+            m.set_config(
+                h,
+                ClientConfig {
+                    hostname: n,
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn a_reload_does_not_renumber_the_devices() {
+        let m = ClientManager::default();
+        seed(&m, &["A", "B", "C"]);
+        let before = mapping(&m);
+        reload(&m);
+        assert_eq!(
+            mapping(&m),
+            before,
+            "a config reload renumbered the devices. Every destructive verb is \
+             keyed by handle and Delete tombstones irreversibly, so a frontend \
+             that armed \"delete handle 0\" before the reload now aims it at a \
+             different machine (#94)."
+        );
+    }
+
+    /// And it must not alternate. "It stabilises after two reloads" would still
+    /// be wrong half the time; the point is that it never moves at all.
+    #[test]
+    fn repeated_reloads_do_not_alternate() {
+        let m = ClientManager::default();
+        seed(&m, &["A", "B", "C", "D"]);
+        let before = mapping(&m);
+        for i in 1..=4 {
+            reload(&m);
+            assert_eq!(mapping(&m), before, "mapping moved on reload {i}");
+        }
     }
 }

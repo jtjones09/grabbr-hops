@@ -215,7 +215,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_fingerprint() {
-        for bad in ["AA:BB", "zz:zz", &"aa".repeat(1), &vec!["aa"; 31].join(":")] {
+        for bad in ["AA:BB", "zz:zz", "aa", &vec!["aa"; 31].join(":")] {
             let c = PairingCode {
                 fingerprint: bad.to_string(),
                 addrs: vec!["10.0.0.1:4242".parse().unwrap()],

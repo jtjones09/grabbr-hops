@@ -17,8 +17,8 @@ use futures::StreamExt;
 use tokio::sync::{Notify, mpsc};
 
 pub use hops_ipc::{
-    ClientConfig, ClientHandle, ClientState, DiscoveredDevice, FrontendEvent, FrontendRequest,
-    Position, RevokedEntry, Status, connect_async,
+    AttemptOrigin, ClientConfig, ClientHandle, ClientState, DiscoveredDevice, FrontendEvent,
+    FrontendRequest, Position, RevokedEntry, Status, connect_async,
 };
 
 pub mod prefs;
@@ -75,6 +75,14 @@ pub struct AppModel {
     /// on `ConnectionAttempt`; cleared once it becomes authorized or the daemon
     /// link drops. The UI surfaces this as an approve/deny prompt.
     pub pending_pairing: Option<String>,
+    /// How the pending attempt arrived. `OutboundDial` means WE dialled and
+    /// found an untrusted receiver — which a console verb can cause, so the UI
+    /// must not present it as a peer knocking (#61).
+    pub pending_pairing_origin: Option<AttemptOrigin>,
+    /// The address that answered, for an `OutboundDial` attempt. The user typed
+    /// an address; this is the one that actually replied, and the two are not
+    /// always the same machine (#93).
+    pub pending_pairing_addr: Option<std::net::SocketAddr>,
     /// When `pending_pairing` was last (re)asserted by a `ConnectionAttempt`.
     /// A front-end can treat the prompt as stale (the peer gave up) once this is
     /// older than a small TTL, since the daemon emits no retraction event.
@@ -152,10 +160,22 @@ impl AppModel {
                 }
                 self.push_message(format!("incoming disconnected: {addr}"));
             }
-            FrontendEvent::ConnectionAttempt { fingerprint } => {
-                self.push_message(format!("pairing request: {fingerprint}"));
+            FrontendEvent::ConnectionAttempt {
+                fingerprint,
+                origin,
+                addr,
+            } => {
+                self.push_message(match origin {
+                    AttemptOrigin::Inbound => format!("pairing request: {fingerprint}"),
+                    AttemptOrigin::OutboundDial => match addr {
+                        Some(a) => format!("{a} answered our dial, untrusted: {fingerprint}"),
+                        None => format!("we dialled an untrusted receiver: {fingerprint}"),
+                    },
+                });
                 if !self.authorized.contains_key(&fingerprint) {
                     self.pending_pairing = Some(fingerprint);
+                    self.pending_pairing_origin = Some(origin);
+                    self.pending_pairing_addr = addr;
                     self.pending_pairing_since = Some(Instant::now());
                 }
             }
@@ -274,6 +294,24 @@ pub fn discovered_hostname(label: &str) -> String {
         label.to_string()
     } else {
         format!("{label}.local")
+    }
+}
+
+impl Device {
+    /// This machine is configured to drive the device, capture is routed to it,
+    /// and the device has told us on the wire that its emulation is **off** —
+    /// so `connect.rs` will refuse every event with `TargetEmulationDisabled`
+    /// before writing a frame.
+    ///
+    /// Kept here rather than in each front-end because both of them used to
+    /// compute `online || alive`, which OR's this away: a peer that connects
+    /// *in* sets `online`, and the dot went green while the same machine
+    /// silently refused everything sent to it. `online` and `alive` are
+    /// different facts about different directions (#92).
+    pub fn refuses_our_input(&self) -> bool {
+        self.send
+            .as_ref()
+            .is_some_and(|s| s.state.active && !s.state.alive)
     }
 }
 
@@ -560,303 +598,151 @@ async fn connection_loop(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{AppModel, ClientConfig, ClientState, TrustState, fallback_label};
+mod attempt_origin {
+    //! A prompt we caused by dialling out must not reach the user looking like a
+    //! peer knocking (#61). The daemon knows which it was; the model has to
+    //! carry that, because the UI cannot re-derive it.
+    use super::{AppModel, AttemptOrigin, FrontendEvent};
+    use std::net::SocketAddr;
 
-    fn client(hostname: Option<&str>, peer_fp: Option<&str>) -> (ClientConfig, ClientState) {
-        let config = ClientConfig {
-            hostname: hostname.map(String::from),
-            ..Default::default()
-        };
-        let state = ClientState {
-            peer_fingerprint: peer_fp.map(String::from),
-            ..Default::default()
-        };
-        (config, state)
+    fn attempt(origin: AttemptOrigin) -> AppModel {
+        attempt_from(origin, None)
     }
 
-    #[test]
-    fn merges_client_and_authorized_by_fingerprint() {
+    fn attempt_from(origin: AttemptOrigin, addr: Option<SocketAddr>) -> AppModel {
         let mut m = AppModel::default();
-        let fp = "aa:bb:cc:dd";
-        m.clients.insert(0, client(Some("studio-mac"), Some(fp)));
-        m.authorized
-            .insert(fp.to_string(), "studio-mac".to_string());
-        let devices = m.devices();
-        assert_eq!(devices.len(), 1, "one machine must render as one card");
-        let d = &devices[0];
-        assert!(d.send.is_some(), "carries the outgoing facet");
-        assert!(d.receive, "trusted to connect in");
-        assert_eq!(d.trust, TrustState::Trusted);
-        assert_eq!(d.fingerprint.as_deref(), Some(fp));
+        m.apply(FrontendEvent::ConnectionAttempt {
+            fingerprint: "AA:BB".into(),
+            origin,
+            addr,
+        });
+        m
     }
 
-    /// The rig case: both Mac receivers were added on Windows BY IP, so the
-    /// name field holds an address. Once the fingerprint is learned the two
-    /// rows must collapse into one card named by the peer, not by its IP.
+    /// The address that answered has to reach the user. They typed one address;
+    /// a different machine can be the one that replies (a typo, a recycled DHCP
+    /// lease, a machine that took the address while the intended one slept), and
+    /// the fingerprint alone gives them nothing to compare against (#93).
     #[test]
-    fn ip_named_client_merges_and_takes_the_peer_description() {
-        let mut m = AppModel::default();
-        let scorn = "73:90:2a:3c:9d:e5";
-        let carrier = "2d:65:8f:e6:f8:2b";
-        m.clients
-            .insert(0, client(Some("10.110.20.99"), Some(scorn)));
-        m.clients
-            .insert(1, client(Some("10.110.21.46"), Some(carrier)));
-        m.authorized
-            .insert(scorn.to_string(), "ScornMBP23".to_string());
-        m.authorized
-            .insert(carrier.to_string(), "CarrierMBP".to_string());
-
-        let devices = m.devices();
-        assert_eq!(devices.len(), 2, "two machines, not four cards");
-        let mut labels: Vec<&str> = devices.iter().map(|d| d.label.as_str()).collect();
-        labels.sort();
-        assert_eq!(
-            labels,
-            ["CarrierMBP", "ScornMBP23"],
-            "named by peer, not by IP"
+    fn the_answering_address_reaches_the_user() {
+        let a: SocketAddr = "10.0.0.5:4242".parse().unwrap();
+        let m = attempt_from(AttemptOrigin::OutboundDial, Some(a));
+        assert_eq!(m.pending_pairing_addr, Some(a));
+        assert!(
+            m.messages.back().unwrap().contains("10.0.0.5:4242"),
+            "the log line must name the address that answered, got {:?}",
+            m.messages.back()
         );
-        for d in &devices {
-            assert!(d.send.is_some(), "{} keeps its outgoing facet", d.label);
-            assert!(d.receive, "{} stays trusted (revoke must render)", d.label);
+    }
+
+    #[test]
+    fn the_origin_reaches_the_model() {
+        assert_eq!(
+            attempt(AttemptOrigin::Inbound).pending_pairing_origin,
+            Some(AttemptOrigin::Inbound)
+        );
+        assert_eq!(
+            attempt(AttemptOrigin::OutboundDial).pending_pairing_origin,
+            Some(AttemptOrigin::OutboundDial)
+        );
+    }
+
+    /// Both still raise a prompt — a console-caused dial is not silently
+    /// swallowed. It is *labelled*, not suppressed. Suppressing it would break
+    /// the outbound pairing flow, which is how a device is actually paired.
+    #[test]
+    fn both_origins_still_prompt() {
+        for o in [AttemptOrigin::Inbound, AttemptOrigin::OutboundDial] {
+            assert_eq!(
+                attempt(o).pending_pairing.as_deref(),
+                Some("AA:BB"),
+                "{o:?} must still raise a prompt"
+            );
         }
     }
 
-    fn revoked(label: &str) -> super::RevokedEntry {
-        super::RevokedEntry {
-            label: label.to_string(),
-            revoked_at: 1_754_000_000,
+    /// And the user-visible sentence differs. If these ever converge, the whole
+    /// point of carrying the provenance is lost.
+    #[test]
+    fn the_two_read_differently() {
+        let inbound = attempt(AttemptOrigin::Inbound).messages.pop_back().unwrap();
+        let dialled = attempt(AttemptOrigin::OutboundDial)
+            .messages
+            .pop_back()
+            .unwrap();
+        assert_ne!(
+            inbound, dialled,
+            "a prompt we summoned by dialling out reads identically to a peer \
+             knocking — that is the #61 defect, and it is what makes a forged \
+             provenance invisible"
+        );
+    }
+}
+
+#[cfg(test)]
+mod refusal_is_not_maskable {
+    //! A device that will refuse our input must not read as healthy (#92).
+    //!
+    //! `Pong(bool)` carries the receiver's own "is my emulation active" bit,
+    //! `connect.rs` fail-closes on it before writing a frame, and both
+    //! front-ends rendered `online || alive` — so a peer that connects *in*
+    //! (setting `online`) masked a false `alive`, and the dot stayed green while
+    //! every event sent to that machine was refused. The user's only symptom was
+    //! the cursor snapping back at the edge.
+    //!
+    //! `online` and `alive` are facts about opposite directions. ORing them
+    //! together is the defect.
+    use super::*;
+
+    fn dev(online: bool, active: bool, alive: bool) -> Device {
+        Device {
+            fingerprint: Some("aa:bb".into()),
+            label: "peer".into(),
+            trust: TrustState::Trusted,
+            online,
+            send: Some(DeviceSend {
+                handle: 0,
+                config: ClientConfig::default(),
+                state: ClientState {
+                    active,
+                    alive,
+                    ..Default::default()
+                },
+            }),
+            receive: true,
         }
     }
 
-    /// The point of persisting revocation: a device you threw out must never
-    /// render like a device you have not met.
+    /// The exact scenario in the issue: B's emulation died, B still dials us so
+    /// `online` is true, and we are actively pushing input at it.
     #[test]
-    fn a_revoked_device_is_shown_as_revoked_not_as_a_stranger() {
-        let mut m = AppModel::default();
-        let fp = "aa:bb:cc:dd";
-        m.revoked.insert(fp.to_string(), revoked("ScornW20"));
-        let devices = m.devices();
-        assert_eq!(devices.len(), 1, "the expelled device stays visible");
-        assert_eq!(devices[0].trust, TrustState::Revoked);
-        assert_eq!(
-            devices[0].label, "ScornW20",
-            "it keeps the name you knew it by"
-        );
+    fn an_inbound_connection_does_not_mask_a_dead_receiver() {
         assert!(
-            !devices[0].receive,
-            "revoked means not trusted to connect in"
-        );
-    }
-
-    /// A revoked peer reconnecting must NOT surface as a pairing request — that
-    /// is exactly the one-click-undo this whole change exists to remove.
-    #[test]
-    fn a_revoked_peer_cannot_appear_as_a_pending_approval() {
-        let mut m = AppModel::default();
-        let fp = "aa:bb:cc:dd";
-        m.revoked.insert(fp.to_string(), revoked("ScornW20"));
-        m.pending_pairing = Some(fp.to_string());
-        let devices = m.devices();
-        assert_eq!(devices.len(), 1);
-        assert_eq!(
-            devices[0].trust,
-            TrustState::Revoked,
-            "a reconnecting revoked peer must not be offered as a new pairing"
-        );
-    }
-
-    /// Belt and braces for the daemon's precedence rule: if both tables somehow
-    /// name the same fingerprint, it must not render as trusted.
-    #[test]
-    fn authorized_wins_only_when_not_revoked() {
-        let mut m = AppModel::default();
-        let fp = "aa:bb:cc:dd";
-        m.authorized.insert(fp.to_string(), "ScornW20".into());
-        let devices = m.devices();
-        assert_eq!(
-            devices[0].trust,
-            TrustState::Trusted,
-            "plain trusted device"
-        );
-
-        // an expelled identity is a TOMBSTONE: even if both tables somehow name
-        // it, it must never render as trusted, because there is no longer any
-        // path from revoked back to authorized.
-        m.revoked.insert(fp.to_string(), revoked("ScornW20"));
-        let devices = m.devices();
-        assert_eq!(devices.len(), 1, "still one card, not two");
-        assert_eq!(
-            devices[0].trust,
-            TrustState::Revoked,
-            "revoked outranks authorized — a dead identity cannot present as trusted"
-        );
-        assert!(!devices[0].receive, "and it is not trusted to connect in");
-    }
-
-    /// Regression: the GUI filtered on `send.is_some() || receive`, which drops
-    /// revoked devices — so the revoked badge and restore button never rendered
-    /// in the real app even though the mock render showed them perfectly.
-    #[test]
-    fn a_revoked_device_survives_the_list_filter() {
-        let mut m = AppModel::default();
-        m.revoked
-            .insert("aa:bb:cc:dd".into(), revoked("old-thinkpad"));
-        let devices = m.devices();
-        assert_eq!(devices.len(), 1);
-        assert!(
-            devices[0].is_listable(),
-            "a revoked device must reach the device list, or the restore UI is unreachable"
-        );
-        assert!(
-            devices.iter().filter(|d| d.is_listable()).count() == 1,
-            "exactly one listable row"
-        );
-    }
-
-    /// The daemon's only channel for "that didn't work". Before this was
-    /// rendered, every failure — unresolvable name, refused trust change, failed
-    /// config write, rejected IPC token — reached the user as silence.
-    #[test]
-    fn errors_become_a_notice_the_ui_can_tell_is_new() {
-        let mut m = AppModel::default();
-        assert_eq!(m.latest_message(), None, "nothing to show at rest");
-        assert_eq!(m.message_seq, 0);
-
-        m.apply(super::FrontendEvent::Error(
-            "could not resolve studio-pc".into(),
-        ));
-        assert_eq!(
-            m.latest_message(),
-            Some("error: could not resolve studio-pc")
-        );
-        let first = m.message_seq;
-        assert!(
-            first > 0,
-            "a notice must bump the seq or the UI cannot raise it"
-        );
-
-        // a SECOND, identical error must still be distinguishable, or a dismissed
-        // banner would stay hidden through a repeat of the same failure
-        m.apply(super::FrontendEvent::Error(
-            "could not resolve studio-pc".into(),
-        ));
-        assert!(
-            m.message_seq > first,
-            "a repeated failure must re-raise the banner"
-        );
-    }
-
-    /// A peer that reconnects on a new source port must not be reported offline
-    /// by the OLD address's late disconnect.
-    #[test]
-    fn a_reconnect_on_a_new_port_stays_connected() {
-        use std::net::SocketAddr;
-        let fp = "aa:bb:cc:dd";
-        let old: SocketAddr = "10.0.0.5:50001".parse().unwrap();
-        let new: SocketAddr = "10.0.0.5:50002".parse().unwrap();
-
-        let mut m = AppModel::default();
-        m.apply(super::FrontendEvent::DeviceConnected {
-            addr: old,
-            fingerprint: fp.into(),
-        });
-        assert!(m.connected_peers.contains(fp));
-
-        // reconnect lands first, THEN the old socket's disconnect arrives
-        m.apply(super::FrontendEvent::DeviceConnected {
-            addr: new,
-            fingerprint: fp.into(),
-        });
-        m.apply(super::FrontendEvent::IncomingDisconnected(old));
-        assert!(
-            m.connected_peers.contains(fp),
-            "the peer is still connected on the new port — a late disconnect for \
-             the old one must not mark it offline"
-        );
-
-        // and the genuine last disconnect DOES clear it
-        m.apply(super::FrontendEvent::IncomingDisconnected(new));
-        assert!(
-            !m.connected_peers.contains(fp),
-            "the last address leaving means offline"
+            dev(true, true, false).refuses_our_input(),
+            "online must not mask a receiver that told us its emulation is off — \
+             every event we send is refused before it is written"
         );
     }
 
     #[test]
-    fn offline_client_and_unrelated_trust_stay_two_cards() {
-        let mut m = AppModel::default();
-        // an outgoing client that has never connected (no fingerprint yet)
-        m.clients.insert(0, client(Some("studio-mac"), None));
-        // an unrelated trusted sender (receive-only)
-        m.authorized
-            .insert("cc:dd:ee:ff".to_string(), "windows-box".to_string());
-        let devices = m.devices();
-        assert_eq!(devices.len(), 2, "no fingerprint to join on => two cards");
-        assert!(
-            devices
-                .iter()
-                .any(|d| d.fingerprint.is_none() && d.send.is_some())
-        );
-        assert!(devices.iter().any(|d| d.receive && d.send.is_none()));
+    fn a_healthy_peer_is_not_flagged() {
+        assert!(!dev(true, true, true).refuses_our_input());
     }
 
+    /// If capture is not routed there we are not sending, so `alive` says
+    /// nothing the user needs to act on. Flagging it would cry wolf on every
+    /// switched-off device.
     #[test]
-    fn excludes_this_device() {
-        let mut m = AppModel::default();
-        let me = "de:ad:be:ef";
-        m.fingerprint = Some(me.to_string());
-        m.authorized.insert(me.to_string(), "myself".to_string());
-        assert!(m.devices().is_empty(), "never list ourselves");
+    fn an_inactive_device_is_not_flagged() {
+        assert!(!dev(true, false, false).refuses_our_input());
     }
 
+    /// A receive-only peer has no send facet and therefore nothing to refuse.
     #[test]
-    fn bare_pairing_request_surfaces_as_pending() {
-        let mut m = AppModel::default();
-        let fp = "12:34:56:78";
-        m.pending_pairing = Some(fp.to_string());
-        let devices = m.devices();
-        assert_eq!(devices.len(), 1);
-        assert_eq!(devices[0].trust, TrustState::PendingApproval);
-        assert_eq!(devices[0].fingerprint.as_deref(), Some(fp));
-    }
-
-    #[test]
-    fn online_reflects_connected_peers() {
-        let mut m = AppModel::default();
-        let fp = "aa:bb:cc:dd";
-        m.authorized
-            .insert(fp.to_string(), "studio-mac".to_string());
-        m.connected_peers.insert(fp.to_string());
-        let devices = m.devices();
-        assert_eq!(devices.len(), 1);
-        assert!(devices[0].online);
-    }
-
-    /// Approving a peer without typing a name must produce the SAME label the
-    /// device projection would have chosen for it, from either frontend. The
-    /// GUI used the literal "device" and the TUI used a 16-char fingerprint
-    /// slice, so the same peer approved the same way was named two different
-    /// things depending on which interface happened to be open — and a second
-    /// unnamed peer made "device" ambiguous as well as uninformative.
-    #[test]
-    fn a_blank_approval_is_named_the_same_way_everywhere() {
-        let fp = "1e:19:1b:2c:3d:4e:5f:60";
-        let label = fallback_label(fp);
-        assert_eq!(label, "1e:19:1b");
-
-        let mut m = AppModel::default();
-        m.authorized.insert(fp.to_string(), label.clone());
-        let d = m.devices();
-        assert_eq!(d.len(), 1);
-        assert_eq!(
-            d[0].label, label,
-            "the stored fallback must match what the projection displays"
-        );
-
-        // an empty fingerprint must still yield something sayable
-        assert_eq!(fallback_label(""), "unnamed device");
+    fn a_receive_only_peer_is_not_flagged() {
+        let mut d = dev(true, true, false);
+        d.send = None;
+        assert!(!d.refuses_our_input());
     }
 }
 

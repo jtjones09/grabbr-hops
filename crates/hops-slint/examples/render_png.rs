@@ -87,6 +87,11 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
         },
     ])));
     ui.set_pairing_fp("a4:f0:9c:2e:11:bd:77:0c:35:9a".into()); // shows the pairing card
+    // flip to true to review the "we dialled this device" wording (#61)
+    ui.set_pairing_from_our_dial(std::env::var_os("PREVIEW_OUR_DIAL").is_some());
+    if std::env::var_os("PREVIEW_OUR_DIAL").is_some() {
+        ui.set_pairing_addr("10.0.0.5:4242".into());
+    }
     // the notice banner — the daemon's only "that didn't work" channel
     ui.set_notice(
         "Refused to grant trust: this machine is being controlled remotely. \
@@ -97,14 +102,16 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
 
     // Exercise all four merged-card states in one shot.
     ui.set_devices(ModelRc::new(VecModel::from(vec![
-        // send + trusted (we dial it AND it's connected in) — renders as a send row
+        // #92: connected IN (online) but its emulation is OFF, so everything we
+        // send is refused. This used to render green because `online || alive`.
         DeviceRow {
             handle: "1".into(),
             name: "studio-pc".into(),
             addr: "10.110.20.42:4242".into(),
             pos: "left".into(),
             active: true,
-            alive: true,
+            alive: false,
+            refuses_input: true,
             has_send: true,
             fingerprint: "1e:19:1b".into(),
             fp_full: "1e:19:1b:c4:a8:44".into(),
@@ -120,6 +127,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             pos: "top".into(),
             active: false,
             alive: false,
+            refuses_input: false,
             has_send: true,
             fingerprint: "".into(),
             fp_full: "".into(),
@@ -135,6 +143,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             pos: "".into(),
             active: false,
             alive: false,
+            refuses_input: false,
             has_send: false,
             fingerprint: "b7:2a:55".into(),
             fp_full: "b7:2a:55:e1:90:33".into(),
@@ -150,6 +159,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             pos: "".into(),
             active: false,
             alive: false,
+            refuses_input: false,
             has_send: false,
             fingerprint: "c3:de:04".into(),
             fp_full: "c3:de:04:aa:11:22".into(),
@@ -166,6 +176,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             pos: "".into(),
             active: false,
             alive: false,
+            refuses_input: false,
             has_send: false,
             fingerprint: "9f:04:7c".into(),
             fp_full: "9f:04:7c:12:aa:03".into(),
