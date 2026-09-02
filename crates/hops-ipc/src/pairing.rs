@@ -316,3 +316,169 @@ mod canonical_fingerprint_tests {
         }
     }
 }
+
+/// How many digits the verification code has. Six is the ceiling on what a
+/// person will reliably compare across two screens, and it is what SSH,
+/// Bluetooth SSP and Signal all settled on.
+pub const SAS_DIGITS: usize = 6;
+
+/// A short number BOTH machines display, for a human to compare.
+///
+/// # Why this exists
+///
+/// Every path into hops' trust store today ends at a prompt on ONE machine.
+/// That prompt can be caused by something other than the person sitting there:
+/// anything holding the IPC token can make the daemon dial an address it chose
+/// and raise a genuine approval prompt for a fingerprint it chose (#61). The
+/// prompt is real; its provenance is forged. Labelling it (#129) tells a
+/// careful human something is odd — it does nothing for a machine check.
+///
+/// A number derived from BOTH fingerprints and shown on BOTH screens is
+/// different in kind. A compromised console cannot make the *other* machine's
+/// screen display a number of its choosing, so "the same six digits appear over
+/// there" is evidence no local attacker can manufacture. That is the
+/// out-of-band human act #61 step 2 needs before "only an unsolicited attempt
+/// may admit a grant" is implementable — today it is not, because approving an
+/// outbound dial is the only way to pair at all.
+///
+/// # Properties
+///
+/// - **Symmetric.** The inputs are sorted, so both ends compute the same digits
+///   without agreeing who is "first".
+/// - **Neither side chooses it.** It commits to both fingerprints, so a machine
+///   that picks its own key to force a value must also control the peer's.
+/// - **Not a secret.** It authenticates nothing on its own and is safe to show.
+///   Its whole job is to be compared by a person.
+///
+/// Returns `None` if either fingerprint is not a valid one — a code derived
+/// from a malformed input would be a number that means nothing.
+pub fn verification_code(a: &str, b: &str) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let (a, b) = (canonical_fingerprint(a)?, canonical_fingerprint(b)?);
+    // Sorted so the two ends agree without negotiating an order.
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let mut h = Sha256::new();
+    // Domain separation: this hash must never collide with any other use of a
+    // fingerprint pair elsewhere in hops.
+    h.update(b"hops-pairing-verification-v1");
+    h.update(lo.as_bytes());
+    h.update(b"\0");
+    h.update(hi.as_bytes());
+    let d = h.finalize();
+    // 8 bytes is far more entropy than 10^6 needs; the modulo bias across a
+    // 64-bit value reduced to a million buckets is not measurable by a human
+    // comparing digits, and this is a comparison aid, not a key.
+    let n = u64::from_be_bytes(d[..8].try_into().ok()?);
+    Some(format!(
+        "{:0width$}",
+        n % 10u64.pow(SAS_DIGITS as u32),
+        width = SAS_DIGITS
+    ))
+}
+
+#[cfg(test)]
+mod verification_code_tests {
+    use super::*;
+
+    const A: &str = "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99:\
+aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
+    const B: &str = "11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:\
+11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00";
+
+    /// The whole ceremony rests on this: both machines must show the same
+    /// digits without negotiating who is "first".
+    #[test]
+    fn both_ends_compute_the_same_code() {
+        assert_eq!(
+            verification_code(A, B),
+            verification_code(B, A),
+            "the code must not depend on which machine computes it, or the two \
+             screens disagree and the user is told to reject a valid pairing"
+        );
+    }
+
+    #[test]
+    fn it_is_six_digits() {
+        let c = verification_code(A, B).expect("valid fingerprints");
+        assert_eq!(c.len(), SAS_DIGITS);
+        assert!(c.chars().all(|ch| ch.is_ascii_digit()), "got {c:?}");
+    }
+
+    /// Leading zeros must survive. `042315` truncated to `42315` is a different
+    /// number on the other screen, and the user is told to reject a good pair.
+    #[test]
+    fn leading_zeros_are_kept() {
+        // search for a pair that produces a leading zero, then assert the width
+        let mut found = false;
+        for i in 0..4096u32 {
+            let b = format!("{:02x}", i % 256);
+            let fp = std::iter::repeat(b).take(32).collect::<Vec<_>>().join(":");
+            if let Some(c) = verification_code(A, &fp) {
+                assert_eq!(c.len(), SAS_DIGITS, "width must be fixed: {c:?}");
+                if c.starts_with('0') {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            found,
+            "expected to find a code with a leading zero in 4096 tries"
+        );
+    }
+
+    /// A different peer must produce a different number, or the code proves
+    /// nothing about WHO is on the other side.
+    ///
+    /// Tested with a peer that sorts BELOW us and one that sorts ABOVE us. The
+    /// inputs are sorted before hashing, so varying only one side exercises
+    /// only one slot — an implementation that hashed `lo` and ignored `hi`
+    /// passed a single-direction version of this test.
+    #[test]
+    fn a_different_peer_gives_a_different_code_in_either_slot() {
+        let below = "00:".repeat(31) + "00";
+        let below2 = "00:".repeat(31) + "01";
+        assert_ne!(
+            verification_code(A, &below).unwrap(),
+            verification_code(A, &below2).unwrap(),
+            "a peer sorting BELOW us must still change the code"
+        );
+        let above = "ff:".repeat(31) + "f0";
+        let above2 = "ff:".repeat(31) + "f1";
+        assert_ne!(
+            verification_code(&below, &above).unwrap(),
+            verification_code(&below, &above2).unwrap(),
+            "a peer sorting ABOVE us must change the code — otherwise the hash \
+             commits to one identity and the number says nothing about who is \
+             actually on the other end"
+        );
+    }
+
+    /// Case is not identity — the trust maps are canonicalised for exactly this
+    /// reason (#67/#100), and a code that disagreed across case would tell the
+    /// user two honest machines do not match.
+    #[test]
+    fn case_does_not_change_the_code() {
+        assert_eq!(
+            verification_code(A, B),
+            verification_code(&A.to_uppercase(), B),
+            "an uppercased fingerprint is the same identity, so the same code"
+        );
+    }
+
+    /// A code from a malformed fingerprint would be a number that means
+    /// nothing, displayed as though it meant something.
+    #[test]
+    fn a_malformed_fingerprint_yields_no_code() {
+        for bad in ["", "nonsense", "aa:bb", &"zz:".repeat(32)] {
+            assert!(
+                verification_code(A, bad).is_none(),
+                "{bad:?} must not produce a code"
+            );
+            assert!(
+                verification_code(bad, A).is_none(),
+                "{bad:?} in either slot"
+            );
+        }
+    }
+}
