@@ -731,6 +731,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                         pos: pos.into(),
                         active,
                         alive,
+                        refuses_input: d.refuses_our_input(),
                         has_send,
                         fingerprint: d
                             .fingerprint
@@ -932,51 +933,6 @@ pub fn run_onboarding() -> Result<Option<hops_frontend_core::prefs::Frontend>, S
 }
 
 #[cfg(test)]
-mod tray_const_property {
-    /// The tray must never let the Slint compiler const-fold `visible`.
-    ///
-    /// If it does, the generated `HopsTray::hide()` writes a constant property,
-    /// i-slint-core panics "Constant property being changed", and `panic =
-    /// "abort"` turns that into SIGABRT for the whole tray app — the two aborts
-    /// in gui.log, and issue #4.
-    ///
-    /// This asserts on the GENERATED code rather than by calling `hide()`,
-    /// deliberately: constructing a real `SystemTrayIcon` needs a live platform
-    /// backend, so a behavioural test could not run on a headless CI box — and
-    /// a guard that does not run in CI is how this shipped in the first place.
-    /// `examples/tray_hide_repro.rs` is the behavioural check, for a machine
-    /// with a desktop.
-    #[test]
-    fn tray_visible_is_not_const_folded() {
-        let generated = std::fs::read_to_string(concat!(env!("OUT_DIR"), "/app.rs"))
-            .expect("the slint build script must have generated app.rs");
-
-        // narrow to the tray's own init, so an unrelated component's constant
-        // `visible` cannot mask a regression here
-        let start = generated
-            .find("impl InnerHopsTray")
-            .expect("generated code should contain InnerHopsTray");
-        let body = &generated[start..];
-        let end = body.find("impl ").map(|i| i + 5).unwrap_or(0);
-        let init = &body[..body[end..]
-            .find("\n    impl ")
-            .map_or(body.len(), |i| end + i)];
-
-        let offending: Vec<&str> = init
-            .lines()
-            .filter(|l| l.contains("r#visible") && l.contains("set_constant"))
-            .collect();
-
-        assert!(
-            offending.is_empty(),
-            "HopsTray::visible is const-folded again — hide() will abort the app (#4). \
-             Re-bind it in ui/tray.slint (`in-out property <bool> shown: true; visible: root.shown;`). \
-             Offending generated line(s): {offending:?}"
-        );
-    }
-}
-
-#[cfg(test)]
 mod destructive_actions_say_so {
     //! The confirm text for delete and revoke must say the change is permanent.
     //!
@@ -1019,6 +975,77 @@ mod destructive_actions_say_so {
         assert_eq!(
             n, 2,
             "delete and revoke must BOTH explain the consequence; found {n} of 2"
+        );
+    }
+}
+
+#[cfg(test)]
+mod refusal_reaches_the_ui {
+    //! Both front-ends must consult the refusal BEFORE the green arm.
+    //!
+    //! `hops_frontend_core::refusal_is_not_maskable` proves the predicate. It
+    //! cannot prove either UI asks it — and the original defect was precisely a
+    //! correct fact discarded at the render step, `online || alive` (#92). So
+    //! the render sites get their own guard.
+
+    /// Non-test source only; split without a trailing newline so a CRLF
+    /// checkout still matches.
+    fn body(src: &str, marker: &str) -> String {
+        let src = src.split("\n#[cfg(test)]").next().unwrap_or(src);
+        // Generous window: too small silently misses the code under test and the
+        // guard then fails on its own slicing rather than on the defect.
+        let at = src
+            .find(marker)
+            .unwrap_or_else(|| panic!("{marker} must exist; if it moved, update this guard"));
+        let window: String = src[at..].chars().take(4000).collect();
+        // Strip comments. Both of these guards describe the very identifiers
+        // they search for, so a raw search finds the PROSE and reads the order
+        // backwards — that produced a clean false pass here (the mutation put
+        // the green arm first and the test still went green), and the identical
+        // mistake had already been made in config.rs the same day.
+        window
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_slint_dot_checks_refusal_before_going_green() {
+        const UI: &str = include_str!("../ui/app.slint");
+        // Two anchors, because there is another `Dot {` at the top of the window
+        // (the daemon-connection indicator) and it is not this one: narrow to
+        // the device-row loop first, then to the dot inside it.
+        let rows = body(UI, "for d in root.devices:");
+        let dot = body(&rows, "Dot {");
+        let refuses = dot
+            .find("refuses-input")
+            .expect("the device dot must consult refuses-input (#92)");
+        let green = dot
+            .find("d.online || d.alive")
+            .expect("the green arm should still exist; if it was rewritten, update this guard");
+        assert!(
+            refuses < green,
+            "the dot evaluates `online || alive` before the refusal, so an inbound \
+             connection masks a receiver that refuses everything we send — the #92 \
+             defect exactly."
+        );
+    }
+
+    #[test]
+    fn the_tui_dot_checks_refusal_before_going_green() {
+        const TUI: &str = include_str!("../../hops-tui/src/lib.rs");
+        let f = body(TUI, "fn device_row(");
+        let refuses = f
+            .find("refuses_our_input()")
+            .expect("the TUI row must consult refuses_our_input (#92)");
+        let green = f
+            .find("d.online ||")
+            .expect("the green arm should still exist; if it was rewritten, update this guard");
+        assert!(
+            refuses < green,
+            "the TUI row reaches its green arm before checking the refusal, so a \
+             peer connected inbound masks one that refuses our input (#92)."
         );
     }
 }

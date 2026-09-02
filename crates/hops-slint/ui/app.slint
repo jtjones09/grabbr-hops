@@ -27,7 +27,11 @@ export struct DeviceRow {
     addr: string,        // "ip:port" / "unresolved" (send facet)
     pos: string,         // "left" / "right" / … (send facet)
     active: bool,        // capture is routed to this device (send facet)
-    alive: bool,         // outgoing connection is reachable (send facet)
+    alive: bool,         // the peer's Pong says its emulation is ON (send facet)
+    refuses-input: bool, // we are routed to it and it says emulation is OFF, so
+                         // every event we send is refused before it is written.
+                         // NOT the same as offline, and `online` must not mask
+                         // it — that is the inbound direction (#92).
     has-send: bool,      // has an outgoing (send-to) facet
     fingerprint: string, // short fingerprint (display)
     fp-full: string,     // full fingerprint (for revoke)
@@ -466,7 +470,14 @@ export component AppWindow inherits Window {
                                 VerticalLayout {
                                     alignment: center;
                                     Dot {
-                                        tint: (d.online || d.alive)
+                                        // refuses-input is checked FIRST. `online`
+                                        // is about the inbound direction and used
+                                        // to OR this away, so a machine silently
+                                        // rejecting everything we sent showed
+                                        // green (#92).
+                                        tint: d.refuses-input
+                                            ? Theme.c.error
+                                            : (d.online || d.alive)
                                             ? Theme.c.success
                                             : (d.active ? Theme.c.warn : Theme.c.muted);
                                     }
@@ -489,6 +500,20 @@ export component AppWindow inherits Window {
                                         font-family: Type.mono;
                                         font-size: Type.caption;
                                         letter-spacing: Type.mono-tracking;
+                                        overflow: elide;
+                                    }
+                                    // The dot alone cannot say WHY, and a green
+                                    // "active" toggle beside a red dot reads as a
+                                    // contradiction. Say the fact: the far end is
+                                    // up and refusing, not unreachable (#92).
+                                    // One line, elided, NEVER wrapped: the row is
+                                    // a fixed 56px and a wrapped block overflows
+                                    // into the row below it.
+                                    if d.refuses-input: Text {
+                                        text: "not accepting input";
+                                        color: Theme.c.error;
+                                        font-size: Type.caption;
+                                        font-weight: Type.medium;
                                         overflow: elide;
                                     }
                                 }
