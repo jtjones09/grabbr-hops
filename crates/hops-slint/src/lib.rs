@@ -69,6 +69,8 @@ struct PolledUi {
     /// Whether that pairing prompt came from OUR outbound dial rather than a
     /// peer connecting in (#61) — the card says which.
     pairing_from_our_dial: bool,
+    /// Six digits both machines display — see `AppModel::pending_verification_code`.
+    pairing_code: String,
     /// The address that answered our dial, so the user can compare it with the
     /// one they typed (#93). Empty when unknown (every inbound attempt).
     pairing_addr: String,
@@ -726,6 +728,11 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                     .map(|a| a.to_string())
                     .unwrap_or_default()
             };
+            let pairing_code = if pairing.is_empty() {
+                String::new()
+            } else {
+                m.pending_verification_code().unwrap_or_default()
+            };
             let pairing_from_our_dial = !pairing.is_empty()
                 && m.pending_pairing_origin
                     == Some(hops_frontend_core::AttemptOrigin::OutboundDial);
@@ -843,6 +850,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                     })
                     .collect(),
                 pairing_from_our_dial,
+                pairing_code,
                 pairing_addr,
                 // the first edge nothing active is already using, so adding a
                 // second device does not silently switch off the first
@@ -893,6 +901,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
             ui.set_discovered(ModelRc::new(VecModel::from(snap.discovered.clone())));
             ui.set_discovery_active(snap.discovery_active);
             ui.set_pairing_from_our_dial(snap.pairing_from_our_dial);
+            ui.set_pairing_code(snap.pairing_code.as_str().into());
             ui.set_pairing_addr(snap.pairing_addr.as_str().into());
             // only when the DAEMON has something new — otherwise a local
             // validation notice would be overwritten on the next poll
@@ -1182,6 +1191,35 @@ mod discovery_states {
             "\"pick one from your network below\" must be guarded on discovery \
              being active AND the list being non-empty. Guarded on the list \
              alone, it promises a section that is not rendered."
+        );
+    }
+}
+
+#[cfg(test)]
+mod verification_code_is_on_screen {
+    //! The pairing card must actually render the code.
+    //!
+    //! A correct primitive that no screen displays is the #92 shape: the fact
+    //! was right and the render step threw it away.
+
+    const UI: &str = include_str!("../ui/app.slint");
+
+    #[test]
+    fn the_card_shows_the_code_and_says_what_to_do_with_it() {
+        // Must be BOUND TO A TEXT, not merely mentioned. The property
+        // declaration and the `if` guard both contain `root.pairing-code`, so a
+        // looser check passed even with the Text blanked to "" — a card that
+        // renders nothing while the guard stays green.
+        assert!(
+            UI.contains("text: root.pairing-code;"),
+            "the pairing card must BIND the verification code to a Text. The \
+             ceremony is the user comparing two screens; a code displayed on \
+             neither is not a ceremony."
+        );
+        assert!(
+            UI.contains("check this matches on the other machine"),
+            "the code needs an instruction. Six unexplained digits invite a click \
+             on `trust & name` rather than a look at the other machine."
         );
     }
 }
