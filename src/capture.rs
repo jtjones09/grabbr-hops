@@ -155,6 +155,7 @@ impl Capture {
 /// debounce a statement `$st`, i.e. the statement is executed only if the
 /// time since the previous execution is at least `$dur`.
 /// `$prev` is used to keep track of this timestamp
+#[macro_export]
 macro_rules! debounce {
     ($prev:ident, $dur:expr, $st:stmt) => {
         let exec = match $prev.get() {
@@ -163,7 +164,7 @@ macro_rules! debounce {
             _ => false,
         };
         if exec {
-            $prev.replace(Some(Instant::now()));
+            $prev.replace(Some(std::time::Instant::now()));
             $st
         }
     };
