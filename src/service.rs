@@ -817,6 +817,14 @@ impl Service {
 
     fn sync_frontend(&mut self) {
         self.enumerate();
+        // Tell a newly-attached frontend whether we are LOOKING, before anything
+        // has been found. `publish_discovered` was reachable only from
+        // `handle_discovery_event`, so on a machine that discovers nothing —
+        // or every time a GUI attached — the frontend never learned discovery
+        // was running and rendered no network section at all. That is exactly
+        // the silence #141 set out to remove; the render was fixed and the
+        // publish was not.
+        self.publish_discovered();
         self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
         self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
         self.notify_frontend(FrontendEvent::PortChanged(self.port, None));
@@ -1833,6 +1841,70 @@ mod reload_resets_handles {
             "reset_handle_allocation clears the slab outright; running it before \
              the removals would drop live clients without destroying their \
              capture."
+        );
+    }
+}
+
+#[cfg(test)]
+mod discovery_state_on_attach {
+    //! A frontend must learn discovery is running the moment it attaches.
+    //!
+    //! `publish_discovered` was reachable only from `handle_discovery_event`,
+    //! so the frontend heard nothing until a peer was FOUND. On a machine that
+    //! discovers nothing — mDNS filtered, or the only peer already paired and
+    //! therefore filtered out of the list — `discovery_active` stayed false and
+    //! the network section never rendered.
+    //!
+    //! Reported from the rig as "wtf? it looks like a gui bug to me", with a
+    //! screenshot showing no section at all while the daemon log said
+    //! `announcing this machine on the local network`. Both were true: the
+    //! daemon was looking and had never said so.
+    //!
+    //! #141 fixed the RENDERING of that state and left the PUBLISHING of it
+    //! unfixed, which is why a guard on the UI alone passed.
+
+    fn production() -> &'static str {
+        const FULL: &str = include_str!("service.rs");
+        FULL.split("\n#[cfg(test)]").next().unwrap_or(FULL)
+    }
+
+    fn body_of(src: &str, sig: &str) -> String {
+        let at = src
+            .find(sig)
+            .unwrap_or_else(|| panic!("{sig} must exist; if renamed, update this guard"));
+        let rest = &src[at..];
+        let end = rest[1..]
+            .find("\n    fn ")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        rest[..end]
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn sync_frontend_publishes_the_discovery_state() {
+        let src = production();
+        assert!(
+            body_of(src, "fn sync_frontend(").contains("publish_discovered()"),
+            "a frontend that attaches must be told whether discovery is running. \
+             Without it, `discovery_active` stays false on any machine that has \
+             not FOUND something, and the network section never appears — the \
+             feature is then indistinguishable from a bug, which is what it \
+             looked like on the rig."
+        );
+    }
+
+    /// And the event path must still publish, or the list stops updating.
+    #[test]
+    fn the_event_path_still_publishes_too() {
+        let src = production();
+        assert!(
+            body_of(src, "fn handle_discovery_event(").contains("publish_discovered()"),
+            "found/lost events must still republish, or the list freezes at \
+             whatever attach-time reported"
         );
     }
 }
