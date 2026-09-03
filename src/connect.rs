@@ -390,6 +390,14 @@ pub(crate) struct ClipboardSender {
     conns: Rc<Mutex<HashMap<SocketAddr, PeerLink>>>,
 }
 
+/// One clipboard-failure line a minute is enough to tell you it is dropping,
+/// without a persistently unreachable peer flooding the log.
+const CLIP_LOG_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(60);
+thread_local! {
+    static PREV_CLIP_LOG: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
 impl ClipboardSender {
     pub(crate) async fn broadcast(&self, text: String) {
         let conns: Vec<Connection> = {
@@ -406,10 +414,36 @@ impl ClipboardSender {
                 .await
                 {
                     Ok(Ok(())) => {}
-                    Ok(Err(e)) => log::debug!("clipboard broadcast failed: {e}"),
+                    // WARN, not debug. Every failure here was invisible on a
+                    // normal install: the launchers run at HOPS_LOG_LEVEL=info,
+                    // so a clipboard that silently stopped working left no trace
+                    // at all -- reported from the rig as "copy paste is now
+                    // broken", then "now its working again", with 69 MB of log
+                    // and not one clipboard line in it.
+                    //
+                    // Debounced because a peer that is persistently unreachable
+                    // would otherwise flood; one line a minute is enough to tell
+                    // you the clipboard is dropping.
+                    Ok(Err(e)) => {
+                        crate::debounce!(
+                            PREV_CLIP_LOG,
+                            CLIP_LOG_DEBOUNCE,
+                            log::warn!("clipboard not shared with a peer: {e}")
+                        );
+                    }
                     // dropping the send future on timeout abandons a stuck
                     // open_uni/write instead of pinning the task indefinitely
-                    Err(_) => log::debug!("clipboard broadcast timed out"),
+                    Err(_) => {
+                        crate::debounce!(
+                            PREV_CLIP_LOG,
+                            CLIP_LOG_DEBOUNCE,
+                            log::warn!(
+                                "clipboard not shared with a peer: it did not accept the \
+                             text within {:?}",
+                                transport::CLIPBOARD_IO_TIMEOUT
+                            )
+                        );
+                    }
                 }
             });
         }

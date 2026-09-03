@@ -338,6 +338,14 @@ pub(crate) struct ClipboardSenderListen {
     conns: Rc<AsyncMutex<Vec<ConnEntry>>>,
 }
 
+/// One clipboard-failure line a minute is enough to tell you it is dropping,
+/// without a persistently unreachable peer flooding the log.
+const CLIP_LOG_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(60);
+thread_local! {
+    static PREV_CLIP_LOG: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
 impl ClipboardSenderListen {
     pub(crate) async fn broadcast(&self, text: String) {
         let conns: Vec<Connection> = {
@@ -354,10 +362,36 @@ impl ClipboardSenderListen {
                 .await
                 {
                     Ok(Ok(())) => {}
-                    Ok(Err(e)) => log::debug!("clipboard broadcast failed: {e}"),
+                    // WARN, not debug. Every failure here was invisible on a
+                    // normal install: the launchers run at HOPS_LOG_LEVEL=info,
+                    // so a clipboard that silently stopped working left no trace
+                    // at all -- reported from the rig as "copy paste is now
+                    // broken", then "now its working again", with 69 MB of log
+                    // and not one clipboard line in it.
+                    //
+                    // Debounced because a peer that is persistently unreachable
+                    // would otherwise flood; one line a minute is enough to tell
+                    // you the clipboard is dropping.
+                    Ok(Err(e)) => {
+                        crate::debounce!(
+                            PREV_CLIP_LOG,
+                            CLIP_LOG_DEBOUNCE,
+                            log::warn!("clipboard not shared with a peer: {e}")
+                        );
+                    }
                     // dropping the send future on timeout abandons a stuck
                     // open_uni/write instead of pinning the task indefinitely
-                    Err(_) => log::debug!("clipboard broadcast timed out"),
+                    Err(_) => {
+                        crate::debounce!(
+                            PREV_CLIP_LOG,
+                            CLIP_LOG_DEBOUNCE,
+                            log::warn!(
+                                "clipboard not shared with a peer: it did not accept the \
+                             text within {:?}",
+                                transport::CLIPBOARD_IO_TIMEOUT
+                            )
+                        );
+                    }
                 }
             });
         }
@@ -588,5 +622,69 @@ mod tests {
                  skipped FpClientVerifier"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod clipboard_failures_are_visible {
+    //! A clipboard that stops working must leave a trace.
+    //!
+    //! Both broadcast paths logged failures at `debug`, and every launcher runs
+    //! at `HOPS_LOG_LEVEL=info`. So a clipboard that silently stopped sharing
+    //! produced NOTHING in the log — reported from the rig as "copy paste is
+    //! now broken", then "now its working again", against a 69 MB daemon log
+    //! containing not one clipboard line.
+    //!
+    //! Undiagnosable is the same failure this project keeps shipping: the probe
+    //! that printed silence, the discovery section that rendered nothing, the
+    //! dot that said "fine". A transient fault you cannot see is one you cannot
+    //! fix, so the level is the fix.
+
+    fn production(src: &str) -> String {
+        let head = src.split("\n#[cfg(test)]").next().unwrap_or(src);
+        head.lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn neither_broadcast_path_hides_a_failure_at_debug() {
+        for (name, src) in [
+            ("listen.rs", production(include_str!("listen.rs"))),
+            ("connect.rs", production(include_str!("connect.rs"))),
+        ] {
+            assert!(
+                !src.contains(r#"log::debug!("clipboard broadcast"#),
+                "{name} logs a clipboard broadcast failure at debug. Every \
+                 launcher runs at info, so that is invisible — which is how a \
+                 clipboard silently stopped sharing on the rig and left no \
+                 evidence at all."
+            );
+            assert!(
+                src.contains("clipboard not shared with a peer"),
+                "{name} must WARN when the clipboard does not reach a peer"
+            );
+        }
+    }
+
+    /// Debounced, or a persistently unreachable peer floods the log — the other
+    /// way this project has hurt itself (a 69 MB log, a 4.4 GB one before that).
+    #[test]
+    fn the_warning_is_debounced() {
+        for (name, src) in [
+            ("listen.rs", production(include_str!("listen.rs"))),
+            ("connect.rs", production(include_str!("connect.rs"))),
+        ] {
+            // Two separate substrings, not one literal: rustfmt wraps the
+            // macro call across lines, and a guard that breaks on formatting
+            // gets deleted rather than fixed.
+            assert!(
+                src.contains("crate::debounce!") && src.contains("PREV_CLIP_LOG"),
+                "{name} must debounce the clipboard warning, or an unreachable \
+                 peer floods the log — the failure mode that produced a 69 MB \
+                 daemon log and a 4.4 GB keystroke log before it"
+            );
+        }
     }
 }
