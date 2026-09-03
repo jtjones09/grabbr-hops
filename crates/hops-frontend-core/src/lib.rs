@@ -318,9 +318,21 @@ impl Device {
     /// silently refused everything sent to it. `online` and `alive` are
     /// different facts about different directions (#92).
     pub fn refuses_our_input(&self) -> bool {
-        self.send
-            .as_ref()
-            .is_some_and(|s| s.state.active && !s.state.alive)
+        self.send.as_ref().is_some_and(|s| {
+            // `active_addr` is Some only while an outbound link is actually up
+            // (set on a successful dial, cleared by `disconnect`). Without it
+            // this predicate fired for a device that is merely OFFLINE, because
+            // `alive` is false until the first Pong arrives and stays false if
+            // no connection is ever made.
+            //
+            // That reintroduced the exact conflation #92 existed to remove:
+            // "up and refusing" and "not reachable" need different fixes from
+            // the user, and telling them the wrong one is worse than saying
+            // nothing. Reported from the rig within minutes of the build
+            // landing — every configured device read "not accepting input"
+            // before anything had crossed.
+            s.state.active && s.state.active_addr.is_some() && !s.state.alive
+        })
     }
 }
 
@@ -703,7 +715,13 @@ mod refusal_is_not_maskable {
     //! together is the defect.
     use super::*;
 
+    /// Connected by default — the interesting new axis is what happens when we
+    /// are NOT.
     fn dev(online: bool, active: bool, alive: bool) -> Device {
+        dev_conn(online, active, alive, true)
+    }
+
+    fn dev_conn(online: bool, active: bool, alive: bool, connected: bool) -> Device {
         Device {
             fingerprint: Some("aa:bb".into()),
             label: "peer".into(),
@@ -715,6 +733,7 @@ mod refusal_is_not_maskable {
                 state: ClientState {
                     active,
                     alive,
+                    active_addr: connected.then(|| "10.0.0.5:4242".parse().unwrap()),
                     ..Default::default()
                 },
             }),
@@ -744,6 +763,27 @@ mod refusal_is_not_maskable {
     #[test]
     fn an_inactive_device_is_not_flagged() {
         assert!(!dev(true, false, false).refuses_our_input());
+    }
+
+    /// Reported from the rig minutes after the build landed: every configured
+    /// device read "not accepting input" before anything had crossed. `alive`
+    /// is false until the first Pong, and stays false while OFFLINE — so a
+    /// predicate that ignores whether a link exists calls "unreachable"
+    /// "refusing", which is the exact conflation #92 existed to remove.
+    #[test]
+    fn an_offline_device_is_not_refusing_it_is_offline() {
+        assert!(
+            !dev_conn(false, true, false, false).refuses_our_input(),
+            "a device with no live link is OFFLINE, not refusing. Those need \
+             different fixes from the user: one is 'go turn hops on over there', \
+             the other is 'go grant it permission'."
+        );
+    }
+
+    /// And the real case still fires: link up, peer says emulation is off.
+    #[test]
+    fn a_connected_peer_that_says_no_is_still_flagged() {
+        assert!(dev_conn(true, true, false, true).refuses_our_input());
     }
 
     /// A receive-only peer has no send facet and therefore nothing to refuse.
