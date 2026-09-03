@@ -96,6 +96,12 @@ export component AppWindow inherits Window {
     // the address that actually answered our dial — the user typed one, and the
     // machine that replies is not always the one they meant (#93)
     in property <string> pairing-addr: "";
+    // Six digits derived from BOTH machines' fingerprints. The other machine
+    // shows the same number; the user's job is to check they match. A
+    // compromised console cannot make the far screen display a number of its
+    // choosing, which is the one property nothing else in this flow has
+    // (#61, #136).
+    in property <string> pairing-code: "";
 
     // `in-out` so the render_png self-review harness can open it for a look —
     // the same reason confirm-delete-handle is. A confirm state you cannot
@@ -317,6 +323,24 @@ export component AppWindow inherits Window {
                             color: Theme.c.warn;
                             font-size: Type.small;
                             font-weight: Type.semibold;
+                        }
+                        // The most important thing on the card, so it reads as
+                        // the thing to act on rather than a detail.
+                        if root.pairing-code != "": VerticalLayout {
+                            spacing: 2px;
+                            Text {
+                                text: "check this matches on the other machine";
+                                color: Theme.c.foreground;
+                                font-size: Type.caption;
+                            }
+                            Text {
+                                text: root.pairing-code;
+                                color: Theme.c.accent;
+                                font-family: Type.mono;
+                                font-size: Type.heading;
+                                font-weight: Type.bold;
+                                letter-spacing: 4px;
+                            }
                         }
                         if root.pairing-from-our-dial: Text {
                             text: "hops went looking for this device — you should only see "

@@ -282,6 +282,24 @@ pub struct Device {
     pub receive: bool,
 }
 
+impl AppModel {
+    /// The six digits to display beside a pending pairing prompt.
+    ///
+    /// Derived from **this machine's** fingerprint and the peer's, so the other
+    /// machine's prompt shows the same number. The user's job is to check they
+    /// match; a compromised console cannot make the far screen show a number of
+    /// its choosing, which is the property nothing else in the pairing flow has
+    /// (#61, #136).
+    ///
+    /// `None` until both fingerprints are known — better to show nothing than a
+    /// number that cannot be compared.
+    pub fn pending_verification_code(&self) -> Option<String> {
+        let ours = self.fingerprint.as_deref()?;
+        let theirs = self.pending_pairing.as_deref()?;
+        hops_ipc::pairing::verification_code(ours, theirs)
+    }
+}
+
 /// The hostname to store for a machine picked off the network list.
 ///
 /// mDNS advertises a host as `<instance>.local.`, and a bare `ScornMBP23` does
@@ -826,5 +844,68 @@ mod discovered_hostnames {
     fn whitespace_and_empty_are_handled() {
         assert_eq!(discovered_hostname("  rig  "), "rig.local");
         assert_eq!(discovered_hostname("   "), "");
+    }
+}
+
+#[cfg(test)]
+mod verification_code_reaches_the_prompt {
+    //! The number is worthless unless it is on the screen next to the decision.
+    //!
+    //! `hops_ipc::pairing::verification_code` can be perfect and the ceremony
+    //! still not exist — that is the shape of #92, where a correct fact was
+    //! discarded at the render step. So the model-level wiring gets its own
+    //! test, and the render site gets one in hops-slint.
+    use super::*;
+
+    const OURS: &str = "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99:\
+aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
+    const THEIRS: &str = "11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:\
+11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00";
+
+    fn model(ours: Option<&str>, pending: Option<&str>) -> AppModel {
+        let mut m = AppModel::default();
+        m.fingerprint = ours.map(String::from);
+        m.pending_pairing = pending.map(String::from);
+        m
+    }
+
+    #[test]
+    fn a_pending_prompt_has_a_code() {
+        let c = model(Some(OURS), Some(THEIRS))
+            .pending_verification_code()
+            .expect("both fingerprints known");
+        assert_eq!(c.len(), 6);
+    }
+
+    /// Both machines must show the SAME digits, which is the entire ceremony.
+    /// Here that means: swapping which fingerprint is "ours" changes nothing.
+    #[test]
+    fn the_other_machine_computes_the_same_number() {
+        assert_eq!(
+            model(Some(OURS), Some(THEIRS)).pending_verification_code(),
+            model(Some(THEIRS), Some(OURS)).pending_verification_code(),
+            "the peer's screen must show what ours does, or the user is told to \
+             reject a valid pairing"
+        );
+    }
+
+    /// Better nothing than a number that cannot be compared.
+    #[test]
+    fn no_code_until_both_ends_are_known() {
+        assert!(
+            model(None, Some(THEIRS))
+                .pending_verification_code()
+                .is_none()
+        );
+        assert!(
+            model(Some(OURS), None)
+                .pending_verification_code()
+                .is_none()
+        );
+        assert!(
+            model(Some(OURS), Some("garbage"))
+                .pending_verification_code()
+                .is_none()
+        );
     }
 }
