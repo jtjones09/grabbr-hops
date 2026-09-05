@@ -4,7 +4,7 @@ description: >-
   Write a post-compaction handoff so the next context window can resume without
   re-deriving what this one already learned. Use when the session is 70-80% full,
   when the user says "handoff" / "we're running out of context" / "compact soon",
-  or before deliberately ending a long working session. Updates nisaba first
+  or before deliberately ending a long working session. Updates the private record first
   (the permanent record), then writes HandoffSessionCompact.md (volatile working
   state). ALSO use at the START of a session when HandoffSessionCompact.md exists
   and is recent — read it before doing anything else.
@@ -33,13 +33,16 @@ If `HandoffSessionCompact.md` exists, **read it before anything else**, then:
 
 ## When invoked to WRITE a handoff
 
-### Step 1 — nisaba first, and validate rather than assume
+### Step 1 — the private record first, and validate rather than assume
 
 The permanent record lives in
-`/Users/scorndraco/Documents/GitHub/nisaba/projects/grabbr-hops/`.
+the private design-record repository. Its location is not in this repo — read it
+from `.claude/private-record.local` (gitignored; a single line holding the path).
+If that file is absent, ask rather than guessing, and do not write the path back
+into anything tracked.
 Do this BEFORE writing the handoff, so the handoff can point at it.
 
-- `git -C <nisaba> log --oneline -5` and `git status --porcelain` — is it current?
+- `git -C <private-record> log --oneline -5` and `git status --porcelain` — is it current?
 - Compare the newest `JOURNAL.md` entry date against the newest grabbr-hops
   commit date. If work has landed since the last journal entry, **write the
   entry now**.
@@ -48,9 +51,9 @@ Do this BEFORE writing the handoff, so the handoff can point at it.
 - If a previous entry was contradicted by something learned this session,
   **correct it in place with a pointer forward**. A stale record that reads as
   current is worse than no record — this project has been burned by exactly that.
-- Commit nisaba. Never leave it dirty.
+- Commit the private record. Never leave it dirty.
 
-Respect nisaba's `CLAUDE.md`: do not rename/move/delete files under `projects/`,
+Respect the private record's own `CLAUDE.md`: do not rename/move/delete files under `projects/`,
 `atoms/`, `positions/`; no new root-level dirs; do not touch root canon unless
 explicitly asked.
 
@@ -58,9 +61,9 @@ explicitly asked.
 
 If this session ran a **Workflow or subagents**, the raw per-agent output is the
 **primary source** and must be preserved verbatim. A summary is never the only
-record. Standing rule: nisaba `positions/research-folder-discipline.md`.
+record. Standing rule: the private record's research-folder discipline note.
 
-Per run, write two files into `nisaba/projects/grabbr-hops/research/`:
+Per run, write two files into its `research/` directory:
 
 - `<date>-<topic>-artifact.md` — every agent's return verbatim, all schema fields,
   with the agent→role mapping and a provenance header (runId, date, phase shape).
@@ -70,7 +73,8 @@ Per run, write two files into `nisaba/projects/grabbr-hops/research/`:
 Where they live:
 
 ```bash
-SESS=~/.claude/projects/-Users-scorndraco-Documents-GitHub-grabbr-hops/<session-id>
+# derived from the repo path, so it carries no username
+SESS=~/.claude/projects/$(pwd | tr '/.' '--')/<session-id>
 ls $SESS/subagents/workflows/wf_*/journal.jsonl   # type:"result" = verbatim returns
 ls $SESS/workflows/scripts/                       # the protocols
 ```
@@ -86,7 +90,7 @@ run's actual #1 recommendation had never been written down at all.
 **Also sweep the scratchpad**, which is genuinely volatile and dies with the session:
 
 ```bash
-ls -la /private/tmp/claude-*/-Users-scorndraco-Documents-GitHub-grabbr-hops/<session-id>/scratchpad/
+ls -la ${TMPDIR:-/tmp}/claude-*/$(pwd | tr '/.' '--')/<session-id>/scratchpad/
 ```
 
 Measured numbers die there. On 2026-08-30 the per-option dependency counts and a
@@ -120,7 +124,7 @@ Vague handoffs are worse than none because they invite re-derivation.
 
 ## TL;DR
 
-### Decisions needed from Jeremy
+### Decisions needed from the maintainer
 Numbered, one sentence each, with a recommendation. "None" if none.
 **Never drop this section** — it decays first when the news is good.
 
@@ -147,7 +151,7 @@ One paragraph: what we are in the middle of, and the immediate next action.
 - open PRs, with CI status
 - rig: which build (commit) is running on Mac / Windows / Linux, and when built
 
-## Waiting on Jeremy
+## Waiting on the maintainer
 Blocking questions, decisions, and any test only he can run. Say WHY each is blocked.
 
 ## Already tried — do not redo
@@ -156,7 +160,7 @@ reason. Include things *I* got wrong and had to retract, so they are not
 re-derived from scratch.
 
 ## Corrections made this session
-Where the record (nisaba, an issue, a code comment) was wrong and is now fixed —
+Where the record (the private record, an issue, a code comment) was wrong and is now fixed —
 and where it is still wrong and known to be.
 
 ## Landed this session
@@ -166,14 +170,14 @@ Commits/PRs merged, with issue numbers.
 Ranked, with what each needs (nothing / a machine / a decision).
 
 ## Pointers
-nisaba entries written, issues filed, memories saved.
+the private record entries written, issues filed, memories saved.
 ```
 
 ### Step 4 — keep it out of git
 
 `HandoffSessionCompact.md` is volatile working state, not project history — it
-belongs in `.gitignore`. The durable record is nisaba. If Jeremy wants it
-versioned, that is his call to make explicitly.
+belongs in `.gitignore`. The durable record is the private record. If the maintainer wants it
+versioned, that is their call to make explicitly.
 
 ## Quality bar
 
@@ -184,7 +188,7 @@ versioned, that is his call to make explicitly.
 - **Record retractions.** When a claim was made and withdrawn, write down the
   withdrawal. Otherwise the next window re-derives the wrong answer.
 - **Prefer "unverified" over a confident guess.** Mark anything not measured.
-- **The TL;DR has four headings and the CX/UX one is not optional.** Jeremy is
+- **The TL;DR has four headings and the CX/UX one is not optional.** the maintainer is
   building a product; a list of green PRs does not answer "what am I getting."
   He has caught this format decaying mid-session — check all four are present
   before sending.
