@@ -73,7 +73,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p hops-ipc -p hops-frontend-core
+      # Was `-p hops-ipc -p hops-frontend-core`, which ran 121 of 166 tests. The
+      # hops-slint guards — the sole evidence for four merged PRs — had never
+      # executed in CI. A guard that does not run is a comment.
+      - run: cargo test --workspace --all-targets
 
   # hops commits to NOT reading raw input devices on Linux. Capture is
   # portal-mediated (xdg-desktop-portal InputCapture / libei), which is
@@ -100,13 +103,21 @@ jobs:
             exit 1
           fi
           echo "OK: no raw input-device access."
-      - name: the installer must not tell users to grant one
+      # This checked install.sh alone and passed for months while the same
+      # instruction sat in service/README.md and service/hops-headless.service.
+      # A guard scoped to one file cannot prove a claim about the project.
+      - name: nothing shipped may tell users to grant one
         run: |
-          if grep -nE 'usermod .*-aG .*input|gpasswd .*input' install.sh ; then
-            echo "::error::install.sh must not instruct users into the input group."
+          if grep -rnE 'usermod .*-aG .*input|gpasswd .*input' \
+               --include='*.sh' --include='*.md' --include='*.service' \
+               --include='*.ps1' --include='*.plist' --include='*.yml' \
+               . --exclude-dir=target --exclude-dir=.git --exclude-dir=.github ; then
+            echo "::error::nothing shipped may instruct users into the input group."
+            echo "hops has no uinput backend; that grant is system-wide keystroke"
+            echo "read access in exchange for a capability this code does not have."
             exit 1
           fi
-          echo "OK: installer grants no input-group membership."
+          echo "OK: nothing instructs input-group membership."
 
   # A build script runs on the HOST. `cfg!(unix)` / `cfg!(target_os = ...)` inside
   # one therefore describes the build machine, not the target — which silently

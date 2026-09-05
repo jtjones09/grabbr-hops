@@ -41,8 +41,6 @@ systemctl --user enable --now hops-headless.service
 # start at boot without an interactive login (the point of a server):
 sudo loginctl enable-linger "$USER"
 
-# let the daemon inject input via /dev/uinput without running as root:
-sudo usermod -aG input "$USER"      # then re-login
 ```
 
 ### macOS
