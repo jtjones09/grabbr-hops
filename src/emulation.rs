@@ -217,11 +217,66 @@ struct ListenTask {
     event_tx: Sender<EmulationEvent>,
 }
 
+/// Suppresses repeat approval prompts for a fingerprint that keeps dialling,
+/// without letting the memory that does the suppressing grow without bound.
+///
+/// This was a bare `HashMap` local to the listen task, inserted into and never
+/// removed from, so it lived for the life of the daemon. Anyone on the network
+/// can add to it: dial with a self-signed certificate we do not know, get
+/// rejected, and a fingerprint is recorded. A peer generating a fresh key per
+/// dial produces a fresh entry per dial — measured at 120 distinct fingerprints
+/// per second from one host, roughly 432,000 permanent entries an hour, in the
+/// highest-privilege daemon on the machine.
+///
+/// Entries exist only to answer "did this exact fingerprint dial within the
+/// suppression window", so an entry older than that window has no reader and is
+/// simply dropped.
+struct RecentRejections {
+    seen: HashMap<String, Instant>,
+}
+
+impl RecentRejections {
+    /// How long a fingerprint stays suppressed after it raises a prompt.
+    const WINDOW: Duration = Duration::from_secs(2);
+
+    /// Prune once the map is larger than a real fleet could explain. Chosen so
+    /// pruning is rare in normal use and cheap when an attacker forces it.
+    const PRUNE_AT: usize = 256;
+
+    fn new() -> Self {
+        Self {
+            seen: HashMap::new(),
+        }
+    }
+
+    /// True if this rejection should raise a prompt.
+    fn should_notify(&mut self, fingerprint: &str) -> bool {
+        let now = Instant::now();
+
+        if self.seen.len() >= Self::PRUNE_AT {
+            self.seen
+                .retain(|_, first_seen| now.duration_since(*first_seen) < Self::WINDOW);
+            // Everything still here is inside the window, which means a flood of
+            // distinct fingerprints rather than a fleet. Drop it: the cost is a
+            // repeated prompt for a peer that dialled seconds ago, and the
+            // alternative is unbounded growth driven by a stranger.
+            if self.seen.len() >= Self::PRUNE_AT {
+                self.seen.clear();
+            }
+        }
+
+        match self.seen.insert(fingerprint.to_owned(), now) {
+            None => true,
+            Some(previous) => now.duration_since(previous) >= Self::WINDOW,
+        }
+    }
+}
+
 impl ListenTask {
     async fn run(mut self) {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         let mut last_response = HashMap::new();
-        let mut rejected_connections = HashMap::new();
+        let mut rejected_connections = RecentRejections::new();
         let mut absmotion = AbsMotionReconstructor::default();
         loop {
             select! {
@@ -297,10 +352,9 @@ impl ListenTask {
                         self.event_tx.send(EmulationEvent::Connected { addr, fingerprint }).expect("channel closed");
                     }
                     Some(ListenEvent::Rejected { fingerprint }) => {
-                        if rejected_connections.insert(fingerprint.clone(), Instant::now())
-                            .is_none_or(|i| i.elapsed() >= Duration::from_secs(2)) {
-                                self.event_tx.send(EmulationEvent::ConnectionAttempt { fingerprint }).expect("channel closed");
-                            }
+                        if rejected_connections.should_notify(&fingerprint) {
+                            self.event_tx.send(EmulationEvent::ConnectionAttempt { fingerprint }).expect("channel closed");
+                        }
                     }
                     None => break
                 }}
@@ -733,6 +787,46 @@ mod tests {
             dx: 1.0,
             dy: 0.0,
         })
+    }
+
+    /// Remote unauthenticated memory growth.
+    ///
+    /// The suppression map was insert-only and lived for the life of the
+    /// daemon, so a peer generating a fresh self-signed certificate per dial
+    /// added a permanent entry per dial — measured at 120 distinct fingerprints
+    /// per second from one host. Remove the pruning in `should_notify` and this
+    /// fails with one entry per distinct fingerprint offered.
+    #[test]
+    fn a_flood_of_unknown_fingerprints_cannot_grow_memory_without_bound() {
+        let mut recent = RecentRejections::new();
+        for i in 0..50_000u32 {
+            // A fresh key per dial, which is what defeats a per-fingerprint
+            // suppression window and what an attacker actually does.
+            recent.should_notify(&format!("fp-{i:08x}"));
+        }
+        assert!(
+            recent.seen.len() < RecentRejections::PRUNE_AT * 2,
+            "50,000 distinct dials left {} entries resident — an unauthenticated \
+             peer can still drive unbounded growth in the daemon holding the \
+             private key",
+            recent.seen.len()
+        );
+    }
+
+    /// The bound must not cost the thing the map exists to do.
+    #[test]
+    fn a_peer_retrying_in_a_loop_still_raises_only_one_prompt() {
+        let mut recent = RecentRejections::new();
+        assert!(
+            recent.should_notify("aa:bb:cc"),
+            "the first sighting of a fingerprint must raise a prompt"
+        );
+        for _ in 0..10_000 {
+            assert!(
+                !recent.should_notify("aa:bb:cc"),
+                "a peer retrying inside the window must not raise a second prompt"
+            );
+        }
     }
 
     /// Denial of revocation by injection.
