@@ -153,6 +153,14 @@ pub struct FpClientVerifier {
     attempts: Arc<Mutex<VecDeque<String>>>,
 }
 
+/// How many distinct unknown fingerprints may await a prompt at once.
+///
+/// Anyone on the network can add to this queue by dialling with a certificate
+/// we do not recognise, before any authorization has happened. The bound is
+/// what stops that from being unbounded memory growth driven by a stranger.
+/// Well past any real fleet, small enough that the flood costs nothing.
+const MAX_PENDING_ATTEMPTS: usize = 32;
+
 impl FpClientVerifier {
     pub fn new(authorized: Authorized, attempts: Arc<Mutex<VecDeque<String>>>) -> Self {
         Self {
@@ -191,7 +199,25 @@ impl ClientCertVerifier for FpClientVerifier {
         {
             Ok(ClientCertVerified::assertion())
         } else {
-            self.attempts.lock().expect("lock").push_back(fingerprint);
+            // Bounded and deduplicated. This queue is the only channel from
+            // the TLS verifier to the accept loop, and it is filled by anyone
+            // on the network who dials with a certificate we do not know —
+            // before any authorization. Unbounded, a stranger retrying in a
+            // loop grows it without limit; duplicated, one stranger produces a
+            // thousand identical prompts.
+            //
+            // rustls gives a client-certificate verifier the certificate and
+            // nothing else — no address, no connection handle — so this cannot
+            // be keyed by connection. The fingerprint is the whole of what the
+            // event carries, which is why a set, not a queue of one per dial,
+            // is the honest shape.
+            let mut attempts = self.attempts.lock().expect("lock");
+            if !attempts.contains(&fingerprint) {
+                if attempts.len() >= MAX_PENDING_ATTEMPTS {
+                    attempts.pop_front();
+                }
+                attempts.push_back(fingerprint);
+            }
             Err(TlsError::General(
                 "sender fingerprint not authorized".into(),
             ))
