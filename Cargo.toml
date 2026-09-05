@@ -88,7 +88,21 @@ time = "0.3"
 notify = "8.2.0"
 if-addrs = "0.13"
 hostname = "0.4"
-mdns-sd = "0.21"
+# 0.21.2 is a FLOOR, not a preference. 0.21.1 panics on a truncated HINFO record
+# whose RDLENGTH runs to the packet boundary (dns_parser.rs:2659, unchecked
+# `self.data[self.offset]`). Every datagram on the mDNS socket reaches that
+# parser before any handshake, and the release profile sets `panic = "abort"`,
+# so a 23-byte packet from any LAN host is a remote unauthenticated daemon kill.
+# Reproduced against published 0.21.1; clean on 0.21.2. See tests/mdns_parser_fuzz.rs.
+mdns-sd = "0.21.2"
+
+[dev-dependencies]
+# `fuzz_api` is #[doc(hidden)] and upstream calls it "not part of the public
+# API" — acceptable for a test, never for shipping code. It exists because
+# `dns_parser` is crate-private, and it is the only way to reach the one parser
+# an unauthenticated LAN host can drive. If upstream removes it the dev-build
+# breaks loudly, which is the correct failure for a test dependency.
+mdns-sd = { version = "0.21.2", features = ["unstable-fuzz-api"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.148"
