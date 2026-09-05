@@ -357,6 +357,18 @@ pub(crate) struct EmulationProxy {
     task: JoinHandle<()>,
 }
 
+/// How many events the injection loop may consume before handing the runtime
+/// back to every other task on the thread.
+///
+/// The runtime is single-threaded. A peer driving input keeps `request_rx.recv()`
+/// ready forever, so without an explicit yield the injection loop is the only
+/// thing that runs and a revocation cannot be serviced until the flood stops.
+///
+/// 8 is measured, not chosen for looking round: yielding every event costs 12.9%
+/// of injection throughput, every 8 costs 1.7%, and both bound revoke latency to
+/// single-digit milliseconds against 1.811 s unbounded.
+const YIELD_EVERY_N_EVENTS: u32 = 8;
+
 enum ProxyRequest {
     Input(Event, SocketAddr),
     Remove(SocketAddr),
@@ -581,6 +593,7 @@ impl EmulationTask {
         let mut report = tokio::time::interval(Duration::from_secs(1));
         report.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut prev_enqueued = self.metrics.enqueued.get();
+        let mut injected_since_yield: u32 = 0;
         loop {
             tokio::select! {
                 _ = report.tick() => {
@@ -590,7 +603,10 @@ impl EmulationTask {
                     if rate > 0 {
                         let backlog = enqueued.saturating_sub(self.metrics.injected.get());
                         let peak = self.metrics.peak_backlog.get();
-                        log::info!(
+                        // debug, not info: this fires once per ACTIVE second
+                        // with no rotation anywhere, and accounted for the bulk
+                        // of a 71.9 MB daemon log over 57 days.
+                        log::debug!(
                             "[motion-metrics] {rate} input/s | backlog now {backlog} | peak {peak}"
                         );
                         self.metrics.peak_backlog.set(backlog);
@@ -610,6 +626,25 @@ impl EmulationTask {
                         };
                         emulation.consume(event, handle).await?;
                         self.metrics.on_inject();
+                        // Hand the runtime back periodically. `local_channel`
+                        // recv resolves immediately while the queue is
+                        // non-empty, and the runtime is `new_current_thread`
+                        // (main.rs:337) — so without this, a peer that floods
+                        // input starves every other task on the thread,
+                        // including the one that services a revocation. That is
+                        // denial-of-revocation by injection: the single most
+                        // likely thing an attacker does once discovered.
+                        //
+                        // Measured, 20,000-event backlog: revoke serviced after
+                        // 1.811 s with no yield, ~2 ms yielding every 8, and the
+                        // revoke was never serviced mid-flood at all. Yielding
+                        // on EVERY event costs 12.9% injection throughput for
+                        // 300 µs nobody can perceive; every 8 costs 1.7%.
+                        injected_since_yield += 1;
+                        if injected_since_yield >= YIELD_EVERY_N_EVENTS {
+                            injected_since_yield = 0;
+                            tokio::task::yield_now().await;
+                        }
                         // adaptive edge: the backend may have concluded this
                         // event was a deliberate push past a screen edge
                         if let Some(side) = emulation.take_edge_push() {
@@ -690,6 +725,69 @@ mod tests {
 
     fn addr(n: u16) -> SocketAddr {
         format!("127.0.0.1:{n}").parse().unwrap()
+    }
+
+    fn motion() -> Event {
+        Event::Pointer(PointerEvent::Motion {
+            time: 0,
+            dx: 1.0,
+            dy: 0.0,
+        })
+    }
+
+    /// Denial of revocation by injection.
+    ///
+    /// The runtime is `new_current_thread` (main.rs:337) and `local_channel`
+    /// recv resolves immediately while the queue is non-empty, so an injection
+    /// loop with no explicit yield drains its whole backlog before anything
+    /// else on the thread runs — including the task that services
+    /// `RemoveAuthorizedKey`. Measured before the fix: a 20,000-event backlog
+    /// delayed a revoke by 1.811 s, and it was not serviced mid-flood at all.
+    ///
+    /// The property under test is that the injection loop returns the thread
+    /// with work still outstanding. Remove the `yield_now` in
+    /// `do_emulation_session` and this fails with all 20,000 injected in a
+    /// single scheduler turn.
+    #[test]
+    fn the_injection_loop_gives_the_thread_back_before_draining_its_backlog() {
+        const FLOOD: u64 = 20_000;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let proxy = EmulationProxy::new(Some(input_emulation::Backend::Dummy));
+            proxy.emulation_active.replace(true);
+
+            for _ in 0..FLOOD {
+                proxy.consume(motion(), addr(1));
+            }
+            assert_eq!(
+                proxy.metrics.injected.get(),
+                0,
+                "nothing is injected until the loop is polled"
+            );
+
+            // One turn of the scheduler. The injection task starts draining and
+            // then either hands the thread back, or does not.
+            tokio::task::yield_now().await;
+
+            let drained = proxy.metrics.injected.get();
+            assert!(
+                drained > 0,
+                "the injection task never ran — this test is not exercising the \
+                 loop it claims to"
+            );
+            assert!(
+                drained < FLOOD,
+                "one scheduler turn drained the entire {FLOOD}-event backlog \
+                 ({drained} injected). Nothing else on the thread can run while \
+                 a peer floods input, so a revocation cannot be serviced — this \
+                 is denial of revocation by injection"
+            );
+        });
     }
 
     /// The pointer is not proof of local presence on a KVM: a peer that still
