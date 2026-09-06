@@ -164,6 +164,32 @@ const _: () = assert!(DEFAULT_TERM_SECS <= MAX_TERM_SECS);
 /// outage rather than explain it.
 pub const RENEW_WINDOW_SECS: u64 = 14 * 86_400;
 
+/// How long a removed or lapsed device keeps its NAME on file.
+///
+/// Enforcing a removal needs the fingerprint and nothing else. A fingerprint is
+/// public — this machine multicasts its own in every mDNS announcement — so
+/// retaining one leaks nothing. The label does not have that property: it is the
+/// user's own name for their own machine, and a store that keeps every label
+/// forever is an inventory of every device the user has ever paired, with their
+/// names for them and the dates each relationship began and ended, in a file
+/// readable by anything running as that user.
+///
+/// That inventory buys one thing: the interface can say "you removed *living
+/// room* in March" rather than showing bare hex. Worth keeping while the user
+/// might still act on it, not worth keeping for the life of the installation.
+///
+/// After this window the name is dropped and the fingerprint stays, so the
+/// removal keeps biting and the archive stops growing.
+pub const NAME_RETENTION_SECS: u64 = 180 * 86_400;
+
+/// How long a LAPSED lease — expired, never removed — is kept at all.
+///
+/// A lapsed lease grants nothing, and re-adding the device is the same flow as
+/// adding it for the first time. Nothing depends on the record, so it is dropped
+/// whole rather than redacted. A removal is never dropped: that record is what
+/// stops a restored backup re-granting an expelled device.
+pub const LAPSED_RETENTION_SECS: u64 = 90 * 86_400;
+
 // ---------------------------------------------------------------------------
 // fingerprints
 // ---------------------------------------------------------------------------
@@ -954,6 +980,53 @@ impl TrustStore {
     ///
     /// Each lease is reported once, because the window is `(old floor, reading]`
     /// and the floor only climbs.
+    /// Drops what the store no longer needs to answer its own questions.
+    ///
+    /// Two different rules, because the two records are not the same kind of
+    /// thing. A lapsed lease grants nothing and nothing depends on it, so it
+    /// goes whole. A removal is load-bearing forever — it is what stops a
+    /// restored backup re-granting an expelled device — so the fingerprint
+    /// stays and only the user's name for the machine is dropped.
+    ///
+    /// Returns how many records were redacted and how many were dropped, so the
+    /// caller can decide whether the store is worth rewriting.
+    pub fn forget_stale_names(&mut self, reading: u64) -> (usize, usize) {
+        let now = self.clock.observe(reading);
+        let mut redacted = 0;
+        let mut dropped = 0;
+
+        self.entries.retain(|_, e| {
+            // A lapsed lease with no removal beside it: nothing refers to it.
+            if let (Some(l), None) = (e.lease.as_ref(), e.denial.as_ref()) {
+                if l.not_after <= now.saturating_sub(LAPSED_RETENTION_SECS) {
+                    dropped += 1;
+                    return false;
+                }
+            }
+            true
+        });
+
+        for e in self.entries.values_mut() {
+            if let Some(d) = e.denial.as_mut() {
+                if !d.label.is_empty() && d.at <= now.saturating_sub(NAME_RETENTION_SECS) {
+                    d.label.clear();
+                    redacted += 1;
+                }
+            }
+            if let Some(l) = e.lease.as_mut() {
+                if !l.label.is_empty()
+                    && l.not_after <= now.saturating_sub(NAME_RETENTION_SECS)
+                    && !l.is_valid_at(now)
+                {
+                    l.label.clear();
+                    redacted += 1;
+                }
+            }
+        }
+
+        (redacted, dropped)
+    }
+
     pub fn sweep(&mut self, reading: u64) -> Vec<Lease> {
         let since = self.clock.floor();
         let now = self.clock.observe(reading);
@@ -1205,6 +1278,93 @@ mod tests {
             !s.we_may_drive(&peer),
             "the same peer must NOT become one we may drive — that grant was \
              never made"
+        );
+    }
+
+    /// A removal must keep biting forever. The user's NAME for the machine
+    /// must not.
+    ///
+    /// The fingerprint is public — this machine multicasts its own in every
+    /// mDNS announcement — so keeping one leaks nothing. The label is the
+    /// user's own name for their own machine, and keeping every label forever
+    /// turns the store into an inventory of every device ever paired.
+    #[test]
+    fn an_old_removal_keeps_biting_after_its_name_is_forgotten() {
+        let mut s = store();
+        let gone = fp(0x31);
+        s.issue(&gone, "living room", Caps::INBOUND, DAY)
+            .expect("issue");
+        s.revoke(&gone);
+
+        let far_future = s.now() + NAME_RETENTION_SECS + DAY;
+        let (redacted, dropped) = s.forget_stale_names(far_future);
+        assert_eq!(
+            (redacted, dropped),
+            (2, 0),
+            "both names go — a removal keeps the lease beside it so `restore` \
+             can bring it back, and the lease carries the same name — but \
+             nothing is dropped"
+        );
+
+        assert!(
+            s.denial(&gone).is_some(),
+            "the removal itself must survive — it is what stops a restored \
+             backup re-granting an expelled device"
+        );
+        assert_eq!(
+            s.denial(&gone).map(|d| d.label.as_str()),
+            Some(""),
+            "the user's name for the machine is gone"
+        );
+        assert_eq!(
+            s.entries()
+                .find(|(k, _)| *k == gone)
+                .and_then(|(_, e)| e.lease.as_ref())
+                .map(|l| l.label.as_str()),
+            Some(""),
+            "the copy kept for restore must not survive as the inventory the \
+             redaction exists to remove"
+        );
+        assert!(!s.may_drive_us(&gone), "and it still permits nothing");
+    }
+
+    /// A lapsed lease grants nothing and nothing refers to it, so it goes whole
+    /// rather than lingering as a redacted row.
+    #[test]
+    fn a_long_lapsed_lease_is_dropped_rather_than_kept_as_an_empty_row() {
+        let mut s = store();
+        let old = fp(0x32);
+        s.issue(&old, "old laptop", Caps::INBOUND, DAY)
+            .expect("issue");
+
+        let far_future = s.now() + LAPSED_RETENTION_SECS + DAY;
+        let (_, dropped) = s.forget_stale_names(far_future);
+        assert_eq!(dropped, 1);
+        assert!(
+            !s.entries().any(|(k, _)| k == old),
+            "nothing depends on a lapsed lease"
+        );
+    }
+
+    /// The pass must never touch a device that is still working.
+    #[test]
+    fn a_live_lease_keeps_its_name_however_old_the_store_is() {
+        let mut s = store();
+        let live = fp(0x33);
+        s.issue(&live, "desk mac", Caps::INBOUND, MAX_TERM_SECS)
+            .expect("issue");
+
+        let later = s.now() + NAME_RETENTION_SECS + DAY;
+        let (redacted, dropped) = s.forget_stale_names(later);
+        assert_eq!((redacted, dropped), (0, 0));
+        assert!(s.may_drive_us(&live));
+        assert_eq!(
+            s.entries()
+                .find(|(k, _)| *k == live)
+                .and_then(|(_, e)| e.lease.as_ref())
+                .map(|l| l.label.as_str()),
+            Some("desk mac"),
+            "a machine still in use keeps its name"
         );
     }
 
