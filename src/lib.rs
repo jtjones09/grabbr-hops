@@ -1,3 +1,4 @@
+pub mod authority;
 mod capture;
 pub mod capture_test;
 pub mod client;
@@ -13,6 +14,8 @@ mod hop_log;
 mod listen;
 pub mod service;
 mod transport;
+pub mod trust;
+pub mod trust_file;
 
 #[cfg(test)]
 mod toolchain_pin {

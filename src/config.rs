@@ -483,7 +483,7 @@ fn harden_existing(_config_dir: &Path, _config_path: &Path) {}
 /// is always the same one. A reader sees the whole old file or the whole new one,
 /// never a truncated one. The temp inherits [`create_private`]'s `0600`, so the
 /// contents are never briefly world-readable either.
-fn write_atomically(path: &Path, contents: &[u8]) -> Result<(), io::Error> {
+pub(crate) fn write_atomically(path: &Path, contents: &[u8]) -> Result<(), io::Error> {
     let tmp = path.with_extension("toml.tmp");
     {
         let mut f = create_private(&tmp)?;
