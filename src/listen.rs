@@ -19,7 +19,7 @@ use tokio::{
 };
 
 use crate::crypto::Identity;
-use crate::transport::{self, Authorized, FpClientVerifier};
+use crate::transport::{self, FpClientVerifier, Trust};
 
 const KEEP_ALIVE: Duration = Duration::from_secs(8);
 const MAX_IDLE: Duration = Duration::from_secs(20);
@@ -68,10 +68,10 @@ pub(crate) struct LanMouseListener {
 
 fn server_config(
     identity: &Identity,
-    authorized: Authorized,
+    trust: Trust,
     attempts: Arc<StdMutex<VecDeque<String>>>,
 ) -> Result<quinn::ServerConfig, ListenerCreationError> {
-    let verifier = Arc::new(FpClientVerifier::new(authorized, attempts));
+    let verifier = Arc::new(FpClientVerifier::new(trust, attempts));
     let mut crypto = rustls::ServerConfig::builder()
         .with_client_cert_verifier(verifier)
         .with_single_cert(vec![identity.cert.clone()], identity.key.clone_key())?;
@@ -109,7 +109,7 @@ impl LanMouseListener {
     pub(crate) async fn new(
         port: u16,
         identity: Arc<Identity>,
-        authorized: Authorized,
+        trust: Trust,
         clipboard_in: Sender<String>,
     ) -> Result<Self, ListenerCreationError> {
         transport::install_crypto_provider();
@@ -118,7 +118,7 @@ impl LanMouseListener {
         let (port_changed_tx, port_changed) = channel();
         let attempts: Arc<StdMutex<VecDeque<String>>> = Default::default();
 
-        let cfg = server_config(&identity, authorized.clone(), attempts.clone())?;
+        let cfg = server_config(&identity, trust.clone(), attempts.clone())?;
         let listen_addr = SocketAddr::new("0.0.0.0".parse().expect("invalid ip"), port);
         let mut endpoint = Endpoint::server(cfg, listen_addr)?;
 
@@ -128,7 +128,7 @@ impl LanMouseListener {
         let listen_task: JoinHandle<()> = {
             let listen_tx = listen_tx.clone();
             let attempts = attempts.clone();
-            let authorized_accept = authorized.clone();
+            let authorized_accept = trust.clone();
             spawn_local(async move {
                 loop {
                     tokio::select! {
@@ -140,7 +140,7 @@ impl LanMouseListener {
                             let listen_tx = listen_tx.clone();
                             let attempts = attempts.clone();
                             let clipboard_in = clipboard_in.clone();
-                            let authorized = authorized_accept.clone();
+                            let trust = authorized_accept.clone();
                             spawn_local(async move {
                                 let remote = incoming.remote_address();
                                 match incoming.await {
@@ -161,13 +161,17 @@ impl LanMouseListener {
                                             conn.close(0u32.into(), b"unauthorized");
                                             return;
                                         };
-                                        if !authorized
+                                        // The receiver's question. A lease that
+                                        // lapsed between the TLS check and here
+                                        // is refused, which is why the check is
+                                        // repeated rather than assumed.
+                                        if !trust
                                             .read()
                                             .expect("lock")
-                                            .contains_key(&fingerprint)
+                                            .may_drive_us(&fingerprint)
                                         {
                                             log::warn!(
-                                                "{addr}: rejecting {fingerprint} — not authorized"
+                                                "{addr}: rejecting {fingerprint} — no live lease permits it to drive this machine"
                                             );
                                             conn.close(0u32.into(), b"unauthorized");
                                             let _ = listen_tx
@@ -207,7 +211,7 @@ impl LanMouseListener {
                             let listen_addr = SocketAddr::new("0.0.0.0".parse().expect("invalid ip"), port);
                             // A dropped port_changed receiver (requester gone) must NOT panic
                             // this long-running accept loop — ignore the send result instead.
-                            match server_config(&identity, authorized.clone(), attempts.clone()) {
+                            match server_config(&identity, trust.clone(), attempts.clone()) {
                                 Ok(cfg) => match Endpoint::server(cfg, listen_addr) {
                                     Ok(new_endpoint) => {
                                         endpoint.close(0u32.into(), b"port change");
@@ -496,7 +500,7 @@ mod tests {
     use crate::crypto::Identity;
     use crate::transport::FpServerVerifier;
     use quinn::{ClientConfig, Endpoint};
-    use std::collections::HashMap;
+
     use std::sync::RwLock;
 
     fn identity() -> Identity {
@@ -514,18 +518,45 @@ mod tests {
         }
     }
 
-    fn allow(fps: &[&str]) -> Authorized {
-        Arc::new(RwLock::new(
-            fps.iter()
-                .map(|f| ((*f).to_string(), "peer".to_string()))
-                .collect::<HashMap<_, _>>(),
-        ))
+    /// A store granting each fingerprint the INBOUND half only — which is what
+    /// a receiver's allowlist ever meant.
+    fn allow(us: &str, fps: &[&str]) -> Trust {
+        let mut store = crate::trust::TrustStore::new(us, 0).expect("our fingerprint");
+        for f in fps {
+            store
+                .issue(
+                    f,
+                    "peer",
+                    crate::trust::Caps::INBOUND,
+                    crate::trust::DEFAULT_TERM_SECS,
+                )
+                .expect("issue");
+        }
+        Arc::new(RwLock::new(store))
+    }
+
+    /// The mirror of [`allow`] for the dialling side: we may drive these peers.
+    /// Two helpers rather than one, because the whole point of the store is
+    /// that these are different grants.
+    fn permit_drive(us: &str, fps: &[&str]) -> Trust {
+        let mut store = crate::trust::TrustStore::new(us, 0).expect("our fingerprint");
+        for f in fps {
+            store
+                .issue(
+                    f,
+                    "peer",
+                    crate::trust::Caps::OUTBOUND,
+                    crate::trust::DEFAULT_TERM_SECS,
+                )
+                .expect("issue");
+        }
+        Arc::new(RwLock::new(store))
     }
 
     /// One client config, reused across dials — this is what makes the test
     /// meaningful: rustls caches session tickets per ClientConfig, so the second
     /// dial offers a PSK and would RESUME if the server allowed it.
-    fn client_config(client: &Identity, trusts: Authorized) -> ClientConfig {
+    fn client_config(client: &Identity, trusts: Trust) -> ClientConfig {
         let observed = Arc::new(StdMutex::new(None));
         let verifier = Arc::new(FpServerVerifier::new(trusts, observed));
         let mut crypto = rustls::ClientConfig::builder()
@@ -580,9 +611,9 @@ mod tests {
             let server_fp = transport::fingerprint_of(&server.cert);
 
             // server trusts the client (as if just approved)
-            let authorized = allow(&[&client_fp]);
+            let trust = allow(&server_fp, &[&client_fp]);
             let attempts: Arc<StdMutex<VecDeque<String>>> = Default::default();
-            let cfg = server_config(&server, authorized.clone(), attempts).expect("server config");
+            let cfg = server_config(&server, trust.clone(), attempts).expect("server config");
             let listen_addr: SocketAddr = "127.0.0.1:0".parse().expect("addr");
             let server_ep = Endpoint::server(cfg, listen_addr).expect("endpoint");
             let addr = server_ep.local_addr().expect("local addr");
@@ -604,15 +635,18 @@ mod tests {
             // ONE endpoint + config for both dials, so a ticket can be cached
             let mut client_ep =
                 Endpoint::client("127.0.0.1:0".parse().expect("addr")).expect("client endpoint");
-            client_ep.set_default_client_config(client_config(&client, allow(&[&server_fp])));
+            client_ep.set_default_client_config(client_config(
+                &client,
+                permit_drive(&client_fp, &[&server_fp]),
+            ));
 
             assert!(
                 dials_ok(&client_ep, addr).await,
-                "an authorized peer must be admitted"
+                "an trust peer must be admitted"
             );
 
             // revoke — exactly what remove_authorized_key does to the shared map
-            authorized.write().expect("lock").remove(&client_fp);
+            trust.write().expect("lock").revoke(&client_fp);
 
             assert!(
                 !dials_ok(&client_ep, addr).await,

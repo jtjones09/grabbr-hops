@@ -79,6 +79,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::trust::{Caps, Denial, Lease, Origin, TrustError, TrustStore};
+
 use hops_ipc::RevokedEntry;
 use hops_ipc::pairing::{canonical_fingerprint, sanitize_label};
 
@@ -212,8 +214,9 @@ pub enum DiskOrigin {
     OutboundDial,
     /// Carried forward from `[authorized_fingerprints]` by [`migrate`].
     Migrated,
-    /// The user restored a previously revoked device.
-    Restored,
+    // No `Restored`. An expelled fingerprint is never re-authorised — the
+    // machine returns by generating a new identity, which arrives as `Inbound`
+    // or `OutboundDial` like any other first contact.
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -824,6 +827,133 @@ pub struct Migration {
 /// The number is only half of it. Expiry must never be silent, which is why
 /// [`LeaseRecord::is_expiring`] exists, and why a lapsed lease keeps its record,
 /// its label and its capabilities so it can be renewed rather than rebuilt.
+/// Rebuilds the in-memory store from the records on disk.
+///
+/// The disk and memory shapes are deliberately different. On disk a record is a
+/// flat row with a state and a capability list, because that is what survives a
+/// hand-edit legibly and what a signature covers. In memory a lease is a thing
+/// with a validity window that answers questions. This is the one place they
+/// meet, so a mismatch shows up here rather than as a peer that mysteriously
+/// cannot connect.
+///
+/// A record that cannot be admitted is REPORTED, never dropped silently — the
+/// caller logs it. Silently dropping a row is how a device loses trust with no
+/// explanation, which is the failure this whole rework exists to remove.
+pub fn rebuild(
+    ours: &str,
+    floor: u64,
+    records: &[LeaseRecord],
+) -> Result<(TrustStore, Vec<String>), TrustError> {
+    let mut store = TrustStore::new(ours, floor)?;
+    let mut refused = Vec::new();
+
+    for r in records {
+        match r.state {
+            // A revocation is a record, not a grant. It goes in first and
+            // nothing later can lift it — `admit` refuses an expelled
+            // fingerprint outright.
+            DiskState::Revoked => {
+                store.admit_denial(
+                    &r.fingerprint,
+                    Denial {
+                        label: r.label.clone(),
+                        at: r.revoked_at.unwrap_or(r.issued_at),
+                    },
+                );
+            }
+            DiskState::Active => {
+                let mut caps = Caps::NONE;
+                for c in &r.caps {
+                    caps = caps
+                        | match c {
+                            DiskCap::Inbound => Caps::INBOUND,
+                            DiskCap::Outbound => Caps::OUTBOUND,
+                        };
+                }
+                let Some(not_after) = r.expires_at else {
+                    refused.push(format!(
+                        "{}: an active lease with no expiry — refused, because a \
+                         lease that never lapses is the grant this replaced",
+                        r.fingerprint
+                    ));
+                    continue;
+                };
+                let lease = Lease {
+                    peer: r.fingerprint.clone(),
+                    issued_to: ours.to_string(),
+                    label: r.label.clone(),
+                    caps,
+                    origin: match r.origin {
+                        DiskOrigin::Inbound => Origin::Inbound,
+                        DiskOrigin::OutboundDial => Origin::OutboundDial,
+                        DiskOrigin::Migrated => Origin::Migrated,
+                    },
+                    issued_at: r.issued_at,
+                    not_after,
+                };
+                if let Err(e) = store.admit(lease) {
+                    refused.push(format!("{}: {e}", r.fingerprint));
+                }
+            }
+        }
+    }
+
+    Ok((store, refused))
+}
+
+/// The store, flattened back to the rows that go on disk.
+///
+/// The inverse of [`rebuild`], and the pair must round-trip: a store written and
+/// read back has to answer every question identically, or a device silently
+/// loses trust across a restart. That round trip is tested.
+pub fn records_of(store: &TrustStore) -> Vec<LeaseRecord> {
+    let mut out: Vec<LeaseRecord> = Vec::new();
+    for (fp, e) in store.entries() {
+        // The expulsion, if there is one. It is a record, not a grant: no
+        // capabilities, and it does not lapse.
+        if let Some(d) = e.denial.as_ref() {
+            out.push(LeaseRecord {
+                fingerprint: fp.to_string(),
+                label: d.label.clone(),
+                state: DiskState::Revoked,
+                origin: DiskOrigin::Migrated,
+                issued_at: d.at,
+                expires_at: None,
+                revoked_at: Some(d.at),
+                caps: Vec::new(),
+            });
+            continue;
+        }
+        if let Some(l) = e.lease.as_ref() {
+            let mut caps = Vec::new();
+            if l.caps.contains(Caps::DRIVE_ME) {
+                caps.push(DiskCap::Inbound);
+            }
+            if l.caps.contains(Caps::I_MAY_DRIVE) {
+                caps.push(DiskCap::Outbound);
+            }
+            out.push(LeaseRecord {
+                fingerprint: fp.to_string(),
+                label: l.label.clone(),
+                state: DiskState::Active,
+                origin: match l.origin {
+                    Origin::Inbound => DiskOrigin::Inbound,
+                    Origin::OutboundDial => DiskOrigin::OutboundDial,
+                    Origin::Migrated => DiskOrigin::Migrated,
+                },
+                issued_at: l.issued_at,
+                expires_at: Some(l.not_after),
+                revoked_at: None,
+                caps,
+            });
+        }
+    }
+    // Stable order so an unchanged store produces an identical file, and a diff
+    // of the file shows what actually changed.
+    out.sort_by(|a, b| a.fingerprint.cmp(&b.fingerprint));
+    out
+}
+
 pub fn migrate(
     authorized: HashMap<String, String>,
     revoked: HashMap<String, RevokedEntry>,

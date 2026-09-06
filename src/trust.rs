@@ -431,8 +431,9 @@ pub enum Origin {
     OutboundDial,
     /// Carried forward from `[authorized_fingerprints]`.
     Migrated,
-    /// The user restored a device they had removed.
-    Restored,
+    // No `Restored`. An expelled fingerprint is never re-authorised — the
+    // machine returns by generating a new identity, which arrives as `Inbound`
+    // or `OutboundDial` like any other first contact.
 }
 
 /// One machine's membership: what `peer` may do to `issued_to`, until when.
@@ -942,6 +943,40 @@ impl TrustStore {
     pub fn is_expiring(&self, fingerprint: &str) -> bool {
         let now = self.now();
         self.lease(fingerprint).is_some_and(|l| l.is_expiring(now)) && !self.is_denied(fingerprint)
+    }
+
+    /// The two config tables, derived from the store, for the daemon to WRITE.
+    ///
+    /// `[authorized_fingerprints]` and `[revoked_fingerprints]` are now a cache:
+    /// written on every save so an older build or a human reading the file still
+    /// sees who is trusted, and never read back as authority. That asymmetry is
+    /// what closes the config-reload door — appending a line to the file grants
+    /// nothing, because nothing consults it.
+    ///
+    /// Only leases that permit inbound drive are listed, because that is what
+    /// the old table meant: "this peer may drive this machine".
+    pub fn config_cache(&self) -> (HashMap<String, String>, HashMap<String, RevokedEntry>) {
+        let now = self.now();
+        let mut authorized = HashMap::new();
+        let mut revoked = HashMap::new();
+        for (fp, e) in self.entries() {
+            if let Some(d) = e.denial.as_ref() {
+                revoked.insert(
+                    fp.to_string(),
+                    RevokedEntry {
+                        label: d.label.clone(),
+                        revoked_at: d.at,
+                    },
+                );
+                continue;
+            }
+            if let Some(l) = e.lease.as_ref() {
+                if l.is_valid_at(now) && l.caps.contains(Caps::DRIVE_ME) {
+                    authorized.insert(fp.to_string(), l.label.clone());
+                }
+            }
+        }
+        (authorized, revoked)
     }
 
     /// Every record, in fingerprint order.

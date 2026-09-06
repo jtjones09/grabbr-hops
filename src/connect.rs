@@ -1,7 +1,7 @@
 use crate::client::ClientManager;
 use crate::config::{local_caps, local_commit};
 use crate::crypto::Identity;
-use crate::transport::{self, Authorized, FpServerVerifier};
+use crate::transport::{self, FpServerVerifier, Trust};
 use hops_ipc::{ClientHandle, DEFAULT_PORT};
 use hops_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender, channel};
@@ -57,10 +57,10 @@ struct PeerLink {
 
 fn client_config(
     identity: &Identity,
-    authorized: Authorized,
+    trust: Trust,
     observed: Arc<StdMutex<Option<String>>>,
 ) -> ClientConfig {
-    let verifier = Arc::new(FpServerVerifier::new(authorized, observed));
+    let verifier = Arc::new(FpServerVerifier::new(trust, observed));
     let mut crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(verifier)
@@ -241,7 +241,7 @@ pub(crate) struct LanMouseConnection {
     /// concurrent dial to another peer overwrite it — losing the trust prompt, or
     /// raising it for the wrong machine.
     identity: Arc<Identity>,
-    authorized: Authorized,
+    trust: Trust,
     /// inbound clipboard text received from peers, forwarded to the service.
     clipboard_in: Sender<String>,
     /// signals the service that this client's peer_fingerprint was just learned,
@@ -261,7 +261,7 @@ impl LanMouseConnection {
     pub(crate) fn new(
         identity: Arc<Identity>,
         client_manager: ClientManager,
-        authorized: Authorized,
+        trust: Trust,
         clipboard_in: Sender<String>,
         untrusted_tx: Sender<(String, SocketAddr)>,
         persist_tx: Sender<ClientHandle>,
@@ -280,7 +280,7 @@ impl LanMouseConnection {
             recv_tx,
             ping_response: Default::default(),
             identity,
-            authorized,
+            trust,
             clipboard_in,
             untrusted_tx,
             persist_tx,
@@ -373,7 +373,7 @@ impl LanMouseConnection {
                 self.recv_tx.clone(),
                 self.ping_response.clone(),
                 self.identity.clone(),
-                self.authorized.clone(),
+                self.trust.clone(),
                 self.clipboard_in.clone(),
                 self.untrusted_tx.clone(),
                 self.persist_tx.clone(),
@@ -480,7 +480,7 @@ async fn connect_to_handle(
     tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
     identity: Arc<Identity>,
-    authorized: Authorized,
+    trust: Trust,
     clipboard_in: Sender<String>,
     untrusted_tx: Sender<(String, SocketAddr)>,
     persist_tx: Sender<ClientHandle>,
@@ -513,7 +513,7 @@ async fn connect_to_handle(
                 let observed = Arc::new(StdMutex::new(None));
                 Dial {
                     addr,
-                    cfg: client_config(&identity, authorized.clone(), observed.clone()),
+                    cfg: client_config(&identity, trust.clone(), observed.clone()),
                     observed,
                 }
             })
@@ -548,7 +548,7 @@ async fn connect_to_handle(
                             TrustPrompt::Offer { addr, fp } => {
                                 log::warn!(
                                     "client {handle}: {addr} answered with fingerprint {fp}, \
-                                     which is not authorized — prompting to trust it"
+                                     which is not trust — prompting to trust it"
                                 );
                                 // Hand it to the service, which checks it against
                                 // the allowlist and raises a ConnectionAttempt if it
@@ -843,7 +843,7 @@ mod tests {
     use crate::crypto::Identity;
     use quinn::Endpoint;
     use quinn::crypto::rustls::QuicServerConfig;
-    use std::collections::HashMap;
+
     use std::sync::RwLock;
 
     fn identity() -> Identity {
@@ -909,7 +909,10 @@ mod tests {
             let client = identity();
             // trust NEITHER receiver, so both handshakes are rejected and both
             // verifiers record what they saw
-            let empty: Authorized = Arc::new(RwLock::new(HashMap::new()));
+            let empty: Trust = Arc::new(RwLock::new(
+                crate::trust::TrustStore::new(&transport::fingerprint_of(&client.cert), 0)
+                    .expect("our fingerprint"),
+            ));
 
             let mut addrs = vec![];
             let mut fps = vec![];
@@ -1005,10 +1008,22 @@ mod tests {
             });
 
             let client = identity();
-            let trusted: Authorized = Arc::new(RwLock::new(HashMap::from([(
-                transport::fingerprint_of(&server.cert),
-                "hostile".to_string(),
-            )])));
+            // The OUTBOUND half: we may drive this receiver. Deliberately not
+            // the inbound one — that is the distinction the flat map could not
+            // express.
+            let trusted: Trust = Arc::new(RwLock::new({
+                let mut st =
+                    crate::trust::TrustStore::new(&transport::fingerprint_of(&client.cert), 0)
+                        .expect("our fingerprint");
+                st.issue(
+                    &transport::fingerprint_of(&server.cert),
+                    "hostile",
+                    crate::trust::Caps::OUTBOUND,
+                    crate::trust::DEFAULT_TERM_SECS,
+                )
+                .expect("issue");
+                st
+            }));
             let observed = Arc::new(StdMutex::new(None));
             let client_ep =
                 Endpoint::client("127.0.0.1:0".parse().expect("addr")).expect("client endpoint");
@@ -1176,7 +1191,10 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, async {
             let client = identity();
-            let empty: Authorized = Arc::new(RwLock::new(HashMap::new()));
+            let empty: Trust = Arc::new(RwLock::new(
+                crate::trust::TrustStore::new(&transport::fingerprint_of(&client.cert), 0)
+                    .expect("our fingerprint"),
+            ));
 
             let mut addrs = vec![];
             let mut fps = vec![];
@@ -1259,10 +1277,20 @@ mod tests {
             });
 
             // we trust this receiver (as if just approved)
-            let trusted: Authorized = Arc::new(RwLock::new(HashMap::from([(
-                server_fp.clone(),
-                "receiver".to_string(),
-            )])));
+            // We may drive this receiver, as if just approved. Outbound only.
+            let trusted: Trust = Arc::new(RwLock::new({
+                let mut st =
+                    crate::trust::TrustStore::new(&transport::fingerprint_of(&client.cert), 0)
+                        .expect("our fingerprint");
+                st.issue(
+                    &server_fp,
+                    "receiver",
+                    crate::trust::Caps::OUTBOUND,
+                    crate::trust::DEFAULT_TERM_SECS,
+                )
+                .expect("issue");
+                st
+            }));
             let observed = Arc::new(StdMutex::new(None));
 
             // ONE endpoint + config across both dials, so a ticket can be cached
@@ -1276,7 +1304,7 @@ mod tests {
             );
 
             // revoke the receiver — what remove_authorized_key does to the shared map
-            trusted.write().expect("lock").remove(&server_fp);
+            trusted.write().expect("lock").revoke(&server_fp);
 
             assert!(
                 !dials_ok(&client_ep, addr).await,
