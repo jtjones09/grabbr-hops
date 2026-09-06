@@ -817,9 +817,9 @@ mod refusal_is_not_maskable {
 mod discovered_hostnames {
     //! A discovered device must survive its addresses changing.
     //!
-    //! Jeremy's case, and the reason this matters: *"if my switch goes down, it
-    //! could still connect to my wifi without having to redo the connection,
-    //! which I have run into with Synergy."* hops already races every known
+    //! The case that motivates it: a machine whose wired link drops and comes
+    //! back on wi-fi should still be the same device, not a new one to pair
+    //! again — a failure people hit on comparable tools. hops races every known
     //! address and keys trust on the fingerprint rather than the address, so a
     //! path change is not a new device. The remaining gap was that addresses
     //! pinned at add-time are a snapshot — a `.local` name closes it, because
@@ -863,10 +863,11 @@ aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
 11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00";
 
     fn model(ours: Option<&str>, pending: Option<&str>) -> AppModel {
-        let mut m = AppModel::default();
-        m.fingerprint = ours.map(String::from);
-        m.pending_pairing = pending.map(String::from);
-        m
+        AppModel {
+            fingerprint: ours.map(String::from),
+            pending_pairing: pending.map(String::from),
+            ..Default::default()
+        }
     }
 
     #[test]

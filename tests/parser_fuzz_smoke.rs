@@ -106,7 +106,7 @@ fn the_mdns_parser_survives_randomised_packets() {
 
 #[test]
 fn the_hops_wire_decoder_survives_randomised_frames() {
-    use hops_proto::{ProtoEvent, MAX_EVENT_SIZE};
+    use hops_proto::{MAX_EVENT_SIZE, ProtoEvent};
 
     let mut rng = Rng(0x686f_7073_5f70_726f);
     let mut decoded = 0u32;

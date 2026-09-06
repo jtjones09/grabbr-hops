@@ -172,7 +172,7 @@ impl Emulation {
 /// spans the gap, so no drift accumulates (unlike a relative-delta stream).
 /// The reconstructed delta is fed to the UNCHANGED injection path (the clamp
 /// + edge detector on the macOS side), so the crown-jewel motion arm is
-/// untouched.
+///   untouched.
 ///
 /// Contract PR-4's sender must uphold: motion is emitted ONLY after the Enter
 /// is acked. hops's capture state machine already enforces this — every event

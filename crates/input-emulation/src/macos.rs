@@ -1202,8 +1202,8 @@ fn get_display_bounds(display: CGDirectDisplayID) -> (CGFloat, CGFloat, CGFloat,
 /// per-edge "pressure". A deliberate push accumulates past the threshold and
 /// signals a cross-back; letting go ends the gesture and the pressure resets.
 /// Coordinate-free by construction (live display bounds + relative motion
-/// only), so it works for any screen size, DPI, or arrangement. Design:
-/// nisaba `projects/grabbr-hops/ADAPTIVE-EDGE-CROSSING.md`.
+/// only), so it works for any screen size, DPI, or arrangement. The full design
+/// note lives in the project's private design record.
 ///
 /// Rung-1 model (shaped by an adversarial review pass):
 /// - **Gesture, not decay**: pressure accumulates linearly while events keep

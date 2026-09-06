@@ -268,7 +268,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
     let buf = ui.window().take_snapshot()?;
     let (w, h) = (buf.width(), buf.height());
     let mut bytes = buf.as_bytes().to_vec();
-    for px in bytes.chunks_exact_mut(4) {
+    for px in bytes.as_chunks_mut::<4>().0 {
         px[3] = 255;
     }
     image::RgbaImage::from_raw(w, h, bytes)

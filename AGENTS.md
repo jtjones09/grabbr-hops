@@ -7,12 +7,14 @@ sharing one keyboard and mouse across machines. Renamed from lan-mouse on 2026-0
 **deliberately severed** — this repo never fetches from or pushes to any lan-mouse remote.
 
 > **Before forming a view on anything with history, read the decision record.**
-> `~/Documents/GitHub/nisaba/projects/grabbr-hops/DECISIONS.md` — dated calls with rationale
-> and reversibility. `JOURNAL.md` beside it is the session-by-session log.
+> Dated calls with rationale and reversibility, plus a session-by-session log, live in a
+> private design record outside this repository. Maintainers: its location is in
+> `.claude/private-record.local` (gitignored). Contributors without it should ask rather
+> than assume a decision was never made.
 >
-> Grepping the journal for a keyword is **not** reading the record. This project has
-> repeatedly lost hours re-deriving conclusions that were already written down, and has
-> twice acted on a stale record that read as current. nisaba is private; this repo is public.
+> Grepping a log for a keyword is **not** reading the record. This project has repeatedly
+> lost hours re-deriving conclusions that were already written down, and has twice acted on
+> a stale record that read as current.
 
 If `HandoffSessionCompact.md` exists in the repo root, **read it before anything else** —
 it is the previous context window's state. See `.claude/skills/handoff/`.
@@ -28,9 +30,9 @@ it is the previous context window's state. See `.claude/skills/handoff/`.
   reintroduce the defect and confirm the guard fires.
 - **Never let a summary be the only record of research.** If a Workflow or subagent run
   produced output, the raw per-agent returns are the **primary source**: preserve them
-  verbatim in nisaba `projects/grabbr-hops/research/<date>-<topic>-artifact.md`, with the
-  workflow script as `-protocol.js`, *before* writing the synthesis — then check the
-  synthesis against them. Standing rule: nisaba `positions/research-folder-discipline.md`.
+  verbatim in the private record's `research/` directory as
+  `<date>-<topic>-artifact.md`, with the workflow script as `-protocol.js`, *before*
+  writing the synthesis — then check the synthesis against them.
   Transcripts survive at `~/.claude/projects/<slug>/<session>/subagents/workflows/wf_*/`.
 - **Never `cd` into a path in scripts; run from the repo root.**
 - **Dates are absolute.** Sessions here are days apart — say `2026-08-29`, never "today".
@@ -126,4 +128,4 @@ binary actually contains real input backends.
 3. Implement the minimal change; file follow-ups rather than absorbing them.
 4. Add a test that fails without the fix. Mutation-test any guard.
 5. `cargo fmt --all` and the `-D warnings` check above.
-6. Record decisions in nisaba `DECISIONS.md`; record what happened in `JOURNAL.md`.
+6. Record decisions and what happened in the private record.

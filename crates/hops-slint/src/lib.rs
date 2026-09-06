@@ -77,6 +77,11 @@ struct PolledUi {
     free_position: String,
     notice: String,
     notice_seq: i32,
+    // An 11-field positional tuple against a 13-field DeviceRow, which is why
+    // the repaint gate silently misses the two fields added most recently. The
+    // fix is a named struct, and it belongs with the device-model work rather
+    // than a lint silenced here — see the interface epic.
+    #[allow(clippy::type_complexity)]
     devices: Vec<(
         String,
         String,
@@ -1154,8 +1159,8 @@ mod discovery_states {
     //! or **looking and there is genuinely nothing** — and #138 rendered the
     //! same absence for all three: the section simply did not appear. On a
     //! network where multicast is filtered, the feature was indistinguishable
-    //! from a bug. Jeremy hit exactly this shape with the probe ("I am not sure
-    //! what should happen"), and the fix there was the same: make silence
+    //! from a bug. The diagnostic probe had the same shape and the same fix:
+    //! when a reader cannot tell what an empty result means, make the silence
     //! explain itself.
 
     const UI: &str = include_str!("../ui/app.slint");

@@ -690,6 +690,10 @@ async fn ping_pong(
     }
 }
 
+// Eight parameters because a dial needs the whole peer context and there is no
+// object that carries it. That object is the lease work; grouping them into an
+// ad-hoc struct here would be moved again in a month.
+#[allow(clippy::too_many_arguments)]
 async fn receive_loop(
     client_manager: ClientManager,
     handle: ClientHandle,
@@ -807,29 +811,28 @@ async fn disconnect(
 /// Accepts the peer's ephemeral clipboard uni streams (everything after the
 /// primary reply stream) and forwards each payload to the service.
 async fn clipboard_accept_loop(conn: Connection, addr: SocketAddr, clipboard_in: Sender<String>) {
-    loop {
-        match conn.accept_uni().await {
-            Ok(recv) => {
-                let clipboard_in = clipboard_in.clone();
-                spawn_local(async move {
-                    match tokio::time::timeout(
-                        transport::CLIPBOARD_IO_TIMEOUT,
-                        transport::recv_clipboard(recv),
-                    )
-                    .await
-                    {
-                        Ok(Ok(text)) => {
-                            let _ = clipboard_in.send(text);
-                        }
-                        Ok(Err(e)) => log::debug!("{addr}: bad clipboard transfer: {e}"),
-                        // dropping the recv future on timeout stops the stream
-                        // and frees the uni-stream slot (never reaped otherwise)
-                        Err(_) => log::debug!("{addr}: clipboard transfer timed out"),
+    // `while let` rather than `loop`+`match`: the error arm is only ever
+    // "connection closed", handled by the input loop, so there is nothing to
+    // distinguish.
+    while let Ok(recv) = conn.accept_uni().await {
+        {
+            let clipboard_in = clipboard_in.clone();
+            spawn_local(async move {
+                match tokio::time::timeout(
+                    transport::CLIPBOARD_IO_TIMEOUT,
+                    transport::recv_clipboard(recv),
+                )
+                .await
+                {
+                    Ok(Ok(text)) => {
+                        let _ = clipboard_in.send(text);
                     }
-                });
-            }
-            // connection closed — the input receive_loop handles disconnect
-            Err(_) => break,
+                    Ok(Err(e)) => log::debug!("{addr}: bad clipboard transfer: {e}"),
+                    // dropping the recv future on timeout stops the stream
+                    // and frees the uni-stream slot (never reaped otherwise)
+                    Err(_) => log::debug!("{addr}: clipboard transfer timed out"),
+                }
+            });
         }
     }
 }

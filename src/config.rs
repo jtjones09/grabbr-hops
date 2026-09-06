@@ -773,7 +773,7 @@ impl Config {
     }
 
     pub fn read_from_disk(&mut self) -> Result<bool, io::Error> {
-        log::info!("reading config from {:?}", &self.config_path);
+        log::info!("reading config from {:?}", self.config_path);
 
         let current_config = fs::read_to_string(&self.config_path)?;
         let current_config = match current_config.parse::<DocumentMut>() {
@@ -803,7 +803,7 @@ impl Config {
     }
 
     pub fn write_back(&mut self) -> Result<(), io::Error> {
-        log::info!("writing config to {:?}", &self.config_path);
+        log::info!("writing config to {:?}", self.config_path);
         /* the new config */
         // Never serialise `unwrap_or_default()`. If there is no parsed config in
         // memory, writing is the one thing this must not do — that is how a parse

@@ -412,7 +412,7 @@ aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
         let mut found = false;
         for i in 0..4096u32 {
             let b = format!("{:02x}", i % 256);
-            let fp = std::iter::repeat(b).take(32).collect::<Vec<_>>().join(":");
+            let fp = std::iter::repeat_n(b, 32).collect::<Vec<_>>().join(":");
             if let Some(c) = verification_code(A, &fp) {
                 assert_eq!(c.len(), SAS_DIGITS, "width must be fixed: {c:?}");
                 if c.starts_with('0') {
