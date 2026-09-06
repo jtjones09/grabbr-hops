@@ -2821,7 +2821,6 @@ mod decision_guards {
     /// file only; the split at the first `#[cfg(test)]` puts this module outside
     /// the scanned region, so the guard cannot match its own text.
     #[test]
-    #[ignore = "RED: post_modifier() branches on target_is_vm_guest, which the 2026-06-17 no-detection clause forbids. Narrow in effect (it picks the injection transport, not the flag content, and only under an env var) but a real breach, and the scroll sign is already gated the same way. Needs the DECISION amended with the narrowing and its reasoning, then this guard updated to permit exactly that — an owner call, not a code change. Tracked in #160."]
     fn the_modifier_path_takes_no_decision_from_which_application_has_focus() {
         const FULL: &str = include_str!("macos.rs");
         let production = FULL.split("\n#[cfg(test)]").next().unwrap_or(FULL);
@@ -2835,29 +2834,46 @@ mod decision_guards {
             .unwrap_or(rest.len());
         let body = &rest[..end];
 
-        let mut detectors = Vec::new();
-        for needle in ["target_is_vm_guest", "is_hypervisor_path", "bundle_id"] {
-            if body.contains(needle) {
-                detectors.push(needle);
-            }
+        // Permitted, per the 2026-09-06 amendment: detection may select the
+        // injection TRANSPORT, because IOHIDPostEvent does not reach a guest
+        // and something had to. It may never select the flag CONTENT, and it
+        // may never become per-vendor whitelisting — that is the alternative
+        // the original decision rejected on the merits, and the reasons it gave
+        // (version-fragile, needs user config, helps one product) are unchanged.
+        for forbidden in ["bundle_id", "is_hypervisor_path", "bundle_identifier"] {
+            assert!(
+                !body.contains(forbidden),
+                "post_modifier() branches on {forbidden:?}. The amendment permits \
+                 choosing the injection TRANSPORT by VM detection and nothing \
+                 else; per-vendor or bundle-id whitelisting stays rejected, on \
+                 the reasoning the original decision gave — it is version-fragile, \
+                 needs user configuration, and only ever helps the one product \
+                 whose behaviour it copies."
+            );
         }
+
+        // The flag content must stay byte-faithful for every target. If a
+        // detector ever reaches the flags themselves, the amendment has been
+        // stretched past what it says.
+        if let Some(flags_at) = body.find("modifier_flags_changed_flags(") {
+            let guard_at = body.find("target_is_vm_guest").unwrap_or(usize::MAX);
+            assert!(
+                guard_at == usize::MAX || guard_at < flags_at,
+                "VM detection appears INSIDE the flag computation. The amendment \
+                 permits detection to pick which call posts the event; it does \
+                 not permit a guest and a native app to receive different flag \
+                 bytes. Byte-faithfulness is the part of the 2026-06-17 decision \
+                 that was never amended."
+            );
+        }
+
+        // The escape hatch has to stay an escape hatch: the whole HID path is
+        // opt-in, so the default build takes no decision from focus at all.
         assert!(
-            detectors.is_empty(),
-            "post_modifier() branches on {detectors:?}. The 2026-06-17 decision \
-             says modifier events are emitted for every target with NO VM or \
-             bundle-id detection, because per-hypervisor whitelisting is \
-             version-fragile, needs user config, and only ever helps the one \
-             product whose trick you copied — while hardware-faithful events \
-             generalise across apps and hypervisors with zero configuration. \
-             This particular use is narrow (it picks the injection transport, \
-             not the flag content, and only under LAN_MOUSE_HID_MODIFIERS), and \
-             the byte-faithfulness clause is untouched. It is still a breach of \
-             the no-detection clause, and it is the vector by which the rest of \
-             that clause erodes — the SCROLL sign is already gated the same way. \
-             Fix this by amending the decision with the narrowing and its \
-             reasoning, then update this guard to permit exactly that. Do not \
-             delete it: the project's own notes currently claim this path is \
-             detection-free, and they are wrong."
+            body.contains("self.hid_modifiers"),
+            "the HID path is no longer gated on the opt-in flag, so VM detection \
+             now runs for every user by default. The amendment was justified by \
+             the narrowness of the exception; remove the gate and it is not narrow."
         );
     }
 
