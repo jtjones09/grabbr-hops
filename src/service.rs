@@ -47,6 +47,16 @@ pub enum ServiceError {
     Authority(#[from] crate::authority::AuthorityError),
 }
 
+/// How often the daemon looks for leases that have lapsed while nothing was
+/// being sent.
+///
+/// A minute, not a second: the point-of-injection check already refuses a
+/// lapsed lease the instant a peer sends anything, so this only has to catch
+/// the quiet case — a session held open with no traffic — and advance the
+/// persisted clock floor. Sweeping harder would cost a sealed write per tick
+/// and buy nothing the hot path does not already cover.
+const LEASE_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub struct Service {
     /// configuration
     config: Config,
@@ -88,6 +98,9 @@ pub struct Service {
     /// Bounded like the TLS attempt queue, and for the same reason: anyone on
     /// the network can cause an entry.
     pending_origin: HashMap<String, AttemptOrigin>,
+    /// The clock floor last written to disk, so a quiet daemon does not rewrite
+    /// a sealed file every sweep for nothing.
+    last_persisted_floor: u64,
     /// (outgoing) client information
     client_manager: ClientManager,
     /// current port
@@ -303,7 +316,7 @@ impl Service {
         let capture_backend = config.capture_backend().map(|b| b.into());
         let capture = Capture::new(capture_backend, conn, config.release_bind());
         let emulation_backend = config.emulation_backend().map(|b| b.into());
-        let emulation = Emulation::new(emulation_backend, listener);
+        let emulation = Emulation::new(emulation_backend, listener, trust.clone());
 
         // create dns resolver
         let resolver = DnsResolver::new()?;
@@ -332,6 +345,7 @@ impl Service {
             trust,
             trust_file,
             pending_origin: HashMap::new(),
+            last_persisted_floor: 0,
             public_key_fingerprint,
             client_manager,
             frontend_event_pending: Default::default(),
@@ -370,8 +384,18 @@ impl Service {
             self.activate_client(handle);
         }
 
+        // A lease nothing checks is a data structure. The point-of-injection
+        // check catches a lapse the moment a peer sends anything, because it
+        // rides the attacker's own code path and cannot be starved; this sweep
+        // catches the quiet case — a peer holding a session open and sending
+        // nothing — and is the only thing that advances the persisted clock
+        // floor while the daemon runs.
+        let mut lease_sweep = tokio::time::interval(LEASE_SWEEP_INTERVAL);
+        lease_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
+                _ = lease_sweep.tick() => self.sweep_lapsed_leases(),
                 request = self.frontend_listener.next() => self.handle_frontend_request(request),
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
                 event = self.emulation.event() => self.handle_emulation_event(event),
@@ -1162,6 +1186,40 @@ impl Service {
     /// from the allowlist does nothing to a session that is already up. EVERY
     /// path that removes trust must call this, or "revoke" only hides the card
     /// while the peer keeps driving this machine (or we keep driving theirs).
+    /// Cut only the direction that was lost.
+    ///
+    /// A lease can lapse in one direction while the other is still live — the
+    /// two are separate capabilities now — so tearing down both would drop a
+    /// session the user still holds. `cut_sessions` remains the both-directions
+    /// verb, used by removal, where everything goes.
+    fn cut_sessions_dir(&mut self, fp: &str, lost: crate::trust::Caps) {
+        use crate::trust::Caps;
+        let handles = if lost.contains(Caps::I_MAY_DRIVE) {
+            self.client_manager.handles_with_fingerprint(fp)
+        } else {
+            Vec::new()
+        };
+        let cut_inbound = lost.contains(Caps::DRIVE_ME);
+        let (inbound, outbound, peer) = (
+            self.revoke_listen.clone(),
+            self.revoke_conn.clone(),
+            fp.to_string(),
+        );
+        tokio::task::spawn_local(async move {
+            let cut_in = if cut_inbound {
+                inbound.close_fingerprint(&peer).await
+            } else {
+                0
+            };
+            let cut_out = outbound.close_handles(&handles).await;
+            if cut_in + cut_out > 0 {
+                log::warn!(
+                    "{peer}: lease lapsed, cut {cut_in} incoming + {cut_out} outgoing session(s)"
+                );
+            }
+        });
+    }
+
     fn cut_sessions(&mut self, fp: &str) {
         // Resolve the handles first: clear_pins_matching erases the fingerprint
         // that the outbound match is made on.
@@ -1245,6 +1303,49 @@ impl Service {
         let (keys, tombstones) = self.trust.read().expect("lock").config_cache();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
         self.notify_frontend(FrontendEvent::RevokedUpdated(tombstones));
+    }
+
+    /// Drop what has lapsed, and cut the sessions it was holding open.
+    ///
+    /// Runs on a timer, which means it can be delayed by a busy thread — the
+    /// injection loop yields every few events precisely so it cannot be delayed
+    /// indefinitely. It is deliberately not the only enforcement: a lapsed
+    /// lease is refused at the point of injection too, where no amount of
+    /// flooding can postpone the check.
+    fn sweep_lapsed_leases(&mut self) {
+        let lapsed = {
+            let mut trust = self.trust.write().expect("lock");
+            trust.sweep(crate::trust::system_seconds())
+        };
+        if lapsed.is_empty() {
+            // Still persist occasionally: the clock floor only advances while
+            // the daemon runs, and a floor that never reaches disk is a floor
+            // that resets on every restart.
+            self.persist_trust_if_floor_moved();
+            return;
+        }
+        for lease in &lapsed {
+            log::info!(
+                "{}: lease lapsed ({}), cutting the sessions it permitted",
+                lease.peer,
+                lease.caps
+            );
+            self.cut_sessions_dir(&lease.peer, lease.caps);
+        }
+        self.persist_trust();
+        let (keys, tombstones) = self.trust.read().expect("lock").config_cache();
+        self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+        self.notify_frontend(FrontendEvent::RevokedUpdated(tombstones));
+    }
+
+    /// Persist only when the clock floor actually moved, so a quiet daemon does
+    /// not rewrite a sealed file every minute for nothing.
+    fn persist_trust_if_floor_moved(&mut self) {
+        let floor = self.trust.read().expect("lock").clock().floor();
+        if floor > self.last_persisted_floor {
+            self.last_persisted_floor = floor;
+            self.persist_trust();
+        }
     }
 
     /// Write the sealed store.

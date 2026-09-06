@@ -101,6 +101,7 @@ impl Emulation {
     pub(crate) fn new(
         backend: Option<input_emulation::Backend>,
         listener: LanMouseListener,
+        trust: crate::transport::Trust,
     ) -> Self {
         let emulation_proxy = EmulationProxy::new(backend);
         let last_injected = emulation_proxy.last_injected.clone();
@@ -111,6 +112,8 @@ impl Emulation {
             emulation_proxy,
             request_rx,
             event_tx,
+            trust,
+            peer_of: HashMap::new(),
         };
         let task = spawn_local(emulation_task.run());
         Self {
@@ -215,6 +218,16 @@ struct ListenTask {
     emulation_proxy: EmulationProxy,
     request_rx: Receiver<EmulationRequest>,
     event_tx: Sender<EmulationEvent>,
+    /// The store, so an expiring lease is refused AT THE POINT OF INJECTION.
+    ///
+    /// The sweep on the service loop catches a lapse eventually, but a timer is
+    /// something a busy thread can delay. This check cannot be delayed, because
+    /// it rides the attacker's own code path: to keep injecting, they have to
+    /// execute it. That is the difference between a lease and a label.
+    trust: crate::transport::Trust,
+    /// Which peer each admitted address belongs to. Populated on accept, so the
+    /// per-event check is a map lookup rather than a certificate parse.
+    peer_of: HashMap<SocketAddr, String>,
 }
 
 /// Suppresses repeat approval prompts for a fingerprint that keeps dialling,
@@ -306,7 +319,24 @@ impl ListenTask {
                                 absmotion.forget(addr);
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                             }
-                            ProtoEvent::Input(event) => self.emulation_proxy.consume(event, addr),
+                            ProtoEvent::Input(event) => {
+                                // Cheap and unstarvable. Roughly 20 ns against
+                                // the ~100 µs blocking syscall that dominates
+                                // an injected event, so it is not measurable on
+                                // the path it protects.
+                                let permitted = self
+                                    .peer_of
+                                    .get(&addr)
+                                    .is_some_and(|fp| {
+                                        self.trust
+                                            .read()
+                                            .expect("lock")
+                                            .may_drive_us(fp)
+                                    });
+                                if permitted {
+                                    self.emulation_proxy.consume(event, addr);
+                                }
+                            }
                             ProtoEvent::Ping => self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())).await,
                             // Peer's version handshake. Echo our own
                             // commit back so the peer's connect-side
@@ -349,6 +379,7 @@ impl ListenTask {
                         }
                     }
                     Some(ListenEvent::Accept { addr, fingerprint }) => {
+                        self.peer_of.insert(addr, fingerprint.clone());
                         self.event_tx.send(EmulationEvent::Connected { addr, fingerprint }).expect("channel closed");
                     }
                     Some(ListenEvent::Rejected { fingerprint }) => {

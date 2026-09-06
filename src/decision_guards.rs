@@ -1076,6 +1076,11 @@ mod every_trust_mutation_happens_at_a_named_door {
         "fn set_label",             // rename; refuses unknown fingerprints
         "fn handle_config_change",  // reload: the config file is a door too
         "fn new",                   // startup load
+        // Added 2026-09-06 with the sweep. It is a door because it drops what
+        // has lapsed, which is a trust change — but it is the one door no human
+        // opens: it mints nothing, narrows only, and runs on a timer. Listed so
+        // the addition is visible in the diff rather than discovered later.
+        "fn sweep_lapsed_leases",
     ];
 
     /// The needle a scan must actually find. If the store is renamed again,
