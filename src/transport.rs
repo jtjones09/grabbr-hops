@@ -166,7 +166,7 @@ pub struct FpClientVerifier {
 /// we do not recognise, before any authorization has happened. The bound is
 /// what stops that from being unbounded memory growth driven by a stranger.
 /// Well past any real fleet, small enough that the flood costs nothing.
-const MAX_PENDING_ATTEMPTS: usize = 32;
+pub(crate) const MAX_PENDING_ATTEMPTS: usize = 32;
 
 impl FpClientVerifier {
     pub fn new(trust: Trust, attempts: Arc<Mutex<VecDeque<String>>>) -> Self {

@@ -2549,3 +2549,359 @@ mod tests {
         assert_ne!(c & NX_DEVICE_L_CMD, 0);
     }
 }
+
+#[cfg(test)]
+mod decision_guards {
+    //! Guards for decisions that can only be enforced from inside this file.
+    //!
+    //! Everything here tests a private item — `update_modifiers`,
+    //! `EdgePressureDetector::update`, the body of `post_modifier` — so it
+    //! cannot live with the rest of the decision guards in
+    //! `src/decision_guards.rs`. When one of these fails, read that module's
+    //! header first: it explains the bar these are held to and why they exist.
+    //!
+    //! macOS-only by construction. These run on the maintainer's machine and on
+    //! the macOS CI runner; on Linux and Windows this file is not compiled, so
+    //! the rules below are unguarded there. That is honest rather than ideal —
+    //! the code they guard is equally macOS-only.
+
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // Caps Lock is a lock, not a momentary modifier
+    // -----------------------------------------------------------------------
+
+    /// **Decided 2026-06-17.** A Caps Lock key-down transition toggles the
+    /// internal `LockMask` so the AlphaShift flag stays set until the next
+    /// press; key-up must not clear it, and auto-repeat key-downs while the key
+    /// is physically held must be swallowed rather than toggling again or
+    /// posting a FlagsChanged.
+    ///
+    /// **Why this needs a test and its neighbours do not.** Caps Lock is
+    /// *classed* as a modifier, so any change that routes modifiers uniformly
+    /// makes it momentary again — which is exactly how it broke the first time,
+    /// when modifiers were routed out of the key-repeat path. It broke a SECOND
+    /// time as the held-Caps-Lock repeat storm, flipping the lock erratically
+    /// and flooding the injection path. Caps Lock latches in hardware; this
+    /// restores that.
+    ///
+    /// Until now the rule lived in `update_modifiers()` with no test of any
+    /// kind, having already regressed twice.
+    #[test]
+    fn a_caps_lock_press_latches_the_lock_and_holding_the_key_does_not_flip_it_again() {
+        let mods = Cell::new(XMods::empty());
+        let held = Cell::new(false);
+        let caps = scancode::Linux::KeyCapsLock as u32;
+
+        assert!(
+            matches!(
+                update_modifiers(&mods, &held, caps, 1),
+                ModifierAction::Post
+            ),
+            "the first Caps Lock press must post a FlagsChanged, or the receiver \
+             never learns the lock turned on and every following letter arrives \
+             lower-case."
+        );
+        assert!(
+            mods.get().contains(XMods::LockMask),
+            "the first Caps Lock press did not set the lock. Caps Lock latches in \
+             hardware; a synthetic path that does not latch types lower-case for \
+             a user whose real keyboard light is on."
+        );
+
+        // A physically held Caps Lock auto-repeats a stream of key-downs with no
+        // intervening key-up. This is the repeat storm.
+        for repeat in 1..=8 {
+            assert!(
+                matches!(
+                    update_modifiers(&mods, &held, caps, 1),
+                    ModifierAction::Swallow
+                ),
+                "auto-repeat #{repeat} of a held Caps Lock was not swallowed. The \
+                 old code toggled the lock AND posted a FlagsChanged on every \
+                 repeat, flipping the lock on and off erratically and flooding \
+                 the injection path — the 'held Caps Lock jams the session' bug. \
+                 Act on the key-DOWN TRANSITION only."
+            );
+            assert!(
+                mods.get().contains(XMods::LockMask),
+                "auto-repeat #{repeat} of a held Caps Lock flipped the lock. The \
+                 user is holding one key; the lock must not oscillate underneath \
+                 them."
+            );
+        }
+    }
+
+    /// **Same decision, the half a uniform-modifier refactor breaks first.**
+    ///
+    /// A key-up is where a momentary modifier is cleared. Caps Lock is not
+    /// momentary, so its key-up must leave the lock exactly as it found it.
+    #[test]
+    fn releasing_caps_lock_leaves_the_lock_on() {
+        let mods = Cell::new(XMods::empty());
+        let held = Cell::new(false);
+        let caps = scancode::Linux::KeyCapsLock as u32;
+
+        update_modifiers(&mods, &held, caps, 1);
+        assert!(
+            mods.get().contains(XMods::LockMask),
+            "precondition: lock on"
+        );
+
+        update_modifiers(&mods, &held, caps, 0);
+        assert!(
+            mods.get().contains(XMods::LockMask),
+            "releasing Caps Lock cleared the lock, making it a MOMENTARY \
+             modifier — capitals only while the key is physically held. That is \
+             the original bug, and it returns whenever somebody routes all \
+             modifiers through one uniform key-up path, because Caps Lock is \
+             classed as a modifier. It is a LOCK: the next PRESS turns it off, \
+             not the release of this one."
+        );
+
+        // And the next fresh press is what turns it off.
+        update_modifiers(&mods, &held, caps, 1);
+        assert!(
+            !mods.get().contains(XMods::LockMask),
+            "the second Caps Lock press did not turn the lock off, so it can only \
+             ever be switched on."
+        );
+    }
+
+    /// The contrast that makes the rule above legible: Shift really is
+    /// momentary, so a fix for Caps Lock that made every modifier latch would
+    /// be just as wrong in the other direction.
+    #[test]
+    fn shift_is_still_momentary_so_the_caps_lock_fix_did_not_latch_everything() {
+        let mods = Cell::new(XMods::empty());
+        let held = Cell::new(false);
+        let shift = scancode::Linux::KeyLeftShift as u32;
+
+        update_modifiers(&mods, &held, shift, 1);
+        assert!(
+            mods.get().contains(XMods::ShiftMask),
+            "precondition: shift down"
+        );
+        update_modifiers(&mods, &held, shift, 0);
+        assert!(
+            !mods.get().contains(XMods::ShiftMask),
+            "releasing Shift left it set. Shift is momentary; only Caps Lock \
+             latches. A latched Shift means every subsequent keystroke arrives \
+             shifted and the user cannot get out of it without another Shift tap."
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // edge crossing is intent and momentum, never a position barrier
+    // -----------------------------------------------------------------------
+
+    /// A detector with an injected display union, so the test never queries a
+    /// real display and gives the same answer on a laptop, on the rig, and in CI.
+    fn detector_on_a_1920x1080_desktop() -> EdgePressureDetector {
+        EdgePressureDetector {
+            enabled: true,
+            // learning is a separate rule; keep this test about the decision
+            learn: false,
+            threshold: [60.0; 4],
+            pressure: [0.0; 4],
+            latched: [false; 4],
+            last_update: None,
+            last_fire: None,
+            last_cross: None,
+            pending_regret: None,
+            last_attempt: None,
+            union: Some((0.0, 1920.0, 0.0, 1080.0, Instant::now())),
+            state_path: None,
+        }
+    }
+
+    /// **Decided 2026-07-07.** Cross-back is decided from true pre-clamp motion
+    /// and live display bounds accumulating into a per-edge pressure — never by
+    /// comparing cursor position against a barrier constant.
+    ///
+    /// **Why, measured.** Position-based crossing is structurally broken on the
+    /// receiver: emulation clamps the cursor to `max_x - 1` while the barrier
+    /// sits at `max_x`, so the cursor can never occupy the barrier coordinate;
+    /// and macOS suppresses the bridging delta for about a quarter second after
+    /// a warp. Re-introducing a position compare reverts a live root-cause
+    /// finding to the bug it replaced, and every constant chosen for it shifts
+    /// with screen size, DPI and refresh rate.
+    ///
+    /// The cursor in this test sits exactly on the clamp coordinate the whole
+    /// time — the position a barrier check trips on — and keeps asking to move
+    /// *inward*. Nothing may fire.
+    #[test]
+    fn sitting_on_the_screen_edge_is_not_by_itself_a_request_to_cross() {
+        let mut d = detector_on_a_1920x1080_desktop();
+        for _ in 0..200 {
+            assert!(
+                d.update(-4.0, 0.0, 0.0, 0.0, 1919.0, 540.0).is_none(),
+                "the detector fired for a cursor merely POSITIONED at the screen \
+                 edge, with no blocked outward motion. That is a position \
+                 tripwire, and it is the bug this design replaced: emulation \
+                 clamps the injected cursor to max_x-1 while the barrier sits at \
+                 max_x, so position can never be the signal. Crossing is intent \
+                 and momentum — accumulated blocked outward motion."
+            );
+        }
+    }
+
+    /// The positive half. Same position, same edge — but now the clamp is
+    /// discarding real outward motion, which is the signal.
+    #[test]
+    fn pushing_outward_against_the_clamp_accumulates_into_a_crossing() {
+        let mut d = detector_on_a_1920x1080_desktop();
+        let mut fired = None;
+        for _ in 0..10 {
+            if let Some(side) = d.update(20.0, 0.0, 20.0, 0.0, 1919.0, 540.0) {
+                fired = Some(side);
+                break;
+            }
+        }
+        assert_eq!(
+            fired,
+            Some(EdgeSide::Right),
+            "sustained blocked outward motion at the desktop's right edge did not \
+             produce a crossing. Blocked motion IS the signal — if this stops \
+             working the mouse simply never leaves the screen, which reads to a \
+             user as hops being broken rather than as a threshold being wrong."
+        );
+    }
+
+    /// Interior bezels clamp too, and must never build cross-back pressure —
+    /// the capture barrier likewise only exists at the union edge.
+    #[test]
+    fn a_clamp_that_is_not_at_the_desktop_edge_builds_no_pressure() {
+        let mut d = detector_on_a_1920x1080_desktop();
+        for _ in 0..50 {
+            assert!(
+                d.update(20.0, 0.0, 20.0, 0.0, 900.0, 540.0).is_none(),
+                "blocked motion in the MIDDLE of the desktop built crossing \
+                 pressure. Interior display bezels clamp as well as the outer \
+                 edge; counting them means the pointer tries to hop to another \
+                 machine while the user is dragging between their own monitors."
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // no VM or bundle-id detection in the modifier path
+    // -----------------------------------------------------------------------
+
+    /// **RED TODAY.** **Decided 2026-06-17.** Synthetic modifier CGEvents are
+    /// emitted for every target with no VM or bundle-id detection.
+    ///
+    /// **Why the rule.** Two alternatives were rejected on the merits. The
+    /// Apple-forums NSEvent approach is in-process-only and cannot work from a
+    /// separate daemon at all; Synergy-style per-hypervisor source-whitelisting
+    /// is version-fragile, needs user config, and only helps the one product
+    /// whose trick you copied. Hardware-faithfulness generalises across apps and
+    /// hypervisors with zero configuration, because the OS already trusts
+    /// real-hardware-shaped events.
+    ///
+    /// **What is actually true in this tree, which the record does not say.**
+    /// `post_modifier` consults `target_is_vm_guest()` to choose between
+    /// `IOHIDPostEvent` and the CGEvent device-bits path. This is materially
+    /// milder than it sounds: the detection selects the injection TRANSPORT,
+    /// not the flag content — both branches derive from the same
+    /// `modifier_flags_changed_flags(depressed)` — and it is reachable only when
+    /// `LAN_MOUSE_HID_MODIFIERS` is set, with the default path falling straight
+    /// through with no detection at all. The byte-faithfulness clause is intact.
+    ///
+    /// But the no-detection clause is breached on that opt-in path, and the
+    /// project's own notes still assert that "the modifier path is still
+    /// detection-free and must stay that way." That claim is false here today.
+    /// Either the clause gets an explicit narrowing in the record or the
+    /// detection comes out — this test refuses to let a green suite imply the
+    /// former already happened.
+    ///
+    /// **A scan, and it has to be**: `post_modifier` takes `&self` on a type
+    /// that owns a live CGEventSource and an IOHID connection, so there is
+    /// nothing a unit test can construct. It scans the production half of this
+    /// file only; the split at the first `#[cfg(test)]` puts this module outside
+    /// the scanned region, so the guard cannot match its own text.
+    #[test]
+    #[ignore = "RED: post_modifier() branches on target_is_vm_guest, which the 2026-06-17 no-detection clause forbids. Narrow in effect (it picks the injection transport, not the flag content, and only under an env var) but a real breach, and the scroll sign is already gated the same way. Needs the DECISION amended with the narrowing and its reasoning, then this guard updated to permit exactly that — an owner call, not a code change. Tracked in #160."]
+    fn the_modifier_path_takes_no_decision_from_which_application_has_focus() {
+        const FULL: &str = include_str!("macos.rs");
+        let production = FULL.split("\n#[cfg(test)]").next().unwrap_or(FULL);
+        let start = production
+            .find("fn post_modifier(")
+            .expect("post_modifier must exist; if it was renamed, update this guard");
+        let rest = &production[start..];
+        let end = rest[1..]
+            .find("\n    fn ")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        let mut detectors = Vec::new();
+        for needle in ["target_is_vm_guest", "is_hypervisor_path", "bundle_id"] {
+            if body.contains(needle) {
+                detectors.push(needle);
+            }
+        }
+        assert!(
+            detectors.is_empty(),
+            "post_modifier() branches on {detectors:?}. The 2026-06-17 decision \
+             says modifier events are emitted for every target with NO VM or \
+             bundle-id detection, because per-hypervisor whitelisting is \
+             version-fragile, needs user config, and only ever helps the one \
+             product whose trick you copied — while hardware-faithful events \
+             generalise across apps and hypervisors with zero configuration. \
+             This particular use is narrow (it picks the injection transport, \
+             not the flag content, and only under LAN_MOUSE_HID_MODIFIERS), and \
+             the byte-faithfulness clause is untouched. It is still a breach of \
+             the no-detection clause, and it is the vector by which the rest of \
+             that clause erodes — the SCROLL sign is already gated the same way. \
+             Fix this by amending the decision with the narrowing and its \
+             reasoning, then update this guard to permit exactly that. Do not \
+             delete it: the project's own notes currently claim this path is \
+             detection-free, and they are wrong."
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // scroll honours the RECEIVER's preference
+    // -----------------------------------------------------------------------
+
+    /// **Decided 2026-06-17.** On macOS injection, read the receiver's
+    /// `com.apple.swipescrolldirection` and flip the scroll sign accordingly,
+    /// rather than passing the wire value through or negating unconditionally.
+    ///
+    /// **What this guard can and cannot prove.** It proves the function agrees
+    /// with the preference it claims to read, and that a malformed `i32::MIN`
+    /// off the wire does not overflow. It CANNOT prove the branch is live,
+    /// because `natural_scroll_enabled()` reads a real system preference with no
+    /// seam to inject through — so on a machine where natural scrolling is on,
+    /// an unconditional negate passes this test. That gap is recorded rather
+    /// than papered over; closing it means giving `apply_natural_scroll` the
+    /// preference as a parameter.
+    ///
+    /// Do not "simplify" this to an unconditional negate. Without the
+    /// conditional, a natural-scrolling sender scrolls backwards on a Mac — the
+    /// original reported defect — and an unconditional negate only moves the
+    /// breakage to the opposite-preference user.
+    #[test]
+    fn the_scroll_sign_follows_the_receivers_own_preference_and_survives_i32_min() {
+        let natural = natural_scroll_enabled();
+        assert_eq!(
+            apply_natural_scroll(7),
+            if natural { -7 } else { 7 },
+            "the injected scroll sign disagrees with this machine's own \
+             com.apple.swipescrolldirection setting. hops must honour the \
+             RECEIVER's preference: without it a natural-scrolling sender \
+             scrolls backwards on a Mac, which is the defect this was written \
+             for."
+        );
+        assert_eq!(
+            apply_natural_scroll(i32::MIN),
+            if natural { i32::MAX } else { i32::MIN },
+            "a malformed i32::MIN scroll delta off the wire overflowed. Plain \
+             negation of i32::MIN panics in debug and wraps in release; with \
+             `panic = \"abort\"` set for release builds, a single crafted value \
+             from an admitted peer takes the whole receiver down with every key \
+             it was holding still latched."
+        );
+    }
+}

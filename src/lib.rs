@@ -17,6 +17,11 @@ mod transport;
 pub mod trust;
 pub mod trust_file;
 
+/// Guards for decisions already made — and, three times now, rebuilt anyway.
+/// See the module docs for the bar each guard is held to.
+#[cfg(test)]
+mod decision_guards;
+
 #[cfg(test)]
 mod toolchain_pin {
     //! `rust-toolchain.toml` and the workflows must name the same compiler.

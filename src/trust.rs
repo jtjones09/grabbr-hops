@@ -46,9 +46,11 @@
 //! previous shape needed that rule restated at four separate doors, and the one
 //! it was missing was the boot path (#66).
 //!
-//! Keeping the lease *under* a denial is what makes removal reversible (#125).
+//! Keeping the lease *under* a denial is what keeps the removal legible — the
+//! machine stays distinguishable from a stranger. It does not make the removal
+//! reversible: an expelled fingerprint is never re-authorised.
 //! Revocation does not erase what was granted; it outranks it. So the single
-//! verb that undoes a removal is [`TrustStore::restore`], and it hands back
+//! There is no verb that undoes a removal. A removed machine returns by
 //! exactly the capabilities that existed — never a bit more, because it does not
 //! mint anything.
 //!
@@ -74,7 +76,7 @@
 //! reachable from a machine that is currently being driven by a peer, because
 //! that is precisely when a user needs to cut somebody off, and refusing to let
 //! them would remove the one action most needed at the moment it is needed.
-//! [`TrustStore::issue`] and [`TrustStore::restore`] are the opposite: issuing,
+//! [`TrustStore::issue`] is the opposite: issuing,
 //! widening or un-blocking is a grant, so the caller gates them on local
 //! presence before they get here. This module does not know about that gate; it
 //! only makes sure the verbs are separable.
@@ -534,7 +536,8 @@ pub struct Denial {
 /// Everything this machine knows about one identity.
 ///
 /// Both fields optional and both kept: a denial does not erase the lease it
-/// outranks, which is what makes removal reversible with one verb.
+/// outranks, so the row stays legible — an expelled machine is distinguishable
+/// from a stranger. It is not a way back in.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Entry {
     pub lease: Option<Lease>,
@@ -560,6 +563,16 @@ pub fn effective_capabilities(entry: &Entry, ours: &str, now: u64) -> Caps {
 /// between a user-facing message and a log line.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum TrustError {
+    /// The approval's provenance and the capability asked for disagree.
+    #[error(
+        "a {origin:?} approval cannot grant {granted} control — direction is the \
+         approval, and the user was never asked that question"
+    )]
+    DirectionMismatch {
+        origin: Origin,
+        granted: &'static str,
+    },
+
     /// The fingerprint was expelled. It can never be re-authorised: the machine
     /// must generate a new identity and pair from scratch.
     #[error(
@@ -572,7 +585,10 @@ pub enum TrustError {
     BadFingerprint(String),
     #[error("this machine holds no record of {0}")]
     Unknown(String),
-    #[error("{0} was removed; restore it before granting it anything")]
+    #[error(
+        "{0} was removed and cannot be granted anything — that identity is \
+         permanently dead; the machine must present a new one"
+    )]
     Denied(String),
     #[error("this lease was issued to {found}, but this machine is {ours}")]
     WrongMachine { ours: String, found: String },
@@ -684,7 +700,7 @@ impl TrustStore {
     /// Issue (or renew, or widen) a lease. The user-facing grant.
     ///
     /// Issuing **clears any denial** of that fingerprint. That is the whole of
-    /// "removal is reversible": there is no tombstone to launder around, because
+    /// the removal is one record: there is no second table to launder around, because
     /// the record of an expulsion is not a separate table that has to outrank
     /// this one — it is a field this verb clears. A user who removed a machine
     /// by mistake pairs it again; the machine does not have to burn its identity
@@ -700,7 +716,22 @@ impl TrustStore {
         caps: Caps,
         term_secs: u64,
     ) -> Result<(), TrustError> {
-        self.issue_with_origin(fingerprint, label, caps, term_secs, Origin::Inbound)
+        // Derive the provenance from what is being granted rather than
+        // defaulting to one. Hardcoding `Inbound` here made every outbound
+        // grant a direction mismatch, which is the API being wrong rather than
+        // the rule: a grant that only permits us to drive the peer came from a
+        // dial we made, by construction.
+        let inbound = caps.contains(Caps::DRIVE_ME);
+        let outbound = caps.contains(Caps::I_MAY_DRIVE);
+        let origin = match (inbound, outbound) {
+            // Both directions never come from ONE approval — a person is asked
+            // one question at a time. It is what migration produces, and what
+            // two separate approvals add up to.
+            (true, true) => Origin::Migrated,
+            (false, true) => Origin::OutboundDial,
+            _ => Origin::Inbound,
+        };
+        self.issue_with_origin(fingerprint, label, caps, term_secs, origin)
     }
 
     /// [`TrustStore::issue`], recording which act produced the lease.
@@ -724,6 +755,27 @@ impl TrustStore {
             not_after: now.saturating_add(term),
         }
         .canonicalized()?;
+
+        // Origin and direction may not disagree.
+        //
+        // The caller was fixed once — the service door now derives caps from
+        // the observed provenance — but a fix in one caller is not the
+        // invariant. Direction IS the approval: an unsolicited knock is the
+        // user answering "may this machine drive mine", our own dial is them
+        // answering "may I drive that machine". A grant that claims one origin
+        // and carries the other's capability is not a narrow over-grant on a
+        // product that reaches sudo, the browser and every MFA prompt.
+        let incoherent = match origin {
+            Origin::OutboundDial if caps.contains(Caps::DRIVE_ME) => Some("inbound"),
+            Origin::Inbound if caps.contains(Caps::I_MAY_DRIVE) => Some("outbound"),
+            _ => None,
+        };
+        if let Some(wrong) = incoherent {
+            return Err(TrustError::DirectionMismatch {
+                origin,
+                granted: wrong,
+            });
+        }
 
         // Through `admit`, deliberately, so there is exactly ONE door into the
         // store and it is the one that refuses an expelled fingerprint. This
@@ -1377,8 +1429,8 @@ mod tests {
         assert_eq!(
             (redacted, dropped),
             (2, 0),
-            "both names go — a removal keeps the lease beside it so `restore` \
-             can bring it back, and the lease carries the same name — but \
+            "both names go — a removal keeps the lease row beside it so the \
+             expulsion stays legible, and that row carries the same name — but \
              nothing is dropped"
         );
 
@@ -1777,7 +1829,7 @@ mod tests {
         assert!(
             s.is_known(&peer),
             "the lease is still on file — a removal outranks it rather than \
-             erasing it, which is what makes it reversible"
+             erasing it, so the machine stays distinguishable from a stranger"
         );
         assert_eq!(s.capabilities(&peer), Caps::NONE);
         assert!(!s.clipboard_from(&peer));

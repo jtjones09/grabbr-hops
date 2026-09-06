@@ -77,6 +77,17 @@ pub struct Service {
     trust: crate::transport::Trust,
     /// Sealed persistence for the store above.
     trust_file: crate::trust_file::TrustFile,
+    /// The provenance of the prompt each fingerprint is currently waiting on.
+    ///
+    /// A grant has to be shaped by HOW the peer arrived: an unsolicited knock
+    /// asks "may this machine drive mine", our own dial asks "may I drive that
+    /// machine". They are different questions and they were being answered with
+    /// the same capability, so confirming a receiver handed it control of this
+    /// machine — the exact harm the direction split exists to remove.
+    ///
+    /// Bounded like the TLS attempt queue, and for the same reason: anyone on
+    /// the network can cause an entry.
+    pending_origin: HashMap<String, AttemptOrigin>,
     /// (outgoing) client information
     client_manager: ClientManager,
     /// current port
@@ -200,29 +211,50 @@ impl Service {
             )?);
         let (mut trust_file, loaded) = crate::trust_file::TrustFile::open(&config_dir, authority)?;
 
-        let records = match loaded {
-            crate::trust_file::Loaded::Present { leases, .. } => leases,
+        let store = match loaded {
+            crate::trust_file::Loaded::Present { leases, .. } => {
+                let (store, refused) =
+                    crate::trust_file::rebuild(&public_key_fingerprint, trust_file.now(), &leases)?;
+                for why in &refused {
+                    // Reported, never dropped silently: a device losing trust
+                    // with no explanation is the failure this rework removes.
+                    log::warn!("trust store: {why}");
+                }
+                store
+            }
             crate::trust_file::Loaded::Absent => {
                 // First run under leases. This is the one-way door: after it,
                 // the config tables never answer a trust question again.
-                let migration = crate::trust_file::migrate(
-                    config.authorized_fingerprints(),
-                    config.revoked_fingerprints(),
+                //
+                // Through the store, deliberately. Outbound is granted only to
+                // a fingerprint the old config actually DIALLED — allowlist
+                // membership was necessary but not sufficient for outbound, so
+                // minting it for everything would create at upgrade exactly the
+                // capability this rework exists to retire.
+                let dialled: std::collections::HashSet<String> = client_manager
+                    .get_client_states()
+                    .into_iter()
+                    .filter_map(|(_, _, st)| st.peer_fingerprint)
+                    .collect();
+                let mut store =
+                    crate::trust::TrustStore::new(&public_key_fingerprint, trust_file.now())?;
+                let report = store.migrate_from_config(
+                    &config.authorized_fingerprints(),
+                    &config.revoked_fingerprints(),
+                    &dialled,
                     trust_file.now(),
                 );
-                migration.log();
-                trust_file.save(&migration.leases)?;
-                migration.leases
+                log::info!(
+                    "migrated the trust store: {} leases, {} removals, {} refused, {} dropped",
+                    report.leased.len(),
+                    report.denied.len(),
+                    report.refused.len(),
+                    report.dropped.len(),
+                );
+                trust_file.save(&crate::trust_file::records_of(&store))?;
+                store
             }
         };
-
-        let (store, refused) =
-            crate::trust_file::rebuild(&public_key_fingerprint, trust_file.now(), &records)?;
-        for why in &refused {
-            // Reported, never dropped silently: a device losing trust with no
-            // explanation is the failure this rework exists to remove.
-            log::warn!("trust store: {why}");
-        }
 
         drop_untrusted_pins(&client_manager, &store);
         let trust: crate::transport::Trust = Arc::new(RwLock::new(store));
@@ -299,6 +331,7 @@ impl Service {
             discovered: HashMap::new(),
             trust,
             trust_file,
+            pending_origin: HashMap::new(),
             public_key_fingerprint,
             client_manager,
             frontend_event_pending: Default::default(),
@@ -1013,13 +1046,32 @@ impl Service {
             )));
             return;
         }
-        // A lease, not a permanent entry. `Caps::INBOUND` because this door is
-        // the inbound approval — the outbound half is granted separately, which
-        // is the whole of #130.
+        // A lease, not a permanent entry — and shaped by how the peer arrived.
+        //
+        // An unsolicited knock is the user answering "may this machine drive
+        // mine": INBOUND. Our own dial is the user answering "may I drive that
+        // machine": OUTBOUND. Granting INBOUND for both is exactly the defect
+        // the direction split exists to remove, and it hid here because the
+        // split was built in the store and never wired to this door.
+        //
+        // Unknown provenance grants nothing. A grant with no prompt behind it
+        // is the case worth failing closed on.
+        let origin = self.pending_origin.remove(&fp);
+        let caps = match origin {
+            Some(AttemptOrigin::Inbound) => crate::trust::Caps::INBOUND,
+            Some(AttemptOrigin::OutboundDial) => crate::trust::Caps::OUTBOUND,
+            None => {
+                log::warn!(
+                    "refusing to authorize {fp}: no pending connection attempt, so there \
+                     is no observed provenance to shape the grant"
+                );
+                return;
+            }
+        };
         if let Err(e) = self.trust.write().expect("lock").issue(
             &fp,
             &desc,
-            crate::trust::Caps::INBOUND,
+            caps,
             crate::trust::DEFAULT_TERM_SECS,
         ) {
             log::warn!("refusing to authorize {fp}: {e}");
@@ -1091,6 +1143,12 @@ impl Service {
                  address so it can be compared with the one that was typed"
             );
         }
+        // Remembered so the grant door mints the capability that matches how
+        // this peer actually arrived, rather than a fixed one.
+        if self.pending_origin.len() >= crate::transport::MAX_PENDING_ATTEMPTS {
+            self.pending_origin.clear();
+        }
+        self.pending_origin.insert(fingerprint.clone(), origin);
         self.notify_frontend(FrontendEvent::ConnectionAttempt {
             fingerprint,
             origin,
@@ -1483,19 +1541,19 @@ mod trust_door_guard {
         use std::collections::HashMap;
 
         let fp = fp32(0xaa);
-        let migration = crate::trust_file::migrate(
-            HashMap::from([(fp.clone(), "laundered".to_string())]),
-            HashMap::from([(
+        let mut store = crate::trust::TrustStore::new(&fp32(0x01), 0).expect("ours");
+        store.migrate_from_config(
+            &HashMap::from([(fp.clone(), "laundered".to_string())]),
+            &HashMap::from([(
                 fp.clone(),
                 hops_ipc::RevokedEntry {
                     label: "expelled".to_string(),
                     revoked_at: 1_000,
                 },
             )]),
+            &std::collections::HashSet::new(),
             2_000,
         );
-        let (store, _) =
-            crate::trust_file::rebuild(&fp32(0x01), 0, &migration.leases).expect("rebuild");
 
         assert_eq!(
             store.capabilities(&fp),

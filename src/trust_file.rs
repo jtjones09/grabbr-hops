@@ -81,8 +81,7 @@ use thiserror::Error;
 
 use crate::trust::{Caps, Denial, Lease, Origin, TrustError, TrustStore};
 
-use hops_ipc::RevokedEntry;
-use hops_ipc::pairing::{canonical_fingerprint, sanitize_label};
+use hops_ipc::pairing::canonical_fingerprint;
 
 use crate::authority::{Authority, AuthorityError, SignatureAlg, verify};
 use crate::config::write_atomically;
@@ -804,9 +803,9 @@ pub struct Migration {
 ///
 /// It keeps doing the one thing revocation could always do: an explicitly
 /// revoked peer cannot raise a prompt, so it cannot choose the moment its user
-/// is asked a security question. What changes is that the user can now restore
-/// it deliberately — a grant, and therefore gated by
-/// `refuse_while_remotely_driven` like every other grant.
+/// is asked a security question. And it is permanent for that key — the machine
+/// returns by generating a new identity and pairing from scratch, which an
+/// attacker holding only the expelled key cannot do.
 ///
 /// # Expiry on a migrated lease: [`MIGRATION_TERM_SECS`], not [`DEFAULT_TERM_SECS`]
 ///
@@ -953,88 +952,18 @@ pub fn records_of(store: &TrustStore) -> Vec<LeaseRecord> {
     out.sort_by(|a, b| a.fingerprint.cmp(&b.fingerprint));
     out
 }
-
-pub fn migrate(
-    authorized: HashMap<String, String>,
-    revoked: HashMap<String, RevokedEntry>,
-    now: u64,
-) -> Migration {
-    let mut out = Migration::default();
-
-    // Tombstones first, so the allowlist pass can see them. This IS
-    // `subtract_revoked`: revocation outranks the allowlist, applied one final
-    // time at the moment the two tables become one. After this there is nothing
-    // left to rank and nothing left that could disagree.
-    let mut revoked: Vec<(String, RevokedEntry)> = revoked.into_iter().collect();
-    revoked.sort_by(|a, b| a.0.cmp(&b.0));
-    for (fp, entry) in revoked {
-        // Both readers already lowercase; belt and braces, because the entire
-        // point of #67 was two sides normalising differently.
-        let fp = fp.trim().to_lowercase();
-        out.leases.push(LeaseRecord {
-            label: sanitize_label(&entry.label),
-            fingerprint: fp,
-            state: DiskState::Revoked,
-            origin: DiskOrigin::Migrated,
-            issued_at: now,
-            expires_at: None,
-            // Untrusted input: it came off disk, and today's writer stores a raw
-            // `SystemTime::now()` with a 0 fallback. Clamp a future value to
-            // now — a tombstone cannot have been written tomorrow — and keep 0
-            // as "unknown", which is what the existing fallback already means.
-            //
-            // Deliberately NOT fed into the clock floor. The floor only
-            // increases, so one hand-written `revoked_at = 4102444800` would
-            // pin this machine's clock in the year 2100 forever and expire
-            // every lease on it instantly.
-            revoked_at: Some(entry.revoked_at.min(now)),
-            caps: Vec::new(),
-        });
-        out.tombstones += 1;
-    }
-
-    let tombstoned: HashMap<&str, ()> = out
-        .leases
-        .iter()
-        .map(|l| (l.fingerprint.as_str(), ()))
-        .collect();
-
-    let mut authorized: Vec<(String, String)> = authorized.into_iter().collect();
-    authorized.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut carried: Vec<LeaseRecord> = Vec::new();
-    for (fp, label) in authorized {
-        let Some(fp) = canonical_fingerprint(&fp) else {
-            // Computed leaf-cert fingerprints are always canonical, so a
-            // malformed key here could never have matched a peer — it granted
-            // nothing and dropping it takes nothing away. The asymmetry with
-            // the revoked branch above is deliberate: an unmatchable *grant* is
-            // inert, an unmatchable *denial* is still a recorded decision.
-            out.dropped.push(fp);
-            continue;
-        };
-        if tombstoned.contains_key(fp.as_str()) {
-            out.refused.push(fp);
-            continue;
-        }
-        carried.push(LeaseRecord {
-            // `add_authorized_key` never sanitised its description — only
-            // `set_label` did — so every label arriving from that door, the CLI
-            // included, reaches this point unsanitised. Sanitise on the way in.
-            label: sanitize_label(&label),
-            fingerprint: fp,
-            state: DiskState::Active,
-            origin: DiskOrigin::Migrated,
-            issued_at: now,
-            expires_at: Some(now.saturating_add(MIGRATION_TERM_SECS)),
-            revoked_at: None,
-            caps: vec![DiskCap::Inbound, DiskCap::Outbound],
-        });
-    }
-    out.carried_forward = carried.len();
-    out.leases.extend(carried);
-    out.leases.sort_by(|a, b| a.fingerprint.cmp(&b.fingerprint));
-    out
-}
+// There is deliberately no `migrate` here.
+//
+// There were two, and they disagreed: this one granted every carried-forward
+// fingerprint BOTH directions unconditionally, while `TrustStore::migrate_from_config`
+// grants outbound only to a peer the old config actually dialled — and explains
+// at length why minting it otherwise is a capability the user never granted,
+// created at upgrade, by the code that claims to retire exactly that defect.
+//
+// The one with the reasoning and the tests had zero production callers. The one
+// that ran had none of either. Two implementations of one rule is how that
+// happens, so there is now one: the daemon migrates through the store and calls
+// `records_of` to get the rows to seal.
 
 impl Migration {
     /// One line per fact a user might otherwise have to guess at.
@@ -1061,6 +990,7 @@ impl Migration {
 mod tests {
     use super::*;
     use crate::authority::{AUTHORITY_KEY_FILE_NAME, SoftwareAuthority};
+    use hops_ipc::RevokedEntry;
 
     const A: &str = "00:01:02:03:04:05:06:07:08:09:0a:0b:0c:0d:0e:0f:\
 10:11:12:13:14:15:16:17:18:19:1a:1b:1c:1d:1e:1f";
@@ -1105,6 +1035,46 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// Test-only shim with the shape the old duplicate had, routed through the
+    /// ONE migration that survives. These tests are about persistence — sealing,
+    /// round-tripping, rollback — and only ever used a migration as a convenient
+    /// way to produce rows. They keep doing that, against the implementation
+    /// that actually runs.
+    ///
+    /// `dialled` is empty here, so a carried-forward fingerprint gets INBOUND
+    /// only. That is the correct rule and it is why the over-grant test below
+    /// changed rather than being deleted.
+    fn migrate(
+        authorized: HashMap<String, String>,
+        revoked: HashMap<String, RevokedEntry>,
+        now: u64,
+    ) -> Migration {
+        let mut store = TrustStore::new(
+            &"aa"
+                .repeat(32)
+                .as_bytes()
+                .chunks(2)
+                .map(|c| std::str::from_utf8(c).expect("ascii"))
+                .collect::<Vec<_>>()
+                .join(":"),
+            now,
+        )
+        .expect("ours");
+        let report = store.migrate_from_config(
+            &authorized,
+            &revoked,
+            &std::collections::HashSet::new(),
+            now,
+        );
+        Migration {
+            leases: records_of(&store),
+            carried_forward: report.leased.len(),
+            tombstones: report.denied.len(),
+            refused: report.refused,
+            dropped: report.dropped,
+        }
     }
 
     fn find<'a>(m: &'a Migration, fp: &str) -> Option<&'a LeaseRecord> {
@@ -1154,15 +1124,26 @@ mod tests {
         assert!(find(&m, A).expect("record").effective_caps(NOW).is_empty());
     }
 
+    /// This asserted BOTH directions, and was wrong. The flat allowlist did
+    /// feed both verifiers, but membership was **necessary and not sufficient**
+    /// for outbound: a dial also needed a `[[clients]]` entry aimed at that
+    /// peer. A fingerprint that was allowlisted and never dialled had outbound
+    /// in theory and never once in practice, so minting it at upgrade creates a
+    /// capability the user never granted — by the code whose job is to retire
+    /// exactly that defect.
+    ///
+    /// The shim above migrates with an empty dialled set, so this peer is the
+    /// never-dialled case.
     #[test]
-    fn an_unrevoked_fingerprint_survives_with_both_directions() {
+    fn an_unrevoked_fingerprint_survives_with_inbound_and_is_not_handed_outbound() {
         let m = migrate(allow(&[(A, "laptop")]), tombstones(&[]), NOW);
         let lease = find(&m, A).expect("carried forward");
         assert_eq!(
             lease.effective_caps(NOW),
-            &[DiskCap::Inbound, DiskCap::Outbound],
-            "the flat allowlist fed BOTH verifiers; narrowing here would break \
-             a working fleet with nothing in the UI to explain it"
+            &[DiskCap::Inbound],
+            "a peer the old config never dialled keeps inbound — dropping that \
+             would break a working fleet with nothing in the UI to explain it — \
+             and must NOT be handed outbound it never had"
         );
         assert!(m.refused.is_empty());
     }
@@ -1197,7 +1178,7 @@ mod tests {
         assert_eq!(lease.label, "laptop", "but the name survives");
         assert_eq!(
             lease.caps,
-            vec![DiskCap::Inbound, DiskCap::Outbound],
+            vec![DiskCap::Inbound],
             "and so does what it was allowed to do, so renewal is one keystroke \
              rather than a re-pair"
         );
