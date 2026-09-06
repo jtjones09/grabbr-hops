@@ -2281,7 +2281,7 @@ mod tests {
     }
 
     #[test]
-    fn the_live_config_migrates_to_no_trust_and_a_removal_that_can_be_undone() {
+    fn the_live_config_migrates_to_no_trust_and_a_removal_that_is_permanent() {
         // The state actually on disk before the upgrade: no clients, an empty
         // `[authorized_fingerprints]`, one removal. Under the old store that
         // machine could never come back.
