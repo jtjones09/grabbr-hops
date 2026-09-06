@@ -559,6 +559,14 @@ pub fn effective_capabilities(entry: &Entry, ours: &str, now: u64) -> Caps {
 /// between a user-facing message and a log line.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum TrustError {
+    /// The fingerprint was expelled. It can never be re-authorised: the machine
+    /// must generate a new identity and pair from scratch.
+    #[error(
+        "{fingerprint} was removed and cannot be trusted again — that machine \
+         must generate a new identity and pair from scratch"
+    )]
+    Expelled { fingerprint: String },
+
     #[error("{0:?} is not a valid device fingerprint")]
     BadFingerprint(String),
     #[error("this machine holds no record of {0}")]
@@ -645,6 +653,20 @@ impl TrustStore {
             });
         }
         let peer = lease.peer.clone();
+
+        // An expelled fingerprint is dead for good. Recovery is the other
+        // machine generating a NEW identity and pairing from scratch — which is
+        // the whole point of issuing new keys, and the reason removal is
+        // destructive by nature. A path from expelled back to full keyboard
+        // control is a capability sitting in the daemon for a convenience worth
+        // almost nothing, since pairing fresh is a single approval.
+        //
+        // This is the door. There is deliberately no restore verb anywhere
+        // above it, so nothing can re-authorise a fingerprint by any route.
+        if self.entries.get(&peer).is_some_and(|e| e.denial.is_some()) {
+            return Err(TrustError::Expelled { fingerprint: peer });
+        }
+
         self.entries.entry(peer).or_default().lease = Some(lease);
         Ok(())
     }
@@ -701,11 +723,12 @@ impl TrustStore {
             not_after: now.saturating_add(term),
         }
         .canonicalized()?;
-        let peer = lease.peer.clone();
-        let entry = self.entries.entry(peer).or_default();
-        entry.denial = None;
-        entry.lease = Some(lease);
-        Ok(())
+
+        // Through `admit`, deliberately, so there is exactly ONE door into the
+        // store and it is the one that refuses an expelled fingerprint. This
+        // used to clear `entry.denial` here — a single line that undid a
+        // removal, which is precisely the path that must not exist.
+        self.admit(lease)
     }
 
     /// Extend an existing lease to a fresh term. Never widens capabilities, and
@@ -797,27 +820,6 @@ impl TrustStore {
             at,
         });
         label
-    }
-
-    /// Undo a removal. The reversible half of #125, and one verb.
-    ///
-    /// Clears the denial and nothing else: whatever lease was underneath comes
-    /// back exactly as it was, which is why this cannot widen anything. If the
-    /// lease had already lapsed, the device is renewable rather than trusted —
-    /// still the right outcome, and still not a grant.
-    ///
-    /// A grant nonetheless, in the sense that matters: it removes a block the
-    /// user put there. The caller gates it on local presence.
-    pub fn restore(&mut self, fingerprint: &str) -> bool {
-        let fp = key(fingerprint);
-        let Some(entry) = self.entries.get_mut(&fp) else {
-            return false;
-        };
-        let had = entry.denial.take().is_some();
-        if entry.lease.is_none() {
-            self.entries.remove(&fp);
-        }
-        had
     }
 
     /// Drop the record entirely — no lease, no denial, no memory of either.
@@ -1288,6 +1290,45 @@ mod tests {
     /// mDNS announcement — so keeping one leaks nothing. The label is the
     /// user's own name for their own machine, and keeping every label forever
     /// turns the store into an inventory of every device ever paired.
+    /// A removed machine comes back by generating a NEW identity, never by
+    /// reusing the key that was expelled.
+    ///
+    /// That is the whole point of issuing new keys: removal is destructive by
+    /// nature, because this is a system that if taken over could read every
+    /// keystroke. A stored path from expelled back to full keyboard control is
+    /// a capability sitting in the daemon for a convenience worth almost
+    /// nothing — pairing fresh is a single approval.
+    #[test]
+    fn an_expelled_key_is_dead_for_good_and_a_new_one_pairs_from_scratch() {
+        let mut s = store();
+        let old_key = fp(0x41);
+        s.issue(&old_key, "laptop", Caps::INBOUND, DAY)
+            .expect("issue");
+        s.revoke(&old_key);
+
+        assert!(
+            matches!(
+                s.issue(&old_key, "laptop", Caps::INBOUND, DAY),
+                Err(TrustError::Expelled { .. })
+            ),
+            "the expelled key must never be re-authorised, by any route"
+        );
+        assert!(!s.may_drive_us(&old_key));
+
+        // The same machine, a new identity. This is the supported recovery.
+        let new_key = fp(0x42);
+        s.issue(&new_key, "laptop", Caps::INBOUND, DAY)
+            .expect("a new identity pairs from scratch");
+        assert!(
+            s.may_drive_us(&new_key),
+            "the machine comes back — the key does not"
+        );
+        assert!(
+            !s.may_drive_us(&old_key),
+            "and the old key stays dead beside it"
+        );
+    }
+
     #[test]
     fn an_old_removal_keeps_biting_after_its_name_is_forgotten() {
         let mut s = store();
@@ -1692,66 +1733,6 @@ mod tests {
     // ------------------------------------------------------- removal + return
 
     #[test]
-    fn a_device_removed_and_added_again_is_trusted() {
-        // Issue #125. The old store refused this outright: the grant door checked
-        // the tombstone and returned, telling the user to reinstall hops on the
-        // other machine so it would generate a new identity.
-        let mut s = store();
-        let peer = fp(0x40);
-        s.issue(&peer, "old thinkpad", Caps::DRIVE_ME, DAY)
-            .expect("issue");
-        s.revoke(&peer);
-        assert!(!s.may_drive_us(&peer), "removal must bite immediately");
-
-        s.issue(&peer, "old thinkpad", Caps::DRIVE_ME, DAY)
-            .expect("re-adding a removed device must be possible — that is #125");
-        assert!(s.may_drive_us(&peer));
-        assert!(
-            !s.is_denied(&peer),
-            "the removal must not survive the re-add"
-        );
-    }
-
-    #[test]
-    fn restoring_a_removed_device_brings_back_the_lease_it_had() {
-        // One verb, and it is reversible. The lease is not erased by removal —
-        // the denial outranks it — so undoing the removal restores exactly the
-        // capabilities that were granted, and not a bit more.
-        let mut s = store();
-        let peer = fp(0x41);
-        s.issue(&peer, "desk mac", Caps::INBOUND, DAY)
-            .expect("issue");
-        s.revoke(&peer);
-        assert!(s.restore(&peer), "there was a removal to undo");
-
-        assert!(s.may_drive_us(&peer));
-        assert!(s.clipboard_from(&peer));
-        assert!(
-            !s.we_may_drive(&peer),
-            "restoring must return the lease that existed, never widen it"
-        );
-        assert!(!s.restore(&peer), "and undoing nothing reports nothing");
-    }
-
-    #[test]
-    fn restoring_a_device_whose_lease_had_lapsed_does_not_mint_one() {
-        let mut s = store();
-        let peer = fp(0x42);
-        s.issue(&peer, "kiosk", Caps::DRIVE_ME, HOUR)
-            .expect("issue");
-        s.revoke(&peer);
-        s.clock().observe(T0 + DAY);
-
-        assert!(s.restore(&peer));
-        assert!(
-            !s.may_drive_us(&peer),
-            "lifting the block clears the block; it does not grant anything"
-        );
-        assert!(s.may_prompt(&peer), "it may ask to be renewed");
-        assert!(s.is_known(&peer));
-    }
-
-    #[test]
     fn a_removal_outranks_an_unexpired_lease() {
         let mut s = store();
         let peer = fp(0x43);
@@ -1766,25 +1747,6 @@ mod tests {
         assert_eq!(s.capabilities(&peer), Caps::NONE);
         assert!(!s.clipboard_from(&peer));
         assert!(!s.clipboard_to(&peer));
-    }
-
-    #[test]
-    fn only_an_explicit_local_verb_clears_a_removal() {
-        let mut s = store();
-        let peer = fp(0x44);
-        s.issue(&peer, "kiosk", Caps::INBOUND, DAY).expect("issue");
-        s.revoke(&peer);
-
-        assert_eq!(s.renew(&peer, DAY), Err(TrustError::Denied(peer.clone())));
-        s.set_label(&peer, "friendly name").expect("rename is fine");
-        s.drop_capabilities(&peer, Caps::CLIPBOARD_FROM);
-        assert!(
-            s.is_denied(&peer),
-            "extending, renaming and narrowing must all leave the removal standing"
-        );
-
-        assert!(s.restore(&peer));
-        assert!(!s.is_denied(&peer));
     }
 
     #[test]
@@ -2353,14 +2315,13 @@ mod tests {
         );
 
         assert!(
-            s.restore(&expelled),
-            "a migrated removal must be reversible — that is #125"
-        );
-        assert!(s.may_prompt(&expelled));
-        assert_eq!(
-            s.capabilities(&expelled),
-            Caps::NONE,
-            "lifting the removal clears the block; it does not mint trust"
+            matches!(
+                s.issue(&expelled, "workshop", Caps::INBOUND, DAY),
+                Err(TrustError::Expelled { .. })
+            ),
+            "a removal carried across the migration must still be permanent — \
+             that machine returns by generating a new identity, not by reusing \
+             the key it was expelled on"
         );
     }
 
