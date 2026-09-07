@@ -2193,3 +2193,78 @@ fn a_test_identity() -> crate::crypto::Identity {
 fn a_test_certificate() -> rustls::pki_types::CertificateDer<'static> {
     a_test_identity().cert
 }
+
+// ---------------------------------------------------------------------------
+// the bundle declares what the code actually browses
+// ---------------------------------------------------------------------------
+
+mod discovery_is_declared_to_the_operating_system {
+    //! **Decided 2026-09-06, after the fact.** The macOS bundle must declare
+    //! every Bonjour service type the code browses, and must carry a Local
+    //! Network usage string.
+    //!
+    //! **Why this is a rule and not a packaging detail.** Both keys were absent.
+    //! macOS then permitted the outbound announcement and silently dropped every
+    //! response: hops advertised itself correctly, discovered nothing, and
+    //! rendered an empty list with no error on any surface. Launched from a
+    //! terminal it worked, because it inherited the terminal's grant — so the
+    //! failure only appeared in the deployment everyone actually uses, and
+    //! looked unreproducible for weeks.
+    //!
+    //! `NSBonjourServices` is the trap. Recent macOS requires an app to declare
+    //! the service types it browses; without the declaration the browse is
+    //! blocked whether or not Local Network is granted, and NO PROMPT IS EVER
+    //! SHOWN — so there is nothing in System Settings for a user to switch on.
+    //!
+    //! This is the cross-fragment class: two files, each internally consistent,
+    //! disagreeing. A test of either alone sees nothing wrong.
+
+    const PACKAGING: &str = include_str!("../scripts/package-macos.sh");
+
+    /// The value the OS needs: the browsed type without mDNS's trailing domain.
+    fn declared_form() -> String {
+        crate::discovery::SERVICE_TYPE
+            .trim_end_matches('.')
+            .trim_end_matches(".local")
+            .to_string()
+    }
+
+    #[test]
+    fn the_bundle_declares_the_service_type_the_code_browses() {
+        let needed = declared_form();
+        assert!(
+            PACKAGING.contains(&format!("<string>{needed}</string>"))
+                && PACKAGING.contains("<key>NSBonjourServices</key>"),
+            "the code browses {:?} but the app bundle does not declare {needed:?} \
+             in NSBonjourServices. macOS blocks an undeclared browse and shows no \
+             prompt, so discovery returns nothing forever and there is nothing a \
+             user can grant. If the service type changed, change it in both \
+             places — that is the whole point of this test.",
+            crate::discovery::SERVICE_TYPE
+        );
+    }
+
+    #[test]
+    fn the_bundle_asks_for_local_network_access() {
+        assert!(
+            // The full plist key form, not a substring: a bare `contains` of
+            // the name also matches a typo'd or suffixed key, which is exactly
+            // the mistake that would leave the prompt broken.
+            PACKAGING.contains("<key>NSLocalNetworkUsageDescription</key>"),
+            "the bundle carries no NSLocalNetworkUsageDescription, so macOS has \
+             no sentence to show when it asks for Local Network access. Without \
+             it the daemon can announce and cannot receive, which reads as \
+             'discovery finds nothing' with no error anywhere."
+        );
+    }
+
+    #[test]
+    fn the_declared_form_drops_the_mdns_domain_and_nothing_else() {
+        assert_eq!(
+            declared_form(),
+            "_hops._udp",
+            "NSBonjourServices takes the bare service type. Leaving the trailing \
+             `.local.` on it makes the declaration silently fail to match."
+        );
+    }
+}

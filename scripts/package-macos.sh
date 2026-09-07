@@ -57,6 +57,27 @@ ${ICON_KEY}
     <key>NSAppSleepDisabled</key><true/>
     <key>NSInputMonitoringUsageDescription</key>
     <string>hops needs Input Monitoring to capture your keyboard and mouse and forward it to the machines you've paired.</string>
+    <!--
+      Both keys are required for discovery, and BOTH were missing. macOS then
+      allowed the outbound announcement and silently dropped every response, so
+      hops advertised itself correctly, found nothing, and showed an empty list
+      with no error anywhere. Started from a terminal it worked, because it
+      inherited the terminal's grant — which is why this looked unreproducible.
+
+      NSBonjourServices is the one that is easy to miss: recent macOS requires an
+      app to DECLARE the service types it browses. Without it the browse is
+      blocked whether or not Local Network is granted, and no prompt is ever
+      shown, so there is nothing for the user to switch on.
+
+      The service type must match hops::discovery::SERVICE_TYPE with the
+      trailing `.local.` removed. A guard test enforces that.
+    -->
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>hops finds the other machines you have paired on your local network, so you can add them without typing an address.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_hops._udp</string>
+    </array>
 </dict>
 </plist>
 PLIST
