@@ -1190,3 +1190,64 @@ mod discovery_states {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// the tray's `visible` must stay bound, or hiding it aborts the app
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tray_const_property {
+    //! A `SystemTrayIcon` that never assigns `visible` gets it const-folded by
+    //! the Slint compiler: generated init sets it true, then calls
+    //! `set_constant()`. The generated `hide()` still writes `false`, and
+    //! writing a constant property panics "Constant property being changed" in
+    //! i-slint-core. The release profile sets `panic = "abort"`, so that is
+    //! SIGABRT for the whole app, not a caught error — issue #4.
+    //!
+    //! Binding it to a public `in-out` makes the compiler's `is_constant()`
+    //! false, so `set_constant()` is never emitted and `hide()` is safe.
+    //!
+    //! **This is a source scan, deliberately, and it is the legitimate case for
+    //! one:** the invariant is about text the Slint compiler reads, and a
+    //! behavioural test would need a real tray on a real display, which CI does
+    //! not have. It is scoped to the one file and mutation-tested.
+    //!
+    //! **It was deleted once**, during a merge-conflict resolution, with no
+    //! mention in the commit message — while the issue it guards stayed open
+    //! and the panic it prevents is still in the logs. Do not delete it again;
+    //! if the tray stops needing it, say so in the diff.
+
+    const TRAY: &str = include_str!("../ui/tray.slint");
+
+    #[test]
+    fn the_trays_visible_is_bound_to_a_property_and_not_a_literal() {
+        let bound = TRAY
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .any(|l| l.trim_start().starts_with("visible:") && l.contains("root."));
+        assert!(
+            bound,
+            "tray.slint no longer binds `visible` to a property. The Slint \
+             compiler will const-fold it, `hide()` will write a constant, and \
+             i-slint-core panics \"Constant property being changed\" — which \
+             under `panic = \"abort\"` takes the whole app down rather than \
+             failing an operation. See issue #4."
+        );
+    }
+
+    #[test]
+    fn the_property_it_binds_to_is_in_out_so_the_compiler_cannot_fold_it() {
+        let declared = TRAY
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .any(|l| l.contains("in-out property <bool> shown"));
+        assert!(
+            declared,
+            "the property `visible` binds to is no longer a public `in-out`. \
+             The compiler's is_constant() then returns true, set_constant() is \
+             emitted again, and hiding the tray aborts the app. The visibility \
+             is what defeats the folding — an equivalent private property does \
+             not."
+        );
+    }
+}
