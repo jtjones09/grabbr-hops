@@ -1,0 +1,37 @@
+#!/bin/bash
+# hops-ctl — address the daemon and the tray SEPARATELY.
+#
+#   hops-ctl status
+#   hops-ctl start-gui | stop-gui | restart-gui
+#   hops-ctl start-daemon | stop-daemon | restart-daemon
+#
+# systemd already runs them as two units; the launchers just never used that,
+# so restarting a crashed tray meant restarting both and stopping a working KVM
+# to fix a dead icon. Same verbs as the macOS and Windows copies.
+set -u
+DAEMON="hops.service"
+GUI="hops-gui.service"
+
+pid_of() { systemctl --user show -p MainPID --value "$1" 2>/dev/null; }
+
+report() {
+  for unit in "$DAEMON" "$GUI"; do
+    p="$(pid_of "$unit")"
+    if [ -n "$p" ] && [ "$p" != 0 ]; then echo "$unit  pid=$p"; else echo "$unit  not running"; fi
+  done
+  # A daemon started by the front door is not a unit, so systemd cannot see it —
+  # and it can still be the process holding the port and serving input.
+  others="$(pgrep -f 'hops daemon' 2>/dev/null | tr '\n' ' ')"
+  [ -n "${others// /}" ] && echo "note: hops daemon pids seen outside systemd: $others"
+}
+
+case "${1:-status}" in
+  status) report ;;
+  stop-gui)                    systemctl --user stop "$GUI";    echo "stopped $GUI" ;;
+  stop-daemon)                 systemctl --user stop "$DAEMON"; echo "stopped $DAEMON" ;;
+  # Only this unit is named, so the other cannot be caught by accident the way
+  # a pkill on the image name would catch it.
+  start-gui|restart-gui)       systemctl --user restart "$GUI";    echo "restarted $GUI" ;;
+  start-daemon|restart-daemon) systemctl --user restart "$DAEMON"; echo "restarted $DAEMON" ;;
+  *) echo "usage: $0 {status|start-gui|stop-gui|restart-gui|start-daemon|stop-daemon|restart-daemon}"; exit 1 ;;
+esac
