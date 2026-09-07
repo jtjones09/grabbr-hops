@@ -104,7 +104,23 @@ RUSTFLAGS="-D warnings" cargo check --workspace --all-targets --no-default-featu
 cargo test --workspace --no-default-features --features "tui slint"
 cargo fmt --all --check
 HOPS_LOG_LEVEL=debug cargo run -- daemon
+
+# is the binary about to run the one the source says it should be?
+hops build-check --repo /path/to/repo            # report; exit 0 always
+hops build-check --repo /path/to/repo --strict   # exit 1 when stale
 ```
+
+`build-check` compares the commit baked in by `build.rs` AND the binary's mtime
+against the newest tracked source file. Both halves are needed: the commit alone
+misses an uncommitted edit, because a binary built before that edit still reports
+a commit equal to `HEAD`. Every launcher runs it — dev launchers with `--strict`
+so a stale binary cannot be tested by accident, daily launchers without, since a
+promoted build is deliberately behind and must still start.
+
+It lives in `src/build_check.rs` rather than in the launchers because the same
+policy hand-written per OS is exactly how the platforms drifted: one built before
+launching and another did not, which cost a full test cycle against a binary from
+the previous day.
 
 `hops-gtk` was retired on 2026-08-30 (2,585 LOC, never adopted the `Device` model, shipped by
 no workflow, yet held `default` and first pick in `src/main.rs` dispatch — so a bare `cargo build`

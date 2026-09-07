@@ -189,6 +189,21 @@ pub enum Command {
     },
     /// open the terminal interface (attaches to the daemon)
     Tui,
+    /// report whether this binary matches the source it was built from
+    ///
+    /// Launchers run this before starting anything, so a stale binary is
+    /// noticed at launch rather than halfway through a test session.
+    BuildCheck {
+        /// source tree to compare against (default: $HOPS_REPO, else the
+        /// working directory)
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// exit non-zero when stale — for dev launchers, where testing an old
+        /// binary measures the wrong code. Daily launchers omit it: a promoted
+        /// build is deliberately behind and must still start.
+        #[arg(long)]
+        strict: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]

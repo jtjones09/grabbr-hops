@@ -1,4 +1,5 @@
 pub mod authority;
+pub mod build_check;
 mod capture;
 pub mod capture_test;
 pub mod client;

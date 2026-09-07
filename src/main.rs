@@ -58,6 +58,10 @@ fn run() -> Result<(), HopsError> {
             Command::Daemon => run_daemon(config)?,
             Command::Gui { hidden } => run_gui(hidden)?,
             Command::Tui => run_tui()?,
+            Command::BuildCheck { repo, strict } => {
+                let r = hops::build_check::check(repo.clone());
+                process::exit(hops::build_check::report(&r, strict));
+            }
         },
         None => {
             //  otherwise start the service as a child process and
