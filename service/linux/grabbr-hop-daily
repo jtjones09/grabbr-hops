@@ -1,0 +1,20 @@
+#!/bin/bash
+# grabbr-hop — DAILY DRIVER (run this for normal, everyday use).
+# Points the systemd user service at the promoted binary ~/grabbr-hop/hops,
+# which dev rebuilds never touch, then opens the app.
+. "$HOME/grabbr-hop/.hops-paths" || { echo "missing .hops-paths"; exit 1; }
+
+if [ ! -x "$HOPS_DAILY" ]; then
+  echo "No daily binary at $HOPS_DAILY."
+  echo "Build + promote one: run grabbr-hop-dev, validate it, then promote-to-daily."
+  exit 1
+fi
+
+# Say what this binary is, then start it regardless. A promoted daily is
+# deliberately behind the source — that is what promoting means.
+hops_gate "$HOPS_DAILY" report
+
+"$HOME/grabbr-hop/.switch-to" "$HOPS_DAILY"
+echo "grabbr-hop: now on the DAILY build ($HOPS_DAILY)."
+sleep 1
+exec "$HOPS_DAILY"

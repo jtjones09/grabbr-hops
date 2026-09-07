@@ -1,0 +1,20 @@
+#!/bin/bash
+# grabbr-hop — DEV / TEST. Rebuilds the working tree, checks the build matches
+# the source, then points the systemd user service at it. Your DAILY binary
+# (~/grabbr-hop/hops) is untouched — run grabbr-hop-daily to switch back.
+. "$HOME/grabbr-hop/.hops-paths" || { echo "missing .hops-paths"; exit 1; }
+
+cd "$HOPS_REPO" || { echo "no repo at $HOPS_REPO"; hops_hold; exit 1; }
+echo "building dev..."
+cargo build --release --no-default-features --features "tui slint" \
+  || { echo; echo "  build failed — nothing was switched."; hops_hold; exit 1; }
+
+# Before anything is switched, so an abort leaves the running service alone.
+hops_gate "$HOPS_RAW" strict || { hops_hold; exit 1; }
+
+"$HOME/grabbr-hop/.switch-to" "$HOPS_RAW" || { hops_hold; exit 1; }
+echo "grabbr-hop: now on the DEV build ($HOPS_RAW)."
+echo "  running: $("$HOPS_RAW" --version 2>&1 | head -1)"
+echo "  -> run grabbr-hop-daily to switch back to your stable daily."
+sleep 1
+exec "$HOPS_RAW" tui

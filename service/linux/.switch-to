@@ -1,0 +1,41 @@
+#!/bin/bash
+# internal helper — point the systemd --user service at $1 (a hops binary),
+# rewrite the unit, and restart it. The launchd counterpart on macOS is the
+# same shape. Not meant to be run directly.
+BIN="$1"
+UNITS="$HOME/.config/systemd/user"
+mkdir -p "$UNITS" || exit 1
+
+cat > "$UNITS/hops.service" <<UNIT
+[Unit]
+Description=hops — software KVM
+After=graphical-session.target
+BindsTo=graphical-session.target
+
+[Service]
+ExecStart=${BIN} daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
+UNIT
+
+systemctl --user daemon-reload || exit 1
+systemctl --user restart hops.service || exit 1
+
+# systemd reports a Type=simple unit as started the moment it forks, so this
+# says the unit was accepted — not that the daemon stayed up. The log is what
+# actually answers that; hops opens it itself at ~/.local/state/hops/.
+echo "hops.service now points at: $BIN"
+
+# The hops front door spawns a detached daemon outside systemd on Linux
+# (start_detached_daemon), so an older one can still hold the port and keep
+# serving input while the unit looks fine. Worth knowing about; not worth
+# killing automatically from a launcher.
+others="$(pgrep -f 'hops daemon' 2>/dev/null | grep -v "$(systemctl --user show -p MainPID --value hops.service 2>/dev/null)" | tr '\n' ' ')"
+[ -n "${others// /}" ] && {
+  echo "note: hops daemon also running outside systemd (pid: $others)"
+  echo "      if input goes to the wrong build, stop those first"
+}
+exit 0
