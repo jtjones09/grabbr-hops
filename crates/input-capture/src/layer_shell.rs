@@ -371,8 +371,17 @@ impl LayerShellInputCapture {
         inner.state.active_positions.remove(&pos);
         // remove all windows corresponding to this client
         while let Some(i) = inner.state.active_windows.iter().position(|w| w.pos == pos) {
-            inner.state.active_windows.remove(i);
-            inner.state.focused = None;
+            let removed = inner.state.active_windows.remove(i);
+            // Only if it was THIS window. Tearing down a capture at one edge
+            // used to drop the pointer focus held at another: a peer
+            // disconnecting, or re-entering from a different edge, destroys an
+            // unrelated position while the user is mid-session on a remote
+            // machine. The compositor sends no new Enter for a surface it did
+            // not touch, so nothing ever restored the focus — and pointer
+            // events kept arriving into an empty slot.
+            if crate::removal_drops_focus(inner.state.focused.as_ref(), &removed) {
+                inner.state.focused = None;
+            }
         }
     }
 }
@@ -774,7 +783,13 @@ impl Dispatch<WlPointer, ()> for State {
                 button,
                 state,
             } => {
-                let window = app.focused.as_ref().unwrap();
+                // No focus, no event. The keyboard and relative-pointer arms
+                // below already read this field this way; these three did not,
+                // and under `panic = "abort"` that turned a dropped button or
+                // scroll into a dead daemon, stranding every key the peer held.
+                let Some(window) = app.focused.as_ref() else {
+                    return;
+                };
                 app.pending_events.push_back((
                     window.pos,
                     CaptureEvent::Input(Event::Pointer(PointerEvent::Button {
@@ -785,7 +800,13 @@ impl Dispatch<WlPointer, ()> for State {
                 ));
             }
             wl_pointer::Event::Axis { time, axis, value } => {
-                let window = app.focused.as_ref().unwrap();
+                // No focus, no event. The keyboard and relative-pointer arms
+                // below already read this field this way; these three did not,
+                // and under `panic = "abort"` that turned a dropped button or
+                // scroll into a dead daemon, stranding every key the peer held.
+                let Some(window) = app.focused.as_ref() else {
+                    return;
+                };
                 if app.scroll_discrete_pending {
                     // each axisvalue120 event is coupled with
                     // a corresponding axis event, which needs to
@@ -803,7 +824,13 @@ impl Dispatch<WlPointer, ()> for State {
                 }
             }
             wl_pointer::Event::AxisValue120 { axis, value120 } => {
-                let window = app.focused.as_ref().unwrap();
+                // No focus, no event. The keyboard and relative-pointer arms
+                // below already read this field this way; these three did not,
+                // and under `panic = "abort"` that turned a dropped button or
+                // scroll into a dead daemon, stranding every key the peer held.
+                let Some(window) = app.focused.as_ref() else {
+                    return;
+                };
                 app.scroll_discrete_pending = true;
                 app.pending_events.push_back((
                     window.pos,

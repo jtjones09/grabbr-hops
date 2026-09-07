@@ -468,3 +468,70 @@ mod destroy_purges_pending {
         );
     }
 }
+
+/// Whether removing `removed` should also drop the currently focused window.
+///
+/// Only when they are the same window. This lives here, ungated, rather than
+/// beside its one caller in the Wayland backend, because that backend only
+/// compiles on Linux — so a test next to it would never run on the machines
+/// where this is developed, and the rule is worth more than the locality.
+///
+/// The rule exists because the Wayland backend used to clear the pointer focus
+/// whenever it tore down *any* capture. Destroying a capture at one screen edge
+/// while the user was driving a remote machine through another dropped the live
+/// focus, and the compositor sends no fresh `Enter` for a surface it never
+/// touched — so nothing restored it, and the next button or scroll event
+/// arrived with nowhere to go.
+// Its only caller is the Wayland backend, which compiles on Linux alone — so
+// on every other platform this is dead code, and CI builds with `-D warnings`.
+// Gating it to Linux instead would take the tests with it, which defeats the
+// reason it was put here.
+#[allow(dead_code)]
+pub(crate) fn removal_drops_focus<T>(
+    focused: Option<&std::sync::Arc<T>>,
+    removed: &std::sync::Arc<T>,
+) -> bool {
+    focused.is_some_and(|f| std::sync::Arc::ptr_eq(f, removed))
+}
+
+#[cfg(test)]
+mod focus_removal {
+    use super::removal_drops_focus;
+    use std::sync::Arc;
+
+    #[test]
+    fn removing_the_focused_window_drops_the_focus() {
+        let focused = Arc::new("edge-left");
+        assert!(removal_drops_focus(Some(&focused), &focused));
+    }
+
+    #[test]
+    fn removing_a_different_window_leaves_the_focus_alone() {
+        let focused = Arc::new("edge-left");
+        let other = Arc::new("edge-right");
+        assert!(
+            !removal_drops_focus(Some(&focused), &other),
+            "tearing down a capture at one edge must not drop the pointer focus \
+             held at another. A peer disconnecting, or re-entering from a \
+             different edge, destroys an unrelated position while the user is \
+             mid-session on a remote machine — and the compositor sends no new \
+             Enter for a surface it did not touch, so the focus never comes back."
+        );
+    }
+
+    #[test]
+    fn equal_contents_are_not_the_same_window() {
+        let focused = Arc::new("edge-left");
+        let twin = Arc::new("edge-left");
+        assert!(
+            !removal_drops_focus(Some(&focused), &twin),
+            "identity, not equality — two surfaces can describe the same edge"
+        );
+    }
+
+    #[test]
+    fn nothing_focused_is_not_a_removal() {
+        let removed = Arc::new("edge-left");
+        assert!(!removal_drops_focus(None, &removed));
+    }
+}
