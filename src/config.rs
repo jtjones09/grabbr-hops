@@ -536,6 +536,18 @@ fn subtract_revoked(
     (authorized, refused)
 }
 
+/// The subcommand, parsed from argv alone.
+///
+/// `build-check` is a diagnostic, so it has to answer when the config file is
+/// unreadable — which is precisely when someone is trying to find out what is
+/// wrong. `Config::new()` loads and validates that file before any subcommand
+/// is dispatched, so a single bad line there made the check exit 1 having never
+/// run, and every launcher reported "stale, rebuild" for a problem no rebuild
+/// could fix.
+pub fn command_from_args() -> Option<Command> {
+    Args::parse().command
+}
+
 impl Config {
     pub fn new() -> Result<Self, ConfigError> {
         let args = Args::parse();

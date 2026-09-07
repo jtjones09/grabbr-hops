@@ -43,6 +43,23 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
+/// The check passed, or was not asked to enforce anything.
+pub const EXIT_OK: i32 = 0;
+/// `--strict`, and the binary does not match the source.
+///
+/// Deliberately not 1. Every other failure in this process also exits 1 —
+/// `main` maps any error to `process::exit(1)` — so a launcher reading 1 as
+/// "stale" also reads "your config file is unparseable" as "stale", and tells
+/// you to rebuild for a problem no rebuild can fix. Staleness needs a code
+/// nothing else uses.
+pub const EXIT_STALE: i32 = 2;
+/// `--strict`, and the comparison could not be made at all.
+///
+/// Separate from stale because the remedy is different — a repo path or a
+/// missing `git`, not a rebuild — and separate from success because a gate that
+/// verified nothing must never report that it verified something.
+pub const EXIT_CANNOT_VERIFY: i32 = 3;
+
 /// What a build check concluded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -139,11 +156,24 @@ fn newest_source(repo: &Path) -> Option<(String, SystemTime)> {
                 || f.ends_with(".slint")
                 || f.ends_with(".lock")
         })
+        .filter(|f| !is_separate_target(f))
         .filter_map(|f| {
             let mtime = std::fs::metadata(repo.join(f)).ok()?.modified().ok()?;
             Some((f.to_string(), mtime))
         })
         .max_by_key(|(_, t)| *t)
+}
+
+/// Whether this path builds into its own cargo target rather than the binary.
+///
+/// Integration tests, benches and examples are separate targets: editing one
+/// cannot change `hops`, so counting them makes the binary look stale when it
+/// is not. That is not merely noisy — a spurious stale verdict blocks a
+/// promotion that should have gone ahead, and adding a test is a normal thing
+/// to do between validating a build and promoting it.
+fn is_separate_target(path: &str) -> bool {
+    path.split('/')
+        .any(|c| matches!(c, "tests" | "benches" | "examples"))
 }
 
 /// Everything the report needs, gathered from the running binary and the repo.
@@ -223,7 +253,16 @@ pub fn report(r: &Report, strict: bool) -> i32 {
                 "hops {} — no source tree to compare against",
                 r.built_commit
             );
-            0
+            if strict {
+                // Someone asked for this to be verified and it could not be.
+                // Returning 0 here would be a gate that passes having checked
+                // nothing — which reads as proof and is worse than no gate.
+                println!("  CANNOT VERIFY: no git checkout at the path given");
+                println!("  the binary may or may not match; nothing was compared");
+                EXIT_CANNOT_VERIFY
+            } else {
+                EXIT_OK
+            }
         }
         Verdict::Current => {
             let dirty = if r.dirty {
@@ -244,9 +283,9 @@ pub fn report(r: &Report, strict: bool) -> i32 {
             }
             if strict {
                 println!("  rebuild before testing, or you will be testing the old code");
-                1
+                EXIT_STALE
             } else {
-                0
+                EXIT_OK
             }
         }
         Verdict::SourceNewer { newest } => {
@@ -254,9 +293,9 @@ pub fn report(r: &Report, strict: bool) -> i32 {
             println!("  {}", r.binary.display());
             if strict {
                 println!("  rebuild before testing, or you will be testing the old code");
-                1
+                EXIT_STALE
             } else {
-                0
+                EXIT_OK
             }
         }
     }
@@ -269,6 +308,89 @@ mod tests {
 
     fn t(secs: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    fn rep(verdict: Verdict) -> Report {
+        Report {
+            verdict,
+            built_commit: "abc12345".into(),
+            head: Some("abc12345".into()),
+            dirty: false,
+            behind: None,
+            binary: PathBuf::from("/tmp/hops"),
+        }
+    }
+
+    #[test]
+    fn stale_uses_a_code_no_other_failure_uses() {
+        assert_ne!(
+            EXIT_STALE, 1,
+            "every other failure in this process exits 1 — `main` maps any error \
+             to exit(1) — so if stale were also 1, a launcher would report \
+             \"stale, rebuild\" for an unparseable config file, which no rebuild fixes"
+        );
+        assert_ne!(EXIT_CANNOT_VERIFY, 1);
+        assert_ne!(EXIT_STALE, EXIT_CANNOT_VERIFY);
+        assert_ne!(EXIT_STALE, EXIT_OK);
+    }
+
+    #[test]
+    fn a_gate_that_compared_nothing_does_not_report_success() {
+        assert_eq!(
+            report(&rep(Verdict::NotACheckout), true),
+            EXIT_CANNOT_VERIFY,
+            "under --strict, being unable to find a checkout means nothing was \
+             compared. Returning success there is a gate that passes having \
+             verified nothing, which reads as proof and is worse than no gate."
+        );
+    }
+
+    #[test]
+    fn a_daily_launcher_is_never_blocked() {
+        for v in [
+            Verdict::NotACheckout,
+            Verdict::Current,
+            Verdict::WrongCommit {
+                built: "a".into(),
+                head: "b".into(),
+            },
+            Verdict::SourceNewer {
+                newest: "src/x.rs".into(),
+            },
+        ] {
+            assert_eq!(
+                report(&rep(v.clone()), false),
+                EXIT_OK,
+                "without --strict nothing may block a launch: a promoted daily \
+                 build is deliberately behind HEAD, and refusing to start it \
+                 would break the everyday driver. {v:?} blocked it."
+            );
+        }
+    }
+
+    #[test]
+    fn a_separate_cargo_target_does_not_make_the_binary_look_stale() {
+        for p in [
+            "tests/logging_sink.rs",
+            "crates/hops-ipc/tests/auth_roundtrip.rs",
+            "crates/hops-slint/examples/render_png.rs",
+            "benches/x.rs",
+        ] {
+            assert!(
+                is_separate_target(p),
+                "{p} builds its own target and cannot change the hops binary; \
+                 counting it makes a current binary look stale and blocks a \
+                 promotion that should have gone ahead"
+            );
+        }
+        for p in [
+            "src/service.rs",
+            "crates/hops-ipc/src/lib.rs",
+            "Cargo.lock",
+            "build.rs",
+        ] {
+            assert!(!is_separate_target(p), "{p} does link into the binary");
+        }
     }
 
     #[test]

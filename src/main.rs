@@ -42,10 +42,22 @@ fn main() {
     hops::logging::init(hops::logging::role_from_argv());
     install_panic_logger();
 
+    // Before anything that reads the config. This is the command someone runs
+    // to find out why the others are failing, so it must not need them to work.
+    if let Some(config::Command::BuildCheck { repo, strict }) = config::command_from_args() {
+        run_build_check(repo, strict);
+    }
+
     if let Err(e) = run() {
         log::error!("{e}");
         process::exit(1);
     }
+}
+
+/// Report whether this binary matches its source, then exit. Never returns.
+fn run_build_check(repo: Option<std::path::PathBuf>, strict: bool) -> ! {
+    let r = hops::build_check::check(repo);
+    process::exit(hops::build_check::report(&r, strict))
 }
 
 fn run() -> Result<(), HopsError> {
@@ -58,10 +70,9 @@ fn run() -> Result<(), HopsError> {
             Command::Daemon => run_daemon(config)?,
             Command::Gui { hidden } => run_gui(hidden)?,
             Command::Tui => run_tui()?,
-            Command::BuildCheck { repo, strict } => {
-                let r = hops::build_check::check(repo.clone());
-                process::exit(hops::build_check::report(&r, strict));
-            }
+            // Normally handled in `main` before the config is loaded; kept
+            // here so the match stays exhaustive and both paths behave alike.
+            Command::BuildCheck { repo, strict } => run_build_check(repo.clone(), strict),
         },
         None => {
             //  otherwise start the service as a child process and
