@@ -2219,7 +2219,11 @@ mod discovery_is_declared_to_the_operating_system {
     //! This is the cross-fragment class: two files, each internally consistent,
     //! disagreeing. A test of either alone sees nothing wrong.
 
-    const PACKAGING: &str = include_str!("../scripts/package-macos.sh");
+    /// The ONE generator both the release bundle and the dev launcher use.
+    /// Pointing the guard at the shared script rather than the release path is
+    /// the point: a dev build that declares less than the shipped app is the
+    /// gap that hid this for weeks.
+    const PACKAGING: &str = include_str!("../scripts/macos-app-bundle.sh");
 
     /// The value the OS needs: the browsed type without mDNS's trailing domain.
     fn declared_form() -> String {
@@ -2255,6 +2259,28 @@ mod discovery_is_declared_to_the_operating_system {
              no sentence to show when it asks for Local Network access. Without \
              it the daemon can announce and cannot receive, which reads as \
              'discovery finds nothing' with no error anywhere."
+        );
+    }
+
+    /// The release path must not grow a second Info.plist.
+    ///
+    /// Having two is what caused this: the packaged app declared permissions
+    /// the dev build did not, so the build being tested was not the build being
+    /// shipped, and a missing declaration only showed up for users.
+    #[test]
+    fn the_release_packaging_uses_the_one_generator_rather_than_its_own_plist() {
+        const RELEASE: &str = include_str!("../scripts/package-macos.sh");
+        assert!(
+            RELEASE.contains("macos-app-bundle.sh"),
+            "package-macos.sh no longer calls the shared bundle generator. Two \
+             ways to build the same bundle is how the tested artifact stops \
+             being the shipped one."
+        );
+        assert!(
+            !RELEASE.contains("<key>CFBundleIdentifier</key>"),
+            "package-macos.sh has grown its own Info.plist again. There must be \
+             exactly one, or a permission added for the release will be absent \
+             from every dev build and nobody will notice until a user reports it."
         );
     }
 
