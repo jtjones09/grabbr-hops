@@ -12,6 +12,7 @@ mod emulation;
 pub mod emulation_test;
 mod hop_log;
 mod listen;
+pub mod logging;
 pub mod service;
 mod transport;
 pub mod trust;

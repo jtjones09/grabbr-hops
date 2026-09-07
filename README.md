@@ -101,6 +101,35 @@ cargo build --release --no-default-features --features "tui slint"
 - **Linux backends / advanced:** input capture & emulation backends are cargo
   features (`layer_shell_capture`, `x11_capture`, `libei_*`, …) — see `Cargo.toml`.
 
+## Logs
+
+Each process writes its own log, whatever started it — no shell redirection
+needed. `daemon`, `gui` and `tui` get separate files; other commands share
+`cli.log`.
+
+| Platform | Location |
+| --- | --- |
+| macOS | `~/Library/Logs/hops/` |
+| Windows | `%LOCALAPPDATA%\hops\logs\` |
+| Linux | `~/.local/state/hops/` (or `$XDG_STATE_HOME/hops/`) |
+
+Files rotate at 8 MB, keeping one previous generation as `<role>.log.1`. Set
+`HOPS_LOG_FILE` to write somewhere else.
+
+`HOPS_LOG_LEVEL` sets how much hops itself logs (`info` by default; `debug` when
+diagnosing something). It does not turn on debug logging for hops' dependencies
+— name one explicitly for that, as in `HOPS_LOG_LEVEL=info,mdns_sd=debug`.
+
+On macOS, warnings and errors also go to the unified log, so they appear in
+Console.app alongside everything else from that moment:
+
+```
+log show --last 1h --predicate 'process == "hops"'
+```
+
+On Linux under the provided systemd units, `journalctl --user -u hops` works as
+usual.
+
 ## Security
 
 - **Transport:** all traffic is **QUIC** (quinn) secured with **TLS 1.3**
