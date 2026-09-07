@@ -280,6 +280,47 @@ fn acquire_single_instance(show_requested: Arc<AtomicBool>) -> Instance {
     }
 }
 
+/// Claim a pending "create device" once its handle appears, or leave it for the
+/// next tick.
+///
+/// The take and the put-back must never overlap, and keeping them in one
+/// function is the whole point of it existing. The call site used to read
+///
+/// ```ignore
+/// if let Some(v) = cell.borrow_mut().take() {
+///     match arrived {
+///         Some(h) => { /* use it */ }
+///         None => *cell.borrow_mut() = Some(v),   // panics
+///     }
+/// }
+/// ```
+///
+/// which panics with `RefCell already borrowed`. On edition 2021 a temporary in
+/// an `if let` scrutinee lives until the end of the whole block, so the borrow
+/// taken to call `.take()` is still held when the retry arm borrows again.
+///
+/// That arm is not an edge case — it runs every time a device is created and
+/// its handle has not yet reached a snapshot, which is the ordinary case on the
+/// tick right after "add". The window died there with no message, because a
+/// panic under `panic = "abort"` was the last thing the process wrote and
+/// nothing was reading its output.
+fn claim_pending<T>(
+    cell: &RefCell<Option<T>>,
+    arrived: Option<ClientHandle>,
+) -> Option<(ClientHandle, T)> {
+    // Ends at the semicolon, before anything else can borrow.
+    let taken = cell.borrow_mut().take();
+    match (arrived, taken) {
+        (Some(handle), Some(value)) => Some((handle, value)),
+        // No handle yet — put it back and try again next tick.
+        (None, Some(value)) => {
+            *cell.borrow_mut() = Some(value);
+            None
+        }
+        (_, None) => None,
+    }
+}
+
 /// Run the Slint GUI front-end. Blocks on the Slint event loop until the user
 /// quits (macOS: via the menu bar "Quit"); the daemon keeps running regardless.
 /// `hidden` starts with only the menu-bar/tray icon and no window (login
@@ -661,42 +702,29 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
             // apply a pending create's name/port/position once its handle shows up
             {
                 let current: HashSet<ClientHandle> = m.clients.keys().copied().collect();
-                if let Some((name, port, position, fix_ips)) =
-                    pending_new_device.borrow_mut().take()
+                let arrived = current.difference(&known_handles.borrow()).next().copied();
+                if let Some((new_handle, (name, port, position, fix_ips))) =
+                    claim_pending(&pending_new_device, arrived)
                 {
-                    match current.difference(&known_handles.borrow()).next() {
-                        Some(&new_handle) => {
-                            if !name.is_empty() {
-                                client.request(FrontendRequest::UpdateHostname(
-                                    new_handle,
-                                    Some(name),
-                                ));
-                            }
-                            if !fix_ips.is_empty() {
-                                // Picked off the network list: pin what mDNS
-                                // told us rather than hoping the name resolves.
-                                client.request(FrontendRequest::UpdateFixIps(
-                                    new_handle,
-                                    fix_ips.clone(),
-                                ));
-                            }
-                            client.request(FrontendRequest::UpdatePort(new_handle, port));
-                            client.request(FrontendRequest::UpdatePosition(new_handle, position));
-                            // ACTUALLY try the machine. Previously "add device"
-                            // created an inert card: nothing was dialed, the other
-                            // machine showed nothing, and two unnamed steps stood
-                            // between "added" and "works" (find the unlabeled
-                            // toggle, then shove the cursor off that edge). The
-                            // form now opens on a free edge, so this cannot evict
-                            // another device, and a name that will not resolve
-                            // now reports itself.
-                            client.request(FrontendRequest::Activate(new_handle, true));
-                        }
-                        // the Created event hasn't reached a snapshot yet — retry next tick
-                        None => {
-                            *pending_new_device.borrow_mut() = Some((name, port, position, fix_ips))
-                        }
+                    if !name.is_empty() {
+                        client.request(FrontendRequest::UpdateHostname(new_handle, Some(name)));
                     }
+                    if !fix_ips.is_empty() {
+                        // Picked off the network list: pin what mDNS
+                        // told us rather than hoping the name resolves.
+                        client.request(FrontendRequest::UpdateFixIps(new_handle, fix_ips.clone()));
+                    }
+                    client.request(FrontendRequest::UpdatePort(new_handle, port));
+                    client.request(FrontendRequest::UpdatePosition(new_handle, position));
+                    // ACTUALLY try the machine. Previously "add device"
+                    // created an inert card: nothing was dialed, the other
+                    // machine showed nothing, and two unnamed steps stood
+                    // between "added" and "works" (find the unlabeled
+                    // toggle, then shove the cursor off that edge). The
+                    // form now opens on a free edge, so this cannot evict
+                    // another device, and a name that will not resolve
+                    // now reports itself.
+                    client.request(FrontendRequest::Activate(new_handle, true));
                 }
                 *known_handles.borrow_mut() = current;
             }
@@ -1249,5 +1277,62 @@ mod tray_const_property {
              is what defeats the folding — an equivalent private property does \
              not."
         );
+    }
+}
+
+#[cfg(test)]
+mod pending_create {
+    //! The tray died here, silently, every time a device was added.
+    //!
+    //! Adding a device stages a pending create and waits for its handle to show
+    //! up in a daemon snapshot. On the tick right after "add" it has not shown
+    //! up yet, so the retry path runs — and the retry path used to borrow a
+    //! `RefCell` that the enclosing `if let` was still holding, which panics.
+    //! Under `panic = "abort"` that was the last thing the process ever did.
+
+    use super::claim_pending;
+    use std::cell::RefCell;
+
+    #[test]
+    fn a_handle_that_has_not_arrived_yet_leaves_the_create_in_place() {
+        let cell = RefCell::new(Some(("mac", 4242u16)));
+
+        // This is the tick right after "add": the create was sent, no handle
+        // has reached a snapshot. It must not panic, and must not lose the
+        // create — losing it means the device is never configured or dialed.
+        let claimed = claim_pending(&cell, None);
+
+        assert!(claimed.is_none(), "nothing to claim without a handle");
+        assert_eq!(
+            *cell.borrow(),
+            Some(("mac", 4242)),
+            "the pending create must survive for the next tick. Taking it and \
+             failing to put it back loses the device silently; borrowing twice \
+             to put it back panics with `RefCell already borrowed`, which is \
+             what killed the window on every add."
+        );
+    }
+
+    #[test]
+    fn an_arrived_handle_claims_the_create_exactly_once() {
+        let cell = RefCell::new(Some(("mac", 4242u16)));
+        let claimed = claim_pending(&cell, Some(7));
+        assert_eq!(claimed, Some((7, ("mac", 4242))));
+        assert!(
+            cell.borrow().is_none(),
+            "a claimed create must be cleared, or the next tick configures the \
+             same device again"
+        );
+        assert!(
+            claim_pending(&cell, Some(8)).is_none(),
+            "and there must be nothing left to claim"
+        );
+    }
+
+    #[test]
+    fn no_pending_create_is_not_an_error() {
+        let cell: RefCell<Option<(&str, u16)>> = RefCell::new(None);
+        assert!(claim_pending(&cell, Some(7)).is_none());
+        assert!(claim_pending(&cell, None).is_none());
     }
 }
