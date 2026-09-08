@@ -141,6 +141,14 @@ pub struct Service {
     untrusted_receivers: Receiver<(String, SocketAddr)>,
     /// a client's peer_fingerprint was just learned — persist it and republish
     persist_requests: Receiver<ClientHandle>,
+    /// a client's LIVE state changed — republish it, without touching the config
+    ///
+    /// Separate from `persist_requests` because this fires often and writes
+    /// nothing: a peer coming up, going away, or announcing its capabilities is
+    /// not a configuration change. Nothing republished a client after its first
+    /// publication, so a sender kept showing what was true when the link was
+    /// made — including "not accepting input" about a peer that had recovered.
+    state_changes: Receiver<ClientHandle>,
     /// broadcast local clipboard changes to outgoing-connection peers
     clipboard_out_conn: ClipboardSender,
     /// force-close outgoing sessions to a receiver whose trust was revoked
@@ -282,6 +290,7 @@ impl Service {
         let (clipboard_in_tx, clipboard_in) = channel();
         let (untrusted_tx, untrusted_receivers) = channel();
         let (persist_tx, persist_requests) = channel();
+        let (state_tx, state_changes) = channel();
         let clipboard = Clipboard::new();
 
         // listener + connection. Both hold the same store and ask it different
@@ -301,6 +310,7 @@ impl Service {
             clipboard_in_tx,
             untrusted_tx,
             persist_tx,
+            state_tx,
         )
         .map_err(|e| ServiceError::Connect(e.to_string()))?;
 
@@ -363,6 +373,7 @@ impl Service {
             clipboard_in,
             untrusted_receivers,
             persist_requests,
+            state_changes,
             clipboard_out_conn,
             clipboard_out_listen,
             revoke_conn,
@@ -415,6 +426,14 @@ impl Service {
                         // persist so the device join survives a restart, and
                         // republish so the merged card appears immediately
                         self.save_config();
+                        self.broadcast_client(handle);
+                    }
+                }
+                handle = self.state_changes.recv() => {
+                    if let Some(handle) = handle {
+                        // Republish only. No save_config: a peer being up or
+                        // down is not configuration, and writing the file on
+                        // every transition would put disk churn on the ping path.
                         self.broadcast_client(handle);
                     }
                 }

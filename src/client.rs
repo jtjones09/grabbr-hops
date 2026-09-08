@@ -317,10 +317,19 @@ impl ClientManager {
         }
     }
 
-    pub(crate) fn set_alive(&self, handle: ClientHandle, alive: bool) {
+    /// Returns whether this actually changed `alive`.
+    ///
+    /// The caller republishes on a change and stays quiet otherwise: pongs
+    /// arrive about twice a second per client, and the frontend only needs to
+    /// hear when the answer is different. Without a signal at all, the sender's
+    /// row keeps whatever it learned first — so a peer whose input emulation
+    /// was broken and has since recovered still reads "not accepting input",
+    /// forever, because nothing republishes the state that says otherwise.
+    pub(crate) fn set_alive(&self, handle: ClientHandle, alive: bool) -> bool {
         if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
-            s.alive = alive;
+            return std::mem::replace(&mut s.alive, alive) != alive;
         }
+        false
     }
 
     pub(crate) fn set_peer_commit(&self, handle: ClientHandle, commit: Option<[u8; 8]>) {
@@ -518,5 +527,67 @@ mod reload_permutation {
             reload(&m);
             assert_eq!(mapping(&m), before, "mapping moved on reload {i}");
         }
+    }
+}
+
+#[cfg(test)]
+mod alive_transitions {
+    //! A sender kept saying "not accepting input" about a peer that had recovered.
+    //!
+    //! `alive` is written by the transport task on every pong — about twice a
+    //! second per client — and nothing republished the client after its first
+    //! publication. So whatever the sender learned when the link came up was
+    //! what it kept showing. A receiver whose input emulation was genuinely
+    //! broken, then fixed, still read as refusing, indefinitely.
+    //!
+    //! The fix is a republish on CHANGE, which needs `set_alive` to say whether
+    //! anything changed. Republishing on every pong instead would put 2 IPC
+    //! messages per second per client on the wire to say nothing.
+
+    use super::*;
+
+    #[test]
+    fn only_a_change_is_worth_republishing() {
+        let m = ClientManager::default();
+        let h = m.add_client();
+
+        assert!(
+            m.set_alive(h, true),
+            "false -> true is a change: this is the peer coming up, and the \
+             frontend has to hear it"
+        );
+        assert!(
+            !m.set_alive(h, true),
+            "true -> true is a pong repeating itself. Reporting it would put \
+             two IPC messages a second per client on the wire to say nothing \
+             changed."
+        );
+        assert!(
+            m.set_alive(h, false),
+            "true -> false is the peer going away, and must reach the frontend"
+        );
+        assert!(!m.set_alive(h, false));
+    }
+
+    #[test]
+    fn the_value_is_actually_stored() {
+        let m = ClientManager::default();
+        let h = m.add_client();
+        m.set_alive(h, true);
+        assert_eq!(
+            m.get_state(h).map(|(_, s)| s.alive),
+            Some(true),
+            "reporting the transition must not come at the cost of recording it"
+        );
+    }
+
+    #[test]
+    fn an_unknown_handle_is_not_a_change() {
+        let m = ClientManager::default();
+        assert!(
+            !m.set_alive(9999, true),
+            "a handle that does not exist changed nothing; republishing it \
+             would emit NoSuchClient at the pong rate"
+        );
     }
 }
