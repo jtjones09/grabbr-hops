@@ -1239,12 +1239,32 @@ mod discovery_states {
     /// hidden while discovery is off regardless of what the list holds.
     #[test]
     fn the_empty_state_never_points_at_a_hidden_section() {
+        // The invariant, not the implementation that used to satisfy it. What
+        // hops found now lives INSIDE the add panel, so there is no longer any
+        // section for the empty state to point at: a direction like "below" or
+        // "from your network" names something that is not on screen until add
+        // is clicked. This used to be a ternary guarded on discovery being
+        // active AND the list being non-empty; moving the list made the
+        // pointer unconditionally wrong rather than conditionally right.
+        let empty_state: Vec<&str> = UI
+            .lines()
+            .filter(|l| l.contains("no devices yet"))
+            .collect();
         assert!(
-            UI.contains("root.discovery-active && root.discovered.length > 0"),
-            "\"pick one from your network below\" must be guarded on discovery \
-             being active AND the list being non-empty. Guarded on the list \
-             alone, it promises a section that is not rendered."
+            !empty_state.is_empty(),
+            "the empty state itself went missing — an empty device list must \
+             still say what to do"
         );
+        for line in empty_state {
+            for pointer in ["below", "from your network", "on your network"] {
+                assert!(
+                    !line.contains(pointer),
+                    "the empty state says {pointer:?}, which names a section \
+                     that is not rendered until the add panel is open. Line: \
+                     {line}"
+                );
+            }
+        }
     }
 }
 
