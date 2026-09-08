@@ -122,12 +122,17 @@ impl LanMouseListener {
         let listen_addr = SocketAddr::new("0.0.0.0".parse().expect("invalid ip"), port);
         let mut endpoint = Endpoint::server(cfg, listen_addr)?;
 
+        // Our own leaf-cert fingerprint. Half of what the match number is
+        // built from; the peer's is read off each connection.
+        let own_fp = identity.fingerprint();
+
         let conns: Rc<AsyncMutex<Vec<ConnEntry>>> = Rc::new(AsyncMutex::new(Vec::new()));
         let conns_clone = conns.clone();
 
         let listen_task: JoinHandle<()> = {
             let listen_tx = listen_tx.clone();
             let attempts = attempts.clone();
+            let own_fp = own_fp.clone();
             let authorized_accept = trust.clone();
             spawn_local(async move {
                 loop {
@@ -141,6 +146,7 @@ impl LanMouseListener {
                             let attempts = attempts.clone();
                             let clipboard_in = clipboard_in.clone();
                             let trust = authorized_accept.clone();
+                            let own_fp = own_fp.clone();
                             spawn_local(async move {
                                 let remote = incoming.remote_address();
                                 match incoming.await {
@@ -191,7 +197,29 @@ impl LanMouseListener {
                                             send,
                                             fingerprint: fingerprint.clone(),
                                         });
-                                        let _ = listen_tx.send(ListenEvent::Accept { addr, fingerprint });
+                                        let _ = listen_tx.send(ListenEvent::Accept { addr, fingerprint: fingerprint.clone() });
+                                        // The match number, computed alongside
+                                        // rather than in front of the
+                                        // connection. Nothing is gated on it
+                                        // yet: a peer whose build predates the
+                                        // ceremony never opens its side, and
+                                        // making an established session wait
+                                        // ten seconds to find that out would
+                                        // charge every connection for a
+                                        // feature that is still being proven.
+                                        {
+                                            let c = conn.clone();
+                                            let mine = own_fp.clone();
+                                            let theirs = fingerprint.clone();
+                                            spawn_local(async move {
+                                                match crate::pair_ceremony::as_responder(&c, &mine, &theirs).await {
+                                                    Ok(code) => log::info!(
+                                                        "match number with {theirs}: {code} — the other machine must show the same six digits"
+                                                    ),
+                                                    Err(e) => log::info!("no match number with {theirs}: {e}"),
+                                                }
+                                            });
+                                        }
                                         spawn_local(read_loop(conns.clone(), addr, conn, listen_tx.clone(), clipboard_in));
                                     }
                                     Err(e) => {

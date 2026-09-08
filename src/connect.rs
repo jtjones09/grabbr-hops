@@ -99,6 +99,7 @@ async fn connect(
     cfg: ClientConfig,
     addr: SocketAddr,
     expected_fp: Option<String>,
+    own_fp: String,
 ) -> Result<(PeerLink, SocketAddr), (SocketAddr, LanMouseConnectionError)> {
     log::info!("connecting to {addr} ...");
     // server_name is the SNI label; trust is by fingerprint, so it is not
@@ -127,6 +128,22 @@ async fn connect(
             conn.close(0u32.into(), b"fingerprint mismatch");
             return Err((addr, LanMouseConnectionError::FingerprintMismatch));
         }
+    }
+    // The match number, computed alongside the connection rather than in front
+    // of it. Nothing is gated on it yet: a peer whose build predates the
+    // ceremony never opens its side, and making an established session wait to
+    // find that out would charge every dial for a feature still being proven.
+    if let Some(theirs) = peer_fingerprint(&conn) {
+        let c = conn.clone();
+        let mine = own_fp.clone();
+        spawn_local(async move {
+            match crate::pair_ceremony::as_initiator(&c, &mine, &theirs).await {
+                Ok(code) => log::info!(
+                    "match number with {theirs}: {code} — the other machine must show the same six digits"
+                ),
+                Err(e) => log::info!("no match number with {theirs}: {e}"),
+            }
+        });
     }
     let send = conn.open_uni().await.map_err(|e| (addr, e.into()))?;
     Ok((
@@ -192,6 +209,7 @@ async fn connect_any(
     endpoint: &Endpoint,
     dials: &[Dial],
     expected_fp: Option<String>,
+    own_fp: &str,
 ) -> Result<(PeerLink, SocketAddr), LanMouseConnectionError> {
     let addrs: Vec<SocketAddr> = dials.iter().map(|d| d.addr).collect();
     let mut joinset = JoinSet::new();
@@ -200,7 +218,7 @@ async fn connect_any(
         let cfg = d.cfg.clone();
         let addr = d.addr;
         let expected = expected_fp.clone();
-        joinset.spawn_local(connect(endpoint, cfg, addr, expected));
+        joinset.spawn_local(connect(endpoint, cfg, addr, expected, own_fp.to_string()));
     }
     // if every candidate failed the identity pin (not a transport error), surface
     // that distinctly so the caller logs the right recovery guidance.
@@ -529,7 +547,8 @@ async fn connect_to_handle(
                 }
             })
             .collect();
-        let (link, addr) = match connect_any(&endpoint, &dials, expected_fp).await {
+        let own_fp = identity.fingerprint();
+        let (link, addr) = match connect_any(&endpoint, &dials, expected_fp, &own_fp).await {
             Ok(c) => c,
             Err(e) => {
                 connecting.lock().await.remove(&handle);
@@ -966,8 +985,20 @@ mod tests {
 
             // genuinely concurrent
             let _ = tokio::join!(
-                connect(client_ep.clone(), cfgs[0].clone(), addrs[0], None),
-                connect(client_ep.clone(), cfgs[1].clone(), addrs[1], None),
+                connect(
+                    client_ep.clone(),
+                    cfgs[0].clone(),
+                    addrs[0],
+                    None,
+                    String::new()
+                ),
+                connect(
+                    client_ep.clone(),
+                    cfgs[1].clone(),
+                    addrs[1],
+                    None,
+                    String::new()
+                ),
             );
 
             for (i, slot) in slots.iter().enumerate() {
@@ -1251,7 +1282,7 @@ mod tests {
                 })
                 .collect();
 
-            let _ = connect_any(&client_ep, &dials, None).await;
+            let _ = connect_any(&client_ep, &dials, None, "").await;
 
             for (i, d) in dials.iter().enumerate() {
                 assert_eq!(
