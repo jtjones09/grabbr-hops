@@ -3,13 +3,17 @@
 //!
 //! Trust is established by **mutual fingerprint authentication** over
 //! self-signed certificates — there is no CA. Both sides check the peer's
-//! leaf-cert SHA-256 fingerprint against the shared `authorized_fingerprints`
-//! allowlist, and both danger-trait verifiers **still delegate handshake-
+//! leaf-cert SHA-256 fingerprint against the shared lease store, and they ask
+//! it DIFFERENT questions: the receiver asks whether this peer may drive us,
+//! the sender asks whether we may drive that peer. One flat allowlist answered
+//! both with the same bit, which is how confirming a machine we dialled also
+//! handed it control of this one. Both danger-trait verifiers **still delegate
+//! handshake-
 //! signature verification** to rustls: the certificate is public, so only the
 //! signature proves the peer holds the matching private key. Skipping that
 //! delegation would reopen the MITM hole this migration closes.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, Once, RwLock};
 
 use hops_proto::{MAX_EVENT_SIZE, ProtoEvent, ProtocolError};
@@ -22,8 +26,13 @@ use thiserror::Error;
 
 use crate::crypto::generate_fingerprint;
 
-/// Authorized-fingerprint allowlist shared by both directions.
-pub type Authorized = Arc<RwLock<HashMap<String, String>>>;
+/// The lease store, shared by both directions and by both clipboard loops.
+///
+/// Shared, but not symmetric: each verifier below asks it the question for its
+/// own direction. That is the whole of the fix — the store can express "this
+/// peer may drive me" and "I may drive this peer" separately, where a
+/// `HashMap<fingerprint, label>` could only express "known".
+pub type Trust = Arc<RwLock<crate::trust::TrustStore>>;
 
 /// Private ALPN so we never complete a handshake with a stray QUIC peer.
 ///
@@ -58,22 +67,24 @@ pub fn fingerprint_of(der: &CertificateDer<'_>) -> String {
 // client side — verify the server (receiver) we are sending input to
 // ---------------------------------------------------------------------------
 
-/// rustls [`ServerCertVerifier`] that accepts a receiver iff its leaf-cert
-/// fingerprint is in the shared allowlist. The presented fingerprint is always
+/// rustls [`ServerCertVerifier`] that accepts a receiver iff we hold a live
+/// lease permitting us to drive it. The presented fingerprint is always
 /// recorded in `observed` (whether accepted or rejected) so the caller can log
 /// it — making it trivial for the user to authorize the receiver.
+///
+/// This is the OUTBOUND question, and it is deliberately not the inbound one.
 #[derive(Debug)]
 pub struct FpServerVerifier {
     provider: Arc<CryptoProvider>,
-    authorized: Authorized,
+    trust: Trust,
     observed: Arc<Mutex<Option<String>>>,
 }
 
 impl FpServerVerifier {
-    pub fn new(authorized: Authorized, observed: Arc<Mutex<Option<String>>>) -> Self {
+    pub fn new(trust: Trust, observed: Arc<Mutex<Option<String>>>) -> Self {
         Self {
             provider: provider(),
-            authorized,
+            trust,
             observed,
         }
     }
@@ -89,17 +100,13 @@ impl ServerCertVerifier for FpServerVerifier {
         _now: UnixTime,
     ) -> Result<ServerCertVerified, TlsError> {
         let fingerprint = fingerprint_of(end_entity);
-        let authorized = self
-            .authorized
-            .read()
-            .expect("lock")
-            .contains_key(&fingerprint);
+        let permitted = self.trust.read().expect("lock").we_may_drive(&fingerprint);
         *self.observed.lock().expect("lock") = Some(fingerprint);
-        if authorized {
+        if permitted {
             Ok(ServerCertVerified::assertion())
         } else {
             Err(TlsError::General(
-                "receiver fingerprint not authorized".into(),
+                "we hold no live lease permitting us to drive that receiver".into(),
             ))
         }
     }
@@ -149,15 +156,23 @@ impl ServerCertVerifier for FpServerVerifier {
 #[derive(Debug)]
 pub struct FpClientVerifier {
     provider: Arc<CryptoProvider>,
-    authorized: Authorized,
+    trust: Trust,
     attempts: Arc<Mutex<VecDeque<String>>>,
 }
 
+/// How many distinct unknown fingerprints may await a prompt at once.
+///
+/// Anyone on the network can add to this queue by dialling with a certificate
+/// we do not recognise, before any authorization has happened. The bound is
+/// what stops that from being unbounded memory growth driven by a stranger.
+/// Well past any real fleet, small enough that the flood costs nothing.
+pub(crate) const MAX_PENDING_ATTEMPTS: usize = 32;
+
 impl FpClientVerifier {
-    pub fn new(authorized: Authorized, attempts: Arc<Mutex<VecDeque<String>>>) -> Self {
+    pub fn new(trust: Trust, attempts: Arc<Mutex<VecDeque<String>>>) -> Self {
         Self {
             provider: provider(),
-            authorized,
+            trust,
             attempts,
         }
     }
@@ -183,17 +198,34 @@ impl ClientCertVerifier for FpClientVerifier {
         _now: UnixTime,
     ) -> Result<ClientCertVerified, TlsError> {
         let fingerprint = fingerprint_of(end_entity);
-        if self
-            .authorized
-            .read()
-            .expect("lock")
-            .contains_key(&fingerprint)
-        {
+        // The INBOUND question, and deliberately not the outbound one. A peer
+        // we hold an outbound lease on — a receiver we confirmed our own dial
+        // reached — gets nothing here. Nobody was asked whether it may drive
+        // this machine.
+        if self.trust.read().expect("lock").may_drive_us(&fingerprint) {
             Ok(ClientCertVerified::assertion())
         } else {
-            self.attempts.lock().expect("lock").push_back(fingerprint);
+            // Bounded and deduplicated. This queue is the only channel from
+            // the TLS verifier to the accept loop, and it is filled by anyone
+            // on the network who dials with a certificate we do not know —
+            // before any authorization. Unbounded, a stranger retrying in a
+            // loop grows it without limit; duplicated, one stranger produces a
+            // thousand identical prompts.
+            //
+            // rustls gives a client-certificate verifier the certificate and
+            // nothing else — no address, no connection handle — so this cannot
+            // be keyed by connection. The fingerprint is the whole of what the
+            // event carries, which is why a set, not a queue of one per dial,
+            // is the honest shape.
+            let mut attempts = self.attempts.lock().expect("lock");
+            if !attempts.contains(&fingerprint) {
+                if attempts.len() >= MAX_PENDING_ATTEMPTS {
+                    attempts.pop_front();
+                }
+                attempts.push_back(fingerprint);
+            }
             Err(TlsError::General(
-                "sender fingerprint not authorized".into(),
+                "no live lease permits that sender to drive this machine".into(),
             ))
         }
     }

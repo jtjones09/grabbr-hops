@@ -1,4 +1,3 @@
-use env_logger::Env;
 use hops::{
     capture_test,
     config::{self, Command, Config, ConfigError},
@@ -38,14 +37,27 @@ enum HopsError {
 }
 
 fn main() {
-    // init logging
-    let env = Env::default().filter_or("HOPS_LOG_LEVEL", "info");
-    env_logger::init_from_env(env);
+    // Logging first, before anything that can fail: a config parse error is
+    // one of the things most worth having in the log.
+    hops::logging::init(hops::logging::role_from_argv());
+    install_panic_logger();
+
+    // Before anything that reads the config. This is the command someone runs
+    // to find out why the others are failing, so it must not need them to work.
+    if let Some(config::Command::BuildCheck { repo, strict }) = config::command_from_args() {
+        run_build_check(repo, strict);
+    }
 
     if let Err(e) = run() {
         log::error!("{e}");
         process::exit(1);
     }
+}
+
+/// Report whether this binary matches its source, then exit. Never returns.
+fn run_build_check(repo: Option<std::path::PathBuf>, strict: bool) -> ! {
+    let r = hops::build_check::check(repo);
+    process::exit(hops::build_check::report(&r, strict))
 }
 
 fn run() -> Result<(), HopsError> {
@@ -58,6 +70,9 @@ fn run() -> Result<(), HopsError> {
             Command::Daemon => run_daemon(config)?,
             Command::Gui { hidden } => run_gui(hidden)?,
             Command::Tui => run_tui()?,
+            // Normally handled in `main` before the config is loaded; kept
+            // here so the match stays exhaustive and both paths behave alike.
+            Command::BuildCheck { repo, strict } => run_build_check(repo.clone(), strict),
         },
         None => {
             //  otherwise start the service as a child process and
@@ -101,7 +116,6 @@ fn run_daemon(config: config::Config) -> Result<(), HopsError> {
 fn run_gui(hidden: bool) -> Result<(), HopsError> {
     #[cfg(feature = "slint")]
     {
-        install_panic_logger();
         hops_slint::run(hidden)?;
         Ok(())
     }
@@ -113,11 +127,11 @@ fn run_gui(hidden: bool) -> Result<(), HopsError> {
     }
 }
 
-/// Make a GUI panic diagnosable.
+/// Make a panic diagnosable, in whichever process it happens.
 ///
-/// The tray runs under launchd with its output redirected to a log file, and
-/// the release profile is `panic = "abort"` — so a panic is the last thing the
-/// process ever writes. The two aborts that became #4 left exactly this in
+/// The release profile is `panic = "abort"`, so a panic is the last thing the
+/// process ever writes — which makes it the single most valuable line in the
+/// log and the one least likely to survive. The two aborts that became #4 left exactly this in
 /// gui.log:
 ///
 /// ```text
@@ -129,14 +143,18 @@ fn run_gui(hidden: bool) -> Result<(), HopsError> {
 /// says to set `RUST_BACKTRACE`, which nobody can do for a job launchd started
 /// at login. Capturing the backtrace ourselves costs nothing until something
 /// panics and turns "it died again" into a stack that names the caller.
-#[cfg(feature = "slint")]
 fn install_panic_logger() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        // keep the standard message, then add what it leaves out
+        // keep the standard message on stderr, then add what it leaves out
         previous(info);
-        eprintln!(
-            "hops: panic in the GUI — backtrace follows\n{}",
+        // Through `log`, not `eprintln!`. The hook was written for the GUI, and
+        // on Windows the tray is started with no redirection at all — so every
+        // backtrace it force-captured went to a closed handle. Routing it
+        // through the logger puts it in the process's own file, which exists on
+        // every platform regardless of who started it.
+        log::error!(
+            "panic: {info}\nbacktrace follows\n{}",
             std::backtrace::Backtrace::force_capture()
         );
     }));

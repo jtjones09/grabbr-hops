@@ -1,0 +1,53 @@
+#!/bin/bash
+# internal — sourced by the launchers in this folder. Not run on its own.
+# Mirrors ~/grabbr-hop/.hops-paths on macOS. Edit HOPS_REPO if the checkout moves.
+HOPS_REPO="${HOPS_REPO:-$HOME/projects/grabbr-hops}"
+HOPS_LAUNCH="$HOME/grabbr-hop"
+HOPS_RAW="$HOPS_REPO/target/release/hops"
+HOPS_DAILY="$HOPS_LAUNCH/hops"
+
+hops_hold() {
+  if [ -t 0 ]; then printf '\nPress Return to close... '; read -r _ || true; fi
+}
+
+# Run the gate and act on it. $1 = binary to check, $2 = "strict" or "report".
+#
+# The four exit codes mean four different things with four different remedies,
+# so they are never collapsed: 2 is stale (rebuild), 3 is that nothing could be
+# compared (fix the repo path), 1 or anything else is the check failing to run
+# at all — which is not a verdict about the binary and must not be shown as one.
+hops_gate() {
+  local bin="$1" mode="$2" rc
+  if [ ! -x "$bin" ]; then
+    echo "  no binary at $bin"
+    return 1
+  fi
+  # Does this binary have the check at all? A binary built before the check
+  # existed makes clap exit 2 for an unknown subcommand — the same code this
+  # uses for "stale". The verdict would be accidentally right, since a binary
+  # older than the check is certainly behind, but the output would be clap's
+  # usage text, which explains nothing to whoever is reading it.
+  if ! "$bin" build-check --help >/dev/null 2>&1; then
+    echo "  this binary predates the build check, so it cannot be compared."
+    echo "  It was built before the check existed, which means it is behind."
+    [ "$mode" = strict ] || return 0
+    echo "  Rebuild to get a binary that can answer for itself."
+    return 1
+  fi
+  if [ "$mode" = strict ]; then
+    "$bin" build-check --repo "$HOPS_REPO" --strict
+  else
+    "$bin" build-check --repo "$HOPS_REPO"
+  fi
+  rc=$?
+  [ "$mode" = strict ] || return 0        # a report never blocks a launch
+  case $rc in
+    0) return 0 ;;
+    2) echo; echo "  STALE — not launching. Nothing was switched." ;;
+    3) echo; echo "  CANNOT VERIFY — nothing was compared, so this is not a" ;
+       echo "  clean bill of health. Check the repo path in .hops-paths." ;;
+    *) echo; echo "  build-check gave no verdict (exit $rc). That is the check" ;
+       echo "  failing to run, not a statement about the binary." ;;
+  esac
+  return 1
+}

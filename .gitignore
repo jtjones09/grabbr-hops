@@ -21,3 +21,7 @@ repo
 # The durable record is nisaba (projects/grabbr-hops/JOURNAL.md + DECISIONS.md);
 # this file is working state for the next context window, not project history.
 HandoffSessionCompact.md
+RESUME-PAUSED-WORK.md
+
+# points at the private design-record repo; must never be committed
+.claude/private-record.local

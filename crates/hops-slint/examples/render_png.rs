@@ -99,7 +99,6 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
         ]
     })));
     ui.set_pairing_fp("a4:f0:9c:2e:11:bd:77:0c:35:9a".into()); // shows the pairing card
-    ui.set_pairing_code("047315".into()); // leading zero on purpose
     // flip to true to review the "we dialled this device" wording (#61)
     ui.set_pairing_from_our_dial(std::env::var_os("PREVIEW_OUR_DIAL").is_some());
     if std::env::var_os("PREVIEW_OUR_DIAL").is_some() {
@@ -268,7 +267,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
     let buf = ui.window().take_snapshot()?;
     let (w, h) = (buf.width(), buf.height());
     let mut bytes = buf.as_bytes().to_vec();
-    for px in bytes.chunks_exact_mut(4) {
+    for px in bytes.as_chunks_mut::<4>().0 {
         px[3] = 255;
     }
     image::RgbaImage::from_raw(w, h, bytes)

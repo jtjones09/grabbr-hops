@@ -1,0 +1,26 @@
+#!/bin/bash
+# grabbr-hop — PROMOTE the current DEV build to be your DAILY driver.
+#   ./promote-to-daily          refuse if the dev build does not match source
+#   ./promote-to-daily force    promote anyway, with a report instead
+. "$HOME/grabbr-hop/.hops-paths" || { echo "missing .hops-paths"; exit 1; }
+[ -x "$HOPS_RAW" ] || { echo "no dev build at $HOPS_RAW — run grabbr-hop-dev first"; hops_hold; exit 1; }
+
+# Refuse a stale build by default: promoting one is how the everyday binary
+# falls silently behind. `force` exists because validating at one commit and
+# promoting after the source moves on is the normal way this gets used.
+if [ "${1:-}" = force ]; then
+  echo "  force: promoting WITHOUT a gate. What follows is a report, not a check:"
+  hops_gate "$HOPS_RAW" report
+else
+  hops_gate "$HOPS_RAW" strict || {
+    echo "  Your current daily is untouched."
+    echo "  To promote this build anyway:  $0 force"
+    hops_hold; exit 1
+  }
+fi
+
+cp -f "$HOPS_RAW" "$HOPS_DAILY" || { echo "copy failed — daily may be incomplete, re-run this"; hops_hold; exit 1; }
+echo "promoted the current dev build -> DAILY ($HOPS_DAILY)."
+echo "  $("$HOPS_DAILY" --version 2>&1 | head -1)"
+echo "  -> run grabbr-hop-daily to switch onto it."
+hops_hold

@@ -1,0 +1,35 @@
+#!/bin/bash
+# hops-ctl — address the daemon and the tray SEPARATELY.
+#
+#   hops-ctl status
+#   hops-ctl start-gui | stop-gui | restart-gui
+#   hops-ctl start-daemon | stop-daemon | restart-daemon
+#
+# launchd already runs them as two agents; the launchers just never used that,
+# so restarting a crashed tray meant restarting both and stopping a working KVM
+# to fix a dead icon. Same verbs as the Windows and Linux copies.
+set -u
+UID_NUM="$(id -u)"
+DAEMON="com.grabbr.hops"
+GUI="com.grabbr.hops.gui"
+
+running() { launchctl print "gui/$UID_NUM/$1" 2>/dev/null | grep -qE '^\s*pid = [0-9]+'; }
+pid_of()  { launchctl print "gui/$UID_NUM/$1" 2>/dev/null | sed -n 's/^[[:space:]]*pid = \([0-9]*\).*/\1/p'; }
+
+report() {
+  for label in "$DAEMON" "$GUI"; do
+    p="$(pid_of "$label")"
+    if [ -n "$p" ]; then echo "$label  pid=$p"; else echo "$label  not running"; fi
+  done
+}
+
+case "${1:-status}" in
+  status) report ;;
+  stop-gui)      launchctl kill TERM "gui/$UID_NUM/$GUI" 2>/dev/null; echo "stopped $GUI" ;;
+  stop-daemon)   launchctl kill TERM "gui/$UID_NUM/$DAEMON" 2>/dev/null; echo "stopped $DAEMON" ;;
+  # kickstart -k restarts just this agent; the other is never named, so it
+  # cannot be caught by accident the way `killall hops` would catch it.
+  start-gui|restart-gui)       launchctl kickstart -k "gui/$UID_NUM/$GUI" >/dev/null 2>&1; echo "restarted $GUI" ;;
+  start-daemon|restart-daemon) launchctl kickstart -k "gui/$UID_NUM/$DAEMON" >/dev/null 2>&1; echo "restarted $DAEMON" ;;
+  *) echo "usage: $0 {status|start-gui|stop-gui|restart-gui|start-daemon|stop-daemon|restart-daemon}"; exit 1 ;;
+esac

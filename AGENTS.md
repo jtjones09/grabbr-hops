@@ -7,12 +7,14 @@ sharing one keyboard and mouse across machines. Renamed from lan-mouse on 2026-0
 **deliberately severed** — this repo never fetches from or pushes to any lan-mouse remote.
 
 > **Before forming a view on anything with history, read the decision record.**
-> `~/Documents/GitHub/nisaba/projects/grabbr-hops/DECISIONS.md` — dated calls with rationale
-> and reversibility. `JOURNAL.md` beside it is the session-by-session log.
+> Dated calls with rationale and reversibility, plus a session-by-session log, live in a
+> private design record outside this repository. Maintainers: its location is in
+> `.claude/private-record.local` (gitignored). Contributors without it should ask rather
+> than assume a decision was never made.
 >
-> Grepping the journal for a keyword is **not** reading the record. This project has
-> repeatedly lost hours re-deriving conclusions that were already written down, and has
-> twice acted on a stale record that read as current. nisaba is private; this repo is public.
+> Grepping a log for a keyword is **not** reading the record. This project has repeatedly
+> lost hours re-deriving conclusions that were already written down, and has twice acted on
+> a stale record that read as current.
 
 If `HandoffSessionCompact.md` exists in the repo root, **read it before anything else** —
 it is the previous context window's state. See `.claude/skills/handoff/`.
@@ -28,9 +30,9 @@ it is the previous context window's state. See `.claude/skills/handoff/`.
   reintroduce the defect and confirm the guard fires.
 - **Never let a summary be the only record of research.** If a Workflow or subagent run
   produced output, the raw per-agent returns are the **primary source**: preserve them
-  verbatim in nisaba `projects/grabbr-hops/research/<date>-<topic>-artifact.md`, with the
-  workflow script as `-protocol.js`, *before* writing the synthesis — then check the
-  synthesis against them. Standing rule: nisaba `positions/research-folder-discipline.md`.
+  verbatim in the private record's `research/` directory as
+  `<date>-<topic>-artifact.md`, with the workflow script as `-protocol.js`, *before*
+  writing the synthesis — then check the synthesis against them.
   Transcripts survive at `~/.claude/projects/<slug>/<session>/subagents/workflows/wf_*/`.
 - **Never `cd` into a path in scripts; run from the repo root.**
 - **Dates are absolute.** Sessions here are days apart — say `2026-08-29`, never "today".
@@ -102,7 +104,23 @@ RUSTFLAGS="-D warnings" cargo check --workspace --all-targets --no-default-featu
 cargo test --workspace --no-default-features --features "tui slint"
 cargo fmt --all --check
 HOPS_LOG_LEVEL=debug cargo run -- daemon
+
+# is the binary about to run the one the source says it should be?
+hops build-check --repo /path/to/repo            # report; exit 0 always
+hops build-check --repo /path/to/repo --strict   # exit 1 when stale
 ```
+
+`build-check` compares the commit baked in by `build.rs` AND the binary's mtime
+against the newest tracked source file. Both halves are needed: the commit alone
+misses an uncommitted edit, because a binary built before that edit still reports
+a commit equal to `HEAD`. Every launcher runs it — dev launchers with `--strict`
+so a stale binary cannot be tested by accident, daily launchers without, since a
+promoted build is deliberately behind and must still start.
+
+It lives in `src/build_check.rs` rather than in the launchers because the same
+policy hand-written per OS is exactly how the platforms drifted: one built before
+launching and another did not, which cost a full test cycle against a binary from
+the previous day.
 
 `hops-gtk` was retired on 2026-08-30 (2,585 LOC, never adopted the `Device` model, shipped by
 no workflow, yet held `default` and first pick in `src/main.rs` dispatch — so a bare `cargo build`
@@ -126,4 +144,4 @@ binary actually contains real input backends.
 3. Implement the minimal change; file follow-ups rather than absorbing them.
 4. Add a test that fails without the fix. Mutation-test any guard.
 5. `cargo fmt --all` and the `-D warnings` check above.
-6. Record decisions in nisaba `DECISIONS.md`; record what happened in `JOURNAL.md`.
+6. Record decisions and what happened in the private record.

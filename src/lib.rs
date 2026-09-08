@@ -1,3 +1,5 @@
+pub mod authority;
+pub mod build_check;
 mod capture;
 pub mod capture_test;
 pub mod client;
@@ -11,8 +13,16 @@ mod emulation;
 pub mod emulation_test;
 mod hop_log;
 mod listen;
+pub mod logging;
 pub mod service;
 mod transport;
+pub mod trust;
+pub mod trust_file;
+
+/// Guards for decisions already made — and, three times now, rebuilt anyway.
+/// See the module docs for the bar each guard is held to.
+#[cfg(test)]
+mod decision_guards;
 
 #[cfg(test)]
 mod toolchain_pin {

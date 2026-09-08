@@ -39,7 +39,23 @@ pub enum ServiceError {
     Certificate(#[from] crypto::Error),
     #[error("connection setup failed: {0}")]
     Connect(String),
+    #[error(transparent)]
+    Trust(#[from] crate::trust_file::TrustFileError),
+    #[error(transparent)]
+    TrustStore(#[from] crate::trust::TrustError),
+    #[error(transparent)]
+    Authority(#[from] crate::authority::AuthorityError),
 }
+
+/// How often the daemon looks for leases that have lapsed while nothing was
+/// being sent.
+///
+/// A minute, not a second: the point-of-injection check already refuses a
+/// lapsed lease the instant a peer sends anything, so this only has to catch
+/// the quiet case — a session held open with no traffic — and advance the
+/// persisted clock floor. Sweeping harder would cost a sealed write per tick
+/// and buy nothing the hot path does not already cover.
+const LEASE_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub struct Service {
     /// configuration
@@ -61,14 +77,30 @@ pub struct Service {
     discovered: HashMap<String, DiscoveredPeer>,
     /// frontend listener
     frontend_listener: AsyncFrontendListener,
-    /// authorized public key sha256 fingerprints
-    authorized_keys: Arc<RwLock<HashMap<String, String>>>,
-    /// Fingerprints the user deliberately expelled. Not shared with the TLS
-    /// verifiers — enforcement is already the allowlist's job. This exists so a
-    /// revoked peer cannot RAISE A PROMPT: it loses the ability to schedule a
-    /// security decision, which is the part of revocation that is actually worth
-    /// something (it cannot exclude anyone — a peer can always re-key).
-    revoked: HashMap<String, hops_ipc::RevokedEntry>,
+    /// The lease store. Shared with both TLS verifiers, which ask it the
+    /// question for their own direction — see [`crate::transport::Trust`].
+    ///
+    /// Replaces a flat `HashMap<fingerprint, label>` plus a separate revoked
+    /// table. Expulsion lives in the store now rather than beside it, because
+    /// with one set there is no second table to outrank the first: a hand-edit
+    /// is caught by the seal over the file, not by a precedence rule.
+    trust: crate::transport::Trust,
+    /// Sealed persistence for the store above.
+    trust_file: crate::trust_file::TrustFile,
+    /// The provenance of the prompt each fingerprint is currently waiting on.
+    ///
+    /// A grant has to be shaped by HOW the peer arrived: an unsolicited knock
+    /// asks "may this machine drive mine", our own dial asks "may I drive that
+    /// machine". They are different questions and they were being answered with
+    /// the same capability, so confirming a receiver handed it control of this
+    /// machine — the exact harm the direction split exists to remove.
+    ///
+    /// Bounded like the TLS attempt queue, and for the same reason: anyone on
+    /// the network can cause an entry.
+    pending_origin: HashMap<String, AttemptOrigin>,
+    /// The clock floor last written to disk, so a quiet daemon does not rewrite
+    /// a sealed file every sweep for nothing.
+    last_persisted_floor: u64,
     /// (outgoing) client information
     client_manager: ClientManager,
     /// current port
@@ -137,21 +169,24 @@ struct Incoming {
 /// a never-connected client does.
 fn drop_untrusted_pins(
     client_manager: &ClientManager,
-    authorized: &HashMap<String, String>,
+    trust: &crate::trust::TrustStore,
 ) -> Vec<ClientHandle> {
     let stale: Vec<(ClientHandle, String)> = client_manager
         .get_client_states()
         .into_iter()
         .filter_map(|(h, _, s)| {
             s.peer_fingerprint
-                .filter(|fp| !authorized.contains_key(fp))
+                // `is_known`, not `has_live_lease`: a lapsed lease must keep
+                // its pin, or a device that only needed renewing is stranded on
+                // an address we forgot.
+                .filter(|fp| !trust.is_known(fp))
                 .map(|fp| (h, fp))
         })
         .collect();
     for (h, fp) in &stale {
         log::warn!(
-            "client {h}: dropping pinned fingerprint {fp} — it is not in \
-             authorized_fingerprints, so it could only ever fail the dial"
+            "client {h}: dropping pinned fingerprint {fp} — the trust store has \
+             no record of it, so the dial could only ever fail"
         );
         client_manager.clear_pins_matching(fp);
     }
@@ -164,27 +199,78 @@ impl Service {
         for client in config.clients() {
             client_manager.add_with_config(client);
         }
-        // Revocation outranks the allowlist HERE TOO, not only on reload. A
-        // fingerprint sitting in BOTH tables is untrusted, so it must also lose
-        // its outbound pin — passing the RAW allowlist here would keep the pin
-        // alive for a device its owner expelled (issue #66).
-        let (allowlist, refused) = config.effective_allowlist();
-        for fp in &refused {
-            log::warn!(
-                "config lists {fp} as BOTH authorized and revoked — refusing it at startup. \
-                 That identity is permanently dead; the device must present a new one."
-            );
-        }
-        drop_untrusted_pins(&client_manager, &allowlist);
-
-        // load identity (cert + key)
+        // The identity has to come first now: the lease store is keyed to THIS
+        // machine's fingerprint, and a store issued to another machine is
+        // refused at the door rather than silently adopted.
         let identity = Arc::new(crypto::load_or_generate_key_and_cert(config.cert_path())?);
         let public_key_fingerprint = crypto::certificate_fingerprint(&identity);
 
         // create frontend communication adapter, exit if already running
         let frontend_listener = AsyncFrontendListener::new().await?;
 
-        let authorized_keys = Arc::new(RwLock::new(allowlist));
+        // Load the sealed store, migrating off [authorized_fingerprints] /
+        // [revoked_fingerprints] on first run. After this those tables are a
+        // CACHE the daemon writes and never reads as authority — which is what
+        // closes the config-reload door: a config change stops being a trust
+        // change.
+        let config_dir = config
+            .cert_path()
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
+        let authority: Arc<dyn crate::authority::Authority> =
+            Arc::new(crate::authority::SoftwareAuthority::load_or_generate(
+                &config_dir.join(crate::authority::AUTHORITY_KEY_FILE_NAME),
+            )?);
+        let (mut trust_file, loaded) = crate::trust_file::TrustFile::open(&config_dir, authority)?;
+
+        let store = match loaded {
+            crate::trust_file::Loaded::Present { leases, .. } => {
+                let (store, refused) =
+                    crate::trust_file::rebuild(&public_key_fingerprint, trust_file.now(), &leases)?;
+                for why in &refused {
+                    // Reported, never dropped silently: a device losing trust
+                    // with no explanation is the failure this rework removes.
+                    log::warn!("trust store: {why}");
+                }
+                store
+            }
+            crate::trust_file::Loaded::Absent => {
+                // First run under leases. This is the one-way door: after it,
+                // the config tables never answer a trust question again.
+                //
+                // Through the store, deliberately. Outbound is granted only to
+                // a fingerprint the old config actually DIALLED — allowlist
+                // membership was necessary but not sufficient for outbound, so
+                // minting it for everything would create at upgrade exactly the
+                // capability this rework exists to retire.
+                let dialled: std::collections::HashSet<String> = client_manager
+                    .get_client_states()
+                    .into_iter()
+                    .filter_map(|(_, _, st)| st.peer_fingerprint)
+                    .collect();
+                let mut store =
+                    crate::trust::TrustStore::new(&public_key_fingerprint, trust_file.now())?;
+                let report = store.migrate_from_config(
+                    &config.authorized_fingerprints(),
+                    &config.revoked_fingerprints(),
+                    &dialled,
+                    trust_file.now(),
+                );
+                log::info!(
+                    "migrated the trust store: {} leases, {} removals, {} refused, {} dropped",
+                    report.leased.len(),
+                    report.denied.len(),
+                    report.refused.len(),
+                    report.dropped.len(),
+                );
+                trust_file.save(&crate::trust_file::records_of(&store))?;
+                store
+            }
+        };
+
+        drop_untrusted_pins(&client_manager, &store);
+        let trust: crate::transport::Trust = Arc::new(RwLock::new(store));
 
         // clipboard sync: a single inbound channel both transports push received
         // payloads into, plus the local monitor/apply backend. The channel is
@@ -198,19 +284,20 @@ impl Service {
         let (persist_tx, persist_requests) = channel();
         let clipboard = Clipboard::new();
 
-        // listener + connection (both authenticate the peer against the shared
-        // authorized-fingerprint allowlist)
+        // listener + connection. Both hold the same store and ask it different
+        // questions: the listener whether a peer may drive us, the connection
+        // whether we may drive a peer.
         let listener = LanMouseListener::new(
             config.port(),
             identity.clone(),
-            authorized_keys.clone(),
+            trust.clone(),
             clipboard_in_tx.clone(),
         )
         .await?;
         let conn = LanMouseConnection::new(
             identity.clone(),
             client_manager.clone(),
-            authorized_keys.clone(),
+            trust.clone(),
             clipboard_in_tx,
             untrusted_tx,
             persist_tx,
@@ -229,7 +316,7 @@ impl Service {
         let capture_backend = config.capture_backend().map(|b| b.into());
         let capture = Capture::new(capture_backend, conn, config.release_bind());
         let emulation_backend = config.emulation_backend().map(|b| b.into());
-        let emulation = Emulation::new(emulation_backend, listener);
+        let emulation = Emulation::new(emulation_backend, listener, trust.clone());
 
         // create dns resolver
         let resolver = DnsResolver::new()?;
@@ -247,9 +334,7 @@ impl Service {
         );
 
         let port = config.port();
-        let revoked = config.revoked_fingerprints();
         let service = Self {
-            revoked,
             config,
             capture,
             emulation,
@@ -257,7 +342,10 @@ impl Service {
             resolver,
             discovery,
             discovered: HashMap::new(),
-            authorized_keys,
+            trust,
+            trust_file,
+            pending_origin: HashMap::new(),
+            last_persisted_floor: 0,
             public_key_fingerprint,
             client_manager,
             frontend_event_pending: Default::default(),
@@ -296,8 +384,18 @@ impl Service {
             self.activate_client(handle);
         }
 
+        // A lease nothing checks is a data structure. The point-of-injection
+        // check catches a lapse the moment a peer sends anything, because it
+        // rides the attacker's own code path and cannot be starved; this sweep
+        // catches the quiet case — a peer holding a session open and sending
+        // nothing — and is the only thing that advances the persisted clock
+        // floor while the daemon runs.
+        let mut lease_sweep = tokio::time::interval(LEASE_SWEEP_INTERVAL);
+        lease_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
+                _ = lease_sweep.tick() => self.sweep_lapsed_leases(),
                 request = self.frontend_listener.next() => self.handle_frontend_request(request),
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
                 event = self.emulation.event() => self.handle_emulation_event(event),
@@ -324,7 +422,7 @@ impl Service {
                     if let Some((fp, addr)) = fp {
                         // only prompt if it really is untrusted — a racing dial can
                         // report a fingerprint that was authorized in the meantime
-                        let known = self.authorized_keys.read().expect("lock").contains_key(&fp);
+                        let known = self.trust.read().expect("lock").we_may_drive(&fp);
                         if !known {
                             log::info!("untrusted receiver {fp} — raising an approval prompt");
                             self.raise_connection_attempt(fp, AttemptOrigin::OutboundDial, Some(addr));
@@ -412,7 +510,7 @@ impl Service {
                 // before rebuilding them, so revoking there would wipe the entire
                 // trust store on any config reload.
                 if let Some(fp) = self.client_manager.peer_fingerprint(handle) {
-                    if self.authorized_keys.read().expect("lock").contains_key(&fp) {
+                    if self.trust.read().expect("lock").is_known(&fp) {
                         log::warn!("deleting client {handle}: also revoking its trust ({fp})");
                         self.remove_authorized_key(fp);
                     }
@@ -472,9 +570,12 @@ impl Service {
             })
             .collect();
         self.config.set_clients(clients);
-        let authorized_keys = self.authorized_keys.read().expect("lock").clone();
-        self.config.set_authorized_keys(authorized_keys);
-        self.config.set_revoked_fingerprints(self.revoked.clone());
+        // A CACHE, written and never read back as authority. It exists so an
+        // older build, or a human reading the file, still sees who is trusted —
+        // but the daemon answers every trust question from the sealed store.
+        let (cache, tombstones) = self.trust.read().expect("lock").config_cache();
+        self.config.set_authorized_keys(cache);
+        self.config.set_revoked_fingerprints(tombstones);
         if let Err(e) = self.config.write_back() {
             log::warn!("failed to write config: {e}");
         }
@@ -499,45 +600,22 @@ impl Service {
         }
         let release_bind = self.config.release_bind();
         self.capture.set_release_bind(release_bind);
-        // A config reload can drop keys exactly like the revoke button does —
-        // editing config.toml by hand, or a watcher-driven reload. Diff against
-        // the live set and tear down anything that lost trust, or revocation is
-        // silently unenforced through this door.
-        self.revoked = self.config.revoked_fingerprints();
-        // Same door as startup: revocation outranks the allowlist. Re-adding a
-        // revoked fingerprint by hand-editing config.toml is refused and logged,
-        // so the denylist cannot be laundered by copy-pasting a key back into
-        // the other table.
-        let (authorized_keys, refused) = self.config.effective_allowlist();
-        for fp in &refused {
-            log::warn!(
-                "config lists {fp} as BOTH authorized and revoked — refusing it. \
-                 Restore it from the device list if that is what you meant."
-            );
-        }
-        let revoked: Vec<String> = {
-            let mut live = self.authorized_keys.write().unwrap();
-            let revoked = live
-                .keys()
-                .filter(|k| !authorized_keys.contains_key(*k))
-                .cloned()
-                .collect();
-            live.clone_from(&authorized_keys);
-            revoked
+        // The config reload door, closed. This block used to adopt the on-disk
+        // allowlist wholesale — `live.clone_from(&authorized_keys)` — so one
+        // appended line, typed at the keyboard or written by anything running
+        // as the user, was a permanent trust grant with no dialog and no IPC
+        // token. Trust no longer lives here: `[authorized_fingerprints]` is a
+        // cache this daemon writes and never reads, and the sealed store is the
+        // only authority. A config change is no longer a trust change.
+        //
+        // A hand-edited config is still exactly where a stale outbound pin gets
+        // reintroduced, so that check stays — against the store.
+        let stale = {
+            let trust = self.trust.read().expect("lock");
+            drop_untrusted_pins(&self.client_manager, &trust)
         };
-        // a hand-edited config is exactly where a stale pin gets reintroduced
-        for h in drop_untrusted_pins(&self.client_manager, &authorized_keys) {
+        for h in stale {
             self.broadcast_client(h);
-        }
-        for fp in &revoked {
-            // ORDER MATTERS and this was inverted: cut_sessions resolves the
-            // affected handles via peer_fingerprint, which clear_pins_matching
-            // erases. Clearing first made the outbound teardown a structural
-            // no-op on exactly the path a6ddccb added it for.
-            self.cut_sessions(fp);
-            for h in self.client_manager.clear_pins_matching(fp) {
-                self.broadcast_client(h);
-            }
         }
         self.sync_frontend();
     }
@@ -761,12 +839,20 @@ impl Service {
             .into_iter()
             .filter_map(|(_, _, s)| s.peer_fingerprint)
             .collect();
-        let authorized = self.authorized_keys.read().expect("lock");
+        let trust = self.trust.read().expect("lock");
         let peers: Vec<DiscoveredDevice> = self
             .discovered
             .values()
             .filter(|p| match &p.claimed_fingerprint {
-                Some(fp) => !configured.contains(fp) && !authorized.contains_key(fp),
+                // `has_live_lease`, so a device whose lease lapsed reappears
+                // as discoverable and can be re-added. An expelled one does
+                // not: `is_known` would hide it forever, and it must stay
+                // visible so the user can see it is gone.
+                Some(fp) => {
+                    !configured.contains(fp)
+                        && !trust.has_live_lease(fp)
+                        && trust.denial(fp).is_none()
+                }
                 None => true,
             })
             .map(|p| DiscoveredDevice {
@@ -775,7 +861,7 @@ impl Service {
                 addrs: p.addrs.clone(),
             })
             .collect();
-        drop(authorized);
+        drop(trust);
         self.notify_frontend(FrontendEvent::Discovered {
             active: self.discovery.is_some(),
             peers,
@@ -868,12 +954,13 @@ impl Service {
             }
         };
         self.notify_frontend(FrontendEvent::PairingCode(pairing_code));
-        let keys = self.authorized_keys.read().expect("lock").clone();
+        // Derived from LIVE inbound leases only. Anything looser makes the
+        // frontend claim a machine can drive you when its lease has lapsed.
+        let (keys, tombstones) = self.trust.read().expect("lock").config_cache();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
         // a freshly-attached frontend must learn the denylist too, or it renders
         // revoked devices as strangers until the next change
-        let revoked = self.revoked.clone();
-        self.notify_frontend(FrontendEvent::RevokedUpdated(revoked));
+        self.notify_frontend(FrontendEvent::RevokedUpdated(tombstones));
         // re-emit current incoming connections so a freshly-attached UI knows
         // which trusted peers are connected right now, not just from future events
         let connected: Vec<(SocketAddr, String)> = self
@@ -968,7 +1055,8 @@ impl Service {
         // identity and pairing from scratch — "the whole point of issuing new
         // keys". Refusing here closes the last laundering route, since
         // raise_connection_attempt already prevents a revoked peer prompting.
-        if let Some(entry) = self.revoked.get(&fp) {
+        let expelled = self.trust.read().expect("lock").denial(&fp).cloned();
+        if let Some(entry) = expelled {
             log::warn!(
                 "refusing to authorize {fp}: it was expelled as {:?}. That identity \
                  is permanently dead — the device must present a new one.",
@@ -982,8 +1070,39 @@ impl Service {
             )));
             return;
         }
-        self.authorized_keys.write().expect("lock").insert(fp, desc);
-        let keys = self.authorized_keys.read().expect("lock").clone();
+        // A lease, not a permanent entry — and shaped by how the peer arrived.
+        //
+        // An unsolicited knock is the user answering "may this machine drive
+        // mine": INBOUND. Our own dial is the user answering "may I drive that
+        // machine": OUTBOUND. Granting INBOUND for both is exactly the defect
+        // the direction split exists to remove, and it hid here because the
+        // split was built in the store and never wired to this door.
+        //
+        // Unknown provenance grants nothing. A grant with no prompt behind it
+        // is the case worth failing closed on.
+        let origin = self.pending_origin.remove(&fp);
+        let caps = match origin {
+            Some(AttemptOrigin::Inbound) => crate::trust::Caps::INBOUND,
+            Some(AttemptOrigin::OutboundDial) => crate::trust::Caps::OUTBOUND,
+            None => {
+                log::warn!(
+                    "refusing to authorize {fp}: no pending connection attempt, so there \
+                     is no observed provenance to shape the grant"
+                );
+                return;
+            }
+        };
+        if let Err(e) = self.trust.write().expect("lock").issue(
+            &fp,
+            &desc,
+            caps,
+            crate::trust::DEFAULT_TERM_SECS,
+        ) {
+            log::warn!("refusing to authorize {fp}: {e}");
+            return;
+        }
+        self.persist_trust();
+        let (keys, _) = self.trust.read().expect("lock").config_cache();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
     }
 
@@ -1025,10 +1144,16 @@ impl Service {
         origin: AttemptOrigin,
         addr: Option<SocketAddr>,
     ) {
-        if let Some(entry) = self.revoked.get(&fingerprint) {
+        if let Some(entry) = self
+            .trust
+            .read()
+            .expect("lock")
+            .denial(&fingerprint)
+            .cloned()
+        {
             log::warn!(
-                "ignoring a connection attempt from revoked device {:?} ({fingerprint}) — \
-                 restore it from the device list if this is intended",
+                "ignoring a connection attempt from removed device {:?} ({fingerprint}) — \
+                 that identity is permanently dead; the machine must present a new one",
                 entry.label
             );
             return;
@@ -1042,6 +1167,12 @@ impl Service {
                  address so it can be compared with the one that was typed"
             );
         }
+        // Remembered so the grant door mints the capability that matches how
+        // this peer actually arrived, rather than a fixed one.
+        if self.pending_origin.len() >= crate::transport::MAX_PENDING_ATTEMPTS {
+            self.pending_origin.clear();
+        }
+        self.pending_origin.insert(fingerprint.clone(), origin);
         self.notify_frontend(FrontendEvent::ConnectionAttempt {
             fingerprint,
             origin,
@@ -1055,6 +1186,40 @@ impl Service {
     /// from the allowlist does nothing to a session that is already up. EVERY
     /// path that removes trust must call this, or "revoke" only hides the card
     /// while the peer keeps driving this machine (or we keep driving theirs).
+    /// Cut only the direction that was lost.
+    ///
+    /// A lease can lapse in one direction while the other is still live — the
+    /// two are separate capabilities now — so tearing down both would drop a
+    /// session the user still holds. `cut_sessions` remains the both-directions
+    /// verb, used by removal, where everything goes.
+    fn cut_sessions_dir(&mut self, fp: &str, lost: crate::trust::Caps) {
+        use crate::trust::Caps;
+        let handles = if lost.contains(Caps::I_MAY_DRIVE) {
+            self.client_manager.handles_with_fingerprint(fp)
+        } else {
+            Vec::new()
+        };
+        let cut_inbound = lost.contains(Caps::DRIVE_ME);
+        let (inbound, outbound, peer) = (
+            self.revoke_listen.clone(),
+            self.revoke_conn.clone(),
+            fp.to_string(),
+        );
+        tokio::task::spawn_local(async move {
+            let cut_in = if cut_inbound {
+                inbound.close_fingerprint(&peer).await
+            } else {
+                0
+            };
+            let cut_out = outbound.close_handles(&handles).await;
+            if cut_in + cut_out > 0 {
+                log::warn!(
+                    "{peer}: lease lapsed, cut {cut_in} incoming + {cut_out} outgoing session(s)"
+                );
+            }
+        });
+    }
+
     fn cut_sessions(&mut self, fp: &str) {
         // Resolve the handles first: clear_pins_matching erases the fingerprint
         // that the outbound match is made on.
@@ -1087,7 +1252,7 @@ impl Service {
             log::warn!("refusing to relabel {fp:?}: not a valid fingerprint");
             return;
         };
-        let known = self.authorized_keys.read().expect("lock").contains_key(&fp);
+        let known = self.trust.read().expect("lock").is_known(&fp);
         if !known {
             // Refuse, do NOT insert. Inserting here would make this verb a
             // trust grant wearing a different name, which is the whole point of
@@ -1101,12 +1266,14 @@ impl Service {
             ));
             return;
         }
-        let label = hops_ipc::pairing::sanitize_label(&label);
-        self.authorized_keys
-            .write()
-            .expect("lock")
-            .insert(fp, label);
-        let keys = self.authorized_keys.read().expect("lock").clone();
+        // Sanitisation is the store's, at the door — the old code did it here
+        // and nowhere else, so a label arriving by any other route was raw.
+        if let Err(e) = self.trust.write().expect("lock").set_label(&fp, &label) {
+            log::warn!("refusing to relabel {fp}: {e}");
+            return;
+        }
+        self.persist_trust();
+        let (keys, _) = self.trust.read().expect("lock").config_cache();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
     }
 
@@ -1117,25 +1284,14 @@ impl Service {
         // dropped: refusing to revoke is the more dangerous failure.
         let fp = hops_ipc::pairing::canonical_fingerprint(&fp)
             .unwrap_or_else(|| fp.trim().to_lowercase());
-        let label = self
-            .authorized_keys
-            .write()
-            .expect("lock")
-            .remove(&fp)
-            .unwrap_or_default();
-        // Remember the expulsion. Without this the peer is a stranger again on
-        // its next dial and raises the ordinary approval prompt, which is how
-        // "revoke" ended up being one click away from undone.
-        self.revoked.insert(
-            fp.clone(),
-            hops_ipc::RevokedEntry {
-                label,
-                revoked_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or_default(),
-            },
-        );
+        // One verb, and it is permanent for this key. The store keeps the
+        // expulsion so the peer is not a stranger again on its next dial — that
+        // is how a removal ended up one click from undone — and stamps it from
+        // the floored clock rather than a raw `SystemTime::now()`, so a
+        // backdated system clock cannot write a tombstone into the past.
+        let label = self.trust.write().expect("lock").revoke(&fp);
+        log::warn!("removed {label:?} ({fp}) — that identity is permanently dead");
+        self.persist_trust();
         self.cut_sessions(&fp);
         // Revoking trust in a fingerprint releases any outbound pin on it, so a
         // client whose receiver re-keyed (e.g. reinstall) can re-learn + re-pin
@@ -1144,10 +1300,64 @@ impl Service {
         for h in self.client_manager.clear_pins_matching(&fp) {
             self.broadcast_client(h);
         }
-        let keys = self.authorized_keys.read().expect("lock").clone();
+        let (keys, tombstones) = self.trust.read().expect("lock").config_cache();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
-        let revoked = self.revoked.clone();
-        self.notify_frontend(FrontendEvent::RevokedUpdated(revoked));
+        self.notify_frontend(FrontendEvent::RevokedUpdated(tombstones));
+    }
+
+    /// Drop what has lapsed, and cut the sessions it was holding open.
+    ///
+    /// Runs on a timer, which means it can be delayed by a busy thread — the
+    /// injection loop yields every few events precisely so it cannot be delayed
+    /// indefinitely. It is deliberately not the only enforcement: a lapsed
+    /// lease is refused at the point of injection too, where no amount of
+    /// flooding can postpone the check.
+    fn sweep_lapsed_leases(&mut self) {
+        let lapsed = {
+            let mut trust = self.trust.write().expect("lock");
+            trust.sweep(crate::trust::system_seconds())
+        };
+        if lapsed.is_empty() {
+            // Still persist occasionally: the clock floor only advances while
+            // the daemon runs, and a floor that never reaches disk is a floor
+            // that resets on every restart.
+            self.persist_trust_if_floor_moved();
+            return;
+        }
+        for lease in &lapsed {
+            log::info!(
+                "{}: lease lapsed ({}), cutting the sessions it permitted",
+                lease.peer,
+                lease.caps
+            );
+            self.cut_sessions_dir(&lease.peer, lease.caps);
+        }
+        self.persist_trust();
+        let (keys, tombstones) = self.trust.read().expect("lock").config_cache();
+        self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+        self.notify_frontend(FrontendEvent::RevokedUpdated(tombstones));
+    }
+
+    /// Persist only when the clock floor actually moved, so a quiet daemon does
+    /// not rewrite a sealed file every minute for nothing.
+    fn persist_trust_if_floor_moved(&mut self) {
+        let floor = self.trust.read().expect("lock").clock().floor();
+        if floor > self.last_persisted_floor {
+            self.last_persisted_floor = floor;
+            self.persist_trust();
+        }
+    }
+
+    /// Write the sealed store.
+    ///
+    /// Deliberately separate from `save_config`: trust must not ride on the
+    /// eleven callers of that, which fire for a window move or a position
+    /// change. This is called only where trust actually changed.
+    fn persist_trust(&mut self) {
+        let records = crate::trust_file::records_of(&self.trust.read().expect("lock"));
+        if let Err(e) = self.trust_file.save(&records) {
+            log::error!("failed to write the trust store: {e}");
+        }
     }
 
     fn enumerate(&mut self) {
@@ -1408,14 +1618,52 @@ mod trust_door_guard {
         &rest[..end]
     }
 
+    /// Replaces a source scan that forbade `authorized_fingerprints()` anywhere
+    /// in this file. Its premise was that reading the raw table skipped the
+    /// revocation subtraction — true while the config WAS the trust store. It
+    /// no longer is: the table is a cache the daemon writes and never reads as
+    /// authority, and the one remaining call is the one-time migration, at the
+    /// boundary where the two tables become one.
+    ///
+    /// The guarantee the scan was protecting still holds and is now checked by
+    /// calling the code: a fingerprint in BOTH tables migrates to a removal, not
+    /// a grant. That is issue #66, tested rather than grepped.
+    /// A well-formed 32-byte fingerprint made of one repeated byte.
+    fn fp32(b: u8) -> String {
+        (0..32)
+            .map(|_| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(":")
+    }
+
     #[test]
-    fn the_daemon_never_reads_the_raw_allowlist() {
-        assert!(
-            !production_source(SERVICE_RS_ALL).contains("authorized_fingerprints()"),
-            "service.rs must obtain the allowlist only via Config::effective_allowlist(), \
-             which subtracts revocation tombstones. Calling authorized_fingerprints() \
-             directly is how a revoked device came back after a reboot — issue #66."
+    fn a_fingerprint_in_both_config_tables_migrates_to_a_removal_not_a_grant() {
+        use crate::trust::Caps;
+        use std::collections::HashMap;
+
+        let fp = fp32(0xaa);
+        let mut store = crate::trust::TrustStore::new(&fp32(0x01), 0).expect("ours");
+        store.migrate_from_config(
+            &HashMap::from([(fp.clone(), "laundered".to_string())]),
+            &HashMap::from([(
+                fp.clone(),
+                hops_ipc::RevokedEntry {
+                    label: "expelled".to_string(),
+                    revoked_at: 1_000,
+                },
+            )]),
+            &std::collections::HashSet::new(),
+            2_000,
         );
+
+        assert_eq!(
+            store.capabilities(&fp),
+            Caps::NONE,
+            "a fingerprint listed as BOTH authorized and revoked must carry no \
+             capability — copy-pasting a key back into the allowlist is how a \
+             removed device came back after a reboot"
+        );
+        assert!(store.denial(&fp).is_some(), "and the removal must survive");
     }
 
     #[test]
@@ -1503,23 +1751,40 @@ mod set_label_cannot_grant {
         rest[..end].to_string()
     }
 
+    /// Replaces a source scan that looked for `contains_key` before `.insert(`
+    /// in this function's text. It could not tell a rename from a regression,
+    /// and a rename is exactly what happened. The guarantee is unchanged and is
+    /// now checked by calling the store: renaming is not a way to authorize.
+    #[test]
+    fn renaming_an_unknown_device_grants_it_nothing() {
+        use crate::trust::{Caps, TrustStore};
+
+        let ours = (0..32)
+            .map(|_| "01".to_string())
+            .collect::<Vec<_>>()
+            .join(":");
+        let stranger = (0..32)
+            .map(|_| "22".to_string())
+            .collect::<Vec<_>>()
+            .join(":");
+        let mut store = TrustStore::new(&ours, 0).expect("ours");
+
+        assert!(
+            store.set_label(&stranger, "mine now").is_err(),
+            "relabelling a device that holds no lease must be REFUSED, not \
+             treated as a grant wearing a different name"
+        );
+        assert_eq!(
+            store.capabilities(&stranger),
+            Caps::NONE,
+            "and it must still permit nothing afterwards"
+        );
+    }
+
     #[test]
     fn set_label_refuses_an_unknown_fingerprint_rather_than_inserting_it() {
         let src = production(include_str!("service.rs"));
         let body = body_of(&src, "fn set_label(");
-        assert!(
-            body.contains("contains_key"),
-            "set_label must CHECK that the fingerprint is already authorized"
-        );
-        // The refusal must come before any write. If the only `insert` is
-        // reachable unconditionally, this verb is a trust grant in disguise.
-        let check = body.find("contains_key").expect("checked above");
-        let insert = body.find(".insert(").expect("set_label must write a label");
-        assert!(
-            check < insert,
-            "set_label must refuse an unknown fingerprint BEFORE writing — otherwise \
-             renaming is a way to authorize"
-        );
         assert!(
             body.contains("return"),
             "the unknown-fingerprint path must return, not fall through"

@@ -189,6 +189,21 @@ pub enum Command {
     },
     /// open the terminal interface (attaches to the daemon)
     Tui,
+    /// report whether this binary matches the source it was built from
+    ///
+    /// Launchers run this before starting anything, so a stale binary is
+    /// noticed at launch rather than halfway through a test session.
+    BuildCheck {
+        /// source tree to compare against (default: $HOPS_REPO, else the
+        /// working directory)
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// exit non-zero when stale — for dev launchers, where testing an old
+        /// binary measures the wrong code. Daily launchers omit it: a promoted
+        /// build is deliberately behind and must still start.
+        #[arg(long)]
+        strict: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
@@ -483,7 +498,7 @@ fn harden_existing(_config_dir: &Path, _config_path: &Path) {}
 /// is always the same one. A reader sees the whole old file or the whole new one,
 /// never a truncated one. The temp inherits [`create_private`]'s `0600`, so the
 /// contents are never briefly world-readable either.
-fn write_atomically(path: &Path, contents: &[u8]) -> Result<(), io::Error> {
+pub(crate) fn write_atomically(path: &Path, contents: &[u8]) -> Result<(), io::Error> {
     let tmp = path.with_extension("toml.tmp");
     {
         let mut f = create_private(&tmp)?;
@@ -519,6 +534,18 @@ fn subtract_revoked(
         authorized.remove(fp);
     }
     (authorized, refused)
+}
+
+/// The subcommand, parsed from argv alone.
+///
+/// `build-check` is a diagnostic, so it has to answer when the config file is
+/// unreadable — which is precisely when someone is trying to find out what is
+/// wrong. `Config::new()` loads and validates that file before any subcommand
+/// is dispatched, so a single bad line there made the check exit 1 having never
+/// run, and every launcher reported "stale, rebuild" for a problem no rebuild
+/// could fix.
+pub fn command_from_args() -> Option<Command> {
+    Args::parse().command
 }
 
 impl Config {
@@ -773,7 +800,7 @@ impl Config {
     }
 
     pub fn read_from_disk(&mut self) -> Result<bool, io::Error> {
-        log::info!("reading config from {:?}", &self.config_path);
+        log::info!("reading config from {:?}", self.config_path);
 
         let current_config = fs::read_to_string(&self.config_path)?;
         let current_config = match current_config.parse::<DocumentMut>() {
@@ -803,7 +830,7 @@ impl Config {
     }
 
     pub fn write_back(&mut self) -> Result<(), io::Error> {
-        log::info!("writing config to {:?}", &self.config_path);
+        log::info!("writing config to {:?}", self.config_path);
         /* the new config */
         // Never serialise `unwrap_or_default()`. If there is no parsed config in
         // memory, writing is the one thing this must not do — that is how a parse

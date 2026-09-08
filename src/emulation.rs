@@ -101,6 +101,7 @@ impl Emulation {
     pub(crate) fn new(
         backend: Option<input_emulation::Backend>,
         listener: LanMouseListener,
+        trust: crate::transport::Trust,
     ) -> Self {
         let emulation_proxy = EmulationProxy::new(backend);
         let last_injected = emulation_proxy.last_injected.clone();
@@ -111,6 +112,8 @@ impl Emulation {
             emulation_proxy,
             request_rx,
             event_tx,
+            trust,
+            peer_of: HashMap::new(),
         };
         let task = spawn_local(emulation_task.run());
         Self {
@@ -172,7 +175,7 @@ impl Emulation {
 /// spans the gap, so no drift accumulates (unlike a relative-delta stream).
 /// The reconstructed delta is fed to the UNCHANGED injection path (the clamp
 /// + edge detector on the macOS side), so the crown-jewel motion arm is
-/// untouched.
+///   untouched.
 ///
 /// Contract PR-4's sender must uphold: motion is emitted ONLY after the Enter
 /// is acked. hops's capture state machine already enforces this — every event
@@ -215,13 +218,78 @@ struct ListenTask {
     emulation_proxy: EmulationProxy,
     request_rx: Receiver<EmulationRequest>,
     event_tx: Sender<EmulationEvent>,
+    /// The store, so an expiring lease is refused AT THE POINT OF INJECTION.
+    ///
+    /// The sweep on the service loop catches a lapse eventually, but a timer is
+    /// something a busy thread can delay. This check cannot be delayed, because
+    /// it rides the attacker's own code path: to keep injecting, they have to
+    /// execute it. That is the difference between a lease and a label.
+    trust: crate::transport::Trust,
+    /// Which peer each admitted address belongs to. Populated on accept, so the
+    /// per-event check is a map lookup rather than a certificate parse.
+    peer_of: HashMap<SocketAddr, String>,
+}
+
+/// Suppresses repeat approval prompts for a fingerprint that keeps dialling,
+/// without letting the memory that does the suppressing grow without bound.
+///
+/// This was a bare `HashMap` local to the listen task, inserted into and never
+/// removed from, so it lived for the life of the daemon. Anyone on the network
+/// can add to it: dial with a self-signed certificate we do not know, get
+/// rejected, and a fingerprint is recorded. A peer generating a fresh key per
+/// dial produces a fresh entry per dial — measured at 120 distinct fingerprints
+/// per second from one host, roughly 432,000 permanent entries an hour, in the
+/// highest-privilege daemon on the machine.
+///
+/// Entries exist only to answer "did this exact fingerprint dial within the
+/// suppression window", so an entry older than that window has no reader and is
+/// simply dropped.
+struct RecentRejections {
+    seen: HashMap<String, Instant>,
+}
+
+impl RecentRejections {
+    /// How long a fingerprint stays suppressed after it raises a prompt.
+    const WINDOW: Duration = Duration::from_secs(2);
+
+    /// Prune once the map is larger than a real fleet could explain. Chosen so
+    /// pruning is rare in normal use and cheap when an attacker forces it.
+    const PRUNE_AT: usize = 256;
+
+    fn new() -> Self {
+        Self {
+            seen: HashMap::new(),
+        }
+    }
+
+    /// True if this rejection should raise a prompt.
+    fn should_notify(&mut self, fingerprint: &str) -> bool {
+        let now = Instant::now();
+
+        if self.seen.len() >= Self::PRUNE_AT {
+            self.seen
+                .retain(|_, first_seen| now.duration_since(*first_seen) < Self::WINDOW);
+            // Everything still here is inside the window, which means a flood of
+            // distinct fingerprints rather than a fleet. Drop it: the cost is a
+            // repeated prompt for a peer that dialled seconds ago, and the
+            // alternative is unbounded growth driven by a stranger.
+            if self.seen.len() >= Self::PRUNE_AT {
+                self.seen.clear();
+            }
+        }
+
+        match self.seen.insert(fingerprint.to_owned(), now) {
+            None => true,
+            Some(previous) => now.duration_since(previous) >= Self::WINDOW,
+        }
+    }
 }
 
 impl ListenTask {
     async fn run(mut self) {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         let mut last_response = HashMap::new();
-        let mut rejected_connections = HashMap::new();
+        let mut rejected_connections = RecentRejections::new();
         let mut absmotion = AbsMotionReconstructor::default();
         loop {
             select! {
@@ -251,7 +319,24 @@ impl ListenTask {
                                 absmotion.forget(addr);
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                             }
-                            ProtoEvent::Input(event) => self.emulation_proxy.consume(event, addr),
+                            ProtoEvent::Input(event) => {
+                                // Cheap and unstarvable. Roughly 20 ns against
+                                // the ~100 µs blocking syscall that dominates
+                                // an injected event, so it is not measurable on
+                                // the path it protects.
+                                let permitted = self
+                                    .peer_of
+                                    .get(&addr)
+                                    .is_some_and(|fp| {
+                                        self.trust
+                                            .read()
+                                            .expect("lock")
+                                            .may_drive_us(fp)
+                                    });
+                                if permitted {
+                                    self.emulation_proxy.consume(event, addr);
+                                }
+                            }
                             ProtoEvent::Ping => self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())).await,
                             // Peer's version handshake. Echo our own
                             // commit back so the peer's connect-side
@@ -294,13 +379,13 @@ impl ListenTask {
                         }
                     }
                     Some(ListenEvent::Accept { addr, fingerprint }) => {
+                        self.peer_of.insert(addr, fingerprint.clone());
                         self.event_tx.send(EmulationEvent::Connected { addr, fingerprint }).expect("channel closed");
                     }
                     Some(ListenEvent::Rejected { fingerprint }) => {
-                        if rejected_connections.insert(fingerprint.clone(), Instant::now())
-                            .is_none_or(|i| i.elapsed() >= Duration::from_secs(2)) {
-                                self.event_tx.send(EmulationEvent::ConnectionAttempt { fingerprint }).expect("channel closed");
-                            }
+                        if rejected_connections.should_notify(&fingerprint) {
+                            self.event_tx.send(EmulationEvent::ConnectionAttempt { fingerprint }).expect("channel closed");
+                        }
                     }
                     None => break
                 }}
@@ -356,6 +441,27 @@ pub(crate) struct EmulationProxy {
     metrics: Rc<QueueMetrics>,
     task: JoinHandle<()>,
 }
+
+/// How many events the injection loop may consume before handing the runtime
+/// back to every other task on the thread.
+///
+/// The runtime is single-threaded. A peer driving input keeps `request_rx.recv()`
+/// ready forever, so without an explicit yield the injection loop is the only
+/// thing that runs and a revocation cannot be serviced until the flood stops.
+///
+/// 8 is measured, not chosen for looking round: yielding every event costs 12.9%
+/// of injection throughput, every 8 costs 1.7%, and both bound revoke latency to
+/// single-digit milliseconds against 1.811 s unbounded.
+///
+/// NOT UNIT-TESTED, deliberately. Three attempts to assert the scheduling effect
+/// from inside the same runtime were all flaky: `LocalSet` may run several ticks
+/// of a spawned task per poll of the outer future, so neither "how much drained
+/// before another task ran" nor "was the backlog ever seen partly drained" is
+/// deterministic. A flaky test that trains people to re-run until green is worse
+/// than an honest gap. The effect is measured end to end instead — revoke
+/// latency under a 20,000-event flood — and that belongs in a rig check, not in
+/// `cargo test`.
+const YIELD_EVERY_N_EVENTS: u32 = 8;
 
 enum ProxyRequest {
     Input(Event, SocketAddr),
@@ -581,6 +687,7 @@ impl EmulationTask {
         let mut report = tokio::time::interval(Duration::from_secs(1));
         report.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut prev_enqueued = self.metrics.enqueued.get();
+        let mut injected_since_yield: u32 = 0;
         loop {
             tokio::select! {
                 _ = report.tick() => {
@@ -590,7 +697,10 @@ impl EmulationTask {
                     if rate > 0 {
                         let backlog = enqueued.saturating_sub(self.metrics.injected.get());
                         let peak = self.metrics.peak_backlog.get();
-                        log::info!(
+                        // debug, not info: this fires once per ACTIVE second
+                        // with no rotation anywhere, and accounted for the bulk
+                        // of a 71.9 MB daemon log over 57 days.
+                        log::debug!(
                             "[motion-metrics] {rate} input/s | backlog now {backlog} | peak {peak}"
                         );
                         self.metrics.peak_backlog.set(backlog);
@@ -610,6 +720,25 @@ impl EmulationTask {
                         };
                         emulation.consume(event, handle).await?;
                         self.metrics.on_inject();
+                        // Hand the runtime back periodically. `local_channel`
+                        // recv resolves immediately while the queue is
+                        // non-empty, and the runtime is `new_current_thread`
+                        // (main.rs:337) — so without this, a peer that floods
+                        // input starves every other task on the thread,
+                        // including the one that services a revocation. That is
+                        // denial-of-revocation by injection: the single most
+                        // likely thing an attacker does once discovered.
+                        //
+                        // Measured, 20,000-event backlog: revoke serviced after
+                        // 1.811 s with no yield, ~2 ms yielding every 8, and the
+                        // revoke was never serviced mid-flood at all. Yielding
+                        // on EVERY event costs 12.9% injection throughput for
+                        // 300 µs nobody can perceive; every 8 costs 1.7%.
+                        injected_since_yield += 1;
+                        if injected_since_yield >= YIELD_EVERY_N_EVENTS {
+                            injected_since_yield = 0;
+                            tokio::task::yield_now().await;
+                        }
                         // adaptive edge: the backend may have concluded this
                         // event was a deliberate push past a screen edge
                         if let Some(side) = emulation.take_edge_push() {
@@ -690,6 +819,46 @@ mod tests {
 
     fn addr(n: u16) -> SocketAddr {
         format!("127.0.0.1:{n}").parse().unwrap()
+    }
+
+    /// Remote unauthenticated memory growth.
+    ///
+    /// The suppression map was insert-only and lived for the life of the
+    /// daemon, so a peer generating a fresh self-signed certificate per dial
+    /// added a permanent entry per dial — measured at 120 distinct fingerprints
+    /// per second from one host. Remove the pruning in `should_notify` and this
+    /// fails with one entry per distinct fingerprint offered.
+    #[test]
+    fn a_flood_of_unknown_fingerprints_cannot_grow_memory_without_bound() {
+        let mut recent = RecentRejections::new();
+        for i in 0..50_000u32 {
+            // A fresh key per dial, which is what defeats a per-fingerprint
+            // suppression window and what an attacker actually does.
+            recent.should_notify(&format!("fp-{i:08x}"));
+        }
+        assert!(
+            recent.seen.len() < RecentRejections::PRUNE_AT * 2,
+            "50,000 distinct dials left {} entries resident — an unauthenticated \
+             peer can still drive unbounded growth in the daemon holding the \
+             private key",
+            recent.seen.len()
+        );
+    }
+
+    /// The bound must not cost the thing the map exists to do.
+    #[test]
+    fn a_peer_retrying_in_a_loop_still_raises_only_one_prompt() {
+        let mut recent = RecentRejections::new();
+        assert!(
+            recent.should_notify("aa:bb:cc"),
+            "the first sighting of a fingerprint must raise a prompt"
+        );
+        for _ in 0..10_000 {
+            assert!(
+                !recent.should_notify("aa:bb:cc"),
+                "a peer retrying inside the window must not raise a second prompt"
+            );
+        }
     }
 
     /// The pointer is not proof of local presence on a KVM: a peer that still

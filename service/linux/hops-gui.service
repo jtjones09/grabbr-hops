@@ -1,0 +1,26 @@
+# hops-gui.service — the tray, as its own unit.
+#
+# Separate from hops.service on purpose. The tray is a CLIENT of the daemon: it
+# attaches, and it can crash, be stopped, and be restarted without the daemon
+# noticing. Fused together, restarting a dead tray icon meant taking down a
+# working KVM — losing keyboard and mouse to fix a cosmetic failure.
+#
+#   cp hops-gui.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now hops-gui.service
+
+[Unit]
+Description=hops tray
+After=graphical-session.target
+BindsTo=graphical-session.target
+# Wants, not Requires: the tray is useful on its own, and must never be the
+# reason the daemon goes down.
+Wants=hops.service
+
+[Service]
+ExecStart=hops gui --hidden
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

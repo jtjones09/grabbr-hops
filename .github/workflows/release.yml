@@ -28,7 +28,32 @@ permissions:
   contents: write
 
 jobs:
+  # A tag is a claim about which build this is, and nothing checked it. The crate
+  # version and the tag are two statements of the same fact written in different
+  # files, and the artifact carries the crate's — so a v0.14.0 tag on a 0.12.0
+  # crate ships a bundle that identifies itself as 0.12.0, with no failure
+  # anywhere. Joining the two costs one job.
+  version-matches-tag:
+    name: the artifact says which build it is
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+      - name: tag must equal the crate version
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          crate=$(grep -m1 -E '^version = ' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          echo "tag=$tag crate=$crate"
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::tag v$tag does not match Cargo.toml version $crate."
+            echo "The published artifact would report $crate. Bump the crate or"
+            echo "retag; do not release a build that misreports its own version."
+            exit 1
+          fi
+          echo "OK: the artifact will report $crate."
+
   build:
+    needs: version-matches-tag
     name: build-${{ matrix.name }}
     # Surfaced so the macOS signing steps can gate on "are the secrets set?"
     # (secrets aren't allowed directly in `if:`, but job env is).

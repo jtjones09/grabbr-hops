@@ -12,10 +12,17 @@
 # Start at BOOT without an interactive login (the point of a headless box):
 #   sudo loginctl enable-linger "$USER"
 #
-# Input emulation on Linux uses /dev/uinput. Grant access without running as root
-# by adding your user to the group that owns it (commonly `input`) — or ship a
-# udev rule — then re-login:
-#   sudo usermod -aG input "$USER"
+# REQUIRES A RUNNING GRAPHICAL SESSION. "Headless" here means no monitor and no
+# interactive login — NOT no display server. Every Linux emulation backend needs
+# one: wlroots calls Connection::connect_to_env() (WAYLAND_DISPLAY), x11 calls
+# XOpenDisplay (DISPLAY), and libei/xdg-desktop-portal go through the portal.
+# There is no /dev/uinput backend in this codebase, so on a box with no display
+# server the daemon starts, discovers and pairs, and then cannot inject.
+#
+# Do NOT add yourself to the `input` group for this. Earlier revisions of this
+# file said to; it grants read access to every /dev/input/event* — system-wide
+# keystroke capture, on the machine running a KVM — for a capability hops does
+# not have and does not use.
 #
 # Configure it over SSH after it's running: `hops tui` (needs a --features tui
 # build), `hops cli ...`, or edit ~/.config/lan-mouse/config.toml. See
@@ -31,8 +38,6 @@ Wants=network-online.target
 ExecStart=%h/.local/bin/hops daemon
 Restart=on-failure
 RestartSec=2
-# headless emulation needs uinput; if you run as root instead of the input group,
-# that also works but is not recommended.
 
 [Install]
 WantedBy=default.target

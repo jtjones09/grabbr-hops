@@ -21,48 +21,21 @@ APP="$OUT/hops.app"
 
 echo "==> Assembling $APP (version $VERSION)"
 mkdir -p "$OUT"
-rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$BIN" "$APP/Contents/MacOS/hops"
-chmod +x "$APP/Contents/MacOS/hops"
 
-# App icon is optional — build it with scripts/makeicns.sh (needs imagemagick +
-# librsvg). Without it the bundle just gets the generic macOS app icon.
-ICON_KEY=""
+# ONE generator, shared with the dev launcher. They used to differ — the release
+# bundle carried the Info.plist and the dev build ran as a bare binary — so a
+# permission declared here was simply absent from the build being tested. See
+# scripts/macos-app-bundle.sh.
+ICNS=""
 if [ -f "$REPO/target/icon.icns" ]; then
-    cp "$REPO/target/icon.icns" "$APP/Contents/Resources/icon.icns"
-    ICON_KEY='    <key>CFBundleIconFile</key><string>icon</string>'
+    ICNS="$REPO/target/icon.icns"
     echo "    + icon.icns"
 else
     echo "    (no target/icon.icns — run scripts/makeicns.sh to add a Finder icon)"
 fi
 
-cat > "$APP/Contents/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleIdentifier</key><string>com.grabbr.hops</string>
-    <key>CFBundleExecutable</key><string>hops</string>
-    <key>CFBundleName</key><string>hops</string>
-    <key>CFBundleDisplayName</key><string>hops</string>
-    <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>${VERSION}</string>
-    <key>CFBundleVersion</key><string>${VERSION}</string>
-${ICON_KEY}
-    <key>LSMinimumSystemVersion</key><string>11.0</string>
-    <key>NSHighResolutionCapable</key><true/>
-    <!-- menu-bar app: no Dock icon / Cmd-Tab entry (matches set_accessory_policy) -->
-    <key>LSUIElement</key><true/>
-    <key>NSAppSleepDisabled</key><true/>
-    <key>NSInputMonitoringUsageDescription</key>
-    <string>hops needs Input Monitoring to capture your keyboard and mouse and forward it to the machines you've paired.</string>
-</dict>
-</plist>
-PLIST
-
-# Fail loudly if the plist is malformed rather than shipping a broken bundle.
-plutil -lint "$APP/Contents/Info.plist" >/dev/null
+# Signing and notarization stay in sign-macos.sh; this only assembles.
+"$REPO/scripts/macos-app-bundle.sh" "$BIN" "$VERSION" "$APP" "$ICNS" >/dev/null
 
 echo "==> Building $OUT/hops-macos.dmg"
 STAGE="$(mktemp -d)"

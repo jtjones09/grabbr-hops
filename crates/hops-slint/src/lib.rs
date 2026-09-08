@@ -69,14 +69,17 @@ struct PolledUi {
     /// Whether that pairing prompt came from OUR outbound dial rather than a
     /// peer connecting in (#61) — the card says which.
     pairing_from_our_dial: bool,
-    /// Six digits both machines display — see `AppModel::pending_verification_code`.
-    pairing_code: String,
     /// The address that answered our dial, so the user can compare it with the
     /// one they typed (#93). Empty when unknown (every inbound attempt).
     pairing_addr: String,
     free_position: String,
     notice: String,
     notice_seq: i32,
+    // An 11-field positional tuple against a 13-field DeviceRow, which is why
+    // the repaint gate silently misses the two fields added most recently. The
+    // fix is a named struct, and it belongs with the device-model work rather
+    // than a lint silenced here — see the interface epic.
+    #[allow(clippy::type_complexity)]
     devices: Vec<(
         String,
         String,
@@ -274,6 +277,47 @@ fn acquire_single_instance(show_requested: Arc<AtomicBool>) -> Instance {
         Err(_) => Instance::Primary(SingleInstanceGuard {
             path: std::path::PathBuf::new(),
         }),
+    }
+}
+
+/// Claim a pending "create device" once its handle appears, or leave it for the
+/// next tick.
+///
+/// The take and the put-back must never overlap, and keeping them in one
+/// function is the whole point of it existing. The call site used to read
+///
+/// ```ignore
+/// if let Some(v) = cell.borrow_mut().take() {
+///     match arrived {
+///         Some(h) => { /* use it */ }
+///         None => *cell.borrow_mut() = Some(v),   // panics
+///     }
+/// }
+/// ```
+///
+/// which panics with `RefCell already borrowed`. On edition 2021 a temporary in
+/// an `if let` scrutinee lives until the end of the whole block, so the borrow
+/// taken to call `.take()` is still held when the retry arm borrows again.
+///
+/// That arm is not an edge case — it runs every time a device is created and
+/// its handle has not yet reached a snapshot, which is the ordinary case on the
+/// tick right after "add". The window died there with no message, because a
+/// panic under `panic = "abort"` was the last thing the process wrote and
+/// nothing was reading its output.
+fn claim_pending<T>(
+    cell: &RefCell<Option<T>>,
+    arrived: Option<ClientHandle>,
+) -> Option<(ClientHandle, T)> {
+    // Ends at the semicolon, before anything else can borrow.
+    let taken = cell.borrow_mut().take();
+    match (arrived, taken) {
+        (Some(handle), Some(value)) => Some((handle, value)),
+        // No handle yet — put it back and try again next tick.
+        (None, Some(value)) => {
+            *cell.borrow_mut() = Some(value);
+            None
+        }
+        (_, None) => None,
     }
 }
 
@@ -658,42 +702,29 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
             // apply a pending create's name/port/position once its handle shows up
             {
                 let current: HashSet<ClientHandle> = m.clients.keys().copied().collect();
-                if let Some((name, port, position, fix_ips)) =
-                    pending_new_device.borrow_mut().take()
+                let arrived = current.difference(&known_handles.borrow()).next().copied();
+                if let Some((new_handle, (name, port, position, fix_ips))) =
+                    claim_pending(&pending_new_device, arrived)
                 {
-                    match current.difference(&known_handles.borrow()).next() {
-                        Some(&new_handle) => {
-                            if !name.is_empty() {
-                                client.request(FrontendRequest::UpdateHostname(
-                                    new_handle,
-                                    Some(name),
-                                ));
-                            }
-                            if !fix_ips.is_empty() {
-                                // Picked off the network list: pin what mDNS
-                                // told us rather than hoping the name resolves.
-                                client.request(FrontendRequest::UpdateFixIps(
-                                    new_handle,
-                                    fix_ips.clone(),
-                                ));
-                            }
-                            client.request(FrontendRequest::UpdatePort(new_handle, port));
-                            client.request(FrontendRequest::UpdatePosition(new_handle, position));
-                            // ACTUALLY try the machine. Previously "add device"
-                            // created an inert card: nothing was dialed, the other
-                            // machine showed nothing, and two unnamed steps stood
-                            // between "added" and "works" (find the unlabeled
-                            // toggle, then shove the cursor off that edge). The
-                            // form now opens on a free edge, so this cannot evict
-                            // another device, and a name that will not resolve
-                            // now reports itself.
-                            client.request(FrontendRequest::Activate(new_handle, true));
-                        }
-                        // the Created event hasn't reached a snapshot yet — retry next tick
-                        None => {
-                            *pending_new_device.borrow_mut() = Some((name, port, position, fix_ips))
-                        }
+                    if !name.is_empty() {
+                        client.request(FrontendRequest::UpdateHostname(new_handle, Some(name)));
                     }
+                    if !fix_ips.is_empty() {
+                        // Picked off the network list: pin what mDNS
+                        // told us rather than hoping the name resolves.
+                        client.request(FrontendRequest::UpdateFixIps(new_handle, fix_ips.clone()));
+                    }
+                    client.request(FrontendRequest::UpdatePort(new_handle, port));
+                    client.request(FrontendRequest::UpdatePosition(new_handle, position));
+                    // ACTUALLY try the machine. Previously "add device"
+                    // created an inert card: nothing was dialed, the other
+                    // machine showed nothing, and two unnamed steps stood
+                    // between "added" and "works" (find the unlabeled
+                    // toggle, then shove the cursor off that edge). The
+                    // form now opens on a free edge, so this cannot evict
+                    // another device, and a name that will not resolve
+                    // now reports itself.
+                    client.request(FrontendRequest::Activate(new_handle, true));
                 }
                 *known_handles.borrow_mut() = current;
             }
@@ -727,11 +758,6 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                 m.pending_pairing_addr
                     .map(|a| a.to_string())
                     .unwrap_or_default()
-            };
-            let pairing_code = if pairing.is_empty() {
-                String::new()
-            } else {
-                m.pending_verification_code().unwrap_or_default()
             };
             let pairing_from_our_dial = !pairing.is_empty()
                 && m.pending_pairing_origin
@@ -850,7 +876,6 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                     })
                     .collect(),
                 pairing_from_our_dial,
-                pairing_code,
                 pairing_addr,
                 // the first edge nothing active is already using, so adding a
                 // second device does not silently switch off the first
@@ -901,7 +926,6 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
             ui.set_discovered(ModelRc::new(VecModel::from(snap.discovered.clone())));
             ui.set_discovery_active(snap.discovery_active);
             ui.set_pairing_from_our_dial(snap.pairing_from_our_dial);
-            ui.set_pairing_code(snap.pairing_code.as_str().into());
             ui.set_pairing_addr(snap.pairing_addr.as_str().into());
             // only when the DAEMON has something new — otherwise a local
             // validation notice would be overwritten on the next poll
@@ -1154,8 +1178,8 @@ mod discovery_states {
     //! or **looking and there is genuinely nothing** — and #138 rendered the
     //! same absence for all three: the section simply did not appear. On a
     //! network where multicast is filtered, the feature was indistinguishable
-    //! from a bug. Jeremy hit exactly this shape with the probe ("I am not sure
-    //! what should happen"), and the fix there was the same: make silence
+    //! from a bug. The diagnostic probe had the same shape and the same fix:
+    //! when a reader cannot tell what an empty result means, make the silence
     //! explain itself.
 
     const UI: &str = include_str!("../ui/app.slint");
@@ -1195,31 +1219,120 @@ mod discovery_states {
     }
 }
 
-#[cfg(test)]
-mod verification_code_is_on_screen {
-    //! The pairing card must actually render the code.
-    //!
-    //! A correct primitive that no screen displays is the #92 shape: the fact
-    //! was right and the render step threw it away.
+// ---------------------------------------------------------------------------
+// the tray's `visible` must stay bound, or hiding it aborts the app
+// ---------------------------------------------------------------------------
 
-    const UI: &str = include_str!("../ui/app.slint");
+#[cfg(test)]
+mod tray_const_property {
+    //! A `SystemTrayIcon` that never assigns `visible` gets it const-folded by
+    //! the Slint compiler: generated init sets it true, then calls
+    //! `set_constant()`. The generated `hide()` still writes `false`, and
+    //! writing a constant property panics "Constant property being changed" in
+    //! i-slint-core. The release profile sets `panic = "abort"`, so that is
+    //! SIGABRT for the whole app, not a caught error — issue #4.
+    //!
+    //! Binding it to a public `in-out` makes the compiler's `is_constant()`
+    //! false, so `set_constant()` is never emitted and `hide()` is safe.
+    //!
+    //! **This is a source scan, deliberately, and it is the legitimate case for
+    //! one:** the invariant is about text the Slint compiler reads, and a
+    //! behavioural test would need a real tray on a real display, which CI does
+    //! not have. It is scoped to the one file and mutation-tested.
+    //!
+    //! **It was deleted once**, during a merge-conflict resolution, with no
+    //! mention in the commit message — while the issue it guards stayed open
+    //! and the panic it prevents is still in the logs. Do not delete it again;
+    //! if the tray stops needing it, say so in the diff.
+
+    const TRAY: &str = include_str!("../ui/tray.slint");
 
     #[test]
-    fn the_card_shows_the_code_and_says_what_to_do_with_it() {
-        // Must be BOUND TO A TEXT, not merely mentioned. The property
-        // declaration and the `if` guard both contain `root.pairing-code`, so a
-        // looser check passed even with the Text blanked to "" — a card that
-        // renders nothing while the guard stays green.
+    fn the_trays_visible_is_bound_to_a_property_and_not_a_literal() {
+        let bound = TRAY
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .any(|l| l.trim_start().starts_with("visible:") && l.contains("root."));
         assert!(
-            UI.contains("text: root.pairing-code;"),
-            "the pairing card must BIND the verification code to a Text. The \
-             ceremony is the user comparing two screens; a code displayed on \
-             neither is not a ceremony."
+            bound,
+            "tray.slint no longer binds `visible` to a property. The Slint \
+             compiler will const-fold it, `hide()` will write a constant, and \
+             i-slint-core panics \"Constant property being changed\" — which \
+             under `panic = \"abort\"` takes the whole app down rather than \
+             failing an operation. See issue #4."
+        );
+    }
+
+    #[test]
+    fn the_property_it_binds_to_is_in_out_so_the_compiler_cannot_fold_it() {
+        let declared = TRAY
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .any(|l| l.contains("in-out property <bool> shown"));
+        assert!(
+            declared,
+            "the property `visible` binds to is no longer a public `in-out`. \
+             The compiler's is_constant() then returns true, set_constant() is \
+             emitted again, and hiding the tray aborts the app. The visibility \
+             is what defeats the folding — an equivalent private property does \
+             not."
+        );
+    }
+}
+
+#[cfg(test)]
+mod pending_create {
+    //! The tray died here, silently, every time a device was added.
+    //!
+    //! Adding a device stages a pending create and waits for its handle to show
+    //! up in a daemon snapshot. On the tick right after "add" it has not shown
+    //! up yet, so the retry path runs — and the retry path used to borrow a
+    //! `RefCell` that the enclosing `if let` was still holding, which panics.
+    //! Under `panic = "abort"` that was the last thing the process ever did.
+
+    use super::claim_pending;
+    use std::cell::RefCell;
+
+    #[test]
+    fn a_handle_that_has_not_arrived_yet_leaves_the_create_in_place() {
+        let cell = RefCell::new(Some(("mac", 4242u16)));
+
+        // This is the tick right after "add": the create was sent, no handle
+        // has reached a snapshot. It must not panic, and must not lose the
+        // create — losing it means the device is never configured or dialed.
+        let claimed = claim_pending(&cell, None);
+
+        assert!(claimed.is_none(), "nothing to claim without a handle");
+        assert_eq!(
+            *cell.borrow(),
+            Some(("mac", 4242)),
+            "the pending create must survive for the next tick. Taking it and \
+             failing to put it back loses the device silently; borrowing twice \
+             to put it back panics with `RefCell already borrowed`, which is \
+             what killed the window on every add."
+        );
+    }
+
+    #[test]
+    fn an_arrived_handle_claims_the_create_exactly_once() {
+        let cell = RefCell::new(Some(("mac", 4242u16)));
+        let claimed = claim_pending(&cell, Some(7));
+        assert_eq!(claimed, Some((7, ("mac", 4242))));
+        assert!(
+            cell.borrow().is_none(),
+            "a claimed create must be cleared, or the next tick configures the \
+             same device again"
         );
         assert!(
-            UI.contains("check this matches on the other machine"),
-            "the code needs an instruction. Six unexplained digits invite a click \
-             on `trust & name` rather than a look at the other machine."
+            claim_pending(&cell, Some(8)).is_none(),
+            "and there must be nothing left to claim"
         );
+    }
+
+    #[test]
+    fn no_pending_create_is_not_an_error() {
+        let cell: RefCell<Option<(&str, u16)>> = RefCell::new(None);
+        assert!(claim_pending(&cell, Some(7)).is_none());
+        assert!(claim_pending(&cell, None).is_none());
     }
 }

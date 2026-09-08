@@ -31,7 +31,7 @@ use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
 /// The DNS-SD service type. `_udp` because the transport is QUIC.
-const SERVICE_TYPE: &str = "_hops._udp.local.";
+pub(crate) const SERVICE_TYPE: &str = "_hops._udp.local.";
 /// TXT key carrying the advertised certificate fingerprint (a claim).
 const TXT_FINGERPRINT: &str = "fp";
 /// TXT key carrying the wire-protocol version, so a future incompatible hops

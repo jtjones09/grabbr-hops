@@ -537,7 +537,7 @@ pub async fn run() -> Result<(), TuiError> {
         }
     };
 
-    let _ = ratatui::restore();
+    ratatui::restore();
     result
 }
 
