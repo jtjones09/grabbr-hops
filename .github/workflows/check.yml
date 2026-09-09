@@ -23,6 +23,11 @@ env:
 
 jobs:
   # The configuration a contributor gets from a bare `cargo build`.
+  # `libfontconfig1-dev` is named rather than assumed. Slint's software
+  # renderer has pulled `yeslogic-fontconfig-sys` since the GUI scaffold
+  # landed, and it built for months on whatever the runner image happened to
+  # preinstall — until the image changed and `main` went red with no repo
+  # change, the same way an unpinned toolchain did.
   default-features:
     name: default features
     runs-on: ubuntu-latest
@@ -34,7 +39,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev \
-            libwayland-dev libx11-dev libxtst-dev pkg-config
+            libwayland-dev libx11-dev libxtst-dev pkg-config \
+            libfontconfig1-dev
       - name: cargo check --workspace --all-targets
         run: cargo check --workspace --all-targets
 
@@ -58,7 +64,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev \
-            libxtst-dev pkg-config
+            libxtst-dev pkg-config libfontconfig1-dev
       - name: check
         run: cargo check --no-default-features --features "${{ matrix.features }}" --all-targets
       - name: test

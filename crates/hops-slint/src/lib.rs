@@ -280,6 +280,38 @@ fn acquire_single_instance(show_requested: Arc<AtomicBool>) -> Instance {
     }
 }
 
+/// A device staged for creation, waiting for the daemon to hand back a handle:
+/// its name, port, screen edge, and the addresses to pin.
+///
+/// Pinned addresses are empty for a hand-typed device (resolve the name) and
+/// populated for one picked off the network list, where mDNS already said
+/// exactly where it is.
+type PendingCreate = (String, u16, Position, Vec<std::net::IpAddr>);
+
+/// Stage a device to be created, and ask the daemon for a handle.
+///
+/// Both halves, always, together. There are two ways to add a machine — typing
+/// a hostname, and picking one off the network list — and each used to do this
+/// itself. The discovered path only ever did the first half: it stored the
+/// name, port, position and addresses, and never sent the request. The poll
+/// loop only acts once a NEW handle turns up in a daemon snapshot, so it waited
+/// for one that was never coming, and clicking "add" on a machine hops had
+/// found did nothing at all, silently, for as long as discovery has existed.
+///
+/// Taking the request as an argument is what makes that testable: the omission
+/// was invisible precisely because nothing could observe it.
+fn stage_create(
+    pending: &RefCell<Option<PendingCreate>>,
+    request: impl FnOnce(FrontendRequest),
+    name: String,
+    port: u16,
+    position: Position,
+    fix_ips: Vec<std::net::IpAddr>,
+) {
+    *pending.borrow_mut() = Some((name, port, position, fix_ips));
+    request(FrontendRequest::Create);
+}
+
 /// Claim a pending "create device" once its handle appears, or leave it for the
 /// next tick.
 ///
@@ -548,10 +580,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
     // hand-typed device (resolve the name) and populated for one picked off the
     // network list, where we already know exactly where it is and should not
     // make DNS agree with mDNS before it will connect (#136).
-    #[allow(clippy::type_complexity)]
-    let pending_new_device: Rc<
-        RefCell<Option<(String, u16, Position, Vec<std::net::IpAddr>)>>,
-    > = Rc::new(RefCell::new(None));
+    let pending_new_device: Rc<RefCell<Option<PendingCreate>>> = Rc::new(RefCell::new(None));
     let known_handles: Rc<RefCell<HashSet<ClientHandle>>> = Rc::new(RefCell::new(HashSet::new()));
     {
         // Add a machine picked off the network list. Same create sequence as a
@@ -560,6 +589,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
         // supply trust (#136).
         let pending = pending_new_device.clone();
         let notice = notice_sink.clone();
+        let c = client.clone();
         ui.on_add_discovered(move |label, ips, port, position| {
             let addrs: Vec<std::net::IpAddr> = ips
                 .split(',')
@@ -582,7 +612,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
             // resolved ones on every reconnect, so a resolvable `.local` name
             // keeps working after every address it was added with has changed.
             let hostname = hops_frontend_core::discovered_hostname(&label);
-            *pending.borrow_mut() = Some((hostname, port, position, addrs));
+            stage_create(&pending, |r| c.request(r), hostname, port, position, addrs);
         });
     }
     {
@@ -617,8 +647,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                 }
             };
             let position = Position::try_from(position.as_str()).unwrap_or_default();
-            *pending.borrow_mut() = Some((name, port, position, Vec::new()));
-            c.request(FrontendRequest::Create);
+            stage_create(&pending, |r| c.request(r), name, port, position, Vec::new());
         });
     }
     {
@@ -1210,12 +1239,32 @@ mod discovery_states {
     /// hidden while discovery is off regardless of what the list holds.
     #[test]
     fn the_empty_state_never_points_at_a_hidden_section() {
+        // The invariant, not the implementation that used to satisfy it. What
+        // hops found now lives INSIDE the add panel, so there is no longer any
+        // section for the empty state to point at: a direction like "below" or
+        // "from your network" names something that is not on screen until add
+        // is clicked. This used to be a ternary guarded on discovery being
+        // active AND the list being non-empty; moving the list made the
+        // pointer unconditionally wrong rather than conditionally right.
+        let empty_state: Vec<&str> = UI
+            .lines()
+            .filter(|l| l.contains("no devices yet"))
+            .collect();
         assert!(
-            UI.contains("root.discovery-active && root.discovered.length > 0"),
-            "\"pick one from your network below\" must be guarded on discovery \
-             being active AND the list being non-empty. Guarded on the list \
-             alone, it promises a section that is not rendered."
+            !empty_state.is_empty(),
+            "the empty state itself went missing — an empty device list must \
+             still say what to do"
         );
+        for line in empty_state {
+            for pointer in ["below", "from your network", "on your network"] {
+                assert!(
+                    !line.contains(pointer),
+                    "the empty state says {pointer:?}, which names a section \
+                     that is not rendered until the add panel is open. Line: \
+                     {line}"
+                );
+            }
+        }
     }
 }
 
@@ -1334,5 +1383,70 @@ mod pending_create {
         let cell: RefCell<Option<(&str, u16)>> = RefCell::new(None);
         assert!(claim_pending(&cell, Some(7)).is_none());
         assert!(claim_pending(&cell, None).is_none());
+    }
+}
+
+#[cfg(test)]
+mod staging_a_create {
+    //! Clicking "add" on a machine hops had found did nothing at all.
+    //!
+    //! Two ways to add a device, two copies of the same two-step sequence, and
+    //! the discovered one only ever did step one: it stored the details and
+    //! never asked the daemon for a handle. The poll loop waits for a new
+    //! handle to appear in a snapshot, so it waited forever — no error, no
+    //! panic, no log line, nothing on screen. It shipped that way with
+    //! discovery and stayed that way.
+
+    use super::{FrontendRequest, Position, stage_create};
+    use std::cell::RefCell;
+
+    #[test]
+    fn staging_also_asks_the_daemon_for_a_handle() {
+        let pending = RefCell::new(None);
+        let sent: RefCell<Vec<FrontendRequest>> = RefCell::new(Vec::new());
+
+        stage_create(
+            &pending,
+            |r| sent.borrow_mut().push(r),
+            "SCORNW20.local".into(),
+            4242,
+            Position::Left,
+            vec!["10.0.0.5".parse().unwrap()],
+        );
+
+        assert!(
+            pending.borrow().is_some(),
+            "the details must be staged for the poll loop to apply"
+        );
+        assert!(
+            sent.borrow()
+                .iter()
+                .any(|r| matches!(r, FrontendRequest::Create)),
+            "staging without asking is a wait for a handle that never comes. \
+             The poll loop only acts when a NEW handle appears in a snapshot, \
+             so a create that is never requested means the button does nothing \
+             at all — no error, no panic, nothing on screen."
+        );
+    }
+
+    #[test]
+    fn what_was_staged_is_what_was_given() {
+        let pending = RefCell::new(None);
+        let sent: RefCell<Vec<FrontendRequest>> = RefCell::new(Vec::new());
+        let ips: Vec<std::net::IpAddr> = vec!["10.0.0.5".parse().unwrap()];
+        stage_create(
+            &pending,
+            |r| sent.borrow_mut().push(r),
+            "host".into(),
+            9999,
+            Position::Right,
+            ips.clone(),
+        );
+        assert_eq!(
+            *pending.borrow(),
+            Some(("host".to_string(), 9999u16, Position::Right, ips)),
+            "a discovered machine's pinned addresses are why it connects \
+             without DNS agreeing first — dropping them there would be silent"
+        );
     }
 }

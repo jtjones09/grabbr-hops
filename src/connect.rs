@@ -255,6 +255,13 @@ pub(crate) struct LanMouseConnection {
     /// has no in-app way to trust it (the inbound path has had a prompt all
     /// along; the outbound path never did).
     untrusted_tx: Sender<(String, SocketAddr)>,
+    /// signals the service that a client's LIVE state changed — the peer came
+    /// up, went away, or answered with different capabilities — so the frontend
+    /// can be told. `persist_tx` cannot serve: it also writes the config file,
+    /// and it only fires when a fingerprint is newly learned. Without this
+    /// channel nothing republishes a client after its first publication, so the
+    /// sender keeps showing whatever was true when the link was first made.
+    state_tx: Sender<ClientHandle>,
 }
 
 impl LanMouseConnection {
@@ -265,6 +272,7 @@ impl LanMouseConnection {
         clipboard_in: Sender<String>,
         untrusted_tx: Sender<(String, SocketAddr)>,
         persist_tx: Sender<ClientHandle>,
+        state_tx: Sender<ClientHandle>,
     ) -> Result<Self, LanMouseConnectionError> {
         transport::install_crypto_provider();
         let endpoint = Endpoint::client("0.0.0.0:0".parse().expect("valid addr"))?;
@@ -284,6 +292,7 @@ impl LanMouseConnection {
             clipboard_in,
             untrusted_tx,
             persist_tx,
+            state_tx,
         })
     }
 
@@ -377,6 +386,7 @@ impl LanMouseConnection {
                 self.clipboard_in.clone(),
                 self.untrusted_tx.clone(),
                 self.persist_tx.clone(),
+                self.state_tx.clone(),
             ));
         }
         Err(LanMouseConnectionError::NotConnected)
@@ -484,6 +494,7 @@ async fn connect_to_handle(
     clipboard_in: Sender<String>,
     untrusted_tx: Sender<(String, SocketAddr)>,
     persist_tx: Sender<ClientHandle>,
+    state_tx: Sender<ClientHandle>,
 ) -> Result<(), LanMouseConnectionError> {
     log::info!("client {handle} connecting ...");
     // Swap in a fresh UDP socket before every (re)connect so a sleep/wake or
@@ -648,6 +659,7 @@ async fn connect_to_handle(
             tx,
             ping_response.clone(),
             clipboard_in,
+            state_tx,
         ));
         return Ok(());
     }
@@ -703,6 +715,7 @@ async fn receive_loop(
     tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
     clipboard_in: Sender<String>,
+    state_tx: Sender<ClientHandle>,
 ) {
     // the peer's reliable inbound stream (their uni stream to us)
     let mut recv = match link.conn.accept_uni().await {
@@ -723,14 +736,22 @@ async fn receive_loop(
                 match event {
                     ProtoEvent::Pong(b) => {
                         client_manager.set_active_addr(handle, Some(addr));
-                        client_manager.set_alive(handle, b);
+                        // Only on a change: pongs are about 2/s per client, and
+                        // the frontend needs to hear when the answer differs,
+                        // not that it was asked again.
+                        if client_manager.set_alive(handle, b) {
+                            let _ = state_tx.send(handle);
+                        }
                         ping_response.borrow_mut().insert(addr);
                     }
                     ProtoEvent::Hello { commit } => {
                         client_manager.set_peer_commit(handle, Some(commit));
+                        // One per connection, and it is the build the row shows.
+                        let _ = state_tx.send(handle);
                     }
                     ProtoEvent::Capability { flags } => {
                         client_manager.set_peer_caps(handle, Some(flags));
+                        let _ = state_tx.send(handle);
                     }
                     event => {
                         let _ = tx.send((handle, event));

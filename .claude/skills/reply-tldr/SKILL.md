@@ -52,6 +52,24 @@ discovered at the bottom.
 Then the detail, under headings. **Keep the detail.** He has said explicitly he
 wants it. The problem was never volume; it was decisions buried in narrative.
 
+## The detail below the TL;DR is EXPLANATION ONLY
+
+Nothing below the four headings may require him to do, decide, or notice
+anything. If a detail section contains something he must act on, that thing is
+in the wrong place — lift it into Decisions, Next steps, or Blocked, and leave
+only the explanation behind.
+
+This is the failure mode in practice: the four headings get written correctly,
+and then a long, satisfying write-up follows with new asks embedded in it — an
+open question, an unresolved caveat, a heads-up about another project. Every one
+of those is something he has to hunt for, which is what the format was created
+to stop. He named it directly: *"you put decisions and content all over in your
+readouts, stop that."*
+
+Do not invent new top-level sections that compete with the four. Detail headings
+are subordinate and descriptive ("why the naive version fails"), never a second
+place where status or asks live.
+
 ## The failure mode to watch for
 
 **This format decays under good news.** When there are five green PRs and a
@@ -72,3 +90,5 @@ statements, no hooks, no staged reveals — a status block, not a pitch.
 - [ ] Anything you are waiting on him for is in the first five lines
 - [ ] Claims are marked as verified or not — do not imply a fix has run when it
       has only compiled
+- [ ] **Re-read every line below the four headings.** If any of it asks him to
+      do, decide, or notice something, move it up. Explanation stays; asks do not.
