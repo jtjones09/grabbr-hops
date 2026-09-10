@@ -238,6 +238,20 @@ pub struct LeaseRecord {
     pub revoked_at: Option<u64>,
     /// Empty for a revoked record.
     pub caps: Vec<DiskCap>,
+    /// Whether a person has compared the match number for this lease and said
+    /// it matched.
+    ///
+    /// Absent means yes. Leases written before the ceremony existed were
+    /// established by a human approving a prompt, and asking them to compare a
+    /// number they were never shown is a question with no honest answer — so
+    /// they are grandfathered rather than re-interrogated.
+    #[serde(default = "confirmed_by_default")]
+    pub confirmed: bool,
+}
+
+/// Absent in an older file means confirmed. See [`LeaseRecord::confirmed`].
+fn confirmed_by_default() -> bool {
+    true
 }
 
 impl LeaseRecord {
@@ -889,6 +903,7 @@ pub fn rebuild(
                     },
                     issued_at: r.issued_at,
                     not_after,
+                    confirmed: r.confirmed,
                 };
                 if let Err(e) = store.admit(lease) {
                     refused.push(format!("{}: {e}", r.fingerprint));
@@ -920,6 +935,8 @@ pub fn records_of(store: &TrustStore) -> Vec<LeaseRecord> {
                 expires_at: None,
                 revoked_at: Some(d.at),
                 caps: Vec::new(),
+                // An expulsion is a record, not a grant; nothing is pending.
+                confirmed: true,
             });
             continue;
         }
@@ -944,6 +961,7 @@ pub fn records_of(store: &TrustStore) -> Vec<LeaseRecord> {
                 expires_at: Some(l.not_after),
                 revoked_at: None,
                 caps,
+                confirmed: l.confirmed,
             });
         }
     }
@@ -1491,6 +1509,7 @@ mod tests {
             expires_at: Some(NOW + DAY),
             revoked_at: None,
             caps: vec![DiskCap::Inbound],
+            confirmed: true,
         };
         let mut two = one.clone();
         two.caps = vec![DiskCap::Outbound];
@@ -1508,6 +1527,7 @@ mod tests {
             expires_at: None,
             revoked_at: None,
             caps: vec![DiskCap::Inbound],
+            confirmed: true,
         };
         assert!(
             validate(&[forever], Path::new("trust.toml")).is_err(),

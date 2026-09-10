@@ -224,7 +224,7 @@ mod a_grant_carries_only_the_direction_that_was_approved {
         // A receiver we confirmed our own dial reached: outbound only.
         let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
         store
-            .issue(&peer_fp, "a receiver", Caps::OUTBOUND, DEFAULT_TERM_SECS)
+            .issue_confirmed(&peer_fp, "a receiver", Caps::OUTBOUND, DEFAULT_TERM_SECS)
             .expect("issue an outbound-only lease");
         let trust = Arc::new(RwLock::new(store));
 
@@ -436,7 +436,7 @@ mod an_expelled_fingerprint_is_never_re_authorised {
         let peer = fp32(0x77);
         let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
         store
-            .issue(&peer, "a machine", Caps::INBOUND, DEFAULT_TERM_SECS)
+            .issue_confirmed(&peer, "a machine", Caps::INBOUND, DEFAULT_TERM_SECS)
             .expect("issue");
         store.revoke(&peer);
         (store, ours, peer)
@@ -461,7 +461,12 @@ mod an_expelled_fingerprint_is_never_re_authorised {
             (
                 "issue",
                 Box::new(|s: &mut TrustStore| {
-                    let _ = s.issue(&fp32(0x77), "back please", Caps::KNOWN, DEFAULT_TERM_SECS);
+                    let _ = s.issue_confirmed(
+                        &fp32(0x77),
+                        "back please",
+                        Caps::KNOWN,
+                        DEFAULT_TERM_SECS,
+                    );
                 }),
             ),
             (
@@ -505,6 +510,7 @@ mod an_expelled_fingerprint_is_never_re_authorised {
                         origin: Origin::Inbound,
                         issued_at: 0,
                         not_after: DEFAULT_TERM_SECS,
+                        confirmed: true,
                     });
                 }),
             ),
@@ -559,7 +565,7 @@ mod an_expelled_fingerprint_is_never_re_authorised {
     fn granting_to_a_removed_device_fails_loudly_rather_than_quietly() {
         use crate::trust::TrustError;
         let (mut store, _, peer) = expelled_store();
-        match store.issue(&peer, "back please", Caps::INBOUND, DEFAULT_TERM_SECS) {
+        match store.issue_confirmed(&peer, "back please", Caps::INBOUND, DEFAULT_TERM_SECS) {
             Err(TrustError::Expelled { fingerprint }) => assert_eq!(fingerprint, peer),
             other => panic!(
                 "granting to a removed device returned {other:?}. It must return \
@@ -718,12 +724,12 @@ mod an_expelled_fingerprint_is_never_re_authorised {
         let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
 
         store
-            .issue(&expelled, "removed", Caps::INBOUND, DEFAULT_TERM_SECS)
+            .issue_confirmed(&expelled, "removed", Caps::INBOUND, DEFAULT_TERM_SECS)
             .expect("issue");
         store.revoke(&expelled);
 
         store
-            .issue(&lapsed, "lapsed", Caps::INBOUND, 10)
+            .issue_confirmed(&lapsed, "lapsed", Caps::INBOUND, 10)
             .expect("issue");
 
         assert!(
@@ -791,7 +797,7 @@ mod taking_trust_away_is_never_gated_the_way_giving_it_is {
         let peer = fp32(0xaa);
         let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
         store
-            .issue(
+            .issue_confirmed(
                 &peer,
                 "driving me right now",
                 Caps::KNOWN,
@@ -928,7 +934,7 @@ mod removing_a_device_takes_its_key_and_not_merely_its_address {
         let peer = fp32(0xcc);
         let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
         store
-            .issue(&peer, "the sold laptop", Caps::KNOWN, DEFAULT_TERM_SECS)
+            .issue_confirmed(&peer, "the sold laptop", Caps::KNOWN, DEFAULT_TERM_SECS)
             .expect("issue");
         assert!(store.may_drive_us(&peer), "precondition: it was trusted");
 
@@ -1489,7 +1495,7 @@ mod the_wire_contract_is_frozen {
             // refuse the handshake is the protocol name.
             let server_trust = {
                 let mut s = crate::trust::TrustStore::new(&server_fp, 0).expect("ours");
-                s.issue(
+                s.issue_confirmed(
                     &client_fp,
                     "peer",
                     crate::trust::Caps::KNOWN,
@@ -1500,7 +1506,7 @@ mod the_wire_contract_is_frozen {
             };
             let client_trust = {
                 let mut s = crate::trust::TrustStore::new(&client_fp, 0).expect("ours");
-                s.issue(
+                s.issue_confirmed(
                     &server_fp,
                     "peer",
                     crate::trust::Caps::KNOWN,

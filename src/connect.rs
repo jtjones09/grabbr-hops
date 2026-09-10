@@ -1036,7 +1036,7 @@ mod tests {
                 let mut st =
                     crate::trust::TrustStore::new(&transport::fingerprint_of(&client.cert), 0)
                         .expect("our fingerprint");
-                st.issue(
+                st.issue_confirmed(
                     &transport::fingerprint_of(&server.cert),
                     "hostile",
                     crate::trust::Caps::OUTBOUND,
@@ -1303,7 +1303,7 @@ mod tests {
                 let mut st =
                     crate::trust::TrustStore::new(&transport::fingerprint_of(&client.cert), 0)
                         .expect("our fingerprint");
-                st.issue(
+                st.issue_confirmed(
                     &server_fp,
                     "receiver",
                     crate::trust::Caps::OUTBOUND,

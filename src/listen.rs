@@ -524,7 +524,7 @@ mod tests {
         let mut store = crate::trust::TrustStore::new(us, 0).expect("our fingerprint");
         for f in fps {
             store
-                .issue(
+                .issue_confirmed(
                     f,
                     "peer",
                     crate::trust::Caps::INBOUND,
@@ -542,7 +542,7 @@ mod tests {
         let mut store = crate::trust::TrustStore::new(us, 0).expect("our fingerprint");
         for f in fps {
             store
-                .issue(
+                .issue_confirmed(
                     f,
                     "peer",
                     crate::trust::Caps::OUTBOUND,
