@@ -122,12 +122,18 @@ impl LanMouseListener {
         let listen_addr = SocketAddr::new("0.0.0.0".parse().expect("invalid ip"), port);
         let mut endpoint = Endpoint::server(cfg, listen_addr)?;
 
+        // Our own leaf-cert fingerprint: half of what a match number is built
+        // from. The peer's is read off each connection rather than from mDNS,
+        // so an interposer hashes a different pair on each side.
+        let own_fp = identity.fingerprint();
+
         let conns: Rc<AsyncMutex<Vec<ConnEntry>>> = Rc::new(AsyncMutex::new(Vec::new()));
         let conns_clone = conns.clone();
 
         let listen_task: JoinHandle<()> = {
             let listen_tx = listen_tx.clone();
             let attempts = attempts.clone();
+            let own_fp = own_fp.clone();
             let authorized_accept = trust.clone();
             spawn_local(async move {
                 loop {
@@ -141,6 +147,7 @@ impl LanMouseListener {
                             let attempts = attempts.clone();
                             let clipboard_in = clipboard_in.clone();
                             let trust = authorized_accept.clone();
+                            let own_fp = own_fp.clone();
                             spawn_local(async move {
                                 let remote = incoming.remote_address();
                                 match incoming.await {
@@ -165,11 +172,21 @@ impl LanMouseListener {
                                         // lapsed between the TLS check and here
                                         // is refused, which is why the check is
                                         // repeated rather than assumed.
-                                        if !trust
-                                            .read()
-                                            .expect("lock")
-                                            .may_drive_us(&fingerprint)
-                                        {
+                                        // A peer mid-pairing is admitted far
+                                        // enough to compare a match number and
+                                        // no further: its lease carries no
+                                        // capability, so every per-event check
+                                        // downstream refuses its input anyway.
+                                        // Without this it could never reach the
+                                        // comparison that earns the grant.
+                                        let (pairing, drives) = {
+                                            let t = trust.read().expect("lock");
+                                            (
+                                                t.is_awaiting_confirmation(&fingerprint),
+                                                t.may_drive_us(&fingerprint),
+                                            )
+                                        };
+                                        if !may_accept(drives, pairing) {
                                             log::warn!(
                                                 "{addr}: rejecting {fingerprint} — no live lease permits it to drive this machine"
                                             );
@@ -191,6 +208,32 @@ impl LanMouseListener {
                                             send,
                                             fingerprint: fingerprint.clone(),
                                         });
+                                        // Only while unconfirmed. Once a device
+                                        // is paired its fingerprint is pinned
+                                        // and every later dial is refused
+                                        // unless it presents that exact
+                                        // identity — so asking again is asking
+                                        // a person to re-check what the code
+                                        // already proved, on every wake.
+                                        if pairing {
+                                            let c = conn.clone();
+                                            let mine = own_fp.clone();
+                                            let theirs = fingerprint.clone();
+                                            spawn_local(async move {
+                                                match crate::pair_ceremony::as_responder(
+                                                    &c, &mine, &theirs,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(code) => log::info!(
+                                                        "match number with {theirs}: {code} — confirm it matches on both machines"
+                                                    ),
+                                                    Err(e) => log::warn!(
+                                                        "no match number with {theirs}: {e} — pairing cannot complete"
+                                                    ),
+                                                }
+                                            });
+                                        }
                                         let _ = listen_tx.send(ListenEvent::Accept { addr, fingerprint });
                                         spawn_local(read_loop(conns.clone(), addr, conn, listen_tx.clone(), clipboard_in));
                                     }
@@ -491,6 +534,50 @@ async fn clipboard_accept_loop(conn: Connection, addr: SocketAddr, clipboard_in:
                 }
             });
         }
+    }
+}
+
+/// Whether a completed handshake may be accepted at all.
+///
+/// Two ways in, and only two. A peer holding a live lease that permits it to
+/// drive this machine, or a peer mid-pairing that has not yet had its match
+/// number compared — the second exists because the comparison happens on a real
+/// connection, so refusing it would make the grant it earns unreachable.
+///
+/// A peer mid-pairing gets a connection and nothing else: its lease carries no
+/// capability, so the per-event checks refuse its input without knowing pairing
+/// exists. Anything else is refused here.
+fn may_accept(may_drive_us: bool, awaiting_confirmation: bool) -> bool {
+    may_drive_us || awaiting_confirmation
+}
+
+#[cfg(test)]
+mod admission {
+    use super::may_accept;
+
+    #[test]
+    fn a_trusted_peer_is_accepted() {
+        assert!(may_accept(true, false));
+    }
+
+    #[test]
+    fn a_peer_mid_pairing_is_accepted_so_the_comparison_can_happen() {
+        assert!(
+            may_accept(false, true),
+            "its lease carries no capability, so it gets a connection and \
+             nothing else — but refusing it outright would make the grant the \
+             comparison earns unreachable, which is how pairing had only one \
+             way in"
+        );
+    }
+
+    #[test]
+    fn a_machine_with_no_lease_is_refused() {
+        assert!(
+            !may_accept(false, false),
+            "neither trusted nor mid-pairing is a stranger, and a stranger \
+             must not get a connection to speak on"
+        );
     }
 }
 
