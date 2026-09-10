@@ -377,14 +377,25 @@ fn start_detached_daemon() -> Result<(), io::Error> {
         path.push("hops/logs");
         let _ = std::fs::create_dir_all(&path);
         path.push("daemon.log");
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .and_then(|f| Ok((f.try_clone()?, f)))
-        {
+        match hops::logging::open_capped(&path).and_then(|f| Ok((f.try_clone()?, f))) {
             Ok((a, b)) => (Stdio::from(a), Stdio::from(b)),
-            Err(_) => (Stdio::null(), Stdio::null()),
+            Err(e) => {
+                // Say so. This used to fall through to /dev/null in silence,
+                // for the life of the process, on the one file someone goes to
+                // when something is wrong — and the thing that would have
+                // carried the message is what just failed.
+                //
+                // Less costly than it was: the daemon opens its own log once it
+                // starts, so what is lost here is only what it emits before
+                // that, plus the runtime's own abort message.
+                log::warn!(
+                    "could not open {} ({e}); the daemon's start-up output will \
+                     not be saved. Once it is running it logs to its own file — \
+                     see the Logs section of the README for where.",
+                    path.display()
+                );
+                (Stdio::null(), Stdio::null())
+            }
         }
     };
     let mut cmd = process::Command::new(std::env::current_exe()?);
