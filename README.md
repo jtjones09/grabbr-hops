@@ -120,6 +120,10 @@ Files rotate at 8 MB, keeping one previous generation as `<role>.log.1`. Set
 diagnosing something). It does not turn on debug logging for hops' dependencies
 — name one explicitly for that, as in `HOPS_LOG_LEVEL=info,mdns_sd=debug`.
 
+Diagnostic modes beyond the ordinary log — queue metrics, the behaviour toggles,
+and time-boxed keystroke logging for scancode work — are in
+[docs/LOGGING.md](docs/LOGGING.md).
+
 On macOS, warnings and errors also go to the unified log, so they appear in
 Console.app alongside everything else from that moment:
 
