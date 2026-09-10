@@ -201,6 +201,22 @@ fn should_write_stderr(owns_file: bool, stderr_is_terminal: bool) -> bool {
     !owns_file || stderr_is_terminal
 }
 
+/// Open an append handle that is capped the same way this module's own log is.
+///
+/// For output that is redirected rather than written through the logger — the
+/// stdout and stderr of a daemon started by the front door. That handle had no
+/// cap at all and grew for the life of an install; one reached 4.4 GB. Rotation
+/// happens here, at open, because nothing downstream of a `Stdio` handle can
+/// check a size.
+pub fn open_capped(path: &Path) -> std::io::Result<File> {
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+    rotate_if_needed(path, &mut f)?;
+    Ok(f)
+}
+
 struct Sink {
     file: Option<Mutex<(PathBuf, File)>>,
     filter: env_filter::Filter,
@@ -395,6 +411,34 @@ mod tests {
             "naming a target explicitly must still work — that is how a protocol \
              problem gets diagnosed"
         );
+    }
+
+    #[test]
+    fn a_redirected_handle_is_capped_at_open() {
+        // The daemon's stdout/stderr are a `Stdio` handle: nothing downstream
+        // can check a size, so the only moment a cap can be applied is here.
+        // Uncapped, this handle grew for the life of an install — one reached
+        // 4.4 GB.
+        let dir = std::env::temp_dir().join(format!("hops-capped-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("daemon.log");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("log.1"));
+
+        fs::write(&path, vec![b'x'; (MAX_BYTES + 1) as usize]).expect("fill");
+        let f = open_capped(&path).expect("open");
+        drop(f);
+
+        assert!(
+            fs::metadata(&path).expect("stat").len() < MAX_BYTES,
+            "an oversized handle must be rotated at open — after this point the \
+             writer is a redirected file descriptor and no size check is possible"
+        );
+        assert!(
+            path.with_extension("log.1").exists(),
+            "and what was there is kept as one generation, not discarded"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
