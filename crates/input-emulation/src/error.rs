@@ -66,6 +66,9 @@ pub enum EmulationCreationError {
     #[cfg(windows)]
     #[error("windows: `{0}`")]
     Windows(#[from] WindowsEmulationCreationError),
+    #[cfg(feature = "recording")]
+    #[error("recording: `{0}`")]
+    Recording(#[from] crate::recording::RecordingEmulationCreationError),
     #[error("capture error")]
     NoAvailableBackend,
 }

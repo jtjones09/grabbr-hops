@@ -64,6 +64,9 @@ pub(crate) struct LanMouseListener {
     conns: Rc<AsyncMutex<Vec<ConnEntry>>>,
     request_port_change: Sender<u16>,
     port_changed: Receiver<Result<u16, ListenerCreationError>>,
+    /// Where the first endpoint bound, so a test that asked for port 0 can dial it.
+    #[cfg(test)]
+    local_addr: SocketAddr,
 }
 
 fn server_config(
@@ -112,6 +115,18 @@ impl LanMouseListener {
         trust: Trust,
         clipboard_in: Sender<String>,
     ) -> Result<Self, ListenerCreationError> {
+        let listen_addr = SocketAddr::new("0.0.0.0".parse().expect("invalid ip"), port);
+        Self::bind(listen_addr, identity, trust, clipboard_in).await
+    }
+
+    /// [`Self::new`] on a chosen address. Tests bind 127.0.0.1 port 0, so they
+    /// neither listen on the network nor collide with a running daemon.
+    async fn bind(
+        listen_addr: SocketAddr,
+        identity: Arc<Identity>,
+        trust: Trust,
+        clipboard_in: Sender<String>,
+    ) -> Result<Self, ListenerCreationError> {
         transport::install_crypto_provider();
         let (listen_tx, listen_rx) = channel();
         let (request_port_change, mut request_port_change_rx) = channel();
@@ -119,8 +134,9 @@ impl LanMouseListener {
         let attempts: Arc<StdMutex<VecDeque<String>>> = Default::default();
 
         let cfg = server_config(&identity, trust.clone(), attempts.clone())?;
-        let listen_addr = SocketAddr::new("0.0.0.0".parse().expect("invalid ip"), port);
         let mut endpoint = Endpoint::server(cfg, listen_addr)?;
+        #[cfg(test)]
+        let local_addr = endpoint.local_addr()?;
 
         let conns: Rc<AsyncMutex<Vec<ConnEntry>>> = Rc::new(AsyncMutex::new(Vec::new()));
         let conns_clone = conns.clone();
@@ -241,7 +257,22 @@ impl LanMouseListener {
             listen_task,
             port_changed,
             request_port_change,
+            #[cfg(test)]
+            local_addr,
         })
+    }
+
+    /// A listener on 127.0.0.1 at a port the OS picks, and that port.
+    #[cfg(test)]
+    pub(crate) async fn bind_loopback(
+        identity: Arc<Identity>,
+        trust: Trust,
+        clipboard_in: Sender<String>,
+    ) -> Result<(Self, u16), ListenerCreationError> {
+        let addr = SocketAddr::new("127.0.0.1".parse().expect("loopback"), 0);
+        let listener = Self::bind(addr, identity, trust, clipboard_in).await?;
+        let port = listener.local_addr.port();
+        Ok((listener, port))
     }
 
     pub(crate) fn request_port_change(&mut self, port: u16) {

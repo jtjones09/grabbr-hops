@@ -25,6 +25,11 @@ pub mod trust_file;
 #[cfg(test)]
 mod decision_guards;
 
+/// Two machines in one test process: a real listener and a real dialer on
+/// loopback, with recording emulation and scripted capture.
+#[cfg(test)]
+mod test_harness;
+
 #[cfg(test)]
 mod toolchain_pin {
     //! `rust-toolchain.toml` and the workflows must name the same compiler.

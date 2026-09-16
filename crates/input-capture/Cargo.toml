@@ -75,3 +75,7 @@ layer_shell = [
 ]
 x11 = ["dep:x11"]
 libei = ["dep:reis", "dep:ashpd"]
+# A backend a test feeds events into, in place of a device. Not in `default` and
+# not in any feature the hops crate exposes: the hops crate turns it on as a
+# dev-dependency only, so no shipped build contains it.
+scripted = []

@@ -2279,6 +2279,17 @@ impl Emulation for MacOSEmulation {
         self.pending_edge_push = None;
         // Fresh crossing: don't carry a stale Caps Lock held-latch across visits.
         self.caps_down.set(false);
+        // Nor a held button. Teardown releases buttons through `consume`, which
+        // empties this set, so anything still here is a release that never
+        // arrived. Left in, it stamps every motion as a drag and switches off
+        // the edge detector until the peer happens to click again (#89).
+        if !self.pressed_buttons.is_empty() {
+            log::warn!(
+                "new session: forgetting buttons a previous one left held: {:?}",
+                self.pressed_buttons
+            );
+            self.pressed_buttons.clear();
+        }
         // Trueloop Phase A: re-anchor the divergence integral each visit so a
         // cross-away/return doesn't log a phantom offset.
         self.probe_integral.set(None);

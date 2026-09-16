@@ -585,6 +585,21 @@ impl CaptureTask {
         self.pending_motion = None;
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
+            // Buttons first, for the same reason as the keys below: a release
+            // bind pressed mid-drag leaves capture with the button down, and its
+            // button-up then reaches this machine instead of the peer, which
+            // keeps dragging (#89). First, because that is the order a person
+            // lets go of a modifier-drag.
+            for button in capture.take_pressed_buttons() {
+                let button_up = ProtoEvent::Input(Event::Pointer(PointerEvent::Button {
+                    time: 0,
+                    button,
+                    state: 0,
+                }));
+                if let Err(e) = self.conn.send(button_up, handle).await {
+                    log::warn!("failed to send button-up to client {handle}: {e}");
+                }
+            }
             // Synthesize key-up events for every key still held in the
             // capture's pressed_keys set BEFORE sending Leave. Without
             // this, pressing the release-bind chord (typically all four
@@ -709,5 +724,159 @@ mod lock_key_tests {
         ] {
             assert!(!is_lock_key(k as u32), "{k:?} must keep auto-repeat");
         }
+    }
+}
+
+#[cfg(test)]
+mod release_mid_drag {
+    //! Leaving capture mid-drag must hand the peer the button-up it will
+    //! otherwise never see (#89).
+    //!
+    //! Driven end to end over loopback: scripted capture feeds the real capture
+    //! task, which sends through the real connection to a real listener. The
+    //! assertion is on what arrives at that listener, because the receiver's own
+    //! teardown now also releases held buttons and would hide a sender that
+    //! forgot to.
+
+    use super::*;
+    use crate::listen::{LanMouseListener, ListenEvent};
+    use crate::test_harness::{Dialer, dialer, machine, run_local, trust, wait_until};
+    use crate::trust::Caps;
+    use input_capture::scripted::Script;
+    use input_event::BTN_LEFT;
+
+    const PATIENCE: Duration = Duration::from_secs(20);
+
+    fn button(state: u32) -> ProtoEvent {
+        ProtoEvent::Input(Event::Pointer(PointerEvent::Button {
+            time: 0,
+            button: BTN_LEFT,
+            state,
+        }))
+    }
+
+    /// `ProtoEvent` has no `PartialEq`; these are the two kinds the test looks for.
+    fn same(a: &ProtoEvent, b: &ProtoEvent) -> bool {
+        match (a, b) {
+            (ProtoEvent::Input(a), ProtoEvent::Input(b)) => a == b,
+            (ProtoEvent::Leave(_), ProtoEvent::Leave(_)) => true,
+            _ => false,
+        }
+    }
+
+    fn key(key: scancode::Linux, state: u8) -> CaptureEvent {
+        CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+            time: 0,
+            key: key as u32,
+            state,
+        }))
+    }
+
+    // LEDGER T7 | class B | 2 frames received by listen::LanMouseListener
+    #[test]
+    fn a_release_chord_mid_drag_sends_the_button_up() {
+        run_local(async {
+            let receiver = machine();
+            let sender = machine();
+
+            // The receiving machine answers like a daemon and writes down every
+            // frame that reaches it.
+            let (clipboard_tx, _) = channel();
+            let (mut listener, port) = LanMouseListener::bind_loopback(
+                receiver.identity.clone(),
+                trust(&receiver, &[&sender], Caps::INBOUND),
+                clipboard_tx,
+            )
+            .await
+            .expect("listener");
+            let wire: Rc<RefCell<Vec<ProtoEvent>>> = Default::default();
+            let received = wire.clone();
+            spawn_local(async move {
+                while let Some(event) = listener.next().await {
+                    let ListenEvent::Msg { event, addr } = event else {
+                        continue;
+                    };
+                    received.borrow_mut().push(event);
+                    match event {
+                        ProtoEvent::Ping => listener.reply(addr, ProtoEvent::Pong(true)).await,
+                        ProtoEvent::Enter(_) => listener.reply(addr, ProtoEvent::Ack(0)).await,
+                        _ => {}
+                    }
+                }
+            });
+            let arrived = |want: ProtoEvent| wire.borrow().iter().position(|e| same(e, &want));
+
+            let Dialer {
+                conn,
+                handle,
+                notices: _notices,
+                ..
+            } = {
+                let d = dialer(
+                    &sender,
+                    trust(&sender, &[&receiver], Caps::OUTBOUND),
+                    port,
+                    hops_ipc::Position::Left,
+                );
+                d.until_alive().await;
+                d
+            };
+
+            let script = Script::new();
+            let bind = vec![scancode::Linux::KeyLeftCtrl, scancode::Linux::KeyLeftShift];
+            let mut capture = Capture::new(Some(script.backend()), conn, bind);
+            capture.create(handle, hops_ipc::Position::Left, CaptureType::Default);
+
+            // Cross, and keep moving until motion is on the wire: before the
+            // receiver's Ack, input is turned into repeated Enters instead.
+            let motion = Event::Pointer(PointerEvent::Motion {
+                time: 0,
+                dx: 1.0,
+                dy: 0.0,
+            });
+            let started = tokio::time::Instant::now();
+            while arrived(ProtoEvent::Input(motion)).is_none() {
+                assert!(started.elapsed() < PATIENCE, "never started sending input");
+                script.push(Position::Left, CaptureEvent::Begin);
+                script.push(Position::Left, CaptureEvent::Input(motion));
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+
+            // Press the button, then the release bind while it is still down.
+            script.push(
+                Position::Left,
+                CaptureEvent::Input(Event::Pointer(PointerEvent::Button {
+                    time: 0,
+                    button: BTN_LEFT,
+                    state: 1,
+                })),
+            );
+            wait_until("the button-down to arrive", PATIENCE, || {
+                arrived(button(1)).is_some()
+            })
+            .await;
+            script.push(Position::Left, key(scancode::Linux::KeyLeftCtrl, 1));
+            script.push(Position::Left, key(scancode::Linux::KeyLeftShift, 1));
+            wait_until("the Leave to arrive", PATIENCE, || {
+                arrived(ProtoEvent::Leave(0)).is_some()
+            })
+            .await;
+
+            let down = arrived(button(1)).expect("down");
+            let leave = arrived(ProtoEvent::Leave(0)).expect("leave");
+            let up = wire
+                .borrow()
+                .iter()
+                .enumerate()
+                .position(|(i, e)| i > down && same(e, &button(0)));
+            assert!(
+                up.is_some_and(|up| up < leave),
+                "the release bind was pressed mid-drag and the peer was sent no \
+                 button-up before Leave: {:?}",
+                wire.borrow()
+            );
+
+            capture.terminate().await;
+        });
     }
 }
