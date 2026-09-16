@@ -107,7 +107,7 @@ HOPS_LOG_LEVEL=debug cargo run -- daemon
 
 # is the binary about to run the one the source says it should be?
 hops build-check --repo /path/to/repo            # report; exit 0 always
-hops build-check --repo /path/to/repo --strict   # exit 1 when stale
+hops build-check --repo /path/to/repo --strict   # exit 2 stale, 3 nothing compared
 ```
 
 `build-check` compares the commit baked in by `build.rs` AND the binary's mtime
@@ -116,6 +116,13 @@ misses an uncommitted edit, because a binary built before that edit still report
 a commit equal to `HEAD`. Every launcher runs it — dev launchers with `--strict`
 so a stale binary cannot be tested by accident, daily launchers without, since a
 promoted build is deliberately behind and must still start.
+
+Under `--strict` the exit code is the verdict: 0 matches, 2 is stale (rebuild), 3
+is that nothing could be compared, and the report says why: for example no
+checkout at the path, no git, git refusing the checkout, or a binary built without
+a commit baked in. Any other code is the check failing to run, not a verdict about
+the binary. clap also exits 2 for a subcommand it does not know, so the launchers
+run `build-check --help` first to rule out a binary older than the check.
 
 It lives in `src/build_check.rs` rather than in the launchers because the same
 policy hand-written per OS is exactly how the platforms drifted: one built before

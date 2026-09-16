@@ -198,9 +198,11 @@ pub enum Command {
         /// working directory)
         #[arg(long)]
         repo: Option<PathBuf>,
-        /// exit non-zero when stale — for dev launchers, where testing an old
-        /// binary measures the wrong code. Daily launchers omit it: a promoted
-        /// build is deliberately behind and must still start.
+        /// exit 2 when stale and 3 when nothing could be compared (for example
+        /// no checkout at the path, no git, or a binary built without a commit
+        /// baked in; the report says why) — for dev launchers, where testing an
+        /// old binary measures the wrong code. Daily launchers omit it: a
+        /// promoted build is deliberately behind and must still start.
         #[arg(long)]
         strict: bool,
     },
