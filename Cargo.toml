@@ -112,6 +112,14 @@ mdns-sd = { version = "0.21.2", features = ["unstable-fuzz-api"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.148"
 
+[target.'cfg(windows)'.dependencies]
+# OpenProcess and GetExitCodeProcess, to tell whether a process has ended.
+# The same version and features the input crates already build.
+windows = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
+
 [features]
 default = [
     # The TUI is the default front-end: it needs no system GUI libraries and builds

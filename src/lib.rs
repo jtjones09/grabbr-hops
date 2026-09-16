@@ -15,6 +15,8 @@ mod hop_log;
 mod listen;
 pub mod logging;
 pub mod match_code;
+mod new_file;
+mod pid;
 pub mod service;
 mod transport;
 pub mod trust;

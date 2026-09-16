@@ -48,7 +48,6 @@
 
 use std::fmt;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -193,12 +192,15 @@ impl SoftwareAuthority {
     /// same directory, same `rcgen` key type, same `0400` mode, same
     /// generate-on-first-run story. One pattern for both keys.
     pub fn load_or_generate(path: &Path) -> Result<Self, AuthorityError> {
+        // A process that ended part-way through creating the key can have left
+        // a whole private key beside it.
+        crate::new_file::remove_abandoned_temporaries(path);
         if path.exists() {
             Self::load(path)
         } else {
             match Self::generate(path) {
-                // Another daemon won the race and created it between the
-                // `exists()` and the `create_new`. Its key is as good as ours.
+                // Another daemon won the race and created it after the
+                // `exists()`. Its key is as good as ours.
                 Err(AuthorityError::Io { source, .. })
                     if source.kind() == std::io::ErrorKind::AlreadyExists =>
                 {
@@ -225,49 +227,16 @@ impl SoftwareAuthority {
         let key_pair = rcgen::KeyPair::generate()?; // ECDSA P-256, as the TLS identity
         let pem = key_pair.serialize_pem();
 
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|source| AuthorityError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
-
-        // `create_new` so we never clobber an authority key that already
-        // exists: overwriting it would orphan every signed file on this
-        // machine, which reads to the user as "hops forgot all my devices".
-        // Created at 0600 and tightened to 0400 after the write, so the key is
-        // never briefly group- or world-readable — the create-then-chmod window
-        // `create_private` exists to avoid for the config file.
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(path).map_err(|source| AuthorityError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        let write = f
-            .write_all(pem.as_bytes())
-            .and_then(|()| f.sync_all())
+        // Whole, and never over an authority key that already exists:
+        // overwriting it would orphan every signed file on this machine, which
+        // reads to the user as "hops forgot all my devices". A half-written key
+        // is never visible either, so no start fails on `Unusable` because
+        // another one was still writing.
+        crate::new_file::create_whole(path, pem.as_bytes(), crate::new_file::Access::OwnerRead)
             .map_err(|source| AuthorityError::Io {
                 path: path.to_path_buf(),
                 source,
-            });
-        if let Err(e) = write {
-            // A half-written key is not a key. Leaving it behind would make
-            // every subsequent start fail on `Unusable` with nothing to do
-            // about it but delete the file by hand.
-            let _ = fs::remove_file(path);
-            return Err(e);
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o400));
-        }
+            })?;
         log::info!("generated a software trust authority at {}", path.display());
 
         Self::from_key_pair(&key_pair, path)
