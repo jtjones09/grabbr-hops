@@ -40,7 +40,6 @@
 //! it.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::SystemTime;
 
 /// The check passed, or was not asked to enforce anything.
@@ -125,10 +124,19 @@ pub fn judge(
 }
 
 /// `git -C <repo> <args...>`, trimmed, or `None` if git or the repo is absent.
+///
+/// No inherited `GIT_` variable reaches it (see `git_env::git_at`). A launcher
+/// started from inside git, such as a hook, carries `GIT_DIR`; were it passed
+/// on, the check would compare that repository, and could pass a strict gate
+/// for a path that holds no checkout.
+///
+/// `--no-optional-locks`, because the check only reads. `git status` otherwise
+/// takes the index lock to write back refreshed timestamps, and a commit
+/// started at that moment fails on the lock. `GIT_OPTIONAL_LOCKS=0` asked for
+/// the same, and is removed with every other `GIT_` variable.
 fn git(repo: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
+    let out = crate::git_env::git_at(repo)
+        .arg("--no-optional-locks")
         .args(args)
         .output()
         .ok()?;
