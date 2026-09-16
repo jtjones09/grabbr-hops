@@ -2,7 +2,7 @@ use crate::{
     capture::{Capture, CaptureType, ICaptureEvent},
     client::ClientManager,
     clipboard::{Clipboard, ClipboardEvent},
-    config::{Config, ConfigClient},
+    config::{Config, ConfigClient, ConfigError},
     connect::{ClipboardSender, LanMouseConnection},
     crypto,
     discovery::{DiscoveredPeer, Discovery, DiscoveryEvent},
@@ -13,8 +13,8 @@ use crate::{
 };
 use futures::StreamExt;
 use hops_ipc::{
-    AsyncFrontendListener, AttemptOrigin, ClientHandle, DiscoveredDevice, FrontendEvent,
-    FrontendRequest, IpcError, IpcListenerCreationError, Position, Status,
+    AsyncFrontendListener, AttemptOrigin, ClientHandle, DaemonEndpoint, DiscoveredDevice,
+    FrontendEvent, FrontendRequest, IpcError, IpcListenerCreationError, Position, Status,
 };
 use local_channel::mpsc::{Receiver, channel};
 use log;
@@ -31,6 +31,8 @@ use tokio::{process::Command, signal, sync::Notify};
 pub enum ServiceError {
     #[error(transparent)]
     IpcListen(#[from] IpcListenerCreationError),
+    #[error(transparent)]
+    Config(#[from] ConfigError),
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
@@ -201,20 +203,54 @@ fn drop_untrusted_pins(
     stale.into_iter().map(|(h, _)| h).collect()
 }
 
+/// Hold the claim before the config is read, and read it only then.
+///
+/// `claim` is a future, so nothing of it runs until it is awaited here.
+async fn claim_then_read_config<L, C>(
+    claim: impl std::future::Future<Output = Result<L, IpcListenerCreationError>>,
+    load_config: impl FnOnce() -> Result<C, ConfigError>,
+) -> Result<(L, C), ServiceError> {
+    let claimed = claim.await?;
+    let config = load_config()?;
+    Ok((claimed, config))
+}
+
 impl Service {
-    pub async fn new(config: Config) -> Result<Self, ServiceError> {
+    /// Start the daemon on `endpoint`: claim it, then read the config, then
+    /// everything else.
+    ///
+    /// The claim is the single-instance check. A daemon started beside a
+    /// running one, or racing another through startup, stops at it with
+    /// `AlreadyRunning`, having opened only its own log and the claim's lock
+    /// file. It never reads or writes the config, the token, the identity key
+    /// or the trust store that the running daemon holds.
+    pub async fn start(
+        endpoint: &DaemonEndpoint,
+        load_config: impl FnOnce() -> Result<Config, ConfigError>,
+    ) -> Result<Self, ServiceError> {
+        let (frontend_listener, config) =
+            claim_then_read_config(AsyncFrontendListener::at(endpoint), load_config).await?;
+        log::info!("using config: {:?}", config.config_path());
+        log::info!("Press {:?} to release the mouse", config.release_bind());
+        Self::new(config, frontend_listener).await
+    }
+
+    /// Everything after the claim and the config. Private, so no daemon is
+    /// built without a claimed endpoint.
+    async fn new(
+        config: Config,
+        frontend_listener: AsyncFrontendListener,
+    ) -> Result<Self, ServiceError> {
         let client_manager = ClientManager::default();
         for client in config.clients() {
             client_manager.add_with_config(client);
         }
-        // The identity has to come first now: the lease store is keyed to THIS
-        // machine's fingerprint, and a store issued to another machine is
-        // refused at the door rather than silently adopted.
-        let identity = Arc::new(crypto::load_or_generate_key_and_cert(config.cert_path())?);
+        // The identity has to come before the lease store: the store is keyed
+        // to THIS machine's fingerprint, and a store issued to another machine
+        // is refused at the door rather than silently adopted.
+        let identity = crypto::load_or_generate_key_and_cert(config.cert_path())?;
+        let identity = Arc::new(identity);
         let public_key_fingerprint = crypto::certificate_fingerprint(&identity);
-
-        // create frontend communication adapter, exit if already running
-        let frontend_listener = AsyncFrontendListener::new().await?;
 
         // Load the sealed store, migrating off [authorized_fingerprints] /
         // [revoked_fingerprints] on first run. After this those tables are a
@@ -2189,6 +2225,134 @@ mod discovery_state_on_attach {
             body_of(src, "fn handle_discovery_event(").contains("publish_discovered()"),
             "found/lost events must still republish, or the list freezes at \
              whatever attach-time reported"
+        );
+    }
+}
+
+#[cfg(test)]
+mod a_second_daemon_leaves_the_running_daemons_files_alone {
+    //! **Decided 2026-09-16 (#159):** at most one daemon. The front door checks
+    //! that none answers before starting one, but a login service, a second
+    //! launch, or a start already under way can still bring up a second. That
+    //! one must stop at the IPC endpoint, before it reads or writes the config,
+    //! or the identity key and trust store the config points it at, which the
+    //! running daemon holds in memory.
+
+    use super::{Service, ServiceError, claim_then_read_config};
+    use crate::config::ConfigError;
+    use hops_ipc::{DaemonEndpoint, IpcListenerCreationError};
+    use std::cell::Cell;
+
+    /// A scratch directory, short enough for a socket path in it (`sun_path`).
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        #[cfg(unix)]
+        let dir = std::path::PathBuf::from(format!("/tmp/h-svc-{tag}-{}", std::process::id()));
+        #[cfg(windows)]
+        let dir = std::env::temp_dir().join(format!("h-svc-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        dir
+    }
+
+    /// Stops the start where the config would be read, so no real config,
+    /// key or trust store is involved.
+    fn stop_here() -> ConfigError {
+        ConfigError::Io(std::io::Error::other("the test stops the start here"))
+    }
+
+    // LEDGER T9 | class B | 1 error + 6 whether the injected config loader ran
+    #[tokio::test]
+    async fn a_daemon_that_finds_the_endpoint_taken_never_reads_the_config() {
+        // The claim fails before the token is read, so nothing here reaches
+        // the user's config directory.
+        let dir = scratch("taken");
+        #[cfg(unix)]
+        let (running, endpoint) = {
+            let path = dir.join("s.sock");
+            let running = std::os::unix::net::UnixListener::bind(&path).expect("a unix listener");
+            (running, DaemonEndpoint::Unix(path))
+        };
+        #[cfg(windows)]
+        let (running, endpoint) = {
+            let running = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+            let addr = running.local_addr().expect("its address");
+            (running, DaemonEndpoint::Tcp(addr))
+        };
+
+        let read_config = Cell::new(false);
+        let got = Service::start(&endpoint, || {
+            read_config.set(true);
+            Err(stop_here())
+        })
+        .await;
+        let refused = matches!(
+            got,
+            Err(ServiceError::IpcListen(
+                IpcListenerCreationError::AlreadyRunning
+            ))
+        );
+        drop(running);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            (refused, read_config.get()),
+            (true, false),
+            "(refused as already running, read the config). A daemon started \
+             beside a running one must stop before the config: on a first run it \
+             would otherwise write one over the running daemon's, and go on to \
+             the identity key and trust store the config names."
+        );
+    }
+
+    // LEDGER T22 | class B | 6 state seen by the injected config loader, 1 return value
+    #[tokio::test]
+    async fn the_config_is_read_only_once_the_endpoint_is_claimed() {
+        // A stand-in for the claim: the real one mints the IPC token in the
+        // user's config directory once it holds the endpoint.
+        let claimed = Cell::new(false);
+        let claim = async {
+            tokio::task::yield_now().await;
+            claimed.set(true);
+            Ok::<_, IpcListenerCreationError>("the claim")
+        };
+        let claimed_when_read = Cell::new(None);
+        let got = claim_then_read_config(claim, || {
+            claimed_when_read.set(Some(claimed.get()));
+            Ok("the config")
+        })
+        .await;
+
+        assert_eq!(
+            (claimed_when_read.get(), got.ok()),
+            (Some(true), Some(("the claim", "the config"))),
+            "(the claim was held when the config was read, both came back). \
+             Reading the config before the claim lets two daemons starting \
+             together both write a default config, and a second daemon that \
+             fails on the config exits 1, which launchd restarts every ten \
+             seconds, instead of stopping as already running."
+        );
+
+        let read = Cell::new(false);
+        let refused = claim_then_read_config(
+            async { Err::<(), _>(IpcListenerCreationError::AlreadyRunning) },
+            || {
+                read.set(true);
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(
+            (
+                matches!(
+                    refused,
+                    Err(ServiceError::IpcListen(
+                        IpcListenerCreationError::AlreadyRunning
+                    ))
+                ),
+                read.get()
+            ),
+            (true, false),
+            "(refused as already running, read the config) for a claim refused"
         );
     }
 }

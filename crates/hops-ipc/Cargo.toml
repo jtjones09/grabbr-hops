@@ -18,6 +18,10 @@ thiserror = "2.0.0"
 tokio = { version = "1.32.0", features = ["macros", "net", "io-util", "time"] }
 tokio-stream = { version = "0.1.15", features = ["io-util"] }
 
+[target.'cfg(unix)'.dependencies]
+# geteuid, to say whose lock file stops the daemon starting
+libc = "0.2.148"
+
 [dev-dependencies]
 # the IPC auth tests drive a connection over an in-memory duplex
 tokio = { version = "1.32.0", features = ["rt", "macros", "io-util", "time"] }

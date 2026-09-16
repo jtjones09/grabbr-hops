@@ -29,7 +29,7 @@
 //!
 //! # Guards that are RED on purpose
 //!
-//! Four rules below are decided, binding, and not yet implemented. They are in
+//! Some rules below are decided, binding, and not yet implemented. They are in
 //! the pre-v0.14 block. Their guards are written against the intended
 //! behaviour, not today's, and each failure message names the issue. Softening
 //! one of them to match current code would convert a scheduled fix into a
@@ -53,8 +53,12 @@ mod scan {
     /// and a `\n#[cfg(test)]\n` pattern silently matches nothing there, turning
     /// the guard into a scan of the whole file including its own tests.
     pub fn code_only(src: &str) -> String {
-        before_tests(src)
-            .lines()
+        without_comments(before_tests(src))
+    }
+
+    /// All of `src`, test modules included, with `//` comments stripped.
+    pub fn without_comments(src: &str) -> String {
+        src.lines()
             .map(|l| l.split("//").next().unwrap_or(""))
             .collect::<Vec<_>>()
             .join("\n")
@@ -1964,6 +1968,10 @@ mod a_frontend_attaches_and_never_starts_a_daemon {
     //! already-running daemon over IPC and must never spawn, fork, launch or
     //! auto-start one; they retry connecting and report that nothing is there.
     //!
+    //! **Amended 2026-09-16 (#159)** for the app's front door, `hops` with no
+    //! subcommand, which may now start the service; see the next module. The
+    //! frontend crates still attach only, and the test below holds them to it.
+    //!
     //! **Why.** "Just start the daemon if it isn't running" is the most
     //! natural-looking UX improvement in this product and it is forbidden. The
     //! daemon holds the private identity key, the trust store, every
@@ -2006,53 +2014,270 @@ mod a_frontend_attaches_and_never_starts_a_daemon {
             }
         }
     }
+}
 
-    /// **RED TODAY.** The binary's front door — `hops` with no subcommand,
-    /// which is what double-clicking the app runs — ensures the daemon is up
-    /// before opening any frontend.
-    ///
-    /// The code carries a reasoned defence (a frontend-spawned daemon can land
-    /// on the dummy backend if its path lacks the Accessibility grant, so it
-    /// bootstraps the GRANTED launchd service instead), and it is genuinely
-    /// narrower than naive drift: the frontend crates spawn nothing, and
-    /// launchd owns the lifetime on macOS. But the decision has no front-door
-    /// carve-out, and its stated harm — making the highest-privilege process a
-    /// UI-triggerable event — is not avoided by routing through launchd. On
-    /// macOS it goes further than the decision contemplates, self-installing a
-    /// LaunchAgent so the daemon starts at every login.
-    ///
-    /// Either the code or the decision is wrong. This test says so out loud
-    /// instead of letting a green suite imply the rule holds.
+mod the_front_door_starts_a_daemon_only_when_none_answers {
+    //! **Decided 2026-09-16 (#159), amending 2026-06-28.** `hops` with no
+    //! subcommand may start the service when none is running: on Linux and
+    //! Windows as a detached process, on macOS through the launchd service.
+    //! The rule is "at most one daemon, started only when none answers".
+    //!
+    //! **Why a second one is not harmless.** Before #159 the Windows front door
+    //! never asked whether a daemon was running: its probe answered "no"
+    //! without connecting, so every launch started another `hops daemon`
+    //! beside the one serving input, and that one loaded the identity key
+    //! before it found the IPC port taken.
+    //!
+    //! The rule has two halves, tested where each one lives:
+    //!
+    //! * **Started only when none answers.** The decision, here, against real
+    //!   listeners standing in for a daemon; and the front door's own probe
+    //!   against the daemon's real listener on this platform's real endpoint,
+    //!   in `tests/front_door_probe.rs`.
+    //! * **At most one daemon.** A probe and a start are two steps, so a second
+    //!   start can still happen: two launches together, or a login service
+    //!   starting one meanwhile. The daemon's claim on its IPC endpoint settles
+    //!   it before the config or any key is read (`hops-ipc` `listen.rs`,
+    //!   `service.rs`, and `tests/second_daemon.rs` on the built binary).
+
+    use crate::daemon_start::{DaemonStart, Watch, start_unless_running};
+    use hops_ipc::{DaemonEndpoint, SocketPathError};
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    /// The process id the stand-in start reports.
+    const STARTED: u32 = 4242;
+
+    /// A started daemon that serves frontends at once. Waiting for a daemon to
+    /// come up is tested in `daemon_start`; this module is about whether one
+    /// is started at all.
+    struct ServesAtOnce;
+
+    impl Watch for ServesAtOnce {
+        fn serves(&mut self, _: &DaemonEndpoint, _: Duration) -> bool {
+            true
+        }
+        fn ended(&mut self, _: u32) -> bool {
+            false
+        }
+        fn log_file(&self) -> Option<std::path::PathBuf> {
+            None
+        }
+    }
+
+    /// Run the front door's decision against `endpoint`, counting the starts
+    /// it asks for.
+    fn decide(endpoint: Result<DaemonEndpoint, SocketPathError>) -> (DaemonStart, u32) {
+        let starts = Cell::new(0);
+        let start = || {
+            starts.set(starts.get() + 1);
+            Ok(STARTED)
+        };
+        let outcome =
+            start_unless_running(endpoint, start, &mut ServesAtOnce, Duration::from_secs(1));
+        (outcome, starts.get())
+    }
+
+    /// A loopback port nothing listens on: bound and released in one statement.
+    fn released_port() -> DaemonEndpoint {
+        DaemonEndpoint::Tcp(
+            std::net::TcpListener::bind("127.0.0.1:0")
+                .and_then(|l| l.local_addr())
+                .expect("a loopback port"),
+        )
+    }
+
+    /// A socket path short enough for `sun_path` (about 104 bytes on macOS),
+    /// unique to this test process.
+    #[cfg(unix)]
+    fn socket_path(tag: &str) -> std::path::PathBuf {
+        let name = format!("hops-front-door-{tag}-{}.sock", std::process::id());
+        let in_tmp = std::env::temp_dir().join(&name);
+        if in_tmp.as_os_str().len() < 100 {
+            in_tmp
+        } else {
+            std::path::Path::new("/tmp").join(name)
+        }
+    }
+
+    /// The Windows transport, checked on every platform: there the daemon's
+    /// IPC listener is a loopback TCP port.
+    // LEDGER T1 | class B | 1 return value
     #[test]
-    #[ignore = "RED: `hops` with no subcommand calls ensure_daemon_running() before opening the frontend, which the 2026-06-28 decision forbids in as many words. Tracked in #159 — do not delete this guard to make the suite green."]
-    fn the_front_door_does_not_bring_the_daemon_up_before_attaching() {
-        let code = super::scan::code_only(include_str!("main.rs"));
-        let mut found = Vec::new();
-        for marker in [
-            "ensure_daemon_running",
-            "start_detached_daemon",
-            "launchctl",
-        ] {
-            if code.contains(marker) {
-                found.push(marker);
+    fn a_daemon_answering_on_loopback_tcp_is_left_alone() {
+        let daemon = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        let endpoint = DaemonEndpoint::Tcp(daemon.local_addr().expect("its address"));
+
+        let decided = decide(Ok(endpoint));
+        drop(daemon);
+
+        assert_eq!(
+            decided,
+            (DaemonStart::AlreadyRunning, 0),
+            "a daemon was listening on its loopback TCP endpoint and the front \
+             door still asked for another to be started. That is the Windows \
+             front door before #159: its probe answered 'not running' without \
+             connecting, so every launch started a second `hops daemon`."
+        );
+    }
+
+    /// The macOS and Linux transport: a Unix socket.
+    // LEDGER T2 | class B | 1 return value
+    #[cfg(unix)]
+    #[test]
+    fn a_daemon_answering_on_its_unix_socket_is_left_alone() {
+        let path = socket_path("live");
+        let _ = std::fs::remove_file(&path);
+        let daemon = std::os::unix::net::UnixListener::bind(&path).expect("a unix listener");
+
+        let decided = decide(Ok(DaemonEndpoint::Unix(path.clone())));
+        drop(daemon);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            decided,
+            (DaemonStart::AlreadyRunning, 0),
+            "a daemon was listening on its Unix socket and the front door still \
+             asked for another to be started. On macOS that can bootstrap the \
+             launchd service beside a daemon started some other way; on Linux \
+             it forks a second daemon."
+        );
+    }
+
+    /// The other half of the rule: when nothing answers, the app may start the
+    /// service, and asks for exactly one.
+    // LEDGER T3 | class B | 1 return value
+    #[test]
+    fn with_nothing_answering_exactly_one_start_is_requested() {
+        #[allow(unused_mut)] // only Unix adds cases
+        let mut cases: Vec<(&str, DaemonEndpoint)> =
+            vec![("a loopback port nothing listens on", released_port())];
+        #[cfg(unix)]
+        let stale = {
+            let stale = socket_path("stale");
+            let _ = std::fs::remove_file(&stale);
+            // Dropping a listener leaves its file behind, as a crashed daemon does.
+            drop(std::os::unix::net::UnixListener::bind(&stale).expect("a unix listener"));
+            cases.push((
+                "a socket file left by a daemon that is gone",
+                DaemonEndpoint::Unix(stale.clone()),
+            ));
+            cases.push((
+                "a socket path with no file at all",
+                DaemonEndpoint::Unix(socket_path("absent")),
+            ));
+            stale
+        };
+
+        let decided: Vec<_> = cases
+            .into_iter()
+            .map(|(what, endpoint)| (what, decide(Ok(endpoint))))
+            .collect();
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(&stale);
+
+        for (what, got) in decided {
+            assert_eq!(
+                got,
+                (DaemonStart::Started(STARTED), 1),
+                "{what}: no daemon was answering, so the front door must ask for \
+                 exactly one start. Asking for none leaves the app open onto a \
+                 service that is not running."
+            );
+        }
+    }
+
+    /// With no `$HOME` or `$XDG_RUNTIME_DIR` there is nothing to ask. A daemon
+    /// started from that environment fails on the same missing variable, so a
+    /// start could only add a process that exits, while a daemon started
+    /// elsewhere with its own environment may be running.
+    // LEDGER T4 | class B | 1 return value
+    #[test]
+    fn an_endpoint_that_cannot_be_worked_out_starts_nothing() {
+        let got = decide(Err(SocketPathError::HomeDirNotFound(
+            std::env::VarError::NotPresent,
+        )));
+        assert_eq!(
+            got,
+            (DaemonStart::CannotProbe, 0),
+            "the front door could not work out where a daemon listens, and still \
+             asked for one to be started. That daemon cannot bind the endpoint \
+             either, so it can only fail, and it may do so beside a daemon that \
+             a login service started with its own environment."
+        );
+    }
+
+    /// A start that fails is reported as failed, not as a start.
+    // LEDGER T5 | class B | 1 return value
+    #[test]
+    fn a_start_that_fails_is_reported_as_failed() {
+        let starts = Cell::new(0);
+        let start = || {
+            starts.set(starts.get() + 1);
+            Err(std::io::Error::other("the executable is gone"))
+        };
+        let got = start_unless_running(
+            Ok(released_port()),
+            start,
+            &mut ServesAtOnce,
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            (got, starts.get()),
+            (DaemonStart::StartFailed, 1),
+            "a start that failed was reported as a start. The front door then \
+             opens onto a service that never started, and nothing says why."
+        );
+    }
+
+    /// A backstop, as source text, for what the behavioural tests cannot call:
+    /// `src/main.rs` itself. Running the binary's front door would start a real
+    /// daemon or bootstrap the real launchd service.
+    ///
+    /// It checks two absences over the whole file with comments stripped (not
+    /// cut at the first test module, which would hide product code placed after
+    /// it): no process-launching machinery at all, and no call to `run_daemon`
+    /// or `run_service` outside `run` and `run_daemon`. The in-process daemon
+    /// `run` starts (for `hops daemon`, and for `hops` in a build without a
+    /// frontend) is held to one instance by its endpoint claim, not by a probe.
+    ///
+    /// Paired with `tests/front_door_probe.rs`, which calls the decision
+    /// `front_door` runs against the real listener.
+    // LEDGER T11 | class S | source text
+    #[test]
+    fn main_rs_launches_no_process_and_runs_the_daemon_only_from_run() {
+        let code = super::scan::without_comments(include_str!("main.rs"));
+        for launch in ["Command::new", "launchctl", "setsid", "CommandExt", "spawn"] {
+            assert!(
+                !code.contains(launch),
+                "src/main.rs contains `{launch}`. Starting the daemon belongs in \
+                 src/daemon_start.rs, behind the check that none is already \
+                 answering. A start added anywhere else can run beside a daemon \
+                 that is serving input, and no test here would see it."
+            );
+        }
+        for (call, allowed_in) in [("run_daemon(", "fn run"), ("run_service(", "fn run_daemon")] {
+            let calls: Vec<usize> = code
+                .match_indices(call)
+                .map(|(at, _)| at)
+                .filter(|&at| !code[..at].ends_with("fn "))
+                .collect();
+            assert!(
+                !calls.is_empty(),
+                "found no call to `{call}..)` in src/main.rs, so this check compared \
+                 nothing. If the daemon's entry point moved, point the check there."
+            );
+            for at in calls {
+                let caller = super::scan::enclosing_fn(&code, at);
+                assert_eq!(
+                    caller, allowed_in,
+                    "src/main.rs calls `{call}..)` from `{caller}`. The daemon runs \
+                     in-process only for `hops daemon`, or for `hops` in a build \
+                     with no frontend. Anywhere else it starts beside the front \
+                     door's own check."
+                );
             }
         }
-        assert!(
-            found.is_empty(),
-            "the front door starts the daemon: {found:?}. The 2026-06-28 decision \
-             says a frontend attaches to a running daemon and must NEVER spawn, \
-             fork, launch or auto-start one, and it has no front-door carve-out. \
-             The code's defence is real — the frontend CRATES spawn nothing, and \
-             routing through launchd avoids the dummy-backend trap that a \
-             self-spawned daemon falls into — but routing through launchd does \
-             not avoid the harm the decision names, which is that the \
-             highest-privilege process on the machine becomes a UI-triggerable \
-             event. On macOS it goes further still, self-installing a LaunchAgent \
-             so the daemon starts at every login. This needs a decision, not a \
-             patch: either the entry gets an explicit front-door exception with \
-             its reasoning, or the front door stops doing this. Do not soften \
-             this test to match the code without that entry."
-        );
     }
 }
 

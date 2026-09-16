@@ -25,7 +25,7 @@ use tokio::net::TcpListener;
 #[cfg(windows)]
 use tokio::net::TcpStream;
 
-use crate::{FrontendEvent, FrontendRequest, IpcError, IpcListenerCreationError, token};
+use crate::{FrontendEvent, FrontendRequest, IpcError, IpcListenerCreationError, ownership, token};
 
 /// The frontend transport. One alias instead of paired `cfg` attributes on every
 /// field, so the two platforms cannot drift apart silently.
@@ -164,13 +164,228 @@ async fn write_one(entry: &mut TxStream, bytes: &[u8]) -> bool {
     }
 }
 
-pub struct AsyncFrontendListener {
+/// A daemon's exclusive hold on its IPC endpoint: the single-instance check.
+///
+/// The daemon takes it after opening its own log and before it reads or
+/// writes anything else: the config, the token, the identity key and the trust
+/// store all come later. A second daemon, started beside a running one or
+/// racing another through startup, stops here with
+/// [`IpcListenerCreationError::AlreadyRunning`].
+///
+/// On Unix the claim is a lock on a file beside the socket, taken before the
+/// socket is checked, removed or bound. What it does not cover:
+///
+/// * **A lock that cannot be taken stops the daemon.** If the filesystem
+///   refuses file locks, the daemon exits with
+///   [`IpcListenerCreationError::Lock`] rather than run without the check.
+/// * **The lock goes when the socket's directory is cleared.** Something that
+///   deletes both files while a daemon runs (a clean-up of `~/Library/Caches`,
+///   which macOS may purge, or of `$XDG_RUNTIME_DIR`, whose files the XDG base
+///   directory specification lets a clean-up remove after six hours
+///   untouched) leaves that daemon unreachable, and a second daemon can then
+///   claim a new lock and socket and read the config and keys. It stops when
+///   it binds the peer port the first still holds. On macOS the front door
+///   does not start that second daemon, since launchd names the running
+///   job's process instead.
+///
+///   The lock stays beside the socket anyway. `$XDG_RUNTIME_DIR` is the one
+///   directory the specification requires to be local and to support file
+///   locks; the config directory, which is not purged, may be a network home
+///   where locks fail, and there the lock would stop the daemon starting at
+///   all. A lock kept elsewhere would also leave the first daemon unreachable.
+/// * **A daemon from before the lock takes none,** wherever the lock is kept.
+///   It still refuses to start beside a socket that answers, and a newer
+///   daemon refuses beside it, but the two starting at the same moment beside
+///   a stale socket can both bind.
+struct Claim {
     #[cfg(windows)]
     listener: TcpListener,
     #[cfg(unix)]
     listener: UnixListener,
+    /// Where the listener is bound. For a TCP endpoint asked for on port 0,
+    /// the port the system picked.
+    endpoint: crate::DaemonEndpoint,
+    /// An exclusive lock on `<socket>.lock`, held for the life of the listener.
+    ///
+    /// Without it, two daemons that both find a stale socket file can both
+    /// bind: the second removes the file the first has just bound, and the
+    /// first keeps a listener no frontend can reach. Holding the lock while
+    /// checking, removing and binding makes those three steps one. The lock
+    /// file is never deleted, since deleting it would let a later daemon lock
+    /// a new file while this one still holds the old.
     #[cfg(unix)]
-    socket_path: PathBuf,
+    _lock: std::fs::File,
+}
+
+impl Claim {
+    #[cfg(unix)]
+    async fn take(endpoint: &crate::DaemonEndpoint) -> Result<Self, IpcListenerCreationError> {
+        let socket_path = match endpoint {
+            crate::DaemonEndpoint::Unix(path) => path.clone(),
+            crate::DaemonEndpoint::Tcp(_) => {
+                return Err(IpcListenerCreationError::Bind {
+                    endpoint: endpoint.clone(),
+                    source: std::io::Error::new(
+                        ErrorKind::Unsupported,
+                        "the daemon listens on a Unix socket on this platform",
+                    ),
+                });
+            }
+        };
+        let lock = lock_beside_with(&socket_path, ownership::foreign_owner)?;
+
+        // `symlink_metadata`, not `exists`: a dangling link at the path would
+        // otherwise pass as absent and fail the bind as if a daemon held it.
+        if std::fs::symlink_metadata(&socket_path).is_ok() {
+            // A daemon that predates the lock holds none, so ask the socket too.
+            match UnixStream::connect(&socket_path).await {
+                Ok(_) => return Err(IpcListenerCreationError::AlreadyRunning),
+                // Nothing listens, and the lock says no other daemon is
+                // starting, so the file is left over from one that is gone.
+                Err(e) => {
+                    log::debug!("{socket_path:?}: {e} - removing left behind socket");
+                    match std::fs::remove_file(&socket_path) {
+                        Err(source) if source.kind() != ErrorKind::NotFound => {
+                            // Going on would fail the bind on the file still
+                            // there, and report a daemon that is not running.
+                            return Err(IpcListenerCreationError::StaleSocket {
+                                path: socket_path,
+                                source,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let listener = match UnixListener::bind(&socket_path) {
+            Ok(ls) => ls,
+            // A daemon that takes no lock bound the path since the check above.
+            // Linux reports that as EADDRINUSE, macOS as EEXIST.
+            Err(e) if matches!(e.kind(), ErrorKind::AddrInUse | ErrorKind::AlreadyExists) => {
+                return Err(IpcListenerCreationError::AlreadyRunning);
+            }
+            Err(source) => {
+                return Err(IpcListenerCreationError::Bind {
+                    endpoint: endpoint.clone(),
+                    source,
+                });
+            }
+        };
+        Ok(Self {
+            listener,
+            endpoint: endpoint.clone(),
+            _lock: lock,
+        })
+    }
+
+    #[cfg(windows)]
+    async fn take(endpoint: &crate::DaemonEndpoint) -> Result<Self, IpcListenerCreationError> {
+        let crate::DaemonEndpoint::Tcp(addr) = endpoint;
+        let bind_error = |source| IpcListenerCreationError::Bind {
+            endpoint: endpoint.clone(),
+            source,
+        };
+        // A port has one listener, so the bind is the whole claim.
+        let listener = match TcpListener::bind(*addr).await {
+            Ok(listener) => listener,
+            Err(e) if e.kind() == ErrorKind::AddrInUse => {
+                return Err(IpcListenerCreationError::AlreadyRunning);
+            }
+            Err(e) => return Err(bind_error(e)),
+        };
+        let bound = listener.local_addr().map_err(bind_error)?;
+        Ok(Self {
+            listener,
+            endpoint: crate::DaemonEndpoint::Tcp(bound),
+        })
+    }
+}
+
+/// Lock `<socket_path>.lock` exclusively, without waiting.
+///
+/// `whose` says who owns the lock file when opening it failed, as
+/// [`ownership::foreign_owner`] does, so the error can say what to do.
+#[cfg(unix)]
+fn lock_beside_with(
+    socket_path: &std::path::Path,
+    whose: impl FnOnce(&std::path::Path, &std::io::Error) -> Option<ownership::Foreign>,
+) -> Result<std::fs::File, IpcListenerCreationError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut name = socket_path.as_os_str().to_owned();
+    name.push(".lock");
+    let path = PathBuf::from(name);
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(source) => {
+            let hint = ownership::hint(
+                whose(&path, &source),
+                "hops keeps this file beside its socket so that a second daemon \
+                 cannot start. Check that this user can create and write it.",
+            );
+            return Err(IpcListenerCreationError::Lock { path, source, hint });
+        }
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(IpcListenerCreationError::AlreadyRunning),
+        Err(std::fs::TryLockError::Error(source)) => Err(IpcListenerCreationError::Lock {
+            path,
+            source,
+            hint: "The filesystem that holds it may not support file locks, and \
+                   hops does not run a daemon without this lock."
+                .to_string(),
+        }),
+    }
+}
+
+/// Read the token frontends must present, or mint it. An error names the
+/// file.
+fn load_token() -> Result<String, IpcListenerCreationError> {
+    let path = token::token_path().map_err(IpcListenerCreationError::TokenPath)?;
+    load_token_with(&path, ownership::foreign_owner)
+}
+
+/// [`load_token`] for the token at `path`, with `whose` saying who owns it
+/// when it cannot be used, as [`ownership::foreign_owner`] does.
+fn load_token_with(
+    path: &std::path::Path,
+    whose: impl FnOnce(&std::path::Path, &std::io::Error) -> Option<ownership::Foreign>,
+) -> Result<String, IpcListenerCreationError> {
+    token::load_or_create_at(path).map_err(|source| {
+        let hint = ownership::hint(
+            whose(path, &source),
+            "Frontends present this token to reach the daemon. Check that this \
+             user can read and write it, and create files in its directory.",
+        );
+        IpcListenerCreationError::Token {
+            path: path.to_path_buf(),
+            source,
+            hint,
+        }
+    })
+}
+
+#[cfg(unix)]
+impl Drop for Claim {
+    fn drop(&mut self) {
+        // Still under the lock: fields are dropped after this body runs.
+        log::debug!("remove socket: {}", self.endpoint);
+        if let crate::DaemonEndpoint::Unix(path) = &self.endpoint {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+pub struct AsyncFrontendListener {
+    claim: Claim,
     line_streams: SelectAll<AuthedLines<ReadHalf<Sock>>>,
     tx_streams: Vec<TxStream>,
     /// the secret every frontend must present as its first line
@@ -178,58 +393,30 @@ pub struct AsyncFrontendListener {
 }
 
 impl AsyncFrontendListener {
+    /// Claim this platform's endpoint, [`crate::DaemonEndpoint::of_this_platform`].
     pub async fn new() -> Result<Self, IpcListenerCreationError> {
-        #[cfg(unix)]
-        let (socket_path, listener) = {
-            let socket_path = crate::default_socket_path()?;
+        Self::at(&crate::DaemonEndpoint::of_this_platform()?).await
+    }
 
-            log::debug!("remove socket: {socket_path:?}");
-            if socket_path.exists() {
-                // try to connect to see if some other instance
-                // of lan-mouse is already running
-                match UnixStream::connect(&socket_path).await {
-                    // connected -> lan-mouse is already running
-                    Ok(_) => return Err(IpcListenerCreationError::AlreadyRunning),
-                    // lan-mouse is not running but a socket was left behind
-                    Err(e) => {
-                        log::debug!("{socket_path:?}: {e} - removing left behind socket");
-                        let _ = std::fs::remove_file(&socket_path);
-                    }
-                }
-            }
-            let listener = match UnixListener::bind(&socket_path) {
-                Ok(ls) => ls,
-                // some other lan-mouse instance has bound the socket in the meantime
-                Err(e) if e.kind() == ErrorKind::AddrInUse => {
-                    return Err(IpcListenerCreationError::AlreadyRunning);
-                }
-                Err(e) => return Err(IpcListenerCreationError::Bind(e)),
-            };
-            (socket_path, listener)
-        };
-
-        #[cfg(windows)]
-        let listener = match TcpListener::bind("127.0.0.1:5252").await {
-            Ok(ls) => ls,
-            // some other lan-mouse instance has bound the socket in the meantime
-            Err(e) if e.kind() == ErrorKind::AddrInUse => {
-                return Err(IpcListenerCreationError::AlreadyRunning);
-            }
-            Err(e) => return Err(IpcListenerCreationError::Bind(e)),
-        };
-
-        let adapter = Self {
-            listener,
-            token: token::load_or_create()
-                .map_err(IpcListenerCreationError::Bind)?
-                .into(),
-            #[cfg(unix)]
-            socket_path,
+    /// Claim `endpoint`, then load the token frontends must present.
+    ///
+    /// Returns [`IpcListenerCreationError::AlreadyRunning`] when another daemon
+    /// holds the endpoint or is part-way through claiming it. Nothing but the
+    /// claim's own lock file is read or written until the claim is held.
+    pub async fn at(endpoint: &crate::DaemonEndpoint) -> Result<Self, IpcListenerCreationError> {
+        let claim = Claim::take(endpoint).await?;
+        Ok(Self {
+            claim,
+            token: load_token()?.into(),
             line_streams: SelectAll::new(),
             tx_streams: vec![],
-        };
+        })
+    }
 
-        Ok(adapter)
+    /// Where this listener is bound: the endpoint it was given, with the port
+    /// filled in when that was a TCP endpoint on port 0.
+    pub fn endpoint(&self) -> &crate::DaemonEndpoint {
+        &self.claim.endpoint
     }
 
     pub async fn broadcast(&mut self, notify: FrontendEvent) {
@@ -247,21 +434,14 @@ impl AsyncFrontendListener {
     }
 }
 
-#[cfg(unix)]
-impl Drop for AsyncFrontendListener {
-    fn drop(&mut self) {
-        log::debug!("remove socket: {:?}", self.socket_path);
-        let _ = std::fs::remove_file(&self.socket_path);
-    }
-}
-
 impl Stream for AsyncFrontendListener {
     type Item = Result<FrontendRequest, IpcError>;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if let Poll::Ready(Some(request)) = self.line_streams.poll_next_unpin(cx) {
-            return Poll::Ready(Some(request));
-        }
-        while let Poll::Ready(Ok((stream, _))) = self.listener.poll_accept(cx) {
+        // Accept before reading. A connection's lines are read only once they
+        // have been polled, which is also what asks to be woken when its token
+        // arrives; accepted after the read, a new frontend waited unheard
+        // until something else woke the daemon.
+        while let Poll::Ready(Ok((stream, _))) = self.claim.listener.poll_accept(cx) {
             let (rx, tx) = tokio::io::split(stream);
             let lines = LinesStream::new(BufReader::new(rx).lines());
             let token = self.token.clone();
@@ -278,6 +458,9 @@ impl Stream for AsyncFrontendListener {
                 state,
                 synced: false,
             });
+        }
+        if let Poll::Ready(Some(request)) = self.line_streams.poll_next_unpin(cx) {
+            return Poll::Ready(Some(request));
         }
 
         // Let go of write halves whose read half hung up, and emit the initial
@@ -470,6 +653,313 @@ mod preauth_and_liveness {
         assert!(
             !write_one(&mut entry, b"x\n").await,
             "a connection whose read half hung up must be released"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod at_most_one_daemon {
+    //! **Decided 2026-09-16 (#159):** at most one daemon runs. The front door
+    //! starts one only when none answers, but its probe and its start are two
+    //! steps, and a login service can start one at any time. What keeps a
+    //! second daemon from running beside the first is its claim on the IPC
+    //! endpoint, so these tests take real claims on real sockets.
+
+    use super::Claim;
+    use crate::ownership::{Foreign, another_users};
+    use crate::{DaemonEndpoint, IpcListenerCreationError};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Barrier};
+
+    /// A socket path short enough for `sun_path`, unique to this test.
+    fn socket_path(tag: &str) -> PathBuf {
+        PathBuf::from(format!("/tmp/h-claim-{tag}-{}.sock", std::process::id()))
+    }
+
+    fn remove(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let mut lock = path.as_os_str().to_owned();
+        lock.push(".lock");
+        let _ = std::fs::remove_file(PathBuf::from(lock));
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("a runtime")
+    }
+
+    fn describe(got: &Result<Claim, IpcListenerCreationError>) -> String {
+        match got {
+            Ok(_) => "claimed".to_string(),
+            Err(e) => format!("{e:?}"),
+        }
+    }
+
+    /// Take `threads` claims on `endpoint` at once, holding every claim until
+    /// all have answered. Returns what each one got.
+    fn contend(endpoint: &DaemonEndpoint, threads: usize) -> Vec<String> {
+        let start = Arc::new(Barrier::new(threads));
+        let answered = Arc::new(Barrier::new(threads));
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let (start, answered, endpoint) =
+                    (start.clone(), answered.clone(), endpoint.clone());
+                std::thread::spawn(move || {
+                    let rt = runtime();
+                    start.wait();
+                    let got = rt.block_on(Claim::take(&endpoint));
+                    answered.wait();
+                    let outcome = describe(&got);
+                    drop(got);
+                    outcome
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("a claiming thread"))
+            .collect()
+    }
+
+    // LEDGER T7 | class B | 1 return value / error
+    #[test]
+    fn a_daemon_starting_beside_a_running_one_is_refused() {
+        let path = socket_path("live");
+        remove(&path);
+        let endpoint = DaemonEndpoint::Unix(path.clone());
+        let rt = runtime();
+
+        let running = rt
+            .block_on(Claim::take(&endpoint))
+            .expect("the first daemon claims a free endpoint");
+        let second = rt.block_on(Claim::take(&endpoint));
+        let (second, socket_kept) = (describe(&second), path.exists());
+        drop(running);
+        assert_eq!(
+            (second.as_str(), socket_kept),
+            ("AlreadyRunning", true),
+            "a second daemon claimed an endpoint a running daemon holds, or \
+             removed its socket. Two daemons would then load the same identity \
+             key and trust store, and frontends could reach only one of them."
+        );
+
+        // A daemon that predates the lock holds none; its socket still answers.
+        remove(&path);
+        let older = std::os::unix::net::UnixListener::bind(&path).expect("a unix listener");
+        let second = describe(&rt.block_on(Claim::take(&endpoint)));
+        let still_answers = std::os::unix::net::UnixStream::connect(&path).is_ok();
+        drop(older);
+        remove(&path);
+        assert_eq!(
+            (second.as_str(), still_answers),
+            ("AlreadyRunning", true),
+            "a daemon started beside one that holds no lock took over its socket"
+        );
+    }
+
+    // LEDGER T8 | class B | 1 return value / error
+    #[test]
+    fn of_daemons_starting_together_beside_a_stale_socket_exactly_one_runs() {
+        const ROUNDS: usize = 40;
+        const DAEMONS: usize = 8;
+        let path = socket_path("stale");
+        let endpoint = DaemonEndpoint::Unix(path.clone());
+        for round in 0..ROUNDS {
+            remove(&path);
+            // Dropping a listener leaves its file behind, as a crashed daemon does.
+            drop(std::os::unix::net::UnixListener::bind(&path).expect("a socket file"));
+
+            let got = contend(&endpoint, DAEMONS);
+            let claimed = got.iter().filter(|g| *g == "claimed").count();
+            let refused = got.iter().filter(|g| *g == "AlreadyRunning").count();
+            if (claimed, refused) != (1, DAEMONS - 1) {
+                remove(&path);
+            }
+            assert_eq!(
+                (claimed, refused),
+                (1, DAEMONS - 1),
+                "round {round}: {got:?}. Each daemon found the stale socket, and \
+                 more than one went on to bind. A later one removes the file an \
+                 earlier one has bound, so the earlier daemon keeps running with \
+                 a listener no frontend can reach: a device removed in the app is \
+                 never removed there."
+            );
+        }
+        remove(&path);
+    }
+
+    // LEDGER T15 | class B | 1 return value / error
+    #[test]
+    fn a_lock_file_that_cannot_be_opened_is_named_in_the_error() {
+        let path = socket_path("lockdir");
+        remove(&path);
+        let mut lock = path.as_os_str().to_owned();
+        lock.push(".lock");
+        let lock = PathBuf::from(lock);
+        let _ = std::fs::remove_dir_all(&lock);
+        // A directory where the lock file belongs fails the open for any user,
+        // root included, as a file this user may not write does for most.
+        std::fs::create_dir(&lock).expect("a directory in the lock file's place");
+
+        let got = runtime().block_on(Claim::take(&DaemonEndpoint::Unix(path.clone())));
+        let _ = std::fs::remove_dir_all(&lock);
+        remove(&path);
+
+        let Err(e @ IpcListenerCreationError::Lock { .. }) = got else {
+            panic!(
+                "expected a lock error naming {lock:?}, got {}. A daemon that \
+                 cannot open its lock file must say which file, or the user is \
+                 left with an OS error and nothing to act on.",
+                describe(&got)
+            );
+        };
+        let IpcListenerCreationError::Lock { path: named, .. } = &e else {
+            unreachable!()
+        };
+        assert_eq!(named, &lock, "the error names a different file: {e}");
+        assert!(
+            e.to_string().contains(&lock.display().to_string()),
+            "the message does not name the lock file: {e}"
+        );
+    }
+
+    // LEDGER T25 | class B | 1 return value / error
+    #[test]
+    fn a_lock_file_another_user_owns_is_reported_as_theirs() {
+        let path = socket_path("lockowner");
+        remove(&path);
+        let mut lock = path.as_os_str().to_owned();
+        lock.push(".lock");
+        let lock = PathBuf::from(lock);
+        let _ = std::fs::remove_dir_all(&lock);
+        // A directory in the lock file's place fails the open for any user.
+        // Only root can make a file another user owns, so the owner is given.
+        std::fs::create_dir(&lock).expect("a directory in the lock file's place");
+        let root_owns_it = Foreign {
+            path: lock.clone(),
+            owner: 0,
+            me: 501,
+        };
+        let asked = std::cell::RefCell::new(None);
+        let theirs = super::lock_beside_with(&path, |at, _| {
+            *asked.borrow_mut() = Some(at.to_path_buf());
+            Some(root_owns_it.clone())
+        });
+        let mine = super::lock_beside_with(&path, |_, _| None);
+        let _ = std::fs::remove_dir_all(&lock);
+        remove(&path);
+
+        let hint_of = |got: Result<std::fs::File, IpcListenerCreationError>| match got {
+            Err(IpcListenerCreationError::Lock { hint, .. }) => hint,
+            other => format!("not a lock error: {other:?}"),
+        };
+        assert_eq!(
+            (asked.into_inner(), hint_of(theirs)),
+            (Some(lock.clone()), another_users(&root_owns_it)),
+            "a lock file that belongs to another user must be reported as theirs, \
+             with what to do, or a daemon left behind by `sudo hops` stops every \
+             later start with only an OS error"
+        );
+        assert!(
+            hint_of(mine).contains("Check that this user can create and write it"),
+            "a lock file this user owns must get the ordinary hint"
+        );
+    }
+
+    // LEDGER T19 | class B | 1 return value / error
+    #[test]
+    fn a_leftover_socket_that_cannot_be_removed_is_not_reported_as_a_running_daemon() {
+        let path = socket_path("stuck");
+        remove(&path);
+        let _ = std::fs::remove_dir_all(&path);
+        // Nothing can listen on a directory, and removing a file cannot remove it.
+        std::fs::create_dir(&path).expect("a directory in the socket's place");
+        std::fs::write(path.join("keep"), b"").expect("a file inside it");
+
+        let got = runtime().block_on(Claim::take(&DaemonEndpoint::Unix(path.clone())));
+        let outcome = describe(&got);
+        let message = got
+            .as_ref()
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&path);
+        remove(&path);
+
+        assert!(
+            matches!(got, Err(IpcListenerCreationError::StaleSocket { .. }))
+                && message.contains(&path.display().to_string()),
+            "got {outcome}: {message}. Nothing answered on the socket path and it \
+             could not be cleared. Reporting that as a running daemon makes the \
+             daemon exit 0, which launchd does not restart, with no daemon running."
+        );
+    }
+}
+
+#[cfg(test)]
+mod the_token_error_names_the_file {
+    //! The daemon cannot start without the token frontends present. When it
+    //! cannot read or create it, the error names the file and says what to do.
+
+    use super::load_token_with;
+    use crate::IpcListenerCreationError;
+    use crate::ownership::{Foreign, another_users};
+
+    // LEDGER T27 | class B | 1 return value / error
+    #[test]
+    fn a_token_that_cannot_be_read_or_created_is_named_with_its_owner() {
+        let dir = std::env::temp_dir().join(format!("hops-token-error-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("ipc-token");
+        // A directory in the token's place can be neither read nor written as a
+        // file, by any user.
+        std::fs::create_dir_all(&path).expect("a directory in the token's place");
+        let root_owns_it = Foreign {
+            path: path.clone(),
+            owner: 0,
+            me: 501,
+        };
+
+        let asked = std::cell::RefCell::new(None);
+        let theirs = load_token_with(&path, |at, _| {
+            *asked.borrow_mut() = Some(at.to_path_buf());
+            Some(root_owns_it.clone())
+        });
+        let mine = load_token_with(&path, |_, _| None);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (named, message, hint) = match theirs {
+            Err(e @ IpcListenerCreationError::Token { .. }) => {
+                let message = e.to_string();
+                let IpcListenerCreationError::Token { path, hint, .. } = e else {
+                    unreachable!()
+                };
+                (path, message, hint)
+            }
+            other => panic!("expected a token error, got {other:?}"),
+        };
+        assert_eq!(
+            (asked.into_inner(), named, hint),
+            (
+                Some(path.clone()),
+                path.clone(),
+                another_users(&root_owns_it)
+            ),
+            "the token error must name the token file and, when another user owns \
+             it, say so. Before, a token left behind by `sudo hops` stopped the \
+             daemon with only \"Permission denied\", and launchd restarted it every \
+             ten seconds."
+        );
+        assert!(
+            message.contains(&path.display().to_string()),
+            "the message does not name the token file: {message}"
+        );
+        assert!(
+            matches!(&mine, Err(IpcListenerCreationError::Token { hint, .. })
+                if hint.contains("Check that this user can read and write it")),
+            "a token this user owns must get the ordinary hint: {mine:?}"
         );
     }
 }

@@ -70,8 +70,12 @@ fn config_dir() -> io::Result<PathBuf> {
 /// user's `%LOCALAPPDATA%`, which is already user-scoped — the same protection
 /// `config.toml` and the TLS key rely on.
 pub fn load_or_create() -> io::Result<String> {
-    let path = token_path()?;
-    if let Ok(existing) = std::fs::read_to_string(&path) {
+    load_or_create_at(&token_path()?)
+}
+
+/// [`load_or_create`] for the token kept at `path`.
+pub fn load_or_create_at(path: &std::path::Path) -> io::Result<String> {
+    if let Ok(existing) = std::fs::read_to_string(path) {
         let existing = existing.trim().to_string();
         // a truncated or hand-mangled token would lock every frontend out with a
         // confusing failure, so replace anything that isn't well-formed
@@ -87,7 +91,7 @@ pub fn load_or_create() -> io::Result<String> {
     getrandom::fill(&mut raw)
         .map_err(|e| io::Error::other(format!("no OS randomness available: {e}")))?;
     let token: String = raw.iter().map(|b| format!("{b:02x}")).collect();
-    write_private(&path, &token)?;
+    write_private(path, &token)?;
     log::info!("minted a new IPC token at {path:?}");
     Ok(token)
 }

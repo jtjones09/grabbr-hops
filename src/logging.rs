@@ -134,6 +134,16 @@ fn role_from(args: impl Iterator<Item = String>) -> &'static str {
     }
 }
 
+/// Where a process in `role` ("daemon", "gui", "tui", "cli") writes its log:
+/// `HOPS_LOG_FILE` when that is set, this platform's log directory otherwise.
+/// `None` when the variable that directory comes from is not set.
+///
+/// For another process to name the file, or send output there: the front
+/// door sends a daemon's start-up output to the file that daemon logs to.
+pub fn file_for(role: &str) -> Option<PathBuf> {
+    default_path(role)
+}
+
 /// Where this process writes, absent an override.
 ///
 /// Per-role rather than one shared file: the daemon and the tray are separate

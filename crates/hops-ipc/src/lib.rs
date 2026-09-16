@@ -3,8 +3,9 @@ use std::{
     env::VarError,
     fmt::Display,
     io,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     str::FromStr,
+    time::Duration,
 };
 use thiserror::Error;
 
@@ -19,11 +20,14 @@ use serde::{Deserialize, Serialize};
 mod connect;
 mod connect_async;
 mod listen;
+mod ownership;
 pub mod pairing;
 pub mod token;
 
-pub use connect::{FrontendEventReader, FrontendRequestWriter, connect};
-pub use connect_async::{AsyncFrontendEventReader, AsyncFrontendRequestWriter, connect_async};
+pub use connect::{FrontendEventReader, FrontendRequestWriter, connect, connect_to};
+pub use connect_async::{
+    AsyncFrontendEventReader, AsyncFrontendRequestWriter, connect_async, connect_async_to,
+};
 pub use listen::AsyncFrontendListener;
 pub use pairing::{PairingCode, PairingError};
 
@@ -35,6 +39,9 @@ pub enum ConnectionError {
     Io(#[from] io::Error),
     #[error("connection timed out")]
     Timeout,
+    /// A frontend on this platform cannot dial that kind of endpoint.
+    #[error("a frontend here cannot connect to {0}")]
+    UnsupportedEndpoint(DaemonEndpoint),
 }
 
 #[derive(Debug, Error)]
@@ -43,8 +50,43 @@ pub enum IpcListenerCreationError {
     SocketPath(#[from] SocketPathError),
     #[error("service already running!")]
     AlreadyRunning,
-    #[error("failed to bind lan-mouse socket: `{0}`")]
-    Bind(io::Error),
+    /// The endpoint could not be bound, for a reason other than a daemon
+    /// holding it.
+    #[error("could not listen on {endpoint}: {source}")]
+    Bind {
+        endpoint: DaemonEndpoint,
+        source: io::Error,
+    },
+    /// The lock that stops a second daemon starting could not be taken, for a
+    /// reason other than another daemon holding it.
+    #[error("could not lock {}: {source}. {hint}", .path.display())]
+    Lock {
+        path: std::path::PathBuf,
+        source: io::Error,
+        /// What to do about it, in words.
+        hint: String,
+    },
+    /// A socket file no daemon answers on, which could not be removed.
+    #[error(
+        "nothing answers on {}, and it could not be removed: {source}. If no hops \
+         daemon is running, remove it and start hops again.",
+        .path.display()
+    )]
+    StaleSocket {
+        path: std::path::PathBuf,
+        source: io::Error,
+    },
+    /// Where the token frontends present is kept could not be worked out.
+    #[error("could not work out where the IPC token is kept: {0}")]
+    TokenPath(io::Error),
+    /// The token frontends present could not be read or created.
+    #[error("could not read or create the IPC token {}: {source}. {hint}", .path.display())]
+    Token {
+        path: std::path::PathBuf,
+        source: io::Error,
+        /// What to do about it, in words.
+        hint: String,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -450,4 +492,177 @@ pub fn default_socket_path() -> Result<PathBuf, SocketPathError> {
         .join("Library")
         .join("Caches")
         .join(LAN_MOUSE_SOCKET_NAME))
+}
+
+/// The loopback port the daemon listens on where there are no Unix sockets.
+///
+/// One definition for the listener, both connectors and the front door's
+/// probe, so the probe cannot ask a different address from the one the daemon
+/// binds.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const TCP_ENDPOINT: SocketAddr =
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5252));
+
+/// How long the probe waits on a TCP endpoint before concluding nothing is
+/// there. A listening daemon completes a loopback handshake at once, and a
+/// connect to a closed port is not guaranteed to fail fast, so this bounds
+/// what asking costs on a machine with no daemon.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Where a frontend reaches the daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonEndpoint {
+    /// A Unix domain socket, on macOS and Linux.
+    #[cfg(unix)]
+    Unix(PathBuf),
+    /// A loopback TCP port, on Windows.
+    Tcp(SocketAddr),
+}
+
+impl Display for DaemonEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(path) => write!(f, "{}", path.display()),
+            Self::Tcp(addr) => write!(f, "{addr}"),
+        }
+    }
+}
+
+impl DaemonEndpoint {
+    /// The endpoint this platform's daemon listens on: the one
+    /// [`AsyncFrontendListener::new`] binds and [`connect()`] and
+    /// [`connect_async()`] dial.
+    ///
+    /// Only the defaults read it. Code that is handed an endpoint, such as
+    /// [`AsyncFrontendListener::at`] and [`connect_async_to`], uses that one,
+    /// and nothing in the environment can point a frontend elsewhere.
+    pub fn of_this_platform() -> Result<Self, SocketPathError> {
+        #[cfg(unix)]
+        {
+            Ok(Self::Unix(default_socket_path()?))
+        }
+        #[cfg(windows)]
+        {
+            Ok(Self::Tcp(TCP_ENDPOINT))
+        }
+    }
+
+    /// Whether something accepts a connection here right now.
+    ///
+    /// Connects and hangs up without sending anything. The daemon sees a
+    /// frontend that closed before presenting its token, and drops it without
+    /// logging a warning.
+    pub fn answers(&self) -> bool {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(path) => std::os::unix::net::UnixStream::connect(path).is_ok(),
+            Self::Tcp(addr) => std::net::TcpStream::connect_timeout(addr, PROBE_TIMEOUT).is_ok(),
+        }
+    }
+
+    /// Whether a daemon serves frontends here: it takes `token` and sends a
+    /// frontend its state, each step within `within`.
+    ///
+    /// Stronger than [`Self::answers`]. A daemon binds its endpoint before it
+    /// reads the token, the config and its keys, and one that fails on any of
+    /// them exits a moment later, so something answering says little about
+    /// whether a daemon is running. A daemon sends state only once its service
+    /// loop runs. Hangs up after the first event, which the daemon treats as
+    /// an ordinary frontend leaving.
+    pub fn serves(&self, token: &str, within: Duration) -> bool {
+        // A zero timeout is an error for the socket calls below.
+        let within = within.max(Duration::from_millis(1));
+        let exchange = || -> io::Result<bool> {
+            match self {
+                #[cfg(unix)]
+                Self::Unix(path) => {
+                    let stream = std::os::unix::net::UnixStream::connect(path)?;
+                    stream.set_read_timeout(Some(within))?;
+                    stream.set_write_timeout(Some(within))?;
+                    state_follows_token(stream, token)
+                }
+                Self::Tcp(addr) => {
+                    let stream = std::net::TcpStream::connect_timeout(addr, within)?;
+                    stream.set_read_timeout(Some(within))?;
+                    stream.set_write_timeout(Some(within))?;
+                    state_follows_token(stream, token)
+                }
+            }
+        };
+        exchange().unwrap_or(false)
+    }
+}
+
+/// Present `token` on `stream`, and say whether an event comes back.
+///
+/// Any whole line of JSON counts, not only a [`FrontendEvent`] this build
+/// knows: the daemon may be another version, left running by launchd across
+/// an update, and it still serves.
+fn state_follows_token(mut stream: impl io::Read + io::Write, token: &str) -> io::Result<bool> {
+    use io::BufRead;
+    stream.write_all(format!("{token}\n").as_bytes())?;
+    let mut line = String::new();
+    io::BufReader::new(stream).read_line(&mut line)?;
+    Ok(line.ends_with('\n') && serde_json::from_str::<serde_json::Value>(line.trim_end()).is_ok())
+}
+
+#[cfg(test)]
+mod serves_whatever_its_version {
+    //! The front door asks whether a daemon serves after it starts one. The
+    //! daemon it reaches may be another build, left running across an update,
+    //! whose events this build does not know.
+
+    use super::DaemonEndpoint;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::time::Duration;
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// A daemon stand-in on a loopback port that answers one connection with
+    /// `reply` once it has read the token, then stays connected until the
+    /// asker hangs up, or hangs up itself when `reply` is not a whole line.
+    /// Returns its endpoint and whether the token arrived as a line of its own.
+    fn replying(reply: &'static str) -> (DaemonEndpoint, std::thread::JoinHandle<bool>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        let endpoint = DaemonEndpoint::Tcp(listener.local_addr().expect("its address"));
+        let peer = std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return false;
+            };
+            let mut reader = BufReader::new(stream.try_clone().expect("a second handle"));
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            let mut writer = stream;
+            let _ = writer.write_all(reply.as_bytes());
+            if reply.ends_with('\n') {
+                let _ = reader.read_to_end(&mut Vec::new());
+            }
+            line == format!("{TOKEN}\n")
+        });
+        (endpoint, peer)
+    }
+
+    fn ask(reply: &'static str) -> (bool, bool) {
+        let (endpoint, peer) = replying(reply);
+        let serves = endpoint.serves(TOKEN, Duration::from_secs(2));
+        (serves, peer.join().expect("the stand-in daemon"))
+    }
+
+    // LEDGER T41 | class B | 2 bytes over a real socket + 1 return value
+    #[test]
+    fn any_event_counts_and_anything_else_does_not() {
+        assert_eq!(
+            (
+                ask("{\"AnEventOfALaterBuild\":{\"n\":1}}\n"),
+                ask("not json\n"),
+                ask("{}"),
+            ),
+            ((true, true), (false, true), (false, true)),
+            "((event unknown to this build), (not JSON), (no whole line before the \
+             hang-up)), each as \
+             (counted as serving, token sent as a line). A daemon of another build \
+             serves all the same; the front door would log it as silent."
+        );
+    }
 }
