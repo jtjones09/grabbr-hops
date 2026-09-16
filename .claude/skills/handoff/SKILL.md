@@ -141,7 +141,7 @@ worth noticing out loud rather than padding.
 Ordered.
 
 ### Blocked
-On him, on hardware, on a run — and why.
+On the maintainer, on hardware, on a run — and why.
 
 ## Right now
 One paragraph: what we are in the middle of, and the immediate next action.
@@ -152,7 +152,7 @@ One paragraph: what we are in the middle of, and the immediate next action.
 - rig: which build (commit) is running on Mac / Windows / Linux, and when built
 
 ## Waiting on the maintainer
-Blocking questions, decisions, and any test only he can run. Say WHY each is blocked.
+Blocking questions, decisions, and any test only the maintainer can run. Say WHY each is blocked.
 
 ## Already tried — do not redo
 The single highest-value section. Approaches attempted and rejected, with the
@@ -190,7 +190,7 @@ versioned, that is their call to make explicitly.
 - **Prefer "unverified" over a confident guess.** Mark anything not measured.
 - **The TL;DR has four headings and the CX/UX one is not optional.** the maintainer is
   building a product; a list of green PRs does not answer "what am I getting."
-  He has caught this format decaying mid-session — check all four are present
+  That format has decayed mid-session before — check all four are present
   before sending.
 - **A summary is never the only record of research.** Preserve the artifact first,
   synthesize second, and check the synthesis against the artifact before committing.
