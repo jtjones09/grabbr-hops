@@ -59,6 +59,9 @@ pub const EXIT_STALE: i32 = 2;
 /// verified nothing must never report that it verified something.
 pub const EXIT_CANNOT_VERIFY: i32 = 3;
 
+/// What `build.rs` bakes in when it could not read a commit.
+const NO_COMMIT: &str = "unknown";
+
 /// What a build check concluded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -106,7 +109,7 @@ pub fn judge(
     };
     // `build.rs` falls back to this outside a checkout; it can never match a
     // real revision, and reporting it as a mismatch would be noise.
-    if built_commit == "unknown" {
+    if built_commit == NO_COMMIT {
         return Verdict::NotACheckout;
     }
     if built_commit != head {
@@ -247,6 +250,28 @@ pub fn check(repo: Option<PathBuf>) -> Report {
     }
 }
 
+/// What the report says when nothing was compared: the end of its first line,
+/// and the reason `--strict` gives.
+///
+/// A binary without a commit is its own case. No path can give it one, so a
+/// reason that points at the path sends the reader to check a checkout that is
+/// fine.
+fn nothing_compared(built_commit: &str) -> (&'static str, &'static str) {
+    if built_commit == NO_COMMIT {
+        (
+            "built without a commit, so there is nothing to compare",
+            "this binary has no commit baked in; rebuild it inside a git \
+             checkout, with git on PATH",
+        )
+    } else {
+        (
+            "no source tree to compare against",
+            "git read no commit at the path given (no checkout there, no git, \
+             or git refused the checkout)",
+        )
+    }
+}
+
 /// Print the report and return the process exit code.
 ///
 /// `strict` is for dev launchers, where a stale binary means the test that
@@ -257,15 +282,13 @@ pub fn check(repo: Option<PathBuf>) -> Report {
 pub fn report(r: &Report, strict: bool) -> i32 {
     match &r.verdict {
         Verdict::NotACheckout => {
-            println!(
-                "hops {} — no source tree to compare against",
-                r.built_commit
-            );
+            let (summary, reason) = nothing_compared(&r.built_commit);
+            println!("hops {} — {summary}", r.built_commit);
             if strict {
                 // Someone asked for this to be verified and it could not be.
                 // Returning 0 here would be a gate that passes having checked
                 // nothing — which reads as proof and is worse than no gate.
-                println!("  CANNOT VERIFY: no git checkout at the path given");
+                println!("  CANNOT VERIFY: {reason}");
                 println!("  the binary may or may not match; nothing was compared");
                 EXIT_CANNOT_VERIFY
             } else {
@@ -350,6 +373,30 @@ mod tests {
             "under --strict, being unable to find a checkout means nothing was \
              compared. Returning success there is a gate that passes having \
              verified nothing, which reads as proof and is worse than no gate."
+        );
+    }
+
+    // LEDGER T18 | class B | 1 return value: build_check::nothing_compared
+    #[test]
+    fn a_binary_without_a_commit_is_not_blamed_on_the_path() {
+        let (summary, reason) = nothing_compared(NO_COMMIT);
+        assert!(
+            reason.contains("no commit baked in") && !reason.contains("path given"),
+            "a binary built without a commit can compare nothing at any path; \
+             a reason that points at the path sends the reader to check a \
+             checkout that is fine. reason: {reason:?}"
+        );
+        assert!(
+            !summary.contains("source tree"),
+            "the first line blames the source tree for a binary with no commit: \
+             {summary:?}"
+        );
+
+        let (_, reason) = nothing_compared("abc12345");
+        assert!(
+            reason.contains("at the path given"),
+            "a binary that carries a commit compared nothing because git read \
+             none at the path, and the reason must say so. reason: {reason:?}"
         );
     }
 

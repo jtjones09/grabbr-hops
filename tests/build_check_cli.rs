@@ -59,6 +59,7 @@ fn a_broken_config_file_does_not_stop_the_diagnostic() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// LEDGER T19 | class B | 5 process exit code + stdout
 #[test]
 fn a_path_with_no_checkout_cannot_pass_a_strict_gate() {
     let empty = std::env::temp_dir().join(format!("hops-bc-empty-{}", std::process::id()));
@@ -76,6 +77,18 @@ fn a_path_with_no_checkout_cannot_pass_a_strict_gate() {
         "a --strict gate that found no checkout compared nothing. Reporting \
          success there is a gate that passes having verified nothing, which \
          reads as proof and is worse than having no gate at all."
+    );
+    // The reason names what is missing: the commit, when this hops was built
+    // without one, and otherwise a checkout git can read at the path.
+    let expected = match baked_commit(&empty) {
+        Some(_) => "CANNOT VERIFY: git read no commit at the path given",
+        None => "CANNOT VERIFY: this binary has no commit baked in",
+    };
+    let report = String::from_utf8_lossy(&strict.stdout);
+    assert!(
+        report.contains(expected),
+        "the strict report does not give the reason nothing was compared; \
+         expected {expected:?} in {report:?}"
     );
 
     let lenient = hops()
