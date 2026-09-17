@@ -284,15 +284,23 @@ impl Claim {
                 }
                 // Anything else, such as a socket this user may not connect
                 // to, cannot say whether a daemon listens there. The file is
-                // left alone. A socket an earlier build's daemon left under
-                // sudo is another user's, and the hint says so.
+                // left alone. A socket a daemon run under sudo left behind is
+                // another user's, and the hint says so.
                 Err(source) => {
-                    let hint = ownership::hint(
-                        whose(&socket_path, &source),
-                        "A daemon may be listening on it, so hops leaves it where \
-                         it is. If no hops daemon is running, remove it, then \
-                         start hops again.",
-                    );
+                    // Before the owner: `chown` follows a link, so its advice
+                    // would change whatever the link names.
+                    let is_a_link = std::fs::symlink_metadata(&socket_path)
+                        .is_ok_and(|meta| meta.file_type().is_symlink());
+                    let hint = if is_a_link {
+                        SOCKET_IS_A_LINK.to_string()
+                    } else {
+                        ownership::hint(
+                            whose(&socket_path, &source),
+                            "A daemon may be listening on it, so hops leaves it \
+                             where it is. If no hops daemon is running, remove it, \
+                             then start hops again.",
+                        )
+                    };
                     return Err(IpcListenerCreationError::SocketUnchecked {
                         path: socket_path,
                         source,
@@ -435,6 +443,14 @@ fn say_if_not_kept(path: &std::path::Path, marked: std::io::Result<()>) {
 #[cfg(unix)]
 const LOCK_IS_A_LINK: &str = "It is a symbolic link, which hops does not follow \
      there. Remove the link, then start hops again.";
+
+/// The hint for a socket path that holds a symbolic link the daemon could not
+/// connect through. A daemon binds its socket at that path itself, so none
+/// listens through a link there, and removing the link leaves whatever it
+/// names alone.
+#[cfg(unix)]
+const SOCKET_IS_A_LINK: &str = "It is a symbolic link, and hops keeps only its \
+     own socket there. Remove the link, then start hops again.";
 
 /// Lock `<socket_path>.lock` exclusively, without waiting.
 ///
@@ -1290,9 +1306,10 @@ mod at_most_one_daemon {
         }
         let path = socket_path("theirs");
         remove(&path);
-        // A daemon of an earlier build, run under sudo, left its socket here.
-        // Only root can make a file root owns, so the owner is given, and the
-        // refusal comes from the socket's mode.
+        // A daemon run under sudo that ended without removing its socket, by
+        // a kill or a panic, left it here. Only root can make a file root
+        // owns, so the owner is given, and the refusal comes from the
+        // socket's mode.
         drop(std::os::unix::net::UnixListener::bind(&path).expect("a socket file"));
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
             .expect("a socket this user may not connect to");
@@ -1336,6 +1353,70 @@ mod at_most_one_daemon {
              must be reported as theirs with what to do. Otherwise a socket left \
              by `sudo hops` stops every later start with only \"Permission \
              denied\"."
+        );
+    }
+
+    // LEDGER T56 | class B | 1 return value / error + 4 file on disk
+    #[test]
+    fn a_link_at_the_socket_path_that_cannot_be_asked_gets_no_chown_advice() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("not checked: nothing refuses root a connection");
+            return;
+        }
+        let path = socket_path("sockettolink");
+        remove(&path);
+        let named = PathBuf::from(format!("/tmp/h-claim-named-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&named);
+        // The link names a socket this user may not connect to. Only root can
+        // make a link root owns, so the owner is given for every path asked.
+        drop(std::os::unix::net::UnixListener::bind(&named).expect("a socket file"));
+        std::fs::set_permissions(&named, std::fs::Permissions::from_mode(0o000))
+            .expect("a socket this user may not connect to");
+        std::os::unix::fs::symlink(&named, &path).expect("a link at the socket path");
+        let files = || (inode(&path), mode(&named), inode(&named));
+        let before = files();
+        let root_owns = |at: &Path, _: &std::io::Error| {
+            Some(Foreign {
+                path: at.to_path_buf(),
+                owner: 0,
+                me: 501,
+            })
+        };
+
+        let got = runtime().block_on(Claim::take_with(
+            &DaemonEndpoint::Unix(path.clone()),
+            root_owns,
+        ));
+        let still_a_link = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_symlink());
+        let after = files();
+        let said = match &got {
+            Err(e @ IpcListenerCreationError::SocketUnchecked { .. }) => e.to_string(),
+            other => describe(other),
+        };
+        drop(got);
+        let _ = std::fs::remove_file(&named);
+        remove(&path);
+
+        assert_eq!(
+            (still_a_link, after),
+            (true, before.clone()),
+            "(a link still at the socket path, (link inode, mode and inode of \
+             the socket it names); they were {before:?}). Neither the link nor \
+             what it names may be changed."
+        );
+        assert_eq!(
+            said,
+            format!(
+                "could not tell whether a daemon listens on {}: Permission denied \
+                 (os error 13). {}",
+                path.display(),
+                super::SOCKET_IS_A_LINK
+            ),
+            "a link at the socket path must be reported as a link to remove. \
+             `chown` follows a link, so advice to chown it would give away \
+             whatever file the link names."
         );
     }
 
