@@ -215,34 +215,31 @@ fn baked_commit(no_checkout: &Path) -> Option<String> {
     (commit != "unknown").then(|| commit.to_string())
 }
 
-/// Whether `dir` is the top of a git work tree. git prints the way up to the
-/// top, which is nothing at the top, so no two spellings of a path are compared.
-fn is_checkout_top(dir: &Path) -> bool {
-    let Ok(out) = setup_git(dir)
-        .args(["rev-parse", "--is-inside-work-tree", "--show-cdup"])
-        .output()
-    else {
-        return false;
-    };
-    out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true"
+/// Whether `dir` holds a `.git` entry: the directory of a checkout, or the file
+/// a linked worktree has. Read from the file system, not asked of git: a git
+/// that refuses the checkout (safe.directory) or is missing is also what makes
+/// `build.rs` bake no commit, so asking git would excuse the very build this
+/// looks for.
+fn holds_git_entry(dir: &Path) -> bool {
+    dir.join(".git").symlink_metadata().is_ok()
 }
 
 /// The commit baked into the hops under test, or `None` if it baked none, for
 /// the tests that compare nothing without one.
 ///
-/// `None` is allowed only where `build.rs` rightly bakes none: this source is
-/// not the top of a git checkout, as in a source archive. Built from the top of
-/// one, a binary without a commit is the build script failing, and a test that
-/// returned a pass for it compared nothing while the run stayed green.
+/// `None` is allowed only where `build.rs` rightly bakes none: this source has
+/// no `.git` of its own, as in a source archive. Built from a checkout, a binary
+/// without a commit is the build script failing, and a test that returned a
+/// pass for it compared nothing while the run stayed green.
 // LEDGER T27 | class B | 5 process stdout: the commit build.rs baked into hops
 fn commit_under_test(no_checkout: &Path) -> Option<String> {
     let baked = baked_commit(no_checkout);
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     assert!(
-        baked.is_some() || !is_checkout_top(manifest_dir),
-        "this hops was built from the top of the checkout at {}, yet it carries \
-         no commit, so each test that needs one would pass having compared \
-         nothing",
+        baked.is_some() || !holds_git_entry(manifest_dir),
+        "this hops was built from the checkout at {}, yet it carries no commit, \
+         so each test that needs one would pass having compared nothing. git \
+         may be missing from PATH, or refusing that checkout (safe.directory)",
         manifest_dir.display()
     );
     baked
