@@ -18,21 +18,50 @@ pub(crate) struct Foreign {
     pub(crate) owner: u32,
     /// The uid hops runs as.
     pub(crate) me: u32,
+    /// A symbolic link `path` is reached through, if there is one: `path`
+    /// itself or a directory above it.
+    pub(crate) through: Option<Link>,
+}
+
+/// A symbolic link, and the target it names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Link {
+    /// Where the link is.
+    pub(crate) at: PathBuf,
+    /// What it names, as the link holds it.
+    pub(crate) to: PathBuf,
 }
 
 /// What to say about `foreign`.
 ///
 /// Says to give it back rather than remove it: it may be the whole config
-/// directory, devices and keys included.
+/// directory, devices and keys included. When it is reached through a link,
+/// no chown is suggested: `chown` follows the link, so it would change what
+/// the link names, and any process of this user can make such a link.
 pub(crate) fn another_users(foreign: &Foreign) -> String {
-    let Foreign { path, owner, me } = foreign;
-    format!(
-        "{} belongs to uid {owner}, not to this user (uid {me}), which happens \
-         after hops has run as that user, for example under sudo. Give it back \
-         to this user (`sudo chown {me} {}`), then start hops again.",
-        path.display(),
-        path.display()
-    )
+    let Foreign {
+        path,
+        owner,
+        me,
+        through,
+    } = foreign;
+    match through {
+        None => format!(
+            "{} belongs to uid {owner}, not to this user (uid {me}), which happens \
+             after hops has run as that user, for example under sudo. Give it back \
+             to this user (`sudo chown {me} {}`), then start hops again.",
+            path.display(),
+            path.display()
+        ),
+        Some(Link { at, to }) => format!(
+            "{} belongs to uid {owner}, not to this user (uid {me}), and {} is a \
+             symbolic link to {}. A chown would follow the link, so check that the \
+             link belongs there, then start hops again.",
+            path.display(),
+            at.display(),
+            to.display()
+        ),
+    }
 }
 
 /// [`another_users`] when `foreign` names something another user owns, as
@@ -66,7 +95,30 @@ pub(crate) fn foreign_owner(path: &Path, error: &io::Error) -> Option<Foreign> {
     };
     // SAFETY: geteuid has no preconditions and cannot fail.
     let me = unsafe { libc::geteuid() };
-    (owner != me).then_some(Foreign { path, owner, me })
+    (owner != me).then(|| Foreign {
+        through: link_on_the_way(&path),
+        path,
+        owner,
+        me,
+    })
+}
+
+/// The symbolic link nearest `path` among `path` and the directories above
+/// it, if there is one.
+///
+/// A link at any of them decides what a chown of `path` changes: `chown`
+/// follows a link at `path`, and the path to it resolves through the others.
+#[cfg(unix)]
+fn link_on_the_way(path: &Path) -> Option<Link> {
+    path.ancestors()
+        .filter(|at| !at.as_os_str().is_empty())
+        // `read_link` succeeds only on a symbolic link.
+        .find_map(|at| {
+            Some(Link {
+                at: at.to_path_buf(),
+                to: std::fs::read_link(at).ok()?,
+            })
+        })
 }
 
 /// Windows files have no single owning uid to compare, so no hint is given.
@@ -77,7 +129,7 @@ pub(crate) fn foreign_owner(_path: &Path, _error: &io::Error) -> Option<Foreign>
 
 #[cfg(test)]
 mod tests {
-    use super::{Foreign, another_users, hint};
+    use super::{Foreign, Link, another_users, hint};
     use std::path::PathBuf;
 
     // LEDGER T26 | class B | 1 return value
@@ -87,6 +139,7 @@ mod tests {
             path: PathBuf::from("/home/me/.config/lan-mouse"),
             owner: 0,
             me: 501,
+            through: None,
         };
         let said = another_users(&foreign);
         for part in [
@@ -101,16 +154,40 @@ mod tests {
             );
         }
         assert_eq!(
-            (hint(Some(foreign), "generic"), hint(None, "generic")),
+            (
+                hint(Some(foreign.clone()), "generic"),
+                hint(None, "generic")
+            ),
             (said, "generic".to_string()),
             "the hint must be the other-user text only when another user owns it"
+        );
+
+        let linked = another_users(&Foreign {
+            through: Some(Link {
+                at: PathBuf::from("/home/me/.config"),
+                to: PathBuf::from("/Library"),
+            }),
+            ..foreign
+        });
+        assert_eq!(
+            (
+                linked.contains(
+                    "/home/me/.config/lan-mouse belongs to uid 0, not to this user \
+                     (uid 501), and /home/me/.config is a symbolic link to /Library."
+                ),
+                linked.contains("chown 501"),
+            ),
+            (true, false),
+            "(names the link and its target, advises a chown) for something \
+             reached through a link. `chown` follows the link, so the advice \
+             would give this user whatever directory the link names. Got: {linked}"
         );
     }
 }
 
 #[cfg(all(test, unix))]
 mod lookup {
-    use super::{Foreign, foreign_owner};
+    use super::{Foreign, Link, foreign_owner};
     use std::io;
     use std::path::{Path, PathBuf};
 
@@ -129,6 +206,7 @@ mod lookup {
                 path: PathBuf::from(path),
                 owner: 0,
                 me,
+                through: None,
             })
         };
         assert_eq!(
@@ -153,5 +231,34 @@ mod lookup {
         let got = foreign_owner(&mine, &refused());
         let _ = std::fs::remove_file(&mine);
         assert_eq!(got, None, "a file this user owns was reported as another's");
+
+        // Reached through a link: a link to `/` stands in for one to any
+        // directory root owns. `/usr` is root's on macOS and Linux.
+        let up = std::env::temp_dir().join(format!("hops-owner-up-{}", std::process::id()));
+        let _ = std::fs::remove_file(&up);
+        std::os::unix::fs::symlink("/", &up).expect("a link to /");
+        let through_up = |path: PathBuf| {
+            (me != 0).then(|| Foreign {
+                path,
+                owner: 0,
+                me,
+                through: Some(Link {
+                    at: up.clone(),
+                    to: PathBuf::from("/"),
+                }),
+            })
+        };
+        let got = (
+            foreign_owner(&up.join("usr"), &io::Error::other("any failure")),
+            foreign_owner(&up.join("hops-no-such-file-for-this-test"), &refused()),
+        );
+        let _ = std::fs::remove_file(&up);
+        assert_eq!(
+            got,
+            (through_up(up.join("usr")), through_up(up.clone())),
+            "(a file reached through a link above it, a directory that is a \
+             link). Each must carry the link and its target, so the hint names \
+             the link instead of advising a chown that would follow it."
+        );
     }
 }

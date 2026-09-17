@@ -827,7 +827,7 @@ mod at_most_one_daemon {
     //! endpoint, so these tests take real claims on real sockets.
 
     use super::Claim;
-    use crate::ownership::{Foreign, another_users};
+    use crate::ownership::{Foreign, Link, another_users};
     use crate::{DaemonEndpoint, IpcListenerCreationError};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Barrier};
@@ -1002,6 +1002,7 @@ mod at_most_one_daemon {
             path: lock.clone(),
             owner: 0,
             me: 501,
+            through: None,
         };
         let asked = std::cell::RefCell::new(None);
         let theirs = super::lock_beside_with(&path, |at, _| {
@@ -1065,11 +1066,93 @@ mod at_most_one_daemon {
                 path: theirs,
                 owner: 0,
                 me,
+                through: None,
             }),
             "a daemon that another user's directory refuses its lock file must say \
              whose directory it is and what to do, or a directory left behind by \
              `sudo hops` stops every later start with only an OS error"
         );
+    }
+
+    // LEDGER T57 | class B | 1 return value / error
+    #[test]
+    fn a_daemon_refused_its_lock_through_a_link_names_the_link_and_advises_no_chown() {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        if me == 0 {
+            eprintln!("not checked: nothing refuses root a file");
+            return;
+        }
+        // A directory of root's that no one else may write in, as in T45.
+        let theirs = if cfg!(target_os = "macos") {
+            "Library"
+        } else {
+            "usr"
+        };
+        let scratch = PathBuf::from(format!("/tmp/h-claim-linkdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir(&scratch).expect("a scratch directory");
+        // Any process of this user can put such a link in place of the
+        // socket's directory, or of a directory above it.
+        let (linked, up) = (scratch.join("linked"), scratch.join("up"));
+        let target = Path::new("/").join(theirs);
+        std::os::unix::fs::symlink(&target, &linked).expect("a link to root's directory");
+        std::os::unix::fs::symlink("/", &up).expect("a link to /");
+
+        let rt = runtime();
+        let refused = |dir: &Path| {
+            let path = dir.join(format!("h-{}.sock", std::process::id()));
+            match rt.block_on(crate::AsyncFrontendListener::at(&DaemonEndpoint::Unix(
+                path.clone(),
+            ))) {
+                Err(e @ IpcListenerCreationError::Lock { .. }) => e.to_string(),
+                Err(other) => format!("not a lock error: {other}"),
+                Ok(listener) => {
+                    drop(listener);
+                    remove(&path);
+                    format!("listening on {}", path.display())
+                }
+            }
+        };
+        let said = [refused(&linked), refused(&up.join(theirs))];
+        for link in [&linked, &up] {
+            let _ = std::fs::remove_file(link);
+        }
+        let _ = std::fs::remove_dir(&scratch);
+
+        let expected = |dir: PathBuf, at: &Path, to: &Path| {
+            format!(
+                "could not lock {}: Permission denied (os error 13). {}",
+                dir.join(format!("h-{}.sock.lock", std::process::id()))
+                    .display(),
+                another_users(&Foreign {
+                    path: dir,
+                    owner: 0,
+                    me,
+                    through: Some(Link {
+                        at: at.to_path_buf(),
+                        to: to.to_path_buf(),
+                    }),
+                })
+            )
+        };
+        assert_eq!(
+            said,
+            [
+                expected(linked.clone(), &linked, &target),
+                expected(up.join(theirs), &up, Path::new("/")),
+            ],
+            "(the socket's directory is a link, a directory above it is a link). \
+             A daemon refused its lock must name the link and its target."
+        );
+        for (said, link) in said.iter().zip([&linked, &up]) {
+            assert!(
+                said.contains(&format!("{} is a symbolic link to /", link.display()))
+                    && !said.contains("sudo chown"),
+                "`chown` follows a link, so advice to chown a path reached through \
+                 one gives this user whatever directory the link names: {said}"
+            );
+        }
     }
 
     // LEDGER T47 | class B | 4 file on disk
@@ -1318,6 +1401,7 @@ mod at_most_one_daemon {
             path: path.clone(),
             owner: 0,
             me: 501,
+            through: None,
         };
         let asked = std::sync::Mutex::new(Vec::new());
         let whose = |at: &Path, _: &std::io::Error| {
@@ -1382,6 +1466,7 @@ mod at_most_one_daemon {
                 path: at.to_path_buf(),
                 owner: 0,
                 me: 501,
+                through: None,
             })
         };
 
@@ -1472,6 +1557,7 @@ mod the_token_error_names_the_file {
             path: path.clone(),
             owner: 0,
             me: 501,
+            through: None,
         };
 
         let asked = std::cell::RefCell::new(None);
