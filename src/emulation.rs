@@ -335,6 +335,23 @@ impl ListenTask {
                                     });
                                 if permitted {
                                     self.emulation_proxy.consume(event, addr);
+                                } else {
+                                    // The lease lapsed or was revoked while the
+                                    // peer was driving. Its button- and key-ups
+                                    // are refused from here on too, so whatever
+                                    // it holds would stay down until the session
+                                    // is cut and the watchdog notices, which
+                                    // takes over a minute after a lapse. A no-op
+                                    // once nothing is held.
+                                    crate::debounce!(
+                                        PREV_REFUSED_LOG,
+                                        Duration::from_secs(1),
+                                        log::warn!(
+                                            "releasing held keys and buttons: \
+                                             {addr} may no longer drive this machine"
+                                        )
+                                    );
+                                    self.emulation_proxy.remove(addr);
                                 }
                             }
                             ProtoEvent::Ping => self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())).await,
@@ -424,6 +441,10 @@ impl ListenTask {
         self.listener.terminate().await;
         self.emulation_proxy.terminate().await;
     }
+}
+
+thread_local! {
+    static PREV_REFUSED_LOG: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
 /// proxy handling the actual input emulation,
@@ -1003,6 +1024,10 @@ mod held_input_is_released {
         emulation: Emulation,
         /// One per peer, each already crossed onto this machine.
         peers: Vec<Dialer>,
+        /// This machine's trust store, which the listener checks per event.
+        trust: crate::transport::Trust,
+        /// Each peer's fingerprint, in the order of `peers`.
+        fingerprints: Vec<String>,
     }
 
     /// `n` senders that have crossed onto this machine and are ready to inject.
@@ -1023,7 +1048,7 @@ mod held_input_is_released {
         .await
         .expect("listener");
         let recording = Recording::new();
-        let emulation = Emulation::new(Some(recording.backend()), listener, receiver_trust);
+        let emulation = Emulation::new(Some(recording.backend()), listener, receiver_trust.clone());
         let mut peers = vec![];
         for sender in &senders {
             let peer = dialer(
@@ -1040,6 +1065,8 @@ mod held_input_is_released {
             recording,
             emulation,
             peers,
+            trust: receiver_trust,
+            fingerprints: senders.iter().map(|m| m.fingerprint.clone()).collect(),
         }
     }
 
@@ -1345,6 +1372,82 @@ mod held_input_is_released {
                 1,
                 "the second peer clicked, which let go of the left button, and \
                  the first peer's teardown injected another up: {:?}",
+                s.recording.calls()
+            );
+        });
+    }
+
+    // LEDGER T12 | class B | 6 struct state: Recording::calls() after a Leave, then the peer's own late up
+    /// A link that stalls past the watchdog and then recovers delivers the
+    /// peer's own button-up after this machine already released the button.
+    /// Injected, that second up would end whatever holds the button by then.
+    #[test]
+    fn a_late_button_up_after_a_teardown_is_not_injected_again() {
+        run_local(async {
+            let s = session().await;
+            let handle = s.inject(button(BTN_LEFT, 1)).await;
+            s.dialer().send(ProtoEvent::Leave(0)).await;
+            s.destroyed(handle).await;
+            assert_eq!(
+                s.consumed(button(BTN_LEFT, 0)).len(),
+                1,
+                "precondition: the Leave released the left button: {:?}",
+                s.recording.calls()
+            );
+
+            // The up the peer sent before it knew, then something after it on
+            // the same stream, so the up has been handled once that arrives.
+            s.dialer()
+                .send(ProtoEvent::Input(button(BTN_LEFT, 0)))
+                .await;
+            s.inject(key(KEY_A, 1)).await;
+
+            assert_eq!(
+                s.consumed(button(BTN_LEFT, 0)).len(),
+                1,
+                "the left button was released at the Leave, and the peer's late \
+                 up was injected as a second one: {:?}",
+                s.recording.calls()
+            );
+        });
+    }
+
+    // LEDGER T13 | class B | 6 struct state: Recording::calls() after the per-event trust check refuses the peer
+    /// Revoking or letting a lease lapse refuses the peer's events at the
+    /// point of injection, its button- and key-ups included. What it held must
+    /// come up then, not when the session is eventually cut.
+    #[test]
+    fn a_peer_refused_mid_drag_leaves_nothing_held() {
+        run_local(async {
+            let s = session().await;
+            let handle = s.inject(button(BTN_LEFT, 1)).await;
+            s.inject(key(KEY_A, 1)).await;
+
+            s.trust
+                .write()
+                .expect("trust lock")
+                .revoke(&s.fingerprints[0]);
+            // Refused: the peer is no longer allowed to drive this machine.
+            s.dialer()
+                .send(ProtoEvent::Input(button(BTN_LEFT, 0)))
+                .await;
+
+            assert!(
+                s.released_before_destroy(handle, button(BTN_LEFT, 0)).await,
+                "the peer was refused while holding the left button and it was \
+                 never released: {:?}",
+                s.recording.calls()
+            );
+            assert!(
+                s.released_before_destroy(handle, key(KEY_A, 0)).await,
+                "the peer was refused while holding a key and it was never \
+                 released: {:?}",
+                s.recording.calls()
+            );
+            assert_eq!(
+                s.consumed(button(BTN_LEFT, 0)).len(),
+                1,
+                "exactly one up: the release, not the refused event: {:?}",
                 s.recording.calls()
             );
         });

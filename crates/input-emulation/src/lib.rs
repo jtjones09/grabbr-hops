@@ -104,6 +104,13 @@ pub struct InputEmulation {
     /// Buttons each handle pressed that no handle has released since, so
     /// teardown can release them. Without this a peer that dropped mid-drag
     /// left the button down on this machine (#89).
+    ///
+    /// Together with the rules in `consume` and `release_held`, a button-up
+    /// reaches the backend only while some handle holds that button, and
+    /// every up clears it for all handles. So a pressed button gets at most
+    /// one up, however many peers pressed it. That is bookkeeping, not what
+    /// the OS saw: a release the backend accepted but did not deliver is not
+    /// repeated when the peer's own up arrives later.
     pressed_buttons: HashMap<EmulationHandle, HashSet<u32>>,
 }
 
@@ -192,22 +199,30 @@ impl InputEmulation {
                 Ok(())
             }
             Event::Pointer(PointerEvent::Button { button, state, .. }) => {
-                // Tracked, not filtered: every button event still reaches the
-                // backend exactly as before. The sets only say what teardown
-                // has to release.
-                if state == 0 {
-                    // The machine has one of each button, so this up lets go of
-                    // it for every peer, not only the one that sent it. A peer
-                    // still listed as holding it would inject a second up at its
-                    // teardown, into whatever holds the button by then: another
-                    // peer's drag or the local user's. That happens when a
-                    // sender reconnects from a new port and lets go, or clicks,
-                    // before the watchdog retires its old connection.
-                    for pressed in self.pressed_buttons.values_mut() {
-                        pressed.remove(&button);
+                if state != 0 {
+                    if let Some(pressed) = self.pressed_buttons.get_mut(&handle) {
+                        pressed.insert(button);
                     }
-                } else if let Some(pressed) = self.pressed_buttons.get_mut(&handle) {
-                    pressed.insert(button);
+                    return self.emulation.consume(event, handle).await;
+                }
+                // An up for a button no peer holds has nothing to let go of.
+                // This machine already released it, at a teardown or through
+                // another peer's up, or never had it pressed. A link that
+                // stalls past the watchdog and then recovers delivers such an
+                // up. Passed on, it would end whatever holds the button by
+                // then: another peer's drag or the local user's.
+                if !self.pressed_buttons.values().any(|p| p.contains(&button)) {
+                    log::debug!("dropping mouse button-up {button:#x}: no peer holds it");
+                    return Ok(());
+                }
+                // The machine has one of each button, so this up lets go of it
+                // for every peer, not only the one that sent it. A peer still
+                // listed as holding it would inject a second up at its
+                // teardown. That happens when a sender reconnects from a new
+                // port and lets go, or clicks, before the watchdog retires its
+                // old connection.
+                for pressed in self.pressed_buttons.values_mut() {
+                    pressed.remove(&button);
                 }
                 self.emulation.consume(event, handle).await
             }
