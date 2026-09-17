@@ -549,8 +549,8 @@ impl CaptureTask {
         // only when the active client changes: the receiver re-anchors its
         // reconstruction at 0 on that Enter, so our cumulative must reset in
         // lock-step. Otherwise the stale cumulative emits a huge first delta
-        // and teleports
-        // the remote cursor. Begin fires once per crossing (idempotent).
+        // and teleports the remote cursor. Begin fires once per crossing
+        // (idempotent).
         if event == CaptureEvent::Begin {
             self.abs_vx = 0.0;
             self.abs_vy = 0.0;
