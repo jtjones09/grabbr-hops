@@ -61,13 +61,15 @@
 //!   signed* store that still grants a device you have since expelled. A
 //!   monotonic `serial`, mirrored in a separate signed floor file that only
 //!   ever advances, refuses that file.
-//! * **Expiry.** Restoring both files together is indistinguishable from a
-//!   legitimate whole-directory restore, and no software-only scheme can tell
-//!   them apart — that residual is what a hardware monotonic counter closes
-//!   later, behind the same [`crate::authority::Authority`] trait. Leases bound
-//!   it anyway: a restored store older than its own lease terms comes back
-//!   already expired. A permanent grant had no such bound, so this is strictly
-//!   better than what it replaces, not a regression dressed up.
+//! * **Restoring both files.** Restoring both files together is
+//!   indistinguishable from a legitimate whole-directory restore, and no
+//!   software-only scheme can tell them apart — that residual is what a
+//!   hardware monotonic counter closes later, behind the same
+//!   [`crate::authority::Authority`] trait. Lease terms used to bound it: a
+//!   restored store older than its terms came back already lapsed. No lease
+//!   has a term in this release (#183), so today nothing bounds it, and a
+//!   restored pair of files grants whatever it held until #185 decides how
+//!   long trust lasts.
 
 use std::collections::HashMap;
 use std::fs;
@@ -79,7 +81,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::trust::{Caps, Denial, Lease, Origin, TrustError, TrustStore};
+use crate::trust::{Caps, Denial, Expiry, Lease, Origin, TrustError, TrustStore};
 
 use hops_ipc::pairing::canonical_fingerprint;
 
@@ -104,16 +106,23 @@ pub const FLOOR_FILE_NAME: &str = "trust-floor.toml";
 /// version it does not know refuses the file rather than guessing.
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// Term for a lease the user issues today.
-pub const DEFAULT_TERM_SECS: u64 = 30 * 86_400;
+/// The longest lease a build from before #183 admits: its `MAX_TERM_SECS`,
+/// unchanged from #158, which added the trust store, until #183.
+/// Copied rather than read from [`crate::trust::MAX_TERM_SECS`], so choosing a
+/// ceiling here (#185) cannot move the date those builds are handed.
+const OLDER_BUILD_CEILING_SECS: u64 = 400 * 86_400;
 
-/// Term for a lease created by the migration. See [`migrate`] for why this is
-/// so much longer than [`DEFAULT_TERM_SECS`].
-pub const MIGRATION_TERM_SECS: u64 = 400 * 86_400;
-
-/// How long before expiry a lease starts being advertised as expiring, so the
-/// renewal prompt precedes the outage instead of following it.
-pub const RENEW_WINDOW_SECS: u64 = 14 * 86_400;
+/// The `expires_at` saved for a lease that does not lapse: the latest date a
+/// build from before #183 accepts for a lease issued at `issued_at`.
+///
+/// Such a build refuses to start on an active lease with no `expires_at`, and
+/// drops, then erases at its next save, a lease dated more than
+/// [`OLDER_BUILD_CEILING_SECS`] after `issued_at`. Builds on both sides of #183
+/// can share one config directory, so this build writes a date it never reads:
+/// [`rebuild`] makes every active lease [`Expiry::Never`].
+fn expiry_older_builds_accept(issued_at: u64) -> u64 {
+    issued_at.saturating_add(OLDER_BUILD_CEILING_SECS)
+}
 
 const TRUST_DOMAIN: &[u8] = b"hops.trust-store.v1\x00";
 const FLOOR_DOMAIN: &[u8] = b"hops.trust-floor.v1\x00";
@@ -187,13 +196,13 @@ pub enum DiskCap {
     Outbound,
 }
 
-/// Lease state. Expiry is *not* a state — it is `expires_at` versus `now`, so
-/// there is exactly one place expiry is decided and it cannot drift out of sync
-/// with a stored flag.
+/// Lease state. Expiry is *not* a state: the store decides it
+/// ([`crate::trust::Expiry`]), so it cannot drift out of sync with a stored
+/// flag.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "kebab-case")]
 pub enum DiskState {
-    /// Carries whatever `caps` says, until `expires_at`.
+    /// Carries whatever `caps` says. See [`LeaseRecord::expires_at`].
     Active,
     /// Deliberately expelled. Carries no capability, does not lapse, and is
     /// kept rather than deleted so the expulsion stays visible and so a
@@ -211,7 +220,7 @@ pub enum DiskOrigin {
     Inbound,
     /// Our dial reached this peer and the user approved the prompt.
     OutboundDial,
-    /// Carried forward from `[authorized_fingerprints]` by [`migrate`].
+    /// Carried forward from `[authorized_fingerprints]` by [`TrustStore::migrate_from_config`].
     Migrated,
     // No `Restored`. An expelled fingerprint is never re-authorised — the
     // machine returns by generating a new identity, which arrives as `Inbound`
@@ -224,14 +233,32 @@ pub struct LeaseRecord {
     /// Canonical `aa:bb:…` leaf-cert fingerprint — the same string the TLS
     /// verifiers compute, so this is the join key with everything else.
     pub fingerprint: String,
-    /// Display name. Sanitised on every write; see [`sanitize_label`].
+    /// Display name. Sanitised on every write; see
+    /// [`hops_ipc::pairing::sanitize_label`].
     pub label: String,
     pub state: DiskState,
     pub origin: DiskOrigin,
     /// Unix seconds, from `max(system clock, floor)`.
     pub issued_at: u64,
-    /// Unix seconds. `None` only for [`DiskState::Revoked`]: a revocation is a
-    /// record, and records do not lapse.
+    /// Unix seconds. Not enforced on load: [`rebuild`] makes every active
+    /// lease [`Expiry::Never`] (#183).
+    ///
+    /// Written for every active lease all the same, as 400 days after
+    /// `issued_at` ([`expiry_older_builds_accept`]), so a build from before
+    /// #183 still starts on a store this build saved. That build does enforce
+    /// the date: past it, that build stops admitting the pairing and this one
+    /// keeps admitting it. A date already on disk may instead be a term that
+    /// build chose (30 days for an approval); the next save replaces it.
+    ///
+    /// **A placeholder, never to be enforced.** Nothing in a schema-v1 store
+    /// tells this date apart from a real 400-day term: [`SCHEMA_VERSION`] did
+    /// not change and `deny_unknown_fields` rules out a marker. A build that
+    /// enforced it would end every pairing this build made on day 400, the
+    /// outage #183 removes. A stored term (#185) needs a schema bump or a new
+    /// field.
+    ///
+    /// Absent on a revoked record, which does not lapse. Absent on an active
+    /// lease also loads and grants, because no stored date decides anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -240,42 +267,12 @@ pub struct LeaseRecord {
     pub caps: Vec<DiskCap>,
 }
 
-impl LeaseRecord {
-    /// The one place expiry is decided.
-    pub fn is_expired(&self, now: u64) -> bool {
-        self.expires_at.is_some_and(|e| now >= e)
-    }
-
-    /// Capabilities in force *right now*. A revoked or lapsed lease has none.
-    ///
-    /// This is the successor to `subtract_revoked`: same job — turn stored
-    /// state plus a rule into the set the verifiers may act on — but pure over
-    /// `(record, now)` instead of over two maps, and constructible in a test
-    /// with no certificate, no socket and no runtime.
-    pub fn effective_caps(&self, now: u64) -> &[DiskCap] {
-        match self.state {
-            DiskState::Revoked => &[],
-            DiskState::Active if self.is_expired(now) => &[],
-            DiskState::Active => &self.caps,
-        }
-    }
-
-    pub fn permits(&self, cap: DiskCap, now: u64) -> bool {
-        self.effective_caps(now).contains(&cap)
-    }
-
-    /// True while the lease is still valid but inside [`RENEW_WINDOW_SECS`] of
-    /// lapsing, so a frontend can ask before the device stops working rather
-    /// than after.
-    pub fn is_expiring(&self, now: u64) -> bool {
-        match self.expires_at {
-            Some(e) if self.state == DiskState::Active && now < e => {
-                e.saturating_sub(now) <= RENEW_WINDOW_SECS
-            }
-            _ => false,
-        }
-    }
-}
+// There is deliberately no decision function over a `LeaseRecord` here.
+//
+// There was one — `effective_caps`, `permits`, `is_expired`, `is_expiring` —
+// with no production caller, and when #183 stopped enforcing a stored
+// `expires_at` it would have gone on reporting those pairings as lapsed. What a
+// record grants is decided in one place: `rebuild` it and ask the store.
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(deny_unknown_fields)]
@@ -496,8 +493,9 @@ impl Clock {
 #[derive(Debug)]
 pub enum Loaded {
     /// No store yet: a fresh install, or one that predates leases. The caller
-    /// runs [`migrate`] and saves the result. This is the ONLY non-fatal
-    /// "nothing here" — every other way of failing to read a store is an error.
+    /// runs [`TrustStore::migrate_from_config`] and saves the result. This is
+    /// the ONLY non-fatal "nothing here" — every other way of failing to read a
+    /// store is an error.
     Absent,
     Present {
         serial: u64,
@@ -713,12 +711,10 @@ fn validate(leases: &[LeaseRecord], path: &Path) -> Result<(), TrustFileError> {
                         format!("{} is not a canonical fingerprint", lease.fingerprint),
                     ));
                 }
-                if lease.expires_at.is_none() {
-                    return Err(TrustFileError::untrusted(
-                        path,
-                        format!("the lease for {} never expires", lease.fingerprint),
-                    ));
-                }
+                // An absent `expires_at` used to be refused here. No stored
+                // date is enforced now (#183), so absent and present grant the
+                // same, and refusing one would stop the daemon over a field
+                // that decides nothing.
             }
             // A fingerprint that can only DENY need not be matchable.
             // `remove_authorized_key` deliberately tombstones even an invalid
@@ -762,70 +758,6 @@ pub struct Migration {
     pub dropped: Vec<String>,
 }
 
-/// Turn today's two tables into leases. Runs exactly once per installation:
-/// after this, `config.toml`'s trust tables are a cache nothing reads.
-///
-/// # What capabilities a carried-forward fingerprint gets: BOTH DIRECTIONS
-///
-/// `[authorized_fingerprints]` was a single flat map handed to `FpServerVerifier`
-/// and `FpClientVerifier` alike. A fingerprint in it is, today, on every running
-/// install, an inbound *and* outbound grant. Migrating it to one direction would
-/// silently break working fleets, and would break them in the least debuggable
-/// way available: the mouse stops crossing to the laptop, nothing is logged as
-/// an error, and the UI shows a device that says "trusted".
-///
-/// The objection is that this carries #130 forward. It does not, and the
-/// distinction matters. #130 is not "existing installs hold too much" — it is
-/// "**an act of approval mints a capability the user did not approve**": you
-/// okay an outbound dial and the machine gains the right to drive yours. That
-/// defect lives in the issuance path and is fixed there, by minting from
-/// `AttemptOrigin` — `OutboundDial` mints [`DiskCap::Outbound`] alone, `Inbound`
-/// mints [`DiskCap::Inbound`] alone. After this migration, no new
-/// both-directions lease is ever minted without the user asking for one.
-///
-/// Migration is not an act of approval. It is a restatement of consent the user
-/// already gave, for both directions, on machines that are working right now.
-/// Rewriting that consent without asking would be its own version of the same
-/// defect, pointed the other way.
-///
-/// And the lease bounds it in a way the flat map never could: this grant
-/// **expires**, and the renewal prompt is the first time the user is asked the
-/// direction question at all. The over-grant becomes a scheduled, visible
-/// decision instead of a permanent invisible one.
-///
-/// # What happens to a revocation: it becomes a revoked lease, not a deletion
-///
-/// #125 requires that an expelled machine can be added back. It does not
-/// require forgetting that it was expelled, and forgetting would be worse than
-/// the trap being removed: a tombstone that vanishes is a denial that a
-/// dotfiles restore can launder. So each entry becomes a [`DiskState::Revoked`]
-/// record — no capabilities, no expiry, label and `revoked_at` preserved.
-///
-/// It keeps doing the one thing revocation could always do: an explicitly
-/// revoked peer cannot raise a prompt, so it cannot choose the moment its user
-/// is asked a security question. And it is permanent for that key — the machine
-/// returns by generating a new identity and pairing from scratch, which an
-/// attacker holding only the expelled key cannot do.
-///
-/// # Expiry on a migrated lease: [`MIGRATION_TERM_SECS`], not [`DEFAULT_TERM_SECS`]
-///
-/// 400 days, not 30, and not never.
-///
-/// Never-expiring is the old permanent grant wearing a lease's clothes; the
-/// carried-forward over-grant would stand forever and the data-model half of
-/// #130 would never actually retire. 30 days is the right term for a decision
-/// the user consciously made this week, and the wrong one for a decision they
-/// made eight months ago and have not thought about since — an upgrade must not
-/// silently arm a deadline the user was never shown.
-///
-/// 400 days clears a full annual cycle with room to spare, so every user meets
-/// the renewal prompt at least a year out, while the fleet is up and the device
-/// is in front of them. And renewal is not re-pairing: the fingerprint is
-/// known, the label is right, the row is already on screen.
-///
-/// The number is only half of it. Expiry must never be silent, which is why
-/// [`LeaseRecord::is_expiring`] exists, and why a lapsed lease keeps its record,
-/// its label and its capabilities so it can be renewed rather than rebuilt.
 /// Rebuilds the in-memory store from the records on disk.
 ///
 /// The disk and memory shapes are deliberately different. On disk a record is a
@@ -838,6 +770,9 @@ pub struct Migration {
 /// A record that cannot be admitted is REPORTED, never dropped silently — the
 /// caller logs it. Silently dropping a row is how a device loses trust with no
 /// explanation, which is the failure this whole rework exists to remove.
+///
+/// A stored `expires_at` is not carried into the store: every active lease is
+/// rebuilt as [`Expiry::Never`] (#183). See [`LeaseRecord::expires_at`].
 pub fn rebuild(
     ours: &str,
     floor: u64,
@@ -869,14 +804,6 @@ pub fn rebuild(
                             DiskCap::Outbound => Caps::OUTBOUND,
                         };
                 }
-                let Some(not_after) = r.expires_at else {
-                    refused.push(format!(
-                        "{}: an active lease with no expiry — refused, because a \
-                         lease that never lapses is the grant this replaced",
-                        r.fingerprint
-                    ));
-                    continue;
-                };
                 let lease = Lease {
                     peer: r.fingerprint.clone(),
                     issued_to: ours.to_string(),
@@ -888,7 +815,12 @@ pub fn rebuild(
                         DiskOrigin::Migrated => Origin::Migrated,
                     },
                     issued_at: r.issued_at,
-                    not_after,
+                    // Not `r.expires_at`. Builds from before #183 wrote 30
+                    // days, or 400 for a migrated lease, and this one writes
+                    // the date those builds accept. Nothing renews a lease
+                    // yet, so honouring any of them would take a working
+                    // device away with no way back but pairing again (#183).
+                    expiry: Expiry::Never,
                 };
                 if let Err(e) = store.admit(lease) {
                     refused.push(format!("{}: {e}", r.fingerprint));
@@ -900,11 +832,117 @@ pub fn rebuild(
     Ok((store, refused))
 }
 
+/// Stored expiry dates worth a line in the load log, sorted by what they mean.
+///
+/// [`rebuild`] enforces none of them (#183); a build from before #183 enforces
+/// every one. The date [`records_of`] writes, 400 days after pairing, is not
+/// listed, whether or not it has passed: this build wrote it, and the next
+/// save writes it again, so it is not news on any start. A store this build
+/// saved therefore logs nothing on later starts, however old its pairings.
+///
+/// That skip also covers a lease a build from before #183 migrated, which it
+/// dated the same way, so such a lease is not named when its date passes. On a
+/// correct clock that is 400 days after #158 added the trust store, at the
+/// earliest.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct StoredTerms<'a> {
+    /// Enforcement time when the store was loaded.
+    pub now: u64,
+    /// Granting, with a date still ahead at load that an older build chose.
+    /// The next save replaces it with the date this build writes.
+    pub replaced: Vec<&'a LeaseRecord>,
+    /// Granting, with a date an older build chose that was at or before
+    /// enforcement time at load. That build had stopped admitting this
+    /// pairing and this one admits it. Once this build saves, the date moves
+    /// to 400 days after pairing, and if that is still ahead, that build
+    /// admits it again until then.
+    pub passed: Vec<&'a LeaseRecord>,
+}
+
+impl StoredTerms<'_> {
+    /// The lines the daemon logs about these dates when it loads the store.
+    ///
+    /// A pairing whose date has passed is named at warn rather than counted:
+    /// it had stopped working on an older build and works on this one, which
+    /// is a grant the user may not expect.
+    pub fn log_lines(&self) -> Vec<(log::Level, String)> {
+        let ceiling_days = OLDER_BUILD_CEILING_SECS / 86_400;
+        let mut lines = Vec::new();
+        if !self.replaced.is_empty() {
+            lines.push((
+                log::Level::Info,
+                format!(
+                    "trust store: {} pairing(s) carry an expiry date an older build chose; \
+                     pairings no longer expire, so it is ignored, and the next save moves it \
+                     to {ceiling_days} days after pairing, the latest an older build accepts",
+                    self.replaced.len(),
+                ),
+            ));
+        }
+        for r in &self.passed {
+            let after_save = if expiry_older_builds_accept(r.issued_at) > self.now {
+                format!(
+                    "once this build saves the store, an older build admits it again until \
+                     {ceiling_days} days after pairing"
+                )
+            } else {
+                format!(
+                    "it was paired more than {ceiling_days} days ago, so an older build goes \
+                     on refusing it after this build saves the store"
+                )
+            };
+            lines.push((
+                log::Level::Warn,
+                format!(
+                    "trust store: {} ({:?}) had passed the expiry date an older hops build \
+                     saved for it, so that build had stopped admitting it. Pairings no longer \
+                     expire, so this build admits it, and {after_save}. Remove it if that \
+                     machine should not have access",
+                    r.fingerprint, r.label
+                ),
+            ));
+        }
+        lines
+    }
+}
+
+/// Sort the active records carrying an `expires_at` against `store`, the
+/// store [`rebuild`] made from them. Records it did not admit are not listed:
+/// the caller already reports those as refused.
+pub fn stored_terms<'a>(records: &'a [LeaseRecord], store: &TrustStore) -> StoredTerms<'a> {
+    let now = store.now();
+    let mut out = StoredTerms {
+        now,
+        ..StoredTerms::default()
+    };
+    for r in records {
+        let Some(end) = r.expires_at else { continue };
+        if r.state != DiskState::Active || !store.has_live_lease(&r.fingerprint) {
+            continue;
+        }
+        if end == expiry_older_builds_accept(r.issued_at) {
+            continue;
+        }
+        if end <= now {
+            out.passed.push(r);
+        } else {
+            out.replaced.push(r);
+        }
+    }
+    out
+}
+
 /// The store, flattened back to the rows that go on disk.
 ///
 /// The inverse of [`rebuild`], and the pair must round-trip: a store written and
 /// read back has to answer every question identically, or a device silently
 /// loses trust across a restart. That round trip is tested.
+///
+/// Every active lease is written with an `expires_at` and read back as
+/// [`Expiry::Never`] (#183). [`Expiry::Never`] is written as the latest date a
+/// build from before #183 accepts ([`expiry_older_builds_accept`]), so that
+/// build still starts on this store. [`Expiry::At`], which nothing in this
+/// build issues, is written with its own date.
 pub fn records_of(store: &TrustStore) -> Vec<LeaseRecord> {
     let mut out: Vec<LeaseRecord> = Vec::new();
     for (fp, e) in store.entries() {
@@ -941,7 +979,13 @@ pub fn records_of(store: &TrustStore) -> Vec<LeaseRecord> {
                     Origin::Migrated => DiskOrigin::Migrated,
                 },
                 issued_at: l.issued_at,
-                expires_at: Some(l.not_after),
+                // Never absent. A build from before #183 refuses to start on
+                // an active lease without one, and it may share this config
+                // directory with this build.
+                expires_at: Some(match l.expiry {
+                    Expiry::Never => expiry_older_builds_accept(l.issued_at),
+                    Expiry::At(end) => end,
+                }),
                 revoked_at: None,
                 caps,
             });
@@ -1051,17 +1095,7 @@ mod tests {
         revoked: HashMap<String, RevokedEntry>,
         now: u64,
     ) -> Migration {
-        let mut store = TrustStore::new(
-            &"aa"
-                .repeat(32)
-                .as_bytes()
-                .chunks(2)
-                .map(|c| std::str::from_utf8(c).expect("ascii"))
-                .collect::<Vec<_>>()
-                .join(":"),
-            now,
-        )
-        .expect("ours");
+        let mut store = TrustStore::new(&ours(), now).expect("ours");
         let report = store.migrate_from_config(
             &authorized,
             &revoked,
@@ -1077,6 +1111,19 @@ mod tests {
         }
     }
 
+    /// The machine the shim migrates for.
+    fn ours() -> String {
+        vec!["aa"; 32].join(":")
+    }
+
+    /// The rows read back the way the daemon reads them, so a test asks the
+    /// store what they grant rather than reading a record's fields.
+    fn rebuilt(rows: &[LeaseRecord], floor: u64) -> TrustStore {
+        let (store, refused) = rebuild(&ours(), floor, rows).expect("rebuild");
+        assert!(refused.is_empty(), "rows refused on rebuild: {refused:?}");
+        store
+    }
+
     fn find<'a>(m: &'a Migration, fp: &str) -> Option<&'a LeaseRecord> {
         m.leases.iter().find(|l| l.fingerprint == fp)
     }
@@ -1085,16 +1132,17 @@ mod tests {
     //
     // The precedence they encode is the invariant that survives the rewrite, so
     // they are ported rather than deleted. They now assert it over the thing
-    // that replaced the rule — a lease's effective capabilities — instead of
-    // over a map subtraction that no longer exists.
+    // that replaced the rule — what the rebuilt store grants — instead of over a
+    // map subtraction that no longer exists.
 
     #[test]
     fn a_revoked_fingerprint_gets_no_capabilities() {
         let m = migrate(allow(&[(A, "old-thinkpad")]), tombstones(&[(A, NOW)]), NOW);
         let lease = find(&m, A).expect("the tombstone is preserved, not deleted");
         assert_eq!(lease.state, DiskState::Revoked);
-        assert!(
-            lease.effective_caps(NOW).is_empty(),
+        assert_eq!(
+            rebuilt(&m.leases, NOW).capabilities(A),
+            Caps::NONE,
             "a fingerprint in BOTH tables must not be trusted after migration"
         );
         assert_eq!(m.refused, vec![A.to_string()], "and it must be reportable");
@@ -1110,7 +1158,8 @@ mod tests {
             NOW,
         );
         assert_eq!(m.carried_forward, 0, "uppercasing must not resurrect it");
-        assert!(find(&m, A).expect("record").effective_caps(NOW).is_empty());
+        assert!(find(&m, A).is_some(), "the record is kept");
+        assert_eq!(rebuilt(&m.leases, NOW).capabilities(A), Caps::NONE);
     }
 
     #[test]
@@ -1121,7 +1170,8 @@ mod tests {
             NOW,
         );
         assert_eq!(m.carried_forward, 0);
-        assert!(find(&m, A).expect("record").effective_caps(NOW).is_empty());
+        assert!(find(&m, A).is_some(), "the record is kept");
+        assert_eq!(rebuilt(&m.leases, NOW).capabilities(A), Caps::NONE);
     }
 
     /// This asserted BOTH directions, and was wrong. The flat allowlist did
@@ -1138,9 +1188,10 @@ mod tests {
     fn an_unrevoked_fingerprint_survives_with_inbound_and_is_not_handed_outbound() {
         let m = migrate(allow(&[(A, "laptop")]), tombstones(&[]), NOW);
         let lease = find(&m, A).expect("carried forward");
-        assert_eq!(
-            lease.effective_caps(NOW),
-            &[DiskCap::Inbound],
+        assert_eq!(lease.caps, vec![DiskCap::Inbound]);
+        let store = rebuilt(&m.leases, NOW);
+        assert!(
+            store.may_drive_us(A) && !store.we_may_drive(A),
             "a peer the old config never dialled keeps inbound — dropping that \
              would break a working fleet with nothing in the UI to explain it — \
              and must NOT be handed outbound it never had"
@@ -1150,39 +1201,96 @@ mod tests {
 
     // -- the three questions the brief asks the migration to answer ---------
 
+    /// This asserted a warning at 395 days and a lapse at 401. A migrated
+    /// lease does not lapse (#183); its saved date is there for older builds.
+    // LEDGER T5 | class B | 1 return value: records_of, rebuild
     #[test]
-    fn an_upgraded_fleet_is_not_dead_the_next_morning() {
+    fn an_upgraded_fleet_is_still_working_ten_years_on() {
         let m = migrate(allow(&[(A, "laptop")]), tombstones(&[]), NOW);
         let lease = find(&m, A).expect("carried forward");
-        assert!(
-            lease.permits(DiskCap::Inbound, NOW + 365 * DAY),
-            "a migrated lease must survive a full year of not thinking about it"
+        assert_eq!(
+            lease.expires_at,
+            Some(NOW + 400 * DAY),
+            "a lease that does not lapse is saved with the latest date a build \
+             from before #183 accepts, or that build refuses to start"
         );
-        assert!(
-            !lease.is_expiring(NOW + 300 * DAY),
-            "and must not nag for most of that year"
-        );
-        assert!(
-            lease.is_expiring(NOW + 395 * DAY),
-            "but must warn before it lapses, not after"
-        );
-        assert!(!lease.permits(DiskCap::Inbound, NOW + 401 * DAY));
+        let mut store = rebuilt(&m.leases, NOW);
+        for later in [NOW + 395 * DAY, NOW + 401 * DAY, NOW + 10 * 365 * DAY] {
+            assert!(store.sweep(later).is_empty(), "lapsed at {later}");
+            assert!(store.may_drive_us(A), "stopped working at {later}");
+            assert!(!store.is_expiring(A), "asked to renew at {later}");
+        }
     }
 
+    /// Replaces `a_lapsed_lease_keeps_everything_needed_to_renew_it`, which
+    /// asserted a migrated record granted nothing at 401 days. Real stores
+    /// already hold 30-day and 400-day terms; those pairings must not lapse,
+    /// and the next save dates both 400 days after pairing.
+    // LEDGER T6 | class B | 1 return value + 6 struct state: rebuild, records_of
     #[test]
-    fn a_lapsed_lease_keeps_everything_needed_to_renew_it() {
-        let m = migrate(allow(&[(A, "laptop")]), tombstones(&[]), NOW);
-        let lease = find(&m, A).expect("carried forward");
-        let after = NOW + 401 * DAY;
-        assert!(lease.effective_caps(after).is_empty(), "no permission");
-        assert_eq!(lease.label, "laptop", "but the name survives");
-        assert_eq!(
-            lease.caps,
-            vec![DiskCap::Inbound],
-            "and so does what it was allowed to do, so renewal is one keystroke \
-             rather than a re-pair"
-        );
-        assert_eq!(lease.state, DiskState::Active, "expiry is not a state");
+    fn a_term_an_earlier_build_wrote_is_not_enforced_and_the_next_save_replaces_it() {
+        let issued = NOW - 20 * DAY;
+        let written_before = |fp: &str, origin, term_days: u64| LeaseRecord {
+            fingerprint: fp.to_owned(),
+            label: format!("{term_days}-day"),
+            state: DiskState::Active,
+            origin,
+            issued_at: issued,
+            expires_at: Some(issued + term_days * DAY),
+            revoked_at: None,
+            caps: vec![DiskCap::Inbound],
+        };
+        let rows = vec![
+            written_before(A, DiskOrigin::Inbound, 30),
+            written_before(B, DiskOrigin::Migrated, 400),
+        ];
+
+        let mut store = rebuilt(&rows, NOW);
+        for later in [NOW + 11 * DAY, NOW + 381 * DAY, NOW + 10 * 365 * DAY] {
+            assert!(
+                store.sweep(later).is_empty(),
+                "a stored term lapsed at {later}: the daemon would cut that \
+                 device's sessions and it could only come back by pairing again. \
+                 Every expires_at in a schema-v1 store is a placeholder; enforcing \
+                 a stored term (#185) needs a schema bump or a new field, not a \
+                 change to rebuild or to this test"
+            );
+            assert!(
+                store.may_drive_us(A),
+                "the 30-day pairing stopped at {later}"
+            );
+            assert!(
+                store.may_drive_us(B),
+                "the 400-day pairing stopped at {later}"
+            );
+        }
+
+        let rewritten = records_of(&store);
+        let labels: Vec<&str> = rewritten.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, ["30-day", "400-day"], "a name was lost");
+        for row in &rewritten {
+            assert_eq!(
+                row.state,
+                DiskState::Active,
+                "{}: expiry is not a state",
+                row.label
+            );
+            assert_eq!(
+                row.expires_at,
+                Some(issued + 400 * DAY),
+                "{}: the next save must write the latest date a build from before \
+                 #183 accepts, not the term that build chose. That date is a \
+                 placeholder no later build may enforce (#185)",
+                row.label
+            );
+            assert_eq!(
+                row.caps,
+                vec![DiskCap::Inbound],
+                "{}: caps changed",
+                row.label
+            );
+            assert_eq!(row.issued_at, issued, "{}: issue date changed", row.label);
+        }
     }
 
     #[test]
@@ -1229,7 +1337,8 @@ mod tests {
         let m = migrate(allow(&[]), tombstones(&[(B, 1_788_579_979)]), NOW);
         assert_eq!(m.leases.len(), 1);
         assert_eq!(m.carried_forward, 0);
-        assert_eq!(m.leases[0].effective_caps(NOW), &[] as &[DiskCap]);
+        assert_eq!(m.leases[0].state, DiskState::Revoked);
+        assert_eq!(rebuilt(&m.leases, NOW).capabilities(B), Caps::NONE);
     }
 
     #[test]
@@ -1264,11 +1373,11 @@ mod tests {
     /// The #66 move, translated to one store: reach in and turn the expulsion
     /// back into a grant.
     ///
-    /// The edit is deliberately COMPLETE — a valid `expires_at`, real caps —
-    /// so that `validate` accepts every field and the signature is the only
-    /// thing left that can refuse it. An incomplete edit would be caught by the
-    /// structural checks and this test would pass without observing the
-    /// signature at all.
+    /// The edit is deliberately COMPLETE — real caps, and no expiry, which this
+    /// build accepts on an active lease — so that `validate` accepts every
+    /// field and the signature is the only thing left that can refuse it. An
+    /// incomplete edit would be caught by the structural checks and this test
+    /// would pass without observing the signature at all.
     #[test]
     fn a_hand_edit_that_launders_a_revocation_is_refused() {
         let d = tmpdir("handedit");
@@ -1280,13 +1389,7 @@ mod tests {
         let text = fs::read_to_string(&p).expect("read");
         let widened = text
             .replace("state = \"revoked\"", "state = \"active\"")
-            .replace(
-                "caps = []",
-                &format!(
-                    "expires_at = {}\ncaps = [\"inbound\", \"outbound\"]",
-                    NOW + 999 * DAY
-                ),
-            );
+            .replace("caps = []", "caps = [\"inbound\", \"outbound\"]");
         assert_ne!(widened, text, "precondition: the edit applied");
         // Precondition: the forged body is structurally impeccable, so nothing
         // but the signature stands between it and being honoured.
@@ -1295,7 +1398,7 @@ mod tests {
                 .expect("the forgery parses");
         validate(&forged.leases, &p).expect("the forgery passes every structural check");
         assert!(
-            forged.leases[0].permits(DiskCap::Inbound, NOW),
+            rebuilt(&forged.leases, NOW).may_drive_us(B),
             "it really is a grant"
         );
 
@@ -1308,25 +1411,33 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
-    /// The other half: extending a lease you already hold. Passes every
-    /// structural check by construction — it is the same record with a later
-    /// date — so again only the signature can catch it.
+    /// The other half: widening a lease you already hold. Passes every
+    /// structural check by construction — it is the same record with one more
+    /// capability — so again only the signature can catch it.
+    ///
+    /// This extended `expires_at` by a century. A stored expiry is no longer
+    /// enforced (#183), so extending it grants nothing here, and the edit that
+    /// grants more is now a wider capability list.
     #[test]
-    fn a_hand_edit_that_extends_a_lease_is_refused() {
-        let d = tmpdir("extend");
+    fn a_hand_edit_that_widens_a_lease_is_refused() {
+        let d = tmpdir("widen");
         let m = migrate(allow(&[(A, "laptop")]), tombstones(&[]), NOW);
         let (mut file, _) = TrustFile::open(&d, authority(&d)).expect("open");
         file.save(&m.leases).expect("save");
 
         let p = d.join(TRUST_FILE_NAME);
         let text = fs::read_to_string(&p).expect("read");
-        let expiry = m.leases[0].expires_at.expect("active leases expire");
-        let extended = text.replace(
-            &format!("expires_at = {expiry}"),
-            &format!("expires_at = {}", expiry + 100 * 365 * DAY),
+        let widened = text.replace("caps = [\"inbound\"]", "caps = [\"inbound\", \"outbound\"]");
+        assert_ne!(widened, text, "precondition: the edit applied");
+        let forged: TrustBody =
+            toml_edit::de::from_str(widened.rsplit_once(SIGNATURE_SEPARATOR).expect("body").0)
+                .expect("the forgery parses");
+        validate(&forged.leases, &p).expect("the forgery passes every structural check");
+        assert!(
+            rebuilt(&forged.leases, NOW).we_may_drive(A),
+            "precondition: it really does grant more"
         );
-        assert_ne!(extended, text, "precondition: the edit applied");
-        fs::write(&p, &extended).expect("write");
+        fs::write(&p, &widened).expect("write");
 
         let err = TrustFile::open(&d, authority(&d)).expect_err("must refuse");
         assert!(matches!(err, TrustFileError::Untrusted { .. }), "{err}");
@@ -1497,23 +1608,380 @@ mod tests {
         assert!(validate(&[one, two], Path::new("trust.toml")).is_err());
     }
 
+    /// This asserted the opposite: that `validate` refuses an active lease with
+    /// no expiry. No stored date is enforced now (#183), so an absent one
+    /// grants exactly what a present one does, and refusing it would stop the
+    /// daemon over a field that decides nothing.
     #[test]
-    fn an_active_lease_must_carry_an_expiry() {
-        let forever = LeaseRecord {
+    fn an_active_lease_with_no_expiry_is_accepted_and_grants() {
+        let unbounded = LeaseRecord {
             fingerprint: A.to_owned(),
             label: "a".into(),
             state: DiskState::Active,
-            origin: DiskOrigin::Migrated,
+            origin: DiskOrigin::Inbound,
             issued_at: NOW,
             expires_at: None,
             revoked_at: None,
             caps: vec![DiskCap::Inbound],
         };
+        validate(std::slice::from_ref(&unbounded), Path::new("trust.toml"))
+            .expect("an active lease with no expiry is a valid record");
+        let (store, refused) = rebuild(&ours(), NOW, &[unbounded]).expect("rebuild");
+        assert!(refused.is_empty(), "refused on rebuild: {refused:?}");
+        assert!(store.may_drive_us(A));
+    }
+
+    /// Real stores hold leases written since #158 with a 30-day term, and
+    /// migrated ones with 400 days, sealed by the build before this one. They
+    /// must load, grant ten years on, keep every removal, and come back from
+    /// the next save dated 400 days after pairing.
+    // LEDGER T7 | class B | 4 file on disk: TrustFile::save, TrustFile::open, records_of
+    #[test]
+    fn a_sealed_store_holding_thirty_and_four_hundred_day_terms_loads_and_none_of_them_lapse() {
+        let d = tmpdir("legacy-terms");
+        let auth = authority(&d);
+        let issued = system_seconds() - 20 * DAY;
+        let active = |fp: &str, origin, cap, term_days: u64| LeaseRecord {
+            fingerprint: fp.to_owned(),
+            label: format!("{term_days}-day"),
+            state: DiskState::Active,
+            origin,
+            issued_at: issued,
+            expires_at: Some(issued + term_days * DAY),
+            revoked_at: None,
+            caps: vec![cap],
+        };
+        const C: &str = "c0:c1:c2:c3:c4:c5:c6:c7:c8:c9:ca:cb:cc:cd:ce:cf:\
+d0:d1:d2:d3:d4:d5:d6:d7:d8:d9:da:db:dc:dd:de:df";
+        let removed = LeaseRecord {
+            fingerprint: C.to_owned(),
+            label: "removed".into(),
+            state: DiskState::Revoked,
+            origin: DiskOrigin::Migrated,
+            issued_at: issued,
+            expires_at: None,
+            revoked_at: Some(issued),
+            caps: vec![],
+        };
+        let rows = vec![
+            active(A, DiskOrigin::Inbound, DiskCap::Inbound, 30),
+            active(B, DiskOrigin::Migrated, DiskCap::Outbound, 400),
+            removed,
+        ];
+        let (mut file, _) = TrustFile::open(&d, auth.clone()).expect("open");
+        file.save(&rows)
+            .expect("seal the store as the earlier build wrote it");
         assert!(
-            validate(&[forever], Path::new("trust.toml")).is_err(),
-            "a never-expiring grant is the thing leases exist to retire; it must \
-             not be reachable by hand-writing the file either"
+            fs::read_to_string(d.join(TRUST_FILE_NAME))
+                .expect("read")
+                .contains(&format!("expires_at = {}", issued + 30 * DAY)),
+            "precondition: the file on disk carries the 30-day term"
         );
+
+        let load = |dir: &Path| {
+            let (file, loaded) = TrustFile::open(dir, auth.clone()).expect("the store loads");
+            let Loaded::Present { leases, .. } = loaded else {
+                panic!("the store must be found");
+            };
+            let (store, refused) = rebuild(&ours(), file.now(), &leases).expect("rebuild");
+            assert!(
+                refused.is_empty(),
+                "a pairing was refused on load: {refused:?}"
+            );
+            (file, store)
+        };
+
+        let (mut file, mut store) = load(&d);
+        let now = file.now();
+        for later in [issued + 30 * DAY, issued + 400 * DAY, now + 10 * 365 * DAY] {
+            assert!(
+                store.sweep(later).is_empty(),
+                "a stored term lapsed at {later}. Every expires_at in a schema-v1 \
+                 store is a placeholder; enforcing a stored term (#185) needs a \
+                 schema bump or a new field, not a change to rebuild or to this test"
+            );
+            assert!(
+                store.may_drive_us(A),
+                "the 30-day pairing stopped at {later} (see #185 before changing this)"
+            );
+            assert!(
+                store.we_may_drive(B),
+                "the 400-day pairing stopped at {later} (see #185 before changing this)"
+            );
+            assert!(store.is_denied(C) && store.capabilities(C) == Caps::NONE);
+        }
+
+        file.save(&records_of(&store)).expect("the next save");
+        let text = fs::read_to_string(d.join(TRUST_FILE_NAME)).expect("read");
+        assert!(
+            !text.contains(&format!("expires_at = {}", issued + 30 * DAY)),
+            "the next save still writes the 30-day term:\n{text}"
+        );
+        assert_eq!(
+            text.matches(&format!("expires_at = {}\n", issued + 400 * DAY))
+                .count(),
+            2,
+            "the next save must date both pairings 400 days after pairing, the \
+             latest a build from before #183 accepts, as a placeholder no later \
+             build may enforce (#185):\n{text}"
+        );
+        let (_, mut store) = load(&d);
+        assert!(store.sweep(now + 10 * 365 * DAY).is_empty());
+        assert!(store.may_drive_us(A) && store.we_may_drive(B));
+        assert!(store.is_denied(C), "the removal survived the rewrite");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A stored date that had already passed by load. On the build that wrote
+    /// it, that pairing had stopped admitting its peer. Nothing enforces the
+    /// date now (#183), so it admits again, and because that is a grant coming
+    /// back the load names it apart from a pairing whose date is still ahead.
+    // LEDGER T2 | class B | 4 file on disk + 1 return value
+    #[test]
+    fn a_pairing_whose_stored_date_had_passed_works_again_and_is_named() {
+        let d = tmpdir("passed-term");
+        let auth = authority(&d);
+        let now = system_seconds();
+        let row = |fp: &str, label: &str, issued_at: u64| LeaseRecord {
+            fingerprint: fp.to_owned(),
+            label: label.into(),
+            state: DiskState::Active,
+            origin: DiskOrigin::Inbound,
+            issued_at,
+            expires_at: Some(issued_at + 30 * DAY),
+            revoked_at: None,
+            caps: vec![DiskCap::Inbound],
+        };
+        let rows = vec![
+            row(A, "expired", now - 40 * DAY),
+            row(B, "current", now - 20 * DAY),
+        ];
+        let (mut file, _) = TrustFile::open(&d, auth.clone()).expect("open");
+        file.save(&rows)
+            .expect("seal the store as the earlier build wrote it");
+
+        let (file, loaded) = TrustFile::open(&d, auth).expect("the store loads");
+        let Loaded::Present { leases, .. } = loaded else {
+            panic!("the store must be found");
+        };
+        let (mut store, refused) = rebuild(&ours(), file.now(), &leases).expect("rebuild");
+        assert!(refused.is_empty(), "refused on load: {refused:?}");
+        let expired = leases.iter().find(|r| r.fingerprint == A).expect("row");
+        assert!(
+            expired.expires_at.is_some_and(|end| end <= store.now()),
+            "precondition: that date had passed by load"
+        );
+
+        // Sorted at load, before the sweeps below move the clock on.
+        let terms = stored_terms(&leases, &store);
+
+        for later in [store.now(), store.now() + 10 * 365 * DAY] {
+            assert!(store.sweep(later).is_empty(), "lapsed at {later}");
+            assert!(
+                store.may_drive_us(A),
+                "the pairing whose date had passed does not admit at {later}"
+            );
+            assert!(
+                store.may_drive_us(B),
+                "the current pairing stopped at {later}"
+            );
+        }
+
+        let named = |rows: &[&LeaseRecord]| {
+            rows.iter()
+                .map(|r| r.fingerprint.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            named(&terms.passed),
+            [A],
+            "a pairing that had stopped working and works again must be named"
+        );
+        assert_eq!(named(&terms.replaced), [B]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Enforcement time is `max(system clock, floor)`, and the floor can sit
+    /// ahead of the system clock. A stored date at the floor is the boundary:
+    /// a build from before #183 stops admitting that pairing at exactly that
+    /// second. This release admits it, and one dated below it (#183), and the
+    /// load log names both. A date still ahead that this build wrote logs
+    /// nothing, so a store it saved does not warn on every start.
+    // LEDGER T4 | class B | 1 return value + 6 struct state: TrustFile::open, rebuild, stored_terms, StoredTerms::log_lines
+    #[test]
+    fn a_pairing_dated_at_or_below_the_clock_floor_is_granted_on_load_and_named_in_the_load_log() {
+        // Year 2096: ahead of any real clock, so enforcement time is the floor.
+        const FLOOR: u64 = 4_000_000_000;
+        const C: &str = "c0:c1:c2:c3:c4:c5:c6:c7:c8:c9:ca:cb:cc:cd:ce:cf:\
+d0:d1:d2:d3:d4:d5:d6:d7:d8:d9:da:db:dc:dd:de:df";
+        const D: &str = "d0:d1:d2:d3:d4:d5:d6:d7:d8:d9:da:db:dc:dd:de:df:\
+e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
+        let d = tmpdir("floor-dated");
+        let auth = authority(&d);
+        let row = |fp: &str, label: &str, issued_at: u64, expires_at: u64| LeaseRecord {
+            fingerprint: fp.to_owned(),
+            label: label.into(),
+            state: DiskState::Active,
+            origin: DiskOrigin::Inbound,
+            issued_at,
+            expires_at: Some(expires_at),
+            revoked_at: None,
+            caps: vec![DiskCap::Inbound],
+        };
+        let saved_by_this_build = FLOOR - 20 * DAY;
+        let rows = vec![
+            row(A, "dated at the floor", FLOOR - 30 * DAY, FLOOR),
+            row(
+                B,
+                "dated before the floor",
+                FLOOR - 40 * DAY,
+                FLOOR - 10 * DAY,
+            ),
+            row(C, "a term still ahead", FLOOR - 20 * DAY, FLOOR + 10 * DAY),
+            row(
+                D,
+                "saved by this build",
+                saved_by_this_build,
+                saved_by_this_build + 400 * DAY,
+            ),
+        ];
+        // Sealed as a store saved when enforcement time was the floor: opening
+        // it raises the floor to its `written_at`.
+        let body = TrustBody {
+            version: SCHEMA_VERSION,
+            serial: 1,
+            written_at: FLOOR,
+            authority: AuthorityBlock {
+                alg: auth.algorithm().as_str().to_owned(),
+                public_key: hex_encode(auth.public_key()),
+            },
+            leases: rows,
+        };
+        let sealed = seal(&body, TRUST_DOMAIN, auth.as_ref()).expect("seal");
+        fs::write(d.join(TRUST_FILE_NAME), sealed).expect("write");
+
+        let (file, loaded) = TrustFile::open(&d, auth).expect("the store loads");
+        let Loaded::Present { leases, .. } = loaded else {
+            panic!("the store must be found");
+        };
+        assert_eq!(
+            file.now(),
+            FLOOR,
+            "precondition: enforcement time is the floor"
+        );
+        let (mut store, refused) = rebuild(&ours(), file.now(), &leases).expect("rebuild");
+        assert!(refused.is_empty(), "refused on load: {refused:?}");
+        let lines = stored_terms(&leases, &store).log_lines();
+
+        for later in [FLOOR, FLOOR + 10 * 365 * DAY] {
+            assert!(store.sweep(later).is_empty(), "lapsed at {later}");
+            for (fp, label) in [
+                (A, "at"),
+                (B, "below"),
+                (C, "ahead of"),
+                (D, "this build's date after"),
+            ] {
+                assert!(
+                    store.may_drive_us(fp),
+                    "the pairing dated {label} the floor was not admitted at {later}"
+                );
+            }
+        }
+
+        let warns_about = |fp: &str, label: &str| {
+            lines.iter().any(|(level, line)| {
+                *level == log::Level::Warn && line.contains(fp) && line.contains(label)
+            })
+        };
+        assert!(
+            warns_about(A, "dated at the floor"),
+            "the pairing dated exactly at the floor is admitted but not named: {lines:#?}"
+        );
+        assert!(
+            warns_about(B, "dated before the floor"),
+            "the pairing dated before the floor is admitted but not named: {lines:#?}"
+        );
+        let mentioned = |fp: &str| lines.iter().any(|(_, line)| line.contains(fp));
+        assert!(
+            !mentioned(C) && !mentioned(D),
+            "a date still ahead is not a grant coming back: {lines:#?}"
+        );
+        let infos: Vec<&str> = lines
+            .iter()
+            .filter(|(level, _)| *level == log::Level::Info)
+            .map(|(_, line)| line.as_str())
+            .collect();
+        assert!(
+            infos.len() == 1 && infos[0].contains(" 1 pairing(s) "),
+            "one date an older build chose is replaced, and the date this build \
+             saved is not counted with it: {infos:#?}"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// The date this build saves, 400 days after pairing, passes on day 400 and
+    /// stays passed. A store only this build wrote must still start quietly:
+    /// a warn on every start about a pairing the user made reads exactly like
+    /// the one real warning, a lapsed pairing coming back.
+    // LEDGER T8 | class B | 4 file on disk + 1 return value: records_of, TrustFile::save, TrustFile::open, rebuild, stored_terms, StoredTerms::log_lines
+    #[test]
+    fn a_store_this_build_saved_logs_nothing_on_later_starts_however_old_its_pairings() {
+        const C: &str = "c0:c1:c2:c3:c4:c5:c6:c7:c8:c9:ca:cb:cc:cd:ce:cf:\
+d0:d1:d2:d3:d4:d5:d6:d7:d8:d9:da:db:dc:dd:de:df";
+        const D: &str = "d0:d1:d2:d3:d4:d5:d6:d7:d8:d9:da:db:dc:dd:de:df:\
+e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
+        let d = tmpdir("own-dates");
+        let auth = authority(&d);
+        let (mut file, _) = TrustFile::open(&d, auth.clone()).expect("open");
+        let now = file.now();
+
+        let mut store = TrustStore::new(&ours(), now).expect("ours");
+        store
+            .issue(A, "paired today", Caps::INBOUND)
+            .expect("issue");
+        for (fp, label, age) in [
+            (B, "400 days ago", 400 * DAY),
+            (C, "401 days ago", 401 * DAY),
+            (D, "two years ago", 2 * 365 * DAY),
+        ] {
+            store
+                .admit(Lease {
+                    peer: fp.to_owned(),
+                    issued_to: ours(),
+                    label: label.into(),
+                    caps: Caps::INBOUND,
+                    origin: Origin::Inbound,
+                    issued_at: now - age,
+                    expiry: Expiry::Never,
+                })
+                .expect("admit");
+        }
+        file.save(&records_of(&store)).expect("save");
+
+        for start in 1..=3 {
+            let (mut file, loaded) = TrustFile::open(&d, auth.clone()).expect("reopen");
+            let Loaded::Present { leases, .. } = loaded else {
+                panic!("the store must be found");
+            };
+            assert!(
+                leases
+                    .iter()
+                    .any(|r| r.expires_at.is_some_and(|end| end <= file.now())),
+                "precondition: a date this build saved has passed"
+            );
+            let (store, refused) = rebuild(&ours(), file.now(), &leases).expect("rebuild");
+            assert!(refused.is_empty(), "refused on load: {refused:?}");
+            for fp in [A, B, C, D] {
+                assert!(store.may_drive_us(fp), "{fp} stopped working");
+            }
+            let lines = stored_terms(&leases, &store).log_lines();
+            assert!(
+                lines.is_empty(),
+                "start {start} logs about dates this build saved itself:\n{lines:#?}"
+            );
+            file.save(&records_of(&store)).expect("save again");
+        }
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]
