@@ -1086,7 +1086,6 @@ mod tests {
                     &transport::fingerprint_of(&server.cert),
                     "hostile",
                     crate::trust::Caps::OUTBOUND,
-                    crate::trust::DEFAULT_TERM_SECS,
                 )
                 .expect("issue");
                 st
@@ -1378,13 +1377,8 @@ mod tests {
                 let mut st =
                     crate::trust::TrustStore::new(&transport::fingerprint_of(&client.cert), 0)
                         .expect("our fingerprint");
-                st.issue(
-                    &server_fp,
-                    "receiver",
-                    crate::trust::Caps::OUTBOUND,
-                    crate::trust::DEFAULT_TERM_SECS,
-                )
-                .expect("issue");
+                st.issue(&server_fp, "receiver", crate::trust::Caps::OUTBOUND)
+                    .expect("issue");
                 st
             }));
             let observed = Arc::new(StdMutex::new(None));

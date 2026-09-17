@@ -23,7 +23,7 @@ use crate::{
     connect::LanMouseConnection,
     crypto::Identity,
     transport::{self, Trust},
-    trust::{Caps, DEFAULT_TERM_SECS, TrustStore},
+    trust::{Caps, TrustStore},
 };
 
 /// Run `f` the way the daemon runs: one thread, inside a `LocalSet`.
@@ -65,9 +65,7 @@ pub(crate) fn machine() -> Machine {
 pub(crate) fn trust(us: &Machine, peers: &[&Machine], caps: Caps) -> Trust {
     let mut store = TrustStore::new(&us.fingerprint, 0).expect("our fingerprint");
     for peer in peers {
-        store
-            .issue(&peer.fingerprint, "peer", caps, DEFAULT_TERM_SECS)
-            .expect("issue");
+        store.issue(&peer.fingerprint, "peer", caps).expect("issue");
     }
     Arc::new(RwLock::new(store))
 }

@@ -1,4 +1,7 @@
-use std::process::Command;
+use std::path::PathBuf;
+
+#[path = "src/git_env.rs"]
+mod git_env;
 
 fn main() {
     // Embed the short git commit (sent in the peer "hello" as a build id). We read
@@ -7,10 +10,27 @@ fn main() {
     // literally named `credential.c` — which trips endpoint-security (EDR)
     // heuristics on managed machines. The CLI needs no C compilation. Falls back
     // to "unknown" outside a git checkout (e.g. a release tarball).
-    let commit = Command::new("git")
-        .args(["rev-parse", "--short=8", "HEAD"])
-        .output()
-        .ok()
+    //
+    // Asked of this package's directory with no inherited GIT_ variable, the
+    // same way `build-check` asks (src/git_env.rs). A build started from inside
+    // git, such as a hook in another repository, would otherwise bake that
+    // repository's commit, and later builds would keep it.
+    //
+    // Only when this directory is the top of its checkout. git searches upward,
+    // so source unpacked inside some other repository (a packaging recipe's, or
+    // a home directory kept in git) would otherwise bake that repository's
+    // commit as this build's id.
+    let manifest_dir = PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+    );
+    let commit = git_env::work_tree(&manifest_dir)
+        .filter(|(_, is_top)| *is_top)
+        .and_then(|_| {
+            git_env::git_at(&manifest_dir)
+                .args(["rev-parse", "--short=8", "HEAD"])
+                .output()
+                .ok()
+        })
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
@@ -32,6 +52,15 @@ fn main() {
     }
     // refs can live packed rather than as loose files
     println!("cargo::rerun-if-changed=.git/packed-refs");
+    // No commit read: git missing, or refusing the checkout (safe.directory).
+    // Installing git or trusting the checkout changes none of the files above,
+    // so a checkout that has them all kept "unknown" baked in, and rebuilding
+    // did not help. Cargo reruns a script that watches a missing path on every
+    // build, recompiling this package, so the script reruns until git reads a
+    // commit. A source archive, with no .git/HEAD, already reruns that way.
+    if commit == "unknown" {
+        println!("cargo::rerun-if-changed=.git/hops-build-read-no-commit");
+    }
 
     let unix = target_is("unix");
     let macos = target_os() == "macos";

@@ -40,7 +40,6 @@
 //! it.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::SystemTime;
 
 /// The check passed, or was not asked to enforce anything.
@@ -60,11 +59,96 @@ pub const EXIT_STALE: i32 = 2;
 /// verified nothing must never report that it verified something.
 pub const EXIT_CANNOT_VERIFY: i32 = 3;
 
+/// What `build.rs` bakes in when it could not read a commit.
+const NO_COMMIT: &str = "unknown";
+
+/// Why nothing was compared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Uncompared {
+    /// `build.rs` could not read a commit when this binary was built.
+    NoCommitBakedIn,
+    /// git found no checkout at the path: none there (a released install, not
+    /// a dev tree), no git, or git refusing it. `named` when someone gave the
+    /// path, rather than it being the working directory.
+    NoCheckout { named: bool },
+    /// The path is a repository with no work tree, a `.git` directory or a bare
+    /// clone: it has a commit, but no source files whose times could be read.
+    NoWorkTree { named: bool },
+    /// The path someone named is below the top of this checkout.
+    InsideCheckout { top: PathBuf },
+    /// The checkout has no commit git can read at `HEAD`: nothing committed
+    /// yet, or `HEAD` names a commit that is missing.
+    HeadUnread,
+    /// The commit matches, but no tracked source file's time, or the binary's,
+    /// could be read.
+    TimesUnread,
+}
+
+impl Uncompared {
+    /// The end of the report's first line.
+    fn summary(&self) -> &'static str {
+        match self {
+            Uncompared::NoCommitBakedIn => "built without a commit, so there is nothing to compare",
+            Uncompared::NoCheckout { .. } => "no source tree to compare against",
+            Uncompared::NoWorkTree { .. } => "no work tree to compare against",
+            Uncompared::InsideCheckout { .. } => "no checkout starts at the path given",
+            Uncompared::HeadUnread => "no commit in the checkout to compare against",
+            Uncompared::TimesUnread => "the commit matches; no source time was compared",
+        }
+    }
+
+    /// What `--strict` says could not be verified, and what to do about it.
+    ///
+    /// A binary without a commit is its own case. No path can give it one, so a
+    /// reason that points at the path sends the reader to check a checkout that
+    /// is fine. Rebuilding is enough once git reads the checkout: `build.rs`
+    /// reruns on every build until it bakes a commit.
+    ///
+    /// With no path given, the working directory is what was read, and a
+    /// reason naming "the path given" sends the reader looking for an argument
+    /// nobody passed.
+    fn reason(&self) -> String {
+        match self {
+            Uncompared::NoCommitBakedIn => "this binary has no commit baked in; rebuild it \
+                 from the top of a git checkout, with a git on PATH that does not refuse \
+                 the checkout (safe.directory)"
+                .to_string(),
+            Uncompared::NoCheckout { named: true } => "git read no commit at the path given \
+                 (no checkout there, no git, or git refused the checkout)"
+                .to_string(),
+            Uncompared::NoCheckout { named: false } => "git read no commit from the working \
+                 directory (no checkout there or above it, no git, or git refused the \
+                 checkout); run the check inside a checkout, or give one with --repo"
+                .to_string(),
+            Uncompared::NoWorkTree { named: true } => "the path given is a git repository \
+                 with no work tree (a .git directory or a bare clone), so no source file \
+                 can be compared; give the checkout itself"
+                .to_string(),
+            Uncompared::NoWorkTree { named: false } => "the working directory is in a git \
+                 repository with no work tree (a .git directory or a bare clone), so no \
+                 source file can be compared; run the check from the checkout itself"
+                .to_string(),
+            Uncompared::InsideCheckout { top } => format!(
+                "the path given is inside the checkout at {}, not its top; give \
+                 that directory",
+                top.display()
+            ),
+            Uncompared::HeadUnread => "git read no commit at HEAD in the checkout \
+                 (nothing committed yet, or HEAD names a missing commit)"
+                .to_string(),
+            Uncompared::TimesUnread => "the commit matches, but no source file's time, or \
+                 the binary's, could be read, so an edit made since the build would go \
+                 unseen"
+                .to_string(),
+        }
+    }
+}
+
 /// What a build check concluded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
-    /// No git checkout to compare against — a released install, not a dev tree.
-    NotACheckout,
+    /// Nothing was compared, for this reason.
+    NotCompared(Uncompared),
     /// The binary matches the source.
     Current,
     /// Built from a different revision.
@@ -77,7 +161,7 @@ pub enum Verdict {
 impl Verdict {
     /// Whether this should stop a dev launcher.
     ///
-    /// `NotACheckout` is deliberately not stale: an installed copy has no
+    /// `NotCompared` is deliberately not stale: an installed copy has no
     /// source to be behind, and refusing to launch there would be nonsense.
     pub fn is_stale(&self) -> bool {
         matches!(
@@ -98,37 +182,52 @@ impl Verdict {
 /// them looking at the wrong thing.
 pub fn judge(
     built_commit: &str,
-    head: Option<&str>,
+    head: Result<&str, Uncompared>,
     binary_mtime: Option<SystemTime>,
     newest_source: Option<(String, SystemTime)>,
 ) -> Verdict {
-    let Some(head) = head else {
-        return Verdict::NotACheckout;
-    };
     // `build.rs` falls back to this outside a checkout; it can never match a
-    // real revision, and reporting it as a mismatch would be noise.
-    if built_commit == "unknown" {
-        return Verdict::NotACheckout;
+    // real revision, and reporting it as a mismatch would be noise. First,
+    // because no path given can change it.
+    if built_commit == NO_COMMIT {
+        return Verdict::NotCompared(Uncompared::NoCommitBakedIn);
     }
+    let head = match head {
+        Ok(head) => head,
+        Err(why) => return Verdict::NotCompared(why),
+    };
     if built_commit != head {
         return Verdict::WrongCommit {
             built: built_commit.to_string(),
             head: head.to_string(),
         };
     }
-    if let (Some(bin), Some((path, src))) = (binary_mtime, newest_source) {
-        if src > bin {
-            return Verdict::SourceNewer { newest: path };
-        }
+    // The timestamps are the half that catches an edit made since the build.
+    // With either side unread only the commit was compared, and saying "up to
+    // date" then would pass a gate on half a check.
+    let (Some(bin), Some((path, src))) = (binary_mtime, newest_source) else {
+        return Verdict::NotCompared(Uncompared::TimesUnread);
+    };
+    if src > bin {
+        return Verdict::SourceNewer { newest: path };
     }
     Verdict::Current
 }
 
 /// `git -C <repo> <args...>`, trimmed, or `None` if git or the repo is absent.
+///
+/// No inherited `GIT_` variable reaches it (see `git_env::git_at`). A launcher
+/// started from inside git, such as a hook, carries `GIT_DIR`; were it passed
+/// on, the check would compare that repository, and could pass a strict gate
+/// for a path that holds no checkout.
+///
+/// `--no-optional-locks`, because the check only reads. `git status` otherwise
+/// takes the index lock to write back refreshed timestamps, and a commit
+/// started at that moment fails on the lock. `GIT_OPTIONAL_LOCKS=0` asked for
+/// the same, and is removed with every other `GIT_` variable.
 fn git(repo: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
+    let out = crate::git_env::git_at(repo)
+        .arg("--no-optional-locks")
         .args(args)
         .output()
         .ok()?;
@@ -139,7 +238,8 @@ fn git(repo: &Path, args: &[&str]) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
-/// The most recently modified tracked source file, if any.
+/// The most recently modified tracked source file, or `None` when git could not
+/// list the tracked files or none of the source files it lists is on disk.
 ///
 /// Tracked files only, via `git ls-files`: a target directory holds build
 /// output newer than any source, and untracked scratch files are not what the
@@ -187,23 +287,58 @@ pub struct Report {
     pub binary: PathBuf,
 }
 
-/// Locate the repo to compare against.
+/// Locate the repo to compare against, and whether someone named it.
 ///
 /// Explicit argument first, then `HOPS_REPO`, then the working directory — so a
 /// launcher can be explicit while a developer standing in the repo needs no
 /// arguments.
-fn resolve_repo(explicit: Option<PathBuf>) -> PathBuf {
-    explicit
-        .or_else(|| std::env::var_os("HOPS_REPO").map(PathBuf::from))
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+///
+/// An empty `HOPS_REPO` is unset, as `export HOPS_REPO=` means in a shell. It
+/// counted as a path someone named, and `git -C ""` runs in the working
+/// directory, so a check run from the top of a checkout refused that checkout
+/// as a directory below itself.
+fn resolve_repo(explicit: Option<PathBuf>) -> (PathBuf, bool) {
+    let from_env = || {
+        std::env::var_os("HOPS_REPO")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    match explicit.or_else(from_env) {
+        Some(named) => (named, true),
+        None => (
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            false,
+        ),
+    }
+}
+
+/// The top of the checkout to compare, or why there is none.
+///
+/// A path someone named must be the top of a checkout. git searches upward, so
+/// a directory below one, or a directory holding no checkout inside another,
+/// was judged by the checkout above it: a verdict about source nobody named.
+/// Only the working directory, the default, is searched upward, so the check
+/// still runs from anywhere in a checkout, and it then reads the whole
+/// checkout rather than the directory it was run from.
+fn locate(path: &Path, named: bool) -> Result<PathBuf, Uncompared> {
+    match crate::git_env::work_tree(path) {
+        Some((top, is_top)) if is_top || !named => Ok(top),
+        Some((top, _)) => Err(Uncompared::InsideCheckout { top }),
+        None if git(path, &["rev-parse", "--git-dir"]).is_some() => {
+            Err(Uncompared::NoWorkTree { named })
+        }
+        None => Err(Uncompared::NoCheckout { named }),
+    }
 }
 
 /// Compare the running binary against a source tree.
 pub fn check(repo: Option<PathBuf>) -> Report {
-    let repo = resolve_repo(repo);
+    let (path, named) = resolve_repo(repo);
+    let top = locate(&path, named);
     let built_commit = env!("HOPS_SHORT_COMMIT").to_string();
-    let head = git(&repo, &["rev-parse", "--short=8", "HEAD"]);
-    let dirty = git(&repo, &["status", "--porcelain"]).is_some();
+    let at_top = |args: &[&str]| top.as_ref().ok().and_then(|top| git(top, args));
+    let head = at_top(&["rev-parse", "--short=8", "HEAD"]);
+    let dirty = at_top(&["status", "--porcelain"]).is_some();
     let binary = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("hops"));
     let binary_mtime = std::fs::metadata(&binary)
         .ok()
@@ -212,22 +347,21 @@ pub fn check(repo: Option<PathBuf>) -> Report {
     // How far behind the integration branch this build is. Only meaningful for
     // a promoted binary, which is deliberately not HEAD; `origin/main` rather
     // than `main` because a local main can itself be weeks stale.
-    let behind = git(
-        &repo,
-        &[
-            "rev-list",
-            "--count",
-            &format!("{built_commit}..origin/main"),
-        ],
-    )
+    let behind = at_top(&[
+        "rev-list",
+        "--count",
+        &format!("{built_commit}..origin/main"),
+    ])
     .and_then(|s| s.parse().ok());
 
-    let verdict = judge(
-        &built_commit,
-        head.as_deref(),
-        binary_mtime,
-        newest_source(&repo),
-    );
+    let newest = top.as_ref().ok().and_then(|top| newest_source(top));
+    // git found the checkout, so an unread HEAD is the checkout's own: there is
+    // no commit in it to match, whatever the binary carries.
+    let head_read = match &top {
+        Ok(_) => head.as_deref().ok_or(Uncompared::HeadUnread),
+        Err(why) => Err(why.clone()),
+    };
+    let verdict = judge(&built_commit, head_read, binary_mtime, newest);
 
     Report {
         verdict,
@@ -248,16 +382,13 @@ pub fn check(repo: Option<PathBuf>) -> Report {
 /// because an everyday binary once ran three weeks behind unnoticed.
 pub fn report(r: &Report, strict: bool) -> i32 {
     match &r.verdict {
-        Verdict::NotACheckout => {
-            println!(
-                "hops {} — no source tree to compare against",
-                r.built_commit
-            );
+        Verdict::NotCompared(why) => {
+            println!("hops {} — {}", r.built_commit, why.summary());
             if strict {
                 // Someone asked for this to be verified and it could not be.
                 // Returning 0 here would be a gate that passes having checked
                 // nothing — which reads as proof and is worse than no gate.
-                println!("  CANNOT VERIFY: no git checkout at the path given");
+                println!("  CANNOT VERIFY: {}", why.reason());
                 println!("  the binary may or may not match; nothing was compared");
                 EXIT_CANNOT_VERIFY
             } else {
@@ -337,7 +468,10 @@ mod tests {
     #[test]
     fn a_gate_that_compared_nothing_does_not_report_success() {
         assert_eq!(
-            report(&rep(Verdict::NotACheckout), true),
+            report(
+                &rep(Verdict::NotCompared(Uncompared::NoCheckout { named: true })),
+                true
+            ),
             EXIT_CANNOT_VERIFY,
             "under --strict, being unable to find a checkout means nothing was \
              compared. Returning success there is a gate that passes having \
@@ -345,10 +479,46 @@ mod tests {
         );
     }
 
+    // LEDGER T18 | class B | 1 return value: build_check::judge, Uncompared::reason
+    #[test]
+    fn a_binary_without_a_commit_is_not_blamed_on_the_path() {
+        let why = match judge(
+            NO_COMMIT,
+            Err(Uncompared::NoCheckout { named: true }),
+            Some(t(100)),
+            None,
+        ) {
+            Verdict::NotCompared(why) => why,
+            other => panic!("a binary with no commit compared something: {other:?}"),
+        };
+        let (summary, reason) = (why.summary(), why.reason());
+        assert!(
+            reason.contains("no commit baked in") && !reason.contains("path given"),
+            "a binary built without a commit can compare nothing at any path; \
+             a reason that points at the path sends the reader to check a \
+             checkout that is fine. reason: {reason:?}"
+        );
+        assert!(
+            !summary.contains("source tree"),
+            "the first line blames the source tree for a binary with no commit: \
+             {summary:?}"
+        );
+
+        let reason = Uncompared::NoCheckout { named: true }.reason();
+        assert!(
+            reason.contains("at the path given"),
+            "a binary that carries a commit compared nothing because git read \
+             none at the path, and the reason must say so. reason: {reason:?}"
+        );
+    }
+
     #[test]
     fn a_daily_launcher_is_never_blocked() {
         for v in [
-            Verdict::NotACheckout,
+            Verdict::NotCompared(Uncompared::NoCheckout { named: false }),
+            Verdict::NotCompared(Uncompared::InsideCheckout {
+                top: PathBuf::from("/src/hops"),
+            }),
             Verdict::Current,
             Verdict::WrongCommit {
                 built: "a".into(),
@@ -398,7 +568,7 @@ mod tests {
         assert_eq!(
             judge(
                 "abc12345",
-                Some("abc12345"),
+                Ok("abc12345"),
                 Some(t(100)),
                 Some(("src/x.rs".into(), t(50)))
             ),
@@ -408,7 +578,7 @@ mod tests {
 
     #[test]
     fn a_different_commit_is_stale() {
-        let v = judge("abc12345", Some("def67890"), Some(t(100)), None);
+        let v = judge("abc12345", Ok("def67890"), Some(t(100)), None);
         assert_eq!(
             v,
             Verdict::WrongCommit {
@@ -426,7 +596,7 @@ mod tests {
     fn an_edit_after_the_build_is_stale_even_when_the_commit_matches() {
         let v = judge(
             "abc12345",
-            Some("abc12345"),
+            Ok("abc12345"),
             Some(t(100)),
             Some(("src/service.rs".into(), t(200))),
         );
@@ -446,20 +616,50 @@ mod tests {
     #[test]
     fn a_release_install_outside_a_checkout_is_not_stale() {
         assert_eq!(
-            judge("abc12345", None, Some(t(100)), None),
-            Verdict::NotACheckout
+            judge(
+                "abc12345",
+                Err(Uncompared::NoCheckout { named: true }),
+                Some(t(100)),
+                None
+            ),
+            Verdict::NotCompared(Uncompared::NoCheckout { named: true })
         );
         assert_eq!(
-            judge("unknown", Some("abc12345"), Some(t(100)), None),
-            Verdict::NotACheckout,
+            judge("unknown", Ok("abc12345"), Some(t(100)), None),
+            Verdict::NotCompared(Uncompared::NoCommitBakedIn),
             "`build.rs` writes \"unknown\" outside a checkout; reporting that as \
              a mismatch would make every released install look broken"
         );
         assert!(
-            !judge("abc12345", None, None, None).is_stale(),
+            !judge(
+                "abc12345",
+                Err(Uncompared::NoCheckout { named: true }),
+                None,
+                None
+            )
+            .is_stale(),
             "an installed copy has no source to be behind — refusing to launch \
              it would be nonsense"
         );
+    }
+
+    // LEDGER T23 | class B | 1 return value: build_check::judge
+    #[test]
+    fn a_matching_commit_with_no_time_read_is_not_current() {
+        for (binary, source) in [
+            (Some(t(100)), None),
+            (None, Some(("src/x.rs".to_string(), t(50)))),
+            (None, None),
+        ] {
+            assert_eq!(
+                judge("abc12345", Ok("abc12345"), binary, source.clone()),
+                Verdict::NotCompared(Uncompared::TimesUnread),
+                "the commit matched but the times were not compared (binary \
+                 {binary:?}, newest source {source:?}); calling that current \
+                 passes a strict gate that never looked for an edit made since \
+                 the build"
+            );
+        }
     }
 
     #[test]
@@ -467,7 +667,7 @@ mod tests {
         // Both are true here; only one gets reported.
         let v = judge(
             "abc12345",
-            Some("def67890"),
+            Ok("def67890"),
             Some(t(100)),
             Some(("src/x.rs".into(), t(200))),
         );
