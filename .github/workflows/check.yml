@@ -69,6 +69,12 @@ jobs:
         run: cargo check --no-default-features --features "${{ matrix.features }}" --all-targets
       - name: test
         run: cargo test --no-default-features --features "${{ matrix.features }}"
+      # The workspace tests run on macOS. The IPC crate has Linux-only code
+      # and tests: the sticky bit on the daemon's lock and socket, and a
+      # listener whose queue of connections not yet accepted is full.
+      - name: test hops-ipc (linux)
+        if: runner.os == 'Linux'
+        run: cargo test -p hops-ipc
 
   # The trust tests are the ones that must never silently stop running: each was
   # written to fail without its fix, and several guard a shipped vulnerability.
