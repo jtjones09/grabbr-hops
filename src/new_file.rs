@@ -23,7 +23,8 @@
 //! A process that ends between writing its temporary file and removing it
 //! leaves `.<name>.<pid>.<n>.tmp` behind, holding a whole private key when
 //! the file is a key. [`remove_abandoned_temporaries`] removes those once
-//! their process is gone.
+//! their process is gone. A creator whose process has the same id as that one
+//! leaves such a file alone and writes under another name.
 
 use std::fs;
 use std::io::{self, Write};
@@ -64,7 +65,20 @@ fn create_whole_with(
     link: impl FnOnce(&Path, &Path) -> io::Result<()>,
     before_rename: impl FnOnce(),
 ) -> io::Result<()> {
-    place(path, contents, access, link, before_rename).map_err(|e| {
+    create_whole_named(path, contents, access, unique, link, before_rename)
+}
+
+/// [`create_whole_with`], with the temporary file's names supplied, so a test
+/// can choose names a file is already at.
+fn create_whole_named(
+    path: &Path,
+    contents: &[u8],
+    access: Access,
+    names: impl FnMut() -> String,
+    link: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    before_rename: impl FnOnce(),
+) -> io::Result<()> {
+    place(path, contents, access, names, link, before_rename).map_err(|e| {
         io::Error::new(
             e.kind(),
             format!("could not create {}: {e}", path.display()),
@@ -76,14 +90,18 @@ fn place(
     path: &Path,
     contents: &[u8],
     access: Access,
+    names: impl FnMut() -> String,
     link: impl FnOnce(&Path, &Path) -> io::Result<()>,
     before_rename: impl FnOnce(),
 ) -> io::Result<()> {
     let dir = directory_of(path);
     fs::create_dir_all(dir)?;
-    let tmp = sibling(path, &format!("{}.tmp", unique()));
+    let (tmp, file) = create_temporary(path, names)?;
 
-    let placed = write_private(&tmp, contents, access).and_then(|()| match link(&tmp, path) {
+    // The temporary is this call's own from here. It is removed on every way
+    // out but a rename, after which its name is no longer this call's.
+    let mut renamed = false;
+    let placed = fill(file, contents, access).and_then(|()| match link(&tmp, path) {
         Ok(()) => Ok(()),
         Err(e) if !hard_links_unsupported(&e) => Err(e),
         Err(link_error) => {
@@ -91,10 +109,14 @@ fn place(
                 "no hard link for {} ({link_error}); renaming it into place under a lock",
                 path.display()
             );
-            rename_into_place_under_lock(&tmp, path, before_rename)
+            rename_into_place_under_lock(&tmp, path, before_rename)?;
+            renamed = true;
+            Ok(())
         }
     });
-    let _ = fs::remove_file(&tmp);
+    if !renamed {
+        let _ = fs::remove_file(&tmp);
+    }
     #[cfg(unix)]
     if placed.is_ok() {
         // So the new directory entry survives a crash, as the contents do.
@@ -228,9 +250,23 @@ fn rename_into_place_under_lock(
     fs::rename(tmp, path)
 }
 
-/// Create `path` private to its owner, write `contents`, sync, and set its
-/// final mode, before any other name for it exists.
-fn write_private(path: &Path, contents: &[u8], access: Access) -> io::Result<()> {
+/// How many names a creator tries for its temporary file.
+///
+/// A name holds this process's id, so a file is already at it only when a
+/// process with the same id left it there: one that ended part-way, whose id
+/// came round again, or a writer in another PID namespace or on another host.
+const TEMPORARY_NAMES: usize = 16;
+
+/// Create a temporary file beside `path`, private to its owner, under the
+/// first name from `names` that no file is at.
+///
+/// A file already at a name is not this call's, so it is left alone and the
+/// next name tried. When every name tried is taken this fails, and not with
+/// `AlreadyExists`, which would say that a file is at `path`.
+fn create_temporary(
+    path: &Path,
+    mut names: impl FnMut() -> String,
+) -> io::Result<(PathBuf, fs::File)> {
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -238,13 +274,32 @@ fn write_private(path: &Path, contents: &[u8], access: Access) -> io::Result<()>
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut f = opts.open(path)?;
-    f.write_all(contents)?;
-    f.sync_all()?;
+    let mut last = PathBuf::new();
+    for _ in 0..TEMPORARY_NAMES {
+        let tmp = sibling(path, &format!("{}.tmp", names()));
+        match opts.open(&tmp) {
+            Ok(file) => return Ok((tmp, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last = tmp,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::other(format!(
+        "files are at all {TEMPORARY_NAMES} names tried for its temporary file, \
+         the last {}. If no hops process is running, remove them, then start \
+         hops again.",
+        last.display()
+    )))
+}
+
+/// Write `contents` to the new temporary `file`, sync it, and set its final
+/// mode, before any other name for it exists. Closes it.
+fn fill(mut file: fs::File, contents: &[u8], access: Access) -> io::Result<()> {
+    file.write_all(contents)?;
+    file.sync_all()?;
     #[cfg(unix)]
     if let Access::OwnerRead = access {
         use std::os::unix::fs::PermissionsExt;
-        f.set_permissions(fs::Permissions::from_mode(0o400))?;
+        file.set_permissions(fs::Permissions::from_mode(0o400))?;
     }
     #[cfg(not(unix))]
     let _ = access; /* FIXME windows permissions */
@@ -491,6 +546,96 @@ mod where_hard_links_are_missing {
             "(default created, config saved, config on disk). Without hard links, \
              a default config renamed into place after a save replaced what the \
              save wrote: the devices and settings in it were lost."
+        );
+    }
+}
+
+#[cfg(test)]
+mod a_temporary_name_already_taken {
+    //! A temporary's name holds its process's id, and ids come round again:
+    //! after a reboot, and often on Windows. A file an earlier process left
+    //! under the name a creator picks is not that creator's to remove.
+
+    use super::{Access, create_whole_named, sibling};
+    use std::io;
+    use std::path::Path;
+
+    fn hard_link(from: &Path, to: &Path) -> io::Result<()> {
+        std::fs::hard_link(from, to)
+    }
+
+    // LEDGER T54 | class B | 4 file on disk + 1 return value / error
+    #[test]
+    fn a_file_under_the_temporarys_name_is_left_alone_and_another_name_is_used() {
+        let dir = std::env::temp_dir().join(format!("hops-taken-name-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let left: &[u8] = b"-----BEGIN PRIVATE KEY----- of an earlier process";
+        let is_left = |p: &Path| std::fs::read(p).is_ok_and(|c| c == left);
+
+        // Files are at the first two names this creator tries.
+        let path = dir.join("lan-mouse.pem");
+        let taken = [sibling(&path, "7.0.tmp"), sibling(&path, "7.1.tmp")];
+        for name in &taken {
+            std::fs::write(name, left).expect("a file under a temporary's name");
+        }
+        let mut n = 0;
+        let names = || {
+            n += 1;
+            format!("7.{}", n - 1)
+        };
+        let created =
+            create_whole_named(&path, b"whole", Access::OwnerRead, names, hard_link, || {});
+        let on_disk = std::fs::read(&path).ok();
+        let kept = taken.iter().map(|name| is_left(name)).collect::<Vec<_>>();
+        let own_removed = std::fs::symlink_metadata(sibling(&path, "7.2.tmp")).is_err();
+
+        // A file is at every name it tries.
+        let other = dir.join("other.pem");
+        let always = sibling(&other, "7.0.tmp");
+        std::fs::write(&always, left).expect("a file under a temporary's name");
+        let refused = create_whole_named(
+            &other,
+            b"x",
+            Access::OwnerRead,
+            || "7.0".to_string(),
+            hard_link,
+            || {},
+        );
+        let refused_kept = is_left(&always);
+        let other_created = std::fs::symlink_metadata(&other).is_ok();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            (
+                created.map_err(|e| e.to_string()),
+                on_disk.as_deref(),
+                kept,
+                own_removed
+            ),
+            (Ok(()), Some(&b"whole"[..]), vec![true, true], true),
+            "(created, contents at the path, files under the taken names still \
+             there, this creator's own temporary removed). A creator removed a \
+             file it did not create and reported that a file was at the path, \
+             where nothing was: a first start whose process id an earlier crashed \
+             start had used failed with an error naming no file in the way."
+        );
+        let kind = refused.as_ref().map_err(|e| e.kind()).err();
+        let message = refused.err().map(|e| e.to_string()).unwrap_or_default();
+        assert_eq!(
+            (
+                kind.is_some_and(|k| k != io::ErrorKind::AlreadyExists),
+                refused_kept,
+                other_created,
+                message.contains(&other.display().to_string()),
+                message.contains(&always.display().to_string()),
+            ),
+            (true, true, false, true, true),
+            "(failed, and not with AlreadyExists; the file in the way still there; \
+             something created at the path; the path named; the taken name named) \
+             when every name was taken: {message}. AlreadyExists tells the caller \
+             that another process created the file, and it then reads a file that \
+             is not there."
         );
     }
 }
