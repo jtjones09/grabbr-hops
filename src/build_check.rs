@@ -75,6 +75,9 @@ pub enum Uncompared {
     NoWorkTree,
     /// The path someone named is below the top of this checkout.
     InsideCheckout { top: PathBuf },
+    /// The checkout has no commit git can read at `HEAD`: nothing committed
+    /// yet, or `HEAD` names a commit that is missing.
+    HeadUnread,
     /// The commit matches, but no tracked source file's time, or the binary's,
     /// could be read.
     TimesUnread,
@@ -88,6 +91,7 @@ impl Uncompared {
             Uncompared::NoCheckout => "no source tree to compare against",
             Uncompared::NoWorkTree => "no work tree to compare against",
             Uncompared::InsideCheckout { .. } => "no checkout starts at the path given",
+            Uncompared::HeadUnread => "no commit in the checkout to compare against",
             Uncompared::TimesUnread => "the commit matches; no source time was compared",
         }
     }
@@ -114,6 +118,9 @@ impl Uncompared {
                  that directory",
                 top.display()
             ),
+            Uncompared::HeadUnread => "git read no commit at HEAD in the checkout \
+                 (nothing committed yet, or HEAD names a missing commit)"
+                .to_string(),
             Uncompared::TimesUnread => "the commit matches, but no source file's time, or \
                  the binary's, could be read, so an edit made since the build would go \
                  unseen"
@@ -270,8 +277,18 @@ pub struct Report {
 /// Explicit argument first, then `HOPS_REPO`, then the working directory — so a
 /// launcher can be explicit while a developer standing in the repo needs no
 /// arguments.
+///
+/// An empty `HOPS_REPO` is unset, as `export HOPS_REPO=` means in a shell. It
+/// counted as a path someone named, and `git -C ""` runs in the working
+/// directory, so a check run from the top of a checkout refused that checkout
+/// as a directory below itself.
 fn resolve_repo(explicit: Option<PathBuf>) -> (PathBuf, bool) {
-    match explicit.or_else(|| std::env::var_os("HOPS_REPO").map(PathBuf::from)) {
+    let from_env = || {
+        std::env::var_os("HOPS_REPO")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    match explicit.or_else(from_env) {
         Some(named) => (named, true),
         None => (
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -321,8 +338,10 @@ pub fn check(repo: Option<PathBuf>) -> Report {
     .and_then(|s| s.parse().ok());
 
     let newest = top.as_ref().ok().and_then(|top| newest_source(top));
+    // git found the checkout, so an unread HEAD is the checkout's own: there is
+    // no commit in it to match, whatever the binary carries.
     let head_read = match &top {
-        Ok(_) => head.as_deref().ok_or(Uncompared::NoCheckout),
+        Ok(_) => head.as_deref().ok_or(Uncompared::HeadUnread),
         Err(why) => Err(why.clone()),
     };
     let verdict = judge(&built_commit, head_read, binary_mtime, newest);

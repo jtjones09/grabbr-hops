@@ -678,6 +678,107 @@ fn a_checkout_with_no_source_time_to_read_cannot_pass_a_strict_gate() {
     );
 }
 
+/// A shell's `export HOPS_REPO=` means no repository, as it does for any
+/// variable. An empty `HOPS_REPO` was taken as a path someone named, and git
+/// ran in the working directory, so a check run from the top of a checkout
+/// refused that checkout as a directory below itself.
+// LEDGER T25 | class B | 5 process exit code + stdout
+#[test]
+fn an_empty_hops_repo_counts_as_unset() {
+    let scratch = Scratch::new(&std::env::temp_dir(), "empty-hops-repo");
+    if baked_commit(&scratch.0).is_none() {
+        eprintln!("nothing compared: this hops was built without a commit baked in");
+        return;
+    }
+    let checkout = scratch.0.join("checkout");
+    let head = repo_with_one_commit(&checkout, "checkout");
+
+    let strict_check = |hops_repo: Option<&str>| {
+        let mut cmd = hops();
+        without_git_variables(&mut cmd).env_remove("HOPS_REPO");
+        if let Some(value) = hops_repo {
+            cmd.env("HOPS_REPO", value);
+        }
+        let out = cmd
+            .current_dir(&checkout)
+            .args(["build-check", "--strict"])
+            .output()
+            .expect("run");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    };
+
+    let unset = strict_check(None);
+    assert!(
+        unset.1.contains(&head),
+        "with HOPS_REPO unset the check did not compare the checkout it ran \
+         from, so agreement below would prove nothing. stdout: {:?}",
+        unset.1
+    );
+    assert_eq!(
+        strict_check(Some("")),
+        unset,
+        "an empty HOPS_REPO was taken as a path someone named rather than as \
+         unset"
+    );
+}
+
+/// A checkout with nothing committed has no commit for the binary's to match.
+/// No test held that: an unread `HEAD` counted as a match would have passed a
+/// strict gate on the source times alone.
+// LEDGER T26 | class B | 5 process exit code + stdout
+#[test]
+fn a_checkout_with_no_commit_at_head_cannot_pass_a_strict_gate() {
+    let scratch = Scratch::new(&std::env::temp_dir(), "unborn");
+    if baked_commit(&scratch.0).is_none() {
+        eprintln!("nothing compared: this hops was built without a commit baked in");
+        return;
+    }
+    let checkout = scratch.0.join("checkout");
+    std::fs::create_dir_all(&checkout).expect("mkdir");
+    stdout_of(setup_git(&checkout).args(["init", "-q"]));
+    // Tracked and older than the binary, so the times alone would pass.
+    let file = checkout.join("a.rs");
+    std::fs::write(&file, "x").expect("write");
+    stdout_of(setup_git(&checkout).args(["add", "a.rs"]));
+    let long_ago =
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .and_then(|f| f.set_modified(long_ago))
+        .expect("set the file's timestamp");
+    let head = setup_git(&checkout)
+        .args(["rev-parse", "--verify", "--quiet", "HEAD"])
+        .output()
+        .expect("run git");
+    assert!(
+        !head.status.success(),
+        "git read a commit at HEAD in a repository with nothing committed, so \
+         the check below would not face an unread HEAD"
+    );
+
+    let out = without_git_variables(&mut hops())
+        .args(["build-check", "--repo"])
+        .arg(&checkout)
+        .arg("--strict")
+        .output()
+        .expect("run");
+    let report = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "the checkout has no commit at HEAD, so there was no commit to match, \
+         yet a strict gate did not say so. stdout: {report:?}"
+    );
+    assert!(
+        report.contains("CANNOT VERIFY: git read no commit at HEAD in the checkout"),
+        "the report does not say why nothing was compared: {report:?}"
+    );
+}
+
 /// `git status` refreshes the index when a file's timestamp no longer matches
 /// the one recorded, and writes it back under the index lock. A commit started
 /// at that moment fails on the lock. The check only reads, so it must leave the

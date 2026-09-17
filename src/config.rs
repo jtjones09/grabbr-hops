@@ -194,13 +194,14 @@ pub enum Command {
     /// Launchers run this before starting anything, so a stale binary is
     /// noticed at launch rather than halfway through a test session.
     BuildCheck {
-        /// top of the checkout to compare against (default: $HOPS_REPO, else
-        /// the checkout the working directory is in)
+        /// top of the checkout to compare against (default: $HOPS_REPO when
+        /// set and not empty, else the checkout the working directory is in)
         #[arg(long)]
         repo: Option<PathBuf>,
         /// exit 2 when stale and 3 when nothing could be compared (for example
-        /// no checkout at the path, a path below the top of one, no git, or a
-        /// binary built without a commit baked in; the report says why) — for
+        /// no checkout at the path, a path below the top of one, a checkout
+        /// with nothing committed, no git, or a binary built without a commit
+        /// baked in; the report says why) — for
         /// dev launchers, where testing an old binary measures the wrong code.
         /// Daily launchers omit it: a promoted build is deliberately behind and
         /// must still start.
