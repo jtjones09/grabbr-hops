@@ -76,6 +76,18 @@ pub enum IpcListenerCreationError {
         path: std::path::PathBuf,
         source: io::Error,
     },
+    /// A file at the socket path that could not be asked whether a daemon
+    /// listens on it, and so was left where it is.
+    #[error(
+        "could not tell whether a daemon listens on {}: {source}. {hint}",
+        .path.display()
+    )]
+    SocketUnchecked {
+        path: std::path::PathBuf,
+        source: io::Error,
+        /// What to do about it, in words.
+        hint: String,
+    },
     /// Where the token frontends present is kept could not be worked out.
     #[error("could not work out where the IPC token is kept: {0}")]
     TokenPath(io::Error),

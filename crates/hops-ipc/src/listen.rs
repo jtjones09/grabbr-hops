@@ -228,6 +228,16 @@ struct Claim {
 impl Claim {
     #[cfg(unix)]
     async fn take(endpoint: &crate::DaemonEndpoint) -> Result<Self, IpcListenerCreationError> {
+        Self::take_with(endpoint, ownership::foreign_owner).await
+    }
+
+    /// [`Claim::take`], with `whose` saying who owns a file in the way, as
+    /// [`ownership::foreign_owner`] does, so the error can say what to do.
+    #[cfg(unix)]
+    async fn take_with(
+        endpoint: &crate::DaemonEndpoint,
+        whose: impl Fn(&std::path::Path, &std::io::Error) -> Option<ownership::Foreign>,
+    ) -> Result<Self, IpcListenerCreationError> {
         let socket_path = match endpoint {
             crate::DaemonEndpoint::Unix(path) => path.clone(),
             crate::DaemonEndpoint::Tcp(_) => {
@@ -240,7 +250,7 @@ impl Claim {
                 });
             }
         };
-        let lock = lock_beside_with(&socket_path, ownership::foreign_owner)?;
+        let lock = lock_beside_with(&socket_path, &whose)?;
         #[cfg(target_os = "linux")]
         say_if_not_kept(&lock_path(&socket_path), mark_to_keep(&lock));
 
@@ -274,11 +284,19 @@ impl Claim {
                 }
                 // Anything else, such as a socket this user may not connect
                 // to, cannot say whether a daemon listens there. The file is
-                // left alone.
+                // left alone. A socket an earlier build's daemon left under
+                // sudo is another user's, and the hint says so.
                 Err(source) => {
-                    return Err(IpcListenerCreationError::Bind {
-                        endpoint: endpoint.clone(),
+                    let hint = ownership::hint(
+                        whose(&socket_path, &source),
+                        "A daemon may be listening on it, so hops leaves it where \
+                         it is. If no hops daemon is running, remove it, then \
+                         start hops again.",
+                    );
+                    return Err(IpcListenerCreationError::SocketUnchecked {
+                        path: socket_path,
                         source,
+                        hint,
                     });
                 }
             }
@@ -1229,9 +1247,15 @@ mod at_most_one_daemon {
         let got = runtime().block_on(Claim::take(&DaemonEndpoint::Unix(path.clone())));
         let after = inode(&path);
         let outcome = match &got {
-            Err(IpcListenerCreationError::Bind { source, .. }) => {
-                format!("Bind: {:?}", source.kind())
-            }
+            Err(IpcListenerCreationError::SocketUnchecked {
+                path: named,
+                source,
+                hint,
+            }) => format!(
+                "SocketUnchecked {}: {:?}. {hint}",
+                named.display(),
+                source.kind()
+            ),
             other => describe(other),
         };
         drop(got);
@@ -1239,11 +1263,79 @@ mod at_most_one_daemon {
         remove(&path);
 
         assert_eq!(
-            (outcome.as_str(), after),
-            ("Bind: PermissionDenied", before),
+            (outcome, after),
+            (
+                format!(
+                    "SocketUnchecked {}: PermissionDenied. A daemon may be \
+                     listening on it, so hops leaves it where it is. If no hops \
+                     daemon is running, remove it, then start hops again.",
+                    path.display()
+                ),
+                before
+            ),
             "(outcome, inode at the socket path; it was {before}). A refused \
              connection does not say that nothing listens. The socket may be a \
              running daemon's, which removing it leaves unreachable."
+        );
+    }
+
+    // LEDGER T55 | class B | 1 return value / error + 4 file on disk
+    #[test]
+    fn a_socket_another_user_left_that_cannot_be_asked_is_reported_as_theirs() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("not checked: nothing refuses root a connection");
+            return;
+        }
+        let path = socket_path("theirs");
+        remove(&path);
+        // A daemon of an earlier build, run under sudo, left its socket here.
+        // Only root can make a file root owns, so the owner is given, and the
+        // refusal comes from the socket's mode.
+        drop(std::os::unix::net::UnixListener::bind(&path).expect("a socket file"));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+            .expect("a socket this user may not connect to");
+        let before = inode(&path);
+        let root_owns_it = Foreign {
+            path: path.clone(),
+            owner: 0,
+            me: 501,
+        };
+        let asked = std::sync::Mutex::new(Vec::new());
+        let whose = |at: &Path, _: &std::io::Error| {
+            asked.lock().expect("the list").push(at.to_path_buf());
+            (at == path).then(|| root_owns_it.clone())
+        };
+
+        let got = runtime().block_on(Claim::take_with(&DaemonEndpoint::Unix(path.clone()), whose));
+        let after = inode(&path);
+        let said = match &got {
+            Err(e @ IpcListenerCreationError::SocketUnchecked { .. }) => e.to_string(),
+            other => describe(other),
+        };
+        drop(got);
+        remove(&path);
+
+        assert_eq!(
+            (asked.into_inner().expect("the list"), after),
+            (vec![path.clone()], before),
+            "(files whose owner was asked, inode at the socket path; it was \
+             {before}). The owner of the socket that could not be asked must be \
+             looked up, and the socket left where it is."
+        );
+        assert_eq!(
+            said,
+            format!(
+                "could not tell whether a daemon listens on {}: Permission denied \
+                 (os error 13). {}",
+                path.display(),
+                another_users(&root_owns_it)
+            ),
+            "a socket another user left, which this user may not connect to, \
+             must be reported as theirs with what to do. Otherwise a socket left \
+             by `sudo hops` stops every later start with only \"Permission \
+             denied\"."
         );
     }
 
