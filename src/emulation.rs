@@ -7,7 +7,7 @@ use input_event::{Event, PointerEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::Cell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     rc::Rc,
     time::{Duration, Instant},
@@ -291,6 +291,9 @@ impl ListenTask {
         let mut last_response = HashMap::new();
         let mut rejected_connections = RecentRejections::new();
         let mut absmotion = AbsMotionReconstructor::default();
+        // Peers released because the trust check refused them, until one of
+        // their events is permitted again.
+        let mut refused = HashSet::new();
         loop {
             select! {
                 e = self.listener.next() => {match e {
@@ -334,22 +337,25 @@ impl ListenTask {
                                             .may_drive_us(fp)
                                     });
                                 if permitted {
+                                    if !refused.is_empty() {
+                                        refused.remove(&addr);
+                                    }
                                     self.emulation_proxy.consume(event, addr);
-                                } else {
+                                } else if refused.insert(addr) {
                                     // The lease lapsed or was revoked while the
                                     // peer was driving. Its button- and key-ups
                                     // are refused from here on too, so whatever
                                     // it holds would stay down until the session
                                     // is cut and the watchdog notices, which
-                                    // takes over a minute after a lapse. A no-op
-                                    // once nothing is held.
-                                    crate::debounce!(
-                                        PREV_REFUSED_LOG,
-                                        Duration::from_secs(1),
-                                        log::warn!(
-                                            "releasing held keys and buttons: \
-                                             {addr} may no longer drive this machine"
-                                        )
+                                    // takes over a minute after a lapse.
+                                    //
+                                    // Once per refusal, not per event: absolute
+                                    // motion is not refused and re-creates the
+                                    // handle, so a release per event tore it
+                                    // down and built it again for every pair.
+                                    log::warn!(
+                                        "releasing held keys and buttons: \
+                                         {addr} may no longer drive this machine"
                                     );
                                     self.emulation_proxy.remove(addr);
                                 }
@@ -429,6 +435,8 @@ impl ListenTask {
                         if instant.elapsed() > Duration::from_secs(10) {
                             log::warn!("releasing held keys and buttons: {addr} not responding!");
                             self.emulation_proxy.remove(addr);
+                            // Forgotten along with the peer.
+                            refused.remove(&addr);
                             let _ = self.event_tx.send(EmulationEvent::Disconnected { addr });
                             false
                         } else {
@@ -441,10 +449,6 @@ impl ListenTask {
         self.listener.terminate().await;
         self.emulation_proxy.terminate().await;
     }
-}
-
-thread_local! {
-    static PREV_REFUSED_LOG: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
 /// proxy handling the actual input emulation,
@@ -1448,6 +1452,136 @@ mod held_input_is_released {
                 s.consumed(button(BTN_LEFT, 0)).len(),
                 1,
                 "exactly one up: the release, not the refused event: {:?}",
+                s.recording.calls()
+            );
+        });
+    }
+
+    // LEDGER T18 | class B | 6 struct state: Recording::calls() after refused events interleaved with absolute motion
+    /// Absolute motion is not refused, and it re-creates the emulation handle
+    /// the refusal destroyed. Releasing on every refused event then tore that
+    /// handle down and built it again for each pair of events: on wlroots a
+    /// new virtual pointer and keyboard every time. A refusal releases once.
+    #[test]
+    fn a_refused_peer_is_released_once_not_per_event() {
+        run_local(async {
+            let s = session().await;
+            let handle = s.inject(button(BTN_LEFT, 1)).await;
+
+            s.trust
+                .write()
+                .expect("trust lock")
+                .revoke(&s.fingerprints[0]);
+            let scroll = Event::Pointer(PointerEvent::Axis {
+                time: 0,
+                axis: 0,
+                value: 1.0,
+            });
+            for seq in 1..=5u32 {
+                s.dialer()
+                    .send(ProtoEvent::PointerMotionAbsolute {
+                        seq,
+                        ts: 0,
+                        vx: seq as f32,
+                        vy: 0.0,
+                    })
+                    .await;
+                s.dialer().send(ProtoEvent::Input(scroll)).await;
+            }
+            // Handled after every event above, so once it reaches the backend
+            // so has everything the refusals asked for.
+            s.dialer()
+                .send(ProtoEvent::PointerMotionAbsolute {
+                    seq: 6,
+                    ts: 0,
+                    vx: 6.0,
+                    vy: 0.0,
+                })
+                .await;
+            let motions = || {
+                s.recording
+                    .calls()
+                    .iter()
+                    .filter(|c| {
+                        matches!(
+                            c,
+                            Recorded::Consume(Event::Pointer(PointerEvent::Motion { .. }), _)
+                        )
+                    })
+                    .count()
+            };
+            wait_until(
+                "every absolute motion to reach the backend",
+                Duration::from_secs(10),
+                || motions() == 6,
+            )
+            .await;
+
+            let calls = s.recording.calls();
+            assert!(
+                calls.contains(&Recorded::Destroy(handle)),
+                "precondition: the refusal released the peer: {calls:?}"
+            );
+            let destroyed = calls
+                .iter()
+                .filter(|c| matches!(c, Recorded::Destroy(_)))
+                .count();
+            assert_eq!(
+                destroyed, 1,
+                "five refused events each tore the peer's emulation handle down \
+                 again after its absolute motion re-created it: {calls:?}"
+            );
+        });
+    }
+
+    // LEDGER T21 | class B | 6 struct state: Recording::calls() after a refusal, a new grant, input, and a second refusal
+    /// A peer granted again after a refusal can press a button again, and a
+    /// second refusal must release that too.
+    #[test]
+    fn a_peer_refused_again_after_a_new_grant_is_released_again() {
+        run_local(async {
+            let s = session().await;
+            let fingerprint = &s.fingerprints[0];
+            let first = s.inject(button(BTN_LEFT, 1)).await;
+
+            let lapse = || {
+                s.trust
+                    .write()
+                    .expect("trust lock")
+                    .drop_capabilities(fingerprint, Caps::DRIVE_ME);
+            };
+            lapse();
+            s.dialer()
+                .send(ProtoEvent::Input(button(BTN_LEFT, 0)))
+                .await;
+            assert!(
+                s.released_before_destroy(first, button(BTN_LEFT, 0)).await,
+                "precondition: the first refusal released the left button: {:?}",
+                s.recording.calls()
+            );
+
+            s.trust
+                .write()
+                .expect("trust lock")
+                .issue(
+                    fingerprint,
+                    "peer",
+                    Caps::INBOUND,
+                    crate::trust::DEFAULT_TERM_SECS,
+                )
+                .expect("grant again");
+            let second = s.inject(button(BTN_RIGHT, 1)).await;
+            assert_ne!(first, second, "precondition: a new handle");
+
+            lapse();
+            s.dialer()
+                .send(ProtoEvent::Input(button(BTN_RIGHT, 0)))
+                .await;
+            assert!(
+                s.released_before_destroy(second, button(BTN_RIGHT, 0))
+                    .await,
+                "the peer was granted again, pressed the right button, and was \
+                 refused again, and the right button was never released: {:?}",
                 s.recording.calls()
             );
         });
