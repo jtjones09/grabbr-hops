@@ -189,9 +189,9 @@ async fn write_one(entry: &mut TxStream, bytes: &[u8]) -> bool {
 ///   the running job's process instead. Elsewhere it is in `$XDG_RUNTIME_DIR`,
 ///   whose files the XDG base directory specification lets a periodic
 ///   clean-up remove unless each has the sticky bit set or its access time
-///   updated every six hours. The lock and the socket get the sticky bit,
-///   which `systemd-tmpfiles` honours. A clean-up that ignores it, or someone
-///   removing the files, still leaves the gap.
+///   updated every six hours. On Linux the lock and the socket get the sticky
+///   bit, which `systemd-tmpfiles` honours. A clean-up that ignores it, or
+///   someone removing the files, still leaves the gap.
 ///
 ///   The lock stays beside the socket anyway. `$XDG_RUNTIME_DIR` is the one
 ///   directory the specification requires to be local and to support file
@@ -238,8 +238,8 @@ impl Claim {
             }
         };
         let lock = lock_beside_with(&socket_path, ownership::foreign_owner)?;
-        #[cfg(not(target_os = "macos"))]
-        keep_through_clean_ups(&lock_path(&socket_path));
+        #[cfg(target_os = "linux")]
+        say_if_not_kept(&lock_path(&socket_path), mark_to_keep(&lock));
 
         // `symlink_metadata`, not `exists`: a dangling link at the path would
         // otherwise pass as absent and fail the bind as if a daemon held it.
@@ -279,8 +279,8 @@ impl Claim {
                 });
             }
         };
-        #[cfg(not(target_os = "macos"))]
-        keep_through_clean_ups(&socket_path);
+        #[cfg(target_os = "linux")]
+        say_if_not_kept(&socket_path, mark_socket_to_keep(&socket_path));
         Ok(Self {
             listener,
             endpoint: endpoint.clone(),
@@ -319,20 +319,62 @@ fn lock_path(socket_path: &std::path::Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Set the sticky bit on `path`, keeping its other mode bits.
+/// The sticky bit.
 ///
-/// The XDG base directory specification names the bit as what keeps a file in
+/// The XDG base directory specification names it as what keeps a file in
 /// `$XDG_RUNTIME_DIR` from a periodic clean-up, and `systemd-tmpfiles` skips
-/// files that have it. It means nothing else on a file on Linux. A daemon that
-/// cannot set it still runs, and says so.
-#[cfg(all(unix, not(target_os = "macos")))]
-fn keep_through_clean_ups(path: &std::path::Path) {
+/// files that have it. It means nothing else on a file on Linux.
+#[cfg(target_os = "linux")]
+const STICKY: u32 = 0o1000;
+
+/// Set the sticky bit on the file `lock` is open on, keeping its other mode
+/// bits.
+///
+/// Through the descriptor, so the mode read and the mode set are those of the
+/// file that was locked, whatever is at its path by then.
+#[cfg(target_os = "linux")]
+fn mark_to_keep(lock: &std::fs::File) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    const STICKY: u32 = 0o1000;
-    let marked = std::fs::symlink_metadata(path).and_then(|meta| {
-        let mode = meta.permissions().mode() & 0o7777;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | STICKY))
-    });
+    let mode = lock.metadata()?.permissions().mode() & 0o7777;
+    lock.set_permissions(std::fs::Permissions::from_mode(mode | STICKY))
+}
+
+/// Set the sticky bit on the socket at `path`, keeping its other mode bits.
+///
+/// Another process of this user can replace what is at `path` at any moment.
+/// A link there is not followed and anything but a socket is left as it is:
+/// following a link would let that process choose which file's mode a daemon
+/// run as root changes.
+///
+/// The path is opened only to name what is there (`O_PATH`), since a socket
+/// cannot be opened to read. `fchmod` does not take such a descriptor, so the
+/// mode is set through its `/proc/self/fd` entry, which names the same file.
+#[cfg(target_os = "linux")]
+fn mark_socket_to_keep(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
+    let named = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+        .open(path)?;
+    let meta = named.metadata()?;
+    if !meta.file_type().is_socket() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "what is there is not a socket",
+        ));
+    }
+    let mode = meta.permissions().mode() & 0o7777;
+    std::fs::set_permissions(
+        format!("/proc/self/fd/{}", named.as_raw_fd()),
+        std::fs::Permissions::from_mode(mode | STICKY),
+    )
+}
+
+/// Log that `path` could not be given the sticky bit, if `marked` says so. A
+/// daemon that cannot set it still runs.
+#[cfg(target_os = "linux")]
+fn say_if_not_kept(path: &std::path::Path, marked: std::io::Result<()>) {
     if let Err(e) = marked {
         log::warn!(
             "could not set the sticky bit on {} ({e}). A clean-up of its \
@@ -343,10 +385,19 @@ fn keep_through_clean_ups(path: &std::path::Path) {
     }
 }
 
+/// The hint for a lock path that holds a symbolic link.
+#[cfg(unix)]
+const LOCK_IS_A_LINK: &str = "It is a symbolic link, which hops does not follow \
+     there. Remove the link, then start hops again.";
+
 /// Lock `<socket_path>.lock` exclusively, without waiting.
 ///
 /// `whose` says who owns the lock file when opening it failed, as
 /// [`ownership::foreign_owner`] does, so the error can say what to do.
+///
+/// A link at the lock path is not followed. Its directory may be written by
+/// any process of this user, and a daemon run as root would otherwise create,
+/// lock and mark whatever file the link names.
 #[cfg(unix)]
 fn lock_beside_with(
     socket_path: &std::path::Path,
@@ -360,15 +411,24 @@ fn lock_beside_with(
         .create(true)
         .truncate(false)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
     {
         Ok(file) => file,
         Err(source) => {
-            let hint = ownership::hint(
-                whose(&path, &source),
-                "hops keeps this file beside its socket so that a second daemon \
-                 cannot start. Check that this user can create and write it.",
-            );
+            // Before the owner: `chown` follows a link, so its advice would
+            // be wrong here.
+            let is_a_link =
+                std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink());
+            let hint = if is_a_link {
+                LOCK_IS_A_LINK.to_string()
+            } else {
+                ownership::hint(
+                    whose(&path, &source),
+                    "hops keeps this file beside its socket so that a second daemon \
+                     cannot start. Check that this user can create and write it.",
+                )
+            };
             return Err(IpcListenerCreationError::Lock { path, source, hint });
         }
     };
@@ -951,7 +1011,7 @@ mod at_most_one_daemon {
     }
 
     // LEDGER T47 | class B | 4 file on disk
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_lock_and_the_socket_are_marked_to_be_kept_through_clean_ups() {
         use std::os::unix::fs::PermissionsExt;
@@ -976,6 +1036,111 @@ mod at_most_one_daemon {
              neither the sticky bit nor a recent access time, which leaves a \
              running daemon that no frontend can reach and a second daemon free \
              to start."
+        );
+    }
+
+    /// The permission bits at `path` in octal, without following a link;
+    /// "nothing" when nothing is there.
+    fn mode(path: &Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(path).map_or("nothing".to_string(), |m| {
+            format!("{:o}", m.permissions().mode() & 0o7777)
+        })
+    }
+
+    // LEDGER T49 | class B | 1 return value / error + 4 file on disk
+    #[test]
+    fn a_link_in_the_lock_files_place_is_not_followed() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = socket_path("locklink");
+        remove(&path);
+        let lock = super::lock_path(&path);
+        let pid = std::process::id();
+        let linked = PathBuf::from(format!("/tmp/h-claim-linked-{pid}"));
+        let nowhere = PathBuf::from(format!("/tmp/h-claim-nowhere-{pid}"));
+        let _ = std::fs::remove_file(&nowhere);
+        std::fs::write(&linked, b"not hops's").expect("a file to link to");
+        std::fs::set_permissions(&linked, std::fs::Permissions::from_mode(0o600))
+            .expect("its mode");
+        let rt = runtime();
+        let claim = || match rt.block_on(Claim::take(&DaemonEndpoint::Unix(path.clone()))) {
+            Err(IpcListenerCreationError::Lock { path, hint, .. }) => {
+                format!("Lock on {}: {hint}", path.display())
+            }
+            other => describe(&other),
+        };
+
+        std::os::unix::fs::symlink(&linked, &lock).expect("a link to a file");
+        let to_a_file = claim();
+        let linked_after = (
+            mode(&linked),
+            std::fs::read_to_string(&linked).unwrap_or_default(),
+        );
+        let _ = std::fs::remove_file(&lock);
+        std::os::unix::fs::symlink(&nowhere, &lock).expect("a link to nothing");
+        let to_nothing = claim();
+        let created = std::fs::symlink_metadata(&nowhere).is_ok();
+        for leftover in [&lock, &linked, &nowhere] {
+            let _ = std::fs::remove_file(leftover);
+        }
+        remove(&path);
+
+        let refused = format!("Lock on {}: {}", lock.display(), super::LOCK_IS_A_LINK);
+        assert_eq!(
+            (to_a_file, linked_after, to_nothing, created),
+            (
+                refused.clone(),
+                ("600".to_string(), "not hops's".to_string()),
+                refused,
+                false
+            ),
+            "(claim beside a link to a file, that file's (mode, contents), claim \
+             beside a link to nothing, whether the claim created what it names). \
+             Any process of this user can put a link where the lock goes. A \
+             daemon that follows it, run as root, locks, creates or changes the \
+             mode of whatever file the link names."
+        );
+    }
+
+    // LEDGER T50 | class B | 4 file on disk + 1 return value
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_a_socket_is_marked_to_be_kept_and_a_link_is_not_followed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = PathBuf::from(format!("/tmp/h-sticky-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).expect("a scratch directory");
+        let chmod = |p: &Path, mode: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).expect("a mode");
+        };
+        let file = dir.join("file");
+        std::fs::write(&file, b"").expect("a file");
+        chmod(&file, 0o600);
+        let socket = dir.join("s.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("a socket");
+        chmod(&socket, 0o700);
+        let (to_file, to_socket) = (dir.join("to-file"), dir.join("to-socket"));
+        std::os::unix::fs::symlink(&file, &to_file).expect("a link to the file");
+        std::os::unix::fs::symlink(&socket, &to_socket).expect("a link to the socket");
+
+        let marked = |p: &Path| super::mark_socket_to_keep(p).is_ok();
+        let refused = [marked(&to_file), marked(&to_socket), marked(&file)];
+        let untouched = (mode(&file), mode(&socket));
+        let socket_marked = (marked(&socket), mode(&socket));
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            (refused, untouched, socket_marked),
+            (
+                [false, false, false],
+                ("600".to_string(), "700".to_string()),
+                (true, "1700".to_string())
+            ),
+            "((marked through a link to a file, through a link to a socket, a \
+             file), (file mode, socket mode) after those, (socket marked, its \
+             mode)). A link where the socket was, followed as root, sets the \
+             mode of the file it names."
         );
     }
 
