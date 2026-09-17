@@ -174,6 +174,10 @@ fn temporary_writer(file_name: &str, prefix: &str) -> Option<u32> {
 /// rename. The lock goes with the process that holds it. The lock file stays:
 /// removing it would let a later process lock a new file while an earlier one
 /// still holds the old.
+///
+/// A link at the lock path is not followed, and the lock is then refused: a
+/// daemon run as root would otherwise create or lock whatever file a process
+/// of this user linked there.
 pub(crate) fn lock_sibling(path: &Path) -> io::Result<fs::File> {
     let lock_path = sibling(path, "lock");
     let mut opts = fs::OpenOptions::new();
@@ -181,7 +185,7 @@ pub(crate) fn lock_sibling(path: &Path) -> io::Result<fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let lock = opts.open(&lock_path)?;
     lock.lock()?;
@@ -487,6 +491,33 @@ mod where_hard_links_are_missing {
             "(default created, config saved, config on disk). Without hard links, \
              a default config renamed into place after a save replaced what the \
              save wrote: the devices and settings in it were lost."
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod the_lock_is_not_taken_through_a_link {
+    // LEDGER T53 | class B | 1 return value / error + 4 file on disk
+    #[test]
+    fn a_link_in_the_lock_files_place_is_refused_and_not_followed() {
+        let dir = std::env::temp_dir().join(format!("hops-lock-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let path = dir.join("config.toml");
+        let nowhere = dir.join("named-by-the-link");
+        std::os::unix::fs::symlink(&nowhere, super::sibling(&path, "lock"))
+            .expect("a link where the lock goes");
+
+        let locked = super::lock_sibling(&path).is_ok();
+        let created = std::fs::symlink_metadata(&nowhere).is_ok();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            (locked, created),
+            (false, false),
+            "(locked, created the file the link names). Any process of this \
+             user can put a link where the lock goes, and a daemon run as root \
+             that follows it creates a file wherever the link says."
         );
     }
 }
