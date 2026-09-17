@@ -215,6 +215,39 @@ fn baked_commit(no_checkout: &Path) -> Option<String> {
     (commit != "unknown").then(|| commit.to_string())
 }
 
+/// Whether `dir` is the top of a git work tree. git prints the way up to the
+/// top, which is nothing at the top, so no two spellings of a path are compared.
+fn is_checkout_top(dir: &Path) -> bool {
+    let Ok(out) = setup_git(dir)
+        .args(["rev-parse", "--is-inside-work-tree", "--show-cdup"])
+        .output()
+    else {
+        return false;
+    };
+    out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true"
+}
+
+/// The commit baked into the hops under test, or `None` if it baked none, for
+/// the tests that compare nothing without one.
+///
+/// `None` is allowed only where `build.rs` rightly bakes none: this source is
+/// not the top of a git checkout, as in a source archive. Built from the top of
+/// one, a binary without a commit is the build script failing, and a test that
+/// returned a pass for it compared nothing while the run stayed green.
+// LEDGER T27 | class B | 5 process stdout: the commit build.rs baked into hops
+fn commit_under_test(no_checkout: &Path) -> Option<String> {
+    let baked = baked_commit(no_checkout);
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        baked.is_some() || !is_checkout_top(manifest_dir),
+        "this hops was built from the top of the checkout at {}, yet it carries \
+         no commit, so each test that needs one would pass having compared \
+         nothing",
+        manifest_dir.display()
+    );
+    baked
+}
+
 /// A launcher started from inside git (a hook, or a shell that exported it)
 /// carries `GIT_DIR`, and `git -C <repo>` obeys it over `<repo>`. The check then
 /// compared that other repository: it named the wrong commit for a checkout,
@@ -234,7 +267,7 @@ fn an_inherited_repository_does_not_stand_in_for_the_named_checkout() {
     std::fs::create_dir_all(&empty).expect("mkdir");
     assert_ne!(named_head, other_head);
 
-    if baked_commit(&empty).is_none() {
+    if commit_under_test(&empty).is_none() {
         eprintln!(
             "nothing compared: this hops was built without a commit baked in, so \
              it reports no checkout whichever repository it reads"
@@ -407,7 +440,7 @@ fn the_build_script_bakes_its_own_checkout_whatever_git_variables_it_inherits() 
 #[test]
 fn a_ceiling_the_caller_set_still_stops_the_search_for_a_checkout() {
     let empty = Scratch::new(&std::env::temp_dir(), "ceiling-empty");
-    if baked_commit(&empty.0).is_none() {
+    if commit_under_test(&empty.0).is_none() {
         eprintln!(
             "nothing compared: this hops was built without a commit baked in, so \
              it reports no checkout wherever git stops"
@@ -463,7 +496,7 @@ fn a_ceiling_the_caller_set_still_stops_the_search_for_a_checkout() {
 #[test]
 fn a_named_path_below_a_checkout_is_not_judged_by_that_checkout() {
     let scratch = Scratch::new(&std::env::temp_dir(), "below-top");
-    if baked_commit(&scratch.0).is_none() {
+    if commit_under_test(&scratch.0).is_none() {
         eprintln!(
             "nothing compared: this hops was built without a commit baked in, so \
              it reports that before looking at any path"
@@ -516,10 +549,9 @@ fn a_named_path_below_a_checkout_is_not_judged_by_that_checkout() {
 }
 
 /// The full id of the commit baked into the hops under test, from this
-/// checkout, or `None` if it baked none.
-fn baked_full_commit() -> Option<String> {
-    let scratch = Scratch::new(&std::env::temp_dir(), "baked");
-    let short = baked_commit(&scratch.0)?;
+/// checkout, or `None` if it baked none (see `commit_under_test`).
+fn baked_full_commit(no_checkout: &Path) -> Option<String> {
+    let short = commit_under_test(no_checkout)?;
     Some(stdout_of(
         setup_git(Path::new(env!("CARGO_MANIFEST_DIR"))).args([
             "rev-parse",
@@ -566,11 +598,11 @@ fn repository_at(dir: &Path, commit: &str, bare: bool) -> PathBuf {
 // LEDGER T21 | class B | 5 process exit code + stdout
 #[test]
 fn from_inside_a_checkout_the_whole_checkout_is_compared() {
-    let Some(baked) = baked_full_commit() else {
+    let scratch = Scratch::new(&std::env::temp_dir(), "from-inside");
+    let Some(baked) = baked_full_commit(&scratch.0) else {
         eprintln!("nothing compared: this hops was built without a commit baked in");
         return;
     };
-    let scratch = Scratch::new(&std::env::temp_dir(), "from-inside");
     let checkout = scratch.0.join("checkout");
     repository_at(&checkout, &baked, false);
     // Written now, so after the hops under test was built.
@@ -602,11 +634,11 @@ fn from_inside_a_checkout_the_whole_checkout_is_compared() {
 // LEDGER T22 | class B | 5 process exit code + stdout
 #[test]
 fn a_repository_without_a_work_tree_cannot_pass_a_strict_gate() {
-    let Some(baked) = baked_full_commit() else {
+    let scratch = Scratch::new(&std::env::temp_dir(), "no-work-tree");
+    let Some(baked) = baked_full_commit(&scratch.0) else {
         eprintln!("nothing compared: this hops was built without a commit baked in");
         return;
     };
-    let scratch = Scratch::new(&std::env::temp_dir(), "no-work-tree");
     let dot_git = repository_at(&scratch.0.join("checkout"), &baked, false);
     let bare = repository_at(&scratch.0.join("bare.git"), &baked, true);
 
@@ -644,11 +676,11 @@ fn a_repository_without_a_work_tree_cannot_pass_a_strict_gate() {
 // LEDGER T24 | class B | 5 process exit code + stdout
 #[test]
 fn a_checkout_with_no_source_time_to_read_cannot_pass_a_strict_gate() {
-    let Some(baked) = baked_full_commit() else {
+    let scratch = Scratch::new(&std::env::temp_dir(), "no-source-times");
+    let Some(baked) = baked_full_commit(&scratch.0) else {
         eprintln!("nothing compared: this hops was built without a commit baked in");
         return;
     };
-    let scratch = Scratch::new(&std::env::temp_dir(), "no-source-times");
     let checkout = scratch.0.join("checkout");
     // Its HEAD is this binary's commit, and it tracks no file on disk.
     repository_at(&checkout, &baked, false);
@@ -686,7 +718,7 @@ fn a_checkout_with_no_source_time_to_read_cannot_pass_a_strict_gate() {
 #[test]
 fn an_empty_hops_repo_counts_as_unset() {
     let scratch = Scratch::new(&std::env::temp_dir(), "empty-hops-repo");
-    if baked_commit(&scratch.0).is_none() {
+    if commit_under_test(&scratch.0).is_none() {
         eprintln!("nothing compared: this hops was built without a commit baked in");
         return;
     }
@@ -732,7 +764,7 @@ fn an_empty_hops_repo_counts_as_unset() {
 #[test]
 fn a_checkout_with_no_commit_at_head_cannot_pass_a_strict_gate() {
     let scratch = Scratch::new(&std::env::temp_dir(), "unborn");
-    if baked_commit(&scratch.0).is_none() {
+    if commit_under_test(&scratch.0).is_none() {
         eprintln!("nothing compared: this hops was built without a commit baked in");
         return;
     }
