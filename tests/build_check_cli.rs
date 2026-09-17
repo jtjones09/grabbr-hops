@@ -638,6 +638,46 @@ fn a_repository_without_a_work_tree_cannot_pass_a_strict_gate() {
     }
 }
 
+/// The commit alone does not show an edit made since the build; the source
+/// files' times do. A checkout at this binary's commit where no tracked source
+/// file's time could be read passed a strict gate as up to date.
+// LEDGER T24 | class B | 5 process exit code + stdout
+#[test]
+fn a_checkout_with_no_source_time_to_read_cannot_pass_a_strict_gate() {
+    let Some(baked) = baked_full_commit() else {
+        eprintln!("nothing compared: this hops was built without a commit baked in");
+        return;
+    };
+    let scratch = Scratch::new(&std::env::temp_dir(), "no-source-times");
+    let checkout = scratch.0.join("checkout");
+    // Its HEAD is this binary's commit, and it tracks no file on disk.
+    repository_at(&checkout, &baked, false);
+    assert_eq!(
+        stdout_of(setup_git(&checkout).args(["rev-parse", "HEAD"])),
+        baked,
+        "the checkout's HEAD is not this binary's commit, so the check would \
+         refuse it on the commit alone and prove nothing"
+    );
+
+    let out = without_git_variables(&mut hops())
+        .args(["build-check", "--repo"])
+        .arg(&checkout)
+        .arg("--strict")
+        .output()
+        .expect("run");
+    let report = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "no source file's time was read, so only the commit was compared, yet a \
+         strict gate did not say so. stdout: {report:?}"
+    );
+    assert!(
+        report.contains("CANNOT VERIFY: the commit matches, but no source file's time"),
+        "the report does not say why nothing was compared: {report:?}"
+    );
+}
+
 /// `git status` refreshes the index when a file's timestamp no longer matches
 /// the one recorded, and writes it back under the index lock. A commit started
 /// at that moment fails on the lock. The check only reads, so it must leave the

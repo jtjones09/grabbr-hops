@@ -75,6 +75,9 @@ pub enum Uncompared {
     NoWorkTree,
     /// The path someone named is below the top of this checkout.
     InsideCheckout { top: PathBuf },
+    /// The commit matches, but no tracked source file's time, or the binary's,
+    /// could be read.
+    TimesUnread,
 }
 
 impl Uncompared {
@@ -85,6 +88,7 @@ impl Uncompared {
             Uncompared::NoCheckout => "no source tree to compare against",
             Uncompared::NoWorkTree => "no work tree to compare against",
             Uncompared::InsideCheckout { .. } => "no checkout starts at the path given",
+            Uncompared::TimesUnread => "the commit matches; no source time was compared",
         }
     }
 
@@ -110,6 +114,10 @@ impl Uncompared {
                  that directory",
                 top.display()
             ),
+            Uncompared::TimesUnread => "the commit matches, but no source file's time, or \
+                 the binary's, could be read, so an edit made since the build would go \
+                 unseen"
+                .to_string(),
         }
     }
 }
@@ -172,10 +180,14 @@ pub fn judge(
             head: head.to_string(),
         };
     }
-    if let (Some(bin), Some((path, src))) = (binary_mtime, newest_source) {
-        if src > bin {
-            return Verdict::SourceNewer { newest: path };
-        }
+    // The timestamps are the half that catches an edit made since the build.
+    // With either side unread only the commit was compared, and saying "up to
+    // date" then would pass a gate on half a check.
+    let (Some(bin), Some((path, src))) = (binary_mtime, newest_source) else {
+        return Verdict::NotCompared(Uncompared::TimesUnread);
+    };
+    if src > bin {
+        return Verdict::SourceNewer { newest: path };
     }
     Verdict::Current
 }
@@ -204,7 +216,8 @@ fn git(repo: &Path, args: &[&str]) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
-/// The most recently modified tracked source file, if any.
+/// The most recently modified tracked source file, or `None` when git could not
+/// list the tracked files or none of the source files it lists is on disk.
 ///
 /// Tracked files only, via `git ls-files`: a target directory holds build
 /// output newer than any source, and untracked scratch files are not what the
@@ -573,6 +586,25 @@ mod tests {
             "an installed copy has no source to be behind — refusing to launch \
              it would be nonsense"
         );
+    }
+
+    // LEDGER T23 | class B | 1 return value: build_check::judge
+    #[test]
+    fn a_matching_commit_with_no_time_read_is_not_current() {
+        for (binary, source) in [
+            (Some(t(100)), None),
+            (None, Some(("src/x.rs".to_string(), t(50)))),
+            (None, None),
+        ] {
+            assert_eq!(
+                judge("abc12345", Ok("abc12345"), binary, source.clone()),
+                Verdict::NotCompared(Uncompared::TimesUnread),
+                "the commit matched but the times were not compared (binary \
+                 {binary:?}, newest source {source:?}); calling that current \
+                 passes a strict gate that never looked for an edit made since \
+                 the build"
+            );
+        }
     }
 
     #[test]
