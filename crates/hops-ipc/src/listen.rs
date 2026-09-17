@@ -179,14 +179,19 @@ async fn write_one(entry: &mut TxStream, bytes: &[u8]) -> bool {
 ///   refuses file locks, the daemon exits with
 ///   [`IpcListenerCreationError::Lock`] rather than run without the check.
 /// * **The lock goes when the socket's directory is cleared.** Something that
-///   deletes both files while a daemon runs (a clean-up of `~/Library/Caches`,
-///   which macOS may purge, or of `$XDG_RUNTIME_DIR`, whose files the XDG base
-///   directory specification lets a clean-up remove after six hours
-///   untouched) leaves that daemon unreachable, and a second daemon can then
-///   claim a new lock and socket and read the config and keys. It stops when
-///   it binds the peer port the first still holds. On macOS the front door
-///   does not start that second daemon, since launchd names the running
-///   job's process instead.
+///   deletes both files while a daemon runs leaves that daemon unreachable,
+///   and a second daemon can then claim a new lock and socket and read the
+///   config and keys. It stops when it binds the peer port the first still
+///   holds.
+///
+///   On macOS the socket is in `~/Library/Caches`, which macOS may purge. The
+///   front door does not start that second daemon there, since launchd names
+///   the running job's process instead. Elsewhere it is in `$XDG_RUNTIME_DIR`,
+///   whose files the XDG base directory specification lets a periodic
+///   clean-up remove unless each has the sticky bit set or its access time
+///   updated every six hours. The lock and the socket get the sticky bit,
+///   which `systemd-tmpfiles` honours. A clean-up that ignores it, or someone
+///   removing the files, still leaves the gap.
 ///
 ///   The lock stays beside the socket anyway. `$XDG_RUNTIME_DIR` is the one
 ///   directory the specification requires to be local and to support file
@@ -233,6 +238,8 @@ impl Claim {
             }
         };
         let lock = lock_beside_with(&socket_path, ownership::foreign_owner)?;
+        #[cfg(not(target_os = "macos"))]
+        keep_through_clean_ups(&lock_path(&socket_path));
 
         // `symlink_metadata`, not `exists`: a dangling link at the path would
         // otherwise pass as absent and fail the bind as if a daemon held it.
@@ -272,6 +279,8 @@ impl Claim {
                 });
             }
         };
+        #[cfg(not(target_os = "macos"))]
+        keep_through_clean_ups(&socket_path);
         Ok(Self {
             listener,
             endpoint: endpoint.clone(),
@@ -302,6 +311,38 @@ impl Claim {
     }
 }
 
+/// `<socket_path>.lock`, the file a daemon locks to claim `socket_path`.
+#[cfg(unix)]
+fn lock_path(socket_path: &std::path::Path) -> PathBuf {
+    let mut name = socket_path.as_os_str().to_owned();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+/// Set the sticky bit on `path`, keeping its other mode bits.
+///
+/// The XDG base directory specification names the bit as what keeps a file in
+/// `$XDG_RUNTIME_DIR` from a periodic clean-up, and `systemd-tmpfiles` skips
+/// files that have it. It means nothing else on a file on Linux. A daemon that
+/// cannot set it still runs, and says so.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn keep_through_clean_ups(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    const STICKY: u32 = 0o1000;
+    let marked = std::fs::symlink_metadata(path).and_then(|meta| {
+        let mode = meta.permissions().mode() & 0o7777;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | STICKY))
+    });
+    if let Err(e) = marked {
+        log::warn!(
+            "could not set the sticky bit on {} ({e}). A clean-up of its \
+             directory may remove it while the daemon runs, and frontends would \
+             then no longer reach the daemon.",
+            path.display()
+        );
+    }
+}
+
 /// Lock `<socket_path>.lock` exclusively, without waiting.
 ///
 /// `whose` says who owns the lock file when opening it failed, as
@@ -312,9 +353,7 @@ fn lock_beside_with(
     whose: impl FnOnce(&std::path::Path, &std::io::Error) -> Option<ownership::Foreign>,
 ) -> Result<std::fs::File, IpcListenerCreationError> {
     use std::os::unix::fs::OpenOptionsExt;
-    let mut name = socket_path.as_os_str().to_owned();
-    name.push(".lock");
-    let path = PathBuf::from(name);
+    let path = lock_path(socket_path);
     let file = match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -865,6 +904,35 @@ mod at_most_one_daemon {
         assert!(
             hint_of(mine).contains("Check that this user can create and write it"),
             "a lock file this user owns must get the ordinary hint"
+        );
+    }
+
+    // LEDGER T47 | class B | 4 file on disk
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_lock_and_the_socket_are_marked_to_be_kept_through_clean_ups() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = socket_path("sticky");
+        remove(&path);
+        let claim = runtime()
+            .block_on(Claim::take(&DaemonEndpoint::Unix(path.clone())))
+            .expect("a claim on a free endpoint");
+        let mode = |p: &Path| {
+            std::fs::symlink_metadata(p)
+                .map(|m| m.permissions().mode() & 0o7777)
+                .unwrap_or(0)
+        };
+        let (socket, lock) = (mode(&path), mode(&super::lock_path(&path)));
+        drop(claim);
+        remove(&path);
+        assert_eq!(
+            (socket & 0o1000, lock),
+            (0o1000, 0o1600),
+            "(sticky bit on the socket, mode of the lock file), socket mode \
+             {socket:o}. `$XDG_RUNTIME_DIR` may be cleaned of files that have \
+             neither the sticky bit nor a recent access time, which leaves a \
+             running daemon that no frontend can reach and a second daemon free \
+             to start."
         );
     }
 
