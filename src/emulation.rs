@@ -350,9 +350,10 @@ impl ListenTask {
                                     // takes over a minute after a lapse.
                                     //
                                     // Once per refusal, not per event: absolute
-                                    // motion is not refused and re-creates the
-                                    // handle, so a release per event tore it
-                                    // down and built it again for every pair.
+                                    // motion is not refused yet (#156) and
+                                    // re-creates the handle, so a release per
+                                    // event tore it down and built it again
+                                    // for every pair.
                                     log::warn!(
                                         "releasing held keys and buttons: \
                                          {addr} may no longer drive this machine"
@@ -1469,16 +1470,20 @@ mod held_input_is_released {
         });
     }
 
-    // LEDGER T18 | class B | 6 struct state: Recording::calls() after refused events interleaved with absolute motion
-    /// Absolute motion is not refused, and it re-creates the emulation handle
-    /// the refusal destroyed. Releasing on every refused event then tore that
-    /// handle down and built it again for each pair of events: on wlroots a
-    /// new virtual pointer and keyboard every time. A refusal releases once.
+    // LEDGER T18 | class B | 6 struct state: Recording::calls() after refused Input events, synced by a Capability marker and a permitted peer's input
+    /// A refusal releases the peer once. Absolute motion is not refused yet
+    /// (#156) and re-creates the handle the refusal destroyed, so releasing on
+    /// every refused event tore that handle down and built it again for each
+    /// pair: on wlroots a new virtual pointer and keyboard every time.
+    ///
+    /// Nothing here needs that motion to be injected. Once #156 refuses it
+    /// too, this still passes, but a release per event then has no handle to
+    /// destroy, and only the repeated warning would show it.
     #[test]
     fn a_refused_peer_is_released_once_not_per_event() {
         run_local(async {
-            let s = session().await;
-            let handle = s.inject(button(BTN_LEFT, 1)).await;
+            let mut s = session_with(2).await;
+            let handle = s.inject_from(0, button(BTN_LEFT, 1)).await;
 
             s.trust
                 .write()
@@ -1490,7 +1495,7 @@ mod held_input_is_released {
                 value: 1.0,
             });
             for seq in 1..=5u32 {
-                s.dialer()
+                s.peers[0]
                     .send(ProtoEvent::PointerMotionAbsolute {
                         seq,
                         ts: 0,
@@ -1498,41 +1503,39 @@ mod held_input_is_released {
                         vy: 0.0,
                     })
                     .await;
-                s.dialer().send(ProtoEvent::Input(scroll)).await;
+                s.peers[0].send(ProtoEvent::Input(scroll)).await;
             }
-            // Handled after every event above, so once it reaches the backend
-            // so has everything the refusals asked for.
-            s.dialer()
-                .send(ProtoEvent::PointerMotionAbsolute {
-                    seq: 6,
-                    ts: 0,
-                    vx: 6.0,
-                    vy: 0.0,
-                })
+
+            // Sent on the same stream after the events above and never
+            // refused, so once the listener reports it, it has handled them
+            // all and queued every release they asked for.
+            const MARKER: u32 = 0x7e57_0018;
+            s.peers[0]
+                .send(ProtoEvent::Capability { flags: MARKER })
                 .await;
-            let motions = || {
-                s.recording
-                    .calls()
-                    .iter()
-                    .filter(|c| {
-                        matches!(
-                            c,
-                            Recorded::Consume(Event::Pointer(PointerEvent::Motion { .. }), _)
-                        )
-                    })
-                    .count()
-            };
-            wait_until(
-                "every absolute motion to reach the backend",
-                Duration::from_secs(10),
-                || motions() == 6,
-            )
-            .await;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let EmulationEvent::PeerCaps { flags: MARKER, .. } =
+                        s.emulation.event().await
+                    {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("the listener handled the refused peer's events within 10s");
+            // Queued behind those releases, so once it reaches the backend so
+            // has every one of them.
+            s.inject_from(1, key(KEY_A, 1)).await;
 
             let calls = s.recording.calls();
             assert!(
                 calls.contains(&Recorded::Destroy(handle)),
                 "precondition: the refusal released the peer: {calls:?}"
+            );
+            assert!(
+                s.consumed(scroll).is_empty(),
+                "precondition: the refused events were not injected: {calls:?}"
             );
             let destroyed = calls
                 .iter()
@@ -1540,8 +1543,8 @@ mod held_input_is_released {
                 .count();
             assert_eq!(
                 destroyed, 1,
-                "five refused events each tore the peer's emulation handle down \
-                 again after its absolute motion re-created it: {calls:?}"
+                "five refused events each tore the refused peer's emulation \
+                 handle down again: {calls:?}"
             );
         });
     }
