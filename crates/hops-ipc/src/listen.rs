@@ -201,7 +201,10 @@ async fn write_one(entry: &mut TxStream, bytes: &[u8]) -> bool {
 /// * **A daemon from before the lock takes none,** wherever the lock is kept.
 ///   It still refuses to start beside a socket that answers, and a newer
 ///   daemon refuses beside it, but the two starting at the same moment beside
-///   a stale socket can both bind.
+///   a stale socket can both bind. On macOS a connect to a listener whose
+///   queue of connections not yet accepted is full is refused as if nothing
+///   listened, so a newer daemon also takes over the socket of an older one
+///   that has stopped accepting.
 struct Claim {
     #[cfg(windows)]
     listener: TcpListener,
@@ -247,9 +250,15 @@ impl Claim {
             // A daemon that predates the lock holds none, so ask the socket too.
             match UnixStream::connect(&socket_path).await {
                 Ok(_) => return Err(IpcListenerCreationError::AlreadyRunning),
+                // On Linux, a connect that does not wait gets WouldBlock
+                // from a listener whose queue of connections not yet
+                // accepted is full. Something listens.
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    return Err(IpcListenerCreationError::AlreadyRunning);
+                }
                 // Nothing listens, and the lock says no other daemon is
                 // starting, so the file is left over from one that is gone.
-                Err(e) => {
+                Err(e) if nothing_listens(&e) => {
                     log::debug!("{socket_path:?}: {e} - removing left behind socket");
                     match std::fs::remove_file(&socket_path) {
                         Err(source) if source.kind() != ErrorKind::NotFound => {
@@ -262,6 +271,15 @@ impl Claim {
                         }
                         _ => {}
                     }
+                }
+                // Anything else, such as a socket this user may not connect
+                // to, cannot say whether a daemon listens there. The file is
+                // left alone.
+                Err(source) => {
+                    return Err(IpcListenerCreationError::Bind {
+                        endpoint: endpoint.clone(),
+                        source,
+                    });
                 }
             }
         }
@@ -317,6 +335,16 @@ fn lock_path(socket_path: &std::path::Path) -> PathBuf {
     let mut name = socket_path.as_os_str().to_owned();
     name.push(".lock");
     PathBuf::from(name)
+}
+
+/// Whether a failed connect to a Unix socket path says that nothing listens
+/// there: no listener on the socket, nothing at the path, or a file that is
+/// not a socket, which Linux reports as a refused connection and macOS as
+/// `ENOTSOCK`.
+#[cfg(unix)]
+fn nothing_listens(e: &std::io::Error) -> bool {
+    matches!(e.kind(), ErrorKind::ConnectionRefused | ErrorKind::NotFound)
+        || e.raw_os_error() == Some(libc::ENOTSOCK)
 }
 
 /// The sticky bit.
@@ -1039,6 +1067,12 @@ mod at_most_one_daemon {
         );
     }
 
+    /// The inode at `path`, without following a link; 0 when nothing is there.
+    fn inode(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path).map_or(0, |m| m.ino())
+    }
+
     /// The permission bits at `path` in octal, without following a link;
     /// "nothing" when nothing is there.
     fn mode(path: &Path) -> String {
@@ -1141,6 +1175,75 @@ mod at_most_one_daemon {
              file), (file mode, socket mode) after those, (socket marked, its \
              mode)). A link where the socket was, followed as root, sets the \
              mode of the file it names."
+        );
+    }
+
+    // LEDGER T51 | class B | 1 return value / error + 4 file on disk
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_daemon_starting_beside_a_listener_with_a_full_queue_leaves_its_socket() {
+        use std::os::fd::AsRawFd;
+        let path = socket_path("fullqueue");
+        remove(&path);
+        let older = std::os::unix::net::UnixListener::bind(&path).expect("a unix listener");
+        // SAFETY: plain values on an open socket. Linux takes a second
+        // `listen` as a new queue length; with 0, one waiting connection
+        // fills the queue.
+        let listened = unsafe { libc::listen(older.as_raw_fd(), 0) };
+        let waiting = std::os::unix::net::UnixStream::connect(&path).expect("a waiting connection");
+        let before = inode(&path);
+
+        let got = runtime().block_on(Claim::take(&DaemonEndpoint::Unix(path.clone())));
+        let after = inode(&path);
+        let outcome = describe(&got);
+        drop(got);
+        drop((waiting, older));
+        remove(&path);
+
+        assert_eq!(listened, 0, "the stand-in could not shorten its queue");
+        assert_eq!(
+            (outcome.as_str(), after),
+            ("AlreadyRunning", before),
+            "(outcome, inode at the socket path; it was {before}). A listener that \
+             has not accepted yet still holds its socket. Removing it leaves that \
+             daemon unreachable beside a second one."
+        );
+    }
+
+    // LEDGER T52 | class B | 1 return value / error + 4 file on disk
+    #[test]
+    fn a_socket_this_user_may_not_connect_to_is_left_where_it_is() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("not checked: nothing refuses root a connection");
+            return;
+        }
+        let path = socket_path("refused");
+        remove(&path);
+        let other = std::os::unix::net::UnixListener::bind(&path).expect("a unix listener");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+            .expect("a socket no one may connect to");
+        let before = inode(&path);
+
+        let got = runtime().block_on(Claim::take(&DaemonEndpoint::Unix(path.clone())));
+        let after = inode(&path);
+        let outcome = match &got {
+            Err(IpcListenerCreationError::Bind { source, .. }) => {
+                format!("Bind: {:?}", source.kind())
+            }
+            other => describe(other),
+        };
+        drop(got);
+        drop(other);
+        remove(&path);
+
+        assert_eq!(
+            (outcome.as_str(), after),
+            ("Bind: PermissionDenied", before),
+            "(outcome, inode at the socket path; it was {before}). A refused \
+             connection does not say that nothing listens. The socket may be a \
+             running daemon's, which removing it leaves unreachable."
         );
     }
 
