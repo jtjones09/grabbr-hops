@@ -1018,6 +1018,7 @@ mod held_input_is_released {
     use super::*;
     use crate::test_harness::{Dialer, dialer, machine, run_local, trust, wait_until};
     use crate::trust::Caps;
+    use input_emulation::ButtonScope;
     use input_emulation::recording::{Recorded, Recording};
     use input_event::{BTN_LEFT, BTN_RIGHT, KeyboardEvent, scancode};
 
@@ -1034,8 +1035,14 @@ mod held_input_is_released {
         fingerprints: Vec<String>,
     }
 
-    /// `n` senders that have crossed onto this machine and are ready to inject.
+    /// `n` senders that have crossed onto this machine and are ready to inject,
+    /// into a backend whose handles share one device.
     async fn session_with(n: usize) -> Session {
+        session_scoped(n, ButtonScope::Machine).await
+    }
+
+    /// [`session_with`], into a backend that counts buttons as `scope` says.
+    async fn session_scoped(n: usize, scope: ButtonScope) -> Session {
         let receiver = machine();
         let senders: Vec<_> = (0..n).map(|_| machine()).collect();
         let receiver_trust = trust(
@@ -1051,7 +1058,7 @@ mod held_input_is_released {
         )
         .await
         .expect("listener");
-        let recording = Recording::new();
+        let recording = Recording::with_button_scope(scope);
         let emulation = Emulation::new(Some(recording.backend()), listener, receiver_trust.clone());
         let mut peers = vec![];
         for sender in &senders {
@@ -1134,6 +1141,11 @@ mod held_input_is_released {
 
         fn position(&self, event: Event) -> Option<usize> {
             self.consumed(event).first().map(|&(at, _)| at)
+        }
+
+        /// The handle each time `event` reached the backend, in order.
+        fn handles_of(&self, event: Event) -> Vec<EmulationHandle> {
+            self.consumed(event).iter().map(|&(_, h)| h).collect()
         }
 
         /// Wait for `handle` to be destroyed, and say where in the log it was.
@@ -1582,6 +1594,151 @@ mod held_input_is_released {
                     .await,
                 "the peer was granted again, pressed the right button, and was \
                  refused again, and the right button was never released: {:?}",
+                s.recording.calls()
+            );
+        });
+    }
+
+    // LEDGER T23 | class B | 6 struct state: Recording::calls() after A holds, B presses and lets go, then A lets go (PerHandle)
+    /// Where each peer has a device of its own and presses are counted across
+    /// devices (wlroots 0.19 and later), the button comes up for applications
+    /// only once every device that pressed it has let go. The first holder's
+    /// own up must still go out, on its own device, after another peer's up.
+    #[test]
+    fn per_device_every_holder_lets_go_through_its_own_device() {
+        run_local(async {
+            let s = session_scoped(2, ButtonScope::PerHandle).await;
+            let first = s.inject_from(0, button(BTN_LEFT, 1)).await;
+            let second = s.inject_from(1, button(BTN_LEFT, 1)).await;
+            assert_ne!(first, second, "precondition: one handle per peer");
+            s.inject_from(1, button(BTN_LEFT, 0)).await;
+
+            s.peers[0]
+                .send(ProtoEvent::Input(button(BTN_LEFT, 0)))
+                .await;
+            // After the up on the same stream: once this is in, so is the up.
+            s.inject_from(0, key(KEY_A, 1)).await;
+
+            assert_eq!(
+                s.handles_of(button(BTN_LEFT, 0)),
+                vec![second, first],
+                "each device pressed the left button once, so each must let go \
+                 of it once; a counted press with no up keeps it held: {:?}",
+                s.recording.calls()
+            );
+        });
+    }
+
+    // LEDGER T24 | class B | 6 struct state: Recording::calls() after A leaves while B holds, then B lets go (PerHandle)
+    /// A peer that leaves while another still holds the same button releases
+    /// its own device's press. The other device's press keeps the button
+    /// down until that peer lets go.
+    #[test]
+    fn per_device_a_leaving_peer_releases_its_press_while_another_holds() {
+        run_local(async {
+            let s = session_scoped(2, ButtonScope::PerHandle).await;
+            let first = s.inject_from(0, button(BTN_LEFT, 1)).await;
+            let second = s.inject_from(1, button(BTN_LEFT, 1)).await;
+            assert_ne!(first, second, "precondition: one handle per peer");
+
+            s.peers[0].send(ProtoEvent::Leave(0)).await;
+            assert!(
+                s.released_before_destroy(first, button(BTN_LEFT, 0)).await,
+                "the first peer left holding the left button on its own device \
+                 and that press was never released: {:?}",
+                s.recording.calls()
+            );
+
+            s.inject_from(1, button(BTN_LEFT, 0)).await;
+            assert_eq!(
+                s.handles_of(button(BTN_LEFT, 0)),
+                vec![first, second],
+                "one up per device that pressed: {:?}",
+                s.recording.calls()
+            );
+        });
+    }
+
+    // LEDGER T25 | class B | 6 struct state: Recording::calls() after an up from a peer holding nothing, then the holder's Leave (PerHandle)
+    /// A sender that crossed back on a new connection lets go there, while
+    /// its old connection still holds the press. The up goes out on the
+    /// device that pressed, and that device then has nothing left to release.
+    #[test]
+    fn per_device_an_up_from_another_peer_goes_out_on_the_pressing_device() {
+        run_local(async {
+            let s = session_scoped(2, ButtonScope::PerHandle).await;
+            let first = s.inject_from(0, button(BTN_LEFT, 1)).await;
+
+            s.peers[1]
+                .send(ProtoEvent::Input(button(BTN_LEFT, 0)))
+                .await;
+            let second = s.inject_from(1, key(KEY_A, 1)).await;
+            assert_ne!(first, second, "precondition: one handle per peer");
+            assert_eq!(
+                s.handles_of(button(BTN_LEFT, 0)),
+                vec![first],
+                "the up must go out on the device that pressed the button, or \
+                 that device keeps its press: {:?}",
+                s.recording.calls()
+            );
+
+            s.peers[0].send(ProtoEvent::Leave(0)).await;
+            s.destroyed(first).await;
+            assert_eq!(
+                s.consumed(button(BTN_LEFT, 0)).len(),
+                1,
+                "the pressing device already let go, and its teardown injected \
+                 another up: {:?}",
+                s.recording.calls()
+            );
+        });
+    }
+
+    // LEDGER T26 | class B | 6 struct state: Recording::calls() after the same peer presses twice (PerHandle)
+    /// A device holds a button once and releases it once. A second press from
+    /// the same peer would be counted with no up ever to match it.
+    #[test]
+    fn per_device_a_repeated_press_from_the_holder_is_not_injected() {
+        run_local(async {
+            let s = session_scoped(1, ButtonScope::PerHandle).await;
+            s.inject(button(BTN_LEFT, 1)).await;
+
+            s.dialer()
+                .send(ProtoEvent::Input(button(BTN_LEFT, 1)))
+                .await;
+            s.inject(key(KEY_A, 1)).await;
+
+            assert_eq!(
+                s.consumed(button(BTN_LEFT, 1)).len(),
+                1,
+                "a second press of a button the device already holds reached \
+                 the backend: {:?}",
+                s.recording.calls()
+            );
+        });
+    }
+
+    // LEDGER T27 | class B | 6 struct state: Recording::calls() after a Leave, then the peer's own late up (PerHandle)
+    /// The late up of T12, where each peer has its own device: nothing holds
+    /// the button any more, so the up is dropped here too.
+    #[test]
+    fn per_device_a_late_button_up_after_a_teardown_is_not_injected_again() {
+        run_local(async {
+            let s = session_scoped(1, ButtonScope::PerHandle).await;
+            let handle = s.inject(button(BTN_LEFT, 1)).await;
+            s.dialer().send(ProtoEvent::Leave(0)).await;
+            s.destroyed(handle).await;
+
+            s.dialer()
+                .send(ProtoEvent::Input(button(BTN_LEFT, 0)))
+                .await;
+            s.inject(key(KEY_A, 1)).await;
+
+            assert_eq!(
+                s.consumed(button(BTN_LEFT, 0)).len(),
+                1,
+                "the left button was released at the Leave, and the peer's late \
+                 up was injected as a second one: {:?}",
                 s.recording.calls()
             );
         });

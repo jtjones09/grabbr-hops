@@ -18,7 +18,7 @@ use std::{
 use async_trait::async_trait;
 use input_event::Event;
 
-use crate::{Backend, Emulation, EmulationHandle, error::EmulationError};
+use crate::{Backend, ButtonScope, Emulation, EmulationHandle, error::EmulationError};
 
 /// Which [`Recording`] a [`Backend::Recording`] writes to.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -35,10 +35,10 @@ pub enum Recorded {
 
 type FailWhen = Box<dyn Fn(&Event) -> bool + Send>;
 
-#[derive(Default)]
 struct Log {
     calls: Vec<Recorded>,
     fail_when: Option<FailWhen>,
+    button_scope: ButtonScope,
 }
 
 type Shared = Arc<Mutex<Log>>;
@@ -57,10 +57,22 @@ pub struct Recording {
 }
 
 impl Recording {
+    /// A recording that answers like a backend whose handles share one
+    /// device.
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
+        Self::with_button_scope(ButtonScope::Machine)
+    }
+
+    /// A recording that answers `scope` when asked how it counts buttons, so
+    /// a test can drive the release rules of either kind of backend.
+    pub fn with_button_scope(button_scope: ButtonScope) -> Self {
         let id = RecordingId(NEXT_ID.fetch_add(1, Ordering::Relaxed));
-        let log = Shared::default();
+        let log = Arc::new(Mutex::new(Log {
+            calls: Vec::new(),
+            fail_when: None,
+            button_scope,
+        }));
         REGISTRY
             .lock()
             .expect("recording registry")
@@ -151,5 +163,9 @@ impl Emulation for RecordingEmulation {
 
     async fn terminate(&mut self) {
         self.record(Recorded::Terminate);
+    }
+
+    fn button_scope(&self) -> ButtonScope {
+        self.log.lock().expect("recording log").button_scope
     }
 }

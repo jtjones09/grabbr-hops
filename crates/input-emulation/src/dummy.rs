@@ -3,7 +3,7 @@ use input_event::Event;
 
 use crate::error::EmulationError;
 
-use super::{Emulation, EmulationHandle};
+use super::{ButtonScope, Emulation, EmulationHandle};
 
 #[derive(Default)]
 pub(crate) struct DummyEmulation;
@@ -28,5 +28,10 @@ impl Emulation for DummyEmulation {
     async fn destroy(&mut self, _: EmulationHandle) {}
     async fn terminate(&mut self) {
         /* nothing to do */
+    }
+
+    /// Injects nothing; one logger stands in for every handle.
+    fn button_scope(&self) -> ButtonScope {
+        ButtonScope::Machine
     }
 }

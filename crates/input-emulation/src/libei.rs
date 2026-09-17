@@ -30,7 +30,7 @@ use input_event::{Event, KeyboardEvent, PointerEvent};
 
 use crate::error::EmulationError;
 
-use super::{Emulation, EmulationHandle, error::LibeiEmulationCreationError};
+use super::{ButtonScope, Emulation, EmulationHandle, error::LibeiEmulationCreationError};
 
 #[derive(Clone, Default)]
 struct Devices {
@@ -260,6 +260,15 @@ impl Emulation for LibeiEmulation {
     async fn terminate(&mut self) {
         let _ = self.session.close().await;
         self.ei_task.abort();
+    }
+
+    /// Every handle injects through the one button device the EIS server
+    /// gave this context (`Devices::button`). mutter ignores a repeated press
+    /// or release on a device (`handle_button` in meta-eis-client.c), so the
+    /// first up lets go of that device's press. How other EIS servers count
+    /// is not checked.
+    fn button_scope(&self) -> ButtonScope {
+        ButtonScope::Machine
     }
 }
 

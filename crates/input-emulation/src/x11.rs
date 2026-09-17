@@ -11,7 +11,7 @@ use input_event::{
 
 use crate::error::EmulationError;
 
-use super::{Emulation, EmulationHandle, error::X11EmulationCreationError};
+use super::{ButtonScope, Emulation, EmulationHandle, error::X11EmulationCreationError};
 
 pub(crate) struct X11Emulation {
     display: *mut xlib::Display,
@@ -150,5 +150,15 @@ impl Emulation for X11Emulation {
 
     async fn terminate(&mut self) {
         /* nothing to do */
+    }
+
+    /// Every handle shares one display connection, so every fake button goes
+    /// through the server's one XTEST pointer. The X server
+    /// (`UpdateDeviceState` in Xi/exevents.c) ignores a press for a button
+    /// that device already holds and lets go at its first release. The
+    /// master pointer keeps the button down while another device, such as
+    /// the local mouse, still holds it.
+    fn button_scope(&self) -> ButtonScope {
+        ButtonScope::Machine
     }
 }

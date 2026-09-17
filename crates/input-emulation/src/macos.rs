@@ -1,4 +1,4 @@
-use super::{EdgeSide, Emulation, EmulationHandle, error::EmulationError};
+use super::{ButtonScope, EdgeSide, Emulation, EmulationHandle, error::EmulationError};
 use async_trait::async_trait;
 use bitflags::bitflags;
 use core_graphics::base::CGFloat;
@@ -2321,6 +2321,14 @@ impl Emulation for MacOSEmulation {
     async fn terminate(&mut self) {
         self.cancel_repeat_task().await;
         self.modifier_state.set(XMods::empty());
+    }
+
+    /// Every handle posts through the one `event_source` and shares the one
+    /// `pressed_buttons` set, so a button is down or up for the whole
+    /// machine. How the window server treats a second down, or a button the
+    /// local user holds, is not published and not checked.
+    fn button_scope(&self) -> ButtonScope {
+        ButtonScope::Machine
     }
 }
 
