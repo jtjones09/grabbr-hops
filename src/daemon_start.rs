@@ -148,6 +148,10 @@ pub fn start_unless_running(
 /// `endpoint`. Returns [`DaemonStart::Started`], [`DaemonStart::NoAnswer`],
 /// [`DaemonStart::Exited`], or [`DaemonStart::AlreadyRunning`] when another
 /// daemon serves and `pid` has ended.
+///
+/// Each ask gets at most what is left of the wait, so the wait is over by
+/// `within` whatever is on the endpoint, give or take one connection attempt
+/// once `pid` has ended.
 fn wait_for_daemon(
     endpoint: &DaemonEndpoint,
     pid: u32,
@@ -691,6 +695,94 @@ mod waiting_for_the_daemon {
             "this start's process exited while another daemon held the endpoint \
              and then served. Reporting {got:?} either calls the exited process \
              the daemon, or gives up on a daemon that is running."
+        );
+    }
+
+    /// A daemon on a loopback port that takes each connection's token, then
+    /// starts a line of JSON and adds a space to it every 50 ms, never ending
+    /// it, for up to 5 s or until the asker hangs up. Asked through the real
+    /// [`DaemonEndpoint::serves`]; its process never ends.
+    struct Trickling {
+        addr: std::net::SocketAddr,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Trickling {
+        const TOKEN: &'static str =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        fn start() -> Self {
+            use std::io::{Read, Write};
+            use std::sync::atomic::Ordering;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+            let addr = listener.local_addr().expect("its address");
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stopped = stop.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    if stopped.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let Ok(mut stream) = stream else { continue };
+                    std::thread::spawn(move || {
+                        let _ = stream.set_nodelay(true);
+                        let _ = stream.read(&mut [0u8; Trickling::TOKEN.len() + 1]);
+                        let began = Instant::now();
+                        let mut sent = stream.write_all(b"{");
+                        while sent.is_ok() && began.elapsed() < Duration::from_secs(5) {
+                            std::thread::sleep(Duration::from_millis(50));
+                            sent = stream.write_all(b" ");
+                        }
+                    });
+                }
+            });
+            Self { addr, stop }
+        }
+    }
+
+    impl Drop for Trickling {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Release);
+            // Wake the accept loop so it sees the flag.
+            let _ = std::net::TcpStream::connect(self.addr);
+        }
+    }
+
+    impl Watch for Trickling {
+        fn serves(&mut self, endpoint: &DaemonEndpoint, within: Duration) -> bool {
+            endpoint.serves(Self::TOKEN, within)
+        }
+
+        fn ended(&mut self, _: u32) -> bool {
+            false
+        }
+
+        fn log_file(&self) -> Option<PathBuf> {
+            None
+        }
+    }
+
+    // LEDGER T44 | class B | 1 return value + elapsed time over a real socket
+    #[test]
+    fn a_daemon_that_trickles_bytes_does_not_stretch_the_wait() {
+        let mut daemon = Trickling::start();
+        let endpoint = DaemonEndpoint::Tcp(daemon.addr);
+        // Past one whole ask, so the last ask must be cut to what is left.
+        let within = super::ASK_WITHIN + Duration::from_millis(200);
+        let began = Instant::now();
+        let got = super::wait_for_daemon(&endpoint, PID, &mut daemon, within);
+        let took = began.elapsed();
+        drop(daemon);
+        assert_eq!(
+            got,
+            DaemonStart::NoAnswer(PID),
+            "a daemon that never finished a line was reported as {got:?}"
+        );
+        assert!(
+            took < within + Duration::from_millis(600),
+            "the wait was to last {within:?} and took {took:?}. Something on the \
+             endpoint that sends a byte now and then must not keep the app from \
+             opening past the wait."
         );
     }
 
