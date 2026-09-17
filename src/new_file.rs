@@ -151,11 +151,17 @@ pub(crate) fn remove_abandoned_temporaries(path: &Path) {
 
 /// The process id in `file_name` when it is a temporary this module writes
 /// for the file whose sibling names start with `prefix`.
+///
+/// Both numbers must be written as [`unique`] writes them: decimal digits
+/// with no leading zero, a process id that fits a `u32` and a counter that
+/// fits a `u64`.
 fn temporary_writer(file_name: &str, prefix: &str) -> Option<u32> {
     let middle = file_name.strip_prefix(prefix)?.strip_suffix(".tmp")?;
     let (pid, n) = middle.split_once('.')?;
-    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    if !digits(pid) || !digits(n) || n.parse::<u64>().is_err() {
+    let as_written = |s: &str| {
+        !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && (s == "0" || !s.starts_with('0'))
+    };
+    if !as_written(pid) || !as_written(n) || n.parse::<u64>().is_err() {
         return None;
     }
     pid.parse().ok()
@@ -516,6 +522,11 @@ mod abandoned_temporaries {
             format!(".lan-mouse.pem.{gone}.0.1.tmp"),
             // A counter no `u64` holds is not one this module wrote.
             format!(".lan-mouse.pem.{gone}.99999999999999999999999.tmp"),
+            // Nor are numbers with a leading zero, which name the same
+            // process and counter.
+            format!(".lan-mouse.pem.0{gone}.0.tmp"),
+            format!(".lan-mouse.pem.{gone}.00.tmp"),
+            format!(".lan-mouse.pem.{gone}.07.tmp"),
             format!("lan-mouse.pem.{gone}.0.tmp"),
             format!(".other.pem.{gone}.0.tmp"),
             ".lan-mouse.pem.lock".to_string(),
