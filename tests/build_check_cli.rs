@@ -605,6 +605,55 @@ fn a_ceiling_the_caller_set_still_stops_the_search_for_a_checkout() {
     );
 }
 
+/// With no path given, the check reads the working directory. A report that
+/// said "the path given" there sent the reader looking for an argument nobody
+/// passed.
+// LEDGER T29 | class B | 5 process exit code + stdout
+#[test]
+fn with_no_path_given_the_report_names_the_working_directory() {
+    let scratch = Scratch::new(&std::env::temp_dir(), "working-dir");
+    if commit_under_test(&scratch.0).is_none() {
+        eprintln!(
+            "nothing compared: this hops was built without a commit baked in, so \
+             it reports that before looking at any directory"
+        );
+        return;
+    }
+    let no_checkout = scratch.0.join("no-checkout");
+    std::fs::create_dir_all(&no_checkout).expect("mkdir");
+    let checkout = scratch.0.join("checkout");
+    repo_with_one_commit(&checkout, "checkout");
+    let dot_git = checkout.join(".git");
+
+    for (dir, reason) in [
+        (
+            &no_checkout,
+            "CANNOT VERIFY: git read no commit from the working directory",
+        ),
+        (
+            &dot_git,
+            "CANNOT VERIFY: the working directory is in a git repository with no work tree",
+        ),
+    ] {
+        let out = without_git_variables(&mut hops())
+            .env_remove("HOPS_REPO")
+            // A temporary directory can sit inside some other checkout.
+            .env("GIT_CEILING_DIRECTORIES", &scratch.0)
+            .current_dir(dir)
+            .args(["build-check", "--strict"])
+            .output()
+            .expect("run");
+        let (code, report) = (out.status.code(), String::from_utf8_lossy(&out.stdout));
+        assert!(
+            code == Some(3) && report.contains(reason) && !report.contains("path given"),
+            "run from {} with no path given, the report did not name the working \
+             directory; expected exit 3 and {reason:?}, got exit {code:?} and \
+             {report:?}",
+            dir.display()
+        );
+    }
+}
+
 /// A path someone names, with `--repo` or `HOPS_REPO`, is the checkout they
 /// mean. git searches upward from a path, so a directory below a checkout was
 /// judged by that checkout: a strict gate for a directory holding no source

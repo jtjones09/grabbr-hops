@@ -68,11 +68,12 @@ pub enum Uncompared {
     /// `build.rs` could not read a commit when this binary was built.
     NoCommitBakedIn,
     /// git found no checkout at the path: none there (a released install, not
-    /// a dev tree), no git, or git refusing it.
-    NoCheckout,
+    /// a dev tree), no git, or git refusing it. `named` when someone gave the
+    /// path, rather than it being the working directory.
+    NoCheckout { named: bool },
     /// The path is a repository with no work tree, a `.git` directory or a bare
     /// clone: it has a commit, but no source files whose times could be read.
-    NoWorkTree,
+    NoWorkTree { named: bool },
     /// The path someone named is below the top of this checkout.
     InsideCheckout { top: PathBuf },
     /// The checkout has no commit git can read at `HEAD`: nothing committed
@@ -88,8 +89,8 @@ impl Uncompared {
     fn summary(&self) -> &'static str {
         match self {
             Uncompared::NoCommitBakedIn => "built without a commit, so there is nothing to compare",
-            Uncompared::NoCheckout => "no source tree to compare against",
-            Uncompared::NoWorkTree => "no work tree to compare against",
+            Uncompared::NoCheckout { .. } => "no source tree to compare against",
+            Uncompared::NoWorkTree { .. } => "no work tree to compare against",
             Uncompared::InsideCheckout { .. } => "no checkout starts at the path given",
             Uncompared::HeadUnread => "no commit in the checkout to compare against",
             Uncompared::TimesUnread => "the commit matches; no source time was compared",
@@ -102,18 +103,30 @@ impl Uncompared {
     /// reason that points at the path sends the reader to check a checkout that
     /// is fine. Rebuilding is enough once git reads the checkout: `build.rs`
     /// reruns on every build until it bakes a commit.
+    ///
+    /// With no path given, the working directory is what was read, and a
+    /// reason naming "the path given" sends the reader looking for an argument
+    /// nobody passed.
     fn reason(&self) -> String {
         match self {
             Uncompared::NoCommitBakedIn => "this binary has no commit baked in; rebuild it \
                  from the top of a git checkout, with a git on PATH that does not refuse \
                  the checkout (safe.directory)"
                 .to_string(),
-            Uncompared::NoCheckout => "git read no commit at the path given (no checkout \
-                 there, no git, or git refused the checkout)"
+            Uncompared::NoCheckout { named: true } => "git read no commit at the path given \
+                 (no checkout there, no git, or git refused the checkout)"
                 .to_string(),
-            Uncompared::NoWorkTree => "the path given is a git repository with no work \
-                 tree (a .git directory or a bare clone), so no source file can be \
-                 compared; give the checkout itself"
+            Uncompared::NoCheckout { named: false } => "git read no commit from the working \
+                 directory (no checkout there or above it, no git, or git refused the \
+                 checkout); run the check inside a checkout, or give one with --repo"
+                .to_string(),
+            Uncompared::NoWorkTree { named: true } => "the path given is a git repository \
+                 with no work tree (a .git directory or a bare clone), so no source file \
+                 can be compared; give the checkout itself"
+                .to_string(),
+            Uncompared::NoWorkTree { named: false } => "the working directory is in a git \
+                 repository with no work tree (a .git directory or a bare clone), so no \
+                 source file can be compared; run the check from the checkout itself"
                 .to_string(),
             Uncompared::InsideCheckout { top } => format!(
                 "the path given is inside the checkout at {}, not its top; give \
@@ -311,8 +324,10 @@ fn locate(path: &Path, named: bool) -> Result<PathBuf, Uncompared> {
     match crate::git_env::work_tree(path) {
         Some((top, is_top)) if is_top || !named => Ok(top),
         Some((top, _)) => Err(Uncompared::InsideCheckout { top }),
-        None if git(path, &["rev-parse", "--git-dir"]).is_some() => Err(Uncompared::NoWorkTree),
-        None => Err(Uncompared::NoCheckout),
+        None if git(path, &["rev-parse", "--git-dir"]).is_some() => {
+            Err(Uncompared::NoWorkTree { named })
+        }
+        None => Err(Uncompared::NoCheckout { named }),
     }
 }
 
@@ -453,7 +468,10 @@ mod tests {
     #[test]
     fn a_gate_that_compared_nothing_does_not_report_success() {
         assert_eq!(
-            report(&rep(Verdict::NotCompared(Uncompared::NoCheckout)), true),
+            report(
+                &rep(Verdict::NotCompared(Uncompared::NoCheckout { named: true })),
+                true
+            ),
             EXIT_CANNOT_VERIFY,
             "under --strict, being unable to find a checkout means nothing was \
              compared. Returning success there is a gate that passes having \
@@ -464,7 +482,12 @@ mod tests {
     // LEDGER T18 | class B | 1 return value: build_check::judge, Uncompared::reason
     #[test]
     fn a_binary_without_a_commit_is_not_blamed_on_the_path() {
-        let why = match judge(NO_COMMIT, Err(Uncompared::NoCheckout), Some(t(100)), None) {
+        let why = match judge(
+            NO_COMMIT,
+            Err(Uncompared::NoCheckout { named: true }),
+            Some(t(100)),
+            None,
+        ) {
             Verdict::NotCompared(why) => why,
             other => panic!("a binary with no commit compared something: {other:?}"),
         };
@@ -481,7 +504,7 @@ mod tests {
              {summary:?}"
         );
 
-        let reason = Uncompared::NoCheckout.reason();
+        let reason = Uncompared::NoCheckout { named: true }.reason();
         assert!(
             reason.contains("at the path given"),
             "a binary that carries a commit compared nothing because git read \
@@ -492,7 +515,7 @@ mod tests {
     #[test]
     fn a_daily_launcher_is_never_blocked() {
         for v in [
-            Verdict::NotCompared(Uncompared::NoCheckout),
+            Verdict::NotCompared(Uncompared::NoCheckout { named: false }),
             Verdict::NotCompared(Uncompared::InsideCheckout {
                 top: PathBuf::from("/src/hops"),
             }),
@@ -593,8 +616,13 @@ mod tests {
     #[test]
     fn a_release_install_outside_a_checkout_is_not_stale() {
         assert_eq!(
-            judge("abc12345", Err(Uncompared::NoCheckout), Some(t(100)), None),
-            Verdict::NotCompared(Uncompared::NoCheckout)
+            judge(
+                "abc12345",
+                Err(Uncompared::NoCheckout { named: true }),
+                Some(t(100)),
+                None
+            ),
+            Verdict::NotCompared(Uncompared::NoCheckout { named: true })
         );
         assert_eq!(
             judge("unknown", Ok("abc12345"), Some(t(100)), None),
@@ -603,7 +631,13 @@ mod tests {
              a mismatch would make every released install look broken"
         );
         assert!(
-            !judge("abc12345", Err(Uncompared::NoCheckout), None, None).is_stale(),
+            !judge(
+                "abc12345",
+                Err(Uncompared::NoCheckout { named: true }),
+                None,
+                None
+            )
+            .is_stale(),
             "an installed copy has no source to be behind — refusing to launch \
              it would be nonsense"
         );
