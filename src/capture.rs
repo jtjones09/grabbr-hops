@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::{
     cell::{Cell, RefCell},
+    net::SocketAddr,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -15,7 +16,7 @@ use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
-use crate::connect::LanMouseConnection;
+use crate::connect::{LanMouseConnection, LanMouseConnectionError};
 
 pub(crate) struct Capture {
     cancellation_token: CancellationToken,
@@ -77,6 +78,7 @@ impl Capture {
             held_lock_keys: Default::default(),
             buttons_down_on_peer: Default::default(),
             active_client: None,
+            acked_at: None,
             backend,
             cancellation_token: cancellation_token.clone(),
             captures: Default::default(),
@@ -182,6 +184,12 @@ fn is_lock_key(key: u32) -> bool {
 
 struct CaptureTask {
     active_client: Option<CaptureHandle>,
+    /// The client that acknowledged the crossing, and where its connection
+    /// was then, so the frames that end the visit reach the peer holding its
+    /// input. Removing a client, or reloading the config, drops it from the
+    /// client list before capture hears of it; looking the handle up then
+    /// finds nothing, or a new client not yet connected.
+    acked_at: Option<(CaptureHandle, SocketAddr)>,
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
     captures: Vec<(CaptureHandle, Position, CaptureType)>,
@@ -374,6 +382,10 @@ impl CaptureTask {
                         ProtoEvent::Ack(_) => {
                             log::info!("client {handle} acknowledged the connection!");
                             self.state = State::Sending;
+                            if self.active_client == Some(handle) {
+                                self.acked_at =
+                                    self.conn.active_addr(handle).map(|addr| (handle, addr));
+                            }
                         }
                         // client disconnected
                         ProtoEvent::Leave(_) => {
@@ -392,9 +404,11 @@ impl CaptureTask {
                     }
                     CaptureRequest::Destroy(h) => {
                         // Switching off or removing the client we are on:
-                        // nothing more reaches it, so let go first.
+                        // nothing more reaches it, so let go first. A removed
+                        // client is already gone from the client list, which
+                        // is why leaving sends to `acked_at`.
                         let released = if self.active_client == Some(h) {
-                            log::info!("releasing capture: client {h} was switched off");
+                            log::info!("releasing capture: client {h} was switched off or removed");
                             self.release_capture(capture).await
                         } else {
                             Ok(())
@@ -627,8 +641,12 @@ impl CaptureTask {
         // out of order.
         self.pending_motion = None;
         let buttons = std::mem::take(&mut self.buttons_down_on_peer);
+        let acked_at = self.acked_at.take();
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
+            let addr = acked_at
+                .filter(|&(acked, _)| acked == handle)
+                .map(|(_, addr)| addr);
             // Buttons first, for the same reason as the keys below: a release
             // bind pressed mid-drag leaves capture with the button down, and its
             // button-up then reaches this machine instead of the peer, which
@@ -640,7 +658,7 @@ impl CaptureTask {
                     button,
                     state: 0,
                 }));
-                if let Err(e) = self.conn.send(button_up, handle).await {
+                if let Err(e) = self.send_leaving(button_up, handle, addr).await {
                     log::warn!("failed to send button-up to client {handle}: {e}");
                 }
             }
@@ -660,7 +678,7 @@ impl CaptureTask {
                     key: key as u32,
                     state: 0,
                 }));
-                if let Err(e) = self.conn.send(key_up, handle).await {
+                if let Err(e) = self.send_leaving(key_up, handle, addr).await {
                     log::warn!("failed to send key-up to client {handle}: {e}");
                 }
             }
@@ -675,14 +693,28 @@ impl CaptureTask {
                 locked: 0,
                 group: 0,
             }));
-            if let Err(e) = self.conn.send(mods_zero, handle).await {
+            if let Err(e) = self.send_leaving(mods_zero, handle, addr).await {
                 log::warn!("failed to reset modifiers on client {handle}: {e}");
             }
 
             log::info!("sending Leave event to client {handle}");
-            if let Err(e) = self.conn.send(ProtoEvent::Leave(0), handle).await {
+            if let Err(e) = self.send_leaving(ProtoEvent::Leave(0), handle, addr).await {
                 log::warn!("failed to send Leave to client {handle}: {e}");
             }
+        }
+    }
+
+    /// Send one of the frames that end a visit: to the connection the peer
+    /// acknowledged the crossing on when there was one, else as any input.
+    async fn send_leaving(
+        &self,
+        event: ProtoEvent,
+        handle: CaptureHandle,
+        addr: Option<SocketAddr>,
+    ) -> Result<(), LanMouseConnectionError> {
+        match addr {
+            Some(addr) => self.conn.send_to(event, handle, addr).await,
+            None => self.conn.send(event, handle).await,
         }
     }
 }
@@ -774,7 +806,8 @@ mod lock_key_tests {
 mod release_mid_drag {
     //! Leaving a peer mid-drag must hand it the button-up it will otherwise
     //! never see (#89), however the visit ends: the release bind, the capture
-    //! backend failing, the client being switched off, or shutdown.
+    //! backend failing, the client being switched off or removed, a config
+    //! reload, or shutdown.
     //!
     //! Driven end to end over loopback: scripted capture feeds the real capture
     //! task, which sends through the real connection to a real listener. The
@@ -830,6 +863,9 @@ mod release_mid_drag {
         script: Script,
         capture: Capture,
         handle: hops_ipc::ClientHandle,
+        /// The sender's client list, which the service changes before it
+        /// tells capture.
+        clients: crate::client::ClientManager,
         _notices: Notices,
     }
 
@@ -869,7 +905,7 @@ mod release_mid_drag {
                 conn,
                 handle,
                 notices,
-                ..
+                clients,
             } = {
                 let d = dialer(
                     &sender,
@@ -890,6 +926,7 @@ mod release_mid_drag {
                 script,
                 capture,
                 handle,
+                clients,
                 _notices: notices,
             };
             visit.cross(ack).await;
@@ -1104,20 +1141,87 @@ mod release_mid_drag {
     }
 
     // LEDGER T16 | class B | 2 frames received by listen::LanMouseListener
-    /// Switching off, or removing, the client the cursor is on: nothing more
-    /// is sent to it, so it must be let go first.
+    /// Switching off the client the cursor is on: nothing more is sent to it,
+    /// so it must be let go first. In the service's order: the client list
+    /// first, then capture.
     #[test]
     fn switching_off_the_client_mid_drag_sends_the_button_up() {
         run_local(async {
             let mut v = Visit::start(true).await;
             v.press(BTN_LEFT).await;
 
+            assert!(v.clients.deactivate_client(v.handle), "precondition");
             v.capture.destroy(v.handle);
 
             assert!(
                 v.leaves(1, Duration::from_secs(10)).await && v.up_before_leave(),
                 "the client was switched off mid-drag and was sent no button-up \
                  and Leave: {:?}",
+                v.frames()
+            );
+
+            v.capture.terminate().await;
+        });
+    }
+
+    // LEDGER T19 | class B | 2 frames received by listen::LanMouseListener
+    /// Removing the client the cursor is on. The service drops it from the
+    /// client list before capture hears of it, so its address can no longer
+    /// be looked up. The peer still holds the button, and this daemon's pings
+    /// keep its watchdog from ever firing.
+    #[test]
+    fn removing_the_client_mid_drag_sends_the_button_up() {
+        run_local(async {
+            let mut v = Visit::start(true).await;
+            v.press(BTN_LEFT).await;
+
+            assert!(v.clients.remove_client(v.handle).is_some(), "precondition");
+            v.capture.destroy(v.handle);
+
+            assert!(
+                v.leaves(1, Duration::from_secs(10)).await && v.up_before_leave(),
+                "the client was removed mid-drag and was sent no button-up and \
+                 Leave: {:?}",
+                v.frames()
+            );
+
+            v.capture.terminate().await;
+        });
+    }
+
+    // LEDGER T20 | class B | 2 frames received by listen::LanMouseListener
+    /// A config reload removes every client and adds them back, numbered from
+    /// 0 again, before capture hears of either. The client the cursor was on
+    /// comes back under the same handle, not yet connected.
+    #[test]
+    fn reloading_the_config_mid_drag_sends_the_button_up() {
+        run_local(async {
+            let mut v = Visit::start(true).await;
+            v.press(BTN_LEFT).await;
+
+            // Service::handle_config_change, for the one client.
+            let (config, state) = v.clients.remove_client(v.handle).expect("precondition");
+            v.capture.destroy(v.handle);
+            v.clients.reset_handle_allocation();
+            let handle = v.clients.add_with_config(crate::config::ConfigClient {
+                ips: config.fix_ips.iter().copied().collect(),
+                hostname: config.hostname,
+                port: config.port,
+                pos: config.pos,
+                active: true,
+                enter_hook: config.cmd,
+                fingerprint: state.peer_fingerprint,
+            });
+            assert_eq!(handle, v.handle, "precondition: the handle is reused");
+            v.clients.deactivate_client(handle);
+            assert!(v.clients.activate_client(handle), "precondition");
+            v.capture
+                .create(handle, hops_ipc::Position::Left, CaptureType::Default);
+
+            assert!(
+                v.leaves(1, Duration::from_secs(10)).await && v.up_before_leave(),
+                "the config was reloaded mid-drag and the peer was sent no \
+                 button-up and Leave: {:?}",
                 v.frames()
             );
 
