@@ -224,10 +224,27 @@ struct ListenTask {
     /// something a busy thread can delay. This check cannot be delayed, because
     /// it rides the attacker's own code path: to keep injecting, they have to
     /// execute it. That is the difference between a lease and a label.
+    ///
+    /// No lease lapses in this release (#183), so today what this refuses is a
+    /// removed device; the lapse half is kept for when a term returns (#185).
     trust: crate::transport::Trust,
     /// Which peer each admitted address belongs to. Populated on accept, so the
     /// per-event check is a map lookup rather than a certificate parse.
     peer_of: HashMap<SocketAddr, String>,
+}
+
+/// The per-event check: may the peer admitted at `addr` inject input right now?
+///
+/// Asked for every input event, against the store as it is at that moment, so
+/// a removal bites between two events rather than at the next handshake.
+pub(crate) fn input_permitted(
+    peer_of: &HashMap<SocketAddr, String>,
+    trust: &crate::transport::Trust,
+    addr: SocketAddr,
+) -> bool {
+    peer_of
+        .get(&addr)
+        .is_some_and(|fp| trust.read().expect("lock").may_drive_us(fp))
 }
 
 /// Suppresses repeat approval prompts for a fingerprint that keeps dialling,
@@ -324,16 +341,7 @@ impl ListenTask {
                                 // the ~100 µs blocking syscall that dominates
                                 // an injected event, so it is not measurable on
                                 // the path it protects.
-                                let permitted = self
-                                    .peer_of
-                                    .get(&addr)
-                                    .is_some_and(|fp| {
-                                        self.trust
-                                            .read()
-                                            .expect("lock")
-                                            .may_drive_us(fp)
-                                    });
-                                if permitted {
+                                if input_permitted(&self.peer_of, &self.trust, addr) {
                                     self.emulation_proxy.consume(event, addr);
                                 }
                             }

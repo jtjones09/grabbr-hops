@@ -12,6 +12,7 @@ pub mod discovery;
 mod dns;
 mod emulation;
 pub mod emulation_test;
+mod git_env;
 mod hop_log;
 mod listen;
 pub mod logging;

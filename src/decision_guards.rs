@@ -136,7 +136,7 @@ mod a_grant_carries_only_the_direction_that_was_approved {
     //! directions" as a goal. That clause is superseded. Trust is per-machine
     //! AND per-direction.
 
-    use crate::trust::{Caps, DEFAULT_TERM_SECS, Origin, TrustStore};
+    use crate::trust::{Caps, Origin, TrustStore};
 
     use super::fp32;
 
@@ -162,7 +162,6 @@ mod a_grant_carries_only_the_direction_that_was_approved {
             &receiver,
             "the laptop I am sending my keyboard to",
             Caps::INBOUND,
-            DEFAULT_TERM_SECS,
             Origin::OutboundDial,
         );
 
@@ -190,7 +189,6 @@ mod a_grant_carries_only_the_direction_that_was_approved {
             &stranger,
             "the box that knocked",
             Caps::OUTBOUND,
-            DEFAULT_TERM_SECS,
             Origin::Inbound,
         );
 
@@ -199,6 +197,53 @@ mod a_grant_carries_only_the_direction_that_was_approved {
             "an Inbound approval minted the outbound right to drive that peer \
              (#130). Direction is a capability, not a synonym for membership; \
              the two questions have different answers and different blast radii."
+        );
+    }
+
+    /// The two tests above ask the store. This asks the grant the door makes
+    /// (`Service::add_authorized_key` through `service::grant_for_attempt`):
+    /// the direction comes from the attempt the user approved, and an approval
+    /// with no attempt behind it grants nothing.
+    // LEDGER T11 | class B | 1 return value + 6 struct state: service::grant_for_attempt, TrustStore::capabilities
+    #[test]
+    fn the_grant_door_mints_the_direction_it_observed_and_nothing_without_an_attempt() {
+        use crate::service::{GrantRefused, grant_for_attempt};
+        use hops_ipc::AttemptOrigin;
+
+        let peer = fp32(0x44);
+        let fresh = || TrustStore::new(&fp32(0x01), 0).expect("our own fingerprint");
+
+        let mut store = fresh();
+        assert_eq!(
+            grant_for_attempt(&mut store, &peer, "no prompt behind this", None),
+            Err(GrantRefused::NoAttempt),
+            "an approval with no pending attempt must be refused"
+        );
+        assert_eq!(
+            store.capabilities(&peer),
+            Caps::NONE,
+            "and it must grant nothing"
+        );
+
+        let mut store = fresh();
+        grant_for_attempt(&mut store, &peer, "knocked", Some(AttemptOrigin::Inbound))
+            .expect("grant");
+        assert!(
+            store.may_drive_us(&peer) && !store.we_may_drive(&peer),
+            "an approved inbound knock must grant inbound and only inbound (#130)"
+        );
+
+        let mut store = fresh();
+        grant_for_attempt(
+            &mut store,
+            &peer,
+            "dialled",
+            Some(AttemptOrigin::OutboundDial),
+        )
+        .expect("grant");
+        assert!(
+            store.we_may_drive(&peer) && !store.may_drive_us(&peer),
+            "an approved outbound dial must grant outbound and only outbound (#130)"
         );
     }
 
@@ -228,7 +273,7 @@ mod a_grant_carries_only_the_direction_that_was_approved {
         // A receiver we confirmed our own dial reached: outbound only.
         let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
         store
-            .issue(&peer_fp, "a receiver", Caps::OUTBOUND, DEFAULT_TERM_SECS)
+            .issue(&peer_fp, "a receiver", Caps::OUTBOUND)
             .expect("issue an outbound-only lease");
         let trust = Arc::new(RwLock::new(store));
 
@@ -409,6 +454,546 @@ mod an_upgrade_mints_no_permission_the_old_config_never_granted {
 }
 
 // ---------------------------------------------------------------------------
+// #183 — no pairing expires until renewal exists
+// ---------------------------------------------------------------------------
+
+mod no_pairing_expires_until_renewal_exists {
+    //! **Decided 2026-09-16 (#183).** The 30-day lease term is dropped for this
+    //! release. A pairing made today, and one already on disk with a term,
+    //! keeps working until the user removes the device.
+    //!
+    //! **Why.** Nothing renews a lease yet, so a term was a date on which a
+    //! working device stopped, with pairing again as the only way back.
+    //!
+    //! **Not settled by this.** How long trust should last is open (#185), and
+    //! a permanent grant fails differently from a lapsing one. Choosing a term
+    //! means changing `trust::DEFAULT_TERM`, `trust_file::rebuild` and the
+    //! store schema together, and this guard with them, in the same commit.
+    //!
+    //! **A stored term needs a new schema, not only a changed `rebuild`.**
+    //! Every `expires_at` in a schema-v1 store is a placeholder and must never
+    //! be enforced. This build writes 400 days after pairing for a lease that
+    //! does not lapse, so a build from before #183 still starts, and nothing
+    //! tells that date apart from a real 400-day term. A build that enforced it
+    //! would end every pairing made under this build at day 400, the outage
+    //! #183 removes. Enforcing a stored term (#185) takes a `SCHEMA_VERSION`
+    //! bump or a new field.
+    //!
+    //! **Why the grant door is covered without building a `Service`.** The
+    //! door (`Service::add_authorized_key`) makes its grant through
+    //! `service::grant_for_attempt`, and this test grants through that call.
+    //! It calls `TrustStore::issue`, which takes no term; the version that
+    //! takes one is `cfg(test)`.
+    //!
+    //! **Why admission alone is not enough.** A door that checks nothing also
+    //! admits a pairing ten years on. The sibling test shows each door still
+    //! refuses a removed device and a lapsed term, so the admission here is the
+    //! store's answer and not a door that stopped asking.
+    //!
+    //! Leases already sealed with a 30-day or 400-day term are covered by
+    //! `trust_file`'s `a_sealed_store_holding_thirty_and_four_hundred_day_terms_…`.
+
+    use std::collections::{HashMap, VecDeque};
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex, RwLock};
+    use std::time::Duration;
+
+    use hops_ipc::AttemptOrigin;
+    use rustls::client::danger::ServerCertVerifier;
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::server::danger::ClientCertVerifier;
+
+    use crate::service::grant_for_attempt;
+    use crate::transport::{FpClientVerifier, FpServerVerifier};
+    use crate::trust::{Caps, Term, TrustStore, system_seconds};
+
+    const TEN_YEARS: u64 = 10 * 365 * 86_400;
+    const HOUR: u64 = 3_600;
+
+    /// The doors a live session passes besides the sweep.
+    const DOORS: [&str; 3] = [
+        "the inbound TLS verifier",
+        "the outbound TLS verifier",
+        "the per-event injection check",
+    ];
+
+    /// Which of [`DOORS`] let `peer` through right now: the inbound verifier
+    /// and the injection check against `receiving`, the outbound verifier
+    /// against `sending`.
+    fn doors_that_admit(
+        peer: &CertificateDer<'static>,
+        receiving: &crate::transport::Trust,
+        sending: &crate::transport::Trust,
+    ) -> Vec<&'static str> {
+        let peer_fp = crate::transport::fingerprint_of(peer);
+        let mut admitted = Vec::new();
+        let tls_now =
+            UnixTime::since_unix_epoch(Duration::from_secs(receiving.read().expect("lock").now()));
+        let inbound =
+            FpClientVerifier::new(receiving.clone(), Arc::new(Mutex::new(VecDeque::new())));
+        if inbound.verify_client_cert(peer, &[], tls_now).is_ok() {
+            admitted.push(DOORS[0]);
+        }
+        let outbound = FpServerVerifier::new(sending.clone(), Arc::new(Mutex::new(None)));
+        let name = ServerName::try_from("grabbr").expect("server name");
+        if outbound
+            .verify_server_cert(peer, &[], &name, &[], tls_now)
+            .is_ok()
+        {
+            admitted.push(DOORS[1]);
+        }
+        let addr: SocketAddr = "192.0.2.7:4242".parse().expect("addr");
+        let peer_of = HashMap::from([(addr, peer_fp)]);
+        if crate::emulation::input_permitted(&peer_of, receiving, addr) {
+            admitted.push(DOORS[2]);
+        }
+        admitted
+    }
+
+    /// Every door a live session passes, asked ten years after the pairing:
+    /// the sweep on the daemon's timer, both TLS verifiers, and the check made
+    /// on every injected input event.
+    // LEDGER T1 | class B | 1 return value + 6 struct state: service::grant_for_attempt, TrustStore::sweep, FpClientVerifier, FpServerVerifier, emulation::input_permitted
+    #[test]
+    fn a_pairing_made_today_is_admitted_at_every_door_ten_years_on() {
+        crate::transport::install_crypto_provider();
+        let peer = super::a_test_certificate();
+        let peer_fp = crate::transport::fingerprint_of(&peer);
+
+        let mut receiving = TrustStore::new(&super::fp32(0x01), 0).expect("ours");
+        grant_for_attempt(
+            &mut receiving,
+            &peer_fp,
+            "a sender",
+            Some(AttemptOrigin::Inbound),
+        )
+        .expect("the grant door grants an approved inbound attempt");
+        let mut sending = TrustStore::new(&super::fp32(0x02), 0).expect("ours");
+        grant_for_attempt(
+            &mut sending,
+            &peer_fp,
+            "a receiver",
+            Some(AttemptOrigin::OutboundDial),
+        )
+        .expect("the grant door grants an approved outbound dial");
+
+        let mut refused = Vec::new();
+
+        // What `Service::sweep_lapsed_leases` does on its timer. Whatever it
+        // returns, the daemon cuts that peer's sessions.
+        let later = system_seconds() + TEN_YEARS;
+        for (side, store) in [("receiving", &mut receiving), ("sending", &mut sending)] {
+            let lapsed = store.sweep(later);
+            if !lapsed.is_empty() {
+                refused.push(format!(
+                    "the {side} sweep reported {} lapse(s)",
+                    lapsed.len()
+                ));
+            }
+            assert_eq!(
+                store.now(),
+                later,
+                "precondition: the store is ten years on"
+            );
+        }
+        let receiving = Arc::new(RwLock::new(receiving));
+        let sending = Arc::new(RwLock::new(sending));
+
+        let admitted = doors_that_admit(&peer, &receiving, &sending);
+        for door in DOORS {
+            if !admitted.contains(&door) {
+                refused.push(format!("{door} refused the peer"));
+            }
+        }
+
+        assert!(
+            refused.is_empty(),
+            "a pairing made today stopped working ten years on (#183):\n  {}\n\
+             Nothing renews a lease yet, so a lapse is a working device that can \
+             only come back by pairing again. If a term is being reintroduced, \
+             that is #185, and it arrives with renewal — not as a constant \
+             changed on its own.",
+            refused.join("\n  ")
+        );
+    }
+
+    /// Each door the ten-years-on test asks still refuses a removed device and
+    /// a lapsed term. Without this, a door that stopped checking the store
+    /// passes that test exactly as a correct one does.
+    // LEDGER T10 | class B | 1 return value: emulation::input_permitted, FpClientVerifier::verify_client_cert, FpServerVerifier::verify_server_cert, TrustStore::sweep
+    #[test]
+    fn every_door_still_refuses_a_removed_device_and_a_lapsed_term() {
+        crate::transport::install_crypto_provider();
+        let peer = super::a_test_certificate();
+        let peer_fp = crate::transport::fingerprint_of(&peer);
+        let pair = |term: Option<Term>| {
+            let mut receiving = TrustStore::new(&super::fp32(0x01), 0).expect("ours");
+            let mut sending = TrustStore::new(&super::fp32(0x02), 0).expect("ours");
+            match term {
+                None => {
+                    grant_for_attempt(
+                        &mut receiving,
+                        &peer_fp,
+                        "a sender",
+                        Some(AttemptOrigin::Inbound),
+                    )
+                    .expect("grant");
+                    grant_for_attempt(
+                        &mut sending,
+                        &peer_fp,
+                        "a receiver",
+                        Some(AttemptOrigin::OutboundDial),
+                    )
+                    .expect("grant");
+                }
+                Some(term) => {
+                    receiving
+                        .issue_with_term(&peer_fp, "a sender", Caps::INBOUND, term)
+                        .expect("issue");
+                    sending
+                        .issue_with_term(&peer_fp, "a receiver", Caps::OUTBOUND, term)
+                        .expect("issue");
+                }
+            }
+            (receiving, sending)
+        };
+        let shared = |s: TrustStore| Arc::new(RwLock::new(s));
+
+        // Removed.
+        let (receiving, sending) = pair(None);
+        let (receiving, sending) = (shared(receiving), shared(sending));
+        assert_eq!(
+            doors_that_admit(&peer, &receiving, &sending),
+            DOORS,
+            "precondition: a live pairing gets through every door"
+        );
+        receiving.write().expect("lock").revoke(&peer_fp);
+        sending.write().expect("lock").revoke(&peer_fp);
+        let admitted = doors_that_admit(&peer, &receiving, &sending);
+        assert!(
+            admitted.is_empty(),
+            "a removed device still gets through {admitted:?}. Removal has to bite \
+             at every door, the per-event check included, or a session opened \
+             before the removal keeps typing into this machine."
+        );
+
+        // Lapsed. No production lease has a term (#183); the check that would
+        // enforce one is kept for #185, so it is exercised with a test-only term.
+        let (receiving, sending) = pair(Some(Term::Secs(HOUR)));
+        let (receiving, sending) = (shared(receiving), shared(sending));
+        assert_eq!(
+            doors_that_admit(&peer, &receiving, &sending),
+            DOORS,
+            "precondition: a term still running gets through every door"
+        );
+        let later = system_seconds() + 2 * HOUR;
+        for (side, store) in [("receiving", &receiving), ("sending", &sending)] {
+            assert_eq!(
+                store.write().expect("lock").sweep(later).len(),
+                1,
+                "the {side} sweep did not report the lapsed term, so the daemon \
+                 would leave that peer's quiet session open"
+            );
+        }
+        let admitted = doors_that_admit(&peer, &receiving, &sending);
+        assert!(
+            admitted.is_empty(),
+            "a lapsed term still gets through {admitted:?}"
+        );
+    }
+}
+
+mod a_build_from_before_183_still_starts_on_a_store_this_build_saves {
+    //! A build from before #183 keeps starting on a trust store this build
+    //! writes. No release reads a trust store; the older builds are builds of
+    //! main from #158 up to #183, and one of those and this build can run
+    //! against one config directory, so a store this build saves must not stop
+    //! the older one.
+    //!
+    //! **What that build checks**, reproduced below from its
+    //! `trust_file::validate` and `trust_file::rebuild` (through
+    //! `Lease::canonicalized`). At startup every active lease carries an
+    //! `expires_at`, or the whole file is refused and the daemon does not
+    //! start. At rebuild `issued_at < expires_at <= issued_at + 400 days` and
+    //! the lease names a capability, or that lease is dropped and erased at
+    //! that build's next save.
+    //!
+    //! **Not promised.** That build still enforces the date it is handed: it
+    //! stops admitting a pairing 400 days after the pairing was made, while
+    //! this build keeps admitting it. It also means running this build once
+    //! brings back, on that build, a pairing whose shorter term had lapsed
+    //! there: the next save dates it 400 days after pairing, so that build
+    //! admits it again until then. The load log names each such pairing.
+    //!
+    //! The saved date is a placeholder no later build may enforce; see
+    //! `no_pairing_expires_until_renewal_exists`.
+
+    use std::collections::{HashMap, HashSet};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use hops_ipc::pairing::canonical_fingerprint;
+
+    use crate::authority::{AUTHORITY_KEY_FILE_NAME, Authority, SoftwareAuthority};
+    use crate::trust::{Caps, Expiry, Lease, Origin, TrustStore};
+    use crate::trust_file::{
+        DiskCap, DiskOrigin, DiskState, LeaseRecord, Loaded, TrustFile, rebuild, records_of,
+        stored_terms,
+    };
+
+    use super::fp32;
+
+    const DAY: u64 = 86_400;
+    /// `trust::MAX_TERM_SECS` in every build with a trust store (#158) and
+    /// from before #183. It never changed in that range.
+    const OLDER_BUILD_CEILING_SECS: u64 = 400 * DAY;
+
+    /// That build's `validate`. An `Err` is a daemon that does not start.
+    fn older_build_starts_on(leases: &[LeaseRecord]) -> Result<(), String> {
+        let mut seen = HashSet::new();
+        for l in leases {
+            if !seen.insert(l.fingerprint.as_str()) {
+                return Err(format!("two leases name {}", l.fingerprint));
+            }
+            match l.state {
+                DiskState::Active => {
+                    if canonical_fingerprint(&l.fingerprint).as_deref()
+                        != Some(l.fingerprint.as_str())
+                    {
+                        return Err(format!("{} is not a canonical fingerprint", l.fingerprint));
+                    }
+                    if l.expires_at.is_none() {
+                        return Err(format!("the lease for {} never expires", l.fingerprint));
+                    }
+                }
+                DiskState::Revoked => {
+                    if !l.caps.is_empty() {
+                        return Err(format!(
+                            "{} is revoked but still carries capabilities",
+                            l.fingerprint
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// What that build's `rebuild` makes of the rows: each admitted lease's
+    /// window `[issued_at, expires_at)`, each removal, and each row it drops.
+    struct OlderBuildStore {
+        windows: HashMap<String, (u64, u64)>,
+        removed: HashSet<String>,
+        dropped: Vec<String>,
+    }
+
+    fn older_build_rebuild(leases: &[LeaseRecord]) -> OlderBuildStore {
+        let mut out = OlderBuildStore {
+            windows: HashMap::new(),
+            removed: HashSet::new(),
+            dropped: Vec::new(),
+        };
+        for l in leases {
+            match l.state {
+                DiskState::Revoked => {
+                    out.removed.insert(l.fingerprint.clone());
+                }
+                DiskState::Active => {
+                    let Some(not_after) = l.expires_at else {
+                        out.dropped.push(format!("{}: no expiry", l.fingerprint));
+                        continue;
+                    };
+                    if not_after <= l.issued_at {
+                        out.dropped
+                            .push(format!("{}: an empty term", l.fingerprint));
+                    } else if not_after - l.issued_at > OLDER_BUILD_CEILING_SECS {
+                        out.dropped.push(format!(
+                            "{}: a term of {}s, over the {OLDER_BUILD_CEILING_SECS}s ceiling",
+                            l.fingerprint,
+                            not_after - l.issued_at
+                        ));
+                    } else if l.caps.is_empty() {
+                        out.dropped
+                            .push(format!("{}: no capabilities", l.fingerprint));
+                    } else {
+                        out.windows
+                            .insert(l.fingerprint.clone(), (l.issued_at, not_after));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn scratch_dir() -> PathBuf {
+        let mut d = std::env::temp_dir();
+        d.push(format!("hops-guard-older-build-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("mkdir");
+        d
+    }
+
+    /// Every kind of row this build saves goes through the real save and the
+    /// real open, then through the older build's checks.
+    // LEDGER T3 | class B | 4 file on disk: trust_file::records_of, TrustFile::save, TrustFile::open
+    #[test]
+    fn a_store_this_build_saves_passes_every_check_a_build_from_before_183_makes() {
+        let dir = scratch_dir();
+        let authority: Arc<dyn Authority> = Arc::new(
+            SoftwareAuthority::load_or_generate(&dir.join(AUTHORITY_KEY_FILE_NAME))
+                .expect("authority"),
+        );
+        let (mut file, _) = TrustFile::open(&dir, authority.clone()).expect("open");
+        let now = file.now();
+
+        let ours = fp32(0x01);
+        let (sender, receiver, carried, removed, old) =
+            (fp32(0x11), fp32(0x12), fp32(0x13), fp32(0x14), fp32(0x15));
+        let mut store = TrustStore::new(&ours, now).expect("ours");
+        store
+            .issue(&sender, "approved inbound", Caps::INBOUND)
+            .expect("issue");
+        store
+            .issue(&receiver, "approved outbound", Caps::OUTBOUND)
+            .expect("issue");
+        store.migrate_from_config(
+            &HashMap::from([(carried.clone(), "carried forward".to_string())]),
+            &HashMap::new(),
+            &HashSet::new(),
+            now,
+        );
+        store
+            .issue(&removed, "removed", Caps::INBOUND)
+            .expect("issue");
+        store.revoke(&removed);
+        // Paired two years ago and still trusted here: the date saved for it
+        // is already behind, and that build must still start.
+        store
+            .admit(Lease {
+                peer: old.clone(),
+                issued_to: ours.clone(),
+                label: "paired two years ago".into(),
+                caps: Caps::INBOUND,
+                origin: Origin::Inbound,
+                issued_at: now - 2 * 365 * DAY,
+                expiry: Expiry::Never,
+            })
+            .expect("admit");
+        assert!(
+            store.may_drive_us(&old),
+            "precondition: this build trusts the old pairing"
+        );
+
+        file.save(&records_of(&store)).expect("save");
+        let (_, loaded) = TrustFile::open(&dir, authority).expect("reopen");
+        let Loaded::Present { leases, .. } = loaded else {
+            panic!("the store must be found");
+        };
+
+        if let Err(why) = older_build_starts_on(&leases) {
+            panic!(
+                "a build from before #183 refuses to start on a store this build \
+                 saved: {why}. Every active lease needs an expires_at that build \
+                 accepts, even though this build ignores it."
+            );
+        }
+        let older = older_build_rebuild(&leases);
+        assert!(
+            older.dropped.is_empty(),
+            "a build from before #183 drops these pairings and erases them at its \
+             next save, taking them from this build too: {:?}",
+            older.dropped
+        );
+        for fp in [&sender, &receiver, &carried, &old] {
+            assert!(
+                older.windows.contains_key(fp.as_str()),
+                "{fp} is missing from what that build admits"
+            );
+        }
+        assert!(
+            older.removed.contains(&removed),
+            "a device removed here must stay removed there"
+        );
+        for fp in [&sender, &receiver, &carried] {
+            let (from, until) = older.windows[fp.as_str()];
+            assert!(from <= now + DAY, "precondition: {fp} was paired today");
+            let last_day = from + OLDER_BUILD_CEILING_SECS - 1;
+            assert!(
+                last_day < until,
+                "that build stops admitting {fp}, paired today, at {until}, before \
+                 {last_day}: it must get the whole 400 days that build allows"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pairings whose 30-day term had lapsed on that build. The load log names
+    /// each one and says what that build does with it once this build saves;
+    /// that build's own rebuild of the saved rows is the check on the claim.
+    // LEDGER T9 | class B | 1 return value: trust_file::rebuild, trust_file::stored_terms, StoredTerms::log_lines, trust_file::records_of
+    #[test]
+    fn the_load_log_says_what_that_build_does_with_a_lapsed_pairing_once_this_build_saves() {
+        let ours = fp32(0x01);
+        let now = crate::trust::system_seconds();
+        let (recent, old) = (fp32(0x21), fp32(0x22));
+        let written_by_that_build = |fp: &str, label: &str, issued_at: u64| LeaseRecord {
+            fingerprint: fp.to_owned(),
+            label: label.into(),
+            state: DiskState::Active,
+            origin: DiskOrigin::Inbound,
+            issued_at,
+            expires_at: Some(issued_at + 30 * DAY),
+            revoked_at: None,
+            caps: vec![DiskCap::Inbound],
+        };
+        let rows = vec![
+            written_by_that_build(&recent, "lapsed ten days ago", now - 40 * DAY),
+            written_by_that_build(&old, "paired two years ago", now - 2 * 365 * DAY),
+        ];
+        let admits_now = |older: &OlderBuildStore, fp: &str| {
+            older
+                .windows
+                .get(fp)
+                .is_some_and(|&(from, until)| from <= now && now < until)
+        };
+        let before = older_build_rebuild(&rows);
+        for fp in [&recent, &old] {
+            assert!(
+                !admits_now(&before, fp),
+                "precondition: that build had stopped admitting {fp}"
+            );
+        }
+
+        let (store, refused) = rebuild(&ours, now, &rows).expect("rebuild");
+        assert!(refused.is_empty(), "refused on load: {refused:?}");
+        let lines = stored_terms(&rows, &store).log_lines();
+        let after = older_build_rebuild(&records_of(&store));
+        assert!(
+            admits_now(&after, &recent) && !admits_now(&after, &old),
+            "precondition: once this build saves, that build admits the recent \
+             pairing again and goes on refusing the old one"
+        );
+
+        for fp in [&recent, &old] {
+            let Some((_, warn)) = lines
+                .iter()
+                .find(|(level, line)| *level == log::Level::Warn && line.contains(fp.as_str()))
+            else {
+                panic!("{fp} works again here and is not named at warn: {lines:#?}");
+            };
+            let admits = admits_now(&after, fp);
+            assert!(
+                warn.contains("admits it again") == admits
+                    && warn.contains("goes on refusing") == !admits,
+                "the load log says of {fp}:\n  {warn}\nbut once this build saves, that \
+                 build {} it",
+                if admits { "admits" } else { "refuses" }
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // expulsion is permanent — the rule this project has now rebuilt three times
 // ---------------------------------------------------------------------------
 
@@ -431,7 +1016,7 @@ mod an_expelled_fingerprint_is_never_re_authorised {
     //! single approval. The reason to remove it was never that it was
     //! reachable — it was that it existed at all.
 
-    use crate::trust::{Caps, DEFAULT_TERM_SECS, Denial, Lease, Origin, TrustStore};
+    use crate::trust::{Caps, Denial, Expiry, Lease, Origin, TrustStore};
 
     use super::fp32;
 
@@ -440,7 +1025,7 @@ mod an_expelled_fingerprint_is_never_re_authorised {
         let peer = fp32(0x77);
         let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
         store
-            .issue(&peer, "a machine", Caps::INBOUND, DEFAULT_TERM_SECS)
+            .issue(&peer, "a machine", Caps::INBOUND)
             .expect("issue");
         store.revoke(&peer);
         (store, ours, peer)
@@ -465,7 +1050,7 @@ mod an_expelled_fingerprint_is_never_re_authorised {
             (
                 "issue",
                 Box::new(|s: &mut TrustStore| {
-                    let _ = s.issue(&fp32(0x77), "back please", Caps::KNOWN, DEFAULT_TERM_SECS);
+                    let _ = s.issue(&fp32(0x77), "back please", Caps::KNOWN);
                 }),
             ),
             (
@@ -475,7 +1060,6 @@ mod an_expelled_fingerprint_is_never_re_authorised {
                         &fp32(0x77),
                         "back please",
                         Caps::KNOWN,
-                        DEFAULT_TERM_SECS,
                         Origin::Inbound,
                     );
                 }),
@@ -483,7 +1067,7 @@ mod an_expelled_fingerprint_is_never_re_authorised {
             (
                 "renew",
                 Box::new(|s: &mut TrustStore| {
-                    let _ = s.renew(&fp32(0x77), DEFAULT_TERM_SECS);
+                    let _ = s.renew(&fp32(0x77));
                 }),
             ),
             (
@@ -508,7 +1092,7 @@ mod an_expelled_fingerprint_is_never_re_authorised {
                         caps: Caps::KNOWN,
                         origin: Origin::Inbound,
                         issued_at: 0,
-                        not_after: DEFAULT_TERM_SECS,
+                        expiry: Expiry::Never,
                     });
                 }),
             ),
@@ -563,7 +1147,7 @@ mod an_expelled_fingerprint_is_never_re_authorised {
     fn granting_to_a_removed_device_fails_loudly_rather_than_quietly() {
         use crate::trust::TrustError;
         let (mut store, _, peer) = expelled_store();
-        match store.issue(&peer, "back please", Caps::INBOUND, DEFAULT_TERM_SECS) {
+        match store.issue(&peer, "back please", Caps::INBOUND) {
             Err(TrustError::Expelled { fingerprint }) => assert_eq!(fingerprint, peer),
             other => panic!(
                 "granting to a removed device returned {other:?}. It must return \
@@ -714,7 +1298,7 @@ mod an_expelled_fingerprint_is_never_re_authorised {
     /// them is a prompt gate that is not gating.
     #[test]
     fn a_removed_device_can_never_put_a_prompt_on_the_screen_and_a_lapsed_one_still_can() {
-        use crate::trust::MAX_TERM_SECS;
+        use crate::trust::{MAX_TERM_SECS, Term};
 
         let ours = fp32(0x01);
         let expelled = fp32(0x88);
@@ -722,12 +1306,12 @@ mod an_expelled_fingerprint_is_never_re_authorised {
         let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
 
         store
-            .issue(&expelled, "removed", Caps::INBOUND, DEFAULT_TERM_SECS)
+            .issue(&expelled, "removed", Caps::INBOUND)
             .expect("issue");
         store.revoke(&expelled);
 
         store
-            .issue(&lapsed, "lapsed", Caps::INBOUND, 10)
+            .issue_with_term(&lapsed, "lapsed", Caps::INBOUND, Term::Secs(10))
             .expect("issue");
 
         assert!(
@@ -782,7 +1366,7 @@ mod taking_trust_away_is_never_gated_the_way_giving_it_is {
     //! reader. A symmetry cleanup that applies the grant gate to both verbs is
     //! the exact regression the record warns about, by name.
 
-    use crate::trust::{Caps, DEFAULT_TERM_SECS, TrustStore};
+    use crate::trust::{Caps, TrustStore};
 
     use super::fp32;
 
@@ -795,12 +1379,7 @@ mod taking_trust_away_is_never_gated_the_way_giving_it_is {
         let peer = fp32(0xaa);
         let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
         store
-            .issue(
-                &peer,
-                "driving me right now",
-                Caps::KNOWN,
-                DEFAULT_TERM_SECS,
-            )
+            .issue(&peer, "driving me right now", Caps::KNOWN)
             .expect("issue");
 
         // No Result, no authority argument, no clock argument: `revoke` returns
@@ -920,7 +1499,7 @@ mod removing_a_device_takes_its_key_and_not_merely_its_address {
     //! the catastrophic half is recorded in only one file, which is why it is
     //! asserted here.
 
-    use crate::trust::{Caps, DEFAULT_TERM_SECS, TrustStore};
+    use crate::trust::{Caps, TrustStore};
 
     use super::fp32;
 
@@ -932,7 +1511,7 @@ mod removing_a_device_takes_its_key_and_not_merely_its_address {
         let peer = fp32(0xcc);
         let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
         store
-            .issue(&peer, "the sold laptop", Caps::KNOWN, DEFAULT_TERM_SECS)
+            .issue(&peer, "the sold laptop", Caps::KNOWN)
             .expect("issue");
         assert!(store.may_drive_us(&peer), "precondition: it was trusted");
 
@@ -1493,24 +2072,14 @@ mod the_wire_contract_is_frozen {
             // refuse the handshake is the protocol name.
             let server_trust = {
                 let mut s = crate::trust::TrustStore::new(&server_fp, 0).expect("ours");
-                s.issue(
-                    &client_fp,
-                    "peer",
-                    crate::trust::Caps::KNOWN,
-                    crate::trust::DEFAULT_TERM_SECS,
-                )
-                .expect("issue");
+                s.issue(&client_fp, "peer", crate::trust::Caps::KNOWN)
+                    .expect("issue");
                 Arc::new(RwLock::new(s))
             };
             let client_trust = {
                 let mut s = crate::trust::TrustStore::new(&client_fp, 0).expect("ours");
-                s.issue(
-                    &server_fp,
-                    "peer",
-                    crate::trust::Caps::KNOWN,
-                    crate::trust::DEFAULT_TERM_SECS,
-                )
-                .expect("issue");
+                s.issue(&server_fp, "peer", crate::trust::Caps::KNOWN)
+                    .expect("issue");
                 Arc::new(RwLock::new(s))
             };
 

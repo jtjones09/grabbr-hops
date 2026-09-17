@@ -12,6 +12,17 @@
 //! staying in the circle is something the user re-affirms rather than something
 //! nobody ever gets around to undoing.
 //!
+//! **No lease is issued with a term in this release (#183).** Nothing renews a
+//! lease yet, so a term was a date on which a working device stopped with no
+//! way back but pairing again. [`DEFAULT_TERM`] is [`Term::Unbounded`], and a
+//! term already on disk is not enforced (`crate::trust_file::rebuild`). How
+//! long trust should last is open (#185). The window, the sweep and the clock
+//! floor below are kept and tested, but a term does not come back by changing
+//! a constant. Every `expires_at` in a schema-v1 store is a placeholder that
+//! `rebuild` must go on ignoring, so [`DEFAULT_TERM`], `rebuild` and a schema
+//! bump or new field change together
+//! (`crate::trust_file::LeaseRecord::expires_at`).
+//!
 //! Expiry is also the reason a lapse must never be mistaken for an expulsion.
 //! A lapsed lease is a device that may knock again and be renewed; an explicit
 //! denial is a device that may not even ask. Those are different states here,
@@ -126,38 +137,48 @@ use hops_ipc::RevokedEntry;
 use hops_ipc::pairing::{canonical_fingerprint, sanitize_label};
 use thiserror::Error;
 
-/// Term offered when a user approves a device: 30 days.
-///
-/// Long enough that a machine in weekly use is never interrupted, short enough
-/// that a machine you stopped using drops out within a month without anybody
-/// remembering to remove it.
-pub const DEFAULT_TERM_SECS: u64 = 30 * 86_400;
+/// How long a lease runs from the moment it is issued.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Term {
+    /// No end. The lease grants until the device is removed.
+    Unbounded,
+    /// Lapses this many seconds after issue, clamped to [`MAX_TERM_SECS`].
+    Secs(u64),
+}
 
-/// Term given to a lease carried forward from the old allowlist: 400 days.
-///
-/// Never-expiring would be the old permanent grant wearing a lease's clothes.
-/// 30 days is right for a decision the user made this week and wrong for one
-/// they made eight months ago — an upgrade must not silently arm a deadline the
-/// user was never shown. 400 days clears a full annual cycle with room, so every
-/// user meets the renewal prompt at least a year out, with the fleet up and the
-/// device in front of them.
-pub const MIGRATION_TERM_SECS: u64 = 400 * 86_400;
+impl Term {
+    /// The expiry of a lease issued at `now` under this term.
+    pub fn expiry_from(self, now: u64) -> Expiry {
+        match self {
+            Term::Unbounded => Expiry::Never,
+            Term::Secs(secs) => Expiry::At(now.saturating_add(secs.min(MAX_TERM_SECS))),
+        }
+    }
+}
 
-/// Hard ceiling on a lease window.
+/// The term every lease is issued with, whether a user approved it or the
+/// migration carried it forward: none.
 ///
-/// Without a ceiling, "membership is a lease" is a naming convention — one
-/// issuance with a hundred-year window restores exactly the shape being removed.
-/// Renewal is cheap and is the intended way to stay trusted, so the ceiling
-/// costs nothing legitimate.
+/// It was 30 days, and 400 for a carried-forward lease. Nothing renews a lease
+/// yet, so either number only scheduled an outage. Dropped until renewal exists
+/// (#183); how long trust should last is open (#185).
 ///
-/// It has to be at least [`MIGRATION_TERM_SECS`] or the upgrade admits nothing
-/// and the whole fleet goes dark on the first boot after it. The two constants
-/// disagreed in an earlier draft (366 versus 400), which is exactly that
-/// failure, so the assertion below is a compile error rather than a comment.
+/// [`Term::Unbounded`] rather than a very large [`Term::Secs`]: a large number
+/// reads as a decision about length that nobody made, and [`MAX_TERM_SECS`]
+/// would clamp it back to 400 days anyway.
+pub const DEFAULT_TERM: Term = Term::Unbounded;
+
+/// Hard ceiling on a numeric lease window.
+///
+/// Without a ceiling, a "lease" with a hundred-year window is a permanent grant
+/// that reads as a lease. The ceiling keeps the two apart: an unbounded grant
+/// can only be the explicit [`Term::Unbounded`], never a number.
 pub const MAX_TERM_SECS: u64 = 400 * 86_400;
 
-const _: () = assert!(MIGRATION_TERM_SECS <= MAX_TERM_SECS);
-const _: () = assert!(DEFAULT_TERM_SECS <= MAX_TERM_SECS);
+const _: () = assert!(match DEFAULT_TERM {
+    Term::Unbounded => true,
+    Term::Secs(secs) => secs <= MAX_TERM_SECS,
+});
 
 /// How long before a lease lapses the UI should start asking to renew it.
 ///
@@ -215,6 +236,23 @@ pub const LAPSED_RETENTION_SECS: u64 = 90 * 86_400;
 /// get wrong.
 fn key(fingerprint: &str) -> String {
     canonical_fingerprint(fingerprint).unwrap_or_else(|| fingerprint.trim().to_lowercase())
+}
+
+/// The provenance of a grant, derived from what is being granted rather than
+/// defaulted. Hardcoding `Inbound` made every outbound grant a direction
+/// mismatch, which is the API being wrong rather than the rule: a grant that
+/// only permits us to drive the peer came from a dial we made, by construction.
+fn origin_of(caps: Caps) -> Origin {
+    let inbound = caps.contains(Caps::DRIVE_ME);
+    let outbound = caps.contains(Caps::I_MAY_DRIVE);
+    match (inbound, outbound) {
+        // Both directions never come from ONE approval — a person is asked
+        // one question at a time. It is what migration produces, and what
+        // two separate approvals add up to.
+        (true, true) => Origin::Migrated,
+        (false, true) => Origin::OutboundDial,
+        _ => Origin::Inbound,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -447,7 +485,8 @@ pub enum Origin {
 /// lease lifted off one machine and dropped onto another is refused rather than
 /// honoured.
 ///
-/// The window is half-open, `[issued_at, not_after)`, in unix seconds.
+/// Valid from `issued_at`, in unix seconds. With [`Expiry::At`] the window is
+/// half-open, `[issued_at, end)`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Lease {
     /// The machine this lease is about.
@@ -461,8 +500,16 @@ pub struct Lease {
     pub caps: Caps,
     pub origin: Origin,
     pub issued_at: u64,
-    /// First second the lease is **no longer** valid.
-    pub not_after: u64,
+    pub expiry: Expiry,
+}
+
+/// When a lease stops granting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Expiry {
+    /// Does not lapse. The lease ends only when the device is removed.
+    Never,
+    /// The first unix second the lease is **no longer** valid.
+    At(u64),
 }
 
 impl Lease {
@@ -475,18 +522,20 @@ impl Lease {
             .ok_or_else(|| TrustError::BadFingerprint(self.peer.clone()))?;
         let issued_to = canonical_fingerprint(&self.issued_to)
             .ok_or_else(|| TrustError::BadFingerprint(self.issued_to.clone()))?;
-        if self.not_after <= self.issued_at {
-            return Err(TrustError::EmptyTerm {
-                issued_at: self.issued_at,
-                not_after: self.not_after,
-            });
-        }
-        let term = self.not_after - self.issued_at;
-        if term > MAX_TERM_SECS {
-            return Err(TrustError::TermTooLong {
-                term,
-                max: MAX_TERM_SECS,
-            });
+        if let Expiry::At(not_after) = self.expiry {
+            if not_after <= self.issued_at {
+                return Err(TrustError::EmptyTerm {
+                    issued_at: self.issued_at,
+                    not_after,
+                });
+            }
+            let term = not_after - self.issued_at;
+            if term > MAX_TERM_SECS {
+                return Err(TrustError::TermTooLong {
+                    term,
+                    max: MAX_TERM_SECS,
+                });
+            }
         }
         let caps = Caps::from_bits_truncating(self.caps.bits());
         if caps.is_empty() {
@@ -508,18 +557,35 @@ impl Lease {
     /// Is this lease inside its window at `now`? `now` must come from a
     /// [`Clock`], never straight from the system clock.
     pub fn is_valid_at(&self, now: u64) -> bool {
-        now >= self.issued_at && now < self.not_after
+        now >= self.issued_at
+            && match self.expiry {
+                Expiry::Never => true,
+                Expiry::At(end) => now < end,
+            }
     }
 
-    /// Seconds until this lease lapses; zero once it has. For a renewal nudge,
-    /// not for a decision.
-    pub fn expires_in(&self, now: u64) -> u64 {
-        self.not_after.saturating_sub(now)
+    /// Had this lease lapsed by `instant`? Never true of one that does not
+    /// lapse. For housekeeping; a decision asks [`Lease::is_valid_at`].
+    fn lapsed_by(&self, instant: u64) -> bool {
+        matches!(self.expiry, Expiry::At(end) if end <= instant)
+    }
+
+    /// Seconds until this lease lapses, zero once it has, and `None` for a
+    /// lease that does not lapse. For a renewal nudge, not for a decision.
+    pub fn expires_in(&self, now: u64) -> Option<u64> {
+        match self.expiry {
+            Expiry::Never => None,
+            Expiry::At(end) => Some(end.saturating_sub(now)),
+        }
     }
 
     /// Still valid, but close enough to lapsing that the user should be asked.
+    /// Never true of a lease that does not lapse.
     pub fn is_expiring(&self, now: u64) -> bool {
-        self.is_valid_at(now) && self.expires_in(now) <= RENEW_WINDOW_SECS
+        self.is_valid_at(now)
+            && self
+                .expires_in(now)
+                .is_some_and(|left| left <= RENEW_WINDOW_SECS)
     }
 }
 
@@ -709,29 +775,16 @@ impl TrustStore {
     /// This is a grant, so the caller is responsible for refusing it while a
     /// peer is driving this machine. The store cannot see that, and a check it
     /// cannot make is a check it must not pretend to make.
-    pub fn issue(
-        &mut self,
-        fingerprint: &str,
-        label: &str,
-        caps: Caps,
-        term_secs: u64,
-    ) -> Result<(), TrustError> {
-        // Derive the provenance from what is being granted rather than
-        // defaulting to one. Hardcoding `Inbound` here made every outbound
-        // grant a direction mismatch, which is the API being wrong rather than
-        // the rule: a grant that only permits us to drive the peer came from a
-        // dial we made, by construction.
-        let inbound = caps.contains(Caps::DRIVE_ME);
-        let outbound = caps.contains(Caps::I_MAY_DRIVE);
-        let origin = match (inbound, outbound) {
-            // Both directions never come from ONE approval — a person is asked
-            // one question at a time. It is what migration produces, and what
-            // two separate approvals add up to.
-            (true, true) => Origin::Migrated,
-            (false, true) => Origin::OutboundDial,
-            _ => Origin::Inbound,
-        };
-        self.issue_with_origin(fingerprint, label, caps, term_secs, origin)
+    ///
+    /// Always [`DEFAULT_TERM`]. There is no term argument, so this verb cannot
+    /// issue a lease that lapses (#183); the version that takes one exists only
+    /// under `cfg(test)`. That does not bind every caller: [`TrustStore::admit`]
+    /// takes a [`Lease`] with any [`Expiry`]. The grant door's own call,
+    /// `service::grant_for_attempt`, is tested ten years on in
+    /// `decision_guards`, and the load door rebuilds every lease as
+    /// [`Expiry::Never`].
+    pub fn issue(&mut self, fingerprint: &str, label: &str, caps: Caps) -> Result<(), TrustError> {
+        self.issue_with_origin(fingerprint, label, caps, origin_of(caps))
     }
 
     /// [`TrustStore::issue`], recording which act produced the lease.
@@ -740,11 +793,34 @@ impl TrustStore {
         fingerprint: &str,
         label: &str,
         caps: Caps,
-        term_secs: u64,
+        origin: Origin,
+    ) -> Result<(), TrustError> {
+        self.issue_lease(fingerprint, label, caps, DEFAULT_TERM, origin)
+    }
+
+    /// [`TrustStore::issue`] under a term of the test's choosing, so the
+    /// window, the sweep and the clock floor stay tested while nothing in
+    /// production can issue a term.
+    #[cfg(test)]
+    pub(crate) fn issue_with_term(
+        &mut self,
+        fingerprint: &str,
+        label: &str,
+        caps: Caps,
+        term: Term,
+    ) -> Result<(), TrustError> {
+        self.issue_lease(fingerprint, label, caps, term, origin_of(caps))
+    }
+
+    fn issue_lease(
+        &mut self,
+        fingerprint: &str,
+        label: &str,
+        caps: Caps,
+        term: Term,
         origin: Origin,
     ) -> Result<(), TrustError> {
         let now = self.now();
-        let term = term_secs.min(MAX_TERM_SECS);
         let lease = Lease {
             peer: fingerprint.to_string(),
             issued_to: self.ours.clone(),
@@ -752,7 +828,7 @@ impl TrustStore {
             caps,
             origin,
             issued_at: now,
-            not_after: now.saturating_add(term),
+            expiry: term.expiry_from(now),
         }
         .canonicalized()?;
 
@@ -786,10 +862,13 @@ impl TrustStore {
 
     /// Extend an existing lease to a fresh term. Never widens capabilities, and
     /// never un-blocks a removed device.
-    pub fn renew(&mut self, fingerprint: &str, term_secs: u64) -> Result<(), TrustError> {
+    ///
+    /// The fresh term is [`DEFAULT_TERM`], for the same reason as
+    /// [`TrustStore::issue`]: a caller of this verb does not choose one.
+    pub fn renew(&mut self, fingerprint: &str) -> Result<(), TrustError> {
+        let term = DEFAULT_TERM;
         let fp = key(fingerprint);
         let now = self.now();
-        let term = term_secs.min(MAX_TERM_SECS);
         let Some(entry) = self.entries.get_mut(&fp) else {
             return Err(TrustError::Unknown(fp));
         };
@@ -800,7 +879,7 @@ impl TrustStore {
             return Err(TrustError::Unknown(fp));
         };
         lease.issued_at = lease.issued_at.min(now);
-        lease.not_after = now.saturating_add(term);
+        lease.expiry = term.expiry_from(now);
         Ok(())
     }
 
@@ -1087,7 +1166,7 @@ impl TrustStore {
         self.entries.retain(|_, e| {
             // A lapsed lease with no removal beside it: nothing refers to it.
             if let (Some(l), None) = (e.lease.as_ref(), e.denial.as_ref()) {
-                if l.not_after <= now.saturating_sub(LAPSED_RETENTION_SECS) {
+                if l.lapsed_by(now.saturating_sub(LAPSED_RETENTION_SECS)) {
                     dropped += 1;
                     return false;
                 }
@@ -1096,17 +1175,23 @@ impl TrustStore {
         });
 
         for e in self.entries.values_mut() {
+            // The lease row beside an old removal carries the same name, and a
+            // lease with no term never lapses, so the removal's age has to
+            // decide for both records or that copy outlives the redaction.
+            let removed_long_ago = e
+                .denial
+                .as_ref()
+                .is_some_and(|d| d.at <= now.saturating_sub(NAME_RETENTION_SECS));
             if let Some(d) = e.denial.as_mut() {
-                if !d.label.is_empty() && d.at <= now.saturating_sub(NAME_RETENTION_SECS) {
+                if !d.label.is_empty() && removed_long_ago {
                     d.label.clear();
                     redacted += 1;
                 }
             }
             if let Some(l) = e.lease.as_mut() {
-                if !l.label.is_empty()
-                    && l.not_after <= now.saturating_sub(NAME_RETENTION_SECS)
-                    && !l.is_valid_at(now)
-                {
+                let lapsed_long_ago =
+                    l.lapsed_by(now.saturating_sub(NAME_RETENTION_SECS)) && !l.is_valid_at(now);
+                if !l.label.is_empty() && (lapsed_long_ago || removed_long_ago) {
                     l.label.clear();
                     redacted += 1;
                 }
@@ -1122,7 +1207,7 @@ impl TrustStore {
         self.entries
             .values()
             .filter_map(|e| e.lease.as_ref())
-            .filter(|l| l.not_after > since && l.not_after <= now)
+            .filter(|l| l.lapsed_by(now) && !l.lapsed_by(since))
             .cloned()
             .collect()
     }
@@ -1170,10 +1255,10 @@ impl TrustStore {
     ///
     /// # Term
     ///
-    /// [`MIGRATION_TERM_SECS`], so the carried-forward grant becomes a scheduled
-    /// visible decision instead of a permanent invisible one, and so the first
-    /// time anyone is asked the direction question is a renewal prompt with the
-    /// device in front of them.
+    /// [`DEFAULT_TERM`], the same as a lease a user approves today. A
+    /// carried-forward grant used to get 400 days so that an upgrade would not
+    /// arm a deadline the user was never shown; with no term at all (#183)
+    /// there is no deadline to arm.
     pub fn migrate_from_config(
         &mut self,
         authorized: &HashMap<String, String>,
@@ -1235,7 +1320,7 @@ impl TrustStore {
                 caps,
                 origin: Origin::Migrated,
                 issued_at: now,
-                not_after: now.saturating_add(MIGRATION_TERM_SECS),
+                expiry: DEFAULT_TERM.expiry_from(now),
             };
             match self.admit(lease) {
                 Ok(()) if !report.leased.contains(&fp) => report.leased.push(fp),
@@ -1291,6 +1376,7 @@ mod tests {
     const T0: u64 = 4_000_000_000;
     const HOUR: u64 = 3_600;
     const DAY: u64 = 86_400;
+    const YEAR: u64 = 365 * DAY;
     /// The instant the live config's one removal was recorded.
     const REMOVED_AT: u64 = 1_788_579_979;
 
@@ -1359,7 +1445,7 @@ mod tests {
         // direction handed it the other one for free.
         let mut s = store();
         let peer = fp(0x11);
-        s.issue(&peer, "shop floor pc", Caps::DRIVE_ME, DAY)
+        s.issue(&peer, "shop floor pc", Caps::DRIVE_ME)
             .expect("issue");
 
         assert!(s.may_drive_us(&peer));
@@ -1389,13 +1475,12 @@ mod tests {
     fn an_expelled_key_is_dead_for_good_and_a_new_one_pairs_from_scratch() {
         let mut s = store();
         let old_key = fp(0x41);
-        s.issue(&old_key, "laptop", Caps::INBOUND, DAY)
-            .expect("issue");
+        s.issue(&old_key, "laptop", Caps::INBOUND).expect("issue");
         s.revoke(&old_key);
 
         assert!(
             matches!(
-                s.issue(&old_key, "laptop", Caps::INBOUND, DAY),
+                s.issue(&old_key, "laptop", Caps::INBOUND),
                 Err(TrustError::Expelled { .. })
             ),
             "the expelled key must never be re-authorised, by any route"
@@ -1404,7 +1489,7 @@ mod tests {
 
         // The same machine, a new identity. This is the supported recovery.
         let new_key = fp(0x42);
-        s.issue(&new_key, "laptop", Caps::INBOUND, DAY)
+        s.issue(&new_key, "laptop", Caps::INBOUND)
             .expect("a new identity pairs from scratch");
         assert!(
             s.may_drive_us(&new_key),
@@ -1420,8 +1505,7 @@ mod tests {
     fn an_old_removal_keeps_biting_after_its_name_is_forgotten() {
         let mut s = store();
         let gone = fp(0x31);
-        s.issue(&gone, "living room", Caps::INBOUND, DAY)
-            .expect("issue");
+        s.issue(&gone, "living room", Caps::INBOUND).expect("issue");
         s.revoke(&gone);
 
         let far_future = s.now() + NAME_RETENTION_SECS + DAY;
@@ -1462,7 +1546,7 @@ mod tests {
     fn a_long_lapsed_lease_is_dropped_rather_than_kept_as_an_empty_row() {
         let mut s = store();
         let old = fp(0x32);
-        s.issue(&old, "old laptop", Caps::INBOUND, DAY)
+        s.issue_with_term(&old, "old laptop", Caps::INBOUND, Term::Secs(DAY))
             .expect("issue");
 
         let far_future = s.now() + LAPSED_RETENTION_SECS + DAY;
@@ -1479,8 +1563,7 @@ mod tests {
     fn a_live_lease_keeps_its_name_however_old_the_store_is() {
         let mut s = store();
         let live = fp(0x33);
-        s.issue(&live, "desk mac", Caps::INBOUND, MAX_TERM_SECS)
-            .expect("issue");
+        s.issue(&live, "desk mac", Caps::INBOUND).expect("issue");
 
         let later = s.now() + NAME_RETENTION_SECS + DAY;
         let (redacted, dropped) = s.forget_stale_names(later);
@@ -1504,7 +1587,6 @@ mod tests {
             &receiver,
             "living room",
             Caps::OUTBOUND,
-            DAY,
             Origin::OutboundDial,
         )
         .expect("issue");
@@ -1534,7 +1616,7 @@ mod tests {
     fn asking_for_a_capability_this_build_does_not_enforce_is_refused() {
         let mut s = store();
         let peer = fp(0x14);
-        s.issue(&peer, "peer", Caps::DRIVE_ME, DAY).expect("issue");
+        s.issue(&peer, "peer", Caps::DRIVE_ME).expect("issue");
         assert!(!s.permits(&peer, Caps(0x4000)));
         assert!(!s.permits(&peer, Caps::DRIVE_ME.union(Caps(0x4000))));
     }
@@ -1556,7 +1638,7 @@ mod tests {
         assert!(Caps::from_bits_truncating(0x4000).is_empty());
         let mut s = store();
         let peer = fp(0x15);
-        s.issue(&peer, "future", Caps::DRIVE_ME.union(Caps(0x4000)), DAY)
+        s.issue(&peer, "future", Caps::DRIVE_ME.union(Caps(0x4000)))
             .expect("issue");
         assert_eq!(
             s.lease(&peer).expect("lease").caps,
@@ -1575,11 +1657,48 @@ mod tests {
 
     // ---------------------------------------------------------------- expiry
 
+    /// No pairing expires until renewal exists (#183). Checked at the old
+    /// 30-day and 400-day boundaries and ten years on, through every question
+    /// the store answers and through the sweep, which is the call the daemon's
+    /// timer makes.
+    #[test]
+    fn a_lease_issued_today_still_grants_everything_ten_years_on() {
+        let mut s = store();
+        let (sender, receiver) = (fp(0x26), fp(0x27));
+        s.issue(&sender, "sender", Caps::INBOUND).expect("issue");
+        s.issue_with_origin(&receiver, "receiver", Caps::OUTBOUND, Origin::OutboundDial)
+            .expect("issue");
+
+        for later in [T0 + 30 * DAY, T0 + 400 * DAY, T0 + 10 * YEAR] {
+            assert!(
+                s.sweep(later).is_empty(),
+                "the sweep reported a lapse at {later}, and the daemon cuts the \
+                 sessions of whatever it reports"
+            );
+            assert_eq!(s.clock().floor(), later, "the sweep still moves the floor");
+            assert!(
+                s.may_drive_us(&sender) && s.clipboard_from(&sender),
+                "a pairing made today stopped admitting its sender at {later}"
+            );
+            assert!(
+                s.we_may_drive(&receiver) && s.clipboard_to(&receiver),
+                "a pairing made today stopped admitting its receiver at {later}"
+            );
+            assert!(s.has_live_lease(&sender) && s.has_live_lease(&receiver));
+            assert!(!s.is_expiring(&sender) && !s.is_expiring(&receiver));
+            assert!(
+                s.config_cache().0.contains_key(&sender),
+                "the table the frontends are sent dropped a live pairing"
+            );
+        }
+    }
+
     #[test]
     fn an_expired_lease_permits_nothing_at_all() {
         let mut s = store();
         let peer = fp(0x20);
-        s.issue(&peer, "laptop", Caps::KNOWN, HOUR).expect("issue");
+        s.issue_with_term(&peer, "laptop", Caps::KNOWN, Term::Secs(HOUR))
+            .expect("issue");
 
         s.clock().observe(T0 + HOUR - 1);
         assert!(
@@ -1613,7 +1732,7 @@ mod tests {
                 caps: Caps::DRIVE_ME,
                 origin: Origin::Inbound,
                 issued_at: T0,
-                not_after: T0 + HOUR,
+                expiry: Expiry::At(T0 + HOUR),
             }),
             denial: None,
         };
@@ -1635,8 +1754,10 @@ mod tests {
     fn a_sweep_reports_each_lapse_exactly_once() {
         let mut s = store();
         let (a, b) = (fp(0x22), fp(0x23));
-        s.issue(&a, "a", Caps::DRIVE_ME, HOUR).expect("issue");
-        s.issue(&b, "b", Caps::DRIVE_ME, DAY).expect("issue");
+        s.issue_with_term(&a, "a", Caps::DRIVE_ME, Term::Secs(HOUR))
+            .expect("issue");
+        s.issue_with_term(&b, "b", Caps::DRIVE_ME, Term::Secs(DAY))
+            .expect("issue");
 
         assert!(s.sweep(T0 + 60).is_empty(), "nothing has lapsed yet");
 
@@ -1660,7 +1781,7 @@ mod tests {
     fn a_lapsed_lease_keeps_everything_needed_to_renew_it() {
         let mut s = store();
         let peer = fp(0x24);
-        s.issue(&peer, "workshop", Caps::INBOUND, HOUR)
+        s.issue_with_term(&peer, "workshop", Caps::INBOUND, Term::Secs(HOUR))
             .expect("issue");
         s.sweep(T0 + DAY);
 
@@ -1675,38 +1796,32 @@ mod tests {
         assert!(!s.is_denied(&peer), "a lapse is not an expulsion");
         assert!(s.may_prompt(&peer));
 
-        s.renew(&peer, DAY).expect("renew");
+        s.renew(&peer).expect("renew");
         assert!(s.may_drive_us(&peer));
     }
 
+    /// This asserted a warning at 395 days and a lapse at 400. The migrated
+    /// lease now carries no term (#183), so there is no outage to warn about.
     #[test]
-    fn an_upgraded_fleet_is_not_dead_the_next_morning_and_is_warned_before_it_is() {
+    fn an_upgraded_fleet_still_works_ten_years_on_and_is_never_nagged() {
         let mut s = store();
         let peer = fp(0x25);
         let mut config = HashMap::new();
         config.insert(peer.clone(), "desk".to_string());
         s.migrate_from_config(&config, &HashMap::new(), &HashSet::new(), T0);
 
-        s.clock().observe(T0 + 365 * DAY);
-        assert!(
-            s.may_drive_us(&peer),
-            "a year of not thinking about it must still work"
-        );
-        assert!(!s.is_expiring(&peer), "and must not nag for most of it");
-
-        s.clock().observe(T0 + 395 * DAY);
-        assert!(
-            s.is_expiring(&peer),
-            "the warning must come before the outage, not explain it afterwards"
-        );
-        assert!(s.may_drive_us(&peer));
-
-        s.clock().observe(T0 + MIGRATION_TERM_SECS);
-        assert!(!s.may_drive_us(&peer));
-        assert!(
-            !s.is_expiring(&peer),
-            "past the term there is nothing to warn"
-        );
+        for later in [T0 + 395 * DAY, T0 + 400 * DAY, T0 + 10 * YEAR] {
+            assert!(
+                s.sweep(later).is_empty(),
+                "a carried-forward pairing lapsed at {later} — nothing renews a \
+                 lease yet, so a lapse is a device that stops working for good"
+            );
+            assert!(s.may_drive_us(&peer), "it must still work at {later}");
+            assert!(
+                !s.is_expiring(&peer),
+                "and nothing may ask the user to renew what cannot lapse"
+            );
+        }
     }
 
     // ----------------------------------------------------------------- clock
@@ -1715,7 +1830,7 @@ mod tests {
     fn rolling_the_system_clock_backward_extends_nothing() {
         let mut s = store();
         let peer = fp(0x30);
-        s.issue(&peer, "kiosk", Caps::DRIVE_ME, HOUR)
+        s.issue_with_term(&peer, "kiosk", Caps::DRIVE_ME, Term::Secs(HOUR))
             .expect("issue");
 
         s.clock().observe(T0 + HOUR);
@@ -1750,7 +1865,7 @@ mod tests {
             caps: Caps::DRIVE_ME,
             origin: Origin::Inbound,
             issued_at: T0 - 2_000,
-            not_after: T0 - 500,
+            expiry: Expiry::At(T0 - 500),
         };
         let entry = Entry {
             lease: Some(lease),
@@ -1768,7 +1883,8 @@ mod tests {
     fn rolling_the_system_clock_forward_expires_a_lease_early_rather_than_late() {
         let mut s = store();
         let peer = fp(0x32);
-        s.issue(&peer, "kiosk", Caps::DRIVE_ME, DAY).expect("issue");
+        s.issue_with_term(&peer, "kiosk", Caps::DRIVE_ME, Term::Secs(DAY))
+            .expect("issue");
         assert!(s.may_drive_us(&peer));
 
         s.clock().observe(T0 + DAY + 1);
@@ -1823,7 +1939,7 @@ mod tests {
     fn a_removal_outranks_an_unexpired_lease() {
         let mut s = store();
         let peer = fp(0x43);
-        s.issue(&peer, "kiosk", Caps::KNOWN, DAY).expect("issue");
+        s.issue(&peer, "kiosk", Caps::KNOWN).expect("issue");
         assert_eq!(s.revoke(&peer), "kiosk", "the name comes back for the log");
 
         assert!(
@@ -1840,10 +1956,9 @@ mod tests {
     fn an_expelled_device_may_not_summon_a_prompt_but_a_lapsed_one_may() {
         let mut s = store();
         let (lapsed, expelled) = (fp(0x45), fp(0x46));
-        s.issue(&lapsed, "laptop", Caps::DRIVE_ME, HOUR)
+        s.issue_with_term(&lapsed, "laptop", Caps::DRIVE_ME, Term::Secs(HOUR))
             .expect("issue");
-        s.issue(&expelled, "kiosk", Caps::DRIVE_ME, DAY)
-            .expect("issue");
+        s.issue(&expelled, "kiosk", Caps::DRIVE_ME).expect("issue");
         s.revoke(&expelled);
         s.clock().observe(T0 + DAY);
 
@@ -1863,7 +1978,7 @@ mod tests {
     fn forgetting_a_device_is_not_the_same_verb_as_removing_it() {
         let mut s = store();
         let peer = fp(0x47);
-        s.issue(&peer, "kiosk", Caps::DRIVE_ME, DAY).expect("issue");
+        s.issue(&peer, "kiosk", Caps::DRIVE_ME).expect("issue");
         s.revoke(&peer);
         assert!(s.forget(&peer));
         assert!(
@@ -1887,7 +2002,7 @@ mod tests {
                 caps: Caps::DRIVE_ME,
                 origin: Origin::Inbound,
                 issued_at: T0,
-                not_after: T0 + DAY,
+                expiry: Expiry::Never,
             }),
             denial: None,
         };
@@ -1923,7 +2038,7 @@ mod tests {
                 caps: Caps::DRIVE_ME,
                 origin: Origin::Inbound,
                 issued_at: T0,
-                not_after: T0 + DAY,
+                expiry: Expiry::Never,
             })
             .expect_err("a lease naming another machine is not a lease here");
         assert!(matches!(err, TrustError::WrongMachine { .. }));
@@ -1936,8 +2051,7 @@ mod tests {
     fn turning_off_the_clipboard_leaves_input_untouched() {
         let mut s = store();
         let peer = fp(0x60);
-        s.issue(&peer, "desk mac", Caps::INBOUND, DAY)
-            .expect("issue");
+        s.issue(&peer, "desk mac", Caps::INBOUND).expect("issue");
         assert_eq!(
             s.drop_capabilities(&peer, Caps::CLIPBOARD_FROM),
             Some(Caps::DRIVE_ME)
@@ -1955,7 +2069,7 @@ mod tests {
         // wanted to stop sending to also stopped being able to reach you.
         let mut s = store();
         let peer = fp(0x61);
-        s.issue(&peer, "both ways", Caps::INBOUND | Caps::OUTBOUND, DAY)
+        s.issue(&peer, "both ways", Caps::INBOUND | Caps::OUTBOUND)
             .expect("issue");
         assert_eq!(
             s.drop_capabilities(&peer, Caps::OUTBOUND),
@@ -1970,8 +2084,7 @@ mod tests {
     fn narrowing_everything_ends_the_lease_without_expelling() {
         let mut s = store();
         let peer = fp(0x62);
-        s.issue(&peer, "one way", Caps::DRIVE_ME, DAY)
-            .expect("issue");
+        s.issue(&peer, "one way", Caps::DRIVE_ME).expect("issue");
         assert_eq!(s.drop_capabilities(&peer, Caps::KNOWN), Some(Caps::NONE));
         assert!(s.lease(&peer).is_none());
         assert!(!s.is_denied(&peer));
@@ -1982,7 +2095,7 @@ mod tests {
     fn narrowing_a_removed_device_keeps_the_removal_on_file() {
         let mut s = store();
         let peer = fp(0x63);
-        s.issue(&peer, "kiosk", Caps::DRIVE_ME, DAY).expect("issue");
+        s.issue(&peer, "kiosk", Caps::DRIVE_ME).expect("issue");
         s.revoke(&peer);
         assert_eq!(s.drop_capabilities(&peer, Caps::KNOWN), Some(Caps::NONE));
         assert!(
@@ -2003,8 +2116,7 @@ mod tests {
         // answer is a boolean denial — matching nothing there means NOT denied.
         let mut s = store();
         let peer = fp(0x70);
-        s.issue(&peer, "expelled", Caps::DRIVE_ME, DAY)
-            .expect("issue");
+        s.issue(&peer, "expelled", Caps::DRIVE_ME).expect("issue");
         s.revoke(&peer);
 
         let shouted = peer.to_uppercase();
@@ -2032,7 +2144,7 @@ mod tests {
         // the permission it was supposed to lose.
         let mut s = store();
         let peer = fp(0x72);
-        s.issue(&peer, "both ways", Caps::INBOUND | Caps::OUTBOUND, DAY)
+        s.issue(&peer, "both ways", Caps::INBOUND | Caps::OUTBOUND)
             .expect("issue");
         assert_eq!(
             s.drop_capabilities(&peer.to_uppercase(), Caps::OUTBOUND),
@@ -2049,7 +2161,7 @@ mod tests {
     fn one_record_answers_the_same_however_the_fingerprint_is_spelled() {
         let mut s = store();
         let peer = fp(0x73);
-        s.issue(&peer.to_uppercase(), "shouty", Caps::DRIVE_ME, DAY)
+        s.issue(&peer.to_uppercase(), "shouty", Caps::DRIVE_ME)
             .expect("issue");
         assert_eq!(s.len(), 1, "two spellings must not become two records");
         assert!(s.may_drive_us(&peer) && s.may_drive_us(&peer.to_uppercase()));
@@ -2064,7 +2176,7 @@ mod tests {
     fn a_string_that_is_not_a_fingerprint_cannot_be_granted_anything() {
         let mut s = store();
         assert_eq!(
-            s.issue("not-a-fingerprint", "x", Caps::DRIVE_ME, DAY),
+            s.issue("not-a-fingerprint", "x", Caps::DRIVE_ME),
             Err(TrustError::BadFingerprint("not-a-fingerprint".to_string()))
         );
         assert!(!s.permits("not-a-fingerprint", Caps::DRIVE_ME));
@@ -2080,12 +2192,13 @@ mod tests {
     fn a_lease_may_not_outlive_the_ceiling() {
         let mut s = store();
         let peer = fp(0x74);
-        s.issue(&peer, "forever", Caps::DRIVE_ME, u64::MAX)
+        s.issue_with_term(&peer, "forever", Caps::DRIVE_ME, Term::Secs(u64::MAX))
             .expect("an over-long request is clamped, not refused");
         assert_eq!(
-            s.lease(&peer).expect("lease").not_after,
-            T0 + MAX_TERM_SECS,
-            "an unbounded lease is the shape being removed"
+            s.lease(&peer).expect("lease").expiry,
+            Expiry::At(T0 + MAX_TERM_SECS),
+            "a number may not stand in for an unbounded lease — that is \
+             `Term::Unbounded`, said out loud"
         );
 
         let err = s
@@ -2096,18 +2209,20 @@ mod tests {
                 caps: Caps::DRIVE_ME,
                 origin: Origin::Migrated,
                 issued_at: T0,
-                not_after: T0 + MAX_TERM_SECS + 1,
+                expiry: Expiry::At(T0 + MAX_TERM_SECS + 1),
             })
             .expect_err("a replayed record may not exceed it either");
         assert!(matches!(err, TrustError::TermTooLong { .. }));
     }
 
     #[test]
-    fn the_migration_term_fits_under_the_ceiling() {
-        // These two constants disagreed in an earlier draft (366 against 400),
-        // which meant every migrated lease was refused and the whole fleet went
+    fn a_lease_with_no_term_is_admissible_at_the_load_door() {
+        // This asserted that the 400-day migration term fitted under the
+        // ceiling. Those constants disagreed in an earlier draft (366 against
+        // 400), so every migrated lease was refused and the whole fleet went
         // dark on the first boot after the upgrade — silently, because a refused
-        // lease looks exactly like a device nobody ever trusted.
+        // lease looks exactly like a device nobody ever trusted. With no term
+        // (#183) the same failure is the load door refusing `Expiry::Never`.
         let mut s = store();
         let peer = fp(0x76);
         s.admit(Lease {
@@ -2117,9 +2232,9 @@ mod tests {
             caps: Caps::INBOUND,
             origin: Origin::Migrated,
             issued_at: T0,
-            not_after: T0 + MIGRATION_TERM_SECS,
+            expiry: Expiry::Never,
         })
-        .expect("a migrated lease must be admissible");
+        .expect("a lease with no term must be admissible");
         assert!(s.may_drive_us(&peer));
     }
 
@@ -2127,11 +2242,11 @@ mod tests {
     fn a_lease_that_permits_nothing_is_refused() {
         let mut s = store();
         assert_eq!(
-            s.issue(&fp(0x77), "", Caps::NONE, DAY),
+            s.issue(&fp(0x77), "", Caps::NONE),
             Err(TrustError::NoCapabilities)
         );
         assert_eq!(
-            s.issue(&fp(0x77), "", Caps(0x4000), DAY),
+            s.issue(&fp(0x77), "", Caps(0x4000)),
             Err(TrustError::NoCapabilities),
             "a lease made only of bits this build does not enforce decides \
              nothing, and must say so rather than sit there reading as trust"
@@ -2145,7 +2260,7 @@ mod tests {
         // and both UIs. Only the rename verb cleaned it.
         let mut s = store();
         let peer = fp(0x78);
-        s.issue(&peer, "ev\u{202e}il\u{0007}\u{200b}", Caps::DRIVE_ME, DAY)
+        s.issue(&peer, "ev\u{202e}il\u{0007}\u{200b}", Caps::DRIVE_ME)
             .expect("issue");
         assert_eq!(s.label(&peer).as_deref(), Some("evil"));
 
@@ -2175,8 +2290,7 @@ mod tests {
         );
 
         let known = fp(0x7b);
-        s.issue(&known, "old name", Caps::DRIVE_ME, DAY)
-            .expect("issue");
+        s.issue(&known, "old name", Caps::DRIVE_ME).expect("issue");
         s.set_label(&known, "new name").expect("rename");
         assert_eq!(s.label(&known).as_deref(), Some("new name"));
         assert_eq!(s.capabilities(&known), Caps::DRIVE_ME);
@@ -2403,7 +2517,7 @@ mod tests {
 
         assert!(
             matches!(
-                s.issue(&expelled, "workshop", Caps::INBOUND, DAY),
+                s.issue(&expelled, "workshop", Caps::INBOUND),
                 Err(TrustError::Expelled { .. })
             ),
             "a removal carried across the migration must still be permanent — \

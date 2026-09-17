@@ -524,12 +524,7 @@ mod tests {
         let mut store = crate::trust::TrustStore::new(us, 0).expect("our fingerprint");
         for f in fps {
             store
-                .issue(
-                    f,
-                    "peer",
-                    crate::trust::Caps::INBOUND,
-                    crate::trust::DEFAULT_TERM_SECS,
-                )
+                .issue(f, "peer", crate::trust::Caps::INBOUND)
                 .expect("issue");
         }
         Arc::new(RwLock::new(store))
@@ -542,12 +537,7 @@ mod tests {
         let mut store = crate::trust::TrustStore::new(us, 0).expect("our fingerprint");
         for f in fps {
             store
-                .issue(
-                    f,
-                    "peer",
-                    crate::trust::Caps::OUTBOUND,
-                    crate::trust::DEFAULT_TERM_SECS,
-                )
+                .issue(f, "peer", crate::trust::Caps::OUTBOUND)
                 .expect("issue");
         }
         Arc::new(RwLock::new(store))

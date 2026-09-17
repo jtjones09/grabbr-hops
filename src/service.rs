@@ -203,6 +203,44 @@ fn drop_untrusted_pins(
     stale.into_iter().map(|(h, _)| h).collect()
 }
 
+/// Why an approved prompt granted nothing.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub(crate) enum GrantRefused {
+    #[error("no pending connection attempt, so there is no observed provenance to shape the grant")]
+    NoAttempt,
+    #[error(transparent)]
+    Store(#[from] crate::trust::TrustError),
+}
+
+/// The grant an approved prompt makes, shaped by how the peer arrived.
+///
+/// An unsolicited knock is the user answering "may this machine drive mine":
+/// INBOUND. Our own dial is the user answering "may I drive that machine":
+/// OUTBOUND. Granting INBOUND for both is exactly the defect the direction
+/// split exists to remove, and it hid in the grant door because the split was
+/// built in the store and never wired to it.
+///
+/// Unknown provenance grants nothing. A grant with no prompt behind it is the
+/// case worth failing closed on.
+///
+/// Through [`crate::trust::TrustStore::issue`], which takes no term, so the
+/// grant does not lapse (#183). Out of `Service::add_authorized_key` so a test
+/// can run the grant itself without standing up a daemon.
+pub(crate) fn grant_for_attempt(
+    trust: &mut crate::trust::TrustStore,
+    fingerprint: &str,
+    label: &str,
+    origin: Option<AttemptOrigin>,
+) -> Result<crate::trust::Caps, GrantRefused> {
+    let caps = match origin {
+        Some(AttemptOrigin::Inbound) => crate::trust::Caps::INBOUND,
+        Some(AttemptOrigin::OutboundDial) => crate::trust::Caps::OUTBOUND,
+        None => return Err(GrantRefused::NoAttempt),
+    };
+    trust.issue(fingerprint, label, caps)?;
+    Ok(caps)
+}
+
 /// Hold the claim before the config is read, and read it only then.
 ///
 /// `claim` is a future, so nothing of it runs until it is awaited here.
@@ -276,6 +314,9 @@ impl Service {
                     // Reported, never dropped silently: a device losing trust
                     // with no explanation is the failure this rework removes.
                     log::warn!("trust store: {why}");
+                }
+                for (level, line) in crate::trust_file::stored_terms(&leases, &store).log_lines() {
+                    log::log!(level, "{line}");
                 }
                 store
             }
@@ -1125,34 +1166,16 @@ impl Service {
             )));
             return;
         }
-        // A lease, not a permanent entry — and shaped by how the peer arrived.
-        //
-        // An unsolicited knock is the user answering "may this machine drive
-        // mine": INBOUND. Our own dial is the user answering "may I drive that
-        // machine": OUTBOUND. Granting INBOUND for both is exactly the defect
-        // the direction split exists to remove, and it hid here because the
-        // split was built in the store and never wired to this door.
-        //
-        // Unknown provenance grants nothing. A grant with no prompt behind it
-        // is the case worth failing closed on.
+        // Shaped by how the peer arrived; see `grant_for_attempt`.
         let origin = self.pending_origin.remove(&fp);
-        let caps = match origin {
-            Some(AttemptOrigin::Inbound) => crate::trust::Caps::INBOUND,
-            Some(AttemptOrigin::OutboundDial) => crate::trust::Caps::OUTBOUND,
-            None => {
-                log::warn!(
-                    "refusing to authorize {fp}: no pending connection attempt, so there \
-                     is no observed provenance to shape the grant"
-                );
-                return;
-            }
+        // The lock is taken on one line on purpose: the named-door guard scans
+        // for that call, and a chain split across lines drops this door out of
+        // its match set without failing anything.
+        let issued = {
+            let mut trust = self.trust.write().expect("lock");
+            grant_for_attempt(&mut trust, &fp, &desc, origin)
         };
-        if let Err(e) = self.trust.write().expect("lock").issue(
-            &fp,
-            &desc,
-            caps,
-            crate::trust::DEFAULT_TERM_SECS,
-        ) {
+        if let Err(e) = issued {
             log::warn!("refusing to authorize {fp}: {e}");
             return;
         }
@@ -1367,6 +1390,9 @@ impl Service {
     /// indefinitely. It is deliberately not the only enforcement: a lapsed
     /// lease is refused at the point of injection too, where no amount of
     /// flooding can postpone the check.
+    ///
+    /// No lease lapses in this release (#183), so today the sweep reports
+    /// nothing and its work is advancing and persisting the clock floor.
     fn sweep_lapsed_leases(&mut self) {
         let lapsed = {
             let mut trust = self.trust.write().expect("lock");
