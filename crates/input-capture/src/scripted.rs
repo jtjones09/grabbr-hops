@@ -27,7 +27,13 @@ use super::{Backend, Capture, CaptureError, CaptureEvent, Position};
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ScriptId(u64);
 
-type Events = UnboundedReceiver<(Position, CaptureEvent)>;
+/// What a script delivers: an event, or a backend failure.
+enum Item {
+    Event(Position, CaptureEvent),
+    Fail,
+}
+
+type Events = UnboundedReceiver<Item>;
 /// The receiving end, lent to one live backend at a time.
 type Slot = Arc<Mutex<Option<Events>>>;
 
@@ -39,7 +45,7 @@ static REGISTRY: Mutex<Option<HashMap<ScriptId, Slot>>> = Mutex::new(None);
 /// Dropping it unregisters it and ends the backend's event stream.
 pub struct Script {
     id: ScriptId,
-    tx: UnboundedSender<(Position, CaptureEvent)>,
+    tx: UnboundedSender<Item>,
 }
 
 impl Script {
@@ -62,7 +68,13 @@ impl Script {
 
     /// Deliver one event, as if the device at `pos` produced it.
     pub fn push(&self, pos: Position, event: CaptureEvent) {
-        let _ = self.tx.send((pos, event));
+        let _ = self.tx.send(Item::Event(pos, event));
+    }
+
+    /// Fail the backend: its stream yields an error next, as a real backend
+    /// does when its event tap or portal session dies.
+    pub fn fail(&self) {
+        let _ = self.tx.send(Item::Fail);
     }
 }
 
@@ -141,7 +153,14 @@ impl Stream for ScriptedCapture {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.events.as_mut() {
-            Some(events) => events.poll_recv(cx).map(|e| e.map(Ok)),
+            Some(events) => events.poll_recv(cx).map(|item| {
+                item.map(|item| match item {
+                    Item::Event(pos, event) => Ok((pos, event)),
+                    Item::Fail => Err(CaptureError::Io(std::io::Error::other(
+                        "scripted: failure requested by the test",
+                    ))),
+                })
+            }),
             None => Poll::Ready(None),
         }
     }

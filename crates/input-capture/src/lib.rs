@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures_core::Stream;
 
-use input_event::{Event, KeyboardEvent, PointerEvent, scancode};
+use input_event::{Event, KeyboardEvent, scancode};
 
 pub use error::{CaptureCreationError, CaptureError, InputCaptureError};
 
@@ -131,8 +131,6 @@ pub struct InputCapture {
     capture: Box<dyn Capture>,
     /// keys pressed by active capture
     pressed_keys: HashSet<scancode::Linux>,
-    /// mouse buttons pressed by active capture, by evdev code
-    pressed_buttons: HashSet<u32>,
     /// map from position to ids
     position_map: HashMap<Position, Vec<CaptureHandle>>,
     /// map from id to position
@@ -196,7 +194,6 @@ impl InputCapture {
     /// release mouse
     pub async fn release(&mut self) -> Result<(), CaptureError> {
         self.pressed_keys.clear();
-        self.pressed_buttons.clear();
         self.capture.release().await
     }
 
@@ -213,14 +210,6 @@ impl InputCapture {
         std::mem::take(&mut self.pressed_keys)
     }
 
-    /// The mouse-button half of [`Self::take_pressed_keys`], with the same
-    /// contract. A release bind pressed mid-drag exits capture with the button
-    /// still down; its button-up then goes to this machine, not the peer, and
-    /// the peer drags on (#89).
-    pub fn take_pressed_buttons(&mut self) -> HashSet<u32> {
-        std::mem::take(&mut self.pressed_buttons)
-    }
-
     /// destroy the input capture
     pub async fn terminate(&mut self) -> Result<(), CaptureError> {
         self.capture.terminate().await
@@ -235,7 +224,6 @@ impl InputCapture {
             pending: Default::default(),
             position_map: Default::default(),
             pressed_keys: HashSet::new(),
-            pressed_buttons: HashSet::new(),
         })
     }
 
@@ -284,19 +272,9 @@ impl Stream for InputCapture {
             Err(e) => return Poll::Ready(Some(Err(e))),
         };
 
-        // handle key and button presses
-        match event {
-            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state, .. })) => {
-                self.update_pressed_keys(key, state);
-            }
-            CaptureEvent::Input(Event::Pointer(PointerEvent::Button { button, state, .. })) => {
-                if state == 0 {
-                    self.pressed_buttons.remove(&button);
-                } else {
-                    self.pressed_buttons.insert(button);
-                }
-            }
-            _ => {}
+        // handle key presses
+        if let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state, .. })) = event {
+            self.update_pressed_keys(key, state);
         }
 
         let len = self
@@ -499,77 +477,6 @@ mod destroy_purges_pending {
             c.position_map.get(&Position::Right).map(|v| v.as_slice()),
             Some([2].as_slice()),
             "the other handle keeps the position registered"
-        );
-    }
-}
-
-#[cfg(all(test, feature = "scripted"))]
-mod held_buttons {
-    //! What the capture layer reports as held is what the sender turns into
-    //! button-ups when it leaves a peer mid-drag (#89). A button reported held
-    //! that is not becomes a stray button-up on the peer; one missed stays
-    //! down there.
-
-    use super::*;
-    use crate::scripted::Script;
-    use input_event::{BTN_LEFT, BTN_RIGHT};
-
-    fn button(button: u32, state: u32) -> CaptureEvent {
-        CaptureEvent::Input(Event::Pointer(PointerEvent::Button {
-            time: 0,
-            button,
-            state,
-        }))
-    }
-
-    /// Capture reading `script`, with one handle at the left edge, after it
-    /// has yielded each of `events`.
-    async fn after(script: &Script, events: &[CaptureEvent]) -> InputCapture {
-        let mut c = InputCapture::new(Some(script.backend()))
-            .await
-            .expect("the scripted backend needs no display");
-        c.create(1, Position::Left).await.expect("create");
-        for &event in events {
-            script.push(Position::Left, event);
-            let (_, got) = c.next().await.expect("an event").expect("no error");
-            assert_eq!(got, event, "precondition: the event came through");
-        }
-        c
-    }
-
-    // LEDGER T8 | class B | 1 return value: InputCapture::take_pressed_buttons()
-    #[tokio::test]
-    async fn only_a_button_still_down_is_reported_held() {
-        let script = Script::new();
-        let mut c = after(
-            &script,
-            &[
-                button(BTN_LEFT, 1),
-                button(BTN_RIGHT, 1),
-                button(BTN_RIGHT, 0),
-            ],
-        )
-        .await;
-        assert_eq!(
-            c.take_pressed_buttons(),
-            HashSet::from([BTN_LEFT]),
-            "the right button was clicked and let go; only the left is down"
-        );
-        assert!(
-            c.take_pressed_buttons().is_empty(),
-            "taking the set empties it, so a second release sends nothing"
-        );
-    }
-
-    // LEDGER T9 | class B | 1 return value: InputCapture::take_pressed_buttons() after release()
-    #[tokio::test]
-    async fn releasing_capture_forgets_held_buttons() {
-        let script = Script::new();
-        let mut c = after(&script, &[button(BTN_LEFT, 1)]).await;
-        c.release().await.expect("release");
-        assert!(
-            c.take_pressed_buttons().is_empty(),
-            "a button pressed before a release must not be reported held after it"
         );
     }
 }
