@@ -907,6 +907,49 @@ mod at_most_one_daemon {
         );
     }
 
+    // LEDGER T45 | class B | 1 return value / error
+    #[test]
+    fn a_daemon_refused_its_lock_by_another_users_directory_says_whose_it_is() {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        if me == 0 {
+            eprintln!("not checked: nothing refuses root a file");
+            return;
+        }
+        // Root's, and not writable by anyone else. `/` on macOS is read-only
+        // to root as well, which is a different refusal.
+        let theirs = PathBuf::from(if cfg!(target_os = "macos") {
+            "/Library"
+        } else {
+            "/"
+        });
+        let path = theirs.join(format!("h-whose-{}.sock", std::process::id()));
+
+        let got = runtime().block_on(crate::AsyncFrontendListener::at(&DaemonEndpoint::Unix(
+            path.clone(),
+        )));
+        let said = match got {
+            Err(IpcListenerCreationError::Lock { hint, .. }) => hint,
+            Err(other) => format!("not a lock error: {other}"),
+            Ok(listener) => {
+                drop(listener);
+                remove(&path);
+                format!("listening on {}", path.display())
+            }
+        };
+        assert_eq!(
+            said,
+            another_users(&Foreign {
+                path: theirs,
+                owner: 0,
+                me,
+            }),
+            "a daemon that another user's directory refuses its lock file must say \
+             whose directory it is and what to do, or a directory left behind by \
+             `sudo hops` stops every later start with only an OS error"
+        );
+    }
+
     // LEDGER T47 | class B | 4 file on disk
     #[cfg(not(target_os = "macos"))]
     #[test]
