@@ -25,7 +25,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 use thiserror::Error;
-use tokio::{process::Command, signal, sync::Notify};
+use tokio::{process::Command, sync::Notify};
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
@@ -45,6 +45,79 @@ pub enum ServiceError {
     TrustStore(#[from] crate::trust::TrustError),
     #[error(transparent)]
     Authority(#[from] crate::authority::AuthorityError),
+    #[error("could not listen for stop requests: {0}")]
+    Signal(io::Error),
+}
+
+/// What asks the daemon to stop and leave through its shutdown, which lets go
+/// of held keys and buttons.
+///
+/// Ctrl+C alone missed every service manager: launchd, systemd and
+/// `hops-ctl stop-daemon` send SIGTERM, so the process died with its injected
+/// input still held on this machine (#197). A console window closing or the
+/// system shutting down is Windows' equivalent. A forced kill still skips
+/// the shutdown, on every platform.
+///
+/// Every stream is made once, before the service loop. A listener made per
+/// loop iteration misses a request that lands between two iterations, and
+/// once tokio has installed its handler the default action no longer ends the
+/// process either, so that request would be lost.
+struct StopRequests {
+    #[cfg(unix)]
+    int: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    term: tokio::signal::unix::Signal,
+    #[cfg(windows)]
+    ctrl_c: tokio::signal::windows::CtrlC,
+    #[cfg(windows)]
+    close: tokio::signal::windows::CtrlClose,
+    #[cfg(windows)]
+    shutdown: tokio::signal::windows::CtrlShutdown,
+}
+
+impl StopRequests {
+    #[cfg(unix)]
+    const DESCRIPTION: &'static str = "Ctrl+C or SIGTERM";
+    #[cfg(windows)]
+    const DESCRIPTION: &'static str = "Ctrl+C, the console closing, or system shutdown";
+
+    #[cfg(unix)]
+    fn new() -> io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            int: signal(SignalKind::interrupt())?,
+            term: signal(SignalKind::terminate())?,
+        })
+    }
+
+    #[cfg(windows)]
+    fn new() -> io::Result<Self> {
+        use tokio::signal::windows;
+        Ok(Self {
+            ctrl_c: windows::ctrl_c()?,
+            close: windows::ctrl_close()?,
+            shutdown: windows::ctrl_shutdown()?,
+        })
+    }
+
+    /// The next stop request, named for the log. Cancel-safe: every branch
+    /// is a `recv` on a stream that keeps a request it has not yet returned.
+    #[cfg(unix)]
+    async fn next(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.int.recv() => "Ctrl+C (SIGINT)",
+            _ = self.term.recv() => "SIGTERM",
+        }
+    }
+
+    #[cfg(windows)]
+    async fn next(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.ctrl_c.recv() => "Ctrl+C",
+            _ = self.close.recv() => "console close",
+            _ = self.shutdown.recv() => "system shutdown",
+        }
+    }
 }
 
 /// How often the daemon looks for leases that have lapsed while nothing was
@@ -404,6 +477,12 @@ impl Service {
         let mut lease_sweep = tokio::time::interval(LEASE_SWEEP_INTERVAL);
         lease_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // Before the loop and once: a stream made per iteration would miss a
+        // signal that lands between two of them, and once tokio installs its
+        // handler the default action (exit) no longer applies.
+        let mut stop = StopRequests::new().map_err(ServiceError::Signal)?;
+        log::info!("service running; stops on {}", StopRequests::DESCRIPTION);
+
         loop {
             tokio::select! {
                 _ = lease_sweep.tick() => self.sweep_lapsed_leases(),
@@ -454,7 +533,10 @@ impl Service {
                     }
                 }
                 _ = self.config.changed() => self.handle_config_change(),
-                r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
+                why = stop.next() => {
+                    log::info!("{why} received");
+                    break;
+                }
             }
         }
 
