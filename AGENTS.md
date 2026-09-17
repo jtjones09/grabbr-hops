@@ -119,10 +119,15 @@ promoted build is deliberately behind and must still start.
 
 Under `--strict` the exit code is the verdict: 0 matches, 2 is stale (rebuild), 3
 is that nothing could be compared, and the report says why: for example no
-checkout at the path, no git, git refusing the checkout, or a binary built without
-a commit baked in. Any other code is the check failing to run, not a verdict about
-the binary. clap also exits 2 for a subcommand it does not know, so the launchers
-run `build-check --help` first to rule out a binary older than the check.
+checkout at the path, a path below the top of a checkout or with no work tree, no
+git, git refusing the checkout, or a binary built without a commit baked in. Any
+other code is the check failing to run, not a verdict about the binary. clap also
+exits 2 for a subcommand it does not know, so the launchers run `build-check
+--help` first to rule out a binary older than the check.
+
+A path given with `--repo` or `HOPS_REPO` must be the top of a checkout, so a
+directory below one is never judged by the checkout above it. Only the working
+directory, the default, is searched upward.
 
 It lives in `src/build_check.rs` rather than in the launchers because the same
 policy hand-written per OS is exactly how the platforms drifted: one built before

@@ -6,7 +6,7 @@
 //! `#[path]`: one copy, one rule.
 
 use std::ffi::OsStr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// The one git variable passed on.
@@ -16,7 +16,39 @@ use std::process::Command;
 /// repository, never make it find another one, and git ignores it when the
 /// path itself holds one. Removing it let a path with no checkout be judged by
 /// an enclosing checkout the caller had fenced off.
-pub(crate) const KEPT_GIT_VARIABLE: &str = "GIT_CEILING_DIRECTORIES";
+const KEPT_GIT_VARIABLE: &str = "GIT_CEILING_DIRECTORIES";
+
+/// The top of the work tree git finds from `path`, and whether `path` is that
+/// top rather than a directory somewhere below it.
+///
+/// git searches upward from the path it is given. A directory below a checkout,
+/// or one holding no checkout that sits inside another, is answered for by the
+/// checkout above it, so a caller that means one directory must check it is
+/// the top. `None` when git finds no work tree: no repository, no git, git
+/// refusing the repository, or a repository with no work tree (a `.git`
+/// directory or a bare clone).
+pub(crate) fn work_tree(path: &Path) -> Option<(PathBuf, bool)> {
+    let out = git_at(path)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let top = String::from_utf8(out.stdout).ok()?;
+    let top = PathBuf::from(top.trim_end_matches(['\n', '\r']));
+    // git before 2.25 printed nothing, successfully, outside a work tree.
+    if top.as_os_str().is_empty() {
+        return None;
+    }
+    // Compared resolved, because the two spellings differ for one directory:
+    // git prints `D:/x` on Windows, and resolves symbolic links and letter case.
+    let is_top = match (std::fs::canonicalize(path), std::fs::canonicalize(&top)) {
+        (Ok(path), Ok(top)) => path == top,
+        _ => false,
+    };
+    Some((top, is_top))
+}
 
 /// `git -C <repo>`, with every inherited variable whose name starts with
 /// `GIT_` removed, except [`KEPT_GIT_VARIABLE`].

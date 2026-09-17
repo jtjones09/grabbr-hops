@@ -310,6 +310,10 @@ fn package_edition(manifest_dir: &Path) -> String {
 /// reached git, the binary carried the other repository's commit, every strict
 /// check reported it stale, and rebuilding kept it.
 ///
+/// git also searches upward, so source unpacked inside another repository (a
+/// packaging recipe's, or a home directory kept in git) baked that repository's
+/// commit as its build id.
+///
 /// The build of this suite inherits no such variable, so its own binary agrees
 /// with the checkout either way. This compiles the checkout's `build.rs` and
 /// runs it the way cargo does, with each variable set, for a repository of its
@@ -346,11 +350,11 @@ fn the_build_script_bakes_its_own_checkout_whatever_git_variables_it_inherits() 
 
     // Cargo runs a build script from the package directory and names that
     // directory in CARGO_MANIFEST_DIR.
-    let baked = |inherited: Option<&str>| {
+    let baked_in = |package: &Path, inherited: Option<&str>| {
         let mut cmd = Command::new(&script);
         without_git_variables(&mut cmd)
-            .current_dir(&named)
-            .env("CARGO_MANIFEST_DIR", &named);
+            .current_dir(package)
+            .env("CARGO_MANIFEST_DIR", package);
         if let Some(var) = inherited {
             cmd.env(var, pointing_at(var, &other.join(".git")));
         }
@@ -365,6 +369,7 @@ fn the_build_script_bakes_its_own_checkout_whatever_git_variables_it_inherits() 
             .find_map(|line| line.strip_prefix("cargo::rustc-env=HOPS_SHORT_COMMIT="))
             .map(str::to_string)
     };
+    let baked = |inherited: Option<&str>| baked_in(&named, inherited);
 
     assert_eq!(
         baked(None).as_deref(),
@@ -381,12 +386,23 @@ fn the_build_script_bakes_its_own_checkout_whatever_git_variables_it_inherits() 
              reports it stale and no rebuild changes that"
         );
     }
+
+    let unpacked = other.join("unpacked-source");
+    std::fs::create_dir_all(&unpacked).expect("mkdir");
+    assert_eq!(
+        baked_in(&unpacked, None).as_deref(),
+        Some("unknown"),
+        "a package directory inside another repository, not at its top, \
+         baked that repository's commit as its own build id"
+    );
 }
 
-/// A caller can fence git in with `GIT_CEILING_DIRECTORIES`, so that a path
-/// holding no checkout is not judged by a checkout above it. Removing every git
-/// variable removed that fence too: the check then gave a verdict about the
-/// enclosing checkout instead of saying that nothing was compared.
+/// A caller can fence git in with `GIT_CEILING_DIRECTORIES`, so that a
+/// directory holding no checkout is not judged by a checkout above it. Removing
+/// every git variable removed that fence too: the check then gave a verdict
+/// about the enclosing checkout instead of saying that nothing was compared.
+/// A path someone names is never searched upward, so the fence matters for the
+/// working directory, the default.
 // LEDGER T17 | class B | 5 process exit code + stdout
 #[test]
 fn a_ceiling_the_caller_set_still_stops_the_search_for_a_checkout() {
@@ -407,14 +423,13 @@ fn a_ceiling_the_caller_set_still_stops_the_search_for_a_checkout() {
 
     let strict_check = |ceiling: Option<&Path>| {
         let mut cmd = hops();
-        without_git_variables(&mut cmd);
+        without_git_variables(&mut cmd).env_remove("HOPS_REPO");
         if let Some(dir) = ceiling {
             cmd.env("GIT_CEILING_DIRECTORIES", dir);
         }
         let out = cmd
-            .args(["build-check", "--repo"])
-            .arg(&below)
-            .arg("--strict")
+            .current_dir(&below)
+            .args(["build-check", "--strict"])
             .output()
             .expect("run");
         (
@@ -435,9 +450,192 @@ fn a_ceiling_the_caller_set_still_stops_the_search_for_a_checkout() {
         code,
         Some(3),
         "GIT_CEILING_DIRECTORIES fenced off the enclosing checkout, yet the \
-         check judged --repo by it rather than reporting that nothing was \
-         compared. stdout: {report:?}"
+         check judged the working directory by it rather than reporting that \
+         nothing was compared. stdout: {report:?}"
     );
+}
+
+/// A path someone names, with `--repo` or `HOPS_REPO`, is the checkout they
+/// mean. git searches upward from a path, so a directory below a checkout was
+/// judged by that checkout: a strict gate for a directory holding no source
+/// passed or failed on the commit and files of whatever checkout sat above it.
+// LEDGER T20 | class B | 5 process exit code + stdout
+#[test]
+fn a_named_path_below_a_checkout_is_not_judged_by_that_checkout() {
+    let scratch = Scratch::new(&std::env::temp_dir(), "below-top");
+    if baked_commit(&scratch.0).is_none() {
+        eprintln!(
+            "nothing compared: this hops was built without a commit baked in, so \
+             it reports that before looking at any path"
+        );
+        return;
+    }
+    let enclosing = scratch.0.join("enclosing");
+    let enclosing_head = repo_with_one_commit(&enclosing, "enclosing");
+    let top = stdout_of(setup_git(&enclosing).args(["rev-parse", "--show-toplevel"]));
+    let below = enclosing.join("no-checkout-here");
+    std::fs::create_dir_all(&below).expect("mkdir");
+
+    let strict_check = |named: &Path, how: &str| {
+        let mut cmd = hops();
+        without_git_variables(&mut cmd).env_remove("HOPS_REPO");
+        match how {
+            "--repo" => cmd.args(["build-check", "--repo"]).arg(named),
+            _ => cmd.env("HOPS_REPO", named).arg("build-check"),
+        };
+        let out = cmd.arg("--strict").output().expect("run");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    };
+
+    let (_, report) = strict_check(&enclosing, "--repo");
+    assert!(
+        report.contains(&enclosing_head),
+        "the check did not read the checkout when named at its top, so a \
+         refusal below would prove nothing. stdout: {report:?}"
+    );
+
+    for how in ["--repo", "HOPS_REPO"] {
+        let (code, report) = strict_check(&below, how);
+        assert_eq!(
+            code,
+            Some(3),
+            "{how} named a directory below a checkout, and the check judged it \
+             by that checkout instead of reporting that nothing was compared. \
+             stdout: {report:?}"
+        );
+        let reason = format!("CANNOT VERIFY: the path given is inside the checkout at {top}");
+        assert!(
+            report.contains(&reason),
+            "the report does not say where the checkout starts; expected \
+             {reason:?} in {report:?}"
+        );
+    }
+}
+
+/// The full id of the commit baked into the hops under test, from this
+/// checkout, or `None` if it baked none.
+fn baked_full_commit() -> Option<String> {
+    let scratch = Scratch::new(&std::env::temp_dir(), "baked");
+    let short = baked_commit(&scratch.0)?;
+    Some(stdout_of(
+        setup_git(Path::new(env!("CARGO_MANIFEST_DIR"))).args([
+            "rev-parse",
+            "--verify",
+            &format!("{short}^{{commit}}"),
+        ]),
+    ))
+}
+
+/// A new repository at `dir` whose HEAD is `commit`, a commit of this checkout,
+/// borrowing this checkout's objects rather than copying them. Returns the
+/// repository's git directory.
+fn repository_at(dir: &Path, commit: &str, bare: bool) -> PathBuf {
+    std::fs::create_dir_all(dir).expect("mkdir");
+    let mut init = setup_git(dir);
+    init.args(["init", "-q"]);
+    if bare {
+        init.arg("--bare");
+    }
+    stdout_of(&mut init);
+    let git_dir = if bare {
+        dir.to_path_buf()
+    } else {
+        dir.join(".git")
+    };
+    let objects = stdout_of(setup_git(Path::new(env!("CARGO_MANIFEST_DIR"))).args([
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "objects",
+    ]));
+    let info = git_dir.join("objects").join("info");
+    std::fs::create_dir_all(&info).expect("mkdir");
+    std::fs::write(info.join("alternates"), format!("{objects}\n")).expect("write alternates");
+    stdout_of(setup_git(dir).args(["update-ref", "--no-deref", "HEAD", commit]));
+    git_dir
+}
+
+/// With no path named, the check still searches upward from the working
+/// directory, so it runs from anywhere in a checkout. It then reads the whole
+/// checkout. It read only the directory it was run from, so an edit anywhere
+/// else, such as to `build.rs` from `src/`, left a stale binary reported as up
+/// to date.
+// LEDGER T21 | class B | 5 process exit code + stdout
+#[test]
+fn from_inside_a_checkout_the_whole_checkout_is_compared() {
+    let Some(baked) = baked_full_commit() else {
+        eprintln!("nothing compared: this hops was built without a commit baked in");
+        return;
+    };
+    let scratch = Scratch::new(&std::env::temp_dir(), "from-inside");
+    let checkout = scratch.0.join("checkout");
+    repository_at(&checkout, &baked, false);
+    // Written now, so after the hops under test was built.
+    std::fs::write(checkout.join("build.rs"), "fn main() {}").expect("write");
+    stdout_of(setup_git(&checkout).args(["add", "build.rs"]));
+    let src = checkout.join("src");
+    std::fs::create_dir_all(&src).expect("mkdir");
+
+    let out = without_git_variables(&mut hops())
+        .env_remove("HOPS_REPO")
+        .current_dir(&src)
+        .args(["build-check", "--strict"])
+        .output()
+        .expect("run");
+    let report = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        report.contains("STALE: build.rs was edited after this binary was built")
+            && out.status.code() == Some(2),
+        "run from src/ in a checkout at this binary's commit, with build.rs \
+         edited since the build, the check did not report build.rs. exit \
+         {:?}, stdout: {report:?}",
+        out.status.code()
+    );
+}
+
+/// A `.git` directory or a bare clone has a commit but no work tree, so the
+/// source files' times cannot be read. The check compared the commit alone
+/// and, when it matched, a strict gate passed with an edited source tree.
+// LEDGER T22 | class B | 5 process exit code + stdout
+#[test]
+fn a_repository_without_a_work_tree_cannot_pass_a_strict_gate() {
+    let Some(baked) = baked_full_commit() else {
+        eprintln!("nothing compared: this hops was built without a commit baked in");
+        return;
+    };
+    let scratch = Scratch::new(&std::env::temp_dir(), "no-work-tree");
+    let dot_git = repository_at(&scratch.0.join("checkout"), &baked, false);
+    let bare = repository_at(&scratch.0.join("bare.git"), &baked, true);
+
+    for repository in [dot_git, bare] {
+        let head = stdout_of(setup_git(&repository).args(["rev-parse", "HEAD"]));
+        assert_eq!(
+            head, baked,
+            "the repository's HEAD is not this binary's commit, so the check \
+             would refuse it on the commit alone and prove nothing"
+        );
+        let out = without_git_variables(&mut hops())
+            .args(["build-check", "--repo"])
+            .arg(&repository)
+            .arg("--strict")
+            .output()
+            .expect("run");
+        let report = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            out.status.code(),
+            Some(3),
+            "--repo {} has no work tree, so no source time was compared, yet a \
+             strict gate did not say so. stdout: {report:?}",
+            repository.display()
+        );
+        assert!(
+            report.contains("CANNOT VERIFY: the path given is a git repository with no work tree"),
+            "the report does not say why nothing was compared: {report:?}"
+        );
+    }
 }
 
 /// `git status` refreshes the index when a file's timestamp no longer matches

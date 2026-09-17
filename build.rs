@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::PathBuf;
 
 #[path = "src/git_env.rs"]
 mod git_env;
@@ -14,16 +14,23 @@ fn main() {
     // Asked of this package's directory with no inherited GIT_ variable, the
     // same way `build-check` asks (src/git_env.rs). A build started from inside
     // git, such as a hook in another repository, would otherwise bake that
-    // repository's commit, and later builds would keep it. The one variable
-    // passed on can change the answer outside a checkout, so a change to it
-    // reruns this script.
-    println!("cargo::rerun-if-env-changed={}", git_env::KEPT_GIT_VARIABLE);
-    let manifest_dir =
-        std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
-    let commit = git_env::git_at(Path::new(&manifest_dir))
-        .args(["rev-parse", "--short=8", "HEAD"])
-        .output()
-        .ok()
+    // repository's commit, and later builds would keep it.
+    //
+    // Only when this directory is the top of its checkout. git searches upward,
+    // so source unpacked inside some other repository (a packaging recipe's, or
+    // a home directory kept in git) would otherwise bake that repository's
+    // commit as this build's id.
+    let manifest_dir = PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+    );
+    let commit = git_env::work_tree(&manifest_dir)
+        .filter(|(_, is_top)| *is_top)
+        .and_then(|_| {
+            git_env::git_at(&manifest_dir)
+                .args(["rev-parse", "--short=8", "HEAD"])
+                .output()
+                .ok()
+        })
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
