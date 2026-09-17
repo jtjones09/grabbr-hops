@@ -239,7 +239,8 @@ fn commit_under_test(no_checkout: &Path) -> Option<String> {
         baked.is_some() || !holds_git_entry(manifest_dir),
         "this hops was built from the checkout at {}, yet it carries no commit, \
          so each test that needs one would pass having compared nothing. git \
-         may be missing from PATH, or refusing that checkout (safe.directory)",
+         may be missing from PATH, or refusing that checkout (safe.directory); \
+         once git reads it, the next build bakes the commit",
         manifest_dir.display()
     );
     baked
@@ -424,6 +425,125 @@ fn the_build_script_bakes_its_own_checkout_whatever_git_variables_it_inherits() 
         Some("unknown"),
         "a package directory inside another repository, not at its top, \
          baked that repository's commit as its own build id"
+    );
+}
+
+/// A hops built while git was missing or refused its checkout carries no
+/// commit. Installing git or trusting the checkout changed none of the files
+/// cargo watched to rerun `build.rs`, so every later build kept "unknown", and
+/// rebuilding, the remedy the report gives, did nothing.
+///
+/// This builds a package with this checkout's build script in a clone, first
+/// through a git that refuses every call, then through the real one, with
+/// nothing else changed.
+#[cfg(unix)]
+// LEDGER T28 | class B | 5 process stdout: the commit build.rs baked into a binary cargo built
+#[test]
+fn a_build_once_git_reads_the_checkout_bakes_its_commit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // The fake git has to be executable, and a cargo target directory is.
+    let scratch = Scratch::new(Path::new(env!("CARGO_TARGET_TMPDIR")), "git-fixed");
+    let origin = scratch.0.join("origin");
+    repo_with_one_commit(&origin, "origin");
+    let package = scratch.0.join("package");
+    stdout_of(
+        setup_git(&scratch.0)
+            .args(["-c", "init.defaultRefFormat=files", "clone", "-q"])
+            .arg(&origin)
+            .arg(&package),
+    );
+    let head = stdout_of(setup_git(&package).args(["rev-parse", "--short=8", "HEAD"]));
+    // A clone, like a developer's checkout, has every file the build script
+    // watches. With one missing, cargo reruns the script on every build, and
+    // a script that never reran could not be told apart.
+    let branch = stdout_of(setup_git(&package).args(["symbolic-ref", "HEAD"]));
+    for watched in ["HEAD", branch.as_str(), "packed-refs"] {
+        assert!(
+            package.join(".git").join(watched).is_file(),
+            "the clone has no .git/{watched}, so cargo reruns the build script \
+             on every build and this test observes nothing"
+        );
+    }
+
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let src = package.join("src");
+    std::fs::create_dir_all(&src).expect("mkdir");
+    std::fs::copy(manifest_dir.join("build.rs"), package.join("build.rs")).expect("copy build.rs");
+    std::fs::copy(
+        manifest_dir.join("src").join("git_env.rs"),
+        src.join("git_env.rs"),
+    )
+    .expect("copy git_env.rs");
+    std::fs::write(
+        package.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"baked\"\nversion = \"0.0.0\"\nedition = \"{}\"\n\n[workspace]\n",
+            package_edition(manifest_dir)
+        ),
+    )
+    .expect("write Cargo.toml");
+    std::fs::write(
+        src.join("main.rs"),
+        "fn main() { print!(\"{}\", env!(\"HOPS_SHORT_COMMIT\")); }\n",
+    )
+    .expect("write main.rs");
+
+    let bin = scratch.0.join("refusing-git");
+    std::fs::create_dir_all(&bin).expect("mkdir");
+    let fake_git = bin.join("git");
+    std::fs::write(
+        &fake_git,
+        "#!/bin/sh\necho 'fatal: detected dubious ownership in repository' >&2\nexit 128\n",
+    )
+    .expect("write the refusing git");
+    std::fs::set_permissions(&fake_git, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let refusing = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&path)))
+        .expect("PATH");
+
+    let target = scratch.0.join("target");
+    let build_and_run = |path: &OsString| {
+        let mut cargo = Command::new(env!("CARGO"));
+        let out = without_git_variables(&mut cargo)
+            .current_dir(&package)
+            .env("PATH", path)
+            .env("CARGO_TARGET_DIR", &target)
+            .env("RUSTC", rustc())
+            // This suite's flags, such as CI's -D warnings, are not the
+            // package's: its build script names features it does not have.
+            .env_remove("RUSTFLAGS")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env_remove("CARGO_BUILD_RUSTFLAGS")
+            .args(["run", "--quiet", "--offline"])
+            .output()
+            .expect("run cargo");
+        assert!(
+            out.status.success(),
+            "cargo could not build and run the package: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    assert_eq!(
+        build_and_run(&refusing),
+        "unknown",
+        "built through a git that refuses every call, the build script still \
+         baked a commit, so the rebuild below would observe nothing"
+    );
+    assert_eq!(
+        build_and_run(&path),
+        head,
+        "git reads the checkout now, yet a rebuild kept \"unknown\": nothing \
+         cargo watches changed, so the build script did not rerun, and \
+         rebuilding, the remedy the report gives, did nothing"
+    );
+    assert_eq!(
+        build_and_run(&refusing),
+        head,
+        "with a commit baked in and nothing changed, the build script reran \
+         (here through the refusing git), so every build would recompile hops"
     );
 }
 

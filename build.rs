@@ -52,6 +52,15 @@ fn main() {
     }
     // refs can live packed rather than as loose files
     println!("cargo::rerun-if-changed=.git/packed-refs");
+    // No commit read: git missing, or refusing the checkout (safe.directory).
+    // Installing git or trusting the checkout changes none of the files above,
+    // so a checkout that has them all kept "unknown" baked in, and rebuilding
+    // did not help. Cargo reruns a script that watches a missing path on every
+    // build, recompiling this package, so the script reruns until git reads a
+    // commit. A source archive, with no .git/HEAD, already reruns that way.
+    if commit == "unknown" {
+        println!("cargo::rerun-if-changed=.git/hops-build-read-no-commit");
+    }
 
     let unix = target_is("unix");
     let macos = target_os() == "macos";

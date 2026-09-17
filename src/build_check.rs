@@ -100,11 +100,13 @@ impl Uncompared {
     ///
     /// A binary without a commit is its own case. No path can give it one, so a
     /// reason that points at the path sends the reader to check a checkout that
-    /// is fine.
+    /// is fine. Rebuilding is enough once git reads the checkout: `build.rs`
+    /// reruns on every build until it bakes a commit.
     fn reason(&self) -> String {
         match self {
             Uncompared::NoCommitBakedIn => "this binary has no commit baked in; rebuild it \
-                 from the top of a git checkout, with git on PATH"
+                 from the top of a git checkout, with a git on PATH that does not refuse \
+                 the checkout (safe.directory)"
                 .to_string(),
             Uncompared::NoCheckout => "git read no commit at the path given (no checkout \
                  there, no git, or git refused the checkout)"
