@@ -2337,6 +2337,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml_edit 0.22.27",
+ "windows 0.61.3",
 ]
 
 [[package]]
@@ -2369,6 +2370,7 @@ dependencies = [
  "base64",
  "futures",
  "getrandom 0.3.4",
+ "libc",
  "log",
  "serde",
  "serde_json",

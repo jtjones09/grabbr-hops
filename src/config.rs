@@ -502,7 +502,17 @@ fn harden_existing(_config_dir: &Path, _config_path: &Path) {}
 /// is always the same one. A reader sees the whole old file or the whole new one,
 /// never a truncated one. The temp inherits [`create_private`]'s `0600`, so the
 /// contents are never briefly world-readable either.
+///
+/// Holds the sibling lock [`crate::new_file`] renames a new file into place
+/// under where there are no hard links, for the write and the rename. A process
+/// creating the default config there checks that nothing is at the path and
+/// renames under that lock, so it never replaces what this saved. Where the lock
+/// cannot be taken, a filesystem without file locks, no creator can take it
+/// either and none renames, so the save goes ahead without it.
 pub(crate) fn write_atomically(path: &Path, contents: &[u8]) -> Result<(), io::Error> {
+    let _lock = crate::new_file::lock_sibling(path)
+        .inspect_err(|e| log::debug!("saving {} without its lock: {e}", path.display()))
+        .ok();
     let tmp = path.with_extension("toml.tmp");
     {
         let mut f = create_private(&tmp)?;
@@ -540,6 +550,37 @@ fn subtract_revoked(
     (authorized, refused)
 }
 
+/// Make sure a config is at `path`, writing the default when none is, after
+/// removing what an earlier process that ended part-way through writing one
+/// left beside it.
+pub(crate) fn ensure_config_file(path: &Path) -> io::Result<()> {
+    crate::new_file::remove_abandoned_temporaries(path);
+    if path.exists() {
+        return Ok(());
+    }
+    write_default_config(path)
+}
+
+/// Write the default config to `path`, unless a config is already there.
+///
+/// Every `hops` process that reads the config runs this, and several start
+/// together: the daemon, the tray at login, the app opened by hand. The file
+/// is created whole and never over one another process has just written.
+/// Opening it with `truncate` instead let a process that found no config a
+/// moment earlier empty the one another had since saved, devices included.
+fn write_default_config(path: &Path) -> io::Result<()> {
+    let default_toml = toml_edit::ser::to_string_pretty(&ConfigToml::default())
+        .expect("default ConfigToml serialization cannot fail");
+    match crate::new_file::create_whole(
+        path,
+        default_toml.as_bytes(),
+        crate::new_file::Access::OwnerReadWrite,
+    ) {
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        other => other,
+    }
+}
+
 /// The subcommand, parsed from argv alone.
 ///
 /// `build-check` is a diagnostic, so it has to answer when the config file is
@@ -573,12 +614,7 @@ impl Config {
         // and notify::Watcher (which requires the dir to exist on macOS
         // FSEvents and some Linux backends) has a concrete path to watch.
         fs::create_dir_all(&config_dir)?;
-        if !config_path.exists() {
-            let default_toml = toml_edit::ser::to_string_pretty(&ConfigToml::default())
-                .expect("default ConfigToml serialization cannot fail");
-            let mut f = create_private(&config_path)?;
-            f.write_all(default_toml.as_bytes())?;
-        }
+        ensure_config_file(&config_path)?;
         // Repair installs created before the modes above were enforced.
         harden_existing(&config_dir, &config_path);
 
@@ -984,6 +1020,48 @@ mod permission_tests {
             "must never widen an already-stricter mode"
         );
         let _ = fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod the_default_config_never_replaces_one {
+    //! Every `hops` process writes the default config when it finds none, and
+    //! the daemon, the tray and the app often start together. One of them can
+    //! find no config, and by the time it writes, another has written one.
+
+    use super::*;
+
+    // LEDGER T18 | class B | 4 file on disk
+    #[test]
+    fn a_config_written_after_the_check_is_kept() {
+        let d = std::env::temp_dir().join(format!("hops-default-config-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        // `Config::new` creates the directory before it writes a default.
+        fs::create_dir_all(&d).expect("the config directory");
+        let p = d.join("config.toml");
+
+        let first = write_default_config(&p);
+        let default_parses = ConfigToml::new(&p).is_ok();
+        // What the daemon saved after this process found no config.
+        let saved = "port = 4343\n\n[authorized_fingerprints]\n\"aa:bb\" = \"laptop\"\n";
+        fs::write(&p, saved).expect("the daemon's save");
+        let second = write_default_config(&p);
+        let on_disk = fs::read_to_string(&p).unwrap_or_default();
+        let _ = fs::remove_dir_all(&d);
+
+        assert!(
+            first.is_ok() && default_parses,
+            "no default config was written where there was none: {first:?}"
+        );
+        assert!(
+            second.is_ok(),
+            "finding a config already there is not an error: {second:?}"
+        );
+        assert_eq!(
+            on_disk, saved,
+            "the default config replaced one written since the check, and the \
+             authorized devices in it were lost"
+        );
     }
 }
 

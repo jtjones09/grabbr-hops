@@ -3,8 +3,9 @@ use std::{
     env::VarError,
     fmt::Display,
     io,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     str::FromStr,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 
@@ -19,11 +20,14 @@ use serde::{Deserialize, Serialize};
 mod connect;
 mod connect_async;
 mod listen;
+mod ownership;
 pub mod pairing;
 pub mod token;
 
-pub use connect::{FrontendEventReader, FrontendRequestWriter, connect};
-pub use connect_async::{AsyncFrontendEventReader, AsyncFrontendRequestWriter, connect_async};
+pub use connect::{FrontendEventReader, FrontendRequestWriter, connect, connect_to};
+pub use connect_async::{
+    AsyncFrontendEventReader, AsyncFrontendRequestWriter, connect_async, connect_async_to,
+};
 pub use listen::AsyncFrontendListener;
 pub use pairing::{PairingCode, PairingError};
 
@@ -35,6 +39,9 @@ pub enum ConnectionError {
     Io(#[from] io::Error),
     #[error("connection timed out")]
     Timeout,
+    /// A frontend on this platform cannot dial that kind of endpoint.
+    #[error("a frontend here cannot connect to {0}")]
+    UnsupportedEndpoint(DaemonEndpoint),
 }
 
 #[derive(Debug, Error)]
@@ -43,8 +50,55 @@ pub enum IpcListenerCreationError {
     SocketPath(#[from] SocketPathError),
     #[error("service already running!")]
     AlreadyRunning,
-    #[error("failed to bind lan-mouse socket: `{0}`")]
-    Bind(io::Error),
+    /// The endpoint could not be bound, for a reason other than a daemon
+    /// holding it.
+    #[error("could not listen on {endpoint}: {source}")]
+    Bind {
+        endpoint: DaemonEndpoint,
+        source: io::Error,
+    },
+    /// The lock that stops a second daemon starting could not be taken, for a
+    /// reason other than another daemon holding it.
+    #[error("could not lock {}: {source}. {hint}", .path.display())]
+    Lock {
+        path: std::path::PathBuf,
+        source: io::Error,
+        /// What to do about it, in words.
+        hint: String,
+    },
+    /// A socket file no daemon answers on, which could not be removed.
+    #[error(
+        "nothing answers on {}, and it could not be removed: {source}. If no hops \
+         daemon is running, remove it and start hops again.",
+        .path.display()
+    )]
+    StaleSocket {
+        path: std::path::PathBuf,
+        source: io::Error,
+    },
+    /// A file at the socket path that could not be asked whether a daemon
+    /// listens on it, and so was left where it is.
+    #[error(
+        "could not tell whether a daemon listens on {}: {source}. {hint}",
+        .path.display()
+    )]
+    SocketUnchecked {
+        path: std::path::PathBuf,
+        source: io::Error,
+        /// What to do about it, in words.
+        hint: String,
+    },
+    /// Where the token frontends present is kept could not be worked out.
+    #[error("could not work out where the IPC token is kept: {0}")]
+    TokenPath(io::Error),
+    /// The token frontends present could not be read or created.
+    #[error("could not read or create the IPC token {}: {source}. {hint}", .path.display())]
+    Token {
+        path: std::path::PathBuf,
+        source: io::Error,
+        /// What to do about it, in words.
+        hint: String,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -450,4 +504,416 @@ pub fn default_socket_path() -> Result<PathBuf, SocketPathError> {
         .join("Library")
         .join("Caches")
         .join(LAN_MOUSE_SOCKET_NAME))
+}
+
+/// The loopback port the daemon listens on where there are no Unix sockets.
+///
+/// One definition for the listener, both connectors and the front door's
+/// probe, so the probe cannot ask a different address from the one the daemon
+/// binds.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const TCP_ENDPOINT: SocketAddr =
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5252));
+
+/// How long the probe waits on a TCP endpoint before concluding nothing is
+/// there. A listening daemon completes a loopback handshake at once, and a
+/// connect to a closed port is not guaranteed to fail fast, so this bounds
+/// what asking costs on a machine with no daemon.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Where a frontend reaches the daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonEndpoint {
+    /// A Unix domain socket, on macOS and Linux.
+    #[cfg(unix)]
+    Unix(PathBuf),
+    /// A loopback TCP port, on Windows.
+    Tcp(SocketAddr),
+}
+
+impl Display for DaemonEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(path) => write!(f, "{}", path.display()),
+            Self::Tcp(addr) => write!(f, "{addr}"),
+        }
+    }
+}
+
+impl DaemonEndpoint {
+    /// The endpoint this platform's daemon listens on: the one
+    /// [`AsyncFrontendListener::new`] binds and [`connect()`] and
+    /// [`connect_async()`] dial.
+    ///
+    /// Only the defaults read it. Code that is handed an endpoint, such as
+    /// [`AsyncFrontendListener::at`] and [`connect_async_to`], uses that one,
+    /// and nothing in the environment can point a frontend elsewhere.
+    pub fn of_this_platform() -> Result<Self, SocketPathError> {
+        #[cfg(unix)]
+        {
+            Ok(Self::Unix(default_socket_path()?))
+        }
+        #[cfg(windows)]
+        {
+            Ok(Self::Tcp(TCP_ENDPOINT))
+        }
+    }
+
+    /// Whether something accepts a connection here right now.
+    ///
+    /// Connects and hangs up without sending anything. The daemon sees a
+    /// frontend that closed before presenting its token, and drops it without
+    /// logging a warning. A Unix socket whose queue of connections waiting to
+    /// be accepted is full has a listener, and answers.
+    pub fn answers(&self) -> bool {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(path) => match connect_unix_now(path) {
+                Ok(_) => true,
+                Err(e) => e.kind() == io::ErrorKind::WouldBlock,
+            },
+            Self::Tcp(addr) => std::net::TcpStream::connect_timeout(addr, PROBE_TIMEOUT).is_ok(),
+        }
+    }
+
+    /// Whether a daemon serves frontends here: it takes `token` and sends a
+    /// frontend its state, all within `within`.
+    ///
+    /// Stronger than [`Self::answers`]. A daemon binds its endpoint before it
+    /// reads the token, the config and its keys, and one that fails on any of
+    /// them exits a moment later, so something answering says little about
+    /// whether a daemon is running. A daemon sends state only once its service
+    /// loop runs. Hangs up after the first event, which the daemon treats as
+    /// an ordinary frontend leaving.
+    ///
+    /// `within` bounds the whole ask, not each step: whatever is on the
+    /// endpoint, sending a byte at a time or never accepting, the answer comes
+    /// by then.
+    pub fn serves(&self, token: &str, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        let exchange = || -> io::Result<bool> {
+            match self {
+                #[cfg(unix)]
+                Self::Unix(path) => state_follows_token(connect_unix_now(path)?, token, deadline),
+                Self::Tcp(addr) => {
+                    let stream = std::net::TcpStream::connect_timeout(addr, time_left(deadline)?)?;
+                    state_follows_token(stream, token, deadline)
+                }
+            }
+        };
+        exchange().unwrap_or(false)
+    }
+}
+
+/// A connected stream whose reads and writes can be given a timeout.
+trait Timed: io::Read + io::Write {
+    fn wait_at_most(&self, within: Duration) -> io::Result<()>;
+}
+
+impl Timed for std::net::TcpStream {
+    fn wait_at_most(&self, within: Duration) -> io::Result<()> {
+        self.set_read_timeout(Some(within))?;
+        self.set_write_timeout(Some(within))
+    }
+}
+
+#[cfg(unix)]
+impl Timed for std::os::unix::net::UnixStream {
+    fn wait_at_most(&self, within: Duration) -> io::Result<()> {
+        self.set_read_timeout(Some(within))?;
+        self.set_write_timeout(Some(within))
+    }
+}
+
+/// How much of one line an ask holds before it concludes no daemon is there.
+///
+/// A daemon's first event lists its clients, a few kilobytes. The limit bounds
+/// what something else on the endpoint can make the front door hold while it
+/// waits.
+const EVENT_LINE_LIMIT: usize = 1 << 20;
+
+/// How long is left until `deadline`; a timeout once nothing is.
+fn time_left(deadline: Instant) -> io::Result<Duration> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    Ok(left)
+}
+
+/// Present `token` on `stream`, and say whether an event comes back by
+/// `deadline`.
+///
+/// Any whole line of JSON counts, not only a [`FrontendEvent`] this build
+/// knows: the daemon may be another version, left running by launchd across
+/// an update, and it still serves.
+fn state_follows_token(mut stream: impl Timed, token: &str, deadline: Instant) -> io::Result<bool> {
+    stream.wait_at_most(time_left(deadline)?)?;
+    stream.write_all(format!("{token}\n").as_bytes())?;
+    let mut line = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        // Every read waits only for what is left. A timeout per read let a
+        // peer that sends a byte now and then keep the ask going for good.
+        stream.wait_at_most(time_left(deadline)?)?;
+        let read = match stream.read(&mut chunk) {
+            Ok(0) => return Ok(false),
+            Ok(n) => &chunk[..n],
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if let Some(end) = read.iter().position(|&b| b == b'\n') {
+            line.extend_from_slice(&read[..end]);
+            return Ok(serde_json::from_slice::<serde_json::Value>(&line).is_ok());
+        }
+        line.extend_from_slice(read);
+        if line.len() > EVENT_LINE_LIMIT {
+            return Ok(false);
+        }
+    }
+}
+
+/// Connect to the Unix socket at `path` without waiting for the listener.
+///
+/// A blocking connect on Linux waits for as long as the listener's queue of
+/// connections not yet accepted stays full, as it does beside a process that
+/// binds and never accepts. This fails with [`io::ErrorKind::WouldBlock`]
+/// instead. The stream it returns blocks.
+#[cfg(unix)]
+fn connect_unix_now(path: &Path) -> io::Result<std::os::unix::net::UnixStream> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: `sockaddr_un` is plain data, for which all zeroes is a valid value.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.len() >= addr.sun_path.len() || bytes.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} cannot name a Unix socket", path.display()),
+        ));
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (to, from) in addr.sun_path.iter_mut().zip(bytes) {
+        *to = libc::c_char::from_ne_bytes([*from]);
+    }
+    // The path and its terminating zero, which the zeroed address supplies.
+    let len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let kind = libc::SOCK_STREAM;
+    // SAFETY: `socket` takes plain values and returns a new descriptor or -1.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, kind, 0) };
+    if fd == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just opened, and nothing else owns it.
+    let stream = std::os::unix::net::UnixStream::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        // SAFETY: `fd` is open; F_SETFD takes a plain flag.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    stream.set_nonblocking(true)?;
+    // SAFETY: `addr` is a valid `sockaddr_un` of at least `len` bytes, and the
+    // descriptor is open.
+    let connected = unsafe {
+        libc::connect(
+            stream.as_raw_fd(),
+            std::ptr::addr_of!(addr).cast::<libc::sockaddr>(),
+            len as libc::socklen_t,
+        )
+    };
+    if connected == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
+
+#[cfg(test)]
+mod serves_whatever_its_version {
+    //! The front door asks whether a daemon serves after it starts one. The
+    //! daemon it reaches may be another build, left running across an update,
+    //! whose events this build does not know.
+
+    use super::DaemonEndpoint;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::time::{Duration, Instant};
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// A daemon stand-in on a loopback port that answers one connection with
+    /// `reply` once it has read the token, then stays connected until the
+    /// asker hangs up, or hangs up itself when `reply` is not a whole line.
+    /// Returns its endpoint and whether the token arrived as a line of its own.
+    fn replying(reply: &'static str) -> (DaemonEndpoint, std::thread::JoinHandle<bool>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        let endpoint = DaemonEndpoint::Tcp(listener.local_addr().expect("its address"));
+        let peer = std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return false;
+            };
+            let mut reader = BufReader::new(stream.try_clone().expect("a second handle"));
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            let mut writer = stream;
+            let _ = writer.write_all(reply.as_bytes());
+            if reply.ends_with('\n') {
+                let _ = reader.read_to_end(&mut Vec::new());
+            }
+            line == format!("{TOKEN}\n")
+        });
+        (endpoint, peer)
+    }
+
+    fn ask(reply: &'static str) -> (bool, bool) {
+        let (endpoint, peer) = replying(reply);
+        let serves = endpoint.serves(TOKEN, Duration::from_secs(2));
+        (serves, peer.join().expect("the stand-in daemon"))
+    }
+
+    // LEDGER T41 | class B | 2 bytes over a real socket + 1 return value
+    #[test]
+    fn any_event_counts_and_anything_else_does_not() {
+        assert_eq!(
+            (
+                ask("{\"AnEventOfALaterBuild\":{\"n\":1}}\n"),
+                ask("not json\n"),
+                ask("{}"),
+            ),
+            ((true, true), (false, true), (false, true)),
+            "((event unknown to this build), (not JSON), (no whole line before the \
+             hang-up)), each as \
+             (counted as serving, token sent as a line). A daemon of another build \
+             serves all the same; the front door would log it as silent."
+        );
+    }
+
+    // LEDGER T42 | class B | 1 return value + elapsed time over a real socket
+    #[test]
+    fn a_peer_that_never_ends_its_line_is_given_up_on_when_the_ask_is_due() {
+        const TRICKLES_FOR: Duration = Duration::from_secs(5);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        let endpoint = DaemonEndpoint::Tcp(listener.local_addr().expect("its address"));
+        // Takes the token, then starts a line of JSON and adds a space to it
+        // every 50 ms, never ending it, until the asker hangs up.
+        let peer = std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let _ = stream.set_nodelay(true);
+            let _ = stream.read(&mut [0u8; TOKEN.len() + 1]);
+            let began = Instant::now();
+            let mut sent = stream.write_all(b"{");
+            while sent.is_ok() && began.elapsed() < TRICKLES_FOR {
+                std::thread::sleep(Duration::from_millis(50));
+                sent = stream.write_all(b" ");
+            }
+        });
+
+        let within = Duration::from_millis(500);
+        let began = Instant::now();
+        let serves = endpoint.serves(TOKEN, within);
+        let took = began.elapsed();
+        let _ = peer.join();
+        assert!(
+            !serves && took < within + Duration::from_secs(1),
+            "asked to answer within {within:?}, `serves` said {serves} after \
+             {took:?}. A peer that sends a byte at a time never lets a timeout \
+             per read expire, and the front door does not open until it has \
+             its answer."
+        );
+    }
+
+    // LEDGER T48 | class B | 1 return value + elapsed time over a real socket
+    #[test]
+    fn a_peer_that_floods_one_line_is_given_up_on_once_it_is_past_any_event() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        let endpoint = DaemonEndpoint::Tcp(listener.local_addr().expect("its address"));
+        // Takes the token, sends one byte more than any event may have and no
+        // newline, then waits for the asker to hang up.
+        let peer = std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let _ = stream.read(&mut [0u8; TOKEN.len() + 1]);
+            let mut flood = vec![b' '; super::EVENT_LINE_LIMIT + 1];
+            flood[0] = b'[';
+            if stream.write_all(&flood).is_ok() {
+                let _ = stream.read_to_end(&mut Vec::new());
+            }
+        });
+
+        let within = Duration::from_secs(4);
+        let began = Instant::now();
+        let serves = endpoint.serves(TOKEN, within);
+        let took = began.elapsed();
+        let _ = peer.join();
+        assert!(
+            !serves && took < within / 2,
+            "`serves` said {serves} after {took:?} of {within:?}, for a peer that \
+             sent more of one line than any event has. Reading on holds all of it \
+             in memory for as long as the ask lasts."
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod a_full_accept_queue {
+    //! On Linux a blocking connect to a Unix socket waits for as long as the
+    //! listener's queue of connections not yet accepted is full.
+
+    use super::DaemonEndpoint;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    // LEDGER T43 | class B | 1 return value + elapsed time over a real socket
+    #[test]
+    fn a_listener_that_never_accepts_neither_holds_up_the_asker_nor_serves() {
+        let path = PathBuf::from(format!("/tmp/h-queue-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("a unix listener");
+        // SAFETY: plain values on an open socket. Linux takes a second
+        // `listen` as a new queue length; with 0, one waiting connection
+        // fills the queue.
+        let listened = unsafe { libc::listen(listener.as_raw_fd(), 0) };
+        let waiting = UnixStream::connect(&path).expect("a connection nothing accepts");
+
+        let endpoint = DaemonEndpoint::Unix(path.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let began = Instant::now();
+            let answers = endpoint.answers();
+            let serves = endpoint.serves(TOKEN, Duration::from_millis(300));
+            let _ = tx.send((answers, serves, began.elapsed()));
+        });
+        let got = rx.recv_timeout(Duration::from_secs(5));
+        drop((waiting, listener));
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(listened, 0, "the stand-in could not shorten its queue");
+        let Ok((answers, serves, took)) = got else {
+            panic!(
+                "asking a listener whose queue is full had not returned after 5 s. \
+                 The front door asks before it opens the app, and would not open."
+            );
+        };
+        assert!(
+            (answers, serves) == (true, false) && took < Duration::from_secs(1),
+            "(answers, serves) = {:?} after {took:?}. Something listens there, so \
+             the front door must not start a daemon beside it, and it takes the \
+             token from no one, so it does not serve.",
+            (answers, serves)
+        );
+    }
 }

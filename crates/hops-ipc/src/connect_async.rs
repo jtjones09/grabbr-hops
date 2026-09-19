@@ -1,4 +1,4 @@
-use crate::{ConnectionError, FrontendEvent, FrontendRequest, IpcError};
+use crate::{ConnectionError, DaemonEndpoint, FrontendEvent, FrontendRequest, IpcError};
 use std::{
     cmp::min,
     task::{Poll, ready},
@@ -55,16 +55,28 @@ impl AsyncFrontendRequestWriter {
     }
 }
 
+/// Connect to the daemon on this platform's endpoint,
+/// [`DaemonEndpoint::of_this_platform`], and present the token.
 pub async fn connect_async(
+    timeout: Option<Duration>,
+) -> Result<(AsyncFrontendEventReader, AsyncFrontendRequestWriter), ConnectionError> {
+    connect_async_to(&DaemonEndpoint::of_this_platform()?, timeout).await
+}
+
+/// Connect to the daemon listening on `endpoint`, and present the token.
+///
+/// Waits for the endpoint to come up, for at most `timeout` if one is given.
+pub async fn connect_async_to(
+    endpoint: &DaemonEndpoint,
     timeout: Option<Duration>,
 ) -> Result<(AsyncFrontendEventReader, AsyncFrontendRequestWriter), ConnectionError> {
     let stream = if let Some(duration) = timeout {
         tokio::select! {
-            s = wait_for_service() => s?,
+            s = wait_for_service(endpoint) => s?,
             _ = tokio::time::sleep(duration) => return Err(ConnectionError::Timeout),
         }
     } else {
-        wait_for_service().await?
+        wait_for_service(endpoint).await?
     };
     #[cfg(unix)]
     let (rx, tx): (ReadHalf<UnixStream>, WriteHalf<UnixStream>) = tokio::io::split(stream);
@@ -93,11 +105,13 @@ impl AsyncFrontendRequestWriter {
 
 /// wait for the lan-mouse socket to come online
 #[cfg(unix)]
-async fn wait_for_service() -> Result<UnixStream, ConnectionError> {
-    let socket_path = crate::default_socket_path()?;
+async fn wait_for_service(endpoint: &DaemonEndpoint) -> Result<UnixStream, ConnectionError> {
+    let DaemonEndpoint::Unix(socket_path) = endpoint else {
+        return Err(ConnectionError::UnsupportedEndpoint(endpoint.clone()));
+    };
     let mut duration = Duration::from_millis(10);
     loop {
-        if let Ok(stream) = UnixStream::connect(&socket_path).await {
+        if let Ok(stream) = UnixStream::connect(socket_path).await {
             break Ok(stream);
         }
         // a signaling mechanism or inotify could be used to
@@ -107,10 +121,11 @@ async fn wait_for_service() -> Result<UnixStream, ConnectionError> {
 }
 
 #[cfg(windows)]
-async fn wait_for_service() -> Result<TcpStream, ConnectionError> {
+async fn wait_for_service(endpoint: &DaemonEndpoint) -> Result<TcpStream, ConnectionError> {
+    let DaemonEndpoint::Tcp(addr) = endpoint;
     let mut duration = Duration::from_millis(10);
     loop {
-        if let Ok(stream) = TcpStream::connect("127.0.0.1:5252").await {
+        if let Ok(stream) = TcpStream::connect(*addr).await {
             break Ok(stream);
         }
         tokio::time::sleep(exponential_back_off(&mut duration)).await;

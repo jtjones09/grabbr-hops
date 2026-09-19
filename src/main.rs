@@ -5,7 +5,7 @@ use hops::{
     service::{Service, ServiceError},
 };
 use hops_cli::CliError;
-use hops_ipc::{IpcError, IpcListenerCreationError};
+use hops_ipc::{DaemonEndpoint, IpcError, IpcListenerCreationError};
 use input_capture::InputCaptureError;
 use input_emulation::InputEmulationError;
 use std::{future::Future, io, process};
@@ -61,13 +61,20 @@ fn run_build_check(repo: Option<std::path::PathBuf>, strict: bool) -> ! {
 }
 
 fn run() -> Result<(), HopsError> {
+    // The daemon reads the config only once it holds its IPC endpoint, so a
+    // second daemon stops before touching anything the first one holds.
+    if runs_the_daemon(config::command_from_args()) {
+        return run_daemon();
+    }
     let config = config::Config::new()?;
     match config.command() {
         Some(command) => match command {
             Command::TestEmulation(args) => run_async(emulation_test::run(config, args))?,
             Command::TestCapture(args) => run_async(capture_test::run(config, args))?,
             Command::Cli(cli_args) => run_async(hops_cli::run(cli_args))?,
-            Command::Daemon => run_daemon(config)?,
+            // Taken above, before the config was read. Kept so the match
+            // stays exhaustive.
+            Command::Daemon => run_daemon()?,
             Command::Gui { hidden } => run_gui(hidden)?,
             Command::Tui => run_tui()?,
             // Normally handled in `main` before the config is loaded; kept
@@ -75,22 +82,19 @@ fn run() -> Result<(), HopsError> {
             Command::BuildCheck { repo, strict } => run_build_check(repo.clone(), strict),
         },
         None => {
-            //  otherwise start the service as a child process and
-            //  run a frontend
             // The `hops` front door (any build with a front-end): make
             // sure the receiver daemon is up, then open the user's chosen
             // interface. Front-ends are attach-only — they never spawn the daemon
-            // themselves (a front-end-spawned daemon can land on the dummy backend
-            // if its path lacks the Accessibility grant); `ensure_daemon_running`
-            // brings up the GRANTED launchd service instead.
+            // themselves. The front door starts one only when none answers; see
+            // `hops::daemon_start`.
             #[cfg(any(feature = "tui", feature = "slint"))]
             {
                 front_door()?;
             }
-            // no front-end compiled in: just run the daemon
+            // no front-end compiled in: just run the daemon (taken above)
             #[cfg(not(any(feature = "tui", feature = "slint")))]
             {
-                run_daemon(config)?;
+                run_daemon()?;
             }
         }
     }
@@ -98,9 +102,19 @@ fn run() -> Result<(), HopsError> {
     Ok(())
 }
 
+/// Whether this invocation runs the daemon: `hops daemon`, or `hops` in a
+/// build with no frontend.
+fn runs_the_daemon(command: Option<Command>) -> bool {
+    match command {
+        Some(Command::Daemon) => true,
+        None => cfg!(not(any(feature = "tui", feature = "slint"))),
+        Some(_) => false,
+    }
+}
+
 /// Run the daemon (the receiver service). A redundant instance self-exits.
-fn run_daemon(config: config::Config) -> Result<(), HopsError> {
-    match run_async(run_service(config)) {
+fn run_daemon() -> Result<(), HopsError> {
+    match run_async(run_service()) {
         Err(HopsError::Service(ServiceError::IpcListen(
             IpcListenerCreationError::AlreadyRunning,
         ))) => {
@@ -183,7 +197,7 @@ fn front_door() -> Result<(), HopsError> {
     use hops_frontend_core::prefs::{
         Frontend, load_frontend, onboarding_done, save_frontend, set_onboarding_done,
     };
-    ensure_daemon_running();
+    hops::daemon_start::ensure_running();
 
     let frontend = if onboarding_done() {
         load_frontend().unwrap_or_else(default_frontend)
@@ -245,107 +259,6 @@ fn default_frontend() -> hops_frontend_core::prefs::Frontend {
     }
 }
 
-/// Make sure the GRANTED receiver daemon is running, without spawning it as our
-/// own child (which could land on the dummy backend). On macOS that means the
-/// launchd service; elsewhere a detached background process.
-#[cfg(any(feature = "tui", feature = "slint"))]
-fn ensure_daemon_running() {
-    // If a receiver is already listening (e.g. the granted daemon under any
-    // identity), do nothing — never start a second one, and don't (re)install a
-    // LaunchAgent that would race the running one on next login.
-    if daemon_socket_alive() {
-        return;
-    }
-    #[cfg(target_os = "macos")]
-    ensure_launchd_daemon();
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = start_detached_daemon();
-    }
-}
-
-/// True if a daemon is already listening on the IPC socket.
-#[cfg(any(feature = "tui", feature = "slint"))]
-fn daemon_socket_alive() -> bool {
-    #[cfg(unix)]
-    {
-        match hops_ipc::default_socket_path() {
-            Ok(path) => std::os::unix::net::UnixStream::connect(path).is_ok(),
-            Err(_) => false,
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        false
-    }
-}
-
-/// Bring up `com.grabbr.hops` via launchd if it isn't already loaded,
-/// self-installing the LaunchAgent plist (pointed at this binary) on first run.
-#[cfg(all(target_os = "macos", any(feature = "tui", feature = "slint")))]
-fn ensure_launchd_daemon() {
-    let uid = unsafe { libc::getuid() };
-    let service = format!("gui/{uid}/com.grabbr.hops");
-    let loaded = process::Command::new("launchctl")
-        .args(["print", &service])
-        .stdout(process::Stdio::null())
-        .stderr(process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if loaded {
-        return;
-    }
-    if let Some(plist) = install_launchd_plist_if_missing() {
-        let _ = process::Command::new("launchctl")
-            .args(["bootstrap", &format!("gui/{uid}"), &plist])
-            .stdout(process::Stdio::null())
-            .stderr(process::Stdio::null())
-            .status();
-    }
-}
-
-/// Write `~/Library/LaunchAgents/com.grabbr.hops.plist` (pointed at the current
-/// binary) if absent; returns its path. Grant is path-bound, so the plist must
-/// point at whatever `hops` binary the user actually launched.
-#[cfg(all(target_os = "macos", any(feature = "tui", feature = "slint")))]
-fn install_launchd_plist_if_missing() -> Option<String> {
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
-    let plist_path = home.join("Library/LaunchAgents/com.grabbr.hops.plist");
-    if plist_path.exists() {
-        return Some(plist_path.to_string_lossy().into_owned());
-    }
-    let exe = std::env::current_exe().ok()?;
-    let logs = home.join("hops/logs");
-    let _ = std::fs::create_dir_all(&logs);
-    let log = logs.join("daemon.log");
-    let plist = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key><string>com.grabbr.hops</string>
-    <key>ProgramArguments</key>
-    <array><string>{exe}</string><string>daemon</string></array>
-    <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
-    <key>ThrottleInterval</key><integer>10</integer>
-    <key>ProcessType</key><string>Interactive</string>
-    <key>StandardOutPath</key><string>{log}</string>
-    <key>StandardErrorPath</key><string>{log}</string>
-</dict>
-</plist>
-"#,
-        exe = exe.display(),
-        log = log.display()
-    );
-    if let Some(dir) = plist_path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    std::fs::write(&plist_path, plist).ok()?;
-    Some(plist_path.to_string_lossy().into_owned())
-}
-
 fn run_async<F, E>(f: F) -> Result<(), HopsError>
 where
     F: Future<Output = Result<(), E>>,
@@ -361,85 +274,9 @@ where
     Ok(runtime.block_on(LocalSet::new().run_until(f))?)
 }
 
-/// Start the daemon as a DETACHED background process (its own session, with
-/// stdio sent to a contained log file) if one isn't already running, then return
-/// without owning it. Used by the front door on non-macOS (macOS uses launchd):
-/// the daemon is the persistent core engine and must survive the front-end — and
-/// its terminal — going away. A redundant daemon self-exits (`AlreadyRunning`).
-#[cfg(all(not(target_os = "macos"), any(feature = "tui", feature = "slint")))]
-fn start_detached_daemon() -> Result<(), io::Error> {
-    use std::process::Stdio;
-    // contained daemon log (never the home root)
-    let (out, err) = {
-        let mut path = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_default();
-        path.push("hops/logs");
-        let _ = std::fs::create_dir_all(&path);
-        path.push("daemon.log");
-        match hops::logging::open_capped(&path).and_then(|f| Ok((f.try_clone()?, f))) {
-            Ok((a, b)) => (Stdio::from(a), Stdio::from(b)),
-            Err(e) => {
-                // Say so. This used to fall through to /dev/null in silence,
-                // for the life of the process, on the one file someone goes to
-                // when something is wrong — and the thing that would have
-                // carried the message is what just failed.
-                //
-                // Less costly than it was: the daemon opens its own log once it
-                // starts, so what is lost here is only what it emits before
-                // that, plus the runtime's own abort message.
-                log::warn!(
-                    "could not open {} ({e}); the daemon's start-up output will \
-                     not be saved. Once it is running it logs to its own file — \
-                     see the Logs section of the README for where.",
-                    path.display()
-                );
-                (Stdio::null(), Stdio::null())
-            }
-        }
-    };
-    let mut cmd = process::Command::new(std::env::current_exe()?);
-    cmd.args(std::env::args().skip(1))
-        .arg("daemon")
-        .stdin(Stdio::null())
-        .stdout(out)
-        .stderr(err);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: setsid() in the forked child detaches it into a new session so
-        // the front-end's terminal closing (SIGHUP) can't take the daemon down.
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // Windows has no setsid(): give the daemon its own detached console and
-        // process group so closing the launching terminal (or the console being
-        // logged off) can't deliver CTRL_CLOSE/CTRL_BREAK and take it down —
-        // without this the "detached" daemon dies with the front-end's console.
-        // For login-persistent autostart prefer the Scheduled Task in
-        // service/windows/; this only covers a hand-launched `hops`.
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-    }
-    // we deliberately drop the Child handle — the daemon owns its own lifecycle.
-    let _ = cmd.spawn()?;
-    Ok(())
-}
-
-async fn run_service(config: Config) -> Result<(), ServiceError> {
-    let release_bind = config.release_bind();
-    let config_path = config.config_path().to_owned();
-    let mut service = Service::new(config).await?;
-    log::info!("using config: {config_path:?}");
-    log::info!("Press {release_bind:?} to release the mouse");
+async fn run_service() -> Result<(), ServiceError> {
+    let endpoint = DaemonEndpoint::of_this_platform().map_err(IpcListenerCreationError::from)?;
+    let mut service = Service::start(&endpoint, Config::new).await?;
     service.run().await?;
     log::info!("service exited!");
     Ok(())

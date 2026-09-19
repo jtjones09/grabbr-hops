@@ -1,4 +1,4 @@
-use crate::{ConnectionError, FrontendEvent, FrontendRequest, IpcError};
+use crate::{ConnectionError, DaemonEndpoint, FrontendEvent, FrontendRequest, IpcError};
 use std::{
     cmp::min,
     io::{self, BufReader, LineWriter, Lines, prelude::*},
@@ -45,8 +45,18 @@ impl FrontendRequestWriter {
     }
 }
 
+/// Connect to the daemon on this platform's endpoint,
+/// [`DaemonEndpoint::of_this_platform`], and present the token.
 pub fn connect() -> Result<(FrontendEventReader, FrontendRequestWriter), ConnectionError> {
-    let rx = wait_for_service()?;
+    connect_to(&DaemonEndpoint::of_this_platform()?)
+}
+
+/// Connect to the daemon listening on `endpoint`, waiting for it to come up,
+/// and present the token.
+pub fn connect_to(
+    endpoint: &DaemonEndpoint,
+) -> Result<(FrontendEventReader, FrontendRequestWriter), ConnectionError> {
+    let rx = wait_for_service(endpoint)?;
     let tx = rx.try_clone()?;
     let buf_reader = BufReader::new(rx);
     let lines = buf_reader.lines();
@@ -63,11 +73,13 @@ pub fn connect() -> Result<(FrontendEventReader, FrontendRequestWriter), Connect
 
 /// wait for the lan-mouse socket to come online
 #[cfg(unix)]
-fn wait_for_service() -> Result<UnixStream, ConnectionError> {
-    let socket_path = crate::default_socket_path()?;
+fn wait_for_service(endpoint: &DaemonEndpoint) -> Result<UnixStream, ConnectionError> {
+    let DaemonEndpoint::Unix(socket_path) = endpoint else {
+        return Err(ConnectionError::UnsupportedEndpoint(endpoint.clone()));
+    };
     let mut duration = Duration::from_millis(10);
     loop {
-        if let Ok(stream) = UnixStream::connect(&socket_path) {
+        if let Ok(stream) = UnixStream::connect(socket_path) {
             break Ok(stream);
         }
         // a signaling mechanism or inotify could be used to
@@ -77,10 +89,11 @@ fn wait_for_service() -> Result<UnixStream, ConnectionError> {
 }
 
 #[cfg(windows)]
-fn wait_for_service() -> Result<TcpStream, ConnectionError> {
+fn wait_for_service(endpoint: &DaemonEndpoint) -> Result<TcpStream, ConnectionError> {
+    let DaemonEndpoint::Tcp(addr) = endpoint;
     let mut duration = Duration::from_millis(10);
     loop {
-        if let Ok(stream) = TcpStream::connect("127.0.0.1:5252") {
+        if let Ok(stream) = TcpStream::connect(*addr) {
             break Ok(stream);
         }
         thread::sleep(exponential_back_off(&mut duration));
