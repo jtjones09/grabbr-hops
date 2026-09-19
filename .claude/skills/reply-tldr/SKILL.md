@@ -14,11 +14,11 @@ description: >-
 
 # reply-tldr — decisions first, always
 
-He has asked for this format three times and it has decayed three times, twice
-inside a single session. It is not a preference about tidiness. He is running a
-project and needs to know what he must decide, what the work is worth to a
-person using hops, and what he is waiting on — without mining a long answer for
-them.
+This format has been asked for three times and has decayed three times, twice
+inside a single session. It is not a preference about tidiness. The reader is
+running a project and needs to know what must be decided, what the work is worth
+to a person using hops, and what is being waited on — without mining a long
+answer for them.
 
 ## The four headings, in this order
 
@@ -26,8 +26,8 @@ Every one is mandatory. If a section is empty, write "none" — do not drop it.
 
 ### 1. Decisions needed
 Numbered. One sentence each. **Give a recommendation, not a menu.** A decision
-he has already made never reappears as a question. This section goes first even
-when the answer is "none", because its absence is what he notices.
+already made never reappears as a question. This section goes first even
+when the answer is "none", because its absence is what gets noticed.
 
 ### 2. What you're getting
 What a *person using hops* experiences differently, in their words.
@@ -45,30 +45,42 @@ know what it is worth — say that out loud rather than hiding it in jargon.
 What *you* do next, ordered.
 
 ### 4. Blocked / waiting
-On him, on hardware, on a run. Say why each is blocked. If you are waiting on
-him for anything, it appears here **and** in the first five lines — never
+On the maintainer, on hardware, on a run. Say why each is blocked. If you are
+waiting on them for anything, it appears here **and** in the first five lines — never
 discovered at the bottom.
 
-Then the detail, under headings. **Keep the detail.** He has said explicitly he
-wants it. The problem was never volume; it was decisions buried in narrative.
+Then the detail, under headings. **Keep the detail.** It is wanted. The problem was never volume; it was decisions buried in narrative.
 
 ## The detail below the TL;DR is EXPLANATION ONLY
 
-Nothing below the four headings may require him to do, decide, or notice
-anything. If a detail section contains something he must act on, that thing is
+Nothing below the four headings may require the reader to do, decide, or notice
+anything. If a detail section contains something they must act on, that thing is
 in the wrong place — lift it into Decisions, Next steps, or Blocked, and leave
 only the explanation behind.
 
 This is the failure mode in practice: the four headings get written correctly,
 and then a long, satisfying write-up follows with new asks embedded in it — an
 open question, an unresolved caveat, a heads-up about another project. Every one
-of those is something he has to hunt for, which is what the format was created
-to stop. He named it directly: *"you put decisions and content all over in your
-readouts, stop that."*
+of those is something the reader has to hunt for, which is what the format was
+created to stop: decisions and content scattered through a readout instead of
+sitting where they were promised.
 
 Do not invent new top-level sections that compete with the four. Detail headings
 are subordinate and descriptive ("why the naive version fails"), never a second
 place where status or asks live.
+
+**One exception, and it is always last: `Provenance`.** When `raise-the-decision`
+fires, its machinery — the decision-record grep and its output, the
+disclosure-instead-of-fix line, the gate keys — goes there, below every detail
+section, capped at 120 words. It is a receipt, not reading. The decision itself
+still appears as a numbered line under **Decisions needed**, with one
+recommendation and nothing else: no options list, no cost-of-deferring, no grep.
+Those belong in a detail section if they belong anywhere.
+
+This exists because that machinery was landing at the TOP, as a fenced block
+above the four headings — more to read before the decisions, which is the exact
+failure this format was created to stop. The order is the point: the few things
+that need a call at the top, the reasoning underneath, the receipts last.
 
 ## The failure mode to watch for
 
@@ -87,8 +99,8 @@ statements, no hooks, no staged reveals — a status block, not a pitch.
 - [ ] All four headings present, in order
 - [ ] Decisions numbered, one sentence, each with a recommendation
 - [ ] "What you're getting" is in user language, and names what is NOT there yet
-- [ ] Anything you are waiting on him for is in the first five lines
+- [ ] Anything you are waiting on the maintainer for is in the first five lines
 - [ ] Claims are marked as verified or not — do not imply a fix has run when it
       has only compiled
-- [ ] **Re-read every line below the four headings.** If any of it asks him to
-      do, decide, or notice something, move it up. Explanation stays; asks do not.
+- [ ] **Re-read every line below the four headings.** If any of it asks the maintainer
+      to do, decide, or notice something, move it up. Explanation stays; asks do not.
