@@ -33,6 +33,10 @@ mod x11;
 /// fallback input capture (does not produce events)
 mod dummy;
 
+/// Capture fed by a test instead of a device. Test builds only; see the feature.
+#[cfg(feature = "scripted")]
+pub mod scripted;
+
 pub type CaptureHandle = u64;
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -96,6 +100,10 @@ pub enum Backend {
     #[cfg(target_os = "macos")]
     MacOs,
     Dummy,
+    /// Never picked by the fallback list and not nameable from a config file:
+    /// only a test holding a [`scripted::Script`] can select it.
+    #[cfg(feature = "scripted")]
+    Scripted(scripted::ScriptId),
 }
 
 impl Display for Backend {
@@ -112,6 +120,8 @@ impl Display for Backend {
             #[cfg(target_os = "macos")]
             Backend::MacOs => write!(f, "MacOS"),
             Backend::Dummy => write!(f, "dummy"),
+            #[cfg(feature = "scripted")]
+            Backend::Scripted(_) => write!(f, "scripted"),
         }
     }
 }
@@ -346,6 +356,8 @@ async fn create_backend(
         #[cfg(target_os = "macos")]
         Backend::MacOs => Ok(Box::new(macos::MacOSInputCapture::new().await?)),
         Backend::Dummy => Ok(Box::new(dummy::DummyInputCapture::new())),
+        #[cfg(feature = "scripted")]
+        Backend::Scripted(id) => Ok(Box::new(scripted::ScriptedCapture::new(id)?)),
     }
 }
 

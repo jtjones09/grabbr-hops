@@ -61,6 +61,9 @@ pub enum CaptureError {
 pub enum CaptureCreationError {
     #[error("no backend available")]
     NoAvailableBackend,
+    #[cfg(feature = "scripted")]
+    #[error("scripted: `{0}`")]
+    Scripted(#[from] crate::scripted::ScriptedCaptureCreationError),
     #[cfg(libei)]
     #[error("error creating input-capture-portal backend: `{0}`")]
     Libei(#[from] LibeiCaptureCreationError),

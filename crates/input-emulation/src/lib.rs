@@ -4,7 +4,7 @@ use std::{
     fmt::Display,
 };
 
-use input_event::{Event, KeyboardEvent};
+use input_event::{Event, KeyboardEvent, PointerEvent};
 
 pub use self::error::{EmulationCreationError, EmulationError, InputEmulationError};
 
@@ -30,6 +30,10 @@ mod macos;
 mod dummy;
 mod error;
 
+/// Records what would have been injected. Test builds only; see the feature.
+#[cfg(feature = "recording")]
+pub mod recording;
+
 pub type EmulationHandle = u64;
 
 /// A screen edge of the receiving desktop, as seen by input emulation.
@@ -44,6 +48,21 @@ pub enum EdgeSide {
     Right,
     Top,
     Bottom,
+}
+
+/// How the system behind a backend counts one button pressed through several
+/// emulation handles. It depends on whether the backend gives each handle a
+/// device of its own, so every backend states its own next to its injection
+/// code.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ButtonScope {
+    /// Every handle injects through the same device, so a button is simply
+    /// down or up. The first up lets go of it for every peer.
+    Machine,
+    /// Each handle injects through a device of its own, and presses are
+    /// counted across devices: applications see the release only once every
+    /// press has been matched by an up.
+    PerHandle,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,6 +80,10 @@ pub enum Backend {
     #[cfg(target_os = "macos")]
     MacOs,
     Dummy,
+    /// Never picked by the fallback list and not nameable from a config file:
+    /// only a test holding a [`recording::Recording`] can select it.
+    #[cfg(feature = "recording")]
+    Recording(recording::RecordingId),
 }
 
 impl Display for Backend {
@@ -79,6 +102,8 @@ impl Display for Backend {
             #[cfg(target_os = "macos")]
             Backend::MacOs => write!(f, "macos"),
             Backend::Dummy => write!(f, "dummy"),
+            #[cfg(feature = "recording")]
+            Backend::Recording(_) => write!(f, "recording"),
         }
     }
 }
@@ -91,6 +116,17 @@ pub struct InputEmulation {
     emulation: Box<dyn Emulation>,
     handles: HashSet<EmulationHandle>,
     pressed_keys: HashMap<EmulationHandle, HashSet<u32>>,
+    /// Buttons each handle holds, so teardown can release them. Without this
+    /// a peer that dropped mid-drag left the button down on this machine
+    /// (#89). What counts as held, and which handle an up goes out on,
+    /// follows `button_scope`; see `machine_button` and `per_handle_button`.
+    ///
+    /// This is bookkeeping, not what the OS saw: a release the backend
+    /// accepted but did not deliver is not repeated when the peer's own up
+    /// arrives later.
+    pressed_buttons: HashMap<EmulationHandle, HashSet<u32>>,
+    /// The backend's own answer, read once: it does not change.
+    button_scope: ButtonScope,
 }
 
 impl InputEmulation {
@@ -109,12 +145,16 @@ impl InputEmulation {
             #[cfg(target_os = "macos")]
             Backend::MacOs => Box::new(macos::MacOSEmulation::new()?),
             Backend::Dummy => Box::new(dummy::DummyEmulation::new()),
+            #[cfg(feature = "recording")]
+            Backend::Recording(id) => Box::new(recording::RecordingEmulation::new(id)?),
         };
         Ok(Self {
             backend,
+            button_scope: emulation.button_scope(),
             emulation,
             handles: HashSet::new(),
             pressed_keys: HashMap::new(),
+            pressed_buttons: HashMap::new(),
         })
     }
 
@@ -174,8 +214,109 @@ impl InputEmulation {
                 }
                 Ok(())
             }
+            Event::Pointer(PointerEvent::Button { button, state, .. }) => match self.button_scope {
+                ButtonScope::Machine => self.machine_button(event, handle, button, state).await,
+                ButtonScope::PerHandle => {
+                    self.per_handle_button(event, handle, button, state).await
+                }
+            },
             _ => self.emulation.consume(event, handle).await,
         }
+    }
+
+    /// A button event where every handle shares one device.
+    ///
+    /// A down is recorded for the handle and passed on. An up is passed on
+    /// only while some handle holds the button, and clears it for all of
+    /// them, so a pressed button gets at most one up however many peers
+    /// pressed it.
+    async fn machine_button(
+        &mut self,
+        event: Event,
+        handle: EmulationHandle,
+        button: u32,
+        state: u32,
+    ) -> Result<(), EmulationError> {
+        if state != 0 {
+            if let Some(pressed) = self.pressed_buttons.get_mut(&handle) {
+                pressed.insert(button);
+            }
+            return self.emulation.consume(event, handle).await;
+        }
+        // An up for a button no peer holds has nothing to let go of. This
+        // machine already released it, at a teardown or through another
+        // peer's up, or never had it pressed. A link that stalls past the
+        // watchdog and then recovers delivers such an up. Passed on, it would
+        // end whatever holds the button by then: another peer's drag or the
+        // local user's.
+        if !self.pressed_buttons.values().any(|p| p.contains(&button)) {
+            log::debug!("dropping mouse button-up {button:#x}: no peer holds it");
+            return Ok(());
+        }
+        // The device has one of each button, so this up lets go of it for
+        // every peer, not only the one that sent it. A peer still listed as
+        // holding it would inject a second up at its teardown. That happens
+        // when a sender reconnects from a new port and lets go, or clicks,
+        // before the watchdog retires its old connection.
+        for pressed in self.pressed_buttons.values_mut() {
+            pressed.remove(&button);
+        }
+        self.emulation.consume(event, handle).await
+    }
+
+    /// A button event where each handle has a device of its own and presses
+    /// are counted across devices.
+    ///
+    /// Every down a handle's device received gets exactly one up through that
+    /// same device: the peer's own up, or one at its teardown. Dropping an up
+    /// because another peer already let go, as `machine_button` does, would
+    /// leave the count above zero and the button held for applications.
+    async fn per_handle_button(
+        &mut self,
+        event: Event,
+        handle: EmulationHandle,
+        button: u32,
+        state: u32,
+    ) -> Result<(), EmulationError> {
+        if state != 0 {
+            if let Some(pressed) = self.pressed_buttons.get_mut(&handle) {
+                // A device holds a button once, and releases it once when it
+                // is destroyed. A second down from it would be counted with
+                // no up to match it.
+                if !pressed.insert(button) {
+                    log::debug!("dropping repeated mouse button-down {button:#x}");
+                    return Ok(());
+                }
+            }
+            return self.emulation.consume(event, handle).await;
+        }
+        // The up goes out on a device that holds the button: the sender's
+        // own, or else the lowest-numbered handle that does. A sender that
+        // reconnected from a new port lets go on the new connection while
+        // its old one still holds the press.
+        let holder = if self
+            .pressed_buttons
+            .get(&handle)
+            .is_some_and(|p| p.contains(&button))
+        {
+            Some(handle)
+        } else {
+            self.pressed_buttons
+                .iter()
+                .filter(|(_, p)| p.contains(&button))
+                .map(|(&h, _)| h)
+                .min()
+        };
+        // As in `machine_button`: nothing holds it, so there is nothing to
+        // let go of, and passing it on would end someone else's press.
+        let Some(holder) = holder else {
+            log::debug!("dropping mouse button-up {button:#x}: no peer holds it");
+            return Ok(());
+        };
+        if let Some(pressed) = self.pressed_buttons.get_mut(&holder) {
+            pressed.remove(&button);
+        }
+        self.emulation.consume(event, holder).await
     }
 
     /// Take the pending adaptive-edge signal, if the backend detected one
@@ -189,6 +330,7 @@ impl InputEmulation {
     pub async fn create(&mut self, handle: EmulationHandle) -> bool {
         if self.handles.insert(handle) {
             self.pressed_keys.insert(handle, HashSet::new());
+            self.pressed_buttons.insert(handle, HashSet::new());
             self.emulation.create(handle).await;
             true
         } else {
@@ -197,9 +339,10 @@ impl InputEmulation {
     }
 
     pub async fn destroy(&mut self, handle: EmulationHandle) {
-        let _ = self.release_keys(handle).await;
+        let _ = self.release_held(handle).await;
         if self.handles.remove(&handle) {
             self.pressed_keys.remove(&handle);
+            self.pressed_buttons.remove(&handle);
             self.emulation.destroy(handle).await
         }
     }
@@ -211,19 +354,67 @@ impl InputEmulation {
         self.emulation.terminate().await
     }
 
-    pub async fn release_keys(&mut self, handle: EmulationHandle) -> Result<(), EmulationError> {
-        if let Some(keys) = self.pressed_keys.get_mut(&handle) {
-            let keys = keys.drain().collect::<Vec<_>>();
-            for key in keys {
-                let event = Event::Keyboard(KeyboardEvent::Key {
-                    time: 0,
-                    key,
-                    state: 0,
-                });
-                self.emulation.consume(event, handle).await?;
-                if let Ok(key) = input_event::scancode::Linux::try_from(key) {
-                    log::warn!("releasing stuck key: {key:?}");
-                }
+    /// Release every button and key `handle` holds, then reset modifiers.
+    ///
+    /// Every teardown funnels through here via [`Self::destroy`]: a peer's
+    /// Leave, the watchdog after a dropped link, shutdown, and the end of an
+    /// emulation session. Buttons go first, which is the order a person lets
+    /// go of a modifier-drag, so the drop keeps the modifiers it was made with.
+    ///
+    /// A release that fails does not stop the rest. Returning at the first
+    /// error left everything after it held, which is the defect this exists to
+    /// prevent. The first error is returned.
+    pub async fn release_held(&mut self, handle: EmulationHandle) -> Result<(), EmulationError> {
+        let mut first_error = None;
+
+        let buttons = self
+            .pressed_buttons
+            .get_mut(&handle)
+            .map(|b| b.drain().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for button in buttons {
+            // Where every peer shares one device, it has one left button
+            // however many peers press it. If another peer still holds this
+            // one, letting go here would end that peer's drag; its own
+            // button-up or teardown releases it instead. Where each peer has
+            // its own device, this device's press is counted, so it is
+            // released here whoever else holds the button.
+            if self.button_scope == ButtonScope::Machine
+                && self
+                    .pressed_buttons
+                    .iter()
+                    .any(|(other, held)| *other != handle && held.contains(&button))
+            {
+                log::debug!("not releasing mouse button {button:#x}: another peer holds it");
+                continue;
+            }
+            log::warn!("releasing stuck mouse button: {button:#x}");
+            let event = Event::Pointer(PointerEvent::Button {
+                time: 0,
+                button,
+                state: 0,
+            });
+            if let Err(e) = self.emulation.consume(event, handle).await {
+                first_error.get_or_insert(e);
+            }
+        }
+
+        let keys = self
+            .pressed_keys
+            .get_mut(&handle)
+            .map(|k| k.drain().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for key in keys {
+            let event = Event::Keyboard(KeyboardEvent::Key {
+                time: 0,
+                key,
+                state: 0,
+            });
+            if let Err(e) = self.emulation.consume(event, handle).await {
+                first_error.get_or_insert(e);
+            }
+            if let Ok(key) = input_event::scancode::Linux::try_from(key) {
+                log::warn!("releasing stuck key: {key:?}");
             }
         }
 
@@ -233,8 +424,14 @@ impl InputEmulation {
             locked: 0,
             group: 0,
         });
-        self.emulation.consume(event, handle).await?;
-        Ok(())
+        if let Err(e) = self.emulation.consume(event, handle).await {
+            first_error.get_or_insert(e);
+        }
+
+        match first_error {
+            None => Ok(()),
+            Some(e) => Err(e),
+        }
     }
 
     pub fn has_pressed_keys(&self, handle: EmulationHandle) -> bool {
@@ -270,6 +467,11 @@ trait Emulation: Send {
     async fn create(&mut self, handle: EmulationHandle);
     async fn destroy(&mut self, handle: EmulationHandle);
     async fn terminate(&mut self);
+    /// How the system behind this backend counts a button pressed through
+    /// several handles. No default: a backend that gives handles their own
+    /// devices and one that shares a device need opposite release rules, so
+    /// each backend states which it is, with its reason, where it injects.
+    fn button_scope(&self) -> ButtonScope;
     /// Adaptive-edge signal (see [`InputEmulation::take_edge_push`]). Backends
     /// without a detector keep the default: never signals.
     fn take_edge_push(&mut self) -> Option<EdgeSide> {

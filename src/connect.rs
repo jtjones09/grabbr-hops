@@ -326,6 +326,11 @@ impl LanMouseConnection {
         }
     }
 
+    /// The address `handle`'s connection is open to, if it has one.
+    pub(crate) fn active_addr(&self, handle: ClientHandle) -> Option<SocketAddr> {
+        self.client_manager.active_addr(handle)
+    }
+
     pub(crate) async fn send(
         &self,
         event: ProtoEvent,
@@ -350,21 +355,7 @@ impl LanMouseConnection {
                     transport::write_frame(&mut send, event).await
                 })
                 .await;
-                match result {
-                    Ok(Ok(())) => log::trace!("{event} >->->->->- {addr}"),
-                    Ok(Err(e)) => {
-                        log::warn!("client {handle} failed to send: {e}");
-                        disconnect(&self.client_manager, handle, addr, &self.conns).await;
-                    }
-                    Err(_) => {
-                        log::warn!(
-                            "client {handle} stopped reading its input stream for {:?} — \
-                             dropping it rather than letting it freeze capture on this machine",
-                            transport::INPUT_SEND_TIMEOUT
-                        );
-                        disconnect(&self.client_manager, handle, addr, &self.conns).await;
-                    }
-                }
+                self.settle(result, event, handle, addr).await;
                 return Ok(());
             }
         }
@@ -390,6 +381,61 @@ impl LanMouseConnection {
             ));
         }
         Err(LanMouseConnectionError::NotConnected)
+    }
+
+    /// Send `event` over the connection already open to `addr`, sent on
+    /// behalf of `handle`. Never dials, and does not ask whether the client
+    /// still exists or its peer is injecting.
+    ///
+    /// For the frames that end a visit. They belong on the connection the
+    /// visit's input went to, and that connection outlives the client: the
+    /// service removes a client before capture lets go of it.
+    pub(crate) async fn send_to(
+        &self,
+        event: ProtoEvent,
+        handle: ClientHandle,
+        addr: SocketAddr,
+    ) -> Result<(), LanMouseConnectionError> {
+        let link = {
+            let conns = self.conns.lock().await;
+            conns.get(&addr).cloned()
+        };
+        let Some(link) = link else {
+            return Err(LanMouseConnectionError::NotConnected);
+        };
+        // Bounded exactly as in `send`, and for the same reason (#64).
+        let result = tokio::time::timeout(transport::INPUT_SEND_TIMEOUT, async {
+            let mut send = link.send.lock().await;
+            transport::write_frame(&mut send, event).await
+        })
+        .await;
+        self.settle(result, event, handle, addr).await;
+        Ok(())
+    }
+
+    /// Log a bounded write's outcome, and disconnect the peer if it failed.
+    async fn settle(
+        &self,
+        result: Result<Result<(), transport::FrameError>, tokio::time::error::Elapsed>,
+        event: ProtoEvent,
+        handle: ClientHandle,
+        addr: SocketAddr,
+    ) {
+        match result {
+            Ok(Ok(())) => log::trace!("{event} >->->->->- {addr}"),
+            Ok(Err(e)) => {
+                log::warn!("client {handle} failed to send: {e}");
+                disconnect(&self.client_manager, handle, addr, &self.conns).await;
+            }
+            Err(_) => {
+                log::warn!(
+                    "client {handle} stopped reading its input stream for {:?} — \
+                     dropping it rather than letting it freeze capture on this machine",
+                    transport::INPUT_SEND_TIMEOUT
+                );
+                disconnect(&self.client_manager, handle, addr, &self.conns).await;
+            }
+        }
     }
 }
 
@@ -694,7 +740,7 @@ async fn ping_pong(
         // Liveness is QUIC's job now (keep-alive + idle timeout). A missed pong
         // under load — e.g. the Pong head-of-line-blocked behind input on the
         // shared reliable stream — must NOT tear down the connection; that false
-        // teardown was triggering release_keys and the stuck-key cascade. We
+        // teardown was triggering release_held and the stuck-key cascade. We
         // keep pinging only to refresh the Pong's emulation-enabled bit; a truly
         // dead link surfaces as a write error above (and a read error in the
         // receive loop).
@@ -1117,6 +1163,35 @@ mod tests {
             "the input send must be WRAPPED in `timeout(transport::INPUT_SEND_TIMEOUT, ..)`. \
              Unbounded, a peer that stops reading freezes the capture task that drains \
              THIS machine's input, and on macOS the event tap dies with it — issue #64."
+        );
+    }
+
+    // LEDGER T22 | class S | source text | pair: a_peer_that_stops_reading_cannot_pin_the_sender
+    /// The same wiring for `send_to`, which carries the frames that end a visit
+    /// from the same capture task, so an unbounded write there freezes it too.
+    #[test]
+    fn the_leave_send_path_is_bounded() {
+        let src = include_str!("connect.rs");
+        let src = src.split("\n#[cfg(test)]").next().unwrap_or(src);
+        let start = src
+            .find("pub(crate) async fn send_to(")
+            .expect("send_to() must exist; if it was renamed, update this guard");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    pub(crate) async fn ")
+            .or_else(|| rest[1..].find("\n    async fn "))
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        let body: String = rest[..end]
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("timeout(transport::INPUT_SEND_TIMEOUT"),
+            "send_to must be WRAPPED in `timeout(transport::INPUT_SEND_TIMEOUT, ..)`, \
+             like send: it runs on the capture task that drains this machine's input \
+             (issue #64)."
         );
     }
 

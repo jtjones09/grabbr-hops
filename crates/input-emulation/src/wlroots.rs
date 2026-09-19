@@ -1,6 +1,6 @@
 use crate::error::EmulationError;
 
-use super::{Emulation, error::WlrootsEmulationCreationError};
+use super::{ButtonScope, Emulation, error::WlrootsEmulationCreationError};
 use async_trait::async_trait;
 use bitflags::bitflags;
 use std::collections::HashMap;
@@ -198,6 +198,21 @@ impl Emulation for WlrootsEmulation {
     }
     async fn terminate(&mut self) {
         /* nothing to do */
+    }
+
+    /// Each handle gets its own virtual pointer (`add_client`), and wlroots
+    /// counts presses across devices. From wlroots 0.19 the seat keeps a
+    /// press count per button and tells applications about a release only
+    /// when it reaches zero (`wlr_seat_pointer_notify_button`), while each
+    /// device keeps the buttons it holds and releases them when it is
+    /// destroyed (`wlr_pointer_finish`). sway passes every device's buttons
+    /// to the seat. So a device must let go of what it pressed.
+    ///
+    /// wlroots 0.18 and older keep the seat's buttons as a set instead: when
+    /// two peers hold one button it comes up at the first up or teardown,
+    /// and the other's up reaches applications as an extra release.
+    fn button_scope(&self) -> ButtonScope {
+        ButtonScope::PerHandle
     }
 }
 

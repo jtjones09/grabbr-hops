@@ -19,7 +19,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{XBUTTON1, XBUTTON2};
 
-use super::{Emulation, EmulationHandle};
+use super::{ButtonScope, Emulation, EmulationHandle};
 
 const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(500);
 const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
@@ -88,6 +88,13 @@ impl Emulation for WindowsEmulation {
     async fn destroy(&mut self, _handle: EmulationHandle) {}
 
     async fn terminate(&mut self) {}
+
+    /// Every handle goes through the same `SendInput` call, with no device of
+    /// its own. How Windows counts a second down before an up is not
+    /// documented and not checked.
+    fn button_scope(&self) -> ButtonScope {
+        ButtonScope::Machine
+    }
 }
 
 impl WindowsEmulation {

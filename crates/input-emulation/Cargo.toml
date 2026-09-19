@@ -74,5 +74,9 @@ wlroots = [
     "dep:wayland-protocols-misc",
 ]
 x11 = ["dep:x11"]
+# A backend that injects nothing and records what it was asked to inject, for
+# tests. Not in `default` and not in any feature the hops crate exposes: the hops
+# crate turns it on as a dev-dependency only, so no shipped build contains it.
+recording = []
 remote_desktop_portal = ["dep:ashpd"]
 libei = ["dep:reis", "dep:ashpd"]

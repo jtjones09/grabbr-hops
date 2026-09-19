@@ -18,7 +18,7 @@ use input_event::{
 
 use crate::error::EmulationError;
 
-use super::{Emulation, EmulationHandle, error::XdpEmulationCreationError};
+use super::{ButtonScope, Emulation, EmulationHandle, error::XdpEmulationCreationError};
 
 pub(crate) struct DesktopPortalEmulation {
     proxy: RemoteDesktop,
@@ -160,6 +160,15 @@ impl Emulation for DesktopPortalEmulation {
         if let Err(e) = self.session.receive_closed().await {
             log::warn!("session.receive_closed(): {e}");
         };
+    }
+
+    /// Every handle injects through the one RemoteDesktop session. mutter
+    /// backs a session with one virtual pointer
+    /// (meta-remote-desktop-session.c) that ignores a second press of a
+    /// button it holds (meta-virtual-input-device-native.c), so the first up
+    /// lets go of it. How other portal backends count is not checked.
+    fn button_scope(&self) -> ButtonScope {
+        ButtonScope::Machine
     }
 }
 

@@ -108,6 +108,11 @@ mdns-sd = "0.21.2"
 # an unauthenticated LAN host can drive. If upstream removes it the dev-build
 # breaks loudly, which is the correct failure for a test dependency.
 mdns-sd = { version = "0.21.2", features = ["unstable-fuzz-api"] }
+# Test-only backends: emulation that records what it would inject, and capture a
+# test feeds events into. Named only here, so only test builds contain them; no
+# feature of this crate forwards to either.
+input-emulation = { path = "crates/input-emulation", version = "0.4.0", default-features = false, features = ["recording"] }
+input-capture = { path = "crates/input-capture", version = "0.4.0", default-features = false, features = ["scripted"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.148"
