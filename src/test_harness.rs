@@ -70,6 +70,57 @@ pub(crate) fn trust(us: &Machine, peers: &[&Machine], caps: Caps) -> Trust {
     Arc::new(RwLock::new(store))
 }
 
+/// A client config for a test that dials the listener itself, with a stream
+/// receive window it chooses.
+///
+/// The real dialler's window is far larger than a test can fill, and a test
+/// about a peer that stops reading has to fill one.
+pub(crate) fn raw_client_config(
+    me: &Machine,
+    trust: Trust,
+    stream_window: u32,
+) -> quinn::ClientConfig {
+    let verifier = Arc::new(transport::FpServerVerifier::new(
+        trust,
+        Arc::new(std::sync::Mutex::new(None)),
+    ));
+    let mut crypto = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_auth_cert(vec![me.identity.cert.clone()], me.identity.key.clone_key())
+        .expect("client auth");
+    crypto.alpn_protocols = vec![transport::ALPN.to_vec()];
+    let mut config = quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(crypto).expect("quic client"),
+    ));
+    let mut transport_config = quinn::TransportConfig::default();
+    // MUST be > 0 or the receiver's reply stream is never accepted.
+    transport_config.max_concurrent_uni_streams(8u8.into());
+    transport_config.stream_receive_window(stream_window.into());
+    config.transport_config(Arc::new(transport_config));
+    config
+}
+
+/// Poll `look` until it answers, and give that answer; panic naming `what` if
+/// it does not within `limit`.
+pub(crate) async fn wait_for<T, F: Future<Output = Option<T>>>(
+    what: &str,
+    limit: Duration,
+    mut look: impl FnMut() -> F,
+) -> T {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if let Some(found) = look().await {
+            return found;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// Poll `done` until it holds; panic naming `what` if it does not within `limit`.
 pub(crate) async fn wait_until(what: &str, limit: Duration, mut done: impl FnMut() -> bool) {
     let started = tokio::time::Instant::now();
