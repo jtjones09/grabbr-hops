@@ -200,6 +200,28 @@ fn temporary_writer(file_name: &str, prefix: &str) -> Option<u32> {
 /// A link at the lock path is not followed, and the lock is then refused: a
 /// daemon run as root would otherwise create or lock whatever file a process
 /// of this user linked there.
+/// A refusal caused by a link at `path`, said plainly; anything else unchanged.
+///
+/// `ELOOP` from an `O_NOFOLLOW` open reads as "Too many levels of symbolic
+/// links", which describes a loop the user does not have.
+#[cfg(unix)]
+pub(crate) fn link_refused(path: &Path, e: io::Error) -> io::Error {
+    if e.raw_os_error() != Some(libc::ELOOP) {
+        return e;
+    }
+    let target = fs::read_link(path)
+        .map(|t| format!(" to {}", t.display()))
+        .unwrap_or_default();
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "{}: hops will not write through a symbolic link{target}. \
+             Remove the link, then start hops again.",
+            path.display()
+        ),
+    )
+}
+
 pub(crate) fn lock_sibling(path: &Path) -> io::Result<fs::File> {
     let lock_path = sibling(path, "lock");
     let mut opts = fs::OpenOptions::new();
