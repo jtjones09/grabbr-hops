@@ -1,12 +1,13 @@
 use crate::config::{local_caps, local_commit};
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use hops_proto::{Position, ProtoEvent};
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
 use input_event::{Event, PointerEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::Cell,
+    collections::VecDeque,
     collections::{HashMap, HashSet},
     net::SocketAddr,
     rc::Rc,
@@ -103,7 +104,7 @@ impl Emulation {
         listener: LanMouseListener,
         trust: crate::transport::Trust,
     ) -> Self {
-        let emulation_proxy = EmulationProxy::new(backend);
+        let emulation_proxy = EmulationProxy::new(backend, listener.pressure());
         let last_injected = emulation_proxy.last_injected.clone();
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
@@ -533,7 +534,10 @@ impl QueueMetrics {
 }
 
 impl EmulationProxy {
-    fn new(backend: Option<input_emulation::Backend>) -> Self {
+    fn new(
+        backend: Option<input_emulation::Backend>,
+        pressure: Rc<crate::listen::InputPressure>,
+    ) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let emulation_active = Rc::new(Cell::new(false));
@@ -547,6 +551,8 @@ impl EmulationProxy {
             handles: Default::default(),
             next_id: 0,
             metrics: metrics.clone(),
+            queued: Default::default(),
+            pressure,
         };
         let task = spawn_local(emulation_task.run());
         Self {
@@ -625,6 +631,100 @@ struct EmulationTask {
     handles: HashMap<SocketAddr, EmulationHandle>,
     next_id: EmulationHandle,
     metrics: Rc<QueueMetrics>,
+    /// What waits for injection, one queue per peer.
+    queued: PeerQueues,
+    /// Peers told to stop sending until their queue drains.
+    pressure: Rc<crate::listen::InputPressure>,
+}
+
+/// How many requests may wait for one peer before its connection stops
+/// reading. Relative motion merges, so an honest mouse never reaches this;
+/// what does is a peer sending events that cannot merge faster than this
+/// machine can inject them.
+const PEER_QUEUE_LIMIT: usize = 256;
+
+/// How many arrived requests are sorted into queues between two injections,
+/// so a key from one peer joins its queue while another peer is flooding.
+const SORT_BATCH: usize = 64;
+
+/// What one peer has asked for and this machine has not done yet.
+enum Queued {
+    Input(Event),
+    /// Tear the peer's handle down, after everything it sent before.
+    Remove,
+}
+
+/// Every peer's queue, served in turn (#82).
+///
+/// Injection used to take requests from one queue in arrival order, so a peer
+/// sending faster than this machine injects pushed every other peer's input
+/// behind its whole backlog. Now each peer waits in its own queue and each
+/// turn injects one request from the next peer that has one.
+#[derive(Default)]
+struct PeerQueues {
+    /// Peers with something queued, in the order they are served.
+    turn: VecDeque<SocketAddr>,
+    queues: HashMap<SocketAddr, VecDeque<Queued>>,
+}
+
+impl PeerQueues {
+    /// Queue `item` for `addr`. Consecutive relative motion merges into one
+    /// event carrying the sum: the pointer ends up in the same place, and a
+    /// fast mouse costs one queue slot, not hundreds. Returns whether it merged
+    /// and how many requests now wait for `addr`.
+    fn push(&mut self, addr: SocketAddr, item: Queued) -> (bool, usize) {
+        let queue = self.queues.entry(addr).or_default();
+        if queue.is_empty() {
+            self.turn.push_back(addr);
+        }
+        if let (
+            Some(Queued::Input(Event::Pointer(PointerEvent::Motion { time, dx, dy }))),
+            Queued::Input(Event::Pointer(PointerEvent::Motion {
+                time: later,
+                dx: more_x,
+                dy: more_y,
+            })),
+        ) = (queue.back_mut(), &item)
+        {
+            *dx += *more_x;
+            *dy += *more_y;
+            *time = *later;
+            return (true, queue.len());
+        }
+        queue.push_back(item);
+        (false, queue.len())
+    }
+
+    /// The next peer's next request, and how many of that peer's are left.
+    fn pop(&mut self) -> Option<(SocketAddr, Queued, usize)> {
+        let addr = self.turn.pop_front()?;
+        let queue = self.queues.get_mut(&addr)?;
+        let item = queue.pop_front()?;
+        let left = queue.len();
+        if left > 0 {
+            self.turn.push_back(addr);
+        } else {
+            self.queues.remove(&addr);
+        }
+        Some((addr, item, left))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.turn.is_empty()
+    }
+
+    /// Drop everything, returning how many inputs were waiting.
+    fn clear(&mut self) -> u64 {
+        let inputs = self
+            .queues
+            .values()
+            .flatten()
+            .filter(|q| matches!(q, Queued::Input(_)))
+            .count() as u64;
+        self.turn.clear();
+        self.queues.clear();
+        inputs
+    }
 }
 
 impl EmulationTask {
@@ -694,6 +794,15 @@ impl EmulationTask {
         }
 
         let res = self.do_emulation_session(&mut emulation).await;
+        // What was still waiting goes with the session. Its peers may read
+        // again, and the backlog counter stays honest.
+        let waiting: Vec<SocketAddr> = self.queued.queues.keys().copied().collect();
+        for addr in waiting {
+            self.pressure.release(addr);
+        }
+        for _ in 0..self.queued.clear() {
+            self.metrics.on_inject();
+        }
         // FIXME replace with async drop when stabilized
         emulation.terminate().await;
         res
@@ -723,7 +832,20 @@ impl EmulationTask {
         let mut prev_enqueued = self.metrics.enqueued.get();
         let mut injected_since_yield: u32 = 0;
         loop {
+            // Sort what has already arrived into its peers' queues first, so a
+            // key from one peer joins its queue while another peer floods.
+            for _ in 0..SORT_BATCH {
+                match self.request_rx.recv().now_or_never() {
+                    Some(request) => {
+                        if self.sort(request.expect("channel closed")) {
+                            return Ok(());
+                        }
+                    }
+                    None => break,
+                }
+            }
             tokio::select! {
+                biased;
                 _ = report.tick() => {
                     let enqueued = self.metrics.enqueued.get();
                     let rate = enqueued - prev_enqueued;
@@ -740,59 +862,93 @@ impl EmulationTask {
                         self.metrics.peak_backlog.set(backlog);
                     }
                 }
-                e = self.request_rx.recv() => match e.expect("channel closed") {
-                    ProxyRequest::Input(event, addr) => {
-                        let handle = match self.handles.get(&addr) {
-                            Some(&handle) => handle,
-                            None => {
-                                let handle = self.next_id;
-                                self.next_id += 1;
-                                emulation.create(handle).await;
-                                self.handles.insert(addr, handle);
-                                handle
+                _ = std::future::ready(()), if !self.queued.is_empty() => {
+                    let (addr, item, left) = self.queued.pop().expect("a peer has something queued");
+                    if left < PEER_QUEUE_LIMIT / 2 {
+                        self.pressure.release(addr);
+                    }
+                    match item {
+                        Queued::Input(event) => {
+                            let handle = match self.handles.get(&addr) {
+                                Some(&handle) => handle,
+                                None => {
+                                    let handle = self.next_id;
+                                    self.next_id += 1;
+                                    emulation.create(handle).await;
+                                    self.handles.insert(addr, handle);
+                                    handle
+                                }
+                            };
+                            emulation.consume(event, handle).await?;
+                            self.metrics.on_inject();
+                            // Hand the runtime back periodically. `local_channel`
+                            // recv resolves immediately while the queue is
+                            // non-empty, and the runtime is `new_current_thread`
+                            // (main.rs:337) — so without this, a peer that floods
+                            // input starves every other task on the thread,
+                            // including the one that services a revocation. That is
+                            // denial-of-revocation by injection: the single most
+                            // likely thing an attacker does once discovered.
+                            //
+                            // Measured, 20,000-event backlog: revoke serviced after
+                            // 1.811 s with no yield, ~2 ms yielding every 8, and the
+                            // revoke was never serviced mid-flood at all. Yielding
+                            // on EVERY event costs 12.9% injection throughput for
+                            // 300 µs nobody can perceive; every 8 costs 1.7%.
+                            injected_since_yield += 1;
+                            if injected_since_yield >= YIELD_EVERY_N_EVENTS {
+                                injected_since_yield = 0;
+                                tokio::task::yield_now().await;
                             }
-                        };
-                        emulation.consume(event, handle).await?;
-                        self.metrics.on_inject();
-                        // Hand the runtime back periodically. `local_channel`
-                        // recv resolves immediately while the queue is
-                        // non-empty, and the runtime is `new_current_thread`
-                        // (main.rs:337) — so without this, a peer that floods
-                        // input starves every other task on the thread,
-                        // including the one that services a revocation. That is
-                        // denial-of-revocation by injection: the single most
-                        // likely thing an attacker does once discovered.
-                        //
-                        // Measured, 20,000-event backlog: revoke serviced after
-                        // 1.811 s with no yield, ~2 ms yielding every 8, and the
-                        // revoke was never serviced mid-flood at all. Yielding
-                        // on EVERY event costs 12.9% injection throughput for
-                        // 300 µs nobody can perceive; every 8 costs 1.7%.
-                        injected_since_yield += 1;
-                        if injected_since_yield >= YIELD_EVERY_N_EVENTS {
-                            injected_since_yield = 0;
-                            tokio::task::yield_now().await;
+                            // adaptive edge: the backend may have concluded this
+                            // event was a deliberate push past a screen edge
+                            if let Some(side) = emulation.take_edge_push() {
+                                self.event_tx
+                                    .send(EmulationEvent::EdgePushed {
+                                        addr,
+                                        side: edge_to_ipc_pos(side),
+                                    })
+                                    .expect("channel closed");
+                            }
+
                         }
-                        // adaptive edge: the backend may have concluded this
-                        // event was a deliberate push past a screen edge
-                        if let Some(side) = emulation.take_edge_push() {
-                            self.event_tx
-                                .send(EmulationEvent::EdgePushed {
-                                    addr,
-                                    side: edge_to_ipc_pos(side),
-                                })
-                                .expect("channel closed");
-                        }
-                    },
-                    ProxyRequest::Remove(addr) => {
-                        if let Some(handle) = self.handles.remove(&addr) {
-                            emulation.destroy(handle).await;
+                        Queued::Remove => {
+                            if let Some(handle) = self.handles.remove(&addr) {
+                                emulation.destroy(handle).await;
+                            }
                         }
                     }
-                    ProxyRequest::Terminate => break Ok(()),
-                    ProxyRequest::Reenable => continue,
-                },
+                }
+                e = self.request_rx.recv() => {
+                    if self.sort(e.expect("channel closed")) {
+                        break Ok(());
+                    }
+                }
             }
+        }
+    }
+
+    /// File one request into its peer's queue. True for `Terminate`.
+    fn sort(&mut self, request: ProxyRequest) -> bool {
+        match request {
+            ProxyRequest::Input(event, addr) => {
+                let (merged, waiting) = self.queued.push(addr, Queued::Input(event));
+                if merged {
+                    // Merged into an event already waiting: done, as far as the
+                    // backlog counter is concerned.
+                    self.metrics.on_inject();
+                }
+                if waiting >= PEER_QUEUE_LIMIT {
+                    self.pressure.hold(addr);
+                }
+                false
+            }
+            ProxyRequest::Remove(addr) => {
+                self.queued.push(addr, Queued::Remove);
+                false
+            }
+            ProxyRequest::Terminate => true,
+            ProxyRequest::Reenable => false,
         }
     }
 }
@@ -906,7 +1062,7 @@ mod tests {
             .expect("runtime");
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, async {
-            let proxy = EmulationProxy::new(None);
+            let proxy = EmulationProxy::new(None, Default::default());
             let window = Duration::from_secs(2);
             assert!(
                 !proxy.remotely_driven_within(window),
@@ -1433,6 +1589,132 @@ mod held_input_is_released {
                 "the left button was released at the Leave, and the peer's late \
                  up was injected as a second one: {:?}",
                 s.recording.calls()
+            );
+        });
+    }
+
+    /// A scroll, which the queues never merge: the flood in the fairness test
+    /// has to be events that cannot be collapsed into one.
+    fn scroll(value: f64) -> Event {
+        Event::Pointer(PointerEvent::Axis {
+            time: 0,
+            axis: 0,
+            value,
+        })
+    }
+
+    fn motion(dx: f64) -> Event {
+        Event::Pointer(PointerEvent::Motion {
+            time: 0,
+            dx,
+            dy: 0.,
+        })
+    }
+
+    /// How many events the backend took before `mark`, and whether it took it.
+    fn injected_before(calls: &[Recorded], mark: Event) -> Option<usize> {
+        let at = calls
+            .iter()
+            .position(|c| matches!(c, Recorded::Consume(e, _) if *e == mark))?;
+        Some(
+            calls[..at]
+                .iter()
+                .filter(|c| matches!(c, Recorded::Consume(..)))
+                .count(),
+        )
+    }
+
+    // LEDGER T27 | class B | 6 struct state: Recording::calls() order under a flood from another peer
+    /// One machine sending faster than this one can inject must not hold up
+    /// another machine's key.
+    ///
+    /// Every peer's input used to wait in one queue in arrival order, so a key
+    /// from a second machine sat behind the whole backlog of the first (#82).
+    /// Injection is made the slow step here, which is what a real backend is.
+    #[test]
+    fn a_flood_from_one_peer_does_not_delay_another_peers_key() {
+        run_local(async {
+            let s = session_with(2).await;
+            const FLOOD: usize = 300;
+            s.recording.consume_takes(Duration::from_millis(2));
+
+            for _ in 0..FLOOD {
+                s.peers[0].send(ProtoEvent::Input(scroll(1.))).await;
+            }
+            s.peers[1].send(ProtoEvent::Input(key(KEY_A, 1))).await;
+
+            wait_until(
+                "the second peer's key to be injected",
+                Duration::from_secs(20),
+                || !s.consumed(key(KEY_A, 1)).is_empty(),
+            )
+            .await;
+            let waited =
+                injected_before(&s.recording.calls(), key(KEY_A, 1)).expect("the key was injected");
+            assert!(
+                waited < FLOOD / 4,
+                "the key waited behind {waited} of the flood's {FLOOD} events; \
+                 each peer is supposed to be served in turn"
+            );
+        });
+    }
+
+    // LEDGER T28 | class B | 6 struct state: Recording::calls() after a high-rate mouse
+    /// A fast mouse costs one queue slot, not hundreds, and the pointer still
+    /// ends up where it was sent.
+    ///
+    /// Relative motion waiting behind an injection merges into the event
+    /// already queued, carrying the sum (#82).
+    #[test]
+    fn a_high_rate_mouse_is_merged_and_still_lands_where_it_was_sent() {
+        run_local(async {
+            let s = session().await;
+            const MOVES: usize = 400;
+            s.recording.consume_takes(Duration::from_millis(2));
+
+            for _ in 0..MOVES {
+                s.dialer().send(ProtoEvent::Input(motion(1.))).await;
+            }
+            // A key after the motion: once it arrives, everything sent before
+            // it has been dealt with.
+            s.peers[0].send(ProtoEvent::Input(key(KEY_A, 1))).await;
+            wait_until(
+                "the key sent after the motion to be injected",
+                Duration::from_secs(20),
+                || !s.consumed(key(KEY_A, 1)).is_empty(),
+            )
+            .await;
+
+            let moved: f64 = s
+                .recording
+                .calls()
+                .iter()
+                .filter_map(|c| match c {
+                    Recorded::Consume(Event::Pointer(PointerEvent::Motion { dx, .. }), _) => {
+                        Some(*dx)
+                    }
+                    _ => None,
+                })
+                .sum();
+            let injections = s
+                .recording
+                .calls()
+                .iter()
+                .filter(|c| {
+                    matches!(
+                        c,
+                        Recorded::Consume(Event::Pointer(PointerEvent::Motion { .. }), _)
+                    )
+                })
+                .count();
+            assert_eq!(
+                moved, MOVES as f64,
+                "the pointer moved {moved} of the {MOVES} it was sent"
+            );
+            assert!(
+                injections < MOVES / 2,
+                "{injections} injections for {MOVES} moves: motion waiting behind \
+                 an injection is supposed to merge"
             );
         });
     }

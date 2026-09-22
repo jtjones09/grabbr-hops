@@ -39,6 +39,48 @@ pub enum ListenerCreationError {
 /// peer before its writer waits. See [`server_config`].
 const REPLY_BUFFER_PER_PEER: u32 = 256 * 1024;
 
+/// Which peers must stop sending until injection catches up with them (#82).
+///
+/// Injection drains each peer's queue in turn. A peer whose queue is full is
+/// held here, and its read loop stops taking frames off the network until it
+/// is released, so QUIC's own flow control slows that peer and no other.
+#[derive(Default)]
+pub(crate) struct InputPressure {
+    held: RefCell<std::collections::HashSet<SocketAddr>>,
+    released: Notify,
+}
+
+impl InputPressure {
+    pub(crate) fn hold(&self, addr: SocketAddr) {
+        self.held.borrow_mut().insert(addr);
+    }
+
+    pub(crate) fn release(&self, addr: SocketAddr) {
+        if self.held.borrow_mut().remove(&addr) {
+            self.released.notify_waiters();
+        }
+    }
+
+    fn is_held(&self, addr: SocketAddr) -> bool {
+        self.held.borrow().contains(&addr)
+    }
+
+    /// Wait until `addr` is not held.
+    async fn until_released(&self, addr: SocketAddr) {
+        loop {
+            // Registered before the check, so a release between the check and
+            // the wait is not missed.
+            let released = self.released.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            if !self.is_held(addr) {
+                return;
+            }
+            released.await;
+        }
+    }
+}
+
 pub(crate) enum ListenEvent {
     Msg {
         event: ProtoEvent,
@@ -145,6 +187,7 @@ pub(crate) struct LanMouseListener {
     listen_tx: Sender<ListenEvent>,
     listen_task: JoinHandle<()>,
     conns: Rc<AsyncMutex<Vec<ConnEntry>>>,
+    pressure: Rc<InputPressure>,
     request_port_change: Sender<u16>,
     port_changed: Receiver<Result<u16, ListenerCreationError>>,
     /// Where the first endpoint bound, so a test that asked for port 0 can dial it.
@@ -230,6 +273,8 @@ impl LanMouseListener {
 
         let conns: Rc<AsyncMutex<Vec<ConnEntry>>> = Rc::new(AsyncMutex::new(Vec::new()));
         let conns_clone = conns.clone();
+        let pressure: Rc<InputPressure> = Default::default();
+        let pressure_clone = pressure.clone();
 
         let listen_task: JoinHandle<()> = {
             let listen_tx = listen_tx.clone();
@@ -243,6 +288,7 @@ impl LanMouseListener {
                             // Drive each handshake on its own task so one slow
                             // peer can't head-of-line-block all other accepts.
                             let conns = conns_clone.clone();
+                            let pressure = pressure_clone.clone();
                             let listen_tx = listen_tx.clone();
                             let attempts = attempts.clone();
                             let clipboard_in = clipboard_in.clone();
@@ -303,7 +349,7 @@ impl LanMouseListener {
                                         });
                                         let closer = ReplyQueueGuard { replies, ready };
                                         let _ = listen_tx.send(ListenEvent::Accept { addr, fingerprint });
-                                        spawn_local(read_loop(conns.clone(), addr, conn, listen_tx.clone(), clipboard_in, closer));
+                                        spawn_local(read_loop(conns.clone(), addr, conn, listen_tx.clone(), clipboard_in, closer, pressure));
                                     }
                                     Err(e) => {
                                         log::warn!("handshake from {remote} failed: {e}");
@@ -347,6 +393,7 @@ impl LanMouseListener {
 
         Ok(Self {
             conns,
+            pressure,
             listen_rx,
             listen_tx,
             listen_task,
@@ -404,6 +451,12 @@ impl LanMouseListener {
             .iter()
             .find(|e| e.addr == addr)
             .map(|e| e.fingerprint.clone())
+    }
+
+    /// Which peers must stop sending until injection catches up. Given to the
+    /// emulation task, which holds and releases them (#82).
+    pub(crate) fn pressure(&self) -> Rc<InputPressure> {
+        self.pressure.clone()
     }
 
     /// A handle for force-closing live inbound sessions when trust is revoked.
@@ -549,6 +602,7 @@ async fn read_loop(
     clipboard_in: Sender<String>,
     // Dropped when this loop ends, which ends the connection's writer task.
     _replies: ReplyQueueGuard,
+    pressure: Rc<InputPressure>,
 ) {
     // the peer's reliable inbound stream (their uni stream to us)
     let mut recv = match conn.accept_uni().await {
@@ -563,6 +617,9 @@ async fn read_loop(
     // clipboard transfers ride the subsequent uni streams on this connection.
     spawn_local(clipboard_accept_loop(conn.clone(), addr, clipboard_in));
     loop {
+        // A peer whose injection queue is full reads nothing more until it
+        // drains, so its own flow control slows it and no other peer (#82).
+        pressure.until_released(addr).await;
         match transport::read_frame(&mut recv).await {
             Ok(Some(event)) => {
                 let _ = listen_tx.send(ListenEvent::Msg { event, addr });
