@@ -5,6 +5,7 @@ use quinn::crypto::rustls::QuicServerConfig;
 use quinn::{Connection, Endpoint, SendStream, TransportConfig};
 use rustls::pki_types::CertificateDer;
 use std::{
+    cell::RefCell,
     collections::VecDeque,
     io,
     net::SocketAddr,
@@ -14,7 +15,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{
-    sync::Mutex as AsyncMutex,
+    sync::{Mutex as AsyncMutex, Notify},
     task::{JoinHandle, spawn_local},
 };
 
@@ -34,6 +35,10 @@ pub enum ListenerCreationError {
     NoInitialCipherSuite(#[from] quinn::crypto::rustls::NoInitialCipherSuite),
 }
 
+/// How much unsent reply and clipboard data this machine will hold for one
+/// peer before its writer waits. See [`server_config`].
+const REPLY_BUFFER_PER_PEER: u32 = 256 * 1024;
+
 pub(crate) enum ListenEvent {
     Msg {
         event: ProtoEvent,
@@ -48,13 +53,91 @@ pub(crate) enum ListenEvent {
     },
 }
 
-/// A live inbound connection plus the reply stream we opened back to the peer
-/// and the fingerprint captured at accept time (so we never re-derive it).
+/// A live inbound connection plus the queue its replies wait in and the
+/// fingerprint captured at accept time (so we never re-derive it).
 struct ConnEntry {
     addr: SocketAddr,
     conn: Connection,
-    send: Arc<AsyncMutex<SendStream>>,
+    replies: Rc<RefCell<PendingReplies>>,
+    /// Wakes this connection's writer task when a reply is queued.
+    ready: Rc<Notify>,
     fingerprint: String,
+}
+
+/// Ends a connection's writer task when its read loop ends: the queue is
+/// marked closed and the task woken, so it stops once it has written what is
+/// already waiting.
+struct ReplyQueueGuard {
+    replies: Rc<RefCell<PendingReplies>>,
+    ready: Rc<Notify>,
+}
+
+impl Drop for ReplyQueueGuard {
+    fn drop(&mut self) {
+        self.replies.borrow_mut().closed = true;
+        self.ready.notify_one();
+    }
+}
+
+/// Replies waiting for one connection's writer task.
+///
+/// The receiver used to write every reply from the one task that also handles
+/// every peer's input, awaiting a QUIC stream whose window a peer that stopped
+/// reading can fill. That peer then held up input from all the others (#82).
+/// Writing happens on a task per connection, and this is where a reply waits.
+///
+/// At most one of each kind is kept: the sender re-sends Enter until it sees an
+/// Ack, so a second queued Ack tells it nothing the first does not, and a peer
+/// that has stopped reading cannot grow this without bound. The oldest waiting
+/// reply of a kind keeps its place in the queue and carries the newest value.
+#[derive(Default)]
+struct PendingReplies {
+    queue: VecDeque<ProtoEvent>,
+    /// The connection is gone: the writer task stops once the queue is empty.
+    closed: bool,
+}
+
+impl PendingReplies {
+    fn push(&mut self, event: ProtoEvent) {
+        if let Some(waiting) = self
+            .queue
+            .iter_mut()
+            .find(|q| std::mem::discriminant(*q) == std::mem::discriminant(&event))
+        {
+            *waiting = event;
+            return;
+        }
+        self.queue.push_back(event);
+    }
+}
+
+/// Writes one connection's replies, in the order they were queued.
+///
+/// Its own task: a write that blocks on this peer's window blocks nothing else.
+async fn reply_loop(
+    addr: SocketAddr,
+    replies: Rc<RefCell<PendingReplies>>,
+    ready: Rc<Notify>,
+    mut send: SendStream,
+) {
+    loop {
+        let next = replies.borrow_mut().queue.pop_front();
+        match next {
+            Some(event) => {
+                log::trace!("reply {event} >=>=>=>=>=> {addr}");
+                if let Err(e) = transport::write_frame(&mut send, event).await {
+                    log::debug!("{addr}: reply stream closed: {e}");
+                    break;
+                }
+            }
+            None => {
+                if replies.borrow().closed {
+                    break;
+                }
+                ready.notified().await;
+            }
+        }
+    }
 }
 
 pub(crate) struct LanMouseListener {
@@ -94,6 +177,13 @@ fn server_config(
     let mut transport_config = TransportConfig::default();
     // MUST be > 0 or the peer's single uni stream is never accepted.
     transport_config.max_concurrent_uni_streams(8u8.into());
+    // What one peer can make this machine hold. quinn buffers what it cannot
+    // send yet, and its default runs to megabytes per connection: a peer that
+    // stops reading its replies had this machine holding all of them, and the
+    // task that wrote them was the one task handling every peer's input (#82).
+    // A reply is a handful of bytes, so this is thousands of them; a clipboard
+    // transfer on the same connection is chunked and flow-controlled anyway.
+    transport_config.send_window(REPLY_BUFFER_PER_PEER as u64);
     transport_config.keep_alive_interval(Some(KEEP_ALIVE));
     transport_config.max_idle_timeout(Some(MAX_IDLE.try_into().expect("idle timeout")));
     server_config.transport_config(Arc::new(transport_config));
@@ -195,20 +285,25 @@ impl LanMouseListener {
                                             return;
                                         }
                                         let send = match conn.open_uni().await {
-                                            Ok(s) => Arc::new(AsyncMutex::new(s)),
+                                            Ok(s) => s,
                                             Err(e) => {
                                                 log::warn!("{addr}: opening reply stream failed: {e}");
                                                 return;
                                             }
                                         };
+                                        let replies: Rc<RefCell<PendingReplies>> = Default::default();
+                                        let ready = Rc::new(Notify::new());
+                                        spawn_local(reply_loop(addr, replies.clone(), ready.clone(), send));
                                         conns.lock().await.push(ConnEntry {
                                             addr,
                                             conn: conn.clone(),
-                                            send,
+                                            replies: replies.clone(),
+                                            ready: ready.clone(),
                                             fingerprint: fingerprint.clone(),
                                         });
+                                        let closer = ReplyQueueGuard { replies, ready };
                                         let _ = listen_tx.send(ListenEvent::Accept { addr, fingerprint });
-                                        spawn_local(read_loop(conns.clone(), addr, conn, listen_tx.clone(), clipboard_in));
+                                        spawn_local(read_loop(conns.clone(), addr, conn, listen_tx.clone(), clipboard_in, closer));
                                     }
                                     Err(e) => {
                                         log::warn!("handshake from {remote} failed: {e}");
@@ -292,18 +387,13 @@ impl LanMouseListener {
         self.listen_tx.close();
     }
 
+    /// Queue a reply for `addr`. Never waits for the peer to read it: that wait
+    /// belongs to this connection's own writer task (#82).
     pub(crate) async fn reply(&self, addr: SocketAddr, event: ProtoEvent) {
-        log::trace!("reply {event} >=>=>=>=>=> {addr}");
-        let send = {
-            let conns = self.conns.lock().await;
-            conns
-                .iter()
-                .find(|e| e.addr == addr)
-                .map(|e| e.send.clone())
-        };
-        if let Some(send) = send {
-            let mut send = send.lock().await;
-            let _ = transport::write_frame(&mut send, event).await;
+        let conns = self.conns.lock().await;
+        if let Some(entry) = conns.iter().find(|e| e.addr == addr) {
+            entry.replies.borrow_mut().push(event);
+            entry.ready.notify_one();
         }
     }
 
@@ -457,6 +547,8 @@ async fn read_loop(
     conn: Connection,
     listen_tx: Sender<ListenEvent>,
     clipboard_in: Sender<String>,
+    // Dropped when this loop ends, which ends the connection's writer task.
+    _replies: ReplyQueueGuard,
 ) {
     // the peer's reliable inbound stream (their uni stream to us)
     let mut recv = match conn.accept_uni().await {
@@ -612,6 +704,83 @@ mod tests {
             }
             _ => false,
         }
+    }
+
+    /// A peer that stops reading its replies must not make this machine wait.
+    ///
+    /// Until the writer task, every reply was written by the one task that also
+    /// handles every peer's input, and a peer whose receive window filled
+    /// blocked it: on main this call pends after about 170 replies, and nothing
+    /// else on this machine takes input again (#82).
+    ///
+    /// The peer here dials the real listener and never reads the stream this
+    /// machine opens back to it. Its window is deliberately small, because the
+    /// point is the block, not the size of a buffer.
+    // LEDGER T26 | class B | 1 return value + elapsed: LanMouseListener::reply
+    #[test]
+    fn replies_to_a_peer_that_stopped_reading_never_wait() {
+        crate::test_harness::run_local(async {
+            let receiver = crate::test_harness::machine();
+            let peer = crate::test_harness::machine();
+            let trust_in =
+                crate::test_harness::trust(&receiver, &[&peer], crate::trust::Caps::INBOUND);
+            let (clip_tx, _clip_rx) = local_channel::mpsc::channel();
+            let (listener, port) =
+                LanMouseListener::bind_loopback(receiver.identity.clone(), trust_in, clip_tx)
+                    .await
+                    .expect("listener");
+            let config = crate::test_harness::raw_client_config(
+                &peer,
+                crate::test_harness::trust(&peer, &[&receiver], crate::trust::Caps::OUTBOUND),
+                1024,
+            );
+            let mut endpoint =
+                Endpoint::client("127.0.0.1:0".parse().expect("loopback")).expect("endpoint");
+            endpoint.set_default_client_config(config);
+            let conn = endpoint
+                .connect(
+                    SocketAddr::new("127.0.0.1".parse().expect("loopback"), port),
+                    "grabbr",
+                )
+                .expect("dial")
+                .await
+                .expect("handshake");
+            // The stream this machine replies on is opened by the listener; the
+            // peer never accepts or reads it.
+            let _input = conn.open_uni().await.expect("input stream");
+            let peer_addr = crate::test_harness::wait_for(
+                "the listener to register the connection",
+                Duration::from_secs(5),
+                || async { listener.conns.lock().await.first().map(|e| e.addr) },
+            )
+            .await;
+
+            for i in 0..5_000u32 {
+                if tokio::time::timeout(
+                    Duration::from_millis(500),
+                    listener.reply(peer_addr, ProtoEvent::Ack(0)),
+                )
+                .await
+                .is_err()
+                {
+                    panic!(
+                        "reply {i} waited for a peer that stopped reading; \
+                         input from every other peer waits with it"
+                    );
+                }
+            }
+            let waiting = listener
+                .conns
+                .lock()
+                .await
+                .first()
+                .map(|e| e.replies.borrow().queue.len())
+                .expect("one connection");
+            assert!(
+                waiting <= 1,
+                "5000 acks left {waiting} waiting: one of each kind is the bound"
+            );
+        });
     }
 
     /// The rig bug: a peer trusted ONCE could reconnect after revocation because a
