@@ -1,8 +1,8 @@
 @echo off
 rem grabbr-hop - DEV / TEST.
 rem
-rem Builds the working tree, checks the build matches the source, and only then
-rem restarts the daemon and tray on it. Your DAILY binary is untouched.
+rem Updates the checkout, builds it, checks the build matches the source, and
+rem only then restarts the daemon and tray on it. Your DAILY binary is untouched.
 rem
 rem Runs in a VISIBLE console on purpose. This used to be a .vbs that launched
 rem everything with window style 0 and did not build at all - so a "deployment"
@@ -10,6 +10,57 @@ rem silently relaunched the previous day's binary, and a failed build showed
 rem nothing whatsoever. A check whose failure is invisible reads as success.
 setlocal
 call "%~dp0grabbr-hop-paths.cmd"
+
+rem Bring the checkout up to date before building, so what gets built is what
+rem the remote branch holds, not whatever was last pulled on this machine. It
+rem only ever fast-forwards. It builds what is there, and says why, when the
+rem tree has uncommitted changes, the branch tracks no remote branch, the remote
+rem cannot be reached, or HOPS_NO_PULL is set. It stops, having built nothing,
+rem when the branch has diverged from its remote branch.
+if defined HOPS_NO_PULL (
+  echo   HOPS_NO_PULL is set: building the checkout as it is.
+  goto :updated
+)
+pushd "%HOPS_REPO%" || goto :diverged
+echo.
+echo   %HOPS_BRANCH% has diverged from its remote branch, so nothing was built.
+echo   Sort it out in %HOPS_REPO%, or run again with HOPS_NO_PULL=1 set.
+goto :hold
+:norepo
+set "HOPS_BRANCH="
+for /f "delims=" %%b in ('git symbolic-ref --short -q HEAD 2^>nul') do set "HOPS_BRANCH=%%b"
+if not defined HOPS_BRANCH (
+  echo   The checkout is not on a branch: building it as it is.
+  popd
+  goto :updated
+)
+set "HOPS_DIRTY="
+for /f "delims=" %%s in ('git status --porcelain --untracked-files^=no') do set "HOPS_DIRTY=1"
+if defined HOPS_DIRTY (
+  echo   %HOPS_BRANCH% has uncommitted changes: building them without pulling.
+  popd
+  goto :updated
+)
+git rev-parse -q --verify "@{upstream}" >nul 2>&1
+if errorlevel 1 (
+  echo   %HOPS_BRANCH% tracks no remote branch: building it as it is.
+  popd
+  goto :updated
+)
+git fetch --quiet
+if errorlevel 1 (
+  echo   Could not reach the remote: building %HOPS_BRANCH% as it is.
+  popd
+  goto :updated
+)
+git merge --ff-only --quiet "@{upstream}" >nul 2>&1
+if errorlevel 1 (
+  popd
+  goto :diverged
+)
+for /f "delims=" %%l in ('git log --oneline -1') do echo   Building %HOPS_BRANCH% at %%l
+popd
+:updated
 
 rem Windows locks a running executable, so the linker cannot replace hops.exe
 rem while the daemon or tray is using it. Renaming works where deleting does

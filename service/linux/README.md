@@ -14,8 +14,11 @@ Edit `HOPS_REPO` in `.hops-paths` if your checkout is not `~/projects/grabbr-hop
 Every launcher runs `hops build-check` first, so a binary that does not match
 its source is caught at launch rather than halfway through a test session:
 
-- `grabbr-hop-dev` — builds, then **refuses to switch** if the build does not
-  match the source. Nothing is switched before that check passes.
+- `grabbr-hop-dev` — fast-forwards the checkout to its remote branch, builds,
+  then **refuses to switch** if the build does not match the source. It builds
+  the checkout as it is when there are uncommitted changes, no remote branch,
+  or no network, and stops if the branch has diverged. `HOPS_NO_PULL=1` skips
+  the update.
 - `grabbr-hop-daily` — **reports and never blocks**. A promoted binary is
   deliberately behind the source; that is what promoting means. It only needs
   saying out loud.
