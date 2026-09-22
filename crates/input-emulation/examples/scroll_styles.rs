@@ -30,7 +30,9 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 fn main() {
-    use core_graphics::event::{CGEvent, CGEventTapLocation, CGScrollEventUnit, ScrollEventUnit};
+    use core_graphics::event::{
+        CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, CGScrollEventUnit, ScrollEventUnit,
+    };
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
     use std::thread::sleep;
     use std::time::Duration;
@@ -102,13 +104,16 @@ fn main() {
             "--down" => sign = -1,
             "--help" | "-h" => {
                 println!(
-                    "usage: scroll_styles [--mode line|pixel|phased|momentum] [--pixels N] \
+                    "usage: scroll_styles [--mode line|pixel|phased|momentum|drag|hold-pan] [--pixels N] \
                      [--lines N] [--steps N] [--gap-ms N] [--repeat N] [--after SECONDS] \
                      [--up|--down]\n\n\
                      line     one LINE-unit event, what hops sends for one wheel notch today\n\
                      pixel    one PIXEL-unit event, unphased, what hops sends for precise scrolling\n\
                      phased   continuous, began -> changed -> ended, what a trackpad swipe looks like\n\
-                     momentum phased, then the inertia tail a trackpad leaves behind"
+                     momentum phased, then the inertia tail a trackpad leaves behind\n\
+                     drag     press the left button, move while held, release: what a mouse drag is\n\
+                     hold-pan press the left button and send phased scrolling while it is held:\n\
+                              what hops would do to make click-and-hold feel like a finger"
                 );
                 return;
             }
@@ -192,6 +197,63 @@ fn main() {
                     }
                     post(0, None, Some(MOMENTUM_END), ScrollEventUnit::PIXEL);
                 }
+            }
+            "drag" | "hold-pan" => {
+                // Where the pointer already is: this drags from there, as a
+                // hand would, rather than teleporting first.
+                let at = CGEvent::new(source.clone())
+                    .expect("an event to read the pointer from")
+                    .location();
+                let press = CGEvent::new_mouse_event(
+                    source.clone(),
+                    CGEventType::LeftMouseDown,
+                    at,
+                    CGMouseButton::Left,
+                )
+                .expect("left down");
+                press.post(CGEventTapLocation::HID);
+                sleep(Duration::from_millis(30));
+
+                for step in 0..steps {
+                    if mode == "drag" {
+                        // A mouse drag: the pointer moves while the button is
+                        // held, which is exactly what hops sends today.
+                        let mut to = at;
+                        to.y += (per_step * (step + 1)) as f64;
+                        let moved = CGEvent::new_mouse_event(
+                            source.clone(),
+                            CGEventType::LeftMouseDragged,
+                            to,
+                            CGMouseButton::Left,
+                        )
+                        .expect("left drag");
+                        moved.post(CGEventTapLocation::HID);
+                    } else {
+                        // Held button, but the movement goes out as gesture
+                        // scrolling: the shape of the change being considered.
+                        let phase = if step == 0 {
+                            PHASE_BEGAN
+                        } else {
+                            PHASE_CHANGED
+                        };
+                        post(per_step, Some(phase), None, ScrollEventUnit::PIXEL);
+                    }
+                    sleep(Duration::from_millis(gap_ms));
+                }
+                if mode == "hold-pan" {
+                    post(0, Some(PHASE_ENDED), None, ScrollEventUnit::PIXEL);
+                }
+
+                let mut up_at = at;
+                up_at.y += (per_step * steps) as f64;
+                let release = CGEvent::new_mouse_event(
+                    source.clone(),
+                    CGEventType::LeftMouseUp,
+                    if mode == "drag" { up_at } else { at },
+                    CGMouseButton::Left,
+                )
+                .expect("left up");
+                release.post(CGEventTapLocation::HID);
             }
             other => panic!("unknown mode {other}; try --help"),
         }
