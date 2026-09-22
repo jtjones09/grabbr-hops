@@ -1,10 +1,11 @@
 #!/bin/bash
-# grabbr-hop — DEV / TEST. Rebuilds the working tree, checks the build matches
-# the source, then points the systemd user service at it. Your DAILY binary
+# grabbr-hop — DEV / TEST. Updates the checkout, rebuilds it, checks the build
+# matches the source, then points the systemd user service at it. Your DAILY binary
 # (~/grabbr-hop/hops) is untouched — run grabbr-hop-daily to switch back.
 . "$HOME/grabbr-hop/.hops-paths" || { echo "missing .hops-paths"; exit 1; }
 
 cd "$HOPS_REPO" || { echo "no repo at $HOPS_REPO"; hops_hold; exit 1; }
+hops_update_checkout || { hops_hold; exit 1; }
 echo "building dev..."
 cargo build --release --no-default-features --features "tui slint" \
   || { echo; echo "  build failed — nothing was switched."; hops_hold; exit 1; }

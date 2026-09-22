@@ -1,0 +1,49 @@
+#!/bin/bash
+# internal helper — point the launchd daemon + tray at $1 (a hops binary),
+# regenerate both plists (logs in ~/grabbr-hop/logs), and restart both agents.
+# $2 = optional extra plist snippet for the daemon's EnvironmentVariables (the
+# dev switcher uses it for A/B toggles). Not meant to be run directly.
+BIN="$1"
+EXTRA_ENV="${2:-}"
+LAUNCH="$HOME/grabbr-hop"
+UID_NUM="$(id -u)"
+mkdir -p "$LAUNCH/logs"
+
+cat > "$HOME/Library/LaunchAgents/com.grabbr.hops.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>Label</key><string>com.grabbr.hops</string>
+    <key>ProgramArguments</key><array><string>${BIN}</string><string>daemon</string></array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><false/>
+    <key>ProcessType</key><string>Interactive</string>
+    <key>EnvironmentVariables</key><dict><key>HOPS_LOG_LEVEL</key><string>${HOPS_LOG_LEVEL:-info}</string>${EXTRA_ENV}</dict>
+    <key>StandardOutPath</key><string>${LAUNCH}/logs/daemon.log</string>
+    <key>StandardErrorPath</key><string>${LAUNCH}/logs/daemon.log</string>
+</dict></plist>
+PLIST
+
+cat > "$HOME/Library/LaunchAgents/com.grabbr.hops.gui.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>Label</key><string>com.grabbr.hops.gui</string>
+    <key>ProgramArguments</key><array><string>${BIN}</string><string>gui</string><string>--hidden</string></array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><false/>
+    <key>ProcessType</key><string>Interactive</string>
+    <key>EnvironmentVariables</key><dict><key>HOPS_LOG_LEVEL</key><string>${HOPS_LOG_LEVEL:-info}</string></dict>
+    <key>StandardOutPath</key><string>${LAUNCH}/logs/gui.log</string>
+    <key>StandardErrorPath</key><string>${LAUNCH}/logs/gui.log</string>
+</dict></plist>
+PLIST
+
+# bootout + bootstrap, with a retry for the transient launchd "I/O error 5".
+for label in com.grabbr.hops com.grabbr.hops.gui; do
+  launchctl bootout "gui/$UID_NUM/$label" 2>/dev/null
+  sleep 1
+  launchctl bootstrap "gui/$UID_NUM" "$HOME/Library/LaunchAgents/$label.plist" 2>/dev/null \
+    || { sleep 2; launchctl bootstrap "gui/$UID_NUM" "$HOME/Library/LaunchAgents/$label.plist" 2>/dev/null; } \
+    || echo "warn: failed to (re)start $label"
+done

@@ -1,11 +1,18 @@
 #!/bin/bash
 # internal — sourced by the launchers in this folder. Not run on its own.
-# Mirrors ~/grabbr-hop/.hops-paths on macOS. Edit HOPS_REPO if the checkout moves.
-HOPS_REPO="${HOPS_REPO:-$HOME/projects/grabbr-hops}"
+#
+# One place for the paths. They used to be repeated in each script, and editing
+# one while missing another does not fail loudly: it builds one binary and
+# starts a different one, which is the failure the build-check gate exists to
+# catch.
+HOPS_REPO="${HOPS_REPO:-$HOME/Documents/GitHub/grabbr-hops}"
 HOPS_LAUNCH="$HOME/grabbr-hop"
-HOPS_RAW="$HOPS_REPO/target/release/hops"
-HOPS_DAILY="$HOPS_LAUNCH/hops"
+HOPS_RAW="$HOPS_REPO/target/release/hops"          # what cargo links
+HOPS_APP="$HOPS_LAUNCH/hops-dev.app"               # what launchd runs for dev
+HOPS_DAILY="$HOPS_LAUNCH/hops"                     # the promoted stable copy
 
+# Keep a failure on screen. These are double-clicked in Finder, and Terminal
+# can close the window the moment the script exits, taking the reason with it.
 hops_hold() {
   if [ -t 0 ]; then printf '\nPress Return to close... '; read -r _ || true; fi
 }
