@@ -75,7 +75,7 @@ pub fn load_or_create() -> io::Result<String> {
 
 /// [`load_or_create`] for the token kept at `path`.
 pub fn load_or_create_at(path: &std::path::Path) -> io::Result<String> {
-    if let Ok(existing) = std::fs::read_to_string(path) {
+    if let Ok(existing) = read_at(path) {
         let existing = existing.trim().to_string();
         // a truncated or hand-mangled token would lock every frontend out with a
         // confusing failure, so replace anything that isn't well-formed
@@ -98,7 +98,30 @@ pub fn load_or_create_at(path: &std::path::Path) -> io::Result<String> {
 
 /// Read the token. Called by frontends (GUI / TUI / CLI) before connecting.
 pub fn read() -> io::Result<String> {
-    Ok(std::fs::read_to_string(token_path()?)?.trim().to_string())
+    Ok(read_at(&token_path()?)?.trim().to_string())
+}
+
+/// The token file's contents, refusing a link at its path.
+///
+/// Reading through a link would hand a frontend, or the daemon's own
+/// malformed-token check, the contents of whatever was linked there (#196).
+#[cfg(unix)]
+fn read_at(path: &std::path::Path) -> io::Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| link_refused(path, e))?;
+    let mut text = String::new();
+    f.read_to_string(&mut text)?;
+    Ok(text)
+}
+
+#[cfg(not(unix))]
+fn read_at(path: &std::path::Path) -> io::Result<String> {
+    std::fs::read_to_string(path)
 }
 
 #[cfg(unix)]
@@ -107,13 +130,42 @@ fn write_private(path: &std::path::Path, token: &str) -> io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     // 0600 from the moment it exists — never create-then-chmod, which leaves a
     // window where the token is world-readable.
+    //
+    // O_NOFOLLOW so the write cannot land on whatever a link at this path
+    // points at. The daemon is meant to run as the owner of this directory,
+    // but one run with more privilege — `sudo -E hops daemon` — would
+    // otherwise truncate and overwrite the link's target (#196).
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(path)?;
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| link_refused(path, e))?;
     f.write_all(token.as_bytes())
+}
+
+/// A refusal caused by a link at `path`, said plainly; anything else unchanged.
+///
+/// `ELOOP` from an `O_NOFOLLOW` open reads as "Too many levels of symbolic
+/// links", which describes a loop the user does not have.
+#[cfg(unix)]
+fn link_refused(path: &std::path::Path, e: io::Error) -> io::Error {
+    if e.raw_os_error() != Some(libc::ELOOP) {
+        return e;
+    }
+    let target = std::fs::read_link(path)
+        .map(|t| format!(" to {}", t.display()))
+        .unwrap_or_default();
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "{}: hops will not write through a symbolic link{target}. \
+             Remove the link, then start hops again.",
+            path.display()
+        ),
+    )
 }
 
 #[cfg(not(unix))]
@@ -131,6 +183,65 @@ pub fn matches(expected: &str, offered: &str) -> bool {
         return false;
     }
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+#[cfg(all(test, unix))]
+mod links {
+    //! A link where the token belongs is refused, and what it points at is left
+    //! alone, so a daemon running with more privilege than this directory's
+    //! owner cannot be made to overwrite another file (#196).
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    fn scratch(name: &str) -> PathBuf {
+        let mut d = std::env::temp_dir();
+        d.push(format!("hops-token-link-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("mkdir");
+        d
+    }
+
+    // LEDGER T1 | class B | 1 error + 4 file on disk: token::load_or_create_at
+    #[test]
+    fn a_link_where_the_token_belongs_is_refused_and_its_target_untouched() {
+        let d = scratch("mint");
+        let target = d.join("someone-elses-file");
+        std::fs::write(&target, b"not the token\n").expect("seed");
+        let token = d.join("ipc-token");
+        std::os::unix::fs::symlink(&target, &token).expect("link");
+
+        let refused = super::load_or_create_at(&token).expect_err("a link must be refused");
+        let said = refused.to_string();
+        assert!(
+            said.contains("symbolic link") && said.contains("ipc-token"),
+            "the refusal must name the link: {said}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read"),
+            "not the token\n",
+            "the link's target must be untouched"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // LEDGER T2 | class B | 1 error: token::read_at, the frontends' read
+    #[test]
+    fn reading_a_token_through_a_link_is_refused() {
+        let d = scratch("read");
+        let target = d.join("a-secret");
+        let mut f = std::fs::File::create(&target).expect("seed");
+        f.write_all(&[b'a'; 64]).expect("write");
+        drop(f);
+        let token = d.join("ipc-token");
+        std::os::unix::fs::symlink(&target, &token).expect("link");
+
+        let refused = super::read_at(&token).expect_err("a link must be refused");
+        assert!(
+            refused.to_string().contains("symbolic link"),
+            "the refusal must say why: {refused}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
 
 #[cfg(test)]

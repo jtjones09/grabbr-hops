@@ -432,7 +432,9 @@ const DEFAULT_RELEASE_KEYS: [scancode::Linux; 4] =
 /// world-readable, and the file this is used for holds `[authorized_fingerprints]`
 /// — the list of keys allowed to take this machine's keyboard and mouse.
 ///
-/// Same pattern, and the same reason, as `hops_ipc::token::write_private`.
+/// Same pattern, and the same reason, as `hops_ipc::token::write_private`,
+/// including `O_NOFOLLOW`: a daemon running with more privilege than the owner
+/// of this directory must not truncate whatever a link here points at (#196).
 fn create_private(path: &Path) -> io::Result<File> {
     #[cfg(unix)]
     {
@@ -442,7 +444,9 @@ fn create_private(path: &Path) -> io::Result<File> {
             .create(true)
             .truncate(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(path)
+            .map_err(|e| crate::new_file::link_refused(path, e))
     }
     #[cfg(not(unix))]
     {
@@ -461,10 +465,20 @@ fn create_private(path: &Path) -> io::Result<File> {
 /// going forward leaves every current user exposed.
 ///
 /// Best-effort by design: a failure here must not stop the daemon from starting.
+/// A link is left alone: `metadata` and `set_permissions` both follow one, so
+/// tightening through it would change the mode of whatever it points at, which
+/// a daemon with more privilege than this directory's owner must not do (#196).
 #[cfg(unix)]
 fn harden_existing(config_dir: &Path, config_path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let tighten = |p: &Path, want: u32| {
+        if fs::symlink_metadata(p).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            log::warn!(
+                "{} is a symbolic link; leaving its permissions alone",
+                p.display()
+            );
+            return;
+        }
         let Ok(meta) = fs::metadata(p) else { return };
         let mode = meta.permissions().mode() & 0o777;
         if mode & !want != 0 {
@@ -951,6 +965,56 @@ mod permission_tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).expect("mkdir");
         d
+    }
+
+    // LEDGER T3 | class B | 1 error + 4 file on disk: config::write_atomically
+    #[test]
+    #[cfg(unix)]
+    fn a_save_refuses_a_link_where_its_temporary_belongs() {
+        let d = tmpdir("save-link");
+        let p = d.join("config.toml");
+        fs::write(&p, b"port = 4242\n").expect("seed");
+        let target = d.join("someone-elses-file");
+        fs::write(&target, b"keep me\n").expect("seed target");
+        std::os::unix::fs::symlink(&target, d.join("config.toml.tmp")).expect("link");
+
+        let refused = write_atomically(&p, b"port = 4243\n").expect_err("a link must be refused");
+        assert!(
+            refused.to_string().contains("symbolic link"),
+            "the refusal must say why: {refused}"
+        );
+        assert_eq!(
+            fs::read_to_string(&target).expect("read"),
+            "keep me\n",
+            "the link's target must be untouched"
+        );
+        assert_eq!(
+            fs::read_to_string(&p).expect("read"),
+            "port = 4242\n",
+            "the config itself must be untouched"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    // LEDGER T4 | class B | 4 file on disk: config::harden_existing
+    #[test]
+    #[cfg(unix)]
+    fn hardening_leaves_a_link_and_its_target_alone() {
+        let d = tmpdir("harden-link");
+        let target = d.join("someone-elses-file");
+        fs::write(&target, b"keep me\n").expect("seed");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).expect("chmod");
+        let p = d.join("config.toml");
+        std::os::unix::fs::symlink(&target, &p).expect("link");
+
+        harden_existing(&d, &p);
+
+        assert_eq!(
+            mode_of(&target),
+            0o644,
+            "a link's target must keep its own permissions"
+        );
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]
