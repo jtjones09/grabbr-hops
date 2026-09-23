@@ -35,6 +35,8 @@ pub(crate) enum LanMouseConnectionError {
     Frame(#[from] transport::FrameError),
     #[error("not connected")]
     NotConnected,
+    #[error("this machine may no longer drive that receiver")]
+    NotPermitted,
     #[error("emulation is disabled on the target device")]
     TargetEmulationDisabled,
     #[error("connection timed out")]
@@ -53,6 +55,10 @@ const MAX_IDLE: Duration = Duration::from_secs(20);
 struct PeerLink {
     conn: Connection,
     send: Arc<Mutex<SendStream>>,
+    /// Whose certificate the receiver presented. Permission is checked against
+    /// this on every send, not only at the handshake: trust can be withdrawn
+    /// while the link stays open (#156).
+    fingerprint: String,
 }
 
 fn client_config(
@@ -99,6 +105,7 @@ async fn connect(
     cfg: ClientConfig,
     addr: SocketAddr,
     expected_fp: Option<String>,
+    trust: Trust,
 ) -> Result<(PeerLink, SocketAddr), (SocketAddr, LanMouseConnectionError)> {
     log::info!("connecting to {addr} ...");
     // server_name is the SNI label; trust is by fingerprint, so it is not
@@ -128,14 +135,44 @@ async fn connect(
             return Err((addr, LanMouseConnectionError::FingerprintMismatch));
         }
     }
+    // The verifier checked permission during the handshake; it can have been
+    // withdrawn since. Checked again before the stream any frame goes on.
+    let Some(fingerprint) = peer_fingerprint(&conn) else {
+        conn.close(0u32.into(), b"no certificate");
+        return Err((addr, LanMouseConnectionError::NotPermitted));
+    };
+    if !trust.read().expect("lock").we_may_drive(&fingerprint) {
+        log::warn!("{addr}: permission to drive {fingerprint} was withdrawn during the handshake");
+        conn.close(0u32.into(), b"not permitted");
+        return Err((addr, LanMouseConnectionError::NotPermitted));
+    }
     let send = conn.open_uni().await.map_err(|e| (addr, e.into()))?;
     Ok((
         PeerLink {
             conn,
             send: Arc::new(Mutex::new(send)),
+            fingerprint,
         },
         addr,
     ))
+}
+
+/// Whether `event` only lets go of something the receiver is holding for us.
+///
+/// These still go to a receiver this machine may no longer drive. Refusing
+/// them cannot take control away from anyone, and would leave a key or button
+/// held over there until its watchdog notices.
+fn only_lets_go(event: &ProtoEvent) -> bool {
+    use input_event::{Event, KeyboardEvent, PointerEvent};
+    match event {
+        ProtoEvent::Leave(_) => true,
+        ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key { state, .. })) => *state == 0,
+        ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers {
+            depressed, latched, ..
+        })) => *depressed == 0 && *latched == 0,
+        ProtoEvent::Input(Event::Pointer(PointerEvent::Button { state, .. })) => *state == 0,
+        _ => false,
+    }
 }
 
 /// What to do with the fingerprints a failed parallel dial observed.
@@ -192,6 +229,7 @@ async fn connect_any(
     endpoint: &Endpoint,
     dials: &[Dial],
     expected_fp: Option<String>,
+    trust: &Trust,
 ) -> Result<(PeerLink, SocketAddr), LanMouseConnectionError> {
     let addrs: Vec<SocketAddr> = dials.iter().map(|d| d.addr).collect();
     let mut joinset = JoinSet::new();
@@ -200,7 +238,7 @@ async fn connect_any(
         let cfg = d.cfg.clone();
         let addr = d.addr;
         let expected = expected_fp.clone();
-        joinset.spawn_local(connect(endpoint, cfg, addr, expected));
+        joinset.spawn_local(connect(endpoint, cfg, addr, expected, trust.clone()));
     }
     // if every candidate failed the identity pin (not a transport error), surface
     // that distinctly so the caller logs the right recovery guidance.
@@ -342,6 +380,15 @@ impl LanMouseConnection {
                 conns.get(&addr).cloned()
             };
             if let Some(link) = link {
+                if !self.may_drive(&link) {
+                    log::warn!(
+                        "client {handle}: this machine may no longer drive {}; closing the link",
+                        link.fingerprint
+                    );
+                    disconnect(&self.client_manager, handle, addr, &self.conns).await;
+                    let _ = self.state_tx.send(handle);
+                    return Err(LanMouseConnectionError::NotPermitted);
+                }
                 if !self.client_manager.alive(handle) {
                     return Err(LanMouseConnectionError::TargetEmulationDisabled);
                 }
@@ -403,6 +450,9 @@ impl LanMouseConnection {
         let Some(link) = link else {
             return Err(LanMouseConnectionError::NotConnected);
         };
+        if !only_lets_go(&event) && !self.may_drive(&link) {
+            return Err(LanMouseConnectionError::NotPermitted);
+        }
         // Bounded exactly as in `send`, and for the same reason (#64).
         let result = tokio::time::timeout(transport::INPUT_SEND_TIMEOUT, async {
             let mut send = link.send.lock().await;
@@ -411,6 +461,14 @@ impl LanMouseConnection {
         .await;
         self.settle(result, event, handle, addr).await;
         Ok(())
+    }
+
+    /// Whether this machine may still drive the receiver at the end of `link`.
+    fn may_drive(&self, link: &PeerLink) -> bool {
+        self.trust
+            .read()
+            .expect("lock")
+            .we_may_drive(&link.fingerprint)
     }
 
     /// Log a bounded write's outcome, and disconnect the peer if it failed.
@@ -575,7 +633,7 @@ async fn connect_to_handle(
                 }
             })
             .collect();
-        let (link, addr) = match connect_any(&endpoint, &dials, expected_fp).await {
+        let (link, addr) = match connect_any(&endpoint, &dials, expected_fp, &trust).await {
             Ok(c) => c,
             Err(e) => {
                 connecting.lock().await.remove(&handle);
@@ -1012,8 +1070,20 @@ mod tests {
 
             // genuinely concurrent
             let _ = tokio::join!(
-                connect(client_ep.clone(), cfgs[0].clone(), addrs[0], None),
-                connect(client_ep.clone(), cfgs[1].clone(), addrs[1], None),
+                connect(
+                    client_ep.clone(),
+                    cfgs[0].clone(),
+                    addrs[0],
+                    None,
+                    empty.clone()
+                ),
+                connect(
+                    client_ep.clone(),
+                    cfgs[1].clone(),
+                    addrs[1],
+                    None,
+                    empty.clone()
+                ),
             );
 
             for (i, slot) in slots.iter().enumerate() {
@@ -1195,6 +1265,213 @@ mod tests {
         );
     }
 
+    /// A sender dialled into a receiver that records every frame it is sent,
+    /// as text: `ProtoEvent` has no equality.
+    struct Recorded {
+        conn: LanMouseConnection,
+        handle: ClientHandle,
+        trust: Trust,
+        receiver: String,
+        addr: SocketAddr,
+        frames: Rc<RefCell<Vec<String>>>,
+    }
+
+    fn key(key: u32, state: u8) -> ProtoEvent {
+        ProtoEvent::Input(input_event::Event::Keyboard(
+            input_event::KeyboardEvent::Key {
+                time: 0,
+                key,
+                state,
+            },
+        ))
+    }
+
+    async fn sender_to_a_recording_receiver() -> Recorded {
+        let server = identity();
+        let receiver = transport::fingerprint_of(&server.cert);
+        let ep = Endpoint::server(open_server(&server), "127.0.0.1:0".parse().expect("addr"))
+            .expect("server endpoint");
+        let addr = ep.local_addr().expect("local addr");
+        let frames: Rc<RefCell<Vec<String>>> = Default::default();
+        let heard = frames.clone();
+        spawn_local(async move {
+            while let Some(incoming) = ep.accept().await {
+                let heard = heard.clone();
+                spawn_local(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    let Ok(mut recv) = conn.accept_uni().await else {
+                        return;
+                    };
+                    while let Ok(Some(frame)) = transport::read_frame(&mut recv).await {
+                        heard.borrow_mut().push(frame.to_string());
+                    }
+                });
+            }
+        });
+
+        let client = Arc::new(identity());
+        let trust: Trust = Arc::new(RwLock::new({
+            let mut st = crate::trust::TrustStore::new(&transport::fingerprint_of(&client.cert), 0)
+                .expect("our fingerprint");
+            st.issue(&receiver, "receiver", crate::trust::Caps::OUTBOUND)
+                .expect("issue");
+            st
+        }));
+        let (clip_tx, _) = channel();
+        let (untrusted_tx, _) = channel();
+        let (persist_tx, _) = channel();
+        let (state_tx, _) = channel();
+        let conn = LanMouseConnection::new(
+            client.clone(),
+            ClientManager::default(),
+            trust.clone(),
+            clip_tx,
+            untrusted_tx,
+            persist_tx,
+            state_tx,
+        )
+        .expect("connection");
+        let cfg = client_config(&client, trust.clone(), Arc::new(StdMutex::new(None)));
+        let (link, addr) = connect(conn.endpoint.clone(), cfg, addr, None, trust.clone())
+            .await
+            .expect("a permitted receiver is dialled");
+        conn.conns.lock().await.insert(addr, link);
+        let handle = conn.client_manager.add_client();
+        conn.client_manager.set_active_addr(handle, Some(addr));
+        conn.client_manager.set_alive(handle, true);
+        Recorded {
+            conn,
+            handle,
+            trust,
+            receiver,
+            addr,
+            frames,
+        }
+    }
+
+    impl Recorded {
+        async fn heard(&self, frame: ProtoEvent) -> bool {
+            let frame = frame.to_string();
+            for _ in 0..100 {
+                if self.frames.borrow().contains(&frame) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            false
+        }
+    }
+
+    fn local(test: impl std::future::Future<Output = ()>) {
+        transport::install_crypto_provider();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        tokio::task::LocalSet::new().block_on(&rt, test);
+    }
+
+    /// Once this machine may no longer drive a receiver, no input reaches it
+    /// and the link is closed, even though the link was open before (#156).
+    #[test]
+    fn a_receiver_we_may_no_longer_drive_is_sent_no_input() {
+        local(async {
+            let r = sender_to_a_recording_receiver().await;
+            r.conn.send(key(30, 1), r.handle).await.expect("sent");
+            assert!(r.heard(key(30, 1)).await, "a permitted receiver gets input");
+
+            r.trust.write().expect("lock").revoke(&r.receiver);
+            let refused = r.conn.send(key(48, 1), r.handle).await;
+
+            assert!(
+                matches!(refused, Err(LanMouseConnectionError::NotPermitted)),
+                "sending to a receiver we may no longer drive returned {refused:?}"
+            );
+            assert!(
+                !r.heard(key(48, 1)).await,
+                "a key reached a receiver this machine may no longer drive"
+            );
+            assert!(
+                !r.conn.conns.lock().await.contains_key(&r.addr),
+                "the link to a receiver we may no longer drive was left open"
+            );
+        });
+    }
+
+    /// Letting go still reaches a receiver this machine may no longer drive,
+    /// so nothing stays held over there; anything else is refused.
+    #[test]
+    fn letting_go_still_reaches_a_receiver_we_may_no_longer_drive() {
+        local(async {
+            let r = sender_to_a_recording_receiver().await;
+            r.trust.write().expect("lock").revoke(&r.receiver);
+
+            for frame in [key(30, 0), ProtoEvent::Leave(0)] {
+                r.conn
+                    .send_to(frame, r.handle, r.addr)
+                    .await
+                    .expect("a release is sent");
+                assert!(
+                    r.heard(frame).await,
+                    "{frame} did not reach the receiver, so what it releases stays held"
+                );
+            }
+            let refused = r.conn.send_to(key(48, 1), r.handle, r.addr).await;
+            assert!(
+                matches!(refused, Err(LanMouseConnectionError::NotPermitted)),
+                "a key-down to a receiver we may no longer drive returned {refused:?}"
+            );
+            assert!(
+                !r.heard(key(48, 1)).await,
+                "a key-down reached a receiver this machine may no longer drive"
+            );
+        });
+    }
+
+    /// Permission withdrawn between the handshake and the first frame: no
+    /// stream is opened, so nothing at all is sent.
+    #[test]
+    fn permission_withdrawn_during_the_handshake_opens_no_stream() {
+        local(async {
+            let server = identity();
+            let receiver = transport::fingerprint_of(&server.cert);
+            let ep = Endpoint::server(open_server(&server), "127.0.0.1:0".parse().expect("addr"))
+                .expect("server endpoint");
+            let addr = ep.local_addr().expect("local addr");
+            spawn_local(async move {
+                while let Some(incoming) = ep.accept().await {
+                    spawn_local(async move {
+                        let _ = incoming.await;
+                    });
+                }
+            });
+
+            let client = identity();
+            let store = || {
+                crate::trust::TrustStore::new(&transport::fingerprint_of(&client.cert), 0)
+                    .expect("our fingerprint")
+            };
+            // What the verifier saw during the handshake...
+            let then: Trust = Arc::new(RwLock::new({
+                let mut st = store();
+                st.issue(&receiver, "receiver", crate::trust::Caps::OUTBOUND)
+                    .expect("issue");
+                st
+            }));
+            // ...and what is true by the time the stream would open.
+            let now: Trust = Arc::new(RwLock::new(store()));
+
+            let ep = Endpoint::client("127.0.0.1:0".parse().expect("addr")).expect("endpoint");
+            let cfg = client_config(&client, then, Arc::new(StdMutex::new(None)));
+            let dialled = connect(ep, cfg, addr, None, now).await;
+            assert!(
+                matches!(dialled, Err((_, LanMouseConnectionError::NotPermitted))),
+                "a dial whose permission was withdrawn after the handshake was kept: {:?}",
+                dialled.map(|(_, a)| a)
+            );
+        });
+    }
+
     fn seen(pairs: &[(&str, &str)]) -> Vec<(SocketAddr, String)> {
         pairs
             .iter()
@@ -1325,7 +1602,7 @@ mod tests {
                 })
                 .collect();
 
-            let _ = connect_any(&client_ep, &dials, None).await;
+            let _ = connect_any(&client_ep, &dials, None, &empty).await;
 
             for (i, d) in dials.iter().enumerate() {
                 assert_eq!(
