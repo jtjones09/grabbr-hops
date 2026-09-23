@@ -39,6 +39,9 @@ struct Log {
     calls: Vec<Recorded>,
     fail_when: Option<FailWhen>,
     button_scope: ButtonScope,
+    /// How long each injected event takes, so a test can make injection the
+    /// slow step and see what happens to everything waiting behind it.
+    consume_takes: Option<std::time::Duration>,
 }
 
 type Shared = Arc<Mutex<Log>>;
@@ -72,6 +75,7 @@ impl Recording {
             calls: Vec::new(),
             fail_when: None,
             button_scope,
+            consume_takes: None,
         }));
         REGISTRY
             .lock()
@@ -89,6 +93,13 @@ impl Recording {
     /// Every call so far, oldest first.
     pub fn calls(&self) -> Vec<Recorded> {
         self.log.lock().expect("recording log").calls.clone()
+    }
+
+    /// Make every injected event take `how_long`, so injection is the slow
+    /// step: what a real backend costs (a blocking syscall per event) without
+    /// waiting on a real device.
+    pub fn consume_takes(&self, how_long: std::time::Duration) {
+        self.log.lock().expect("recording log").consume_takes = Some(how_long);
     }
 
     /// Make `consume` return an error for every event matching `when`. The
@@ -142,11 +153,17 @@ impl Emulation for RecordingEmulation {
         event: Event,
         handle: EmulationHandle,
     ) -> Result<(), EmulationError> {
-        let fail = {
+        let (fail, takes) = {
             let mut log = self.log.lock().expect("recording log");
             log.calls.push(Recorded::Consume(event, handle));
-            log.fail_when.as_ref().is_some_and(|fail| fail(&event))
+            (
+                log.fail_when.as_ref().is_some_and(|fail| fail(&event)),
+                log.consume_takes,
+            )
         };
+        if let Some(takes) = takes {
+            tokio::time::sleep(takes).await;
+        }
         if fail {
             return Err(io::Error::other("recording: failure requested by the test").into());
         }
