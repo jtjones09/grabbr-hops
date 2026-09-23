@@ -45,11 +45,17 @@ fn main() {
     const MOMENTUM_PHASE: u32 = 123;
     const IS_CONTINUOUS: u32 = 88;
 
-    // NSEventPhase, as macOS reports it to applications.
+    const DELTA_AXIS_1: u32 = 11;
+
+    // CGScrollPhase, which is what field 99 takes. These are NOT the NSEventPhase
+    // numbers an application sees: there, Changed is 4 and Ended is 8. Writing
+    // NSEventPhase into field 99 sends Ended where Changed was meant and
+    // Cancelled where Ended was meant, which looks like a working gesture in the
+    // source and measures as nonsense.
     const PHASE_BEGAN: i64 = 1;
-    const PHASE_CHANGED: i64 = 4;
-    const PHASE_ENDED: i64 = 8;
-    // NSEventPhase for the momentum tail a trackpad leaves behind.
+    const PHASE_CHANGED: i64 = 2;
+    const PHASE_ENDED: i64 = 4;
+    // CGMomentumScrollPhase, field 123. Ordinal, not a bitmask like the above.
     const MOMENTUM_BEGIN: i64 = 1;
     const MOMENTUM_CONTINUE: i64 = 2;
     const MOMENTUM_END: i64 = 3;
@@ -104,9 +110,11 @@ fn main() {
             "--down" => sign = -1,
             "--help" | "-h" => {
                 println!(
-                    "usage: scroll_styles [--mode line|pixel|phased|momentum|drag|hold-pan] [--pixels N] \
+                    "usage: scroll_styles [--mode fields|line|pixel|phased|momentum|drag|hold-pan] \
+                     [--pixels N] \
                      [--lines N] [--steps N] [--gap-ms N] [--repeat N] [--after SECONDS] \
                      [--up|--down]\n\n\
+                     fields   print which fields macOS fills in itself; posts nothing\n\
                      line     one LINE-unit event, what hops sends for one wheel notch today\n\
                      pixel    one PIXEL-unit event, unphased, what hops sends for precise scrolling\n\
                      phased   continuous, began -> changed -> ended, what a trackpad swipe looks like\n\
@@ -123,20 +131,50 @@ fn main() {
     }
     assert!(steps > 0, "--steps must be at least 1");
 
-    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+    // The same state the daemon uses, so the probe measures what hops would
+    // send rather than something a receiving app may treat differently.
+    let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
         .expect("an event source; the terminal may need Accessibility");
+
+    if mode == "fields" {
+        // Which fields macOS fills in on its own, for each unit. Nothing is
+        // posted, so this is safe to run with anything focused.
+        for (name, unit) in [
+            ("PIXEL", ScrollEventUnit::PIXEL),
+            ("LINE", ScrollEventUnit::LINE),
+        ] {
+            let event = CGEvent::new_scroll_event(source.clone(), unit, 1, 10 * sign, 0, 0)
+                .expect("scroll event");
+            println!("{name} unit, delta {}:", 10 * sign);
+            for (label, field) in [
+                ("DeltaAxis1 (11)", DELTA_AXIS_1),
+                ("FixedPtDeltaAxis1 (93)", FIXED_PT_DELTA_AXIS_1),
+                ("PointDeltaAxis1 (96)", POINT_DELTA_AXIS_1),
+                ("IsContinuous (88)", IS_CONTINUOUS),
+                ("ScrollPhase (99)", SCROLL_PHASE),
+                ("MomentumPhase (123)", MOMENTUM_PHASE),
+            ] {
+                println!(
+                    "  {label:<24} {} ({})",
+                    event.get_integer_value_field(field),
+                    event.get_double_value_field(field)
+                );
+            }
+        }
+        return;
+    }
 
     // One event, with whatever fields the style calls for.
     let post = |delta: i32, phase: Option<i64>, momentum: Option<i64>, unit: CGScrollEventUnit| {
         let event =
             CGEvent::new_scroll_event(source.clone(), unit, 1, delta, 0, 0).expect("scroll event");
-        if phase.is_some() || momentum.is_some() {
-            event.set_integer_value_field(IS_CONTINUOUS, 1);
-            // A trackpad reports the same movement three ways, and apps read
-            // different ones: whole units, points, and a fixed-point value.
-            event.set_integer_value_field(POINT_DELTA_AXIS_1, delta as i64);
-            event.set_double_value_field(FIXED_PT_DELTA_AXIS_1, delta as f64);
-        }
+        // A trackpad reports the same movement three ways and apps read
+        // different ones: lines, points, and a fixed-point line value. Creating
+        // the event with a PIXEL delta fills in all three, and sets the
+        // continuous flag too, so the only thing a gesture still needs is the
+        // phase. Run `--mode fields` to see that for yourself; do not write
+        // those deltas by hand, because macOS recomputes them from each other
+        // and the order it does that in is not documented.
         if let Some(phase) = phase {
             event.set_integer_value_field(SCROLL_PHASE, phase);
         }
