@@ -1659,6 +1659,48 @@ mod held_input_is_released {
         });
     }
 
+    /// Leave's release waits its turn behind input the same peer sent first.
+    ///
+    /// A key-down still queued when Leave arrives must be injected before the
+    /// release, or it lands on a fresh handle after everything was let go and
+    /// stays held (#82).
+    #[test]
+    fn a_key_down_queued_before_leave_is_released_last() {
+        run_local(async {
+            let s = session().await;
+            s.recording.consume_takes(Duration::from_millis(2));
+
+            // Scrolls do not merge, so the key-down really waits behind them.
+            for _ in 0..100 {
+                s.dialer().send(ProtoEvent::Input(scroll(1.))).await;
+            }
+            s.dialer().send(ProtoEvent::Input(key(KEY_A, 1))).await;
+            s.dialer().send(ProtoEvent::Leave(0)).await;
+
+            let first_destroy = || {
+                s.recording
+                    .calls()
+                    .iter()
+                    .position(|c| matches!(c, Recorded::Destroy(_)))
+            };
+            wait_until(
+                "the key-down to be injected and the peer released",
+                Duration::from_secs(20),
+                || s.position(key(KEY_A, 1)).is_some() && first_destroy().is_some(),
+            )
+            .await;
+            let key_at = s
+                .position(key(KEY_A, 1))
+                .expect("the key-down was injected");
+            let released_at = first_destroy().expect("the peer was released");
+            assert!(
+                key_at < released_at,
+                "the key-down queued before Leave was injected at {key_at}, after the \
+                 release at {released_at}: nothing would ever let it go"
+            );
+        });
+    }
+
     // LEDGER T28 | class B | 6 struct state: Recording::calls() after a high-rate mouse
     /// A fast mouse costs one queue slot, not hundreds, and the pointer still
     /// ends up where it was sent.
