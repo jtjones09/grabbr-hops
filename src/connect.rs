@@ -408,6 +408,20 @@ impl LanMouseConnection {
         }
 
         // not connected yet — connect in the background (lazy connect)
+        self.start_dial(handle).await;
+        Err(LanMouseConnectionError::NotConnected)
+    }
+
+    /// Dial `handle` now if it has no connection, rather than when the pointer
+    /// next crosses to it. For a device being added (#195).
+    pub(crate) async fn dial(&self, handle: ClientHandle) {
+        if self.client_manager.active_addr(handle).is_none() {
+            self.start_dial(handle).await;
+        }
+    }
+
+    /// Start a dial to `handle` in the background, unless one is under way.
+    async fn start_dial(&self, handle: ClientHandle) {
         let mut connecting = self.connecting.lock().await;
         if !connecting.contains(&handle) {
             connecting.insert(handle);
@@ -427,7 +441,6 @@ impl LanMouseConnection {
                 self.state_tx.clone(),
             ));
         }
-        Err(LanMouseConnectionError::NotConnected)
     }
 
     /// Send `event` over the connection already open to `addr`, sent on

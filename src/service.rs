@@ -10,7 +10,7 @@ use crate::{
     emulation::{Emulation, EmulationEvent},
     hop_log::Lifecycle,
     listen::{ClipboardSenderListen, LanMouseListener, ListenerCreationError},
-    prompt_gate::Admit,
+    prompt_gate::{Admit, PromptGate},
 };
 use futures::StreamExt;
 use hops_ipc::{
@@ -124,6 +124,9 @@ impl StopRequests {
     }
 }
 
+/// How often a device being added is dialled again until it answers (#195).
+const ADD_DIAL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// How often the daemon looks for leases that have lapsed while nothing was
 /// being sent.
 ///
@@ -177,6 +180,10 @@ pub struct Service {
     pending_origin: HashMap<String, AttemptOrigin>,
     /// Whether a pairing prompt may appear right now (#195).
     prompt_gate: crate::prompt_gate::PromptGate,
+    /// Devices switched on while the pairing window was open and not yet
+    /// paired, dialled every second until they connect, with when that began.
+    /// Without it a new device is only dialled when the pointer crosses to it.
+    adding: HashMap<ClientHandle, Instant>,
     /// The clock floor last written to disk, so a quiet daemon does not rewrite
     /// a sealed file every sweep for nothing.
     last_persisted_floor: u64,
@@ -510,6 +517,7 @@ impl Service {
             trust_file,
             pending_origin: HashMap::new(),
             prompt_gate: crate::prompt_gate::PromptGate::new(),
+            adding: HashMap::new(),
             last_persisted_floor: 0,
             public_key_fingerprint,
             client_manager,
@@ -558,6 +566,8 @@ impl Service {
         // floor while the daemon runs.
         let mut lease_sweep = tokio::time::interval(LEASE_SWEEP_INTERVAL);
         lease_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut add_dials = tokio::time::interval(ADD_DIAL_INTERVAL);
+        add_dials.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         // Before the loop and once: a stream made per iteration would miss a
         // signal that lands between two of them, and once tokio installs its
@@ -568,6 +578,7 @@ impl Service {
         loop {
             tokio::select! {
                 _ = lease_sweep.tick() => self.sweep_lapsed_leases(),
+                _ = add_dials.tick(), if !self.adding.is_empty() => self.retry_adding(),
                 request = self.frontend_listener.next() => self.handle_frontend_request(request),
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
                 event = self.emulation.event() => self.handle_emulation_event(event),
@@ -667,6 +678,11 @@ impl Service {
         match request {
             FrontendRequest::Activate(handle, active) => {
                 self.set_client_active(handle, active);
+                if active {
+                    self.begin_adding(handle);
+                } else {
+                    self.adding.remove(&handle);
+                }
                 self.save_config();
             }
             FrontendRequest::AuthorizeKey(desc, fp) => {
@@ -1586,6 +1602,62 @@ impl Service {
         }
     }
 
+    /// Start dialling a device just switched on from a frontend, if the pairing
+    /// window is open and this machine cannot already drive it, so pairing
+    /// does not wait for the pointer to cross.
+    ///
+    /// Only here, not in `activate_client`: starting up, a config reload and a
+    /// crossing also activate clients, and none of them is someone adding a
+    /// device.
+    fn begin_adding(&mut self, handle: ClientHandle) {
+        if self.prompt_gate.remaining(Instant::now()).is_none() {
+            return;
+        }
+        let paired = self
+            .client_manager
+            .peer_fingerprint(handle)
+            .is_some_and(|fp| self.trust.read().expect("lock").we_may_drive(&fp));
+        if paired {
+            return;
+        }
+        log::info!("dialling client {handle} every second while it is paired");
+        self.adding.insert(handle, Instant::now());
+        self.capture.dial(handle);
+    }
+
+    /// Dial again every device still being added. Stops for one that connected,
+    /// was switched off or removed, or ran out of time; the last says why.
+    fn retry_adding(&mut self) {
+        let now = Instant::now();
+        let window_open = self.prompt_gate.remaining(now).is_some();
+        let mut gave_up = Vec::new();
+        self.adding.retain(|&handle, &mut started| {
+            let Some((_, state)) = self.client_manager.get_state(handle) else {
+                return false;
+            };
+            if !state.active || self.client_manager.active_addr(handle).is_some() {
+                return false;
+            }
+            if !window_open || now.saturating_duration_since(started) >= PromptGate::WINDOW {
+                gave_up.push(handle);
+                return false;
+            }
+            self.capture.dial(handle);
+            true
+        });
+        for handle in gave_up {
+            let name = self
+                .client_manager
+                .get_hostname(handle)
+                .unwrap_or_else(|| format!("device {handle}"));
+            log::info!("stopped dialling {name}: pairing did not finish in time");
+            self.notify_frontend(FrontendEvent::Error(format!(
+                "Pairing with {name} did not finish in two minutes. Open add device on \
+                 both machines, then switch {name} off and on to try again."
+            )));
+        }
+    }
+
     fn deactivate_client(&mut self, handle: ClientHandle) {
         log::debug!("deactivating client {handle}");
         if self.client_manager.deactivate_client(handle) {
@@ -1641,6 +1713,7 @@ impl Service {
     }
 
     fn remove_client(&mut self, handle: ClientHandle) {
+        self.adding.remove(&handle);
         if self
             .client_manager
             .remove_client(handle)

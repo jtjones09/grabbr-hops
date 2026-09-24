@@ -63,6 +63,8 @@ enum CaptureRequest {
     Reenable,
     /// set release bind
     SetReleaseBind(Vec<scancode::Linux>),
+    /// dial a client now, rather than when the pointer next crosses to it
+    Dial(CaptureHandle),
 }
 
 impl Capture {
@@ -137,6 +139,14 @@ impl Capture {
     pub(crate) fn destroy(&self, handle: CaptureHandle) {
         self.request_tx
             .send(CaptureRequest::Destroy(handle))
+            .expect("channel closed");
+    }
+
+    /// Dial `handle` now if it has no connection, without waiting for the
+    /// pointer to cross to it. For a device being added (#195).
+    pub(crate) fn dial(&self, handle: CaptureHandle) {
+        self.request_tx
+            .send(CaptureRequest::Dial(handle))
             .expect("channel closed");
     }
 
@@ -298,6 +308,8 @@ impl CaptureTask {
                         CaptureRequest::SetReleaseBind(bind) => {
                             self.release_bind.borrow_mut().clone_from(&bind);
                         }
+                        // Pairing does not need capture running.
+                        CaptureRequest::Dial(h) => self.conn.dial(h).await,
                     },
                     _ = self.cancellation_token.cancelled() => return,
                 }
@@ -397,6 +409,7 @@ impl CaptureTask {
                 },
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     CaptureRequest::Reenable => { /* already active */ },
+                    CaptureRequest::Dial(h) => self.conn.dial(h).await,
                     CaptureRequest::Release => self.release_capture(capture).await?,
                     CaptureRequest::Create(h, p, t) => {
                         self.add_capture(h, p, t);
