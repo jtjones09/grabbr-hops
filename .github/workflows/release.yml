@@ -52,8 +52,20 @@ jobs:
           fi
           echo "OK: the artifact will report $crate."
 
+  # No release is built while a published advisory stands against a crate in
+  # Cargo.lock.
+  advisories:
+    name: dependency advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2, cargo-deny 0.20.2
+        with:
+          command: check advisories
+          arguments: --all-features --workspace
+
   build:
-    needs: version-matches-tag
+    needs: [version-matches-tag, advisories]
     name: build-${{ matrix.name }}
     # Surfaced so the macOS signing steps can gate on "are the secrets set?"
     # (secrets aren't allowed directly in `if:`, but job env is).
@@ -85,8 +97,8 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
-          cargo build --release --no-default-features --features "${{ matrix.features }}" --target aarch64-apple-darwin
-          cargo build --release --no-default-features --features "${{ matrix.features }}" --target x86_64-apple-darwin
+          cargo build --locked --release --no-default-features --features "${{ matrix.features }}" --target aarch64-apple-darwin
+          cargo build --locked --release --no-default-features --features "${{ matrix.features }}" --target x86_64-apple-darwin
           mkdir -p dist
           lipo -create -output dist/hops \
             target/aarch64-apple-darwin/release/hops \
@@ -99,7 +111,7 @@ jobs:
       # secrets — the unsigned .tar.gz above is still produced either way.
       - name: Import Developer ID certificate (macOS)
         if: runner.os == 'macOS' && env.MACOS_CERT_P12 != ''
-        uses: apple-actions/import-codesign-certs@v7
+        uses: apple-actions/import-codesign-certs@5142e029c445c10ffc7149d172e540235a065466 # v7
         with:
           p12-file-base64: ${{ secrets.MACOS_CERT_P12 }}
           p12-password: ${{ secrets.MACOS_CERT_PASSWORD }}
@@ -122,7 +134,7 @@ jobs:
       - name: Build (Windows)
         if: runner.os == 'Windows'
         run: |
-          cargo build --release --no-default-features --features "${{ matrix.features }}"
+          cargo build --locked --release --no-default-features --features "${{ matrix.features }}"
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target\release\hops.exe dist\hops.exe
           # TODO(signing): signtool sign /fd SHA256 /tr <timestamp-url> /td SHA256 /a dist\hops.exe
@@ -138,7 +150,7 @@ jobs:
       - name: Build (Linux)
         if: runner.os == 'Linux'
         run: |
-          cargo build --release --no-default-features --features "${{ matrix.features }}"
+          cargo build --locked --release --no-default-features --features "${{ matrix.features }}"
 
           # A Linux build with no input backends compiles, links, runs, connects,
           # and silently discards every event. It shipped for months (#47). Assert
@@ -178,7 +190,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: artifacts/**/*
           generate_release_notes: true
