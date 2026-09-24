@@ -19,6 +19,7 @@ pub mod logging;
 pub mod match_code;
 mod new_file;
 mod pid;
+mod prompt_gate;
 pub mod service;
 mod transport;
 pub mod trust;

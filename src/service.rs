@@ -10,6 +10,7 @@ use crate::{
     emulation::{Emulation, EmulationEvent},
     hop_log::Lifecycle,
     listen::{ClipboardSenderListen, LanMouseListener, ListenerCreationError},
+    prompt_gate::Admit,
 };
 use futures::StreamExt;
 use hops_ipc::{
@@ -23,6 +24,7 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
     sync::{Arc, RwLock},
+    time::Instant,
 };
 use thiserror::Error;
 use tokio::{process::Command, sync::Notify};
@@ -173,6 +175,8 @@ pub struct Service {
     /// Bounded like the TLS attempt queue, and for the same reason: anyone on
     /// the network can cause an entry.
     pending_origin: HashMap<String, AttemptOrigin>,
+    /// Whether a pairing prompt may appear right now (#195).
+    prompt_gate: crate::prompt_gate::PromptGate,
     /// The clock floor last written to disk, so a quiet daemon does not rewrite
     /// a sealed file every sweep for nothing.
     last_persisted_floor: u64,
@@ -505,6 +509,7 @@ impl Service {
             trust,
             trust_file,
             pending_origin: HashMap::new(),
+            prompt_gate: crate::prompt_gate::PromptGate::new(),
             last_persisted_floor: 0,
             public_key_fingerprint,
             client_manager,
@@ -730,7 +735,24 @@ impl Service {
                 self.save_config();
             }
             FrontendRequest::SaveConfiguration => self.save_config(),
+            FrontendRequest::OpenPairing => {
+                self.prompt_gate.open(Instant::now());
+                log::info!(
+                    "add device opened: pairing requests may prompt for the next {} s",
+                    crate::prompt_gate::PromptGate::WINDOW.as_secs()
+                );
+                self.publish_pairing_window();
+            }
         }
+    }
+
+    /// Tell every frontend how long pairing prompts may still appear here.
+    fn publish_pairing_window(&mut self) {
+        let seconds = self
+            .prompt_gate
+            .remaining(Instant::now())
+            .map_or(0, |left| left.as_secs().max(1) as u32);
+        self.notify_frontend(FrontendEvent::PairingOpen { seconds });
     }
 
     fn save_config(&mut self) {
@@ -1080,6 +1102,7 @@ impl Service {
     }
 
     fn sync_frontend(&mut self) {
+        self.publish_pairing_window();
         self.enumerate();
         // Tell a newly-attached frontend whether we are LOOKING, before anything
         // has been found. `publish_discovered` was reachable only from
@@ -1317,6 +1340,26 @@ impl Service {
                 entry.label
             );
             return;
+        }
+        let now = Instant::now();
+        match self.prompt_gate.admit(&fingerprint, now) {
+            Admit::Prompt => {}
+            Admit::Repeat => return,
+            Admit::Closed => {
+                if let Some(line) = self.prompt_gate.note_refusal(&fingerprint, now) {
+                    log::info!("{line}");
+                }
+                if origin == AttemptOrigin::OutboundDial {
+                    // Our own dial reached a machine we are not paired with, so the
+                    // person at this one can act on it; a stranger knocking cannot.
+                    self.notify_frontend(FrontendEvent::Error(format!(
+                        "{} is not paired with this machine. Open Add device on both \
+                         machines, then move the pointer across again.",
+                        addr.map_or_else(|| "That device".to_owned(), |a| a.to_string())
+                    )));
+                }
+                return;
+            }
         }
         if origin == AttemptOrigin::OutboundDial {
             // Say so. A console verb can cause this, and a prompt the console

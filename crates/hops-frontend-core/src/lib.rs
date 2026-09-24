@@ -52,6 +52,9 @@ pub struct AppModel {
     pub revoked: HashMap<String, RevokedEntry>,
     /// The daemon's listen port.
     pub port: Option<u16>,
+    /// Until when pairing prompts may appear on this machine, or `None` while
+    /// the window is closed (#195).
+    pub pairing_open_until: Option<Instant>,
     /// Recent transient events / errors (newest last), capped at [`MAX_MESSAGES`].
     pub messages: VecDeque<String>,
     /// Monotonic counter, bumped on every message. Lets a polling frontend tell a
@@ -189,8 +192,20 @@ impl AppModel {
                 self.discovery_active = active;
                 self.discovered = peers;
             }
+            FrontendEvent::PairingOpen { seconds } => {
+                self.pairing_open_until = (seconds > 0)
+                    .then(|| Instant::now() + std::time::Duration::from_secs(seconds.into()));
+            }
             FrontendEvent::NoSuchClient(_) => {}
         }
+    }
+
+    /// Whole seconds left in the pairing window, or `None` when it is closed.
+    pub fn pairing_seconds_left(&self, now: Instant) -> Option<u64> {
+        let left = self.pairing_open_until?.checked_duration_since(now)?;
+        // Rounded up, so the countdown reads 2:00 when it opens and never 0:00
+        // while prompts are still allowed.
+        Some(left.as_secs() + u64::from(left.subsec_nanos() > 0)).filter(|&s| s > 0)
     }
 
     /// Record a peer as connected, dropping any stale fingerprint previously
@@ -826,5 +841,27 @@ mod discovered_hostnames {
     fn whitespace_and_empty_are_handled() {
         assert_eq!(discovered_hostname("  rig  "), "rig.local");
         assert_eq!(discovered_hostname("   "), "");
+    }
+}
+
+#[cfg(test)]
+mod pairing_window {
+    //! The daemon says how long pairing prompts may appear here; zero closes
+    //! the window (#195).
+    use super::*;
+
+    #[test]
+    fn the_pairing_window_follows_the_daemon() {
+        let mut m = AppModel::default();
+        assert_eq!(m.pairing_seconds_left(Instant::now()), None);
+        m.apply(FrontendEvent::PairingOpen { seconds: 120 });
+        let left = m.pairing_seconds_left(Instant::now()).expect("open");
+        assert!((119..=120).contains(&left), "{left} s left, expected 120");
+        m.apply(FrontendEvent::PairingOpen { seconds: 0 });
+        assert_eq!(
+            m.pairing_seconds_left(Instant::now()),
+            None,
+            "the daemon closed the window and the model kept it open"
+        );
     }
 }

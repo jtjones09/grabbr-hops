@@ -461,6 +461,9 @@ pub async fn run() -> Result<(), TuiError> {
                                 terminal = ratatui::init();
                             }
                             KeyCode::Char('a') => {
+                                // Opening add device is what lets a pairing
+                                // prompt appear here, for two minutes (#195).
+                                client.request(FrontendRequest::OpenPairing);
                                 input = Some(Input::Add { buf: String::new() });
                             }
                             // ---- actions on the selected device ----
@@ -923,13 +926,24 @@ fn ui(
         theme,
     );
     let fp = model.fingerprint.as_deref().unwrap_or("—");
-    let footer = vec![
+    let mut footer = vec![
         line1,
         Line::from(vec![
             Span::styled("this device: ", muted),
             Span::styled(fp.to_string(), Style::default().fg(col(theme.accent))),
         ]),
     ];
+    // Stays after the add prompt closes: the other machine can still answer
+    // until the window runs out, and this is the only sign that it can.
+    if let Some(left) = model.pairing_seconds_left(Instant::now()) {
+        footer.push(Line::from(vec![
+            Span::styled(
+                format!("pairing open · {}:{:02}", left / 60, left % 60),
+                Style::default().fg(col(theme.accent)),
+            ),
+            Span::styled(" — open add device on the other machine too", muted),
+        ]));
+    }
     f.render_widget(
         Paragraph::new(footer)
             .style(base)
@@ -1230,6 +1244,24 @@ mod tests {
 
     fn screen(model: &AppModel, sel: usize) -> String {
         render(model, sel).join("\n")
+    }
+
+    /// While pairing prompts may appear here, the footer says so and for how
+    /// long; once the window closes, the line goes (#195).
+    #[test]
+    fn the_footer_counts_down_the_pairing_window() {
+        let mut model = AppModel::default();
+        assert!(
+            !screen(&model, 0).contains("pairing open"),
+            "a closed pairing window was shown as open"
+        );
+        model.pairing_open_until = Some(Instant::now() + Duration::from_secs(102));
+        let out = screen(&model, 0);
+        assert!(
+            out.contains("pairing open · 1:42") || out.contains("pairing open · 1:41"),
+            "the open pairing window is not shown with its time left:\n{out}"
+        );
+        assert!(out.contains("open add device on the other machine too"));
     }
 
     /// One machine we both cross to AND trust must be ONE row.

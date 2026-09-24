@@ -207,6 +207,14 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
         ui.set_pairing_fp("".into());
     }
 
+    // PREVIEW_PAIRING_SECONDS=102 shows the pairing window counting down (#195).
+    if let Some(seconds) = std::env::var("PREVIEW_PAIRING_SECONDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        ui.set_pairing_seconds(seconds);
+    }
+
     match std::env::args().nth(5).as_deref() {
         Some("settings") => ui.set_show_settings(true),
         Some("add-device") => ui.set_show_add_device(true),
