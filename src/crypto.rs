@@ -64,20 +64,19 @@ pub fn load_certificate(path: &Path) -> Result<Identity, Error> {
 }
 
 fn parse_identity(pem: &str, src: &str) -> Result<Identity, Error> {
-    let mut cert: Option<CertificateDer<'static>> = None;
-    let mut key: Option<PrivateKeyDer<'static>> = None;
-    let mut bytes = pem.as_bytes();
-    for item in rustls_pemfile::read_all(&mut bytes) {
-        match item.map_err(|e| Error::Pem(e.to_string()))? {
-            rustls_pemfile::Item::X509Certificate(c) if cert.is_none() => cert = Some(c),
-            rustls_pemfile::Item::Pkcs8Key(k) if key.is_none() => key = Some(k.into()),
-            rustls_pemfile::Item::Pkcs1Key(k) if key.is_none() => key = Some(k.into()),
-            rustls_pemfile::Item::Sec1Key(k) if key.is_none() => key = Some(k.into()),
-            _ => {}
-        }
-    }
-    let cert = cert.ok_or_else(|| Error::NoCertificate(src.to_owned()))?;
-    let key = key.ok_or_else(|| Error::NoPrivateKey(src.to_owned()))?;
+    use rustls_pki_types::pem::{self, PemObject};
+    // The first certificate and the first private key in the file, whichever
+    // kind of key it is (PKCS#8, PKCS#1 or SEC1).
+    let cert = match CertificateDer::from_pem_slice(pem.as_bytes()) {
+        Ok(cert) => cert,
+        Err(pem::Error::NoItemsFound) => return Err(Error::NoCertificate(src.to_owned())),
+        Err(e) => return Err(Error::Pem(e.to_string())),
+    };
+    let key = match PrivateKeyDer::from_pem_slice(pem.as_bytes()) {
+        Ok(key) => key,
+        Err(pem::Error::NoItemsFound) => return Err(Error::NoPrivateKey(src.to_owned())),
+        Err(e) => return Err(Error::Pem(e.to_string())),
+    };
     Ok(Identity { cert, key })
 }
 
@@ -181,5 +180,94 @@ mod one_identity_on_disk {
                  changes at its next restart, and every paired machine refuses it."
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod reading_an_identity {
+    use super::{Error, Identity, parse_identity};
+
+    /// A certificate from a fresh identity, as PEM, to pair with a key.
+    fn certificate_pem() -> String {
+        let key = rcgen::KeyPair::generate().expect("keypair");
+        let params = rcgen::CertificateParams::new(vec!["grabbr".to_owned()]).expect("params");
+        params.self_signed(&key).expect("self signed").pem()
+    }
+
+    /// hops' own identity file: a certificate and a PKCS#8 key.
+    #[test]
+    fn an_identity_reads_back_as_the_certificate_and_key_written() {
+        let key = rcgen::KeyPair::generate().expect("keypair");
+        let params = rcgen::CertificateParams::new(vec!["grabbr".to_owned()]).expect("params");
+        let cert = params.self_signed(&key).expect("self signed");
+        let pem = format!("{}{}", cert.pem(), key.serialize_pem());
+
+        let identity = parse_identity(&pem, "test").expect("parses");
+        assert_eq!(identity.cert.as_ref(), cert.der().as_ref());
+        assert_eq!(identity.key.secret_der(), key.serialize_der().as_slice());
+    }
+
+    /// The SEC1 key inside a PKCS#8 one: PKCS#8 wraps it as the third element
+    /// of its top-level sequence, an octet string.
+    fn sec1_pem() -> String {
+        fn next(der: &[u8]) -> (&[u8], &[u8]) {
+            let (len, at) = match der[1] {
+                n if n < 0x80 => (n as usize, 2),
+                0x81 => (der[2] as usize, 3),
+                _ => (((der[2] as usize) << 8) | der[3] as usize, 4),
+            };
+            (&der[at..at + len], &der[at + len..])
+        }
+        let pkcs8 = rcgen::KeyPair::generate().expect("keypair").serialize_der();
+        let (outer, _) = next(&pkcs8);
+        let (_version, rest) = next(outer);
+        let (_algorithm, rest) = next(rest);
+        let (sec1, _) = next(rest);
+
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut b64 = String::new();
+        for chunk in sec1.chunks(3) {
+            let n = chunk.iter().fold(0u32, |n, &b| n << 8 | b as u32) << (8 * (3 - chunk.len()));
+            for i in 0..4 {
+                b64.push(if i <= chunk.len() {
+                    ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char
+                } else {
+                    '='
+                });
+            }
+        }
+        format!("-----BEGIN EC PRIVATE KEY-----\n{b64}\n-----END EC PRIVATE KEY-----\n")
+    }
+
+    /// A key file in the older SEC1 form is still accepted. PKCS#1 takes the
+    /// same path through the parser; it is not generated here because nothing
+    /// in the dependency tree makes RSA keys.
+    #[test]
+    fn an_older_key_format_is_still_read() {
+        let pem = format!("{}{}", certificate_pem(), sec1_pem());
+        let identity = parse_identity(&pem, "test");
+        assert!(
+            matches!(
+                identity,
+                Ok(Identity {
+                    key: rustls_pki_types::PrivateKeyDer::Sec1(_),
+                    ..
+                })
+            ),
+            "a SEC1 private key was refused"
+        );
+    }
+
+    /// A file missing either half says which half is missing.
+    #[test]
+    fn a_missing_half_is_named() {
+        assert!(matches!(
+            parse_identity(&sec1_pem(), "f"),
+            Err(Error::NoCertificate(_))
+        ));
+        assert!(matches!(
+            parse_identity(&certificate_pem(), "f"),
+            Err(Error::NoPrivateKey(_))
+        ));
     }
 }

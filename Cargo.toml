@@ -86,7 +86,6 @@ rustls = { version = "0.23.12", default-features = false, features = [
     "tls12",
 ] }
 rustls-pki-types = "1"
-rustls-pemfile = "2"
 rcgen = "0.13.1"
 sha2 = "0.10.8"
 time = "0.3"
