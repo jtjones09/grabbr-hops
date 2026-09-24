@@ -86,6 +86,9 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
             port,
             ips,
         }) => {
+            // Adding a device from here is the add-device flow too, so pairing
+            // prompts may appear on this machine for the next two minutes (#195).
+            tx.request(FrontendRequest::OpenPairing).await?;
             tx.request(FrontendRequest::Create).await?;
             while let Some(e) = rx.next().await {
                 if let FrontendEvent::Created(handle, _, _) = e? {

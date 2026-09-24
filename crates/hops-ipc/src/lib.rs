@@ -375,6 +375,9 @@ pub enum FrontendEvent {
         /// does not carry one (see #83).
         addr: Option<SocketAddr>,
     },
+    /// Pairing prompts may appear on this machine for this many more seconds.
+    /// Zero means the window is closed (#195).
+    PairingOpen { seconds: u32 },
 }
 
 /// A machine advertising itself on the local network.
@@ -461,6 +464,12 @@ pub enum FrontendRequest {
     // in src/service.rs that fails if a shell becomes reachable from here again.
     /// save config file
     SaveConfiguration,
+    /// The add-device flow was opened on this machine. Pairing prompts may
+    /// appear here for the next two minutes, and at no other time (#195).
+    ///
+    /// Grants nothing by itself: a prompt still has to be approved, and only
+    /// `AuthorizeKey` does that.
+    OpenPairing,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]

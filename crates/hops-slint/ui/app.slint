@@ -123,6 +123,9 @@ export component AppWindow inherits Window {
     // real app's Rust side, which only ever reads them indirectly via clicks.
     in-out property <bool> show-settings: false;
     in-out property <bool> show-add-device: false;
+    // Seconds left in which a pairing prompt may appear on this machine (#195).
+    // Zero while the window is closed. `in-out` so render_png can show it.
+    in-out property <int> pairing-seconds: 0;
     // seeded from `free-position` when the panel opens — defaulting every add to
     // "left" meant the second device silently evicted the first
     property <string> add-device-position: "left";
@@ -155,6 +158,8 @@ export component AppWindow inherits Window {
     callback deny-pairing(string /* full fingerprint */);
     callback set-theme(int /* palette index */);
     callback create-device(string /* name */, string /* port */, string /* position */);
+    // Add device was opened: pairing prompts may appear here for two minutes.
+    callback open-pairing();
     // add a machine picked off the network list: label, comma-separated IPs,
     // port, edge. Discovery supplies the address, never the trust (#136).
     callback add-discovered(string /* label */, string /* ips */, string /* port */, string /* position */);
@@ -391,11 +396,24 @@ export component AppWindow inherits Window {
                                 // the second device does not evict the first
                                 if !root.show-add-device {
                                     root.add-device-position = root.free-position;
+                                    root.open-pairing();
                                 }
                                 root.show-add-device = !root.show-add-device;
                             }
                         }
                     }
+                }
+                // Stays after the form is closed: the other machine can still
+                // answer until the window runs out, and this is the only sign
+                // that it can.
+                if root.pairing-seconds > 0: Text {
+                    text: "pairing open · " + Math.floor(root.pairing-seconds / 60) + ":"
+                        + (Math.mod(root.pairing-seconds, 60) < 10 ? "0" : "")
+                        + Math.mod(root.pairing-seconds, 60)
+                        + " — open add device on the other machine too";
+                    color: Theme.c.muted;
+                    font-size: Type.small;
+                    wrap: word-wrap;
                 }
                 if root.show-add-device: Rectangle {
                     vertical-stretch: 0;

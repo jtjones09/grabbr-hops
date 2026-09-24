@@ -73,6 +73,8 @@ struct PolledUi {
     /// one they typed (#93). Empty when unknown (every inbound attempt).
     pairing_addr: String,
     free_position: String,
+    /// Seconds left in the pairing window, 0 when closed (#195).
+    pairing_seconds: i32,
     notice: String,
     notice_seq: i32,
     // An 11-field positional tuple against a 13-field DeviceRow, which is why
@@ -617,6 +619,10 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
     }
     {
         let c = client.clone();
+        ui.on_open_pairing(move || c.request(FrontendRequest::OpenPairing));
+    }
+    {
+        let c = client.clone();
         let pending = pending_new_device.clone();
         let notice = notice_sink.clone();
         ui.on_create_device(move |name, port, position| {
@@ -917,6 +923,9 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                     })
                     .unwrap_or("left")
                     .to_string(),
+                pairing_seconds: m
+                    .pairing_seconds_left(Instant::now())
+                    .map_or(0, |s| s.min(i32::MAX as u64) as i32),
                 notice: m.latest_message().unwrap_or_default().to_string(),
                 // i32 is Slint's integer; the seq only needs to CHANGE, not be exact
                 notice_seq: (m.message_seq % (i32::MAX as u64)) as i32,
@@ -956,6 +965,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
             ui.set_discovery_active(snap.discovery_active);
             ui.set_pairing_from_our_dial(snap.pairing_from_our_dial);
             ui.set_pairing_addr(snap.pairing_addr.as_str().into());
+            ui.set_pairing_seconds(snap.pairing_seconds);
             // only when the DAEMON has something new — otherwise a local
             // validation notice would be overwritten on the next poll
             if snap.notice_seq != last_daemon_notice.get() {
@@ -1447,6 +1457,55 @@ mod staging_a_create {
             Some(("host".to_string(), 9999u16, Position::Right, ips)),
             "a discovered machine's pinned addresses are why it connects \
              without DNS agreeing first — dropping them there would be silent"
+        );
+    }
+}
+
+#[cfg(test)]
+mod add_opens_pairing {
+    //! Opening the add form must open the pairing window, or no pairing prompt
+    //! can ever appear on this machine (#195). The link is in `app.slint`, which
+    //! no test here can click, so this reads the button's handler.
+
+    /// `app.slint` with `//` comments removed, so prose cannot satisfy it.
+    fn code() -> String {
+        include_str!("../ui/app.slint")
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The body of the first `clicked => { ... }` after `anchor`, braces matched.
+    fn handler_after(code: &str, anchor: &str) -> String {
+        let at = code.find(anchor).expect("the button is still there");
+        let rest = &code[at..];
+        let open = rest.find("clicked =>").expect("it has a click handler");
+        let body = &rest[open..];
+        let start = body.find('{').expect("a block");
+        let mut depth = 0;
+        for (i, ch) in body[start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return body[start..start + i + 1].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced click handler");
+    }
+
+    #[test]
+    fn opening_add_device_opens_the_pairing_window() {
+        let handler = handler_after(&code(), "\"+ add\"");
+        assert!(
+            handler.contains("root.open-pairing()"),
+            "the + add button no longer opens the pairing window, so no pairing \
+             prompt can appear on this machine:\n{handler}"
         );
     }
 }
