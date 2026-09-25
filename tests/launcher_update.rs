@@ -270,3 +270,41 @@ fn a_branch_with_no_remote_and_hops_no_pull_are_built_as_they_are() {
         );
     }
 }
+
+/// Started from the desktop, a Linux launcher has read neither ~/.profile nor
+/// ~/.bashrc, so rustup's cargo is not on PATH until `.hops-paths` loads it.
+#[test]
+fn the_linux_launcher_finds_cargo_without_a_login_shell() {
+    let dir = scratch("cargo-env");
+    let home = dir.0.join("home");
+    let bin = home.join(".cargo").join("bin");
+    std::fs::create_dir_all(&bin).expect("bin");
+    let cargo = bin.join("cargo");
+    std::fs::write(&cargo, "#!/bin/sh\n").expect("stub cargo");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    // What rustup writes, trimmed to the line that matters.
+    std::fs::write(
+        home.join(".cargo").join("env"),
+        "export PATH=\"$HOME/.cargo/bin:$PATH\"\n",
+    )
+    .expect("env");
+
+    let helpers = Path::new(env!("CARGO_MANIFEST_DIR")).join("service/linux/.hops-paths");
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(". \"$1\" && command -v cargo")
+        .arg("_")
+        .arg(&helpers)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &home)
+        .output()
+        .expect("bash runs");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        cargo.to_str().expect("path"),
+        "with only /usr/bin:/bin on PATH, the launcher could not find cargo: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
