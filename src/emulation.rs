@@ -249,6 +249,23 @@ pub(crate) fn input_permitted<F: AsRef<str>>(
         .is_some_and(|fp| trust.read().expect("lock").may_drive_us(fp.as_ref()))
 }
 
+/// Whether the peer at `addr` has crossed onto this machine and may inject.
+/// A peer sending input without crossing is logged once, by name (#102).
+fn has_crossed(
+    driving: &HashSet<SocketAddr>,
+    logged: &mut HashSet<SocketAddr>,
+    addr: SocketAddr,
+    peer: &str,
+) -> bool {
+    if driving.contains(&addr) {
+        return true;
+    }
+    if logged.insert(addr) {
+        log::warn!("dropped input from {addr} ({peer}): it has not crossed onto this machine");
+    }
+    false
+}
+
 impl ListenTask {
     /// Whose input this is, if the peer at `addr` may drive this machine right
     /// now. If not, it is released: once per refusal rather than per event,
@@ -281,6 +298,16 @@ impl ListenTask {
         // Peers released because the trust check refused them, until one of
         // their events is permitted again.
         let mut refused = HashSet::new();
+        // Peers that crossed onto this machine and have not left. Only these
+        // inject: a paired peer that never sent Enter would otherwise type into
+        // this machine with no crossing, no "entered" line in the log and
+        // nothing in the app saying it was in control (#102). The session ends
+        // on the peer's Leave, its reaping or a new connection, never on our
+        // own release: its key-ups are still on the way then.
+        let mut driving: HashSet<SocketAddr> = HashSet::new();
+        // Peers already logged for sending input without crossing, so one
+        // that keeps doing it costs one line, not one per event.
+        let mut unentered_logged: HashSet<SocketAddr> = HashSet::new();
         loop {
             select! {
                 e = self.listener.next() => {match e {
@@ -304,10 +331,13 @@ impl ListenTask {
                                     // displacement to 0 on Enter). Idempotent across the
                                     // pre-Ack Enter re-sends; motion only arrives after.
                                     absmotion.anchor(addr);
+                                    driving.insert(addr);
+                                    unentered_logged.remove(&addr);
                                     self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");
                                 }
                             }
                             ProtoEvent::Leave(_) => {
+                                driving.remove(&addr);
                                 self.emulation_proxy.remove(addr);
                                 absmotion.forget(addr);
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
@@ -318,7 +348,9 @@ impl ListenTask {
                                 // an injected event, so it is not measurable on
                                 // the path it protects.
                                 if let Some(peer) = self.admit(&mut refused, addr) {
-                                    self.emulation_proxy.consume(event, addr, peer);
+                                    if has_crossed(&driving, &mut unentered_logged, addr, &peer) {
+                                        self.emulation_proxy.consume(event, addr, peer);
+                                    }
                                 }
                             }
                             ProtoEvent::Ping => self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())).await,
@@ -353,7 +385,10 @@ impl ListenTask {
                             // for the Stage 3 servo; unused here. Inert until a peer
                             // negotiates caps::ABSOLUTE_MOTION and emits these (PR-4).
                             ProtoEvent::PointerMotionAbsolute { seq: _, ts, vx, vy } => {
-                                if let Some(peer) = self.admit(&mut refused, addr) {
+                                if let Some(peer) = self
+                                    .admit(&mut refused, addr)
+                                    .filter(|peer| has_crossed(&driving, &mut unentered_logged, addr, peer))
+                                {
                                     let (dx, dy) = absmotion.delta(addr, vx, vy);
                                     self.emulation_proxy.consume(
                                         Event::Pointer(PointerEvent::Motion { time: ts, dx, dy }),
@@ -366,6 +401,10 @@ impl ListenTask {
                         }
                     }
                     Some(ListenEvent::Accept { addr, fingerprint }) => {
+                        // A new connection is a new session, whatever the old
+                        // one on this address was doing.
+                        driving.remove(&addr);
+                        unentered_logged.remove(&addr);
                         self.peer_of.insert(addr, Rc::from(fingerprint.as_str()));
                         self.event_tx.send(EmulationEvent::Connected { addr, fingerprint }).expect("channel closed");
                     }
@@ -402,6 +441,8 @@ impl ListenTask {
                             self.emulation_proxy.remove(addr);
                             // Forgotten along with the peer.
                             refused.remove(&addr);
+                            driving.remove(&addr);
+                            unentered_logged.remove(&addr);
                             let _ = self.event_tx.send(EmulationEvent::Disconnected { addr });
                             false
                         } else {
@@ -1163,6 +1204,11 @@ mod held_input_is_released {
 
     /// [`session_with`], into a backend that counts buttons as `scope` says.
     async fn session_scoped(n: usize, scope: ButtonScope) -> Session {
+        connected(n, scope, true).await
+    }
+
+    /// `n` senders connected to this machine, crossed onto it if `cross`.
+    async fn connected(n: usize, scope: ButtonScope, cross: bool) -> Session {
         let receiver = machine();
         let senders: Vec<_> = (0..n).map(|_| machine()).collect();
         let receiver_trust = trust(
@@ -1189,7 +1235,9 @@ mod held_input_is_released {
                 hops_ipc::Position::Left,
             );
             peer.until_alive().await;
-            peer.send(ProtoEvent::Enter(Position::Right)).await;
+            if cross {
+                peer.send(ProtoEvent::Enter(Position::Right)).await;
+            }
             peers.push(peer);
         }
         Session {
@@ -1531,11 +1579,14 @@ mod held_input_is_released {
                 s.recording.calls()
             );
 
-            // The up the peer sent before it knew, then something after it on
-            // the same stream, so the up has been handled once that arrives.
+            // The up the peer sent before it knew, then a fresh crossing and a
+            // key on the same stream, so the up has been handled once the key
+            // arrives. A peer that has left cannot inject, so without the
+            // crossing the key would never arrive either (#102).
             s.dialer()
                 .send(ProtoEvent::Input(button(BTN_LEFT, 0)))
                 .await;
+            s.dialer().send(ProtoEvent::Enter(Position::Right)).await;
             s.inject(key(KEY_A, 1)).await;
 
             assert_eq!(
@@ -1866,6 +1917,81 @@ mod held_input_is_released {
         });
     }
 
+    /// A paired peer that connects but never crosses cannot type into this
+    /// machine or move its pointer. Once it crosses, it can (#102).
+    #[test]
+    fn a_peer_that_never_crossed_cannot_inject() {
+        run_local(async {
+            let mut s = connected(1, ButtonScope::Machine, false).await;
+            s.peers[0].send(ProtoEvent::Input(key(KEY_A, 1))).await;
+            s.peers[0].send(absolute(1)).await;
+            sync(&mut s, 0).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                s.consumed(key(KEY_A, 1)).is_empty() && motions(&s) == 0,
+                "a peer that never crossed onto this machine injected: {:?}",
+                s.recording.calls()
+            );
+
+            // The same peer, permitted all along, once it has crossed.
+            s.peers[0].send(ProtoEvent::Enter(Position::Right)).await;
+            s.inject(key(KEY_A, 1)).await;
+        });
+    }
+
+    /// Leaving ends the peer's session: a key it presses after its Leave is
+    /// not injected until it crosses again (#102). A late key-up is already
+    /// stopped by the held-input bookkeeping, so this needs a key-down.
+    #[test]
+    fn a_peer_that_left_cannot_inject_until_it_crosses_again() {
+        run_local(async {
+            let mut s = session().await;
+            let handle = s.inject(key(KEY_A, 1)).await;
+            s.dialer().send(ProtoEvent::Leave(0)).await;
+            s.destroyed(handle).await;
+
+            s.peers[0].send(ProtoEvent::Input(key(KEY_A, 1))).await;
+            sync(&mut s, 0).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(
+                s.consumed(key(KEY_A, 1)).len(),
+                1,
+                "a peer pressed a key after it left, and it was injected: {:?}",
+                s.recording.calls()
+            );
+        });
+    }
+
+    /// Handing the pointer back does not end the peer's session: the key-ups
+    /// it sent before it heard are still let in, or the keys stay held.
+    #[test]
+    fn key_ups_after_we_hand_the_pointer_back_are_still_injected() {
+        run_local(async {
+            let mut s = session().await;
+            let addr = sync(&mut s, 0)
+                .await
+                .iter()
+                .find_map(|e| match e {
+                    EmulationEvent::Entered { addr, .. } => Some(*addr),
+                    _ => None,
+                })
+                .expect("the session crossed");
+            s.inject(key(KEY_A, 1)).await;
+
+            s.emulation.send_leave_event(addr);
+            s.peers[0].send(ProtoEvent::Input(key(KEY_A, 0))).await;
+            sync(&mut s, 0).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(
+                s.consumed(key(KEY_A, 0)).len(),
+                1,
+                "the key-up sent as this machine handed the pointer back was \
+                 dropped, so the key stays held: {:?}",
+                s.recording.calls()
+            );
+        });
+    }
+
     /// Revoking or letting a lease lapse refuses the peer's events at the
     /// point of injection, its button- and key-ups included. What it held must
     /// come up then, not when the session is eventually cut.
@@ -2164,6 +2290,8 @@ mod held_input_is_released {
             s.dialer()
                 .send(ProtoEvent::Input(button(BTN_LEFT, 0)))
                 .await;
+            // A peer that has left cannot inject: cross again first (#102).
+            s.dialer().send(ProtoEvent::Enter(Position::Right)).await;
             s.inject(key(KEY_A, 1)).await;
 
             assert_eq!(
