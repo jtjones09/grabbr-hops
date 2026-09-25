@@ -104,7 +104,7 @@ impl Emulation {
         listener: LanMouseListener,
         trust: crate::transport::Trust,
     ) -> Self {
-        let emulation_proxy = EmulationProxy::new(backend, listener.pressure());
+        let emulation_proxy = EmulationProxy::new(backend, listener.pressure(), trust.clone());
         let last_injected = emulation_proxy.last_injected.clone();
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
@@ -230,25 +230,50 @@ struct ListenTask {
     /// removed device; the lapse half is kept for when a term returns (#185).
     trust: crate::transport::Trust,
     /// Which peer each admitted address belongs to. Populated on accept, so the
-    /// per-event check is a map lookup rather than a certificate parse.
-    peer_of: HashMap<SocketAddr, String>,
+    /// per-event check is a map lookup rather than a certificate parse. Shared
+    /// with every event queued for injection, which is checked again there.
+    peer_of: HashMap<SocketAddr, Rc<str>>,
 }
 
 /// The per-event check: may the peer admitted at `addr` inject input right now?
 ///
 /// Asked for every input event, against the store as it is at that moment, so
 /// a removal bites between two events rather than at the next handshake.
-pub(crate) fn input_permitted(
-    peer_of: &HashMap<SocketAddr, String>,
+pub(crate) fn input_permitted<F: AsRef<str>>(
+    peer_of: &HashMap<SocketAddr, F>,
     trust: &crate::transport::Trust,
     addr: SocketAddr,
 ) -> bool {
     peer_of
         .get(&addr)
-        .is_some_and(|fp| trust.read().expect("lock").may_drive_us(fp))
+        .is_some_and(|fp| trust.read().expect("lock").may_drive_us(fp.as_ref()))
 }
 
 impl ListenTask {
+    /// Whose input this is, if the peer at `addr` may drive this machine right
+    /// now. If not, it is released: once per refusal rather than per event,
+    /// since every refused event would otherwise tear down and rebuild its
+    /// handle.
+    ///
+    /// Every event that can move, press or take this machine comes through
+    /// here: `Enter`, `Input` and absolute motion alike (#156).
+    fn admit(&self, refused: &mut HashSet<SocketAddr>, addr: SocketAddr) -> Option<Rc<str>> {
+        if input_permitted(&self.peer_of, &self.trust, addr) {
+            if !refused.is_empty() {
+                refused.remove(&addr);
+            }
+            return self.peer_of.get(&addr).cloned();
+        }
+        if refused.insert(addr) {
+            // Its button- and key-ups are refused from here on too, so whatever
+            // it holds would stay down until the session is cut and the
+            // watchdog notices.
+            log::warn!("releasing held keys and buttons: {addr} may no longer drive this machine");
+            self.emulation_proxy.remove(addr);
+        }
+        None
+    }
+
     async fn run(mut self) {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         let mut last_response = HashMap::new();
@@ -263,6 +288,9 @@ impl ListenTask {
                         log::trace!("{event} <-<-<-<-<- {addr}");
                         last_response.insert(addr, Instant::now());
                         match event {
+                            // A peer that may not drive this machine cannot take it
+                            // either: no Ack, no "entered", nothing released for it.
+                            ProtoEvent::Enter(_) if self.admit(&mut refused, addr).is_none() => {}
                             ProtoEvent::Enter(pos) => {
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
                                     // per-wire-event (the sender re-sends Enter until the
@@ -289,29 +317,8 @@ impl ListenTask {
                                 // the ~100 µs blocking syscall that dominates
                                 // an injected event, so it is not measurable on
                                 // the path it protects.
-                                if input_permitted(&self.peer_of, &self.trust, addr) {
-                                    if !refused.is_empty() {
-                                        refused.remove(&addr);
-                                    }
-                                    self.emulation_proxy.consume(event, addr);
-                                } else if refused.insert(addr) {
-                                    // The lease lapsed or was revoked while the
-                                    // peer was driving. Its button- and key-ups
-                                    // are refused from here on too, so whatever
-                                    // it holds would stay down until the session
-                                    // is cut and the watchdog notices, which
-                                    // takes over a minute after a lapse.
-                                    //
-                                    // Once per refusal, not per event: absolute
-                                    // motion is not refused yet (#156) and
-                                    // re-creates the handle, so a release per
-                                    // event tore it down and built it again
-                                    // for every pair.
-                                    log::warn!(
-                                        "releasing held keys and buttons: \
-                                         {addr} may no longer drive this machine"
-                                    );
-                                    self.emulation_proxy.remove(addr);
+                                if let Some(peer) = self.admit(&mut refused, addr) {
+                                    self.emulation_proxy.consume(event, addr, peer);
                                 }
                             }
                             ProtoEvent::Ping => self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())).await,
@@ -346,17 +353,20 @@ impl ListenTask {
                             // for the Stage 3 servo; unused here. Inert until a peer
                             // negotiates caps::ABSOLUTE_MOTION and emits these (PR-4).
                             ProtoEvent::PointerMotionAbsolute { seq: _, ts, vx, vy } => {
-                                let (dx, dy) = absmotion.delta(addr, vx, vy);
-                                self.emulation_proxy.consume(
-                                    Event::Pointer(PointerEvent::Motion { time: ts, dx, dy }),
-                                    addr,
-                                );
+                                if let Some(peer) = self.admit(&mut refused, addr) {
+                                    let (dx, dy) = absmotion.delta(addr, vx, vy);
+                                    self.emulation_proxy.consume(
+                                        Event::Pointer(PointerEvent::Motion { time: ts, dx, dy }),
+                                        addr,
+                                        peer,
+                                    );
+                                }
                             }
                             _ => {}
                         }
                     }
                     Some(ListenEvent::Accept { addr, fingerprint }) => {
-                        self.peer_of.insert(addr, fingerprint.clone());
+                        self.peer_of.insert(addr, Rc::from(fingerprint.as_str()));
                         self.event_tx.send(EmulationEvent::Connected { addr, fingerprint }).expect("channel closed");
                     }
                     // Every refused handshake goes up. Whether it may prompt, and
@@ -444,7 +454,8 @@ pub(crate) struct EmulationProxy {
 const YIELD_EVERY_N_EVENTS: u32 = 8;
 
 enum ProxyRequest {
-    Input(Event, SocketAddr),
+    /// An event, the address it came from, and whose it is.
+    Input(Event, SocketAddr, Rc<str>),
     Remove(SocketAddr),
     Terminate,
     Reenable,
@@ -482,6 +493,7 @@ impl EmulationProxy {
     fn new(
         backend: Option<input_emulation::Backend>,
         pressure: Rc<crate::listen::InputPressure>,
+        trust: crate::transport::Trust,
     ) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
@@ -498,6 +510,7 @@ impl EmulationProxy {
             metrics: metrics.clone(),
             queued: Default::default(),
             pressure,
+            trust,
         };
         let task = spawn_local(emulation_task.run());
         Self {
@@ -534,14 +547,14 @@ impl EmulationProxy {
         event
     }
 
-    fn consume(&self, event: Event, addr: SocketAddr) {
+    fn consume(&self, event: Event, addr: SocketAddr, peer: Rc<str>) {
         // stamped before the enabled-check: what matters is that a REMOTE peer is
         // driving, not whether we happened to act on it
         self.last_injected.set(Some(Instant::now()));
         // ignore events if emulation is currently disabled
         if self.emulation_active.get() {
             self.request_tx
-                .send(ProxyRequest::Input(event, addr))
+                .send(ProxyRequest::Input(event, addr, peer))
                 .expect("channel closed");
             self.metrics.on_enqueue();
         }
@@ -580,6 +593,9 @@ struct EmulationTask {
     queued: PeerQueues,
     /// Peers told to stop sending until their queue drains.
     pressure: Rc<crate::listen::InputPressure>,
+    /// Asked again before each event is injected: a peer can lose permission
+    /// while its input waits in the queue (#156).
+    trust: crate::transport::Trust,
 }
 
 /// How many requests may wait for one peer before its connection stops
@@ -594,7 +610,8 @@ const SORT_BATCH: usize = 64;
 
 /// What one peer has asked for and this machine has not done yet.
 enum Queued {
-    Input(Event),
+    /// An event and the fingerprint of the peer that sent it.
+    Input(Event, Rc<str>),
     /// Tear the peer's handle down, after everything it sent before.
     Remove,
 }
@@ -623,18 +640,25 @@ impl PeerQueues {
             self.turn.push_back(addr);
         }
         if let (
-            Some(Queued::Input(Event::Pointer(PointerEvent::Motion { time, dx, dy }))),
-            Queued::Input(Event::Pointer(PointerEvent::Motion {
-                time: later,
-                dx: more_x,
-                dy: more_y,
-            })),
+            Some(Queued::Input(Event::Pointer(PointerEvent::Motion { time, dx, dy }), queued_by)),
+            Queued::Input(
+                Event::Pointer(PointerEvent::Motion {
+                    time: later,
+                    dx: more_x,
+                    dy: more_y,
+                }),
+                from,
+            ),
         ) = (queue.back_mut(), &item)
         {
-            *dx += *more_x;
-            *dy += *more_y;
-            *time = *later;
-            return (true, queue.len());
+            // Only one peer's motion merges into its own: a new connection
+            // from the same address may be a different machine.
+            if queued_by == from {
+                *dx += *more_x;
+                *dy += *more_y;
+                *time = *later;
+                return (true, queue.len());
+            }
         }
         queue.push_back(item);
         (false, queue.len())
@@ -658,13 +682,19 @@ impl PeerQueues {
         self.turn.is_empty()
     }
 
+    /// Forget everything queued for `addr`; returns how much that was.
+    fn drop_peer(&mut self, addr: SocketAddr) -> usize {
+        self.turn.retain(|&a| a != addr);
+        self.queues.remove(&addr).map_or(0, |q| q.len())
+    }
+
     /// Drop everything, returning how many inputs were waiting.
     fn clear(&mut self) -> u64 {
         let inputs = self
             .queues
             .values()
             .flatten()
-            .filter(|q| matches!(q, Queued::Input(_)))
+            .filter(|q| matches!(q, Queued::Input(..)))
             .count() as u64;
         self.turn.clear();
         self.queues.clear();
@@ -813,7 +843,23 @@ impl EmulationTask {
                         self.pressure.release(addr);
                     }
                     match item {
-                        Queued::Input(event) => {
+                        Queued::Input(_, peer)
+                            if !self.trust.read().expect("lock").may_drive_us(&peer) =>
+                        {
+                            // Lost permission while this waited. Nothing it
+                            // queued goes in, and what it holds is let go.
+                            let dropped = self.queued.drop_peer(addr);
+                            self.pressure.release(addr);
+                            log::warn!(
+                                "dropped {} queued event(s) and released held input: \
+                                 {addr} may no longer drive this machine",
+                                dropped + 1
+                            );
+                            if let Some(handle) = self.handles.remove(&addr) {
+                                emulation.destroy(handle).await;
+                            }
+                        }
+                        Queued::Input(event, _) => {
                             let handle = match self.handles.get(&addr) {
                                 Some(&handle) => handle,
                                 None => {
@@ -876,8 +922,8 @@ impl EmulationTask {
     /// File one request into its peer's queue. True for `Terminate`.
     fn sort(&mut self, request: ProxyRequest) -> bool {
         match request {
-            ProxyRequest::Input(event, addr) => {
-                let (merged, waiting) = self.queued.push(addr, Queued::Input(event));
+            ProxyRequest::Input(event, addr, peer) => {
+                let (merged, waiting) = self.queued.push(addr, Queued::Input(event, peer));
                 if merged {
                     // Merged into an event already waiting: done, as far as the
                     // backlog counter is concerned.
@@ -920,7 +966,7 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
     loop {
         match rx.recv().await.expect("channel closed") {
             ProxyRequest::Terminate => return,
-            ProxyRequest::Input(_, _) => continue,
+            ProxyRequest::Input(..) => continue,
             ProxyRequest::Remove(_) => continue,
             ProxyRequest::Reenable => continue,
         }
@@ -967,7 +1013,10 @@ mod tests {
             .expect("runtime");
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, async {
-            let proxy = EmulationProxy::new(None, Default::default());
+            let trust = std::sync::Arc::new(std::sync::RwLock::new(
+                crate::trust::TrustStore::new(&["aa"; 32].join(":"), 0).expect("a store"),
+            ));
+            let proxy = EmulationProxy::new(None, Default::default(), trust);
             let window = Duration::from_secs(2);
             assert!(
                 !proxy.remotely_driven_within(window),
@@ -981,6 +1030,7 @@ mod tests {
                     dy: 0.0,
                 }),
                 addr(1),
+                Rc::from("cc:dd"),
             );
             assert!(
                 proxy.remotely_driven_within(window),
@@ -1667,6 +1717,155 @@ mod held_input_is_released {
     }
 
     // LEDGER T13 | class B | 6 struct state: Recording::calls() after the per-event trust check refuses the peer
+    /// Send a marker the listener never refuses on peer `from`'s stream, and
+    /// return every event reported until it arrives. Once it does, the listener
+    /// has handled everything that peer sent before it.
+    async fn sync(s: &mut Session, from: usize) -> Vec<EmulationEvent> {
+        const MARKER: u32 = 0x7e57_0156;
+        s.peers[from]
+            .send(ProtoEvent::Capability { flags: MARKER })
+            .await;
+        let mut seen = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match s.emulation.event().await {
+                    EmulationEvent::PeerCaps { flags: MARKER, .. } => break,
+                    other => seen.push(other),
+                }
+            }
+        })
+        .await
+        .expect("the marker arrived");
+        seen
+    }
+
+    fn absolute(seq: u32) -> ProtoEvent {
+        ProtoEvent::PointerMotionAbsolute {
+            seq,
+            ts: 0,
+            vx: 10.0 * seq as f32,
+            vy: 0.0,
+        }
+    }
+
+    fn motions(s: &Session) -> usize {
+        s.recording
+            .calls()
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    Recorded::Consume(Event::Pointer(PointerEvent::Motion { .. }), _)
+                )
+            })
+            .count()
+    }
+
+    /// Absolute motion is on by default, so it has to be refused like any
+    /// other input once the peer may no longer drive this machine (#156).
+    #[test]
+    fn a_removed_peer_cannot_move_the_pointer_with_absolute_motion() {
+        run_local(async {
+            let mut s = session().await;
+            sync(&mut s, 0).await;
+            s.trust
+                .write()
+                .expect("trust lock")
+                .revoke(&s.fingerprints[0]);
+            for seq in 1..=5 {
+                s.peers[0].send(absolute(seq)).await;
+            }
+            sync(&mut s, 0).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(
+                motions(&s),
+                0,
+                "a removed peer moved the pointer with absolute motion: {:?}",
+                s.recording.calls()
+            );
+        });
+    }
+
+    /// A peer that may not drive this machine cannot take it either: no
+    /// crossing is reported, and the sender is not told it arrived (#156).
+    #[test]
+    fn a_removed_peer_cannot_take_this_machine_with_enter() {
+        run_local(async {
+            let mut s = session().await;
+            sync(&mut s, 0).await;
+            s.trust
+                .write()
+                .expect("trust lock")
+                .revoke(&s.fingerprints[0]);
+            s.peers[0].send(ProtoEvent::Enter(Position::Right)).await;
+            let seen = sync(&mut s, 0).await;
+            assert!(
+                !seen.iter().any(|e| matches!(
+                    e,
+                    EmulationEvent::Entered { .. } | EmulationEvent::ReleaseNotify
+                )),
+                "a removed peer's Enter was acted on"
+            );
+        });
+    }
+
+    /// Input already waiting when the peer loses permission is not injected,
+    /// and what the peer held is let go (#156).
+    #[test]
+    fn input_queued_before_a_removal_is_dropped_and_held_input_released() {
+        run_local(async {
+            let mut s = session().await;
+            let handle = s.inject(button(BTN_LEFT, 1)).await;
+            s.recording.consume_takes(Duration::from_millis(2));
+            for _ in 0..100 {
+                s.peers[0].send(ProtoEvent::Input(scroll(1.))).await;
+            }
+            s.peers[0].send(ProtoEvent::Input(key(KEY_A, 1))).await;
+            // The listener has admitted all of it: the key is queued behind
+            // the scrolls, which take about 200 ms to inject.
+            sync(&mut s, 0).await;
+            s.trust
+                .write()
+                .expect("trust lock")
+                .revoke(&s.fingerprints[0]);
+
+            assert!(
+                s.released_before_destroy(handle, button(BTN_LEFT, 0)).await,
+                "the peer held the left button and lost permission, and it was \
+                 never released: {:?}",
+                s.recording.calls()
+            );
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            assert!(
+                s.consumed(key(KEY_A, 1)).is_empty(),
+                "a key queued before the peer lost permission was injected after it"
+            );
+        });
+    }
+
+    /// Losing only the right to drive this machine, while keeping the other
+    /// direction, refuses its input the same way (#156).
+    #[test]
+    fn a_peer_that_may_only_be_driven_cannot_inject() {
+        run_local(async {
+            let mut s = session().await;
+            sync(&mut s, 0).await;
+            s.trust
+                .write()
+                .expect("trust lock")
+                .drop_capabilities(&s.fingerprints[0], Caps::DRIVE_ME);
+            s.peers[0].send(ProtoEvent::Input(key(KEY_A, 1))).await;
+            s.peers[0].send(absolute(1)).await;
+            sync(&mut s, 0).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                s.consumed(key(KEY_A, 1)).is_empty() && motions(&s) == 0,
+                "a peer without the right to drive this machine injected: {:?}",
+                s.recording.calls()
+            );
+        });
+    }
+
     /// Revoking or letting a lease lapse refuses the peer's events at the
     /// point of injection, its button- and key-ups included. What it held must
     /// come up then, not when the session is eventually cut.
@@ -1708,14 +1907,12 @@ mod held_input_is_released {
     }
 
     // LEDGER T18 | class B | 6 struct state: Recording::calls() after refused Input events, synced by a Capability marker and a permitted peer's input
-    /// A refusal releases the peer once. Absolute motion is not refused yet
-    /// (#156) and re-creates the handle the refusal destroyed, so releasing on
-    /// every refused event tore that handle down and built it again for each
-    /// pair: on wlroots a new virtual pointer and keyboard every time.
-    ///
-    /// Nothing here needs that motion to be injected. Once #156 refuses it
-    /// too, this still passes, but a release per event then has no handle to
-    /// destroy, and only the repeated warning would show it.
+    /// A refusal releases the peer once. When absolute motion still slipped
+    /// past the check it re-created the handle the refusal destroyed, so
+    /// releasing on every refused event tore that handle down and built it
+    /// again for each pair: on wlroots a new virtual pointer and keyboard every
+    /// time. Absolute motion is refused too now (#156); a release per event
+    /// would have no handle to destroy, and only the repeated warning shows it.
     #[test]
     fn a_refused_peer_is_released_once_not_per_event() {
         run_local(async {
