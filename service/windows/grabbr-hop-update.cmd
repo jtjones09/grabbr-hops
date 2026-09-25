@@ -14,12 +14,7 @@ if defined HOPS_NO_PULL (
   echo   HOPS_NO_PULL is set: building the checkout as it is.
   goto :updated
 )
-pushd "%HOPS_REPO%" || goto :diverged
-echo.
-echo   %HOPS_BRANCH% has diverged from its remote branch, so nothing was built.
-echo   Sort it out in %HOPS_REPO%, or run again with HOPS_NO_PULL=1 set.
-goto :hold
-:norepo
+pushd "%HOPS_REPO%" || goto :norepo
 set "HOPS_BRANCH="
 for /f "delims=" %%b in ('git symbolic-ref --short -q HEAD 2^>nul') do set "HOPS_BRANCH=%%b"
 if not defined HOPS_BRANCH (
@@ -56,5 +51,14 @@ popd
 :updated
 exit /b 0
 
-:hold
+rem Only reached by goto: each ends the update without building.
+:diverged
+echo.
+echo   %HOPS_BRANCH% has diverged from its remote branch, so nothing was built.
+echo   Sort it out in %HOPS_REPO%, or run again with HOPS_NO_PULL=1 set.
+exit /b 1
+
+:norepo
+echo.
+echo   No repo at %HOPS_REPO% - edit grabbr-hop-paths.cmd.
 exit /b 1
