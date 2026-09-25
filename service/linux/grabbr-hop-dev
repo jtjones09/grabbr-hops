@@ -7,7 +7,11 @@
 cd "$HOPS_REPO" || { echo "no repo at $HOPS_REPO"; hops_hold; exit 1; }
 hops_update_checkout || { hops_hold; exit 1; }
 echo "building dev..."
-cargo build --release --no-default-features --features "tui slint" \
+# The Linux release's feature set (.github/workflows/release.yml). On Linux the
+# input backends are features; without them the build captures and injects
+# nothing. tests/launcher_features.rs keeps the two in step.
+cargo build --release --no-default-features \
+  --features "tui libei_capture libei_emulation layer_shell_capture wlroots_emulation x11_capture x11_emulation rdp_emulation" \
   || { echo; echo "  build failed — nothing was switched."; hops_hold; exit 1; }
 
 # Before anything is switched, so an abort leaves the running service alone.

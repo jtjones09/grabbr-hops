@@ -6,6 +6,12 @@ HOPS_LAUNCH="$HOME/grabbr-hop"
 HOPS_RAW="$HOPS_REPO/target/release/hops"
 HOPS_DAILY="$HOPS_LAUNCH/hops"
 
+# Started from the desktop rather than a terminal, a launcher has read neither
+# ~/.profile nor ~/.bashrc, which is where rustup puts cargo on PATH.
+if ! command -v cargo >/dev/null 2>&1 && [ -f "$HOME/.cargo/env" ]; then
+  . "$HOME/.cargo/env"
+fi
+
 hops_hold() {
   if [ -t 0 ]; then printf '\nPress Return to close... '; read -r _ || true; fi
 }
