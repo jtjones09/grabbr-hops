@@ -1619,6 +1619,83 @@ mod held_input_is_released {
         });
     }
 
+    // LEDGER T69 | class B | 6 struct state + 1 return value: Recording::calls() and Emulation::event() within 1 s of one of two peers' links closing
+    /// Two peers drive this machine and one link closes. That peer's held
+    /// input comes up and the service is told at once, whether or not another
+    /// peer is still connected; the other peer's session is left alone.
+    #[test]
+    fn a_closed_link_is_let_go_while_another_peer_stays_connected() {
+        run_local(async {
+            let mut s = session_with(2).await;
+            let closing = s.inject_from(0, key(KEY_A, 1)).await;
+            let staying = s.inject_from(1, key(KEY_B, 1)).await;
+            assert_ne!(closing, staying, "precondition: one handle per peer");
+            let addr = sync(&mut s, 0)
+                .await
+                .iter()
+                .find_map(|e| match e {
+                    EmulationEvent::Connected { addr, fingerprint }
+                        if *fingerprint == s.fingerprints[0] =>
+                    {
+                        Some(*addr)
+                    }
+                    _ => None,
+                })
+                .expect("the closing peer's connection was reported");
+
+            s.peers[0]
+                .conn
+                .revoker()
+                .close_handles(&[s.peers[0].handle])
+                .await;
+
+            let reported = tokio::time::timeout(AT_ONCE, async {
+                loop {
+                    if let EmulationEvent::Disconnected { addr: gone } = s.emulation.event().await {
+                        if gone == addr {
+                            break;
+                        }
+                    }
+                }
+            })
+            .await;
+            assert!(
+                reported.is_ok(),
+                "one of two connected peers closed its link, and that was not \
+                 reported within {AT_ONCE:?}"
+            );
+            wait_until(
+                "the closed link's held key to be released while another peer \
+                 stays connected",
+                AT_ONCE,
+                || s.recording.calls().contains(&Recorded::Destroy(closing)),
+            )
+            .await;
+            assert!(
+                s.released_before_destroy(closing, key(KEY_A, 0)).await,
+                "the closed link's held key was not released: {:?}",
+                s.recording.calls()
+            );
+
+            // Its link is still up, so it keeps what it holds and still drives.
+            let kept = || {
+                !s.recording.calls().contains(&Recorded::Destroy(staying))
+                    && s.position(key(KEY_B, 0)).is_none()
+            };
+            assert!(
+                kept(),
+                "one peer's link closed and the other's held key was let go: {:?}",
+                s.recording.calls()
+            );
+            s.inject_from(1, key(KEY_C, 1)).await;
+            assert!(
+                kept(),
+                "one peer's link closed and the other's held key was let go: {:?}",
+                s.recording.calls()
+            );
+        });
+    }
+
     // LEDGER T2 | class B | 6 struct state: Recording::calls() after a Leave
     #[test]
     fn a_leave_releases_a_held_button_with_the_keys() {
