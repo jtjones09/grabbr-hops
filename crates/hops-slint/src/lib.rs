@@ -129,6 +129,22 @@ pub fn theme_colors(t: &theme::Theme) -> ThemeColors {
     }
 }
 
+/// The pairing prompt to show, or `""` for none: a request for a direction
+/// not yet permitted, still actively attempting (not a stale prompt for a peer
+/// that left), and not currently snooze-dismissed.
+fn live_pairing(m: &hops_frontend_core::AppModel, dismissed: &HashMap<String, Instant>) -> String {
+    m.pairing_request()
+        .filter(|fp| {
+            m.pending_pairing_since
+                .is_some_and(|t| t.elapsed() < STALE_TTL)
+                && dismissed
+                    .get(*fp)
+                    .is_none_or(|t| t.elapsed() >= DISMISS_TTL)
+        })
+        .unwrap_or_default()
+        .to_owned()
+}
+
 /// First 16 hex chars of a fingerprint for a glanceable id.
 fn short_fp(fp: &str) -> String {
     let head: String = fp.chars().take(16).collect();
@@ -769,24 +785,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
             // repaints the window constantly (flickering VRR displays); when
             // nothing changed we touch nothing and the window stays static.
 
-            // a live pairing prompt: untrusted, still actively attempting (not a
-            // stale prompt for a peer that left), and not currently snooze-dismissed
-            let pairing = m
-                .pending_pairing
-                .as_ref()
-                .filter(|fp| {
-                    !m.authorized.contains_key(*fp)
-                        && m.pending_pairing_since
-                            .map(|t| t.elapsed() < STALE_TTL)
-                            .unwrap_or(false)
-                        && dismissed
-                            .borrow()
-                            .get(*fp)
-                            .map(|t| t.elapsed() >= DISMISS_TTL)
-                            .unwrap_or(true)
-                })
-                .cloned()
-                .unwrap_or_default();
+            let pairing = live_pairing(&m, &dismissed.borrow());
             let pairing_addr = if pairing.is_empty() {
                 String::new()
             } else {
@@ -1506,6 +1505,37 @@ mod add_opens_pairing {
             handler.contains("root.open-pairing()"),
             "the + add button no longer opens the pairing window, so no pairing \
              prompt can appear on this machine:\n{handler}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod second_direction {
+    //! A machine that may already drive this one answers this machine's dial.
+    //! The window's pairing card asks whether this machine may drive it: one
+    //! approval grants one direction, so the reverse needs its own card (#166).
+    use super::*;
+    use hops_frontend_core::{AppModel, AttemptOrigin, FrontendEvent};
+
+    const FP: &str = "1e:19:1b:2c:3d:4e:5f:60:71:82:93:a4:b5:c6:d7:e8";
+
+    // LEDGER T9 | class B | 1 return value: live_pairing, the value the poll loop sets as pairing-fp
+    #[test]
+    fn the_card_for_the_second_direction_is_shown() {
+        let mut m = AppModel::default();
+        m.apply(FrontendEvent::AuthorizedUpdated(
+            [(FP.to_owned(), "desk mac".to_owned())].into(),
+        ));
+        m.apply(FrontendEvent::ConnectionAttempt {
+            fingerprint: FP.into(),
+            origin: AttemptOrigin::OutboundDial,
+            addr: Some("10.0.0.5:4242".parse().expect("addr")),
+        });
+        assert_eq!(
+            live_pairing(&m, &HashMap::new()),
+            FP,
+            "no card asks whether this machine may drive a peer that may \
+             already drive it"
         );
     }
 }

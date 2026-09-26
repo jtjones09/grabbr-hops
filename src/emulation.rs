@@ -2304,3 +2304,148 @@ mod held_input_is_released {
         });
     }
 }
+
+#[cfg(test)]
+mod a_pairing_approved_both_ways {
+    //! Two machines that each approved the other in both directions drive each
+    //! other (#166). The first approval on each side lets one machine drive the
+    //! other; the second, the reverse. Everything is the production path: the
+    //! grant door the approval prompt calls, both TLS verifiers, the listener,
+    //! the per-event check and the emulation task, into a recording backend.
+
+    use super::*;
+    use crate::service::grant_for_attempt;
+    use crate::test_harness::{Dialer, Machine, dialer, machine, run_local, wait_until};
+    use crate::transport::Trust;
+    use crate::trust::TrustStore;
+    use hops_ipc::AttemptOrigin;
+    use input_emulation::recording::{Recorded, Recording};
+    use input_event::{KeyboardEvent, scancode};
+    use std::sync::{Arc, RwLock};
+
+    /// One machine: its store, and the listener and emulation it receives on.
+    struct Side {
+        machine: Machine,
+        trust: Trust,
+        recording: Recording,
+        _emulation: Emulation,
+        port: u16,
+    }
+
+    async fn side() -> Side {
+        let machine = machine();
+        let trust: Trust = Arc::new(RwLock::new(
+            TrustStore::new(&machine.fingerprint, 0).expect("our fingerprint"),
+        ));
+        let (clipboard_tx, _) = channel();
+        let (listener, port) =
+            LanMouseListener::bind_loopback(machine.identity.clone(), trust.clone(), clipboard_tx)
+                .await
+                .expect("listener");
+        let recording = Recording::new();
+        let emulation = Emulation::new(Some(recording.backend()), listener, trust.clone());
+        Side {
+            machine,
+            trust,
+            recording,
+            _emulation: emulation,
+            port,
+        }
+    }
+
+    /// What the approval prompt does when the user says yes to `peer`.
+    fn approve(on: &Side, peer: &Side, origin: AttemptOrigin) {
+        grant_for_attempt(
+            &mut on.trust.write().expect("trust lock"),
+            &peer.machine.fingerprint,
+            "the other machine",
+            Some(origin),
+        )
+        .expect("the approval grants");
+    }
+
+    /// `from` dials `to` and crosses onto it.
+    async fn drive(from: &Side, to: &Side) -> Dialer {
+        let d = dialer(
+            &from.machine,
+            from.trust.clone(),
+            to.port,
+            hops_ipc::Position::Left,
+        );
+        d.until_alive().await;
+        d.send(ProtoEvent::Enter(Position::Right)).await;
+        d
+    }
+
+    fn key(key: u32) -> Event {
+        Event::Keyboard(KeyboardEvent::Key {
+            time: 0,
+            key,
+            state: 1,
+        })
+    }
+
+    /// Send `event` over `d` and wait for it to reach `to`'s backend.
+    async fn types(d: &Dialer, to: &Side, event: Event, what: &str) {
+        let arrived = || {
+            to.recording
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Recorded::Consume(e, _) if *e == event))
+        };
+        d.send(ProtoEvent::Input(event)).await;
+        wait_until(what, Duration::from_secs(10), arrived).await;
+    }
+
+    // LEDGER T4 | class B | 6 struct state: Recording::calls() after service::grant_for_attempt on both machines, over LanMouseListener, Emulation and LanMouseConnection
+    #[test]
+    fn a_pairing_approved_both_ways_carries_input_both_ways() {
+        run_local(async {
+            let a = side().await;
+            let b = side().await;
+
+            // B drives A: A approved B's knock, B approved A answering its dial.
+            approve(&a, &b, AttemptOrigin::Inbound);
+            approve(&b, &a, AttemptOrigin::OutboundDial);
+            let b_to_a = drive(&b, &a).await;
+            types(
+                &b_to_a,
+                &a,
+                key(scancode::Linux::KeyA as u32),
+                "B's first key to reach A",
+            )
+            .await;
+
+            // Then A drives B: the reverse approval on each machine.
+            approve(&a, &b, AttemptOrigin::OutboundDial);
+            approve(&b, &a, AttemptOrigin::Inbound);
+            let a_to_b = drive(&a, &b).await;
+            types(
+                &a_to_b,
+                &b,
+                key(scancode::Linux::KeyB as u32),
+                "A's key to reach B",
+            )
+            .await;
+
+            // B still drives A, on the connection it already had...
+            types(
+                &b_to_a,
+                &a,
+                key(scancode::Linux::KeyC as u32),
+                "B's key to reach A after A was approved to drive B (#166: the \
+                 second approval replaced the first)",
+            )
+            .await;
+            // ...and on a new one, which passes both verifiers again.
+            let again = drive(&b, &a).await;
+            types(
+                &again,
+                &a,
+                key(scancode::Linux::KeyD as u32),
+                "B's key to reach A over a new connection",
+            )
+            .await;
+        });
+    }
+}

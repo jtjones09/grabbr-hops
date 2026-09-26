@@ -280,22 +280,7 @@ pub async fn run() -> Result<(), TuiError> {
             notice = None;
         }
 
-        // a live pending pairing: untrusted, still actively attempting (not a
-        // stale prompt for a peer that left), and not currently snooze-dismissed
-        let pairing: Option<String> = model.pending_pairing.clone().filter(|fp| {
-            if model.authorized.contains_key(fp) {
-                return false;
-            }
-            let fresh = model
-                .pending_pairing_since
-                .map(|t| t.elapsed() < STALE_TTL)
-                .unwrap_or(false);
-            let snoozed = dismissed
-                .get(fp)
-                .map(|t| t.elapsed() < DISMISS_TTL)
-                .unwrap_or(false);
-            fresh && !snoozed
-        });
+        let pairing = live_pairing(&model, &dismissed);
 
         let mut list_state = ListState::default();
         if count > 0 {
@@ -1068,6 +1053,18 @@ fn footer_line(
     Line::from(spans)
 }
 
+/// The pairing prompt to show: a request for a direction not yet permitted,
+/// still actively attempting (not a stale prompt for a peer that left), and not
+/// currently snooze-dismissed.
+fn live_pairing(model: &AppModel, dismissed: &HashMap<String, Instant>) -> Option<String> {
+    let fp = model.pairing_request()?;
+    let fresh = model
+        .pending_pairing_since
+        .is_some_and(|t| t.elapsed() < STALE_TTL);
+    let snoozed = dismissed.get(fp).is_some_and(|t| t.elapsed() < DISMISS_TTL);
+    (fresh && !snoozed).then(|| fp.to_owned())
+}
+
 /// Render a centered approve/deny popup for an untrusted incoming peer.
 fn pairing_popup(
     f: &mut Frame,
@@ -1244,6 +1241,59 @@ mod tests {
 
     fn screen(model: &AppModel, sel: usize) -> String {
         render(model, sel).join("\n")
+    }
+
+    /// A machine that may already drive this one answers this machine's dial.
+    /// The TUI asks whether this machine may drive it: one approval grants one
+    /// direction, so the reverse needs its own card (#166).
+    // LEDGER T8 | class B | 3 widget tree: live_pairing, ui() into a TestBackend
+    #[test]
+    fn the_card_for_the_second_direction_is_shown() {
+        use hops_frontend_core::{AttemptOrigin, FrontendEvent};
+        let mut model = AppModel::default();
+        model.apply(FrontendEvent::AuthorizedUpdated(
+            [(FP.to_owned(), "desk mac".to_owned())].into(),
+        ));
+        model.apply(FrontendEvent::ConnectionAttempt {
+            fingerprint: FP.into(),
+            origin: AttemptOrigin::OutboundDial,
+            addr: Some("10.0.0.5:4242".parse().expect("addr")),
+        });
+
+        let pairing = live_pairing(&model, &HashMap::new());
+        let devices = listable(&model);
+        let mut state = ListState::default();
+        let theme = theme::default_theme();
+        let mut term = Terminal::new(TestBackend::new(120, 24)).expect("test terminal");
+        term.draw(|f| {
+            ui(
+                f,
+                &model,
+                &devices,
+                &mut state,
+                None,
+                None,
+                pairing.as_deref(),
+                None,
+                false,
+                &theme,
+            )
+        })
+        .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let out = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            out.contains("we dialled this device") && out.contains("10.0.0.5:4242 answered"),
+            "no card asks whether this machine may drive a peer that may \
+             already drive it:\n{out}"
+        );
     }
 
     /// While pairing prompts may appear here, the footer says so and for how

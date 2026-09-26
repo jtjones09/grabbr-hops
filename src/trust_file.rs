@@ -1994,4 +1994,66 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
         assert_eq!(hex_decode("zz"), None, "not hex");
         assert_eq!(hex_decode("AB"), None, "uppercase is not our encoding");
     }
+
+    /// Two machines that drive each other: this one approved B's knock, then
+    /// approved B answering this machine's own dial. The second approval adds
+    /// a direction to the pairing. It used to replace the lease, so B lost the
+    /// right to drive this machine the moment this machine could drive B
+    /// (#166). Both directions, both clipboard directions and the name given
+    /// at the first approval survive the grant, the save and a restart.
+    // LEDGER T1 | class B | 4 file on disk + 1 return value: service::grant_for_attempt, TrustFile::save, TrustFile::open, rebuild, TrustStore::permits
+    #[test]
+    fn approving_the_second_direction_keeps_the_first() {
+        use crate::service::grant_for_attempt;
+        use hops_ipc::AttemptOrigin;
+
+        let d = tmpdir("second-direction");
+        let auth = authority(&d);
+        let (mut file, _) = TrustFile::open(&d, auth.clone()).expect("open");
+        let mut store = TrustStore::new(&ours(), file.now()).expect("ours");
+
+        grant_for_attempt(&mut store, B, "desk mac", Some(AttemptOrigin::Inbound))
+            .expect("the first approval grants");
+        grant_for_attempt(
+            &mut store,
+            B,
+            "b4:ab short name",
+            Some(AttemptOrigin::OutboundDial),
+        )
+        .expect("the second approval grants");
+        file.save(&records_of(&store)).expect("save");
+
+        let (file, loaded) = TrustFile::open(&d, auth).expect("reopen");
+        let Loaded::Present { leases, .. } = loaded else {
+            panic!("the saved store must be found");
+        };
+        let (store, refused) = rebuild(&ours(), file.now(), &leases).expect("rebuild");
+        assert!(refused.is_empty(), "refused on load: {refused:?}");
+
+        let lost: Vec<String> = Caps::NAMED
+            .iter()
+            .filter(|(bit, _)| !store.permits(B, *bit))
+            .map(|(_, name)| (*name).to_owned())
+            .collect();
+        assert!(
+            lost.is_empty(),
+            "after approving both directions and restarting, the pairing no \
+             longer permits {lost:?}; it holds {}. A second approval must add \
+             to the pairing, not replace it (#166).",
+            store.capabilities(B)
+        );
+        assert_eq!(
+            store.label(B).as_deref(),
+            Some("desk mac"),
+            "the second approval renamed the device; it adds a direction and \
+             must keep the name the device already has"
+        );
+        assert_eq!(
+            store.lease(B).map(|l| l.origin),
+            Some(Origin::Migrated),
+            "a pairing that holds both directions was saved as coming from \
+             one approval; two approvals add up to what `origin_of` names"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
 }

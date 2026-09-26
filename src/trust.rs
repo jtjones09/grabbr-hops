@@ -469,7 +469,8 @@ pub enum Origin {
     Inbound,
     /// Our own dial reached this peer and the user approved the prompt.
     OutboundDial,
-    /// Carried forward from `[authorized_fingerprints]`.
+    /// Carried forward from `[authorized_fingerprints]`, or both directions
+    /// from two approvals added together (#166).
     Migrated,
     // No `Restored`. An expelled fingerprint is never re-authorised — the
     // machine returns by generating a new identity, which arrives as `Inbound`
@@ -765,6 +766,10 @@ impl TrustStore {
 
     /// Issue (or renew, or widen) a lease. The user-facing grant.
     ///
+    /// A grant to a device whose lease is in force adds the granted
+    /// capabilities to that lease and keeps its name (#166): approving the
+    /// second direction of a pairing leaves the first in place.
+    ///
     /// Issuing **clears any denial** of that fingerprint. That is the whole of
     /// the removal is one record: there is no second table to launder around, because
     /// the record of an expulsion is not a separate table that has to outrank
@@ -852,6 +857,42 @@ impl TrustStore {
                 granted: wrong,
             });
         }
+
+        // A grant to a pairing in force adds to it (#166). One approval
+        // answers one question about one direction, so a pair of machines
+        // meant to drive each other is approved twice, and replacing the lease
+        // made the second approval take away the first. The approval, checked
+        // above on its own, decides the capabilities it adds and the time of
+        // the grant. The rest of the lease belongs to the pairing, the name it
+        // already has included, and is kept.
+        //
+        // In force only. A lapsed lease grants nothing, and folding it in would
+        // revive a direction nobody was asked about this time; a removed device
+        // gets no lease at all, because `admit` refuses it.
+        let held = self
+            .entries
+            .get(&lease.peer)
+            .filter(|e| !effective_capabilities(e, &self.ours, now).is_empty())
+            .and_then(|e| e.lease.clone());
+        let lease = match held {
+            Some(held) => {
+                let caps = held.caps | lease.caps;
+                Lease {
+                    caps,
+                    // Two directions from two approvals are what `origin_of`
+                    // says they add up to.
+                    origin: if caps == lease.caps {
+                        lease.origin
+                    } else {
+                        origin_of(caps)
+                    },
+                    issued_at: lease.issued_at,
+                    expiry: lease.expiry,
+                    ..held
+                }
+            }
+            None => lease,
+        };
 
         // Through `admit`, deliberately, so there is exactly ONE door into the
         // store and it is the one that refuses an expelled fingerprint. This
@@ -1600,6 +1641,78 @@ mod tests {
         );
         assert!(!s.clipboard_from(&receiver));
         assert_eq!(s.capabilities(&receiver), Caps::OUTBOUND);
+    }
+
+    /// Adding to a pairing does not relax what one approval may grant. A
+    /// machine we drive, approved again from our own dial, gets nothing an
+    /// outbound approval cannot mint, however the pairing already stands
+    /// (#130, #166).
+    // LEDGER T2 | class B | 1 error + 6 struct state: TrustStore::issue_with_origin, TrustStore::may_drive_us
+    #[test]
+    fn a_second_approval_is_checked_against_its_own_origin() {
+        let mut s = store();
+        let receiver = fp(0x13);
+        s.issue_with_origin(&receiver, "den", Caps::OUTBOUND, Origin::OutboundDial)
+            .expect("issue");
+
+        assert_eq!(
+            s.issue_with_origin(&receiver, "den", Caps::KNOWN, Origin::OutboundDial),
+            Err(TrustError::DirectionMismatch {
+                origin: Origin::OutboundDial,
+                granted: "inbound",
+            }),
+            "an outbound approval carrying inbound control was accepted because \
+             the device was already paired"
+        );
+        assert!(
+            !s.may_drive_us(&receiver),
+            "an approval of our own dial let the receiver drive this machine"
+        );
+        assert_eq!(s.capabilities(&receiver), Caps::OUTBOUND);
+    }
+
+    /// A lapsed pairing grants nothing, so approving one direction of it grants
+    /// that direction and nothing more. Adding to a pairing is for one that is
+    /// in force; reviving the other direction would grant what nobody was asked
+    /// about this time.
+    // LEDGER T3 | class B | 1 return value: TrustStore::issue_with_origin, TrustStore::capabilities
+    #[test]
+    fn approving_one_direction_of_a_lapsed_pairing_does_not_revive_the_other() {
+        let mut s = store();
+        let peer = fp(0x25);
+        s.issue_with_term(&peer, "workshop", Caps::INBOUND, Term::Secs(HOUR))
+            .expect("issue");
+        s.sweep(T0 + DAY);
+        assert!(!s.has_live_lease(&peer), "precondition: it has lapsed");
+
+        s.issue_with_origin(&peer, "workshop", Caps::OUTBOUND, Origin::OutboundDial)
+            .expect("issue");
+        assert_eq!(
+            s.capabilities(&peer),
+            Caps::OUTBOUND,
+            "approving our dial to a lapsed pairing revived its inbound half"
+        );
+    }
+
+    /// An approval that grants everything the pairing already holds is a
+    /// renewal, not an addition, so the lease records the act the approval
+    /// names. Only a lease that adds up two approvals takes the origin
+    /// `origin_of` derives from the union (#166).
+    // LEDGER T10 | class B | 1 struct state: TrustStore::issue_with_origin, TrustStore::lease
+    #[test]
+    fn an_approval_covering_the_pairing_keeps_its_own_origin() {
+        let mut s = store();
+        let peer = fp(0x26);
+        s.issue(&peer, "attic", Caps::INBOUND).expect("issue");
+        assert_eq!(s.lease(&peer).map(|l| l.origin), Some(Origin::Inbound));
+
+        s.issue_with_origin(&peer, "attic", Caps::INBOUND, Origin::Migrated)
+            .expect("issue");
+        assert_eq!(
+            s.lease(&peer).map(|l| (l.caps, l.origin)),
+            Some((Caps::INBOUND, Origin::Migrated)),
+            "an approval that adds nothing lost the origin it was given"
+        );
     }
 
     #[test]
