@@ -812,13 +812,27 @@ impl Service {
                 // Deliberately here and NOT in remove_client(): that is also
                 // called by handle_config_change, which removes clients it
                 // replaces, so revoking there would drop trust on a reload.
+                //
+                // A config saved before #12 can hold a second device pinned
+                // to the same machine, folded into this one's card. It goes
+                // too: left behind, the revocation clears its pin and it
+                // dials whatever answers at its address.
+                let mut gone = vec![handle];
                 if let Some(fp) = self.client_manager.peer_fingerprint(handle) {
+                    gone.extend(
+                        self.client_manager
+                            .pinned_to(&fp)
+                            .into_iter()
+                            .filter(|&h| h != handle),
+                    );
                     if self.trust.read().expect("lock").is_known(&fp) {
                         log::warn!("deleting client {handle}: also revoking its trust ({fp})");
                         self.remove_authorized_key(fp);
                     }
                 }
-                self.remove_client(handle);
+                for handle in gone {
+                    self.remove_client(handle);
+                }
                 self.save_config();
             }
             FrontendRequest::EnableCapture => self.capture.reenable(),
@@ -1943,16 +1957,22 @@ impl Service {
     }
 
     /// Dial again every device still being added. Stops for one that connected,
-    /// was switched off or removed, or ran out of time; the last says why.
+    /// was switched off or removed, reached a machine another device already
+    /// dials, or ran out of time; the last two say why.
     fn retry_adding(&mut self) {
         let now = Instant::now();
         let window_open = self.prompt_gate.remaining(now).is_some();
         let mut gave_up = Vec::new();
+        let mut added_before = Vec::new();
         self.adding.retain(|&handle, &mut started| {
             let Some((_, state)) = self.client_manager.get_state(handle) else {
                 return false;
             };
             if !state.active || self.client_manager.active_addr(handle).is_some() {
+                return false;
+            }
+            if let Some(other) = self.client_manager.same_machine_as(handle) {
+                added_before.push((handle, other));
                 return false;
             }
             if !window_open || now.saturating_duration_since(started) >= PromptGate::WINDOW {
@@ -1962,17 +1982,29 @@ impl Service {
             self.capture.dial(handle);
             true
         });
+        for (handle, other) in added_before {
+            let (name, other) = (self.device_name(handle), self.device_name(other));
+            log::info!("stopped dialling {name}: it is {other}, which is already added");
+            self.notify_frontend(FrontendEvent::Error(format!(
+                "{name} is the same machine as {other}, which is already added. \
+                 Remove {name}."
+            )));
+        }
         for handle in gave_up {
-            let name = self
-                .client_manager
-                .get_hostname(handle)
-                .unwrap_or_else(|| format!("device {handle}"));
+            let name = self.device_name(handle);
             log::info!("stopped dialling {name}: pairing did not finish in time");
             self.notify_frontend(FrontendEvent::Error(format!(
                 "Pairing with {name} did not finish in two minutes. Open add device on \
                  both machines, then switch {name} off and on to try again."
             )));
         }
+    }
+
+    /// What the user calls the device at `handle`.
+    fn device_name(&self, handle: ClientHandle) -> String {
+        self.client_manager
+            .get_hostname(handle)
+            .unwrap_or_else(|| format!("device {handle}"))
     }
 
     fn deactivate_client(&mut self, handle: ClientHandle) {

@@ -583,3 +583,105 @@ fn a_delete_or_rename_for_a_pin_the_device_no_longer_has_is_refused() {
         );
     });
 }
+
+// LEDGER T9904 | class B | 1 error event and device list returned over IPC by the hops binary, dialling a real QUIC receiver
+/// A machine added a second time, here by address while it is already a
+/// device, is not dialled for the new device, and the user is told which
+/// device it already is (#12). It used to be pinned to the machine too, and
+/// the two made one card whose name came from one and whose buttons acted
+/// on the other.
+#[test]
+fn a_machine_added_a_second_time_is_refused_and_the_user_is_told() {
+    local(async {
+        let (daemon, receiver, mut frontend, first) = connected("6").await;
+        frontend.send(FrontendRequest::OpenPairing).await;
+        frontend.send(FrontendRequest::Create).await;
+        let again = frontend
+            .next("the new device", |e| match e {
+                FrontendEvent::Created(h, ..) => Some(h),
+                _ => None,
+            })
+            .await;
+        for request in [
+            FrontendRequest::UpdateFixIps(again, vec!["127.0.0.1".parse().expect("ip")]),
+            FrontendRequest::UpdatePort(again, receiver.port),
+            FrontendRequest::UpdatePosition(again, hops_ipc::Position::Right),
+            FrontendRequest::Activate(again, true),
+        ] {
+            frontend.send(request).await;
+        }
+
+        let told = frontend
+            .next(
+                "the notice that the machine is already added",
+                |e| match e {
+                    FrontendEvent::Error(m) if m.contains("same machine") => Some(m),
+                    _ => None,
+                },
+            )
+            .await;
+        assert!(
+            told.contains("127.0.0.1"),
+            "the notice does not name the device already added: {told}"
+        );
+        let devices = frontend.devices().await;
+        assert_eq!(
+            (
+                devices
+                    .get(&first)
+                    .and_then(|(_, s)| s.peer_fingerprint.clone()),
+                devices
+                    .get(&again)
+                    .and_then(|(_, s)| s.peer_fingerprint.clone()),
+            ),
+            (Some(receiver.fingerprint.clone()), None),
+            "(first device's pin, second device's pin): only the first device \
+             may be pinned to the machine; log:\n{}",
+            daemon.log()
+        );
+    });
+}
+
+// LEDGER T9905 | class B | 1 device list returned over IPC by the hops binary after a real config load
+/// A config saved before #12 can hold two devices pinned to one machine,
+/// shown as one card. Deleting that card removes both: the machine is
+/// revoked, and a device left behind would lose its pin to the revocation
+/// and dial whatever answers at its address.
+#[test]
+fn deleting_a_machine_saved_as_two_devices_removes_both() {
+    local(async {
+        let pin = format!("{}33", "33:".repeat(31));
+        let entry = |name: &str, pos: &str| {
+            format!(
+                "\n[[clients]]\nhostname = \"{name}\"\nposition = \"{pos}\"\n\
+                 fingerprint = \"{pin}\"\n"
+            )
+        };
+        let daemon = Daemon::start(
+            "7",
+            &format!(
+                "{DUMMY}{}{}\n[authorized_fingerprints]\n\"{pin}\" = \"desk\"\n",
+                entry("desk.invalid", "top"),
+                entry("192.0.2.10", "bottom"),
+            ),
+        );
+        let mut frontend = Frontend::attach().await;
+        let shown = frontend.devices().await;
+        assert_eq!(shown.len(), 2, "precondition: both devices loaded");
+        let desk = handle_named(&shown, "desk.invalid");
+
+        frontend
+            .send(FrontendRequest::Delete {
+                handle: desk,
+                fingerprint: Some(pin),
+            })
+            .await;
+        assert_eq!(
+            names(&frontend.devices().await),
+            Vec::<String>::new(),
+            "the machine was deleted and a second device pinned to it is still \
+             there; log:\n{}",
+            daemon.log()
+        );
+    });
+}

@@ -845,6 +845,14 @@ impl AppModel {
                         send: None,
                         receive: false,
                     });
+                    // One entry per card. Of two entries for one machine, the
+                    // first added names the card and takes its buttons (#12):
+                    // the name used to come from one and the buttons from the
+                    // other. `clients` is ordered by handle, and the daemon
+                    // dials the machine for that same entry only.
+                    if device.send.is_some() {
+                        continue;
+                    }
                     // A user-typed send-side hostname is the preferred label --
                     // EXCEPT when it is a bare IP literal. Adding a device by
                     // address puts the IP in the name field, and an address is a
@@ -1844,6 +1852,50 @@ mod projection {
         for d in &devices {
             assert!(d.send.is_some(), "{} keeps its outgoing facet", d.label);
             assert!(d.receive, "{} may still drive this machine", d.label);
+        }
+    }
+
+    /// The same machine added twice, once by name and once by address: one
+    /// card, whose name and controls come from the same entry, the first
+    /// added (#12). The name came from one entry and the handle every button
+    /// acts on from the other.
+    // LEDGER T9902 | class B | 6 struct state: AppModel::devices()
+    #[test]
+    fn a_machine_added_twice_is_one_card_named_and_driven_by_one_entry() {
+        let desk = "73:90:2a:3c:9d:e5";
+        for (first, second) in [
+            (Some("desk-mac.local"), Some("192.0.2.10")),
+            (Some("192.0.2.10"), Some("desk-mac.local")),
+            (Some("desk-mac.local"), Some("den")),
+        ] {
+            let mut m = AppModel::default();
+            m.clients.insert(3, client(first, Some(desk)));
+            m.clients.insert(7, client(second, Some(desk)));
+            m.authorized
+                .insert(desk.to_string(), "desk mac".to_string());
+            let devices = m.devices();
+            let cards: Vec<(&str, Option<u64>, Option<&str>)> = devices
+                .iter()
+                .map(|d| {
+                    let send = d.send.as_ref();
+                    (
+                        d.label.as_str(),
+                        send.map(|s| s.handle),
+                        send.and_then(|s| s.config.hostname.as_deref()),
+                    )
+                })
+                .collect();
+            let named = match first {
+                Some(h) if h.parse::<std::net::IpAddr>().is_err() => h,
+                _ => "desk mac",
+            };
+            assert_eq!(
+                cards,
+                [(named, Some(3), first)],
+                "(name, the handle its buttons act on, that handle's hostname): \
+                 {first:?} then {second:?}, both the desk. The card has to be the \
+                 first entry's, name and buttons both"
+            );
         }
     }
 

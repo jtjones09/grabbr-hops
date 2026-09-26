@@ -792,28 +792,39 @@ async fn connect_to_handle(
             connecting.lock().await.remove(&handle);
             return Err(LanMouseConnectionError::NotConnected);
         }
-        log::info!("client ({handle}) connected @ {addr}");
         // Stamp the receiver's leaf-cert fingerprint from THIS connection — the
         // pin identity + the key the frontend uses to correlate this client with
         // its authorized_fingerprints entry. Only overwrite on a real read: a
         // None from an accepted handshake (shouldn't happen) must NOT wipe a good
         // prior pin — that would fail OPEN on the next dial.
         match peer_fingerprint(&link.conn) {
-            Some(fp) => {
-                let is_new =
-                    client_manager.peer_fingerprint(handle).as_deref() != Some(fp.as_str());
-                log::info!("client {handle} receiver fingerprint: {fp}");
-                client_manager.set_peer_fingerprint(handle, Some(fp));
-                // persist it so the device view can join from a cold start
-                if is_new {
-                    let _ = persist_tx.send(handle);
+            Some(fp) => match client_manager.pin(handle, fp.clone()) {
+                Ok(is_new) => {
+                    log::info!("client {handle} receiver fingerprint: {fp}");
+                    // persist it so the device view can join from a cold start
+                    if is_new {
+                        let _ = persist_tx.send(handle);
+                    }
                 }
-            }
+                // One device per machine (#12): this machine is another
+                // device's, so this device pins nothing and keeps no link.
+                Err(other) => {
+                    drop(open);
+                    log::warn!(
+                        "client {handle}: {addr} is {fp}, the machine client {other} \
+                         already dials; closing this link"
+                    );
+                    link.conn.close(0u32.into(), b"already added");
+                    connecting.lock().await.remove(&handle);
+                    return Err(LanMouseConnectionError::NotConnected);
+                }
+            },
             None => log::warn!(
                 "client {handle}: connected but could not read the receiver's \
                  leaf-cert fingerprint; keeping any prior pin"
             ),
         }
+        log::info!("client ({handle}) connected @ {addr}");
         client_manager.set_active_addr(handle, Some(addr));
         open.insert(addr, link.clone());
         drop(open);
