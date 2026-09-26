@@ -1529,3 +1529,307 @@ mod the_service_problem {
         assert_eq!(model.service_problem(), None);
     }
 }
+
+#[cfg(test)]
+mod projection {
+    //! One card per physical peer, joined on the fingerprint across the
+    //! outgoing clients and the trust tables, which is the projection both
+    //! front-ends render.
+    use super::{AppModel, ClientConfig, ClientState, FrontendEvent, TrustState, fallback_label};
+
+    fn client(hostname: Option<&str>, peer_fp: Option<&str>) -> (ClientConfig, ClientState) {
+        let config = ClientConfig {
+            hostname: hostname.map(String::from),
+            ..Default::default()
+        };
+        let state = ClientState {
+            peer_fingerprint: peer_fp.map(String::from),
+            ..Default::default()
+        };
+        (config, state)
+    }
+
+    fn revoked(label: &str) -> super::RevokedEntry {
+        super::RevokedEntry {
+            label: label.to_string(),
+            revoked_at: 1_754_000_000,
+        }
+    }
+
+    // LEDGER T501 | class B | 6 struct state: AppModel::devices()
+    #[test]
+    fn merges_client_and_authorized_by_fingerprint() {
+        let mut m = AppModel::default();
+        let fp = "aa:bb:cc:dd";
+        m.clients.insert(0, client(Some("studio-mac"), Some(fp)));
+        m.authorized
+            .insert(fp.to_string(), "studio-mac".to_string());
+        let devices = m.devices();
+        assert_eq!(devices.len(), 1, "one machine must render as one card");
+        let d = &devices[0];
+        assert!(d.send.is_some(), "carries the outgoing facet");
+        assert!(d.receive, "may drive this machine");
+        assert_eq!(d.trust, TrustState::Trusted);
+        assert_eq!(d.fingerprint.as_deref(), Some(fp));
+    }
+
+    /// Two machines added by address: the name field holds an address. Once
+    /// the fingerprint is learned, each collapses into one card named by the
+    /// peer, not by its address.
+    // LEDGER T502 | class B | 6 struct state: AppModel::devices()
+    #[test]
+    fn ip_named_client_merges_and_takes_the_peer_description() {
+        let mut m = AppModel::default();
+        let desk = "73:90:2a:3c:9d:e5";
+        let laptop = "2d:65:8f:e6:f8:2b";
+        m.clients.insert(0, client(Some("192.0.2.10"), Some(desk)));
+        m.clients
+            .insert(1, client(Some("192.0.2.11"), Some(laptop)));
+        m.authorized
+            .insert(desk.to_string(), "desk mac".to_string());
+        m.authorized
+            .insert(laptop.to_string(), "laptop".to_string());
+
+        let devices = m.devices();
+        assert_eq!(devices.len(), 2, "two machines, not four cards");
+        let mut labels: Vec<&str> = devices.iter().map(|d| d.label.as_str()).collect();
+        labels.sort();
+        assert_eq!(labels, ["desk mac", "laptop"], "named by peer, not by IP");
+        for d in &devices {
+            assert!(d.send.is_some(), "{} keeps its outgoing facet", d.label);
+            assert!(d.receive, "{} may still drive this machine", d.label);
+        }
+    }
+
+    /// A denial the trust store still holds must never render like a device
+    /// never met.
+    // LEDGER T503 | class B | 6 struct state: AppModel::devices()
+    #[test]
+    fn a_revoked_device_is_shown_as_revoked_not_as_a_stranger() {
+        let mut m = AppModel::default();
+        let fp = "aa:bb:cc:dd";
+        m.revoked.insert(fp.to_string(), revoked("old laptop"));
+        let devices = m.devices();
+        assert_eq!(devices.len(), 1, "the removed device stays visible");
+        assert_eq!(devices[0].trust, TrustState::Revoked);
+        assert_eq!(
+            devices[0].label, "old laptop",
+            "it keeps the name it was known by"
+        );
+        assert!(!devices[0].receive, "revoked means it may not drive us");
+    }
+
+    /// A revoked peer reconnecting must not surface as a pairing request.
+    // LEDGER T504 | class B | 6 struct state: AppModel::devices()
+    #[test]
+    fn a_revoked_peer_cannot_appear_as_a_pending_approval() {
+        let mut m = AppModel::default();
+        let fp = "aa:bb:cc:dd";
+        m.revoked.insert(fp.to_string(), revoked("old laptop"));
+        m.pending_pairing = Some(fp.to_string());
+        let devices = m.devices();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(
+            devices[0].trust,
+            TrustState::Revoked,
+            "a reconnecting revoked peer must not be offered as a new pairing"
+        );
+    }
+
+    /// If both tables somehow name the same fingerprint, it must not render as
+    /// trusted.
+    // LEDGER T505 | class B | 6 struct state: AppModel::devices()
+    #[test]
+    fn authorized_wins_only_when_not_revoked() {
+        let mut m = AppModel::default();
+        let fp = "aa:bb:cc:dd";
+        m.authorized.insert(fp.to_string(), "old laptop".into());
+        let devices = m.devices();
+        assert_eq!(
+            devices[0].trust,
+            TrustState::Trusted,
+            "plain trusted device"
+        );
+
+        m.revoked.insert(fp.to_string(), revoked("old laptop"));
+        let devices = m.devices();
+        assert_eq!(devices.len(), 1, "still one card, not two");
+        assert_eq!(
+            devices[0].trust,
+            TrustState::Revoked,
+            "revoked outranks authorized: a denied identity cannot present as trusted"
+        );
+        assert!(!devices[0].receive, "and it may not drive us");
+    }
+
+    /// Filtering on `send.is_some() || receive` drops revoked devices, so the
+    /// removed state never rendered in the real app.
+    // LEDGER T506 | class B | 1 return value: Device::is_listable over AppModel::devices()
+    #[test]
+    fn a_revoked_device_survives_the_list_filter() {
+        let mut m = AppModel::default();
+        m.revoked
+            .insert("aa:bb:cc:dd".into(), revoked("old laptop"));
+        let devices = m.devices();
+        assert_eq!(devices.len(), 1);
+        assert!(
+            devices[0].is_listable(),
+            "a revoked device must reach the device list, or nothing says it was removed"
+        );
+        assert_eq!(
+            devices.iter().filter(|d| d.is_listable()).count(),
+            1,
+            "exactly one listable row"
+        );
+    }
+
+    /// The daemon's only channel for "that didn't work": each failure must
+    /// be something a UI can tell is new.
+    // LEDGER T507 | class B | 6 struct state: AppModel::apply
+    #[test]
+    fn errors_become_a_notice_the_ui_can_tell_is_new() {
+        let mut m = AppModel::default();
+        assert_eq!(m.latest_message(), None, "nothing to show at rest");
+        assert_eq!(m.message_seq, 0);
+
+        m.apply(FrontendEvent::Error("could not resolve studio-pc".into()));
+        assert_eq!(
+            m.latest_message(),
+            Some("error: could not resolve studio-pc")
+        );
+        let first = m.message_seq;
+        assert!(
+            first > 0,
+            "a notice must bump the seq or the UI cannot raise it"
+        );
+
+        // A second, identical error must still be distinguishable, or a
+        // dismissed banner would stay hidden through a repeat of the failure.
+        m.apply(FrontendEvent::Error("could not resolve studio-pc".into()));
+        assert!(
+            m.message_seq > first,
+            "a repeated failure must re-raise the banner"
+        );
+    }
+
+    /// A peer that reconnects on a new source port must not be reported
+    /// offline by the old address's late disconnect.
+    // LEDGER T508 | class B | 6 struct state: AppModel::apply
+    #[test]
+    fn a_reconnect_on_a_new_port_stays_connected() {
+        use std::net::SocketAddr;
+        let fp = "aa:bb:cc:dd";
+        let old: SocketAddr = "192.0.2.5:50001".parse().unwrap();
+        let new: SocketAddr = "192.0.2.5:50002".parse().unwrap();
+
+        let mut m = AppModel::default();
+        m.apply(FrontendEvent::DeviceConnected {
+            addr: old,
+            fingerprint: fp.into(),
+        });
+        assert!(m.connected_peers.contains(fp));
+
+        // The reconnect lands first, then the old socket's disconnect.
+        m.apply(FrontendEvent::DeviceConnected {
+            addr: new,
+            fingerprint: fp.into(),
+        });
+        m.apply(FrontendEvent::IncomingDisconnected(old));
+        assert!(
+            m.connected_peers.contains(fp),
+            "the peer is still connected on the new port; a late disconnect \
+             for the old one must not mark it offline"
+        );
+
+        m.apply(FrontendEvent::IncomingDisconnected(new));
+        assert!(
+            !m.connected_peers.contains(fp),
+            "the last address leaving means offline"
+        );
+    }
+
+    // LEDGER T509 | class B | 6 struct state: AppModel::devices()
+    #[test]
+    fn offline_client_and_unrelated_trust_stay_two_cards() {
+        let mut m = AppModel::default();
+        // an outgoing client that has never connected (no fingerprint yet)
+        m.clients.insert(0, client(Some("studio-mac"), None));
+        // an unrelated peer that may drive us (receive-only)
+        m.authorized
+            .insert("cc:dd:ee:ff".to_string(), "windows-box".to_string());
+        let devices = m.devices();
+        assert_eq!(devices.len(), 2, "no fingerprint to join on => two cards");
+        assert!(
+            devices
+                .iter()
+                .any(|d| d.fingerprint.is_none() && d.send.is_some())
+        );
+        assert!(devices.iter().any(|d| d.receive && d.send.is_none()));
+    }
+
+    // LEDGER T510 | class B | 6 struct state: AppModel::devices()
+    #[test]
+    fn excludes_this_device() {
+        let mut m = AppModel::default();
+        let me = "de:ad:be:ef";
+        m.fingerprint = Some(me.to_string());
+        m.authorized.insert(me.to_string(), "myself".to_string());
+        m.revoked.insert(me.to_string(), revoked("myself"));
+        m.pending_pairing = Some(me.to_string());
+        assert!(m.devices().is_empty(), "never list ourselves");
+    }
+
+    // LEDGER T511 | class B | 6 struct state: AppModel::devices()
+    #[test]
+    fn bare_pairing_request_surfaces_as_pending() {
+        let mut m = AppModel::default();
+        let fp = "12:34:56:78";
+        m.pending_pairing = Some(fp.to_string());
+        let devices = m.devices();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].trust, TrustState::PendingApproval);
+        assert_eq!(devices[0].fingerprint.as_deref(), Some(fp));
+        assert!(
+            !devices[0].is_listable(),
+            "a bare request lives on the pairing card, not in the list"
+        );
+    }
+
+    // LEDGER T512 | class B | 6 struct state: AppModel::apply + AppModel::devices()
+    #[test]
+    fn online_reflects_connected_peers() {
+        let mut m = AppModel::default();
+        let fp = "aa:bb:cc:dd";
+        m.authorized
+            .insert(fp.to_string(), "studio-mac".to_string());
+        m.apply(FrontendEvent::DeviceConnected {
+            addr: "192.0.2.5:50001".parse().unwrap(),
+            fingerprint: fp.into(),
+        });
+        let devices = m.devices();
+        assert_eq!(devices.len(), 1);
+        assert!(devices[0].online);
+    }
+
+    /// Approving a peer without typing a name must produce the same label
+    /// the projection would have chosen, from either front-end.
+    // LEDGER T513 | class B | 1 return value: fallback_label, 6 struct state: AppModel::devices()
+    #[test]
+    fn a_blank_approval_is_named_the_same_way_everywhere() {
+        let fp = "1e:19:1b:2c:3d:4e:5f:60";
+        let label = fallback_label(fp);
+        assert_eq!(label, "1e:19:1b");
+
+        let mut m = AppModel::default();
+        m.authorized.insert(fp.to_string(), label.clone());
+        let d = m.devices();
+        assert_eq!(d.len(), 1);
+        assert_eq!(
+            d[0].label, label,
+            "the stored fallback must match what the projection displays"
+        );
+
+        // an empty fingerprint must still yield something sayable
+        assert_eq!(fallback_label(""), "unnamed device");
+    }
+}
