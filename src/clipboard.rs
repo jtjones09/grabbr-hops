@@ -20,6 +20,7 @@
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
+use crate::client::ClientManager;
 use crate::transport::{PeerClipboard, Trust};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio::time::{MissedTickBehavior, interval};
@@ -142,21 +143,31 @@ impl Clipboard {
 /// completes. This is the last check, at the moment of applying: text queued
 /// before its sender was removed must not land after it. Holding the receiver
 /// privately makes this the only way from the network to [`Clipboard::apply`].
+///
+/// It is also the only check of the device switch on text coming in: a
+/// machine switched off here has none of its text applied, whichever of the
+/// two machines opened the link it came over (#218).
 pub(crate) struct ClipboardInbox {
     rx: Receiver<PeerClipboard>,
     trust: Trust,
+    clients: ClientManager,
 }
 
 impl ClipboardInbox {
-    pub(crate) fn new(rx: Receiver<PeerClipboard>, trust: Trust) -> Self {
-        Self { rx, trust }
+    pub(crate) fn new(rx: Receiver<PeerClipboard>, trust: Trust, clients: ClientManager) -> Self {
+        Self { rx, trust, clients }
     }
 
-    /// The next text a peer sent whose pairing still takes clipboard from it.
-    /// `None` once every transport has gone.
+    /// The next text a peer sent whose pairing still takes clipboard from it,
+    /// from a machine not switched off here. `None` once every transport has
+    /// gone.
     pub(crate) async fn next(&mut self) -> Option<String> {
         loop {
             let received = self.rx.recv().await?;
+            if !self.clients.switch_allows_clipboard(&received.from) {
+                log::info!("clipboard text dropped: its sender is switched off on this machine");
+                continue;
+            }
             if self
                 .trust
                 .read()
@@ -419,7 +430,7 @@ mod clipboard_follows_the_pairing {
             let (me, peer) = (machine(), machine());
             let trust = trust(&me, &[&peer], Caps::INBOUND);
             let (queue, rx) = channel();
-            let mut inbox = ClipboardInbox::new(rx, trust.clone());
+            let mut inbox = ClipboardInbox::new(rx, trust.clone(), Default::default());
             let from_peer = |text: &str| PeerClipboard {
                 from: peer.fingerprint.clone(),
                 text: text.to_string(),
@@ -459,6 +470,311 @@ mod clipboard_follows_the_pairing {
                 Some(quinn::VarInt::from_u32(transport::CLIPBOARD_REFUSED)),
                 "a peer the pairing takes no clipboard from was left sending \
                  into a stream this machine would never use"
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod clipboard_follows_the_switch {
+    //! Off means off (#218): no clipboard text moves to or from a machine
+    //! whose device is switched off here, over the link this machine dialled
+    //! to it or the one it opened to this machine, and switching it back on
+    //! restores both. The machines are the production transports over
+    //! loopback; only the system clipboard at each end is left out.
+
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    use futures::StreamExt;
+    use hops_ipc::{ClientHandle, Position};
+    use hops_proto::ProtoEvent;
+    use local_channel::mpsc::channel;
+
+    use crate::client::ClientManager;
+    use crate::config::ConfigClient;
+    use crate::listen::{ClipboardSenderListen, LanMouseListener, ListenEvent};
+    use crate::test_harness::{
+        ARRIVES_WITHIN, Dialer, Machine, NEVER_WITHIN, applied_within, clipboard_pair, dialer,
+        heard_within, machine, run_local, trust, wait_until,
+    };
+    use crate::transport::Trust;
+    use crate::trust::{Caps, TrustStore};
+
+    use super::ClipboardInbox;
+
+    const LINK_UP_WITHIN: Duration = Duration::from_secs(10);
+
+    fn both_ways(me: &Machine, peer: &Machine) -> TrustStore {
+        let mut store = TrustStore::new(&me.fingerprint, 0).expect("ours");
+        store
+            .issue(&peer.fingerprint, "peer", Caps::KNOWN)
+            .expect("issue");
+        store
+    }
+
+    async fn heard(rx: &mut Dialer, within: Duration) -> Option<String> {
+        heard_within(&mut rx.notices.clipboard, within)
+            .await
+            .map(|(text, _)| text)
+    }
+
+    // LEDGER T2181 | class B | 1 return value: ClipboardInbox::next on each machine, after ClipboardSender::broadcast and ClipboardSenderListen::broadcast; OutboundRevoker::close_fingerprint, LanMouseConnection::send
+    #[test]
+    fn a_device_switched_off_is_sent_no_clipboard_over_the_link_dialled_to_it_and_none_of_its_is_applied()
+     {
+        run_local(async {
+            // This machine dialled the peer, as its first crossing does.
+            let (peer, me) = (machine(), machine());
+            let (on_peer, on_me) = (both_ways(&peer, &me), both_ways(&me, &peer));
+            let mut pair = clipboard_pair(peer, on_peer, me, on_me).await;
+            let (mut peer_applies, mut here_applies) = pair.inboxes();
+            let (switch, device) = (pair.dialer.clients.clone(), pair.dialer.handle);
+
+            pair.driver_sends.broadcast("switched on".into()).await;
+            pair.driven_sends.broadcast("its, switched on".into()).await;
+            assert_eq!(
+                (
+                    applied_within(&mut peer_applies, ARRIVES_WITHIN).await,
+                    applied_within(&mut here_applies, ARRIVES_WITHIN).await,
+                ),
+                (Some("switched on".into()), Some("its, switched on".into())),
+                "(there, here): clipboard did not flow both ways with the device on"
+            );
+
+            // Only the switch changes: the link stays up, as a link racing
+            // the switch would.
+            assert!(switch.deactivate_client(device), "precondition");
+            pair.driver_sends.broadcast("switched off".into()).await;
+            assert_eq!(
+                applied_within(&mut peer_applies, NEVER_WITHIN).await,
+                None,
+                "text copied here went to a device switched off here, over the \
+                 link this machine dialled to it"
+            );
+            pair.driven_sends
+                .broadcast("its, switched off".into())
+                .await;
+            assert_eq!(
+                applied_within(&mut here_applies, NEVER_WITHIN).await,
+                None,
+                "text from a device switched off here was applied here"
+            );
+
+            assert!(switch.activate_client(device), "precondition");
+            pair.driver_sends.broadcast("back on".into()).await;
+            pair.driven_sends.broadcast("its, back on".into()).await;
+            assert_eq!(
+                (
+                    applied_within(&mut peer_applies, ARRIVES_WITHIN).await,
+                    applied_within(&mut here_applies, ARRIVES_WITHIN).await,
+                ),
+                (Some("back on".into()), Some("its, back on".into())),
+                "(there, here): switching the device back on left its clipboard \
+                 stopped"
+            );
+
+            // What switching it off does to the link: closed by the
+            // fingerprint it proved. Switched back on, it is dialled at the
+            // next crossing, as any device that is on is.
+            assert!(switch.deactivate_client(device), "precondition");
+            let peer_fp = pair.driven.fingerprint.clone();
+            assert_eq!(
+                pair.dialer.conn.revoker().close_fingerprint(&peer_fp).await,
+                1,
+                "precondition: the link was up"
+            );
+            assert!(switch.activate_client(device), "precondition");
+            let _ = pair.dialer.conn.send(ProtoEvent::Ping, device).await;
+            wait_until(
+                "the device switched back on to be dialled again",
+                LINK_UP_WITHIN,
+                || pair.dialer.conn.active_addr(device).is_some(),
+            )
+            .await;
+            pair.driver_sends.broadcast("dialled again".into()).await;
+            assert_eq!(
+                applied_within(&mut peer_applies, ARRIVES_WITHIN).await,
+                Some("dialled again".into()),
+                "a device switched off and on again was not sent clipboard over \
+                 its new link"
+            );
+        });
+    }
+
+    /// This machine's listener, with what the service puts around it for
+    /// clipboard: the device list, the broadcast to the machines that dialled
+    /// in, and the check made before their text is applied.
+    struct DialledInto {
+        me: Machine,
+        trust: Trust,
+        clients: ClientManager,
+        listener: LanMouseListener,
+        port: u16,
+        sends: ClipboardSenderListen,
+        applies: ClipboardInbox,
+    }
+
+    async fn dialled_into() -> DialledInto {
+        let me = machine();
+        let trust = trust(&me, &[], Caps::KNOWN);
+        let clients = ClientManager::default();
+        let (heard_tx, heard) = channel();
+        let (listener, port) =
+            LanMouseListener::bind_loopback(me.identity.clone(), trust.clone(), heard_tx)
+                .await
+                .expect("listener");
+        let sends = listener.clipboard_sender(clients.clone());
+        let applies = ClipboardInbox::new(heard, trust.clone(), clients.clone());
+        DialledInto {
+            me,
+            trust,
+            clients,
+            listener,
+            port,
+            sends,
+            applies,
+        }
+    }
+
+    impl DialledInto {
+        /// A device here for `peer`, switched on, pinned to it and sharing
+        /// the clipboard both ways, and its link to this machine up.
+        async fn device_dialling_in(&mut self, peer: &Machine) -> (Dialer, ClientHandle) {
+            self.trust
+                .write()
+                .expect("lock")
+                .issue(&peer.fingerprint, "peer", Caps::KNOWN)
+                .expect("issue");
+            let device = self.entry_for(peer);
+            let d = dialer(
+                peer,
+                trust(peer, &[&self.me], Caps::KNOWN),
+                self.port,
+                Position::Left,
+            );
+            d.conn.dial(d.handle).await;
+            let accepted = tokio::time::timeout(LINK_UP_WITHIN, async {
+                while let Some(event) = self.listener.next().await {
+                    if let ListenEvent::Accept { fingerprint, .. } = event {
+                        if fingerprint == peer.fingerprint {
+                            return true;
+                        }
+                    }
+                }
+                false
+            })
+            .await;
+            assert!(
+                matches!(accepted, Ok(true)),
+                "this machine never accepted the peer's link"
+            );
+            wait_until("the peer to hold its link", LINK_UP_WITHIN, || {
+                d.conn.active_addr(d.handle).is_some()
+            })
+            .await;
+            (d, device)
+        }
+
+        /// Another entry here pinned to `peer`, switched on.
+        fn entry_for(&self, peer: &Machine) -> ClientHandle {
+            self.clients.add_with_config(ConfigClient {
+                ips: HashSet::new(),
+                hostname: None,
+                port: hops_ipc::DEFAULT_PORT,
+                pos: Position::Right,
+                active: true,
+                enter_hook: None,
+                fingerprint: Some(peer.fingerprint.clone()),
+            })
+        }
+    }
+
+    // LEDGER T2182 | class B | 1 return value: ClipboardInbox::next; 6 struct state: each peer's transport queue after ClipboardSenderListen::broadcast
+    #[test]
+    fn a_device_switched_off_is_sent_no_clipboard_over_the_link_it_opened_and_the_others_still_are()
+    {
+        run_local(async {
+            let mut here = dialled_into().await;
+            let (switched, other) = (machine(), machine());
+            let (mut switched_peer, device) = here.device_dialling_in(&switched).await;
+            let (mut other_peer, _) = here.device_dialling_in(&other).await;
+            let (switched_sends, other_sends) = (
+                switched_peer.conn.clipboard_sender(),
+                other_peer.conn.clipboard_sender(),
+            );
+
+            here.sends.broadcast("all on".into()).await;
+            assert_eq!(
+                (
+                    heard(&mut switched_peer, ARRIVES_WITHIN).await,
+                    heard(&mut other_peer, ARRIVES_WITHIN).await,
+                ),
+                (Some("all on".into()), Some("all on".into())),
+                "clipboard did not reach two devices that are on"
+            );
+            switched_sends.broadcast("its, on".into()).await;
+            assert_eq!(
+                applied_within(&mut here.applies, ARRIVES_WITHIN).await,
+                Some("its, on".into()),
+                "text from a device that is on was not applied"
+            );
+
+            assert!(here.clients.deactivate_client(device), "precondition");
+            here.sends.broadcast("one off".into()).await;
+            assert_eq!(
+                heard(&mut other_peer, ARRIVES_WITHIN).await,
+                Some("one off".into()),
+                "switching one device off stopped clipboard to another"
+            );
+            assert_eq!(
+                heard(&mut switched_peer, NEVER_WITHIN).await,
+                None,
+                "text copied here went to a device switched off here, over the \
+                 link it opened to this machine"
+            );
+            switched_sends.broadcast("its, off".into()).await;
+            assert_eq!(
+                applied_within(&mut here.applies, NEVER_WITHIN).await,
+                None,
+                "text from a device switched off here was applied, over the link \
+                 it opened to this machine"
+            );
+            other_sends.broadcast("the other's".into()).await;
+            assert_eq!(
+                applied_within(&mut here.applies, ARRIVES_WITHIN).await,
+                Some("the other's".into()),
+                "switching one device off stopped clipboard from another"
+            );
+
+            // A second entry for the same machine, switched on, does not
+            // reopen it.
+            here.entry_for(&switched);
+            here.sends.broadcast("another entry on".into()).await;
+            assert_eq!(
+                heard(&mut other_peer, ARRIVES_WITHIN).await,
+                Some("another entry on".into()),
+                "precondition: the other device still gets text"
+            );
+            assert_eq!(
+                heard(&mut switched_peer, NEVER_WITHIN).await,
+                None,
+                "one entry for a machine is off and another is on, and text went \
+                 to it: off has to fail closed"
+            );
+
+            assert!(here.clients.activate_client(device), "precondition");
+            here.sends.broadcast("back on".into()).await;
+            assert_eq!(
+                heard(&mut switched_peer, ARRIVES_WITHIN).await,
+                Some("back on".into()),
+                "switching the device back on left clipboard to it stopped"
+            );
+            switched_sends.broadcast("its, back on".into()).await;
+            assert_eq!(
+                applied_within(&mut here.applies, ARRIVES_WITHIN).await,
+                Some("its, back on".into()),
+                "switching the device back on left clipboard from it stopped"
             );
         });
     }

@@ -337,6 +337,14 @@ impl ClientManager {
             .is_some_and(|(c, s)| c.port == addr.port() && s.ips.contains(&addr.ip()))
     }
 
+    /// Whether `handle` is a device and is switched on.
+    pub(crate) fn is_on(&self, handle: ClientHandle) -> bool {
+        self.clients
+            .borrow()
+            .get(handle)
+            .is_some_and(|(_, s)| s.active)
+    }
+
     /// The devices whose connection is open to `addr`.
     pub(crate) fn handles_at(&self, addr: SocketAddr) -> Vec<ClientHandle> {
         self.clients
@@ -405,6 +413,23 @@ impl ClientManager {
             .borrow()
             .get(handle)
             .and_then(|(_, s)| s.peer_fingerprint.clone())
+    }
+
+    /// Whether the device switch lets clipboard text move between this
+    /// machine and the one that proved `fingerprint`: sent to it or applied
+    /// from it, over a link either machine opened (#218).
+    ///
+    /// Not when any device pinned to that fingerprint is switched off, even
+    /// if another entry for the same machine is on: off fails closed. A
+    /// device with no pin names no machine and gates nothing. The pairing's
+    /// own clipboard grant is a separate check, and both have to allow.
+    pub(crate) fn switch_allows_clipboard(&self, fingerprint: &str) -> bool {
+        !self.clients.borrow().iter().any(|(_, (_, s))| {
+            !s.active
+                && s.peer_fingerprint
+                    .as_deref()
+                    .is_some_and(|pin| pin.eq_ignore_ascii_case(fingerprint))
+        })
     }
 
     /// Clear the pin on any client currently pinned to `fingerprint`, so its
@@ -693,6 +718,74 @@ mod handles_are_never_reused {
             "(the handle was reused, pin, address) of a device added after \
              another was deleted. A reused handle lets a late write for the \
              deleted device land on the new one."
+        );
+    }
+}
+
+#[cfg(test)]
+mod the_switch_gates_clipboard_by_fingerprint {
+    //! Off means off (#218): no clipboard moves to or from a machine a device
+    //! pinned to it is switched off for. These ask the one function both
+    //! directions ask; `clipboard::clipboard_follows_the_switch` watches the
+    //! text itself.
+
+    use super::*;
+
+    const A: &str = "aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa";
+    const B: &str = "bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb";
+
+    fn device(m: &ClientManager, pin: Option<&str>, on: bool) -> ClientHandle {
+        m.add_with_config(ConfigClient {
+            ips: HashSet::new(),
+            hostname: None,
+            port: hops_ipc::DEFAULT_PORT,
+            pos: Position::default(),
+            active: on,
+            enter_hook: None,
+            fingerprint: pin.map(str::to_string),
+        })
+    }
+
+    // LEDGER T2180 | class B | 1 return value: ClientManager::switch_allows_clipboard
+    #[test]
+    fn a_machine_switched_off_under_any_of_its_entries_gets_no_clipboard() {
+        let m = ClientManager::default();
+        let a = device(&m, Some(A), true);
+        device(&m, Some(B), true);
+        assert!(
+            m.switch_allows_clipboard(A) && m.switch_allows_clipboard(B),
+            "a device that is on stopped clipboard"
+        );
+
+        m.deactivate_client(a);
+        assert_eq!(
+            (m.switch_allows_clipboard(A), m.switch_allows_clipboard(B)),
+            (false, true),
+            "(switched off, still on): switching one device off must stop its \
+             clipboard and only its"
+        );
+
+        // A second entry for the same machine, switched on, does not reopen it.
+        device(&m, Some(A), true);
+        assert!(
+            !m.switch_allows_clipboard(A),
+            "one entry for a machine is on and another is off, and clipboard \
+             flowed: off has to fail closed"
+        );
+
+        // A device with no pin names no machine.
+        device(&m, None, false);
+        m.activate_client(a);
+        assert!(
+            m.switch_allows_clipboard(A),
+            "switching the device back on left its clipboard stopped"
+        );
+        assert!(
+            m.switch_allows_clipboard(
+                "cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc"
+            ),
+            "a device with no pin, switched off, stopped clipboard with a machine \
+             no device names"
         );
     }
 }

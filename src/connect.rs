@@ -363,6 +363,7 @@ impl LanMouseConnection {
         ClipboardSender {
             conns: self.conns.clone(),
             trust: self.trust.clone(),
+            clients: self.client_manager.clone(),
         }
     }
 
@@ -539,6 +540,9 @@ impl LanMouseConnection {
 pub(crate) struct ClipboardSender {
     conns: Rc<Mutex<HashMap<SocketAddr, PeerLink>>>,
     trust: Trust,
+    /// The device switches: none of the clipboard goes to a machine that is
+    /// switched off.
+    clients: ClientManager,
 }
 
 /// One clipboard-failure line a minute is enough to tell you it is dropping,
@@ -555,10 +559,12 @@ impl ClipboardSender {
             let conns = self.conns.lock().await;
             let trust = self.trust.read().expect("lock");
             // Sent only where the lease says so (#186), so a device that was
-            // removed while its link stayed up is not sent it either.
+            // removed while its link stayed up is not sent it either, and
+            // never to a machine switched off here (#218).
             conns
                 .values()
                 .filter(|l| trust.clipboard_to(&l.fingerprint))
+                .filter(|l| self.clients.switch_allows_clipboard(&l.fingerprint))
                 .map(|l| l.conn.clone())
                 .collect()
         };
@@ -749,6 +755,19 @@ async fn connect_to_handle(
                  removed or re-addressed; closing it"
             );
             link.conn.close(0u32.into(), b"stale dial");
+            connecting.lock().await.remove(&handle);
+            return Err(LanMouseConnectionError::NotConnected);
+        }
+        // Switched off while the handshake ran: a device that is off holds
+        // no link (#218), and switching it off closed only the links already
+        // open.
+        if !client_manager.is_on(handle) {
+            drop(open);
+            log::info!(
+                "client {handle}: the dial to {addr} finished after the device was \
+                 switched off; closing it"
+            );
+            link.conn.close(0u32.into(), b"switched off");
             connecting.lock().await.remove(&handle);
             return Err(LanMouseConnectionError::NotConnected);
         }
@@ -1902,6 +1921,26 @@ mod a_device_edit_touches_only_that_device {
                  elsewhere. Written means the old machine's identity became the \
                  device's pin and its link the device's connection, so input \
                  meant for the new address goes to the old machine (#97)."
+            );
+        });
+    }
+
+    // LEDGER T2183 | class B | 6 struct state: ClientManager after LanMouseConnection::send's dial, 2 connection closed at the receiver
+    #[test]
+    fn a_dial_that_lands_after_its_device_was_switched_off_keeps_no_link() {
+        run_local(async {
+            let (door, d, _) = a_dial_held_at_the_door().await;
+
+            // The user switches the device off while its dial is out.
+            assert!(d.clients.deactivate_client(d.handle), "precondition");
+
+            let landed = once_let_in(&door, || d.clients.active_addr(d.handle).is_some()).await;
+            assert_eq!(
+                landed,
+                Landed::Closed,
+                "a dial finished after its device was switched off. Written means \
+                 the device holds a link while it shows as off, LeftOpen that the \
+                 link was kept anyway; switching a device off closes its link (#218)."
             );
         });
     }

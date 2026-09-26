@@ -222,6 +222,9 @@ impl Dialer {
 pub(crate) struct ClipboardPair {
     pub(crate) driven: Machine,
     pub(crate) driven_trust: Trust,
+    /// The driven machine's device list: none, until a test adds one. The
+    /// driver's is the dialer's.
+    pub(crate) driven_clients: ClientManager,
     pub(crate) driven_sends: crate::listen::ClipboardSenderListen,
     /// What the driven machine's transport queued for its service.
     pub(crate) driven_heard: Receiver<crate::transport::PeerClipboard>,
@@ -250,7 +253,8 @@ pub(crate) async fn clipboard_pair(
     )
     .await
     .expect("listener");
-    let driven_sends = listener.clipboard_sender();
+    let driven_clients = ClientManager::default();
+    let driven_sends = listener.clipboard_sender(driven_clients.clone());
     let dialer = dialer(&driver, driver_trust.clone(), port, Position::Left);
     dialer.conn.dial(dialer.handle).await;
     let accepted = tokio::time::timeout(Duration::from_secs(10), async {
@@ -276,6 +280,7 @@ pub(crate) async fn clipboard_pair(
     ClipboardPair {
         driven,
         driven_trust,
+        driven_clients,
         driven_sends,
         driven_heard,
         _listener: listener,
@@ -318,8 +323,16 @@ impl ClipboardPair {
         let driven = std::mem::replace(&mut self.driven_heard, channel().1);
         let driver = std::mem::replace(&mut self.dialer.notices.clipboard, channel().1);
         (
-            crate::clipboard::ClipboardInbox::new(driven, self.driven_trust.clone()),
-            crate::clipboard::ClipboardInbox::new(driver, self.driver_trust.clone()),
+            crate::clipboard::ClipboardInbox::new(
+                driven,
+                self.driven_trust.clone(),
+                self.driven_clients.clone(),
+            ),
+            crate::clipboard::ClipboardInbox::new(
+                driver,
+                self.driver_trust.clone(),
+                self.dialer.clients.clone(),
+            ),
         )
     }
 }
