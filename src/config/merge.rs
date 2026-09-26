@@ -238,7 +238,14 @@ fn change_fields(entry: &mut Table, base: &ConfigClient, ours: &ConfigClient, fr
                 {
                     *value.decor_mut() = old.decor().clone();
                 }
-                entry.insert(key, new);
+                // In place: `insert` over a key clears the key's decor, which
+                // holds a comment written on the line above it.
+                match entry.get_mut(key) {
+                    Some(slot) => *slot = new,
+                    None => {
+                        entry.insert(key, new);
+                    }
+                }
             }
         }
     }

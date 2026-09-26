@@ -2205,4 +2205,64 @@ aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
              by hand: {changed:#?}"
         );
     }
+
+    // LEDGER T28 | class B | 4 file on disk written by Config::write_back
+    #[test]
+    fn a_comment_above_a_key_the_daemon_changes_stays_above_it() {
+        let entry = "[[clients]]\n# the garage machine\n\
+                     hostname = \"garage-pc\" # after the name\n\
+                     # keep it on the left\nposition = \"left\"\n";
+        let pinned = format!(
+            "[[clients]]\n# the garage machine\n\
+             hostname = \"garage-pc\" # after the name\nfingerprint = \"{DESK}\"\n\
+             # keep it on the left\nposition = \"left\"\n"
+        );
+        type Change = fn(&mut Vec<ConfigClient>);
+        let cases: [(&str, &str, Change, &str); 3] = [
+            (
+                "renamed",
+                entry,
+                |c| c[0].hostname = Some("workshop-pc".to_string()),
+                "[[clients]]\n# the garage machine\n\
+                 hostname = \"workshop-pc\" # after the name\n\
+                 # keep it on the left\nposition = \"left\"\n",
+            ),
+            (
+                "moved",
+                entry,
+                |c| c[0].pos = Position::Top,
+                "[[clients]]\n# the garage machine\n\
+                 hostname = \"garage-pc\" # after the name\n\
+                 # keep it on the left\nposition = \"top\"\n",
+            ),
+            // a rename forgets the pin until the next handshake, so its line goes
+            (
+                "pinned",
+                &pinned,
+                |c| {
+                    c[0].hostname = Some("workshop-pc".to_string());
+                    c[0].fingerprint = None;
+                },
+                "[[clients]]\n# the garage machine\n\
+                 hostname = \"workshop-pc\" # after the name\n\
+                 # keep it on the left\nposition = \"left\"\n",
+            ),
+        ];
+        let mut wrong = vec![];
+        for (tag, before, change, after) in cases {
+            let (s, mut config) = scratch(&format!("above{tag}"), before);
+            let mut clients = config.clients();
+            change(&mut clients);
+            config.set_clients(clients);
+            config.write_back().expect("the save");
+            let saved = fs::read_to_string(&s.path).expect("the config");
+            if saved != after {
+                wrong.push(format!("{tag}:\n{saved}"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "a save dropped a comment of an entry it changed, or moved it: {wrong:#?}"
+        );
+    }
 }
