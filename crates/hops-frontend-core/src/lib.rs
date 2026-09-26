@@ -1011,10 +1011,15 @@ async fn connection_loop<C, F, E, W>(
             while request_rx.try_recv().is_ok() {
                 dropped += 1;
             }
+            // Said as a lost connection, not a stopped service: the daemon
+            // also closes the connection of a frontend that stopped reading,
+            // and keeps running (#95).
             if dropped > 0 {
-                log::warn!("frontend: the daemon went away with {dropped} request(s) not sent");
+                log::warn!(
+                    "frontend: the daemon connection closed with {dropped} request(s) not sent"
+                );
                 m.push_error(format!(
-                    "The hops service went away before {} reached it, so {} not made.",
+                    "The connection to the hops service was lost before {} reached it, so {} not made.",
                     if dropped == 1 {
                         "your last change".to_string()
                     } else {
