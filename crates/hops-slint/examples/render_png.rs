@@ -127,6 +127,10 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
     if let Ok(notice) = std::env::var("PREVIEW_NOTICE") {
         ui.set_notice(notice.into());
     }
+    // PREVIEW_INFO="..." shows the neutral info bar, e.g. the restart note.
+    if let Ok(info) = std::env::var("PREVIEW_INFO") {
+        ui.set_info(info.into());
+    }
 
     // Exercise all four merged-card states in one shot.
     ui.set_devices(ModelRc::new(VecModel::from(vec![

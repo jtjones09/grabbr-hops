@@ -88,6 +88,11 @@ export component AppWindow inherits Window {
     in property <string> notice: "";
     in property <int> notice-seq: 0;
     property <int> dismissed-seq: 0;
+    // One-off news for the user, such as that the app restarted its service
+    // because it ran another build (#222). News, not a failure: the red
+    // banner above carries errors only (#150).
+    in property <string> info: "";
+    property <bool> info-dismissed: false;
     in property <bool> connected: false;
     // What is wrong with the service, or empty: why the service the app
     // started did not come up, or that the daemon runs another build than
@@ -317,6 +322,37 @@ export component AppWindow inherits Window {
             VerticalLayout {
                 spacing: Space.lg;
                 alignment: start;
+                // --- info: news that is not a failure ---------------------------------
+                if root.info != "" && !root.info-dismissed: Rectangle {
+                    vertical-stretch: 0;
+                    background: Theme.c.surface-raised;
+                    border-radius: Radius.lg;
+                    border-width: 1px;
+                    border-color: Theme.c.border;
+                    HorizontalLayout {
+                        padding: Space.md;
+                        spacing: Space.sm;
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 1;
+                            Text {
+                                text: root.info;
+                                color: Theme.c.foreground;
+                                font-size: Type.small;
+                                wrap: word-wrap;
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            PillButton {
+                                text: "dismiss";
+                                ghost: true;
+                                clicked => { root.info-dismissed = true; }
+                            }
+                        }
+                    }
+                }
+
                 // --- notice: the daemon's only channel for "that didn't work" ---------
                 // Before this existed, an unresolvable name, a refused trust
                 // change, a failed config write and a rejected IPC token were all

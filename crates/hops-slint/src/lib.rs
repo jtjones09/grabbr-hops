@@ -627,7 +627,18 @@ fn claim_pending<T>(
 /// autostart); the window then opens on tray click or a second `hops gui` launch.
 /// `launch` is what the binary knows as it opens: its own build, and why a
 /// service it tried to start did not come up.
+/// Put what the app has to say as it opens, that it restarted its service
+/// (#222), in the window's neutral info bar. It is news, not a failure, and
+/// the red banner carries errors only (#150): pushed there as activity, the
+/// window never showed it at all.
+fn show_opening_info(ui: &AppWindow, restarted: Option<&str>) {
+    if let Some(note) = restarted {
+        ui.set_info(note.into());
+    }
+}
+
 pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
+    let opening_info = launch.restarted.clone();
     // A second launch surfaces the resident window rather than duplicating the
     // tray icon; the flag is flipped by the single-instance socket thread and
     // read by the poll timer (both below). Also the vehicle for "reopen".
@@ -655,6 +666,7 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
     let client = rx.recv().map_err(|_| SlintError::ClientInit)?;
 
     let ui = AppWindow::new()?;
+    show_opening_info(&ui, opening_info.as_deref());
 
     // Force the opening size to 560x690. preferred-width/height in app.slint
     // aren't enough alone: the ScrollView lets the window shrink to a tiny
@@ -2205,6 +2217,34 @@ mod the_banner_shows_errors {
             "right",
             "the add form would open on the left edge an active device uses, \
              and adding there switches that device off"
+        );
+    }
+}
+
+#[cfg(test)]
+mod the_restart_note_is_news_not_an_error {
+    //! The app says it restarted its service (#222) in the neutral info bar.
+    //! The red banner carries errors only (#150), and the note, recorded as
+    //! activity, reached neither.
+    use super::*;
+
+    // LEDGER T519 | class B | 3 widget tree: AppWindow info/notice after show_opening_info
+    #[test]
+    fn a_restarted_service_is_told_in_the_info_bar_not_the_error_banner() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = AppWindow::new().expect("window");
+        let note =
+            "hops restarted its service because it was running hops 0.12.0, not this version.";
+        show_opening_info(&ui, Some(note));
+        assert_eq!(
+            ui.get_info().as_str(),
+            note,
+            "the window never says it restarted the service"
+        );
+        assert_eq!(
+            ui.get_notice().as_str(),
+            "",
+            "a restart that worked was shown as an error"
         );
     }
 }
