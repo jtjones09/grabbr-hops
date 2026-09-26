@@ -2466,6 +2466,65 @@ mod one_trust_write_site {
 }
 
 #[cfg(test)]
+mod trust_reaches_every_app_whole {
+    //! What the trust store grants reaches the apps as three events that
+    //! `publish_trust` sends together: who may drive this machine, who was
+    //! removed, and each pairing's clipboard (#187). A site that sends the
+    //! first alone leaves every app showing the clipboard from before the
+    //! change, and offering a switch for a clipboard that is already off.
+    //!
+    //! A source guard because the property is about every site, the next one
+    //! included. The approval and the switch are also watched running, in
+    //! `tests/pending_prompts.rs` (T7) and `tests/clipboard_off.rs`.
+
+    /// Non-test source with comments stripped: this guard names what it
+    /// forbids.
+    fn production() -> String {
+        include_str!("service.rs")
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap_or_default()
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Which `fn` encloses a given byte offset.
+    fn enclosing_fn(src: &str, at: usize) -> String {
+        src[..at]
+            .rmatch_indices("fn ")
+            .map(|(i, _)| {
+                let rest = &src[i..];
+                rest[..rest.find('(').unwrap_or(rest.len())]
+                    .trim()
+                    .to_string()
+            })
+            .next()
+            .unwrap_or_else(|| "<top level>".to_string())
+    }
+
+    // LEDGER E2A-14 | class S | source text: every trust event in service.rs is sent from publish_trust
+    #[test]
+    fn only_publish_trust_sends_the_trust_events() {
+        let src = production();
+        for event in ["AuthorizedUpdated(", "RevokedUpdated(", "TrustUpdated("] {
+            let senders: Vec<String> = src
+                .match_indices(event)
+                .map(|(at, _)| enclosing_fn(&src, at))
+                .collect();
+            assert_eq!(
+                senders,
+                ["fn publish_trust"],
+                "{event} is sent from {senders:?}. Call publish_trust() instead: it \
+                 sends the clipboard with it, and without that every app keeps \
+                 showing the clipboard from before the change"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod attempt_origin_guard {
     //! Both `raise_connection_attempt` call sites must declare where the attempt
     //! came from, and they must not declare the same thing.

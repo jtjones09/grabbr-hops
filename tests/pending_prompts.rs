@@ -1,7 +1,7 @@
 //! What the daemon does with a pairing request it admitted: which address the
 //! prompt names (#83), whether the knock is logged (#114), whether a frontend
-//! that attaches afterwards is shown it (#114), and which machine an approval
-//! then trusts (#168).
+//! that attaches afterwards is shown it (#114), which machine an approval
+//! then trusts (#168), and whether the approval reports its clipboard (#187).
 //!
 //! Runs the built binary with dummy capture and emulation, discovery off, a
 //! free port, and every path it could touch in a scratch directory. Each
@@ -228,7 +228,7 @@ fn prompts(events: &[FrontendEvent]) -> Vec<(String, AttemptOrigin, Option<Socke
         .collect()
 }
 
-// LEDGER T2 T3 T4 T5 T6 | class B | 2 bytes (IPC events) + 5 process log line: the hops daemon binary
+// LEDGER T2 T3 T4 T5 T6 T7 | class B | 2 bytes (IPC events) + 5 process log line: the hops daemon binary
 #[tokio::test(flavor = "current_thread")]
 async fn an_admitted_pairing_request_names_its_address_is_logged_and_survives_a_new_frontend() {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -316,11 +316,11 @@ async fn an_admitted_pairing_request_names_its_address_is_logged_and_survives_a_
         ))
         .await
         .expect("approval sent");
-    let trusted: Option<HashMap<String, String>> = events_for(&mut first, Duration::from_secs(3))
-        .await
-        .into_iter()
+    let after_approval = events_for(&mut first, Duration::from_secs(3)).await;
+    let trusted: Option<HashMap<String, String>> = after_approval
+        .iter()
         .filter_map(|e| match e {
-            FrontendEvent::AuthorizedUpdated(map) => Some(map),
+            FrontendEvent::AuthorizedUpdated(map) => Some(map.clone()),
             _ => None,
         })
         .next_back();
@@ -332,6 +332,22 @@ async fn an_admitted_pairing_request_names_its_address_is_logged_and_survives_a_
             "T6: approving {} as \"laptop\" left the trusted set as {other_state:?}",
             laptop.fingerprint
         )),
+    }
+
+    // T7: the approval tells the apps the pairing's clipboard as well, or they
+    // show none and offer no switch for it until they sync again (#187).
+    let clipboards = after_approval
+        .iter()
+        .filter_map(|e| match e {
+            FrontendEvent::TrustUpdated(map) => Some(map),
+            _ => None,
+        })
+        .next_back();
+    if !clipboards.is_some_and(|map| map.contains_key(&laptop.fingerprint)) {
+        failures.push(format!(
+            "T7: approving {} did not tell the apps its clipboard: {clipboards:?}",
+            laptop.fingerprint
+        ));
     }
 
     assert!(
