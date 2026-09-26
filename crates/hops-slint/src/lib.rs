@@ -312,30 +312,6 @@ fn stage_create(
     request(FrontendRequest::Create);
 }
 
-/// Claim a pending "create device" once its handle appears, or leave it for the
-/// next tick.
-///
-/// The take and the put-back must never overlap, and keeping them in one
-/// function is the whole point of it existing. The call site used to read
-///
-/// ```ignore
-/// if let Some(v) = cell.borrow_mut().take() {
-///     match arrived {
-///         Some(h) => { /* use it */ }
-///         None => *cell.borrow_mut() = Some(v),   // panics
-///     }
-/// }
-/// ```
-///
-/// which panics with `RefCell already borrowed`. On edition 2021 a temporary in
-/// an `if let` scrutinee lives until the end of the whole block, so the borrow
-/// taken to call `.take()` is still held when the retry arm borrows again.
-///
-/// That arm is not an edge case — it runs every time a device is created and
-/// its handle has not yet reached a snapshot, which is the ordinary case on the
-/// tick right after "add". The window died there with no message, because a
-/// panic under `panic = "abort"` was the last thing the process wrote and
-/// nothing was reading its output.
 /// Put `fingerprint`'s request on the pairing card.
 ///
 /// A name typed while the card showed another machine is cleared, so it can
@@ -364,6 +340,30 @@ fn approval(
     Ok(FrontendRequest::AuthorizeKey(desc, fingerprint.to_string()))
 }
 
+/// Claim a pending "create device" once its handle appears, or leave it for the
+/// next tick.
+///
+/// The take and the put-back must never overlap, and keeping them in one
+/// function is the whole point of it existing. The call site used to read
+///
+/// ```ignore
+/// if let Some(v) = cell.borrow_mut().take() {
+///     match arrived {
+///         Some(h) => { /* use it */ }
+///         None => *cell.borrow_mut() = Some(v),   // panics
+///     }
+/// }
+/// ```
+///
+/// which panics with `RefCell already borrowed`. On edition 2021 a temporary in
+/// an `if let` scrutinee lives until the end of the whole block, so the borrow
+/// taken to call `.take()` is still held when the retry arm borrows again.
+///
+/// That arm is not an edge case — it runs every time a device is created and
+/// its handle has not yet reached a snapshot, which is the ordinary case on the
+/// tick right after "add". The window died there with no message, because a
+/// panic under `panic = "abort"` was the last thing the process wrote and
+/// nothing was reading its output.
 fn claim_pending<T>(
     cell: &RefCell<Option<T>>,
     arrived: Option<ClientHandle>,
