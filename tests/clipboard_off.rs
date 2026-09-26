@@ -1,5 +1,6 @@
-//! Turning a paired machine's clipboard off reaches the app at once, and it
-//! is still off after the daemon restarts (#182, #187).
+//! Turning a paired machine's clipboard off reaches the app at once, turning
+//! it off again writes nothing, and it is still off after the daemon restarts
+//! (#182, #187).
 //!
 //! Runs the built daemon. The paired machine is carried forward from the
 //! config tables an upgrade reads, which pairs it the way every machine paired
@@ -55,7 +56,7 @@ async fn reported(
     .or(last)
 }
 
-// LEDGER E2A-9 | class B | 5 process: FrontendRequest::DisableClipboard into the built daemon, FrontendEvent::TrustUpdated from it, across a restart
+// LEDGER E2A-9 | class B | 5 process + 4 file on disk: FrontendRequest::DisableClipboard into the built daemon, FrontendEvent::TrustUpdated from it, trust.toml unchanged by a second request, across a restart
 #[tokio::test(flavor = "current_thread")]
 async fn turning_the_clipboard_off_reaches_the_app_and_survives_a_restart() {
     let (mut daemon, _port) = common::start(
@@ -84,6 +85,36 @@ async fn turning_the_clipboard_off_reaches_the_app_and_survives_a_restart() {
         reported(&mut events, |t| t == OFF).await,
         Some(OFF),
         "the app was not told the clipboard is off; log:\n{}",
+        daemon.log()
+    );
+
+    // Asked again, the clipboard is already off and nothing is written. The
+    // sync is handled after the request, so its first event says the request
+    // was handled too.
+    let store = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME is set"))
+        .join(".config/lan-mouse/trust.toml");
+    let written = std::fs::read(&store).expect("the trust store is on disk");
+    for request in [
+        FrontendRequest::DisableClipboard(DESK_MAC.to_owned()),
+        FrontendRequest::Sync,
+    ] {
+        requests
+            .request(request)
+            .await
+            .expect("the request is sent");
+    }
+    let handled = common::next_matching(&mut events, WAIT, |e| {
+        matches!(e, FrontendEvent::DaemonBuild(_)).then_some(())
+    })
+    .await;
+    assert!(
+        handled.is_some(),
+        "the daemon did not answer a sync; log:\n{}",
+        daemon.log()
+    );
+    assert!(
+        std::fs::read(&store).ok() == Some(written),
+        "turning an already-off clipboard off wrote the trust store again; log:\n{}",
         daemon.log()
     );
 

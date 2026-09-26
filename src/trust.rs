@@ -1020,16 +1020,24 @@ impl TrustStore {
     /// authority. There is deliberately no verb that turns it back on here:
     /// widening a pairing waits for #107.
     ///
-    /// False when there is no lease to change.
-    pub fn disable_clipboard(&mut self, fingerprint: &str) -> bool {
+    /// `None` when there is no pairing to change: no lease, or the device
+    /// was removed. `Some(false)` when its clipboard is already off by
+    /// choice, so there is nothing to save and nobody to tell.
+    pub fn disable_clipboard(&mut self, fingerprint: &str) -> Option<bool> {
         let fp = key(fingerprint);
-        if self.drop_capabilities(&fp, Caps::CLIPBOARD).is_none() {
-            return false;
+        let entry = self.entries.get(&fp)?;
+        if entry.denial.is_some() {
+            return None;
         }
+        let lease = entry.lease.as_ref()?;
+        if lease.clipboard_chosen && !lease.caps.intersects(Caps::CLIPBOARD) {
+            return Some(false);
+        }
+        self.drop_capabilities(&fp, Caps::CLIPBOARD)?;
         if let Some(lease) = self.entries.get_mut(&fp).and_then(|e| e.lease.as_mut()) {
             lease.clipboard_chosen = true;
         }
-        true
+        Some(true)
     }
 
     /// What each paired machine may do right now, for telling frontends.
@@ -1535,6 +1543,38 @@ mod tests {
     /// No certificate, no socket, no backend, no runtime, no authority (#127).
     fn store() -> TrustStore {
         TrustStore::new(&us(), T0).expect("a fingerprint and a number is the whole of it")
+    }
+
+    /// Turning a clipboard off changes the lease once. Asked again, nothing
+    /// changes, so the daemon neither saves nor republishes; a removed or
+    /// unknown device has no clipboard to turn off (#182).
+    // LEDGER E2A-13 | class B | 1 return value + 2 struct state: TrustStore::disable_clipboard, capabilities
+    #[test]
+    fn turning_the_clipboard_off_again_changes_nothing() {
+        let mut s = store();
+        let (desk, gone) = (fp(0x10), fp(0x20));
+        s.issue(&desk, "desk mac", Caps::INBOUND).expect("issue");
+        s.issue(&gone, "old laptop", Caps::INBOUND).expect("issue");
+        s.revoke(&gone);
+
+        assert_eq!(s.disable_clipboard(&desk), Some(true), "the first time");
+        assert!(
+            !s.capabilities(&desk).intersects(Caps::CLIPBOARD) && s.may_drive_us(&desk),
+            "the clipboard is not off, or more than it went: {}",
+            s.capabilities(&desk)
+        );
+        assert_eq!(
+            s.disable_clipboard(&desk),
+            Some(false),
+            "a clipboard already off reports a change, so every request saves the \
+             store and tells every app again"
+        );
+        assert_eq!(
+            s.disable_clipboard(&gone),
+            None,
+            "a removed device reports a clipboard to turn off"
+        );
+        assert_eq!(s.disable_clipboard(&fp(0x30)), None, "an unknown device");
     }
 
     fn allow(pairs: &[(&str, &str)]) -> HashMap<String, String> {

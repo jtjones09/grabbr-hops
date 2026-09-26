@@ -1668,12 +1668,20 @@ impl Service {
         // The lock is taken on one line on purpose: the named-door guard scans
         // for that call.
         let changed = self.trust.write().expect("lock").disable_clipboard(&fp);
-        if !changed {
-            log::warn!("not turning the clipboard off for {fp}: it is not a paired device");
-            self.notify_frontend(FrontendEvent::Error(
-                "That device is not paired, so it has no clipboard to turn off.".to_string(),
-            ));
-            return;
+        match changed {
+            None => {
+                log::warn!("not turning the clipboard off for {fp}: it is not a paired device");
+                self.notify_frontend(FrontendEvent::Error(
+                    "That device is not paired, so it has no clipboard to turn off.".to_string(),
+                ));
+                return;
+            }
+            // Already off: nothing to save, and every app already shows it.
+            Some(false) => {
+                log::debug!("the clipboard for {fp} is already off");
+                return;
+            }
+            Some(true) => {}
         }
         let label = self
             .trust

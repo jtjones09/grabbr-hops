@@ -2570,7 +2570,11 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
             .issue(B, "driven from here", Caps::OUTBOUND)
             .expect("issue");
         for fp in [A, B] {
-            assert!(store.disable_clipboard(fp), "{fp} has a lease to change");
+            assert_eq!(
+                store.disable_clipboard(fp),
+                Some(true),
+                "{fp} has a lease to change"
+            );
             assert!(
                 !store.capabilities(fp).intersects(Caps::CLIPBOARD),
                 "precondition: {fp}'s clipboard is off in memory"
@@ -2673,7 +2677,11 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
             let mut store = TrustStore::new(&ours(), file.now()).expect("ours");
             grant_for_attempt(&mut store, B, "desk mac", Some(AttemptOrigin::Inbound))
                 .expect("the first approval grants");
-            assert!(store.disable_clipboard(B), "a lease to switch off");
+            assert_eq!(
+                store.disable_clipboard(B),
+                Some(true),
+                "a lease to switch off"
+            );
             if restart_first {
                 file.save(&records_of(&store)).expect("save");
                 std::mem::drop(file);
@@ -2781,7 +2789,11 @@ cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc";
         // A save that drops nothing keeps the copies.
         let (d, _, mut file, mut store) = migrated("copy-kept");
         store.set_label(A, "renamed").expect("rename");
-        assert!(store.disable_clipboard(B), "a lease to switch off");
+        assert_eq!(
+            store.disable_clipboard(B),
+            Some(true),
+            "a lease to switch off"
+        );
         file.save(&records_of(&store)).expect("save");
         assert_eq!(
             copies_exist(&d),
