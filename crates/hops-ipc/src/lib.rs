@@ -1197,7 +1197,31 @@ mod asks_a_daemon_its_build {
         );
     }
 
+    /// A daemon that hangs up on the token, as one of this build does on a
+    /// stale token, has said nothing about its build. Read as one that
+    /// states none, it would be restarted by the app.
+    // LEDGER T2253 | class B | bytes over a real socket + 1 return value
+    #[test]
+    fn a_daemon_that_closes_on_the_token_has_said_nothing() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        let endpoint = DaemonEndpoint::Tcp(listener.local_addr().expect("its address"));
+        std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let _ = BufReader::new(stream).read_line(&mut String::new());
+        });
+        assert_eq!(
+            endpoint.build(Some(TOKEN), Duration::from_secs(5)),
+            None,
+            "a daemon that read the token and hung up was read as one that states \
+             no build, which the app restarts"
+        );
+    }
+
     /// The listener named is the process that listens, as the kernel says.
+    /// Here it also asks; tests/daemon_build.rs asks a daemon in another
+    /// process.
     // LEDGER T2222 | class B | 1 return value from a real socket
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]

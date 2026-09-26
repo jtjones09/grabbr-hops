@@ -115,7 +115,16 @@ fn runs_the_daemon(command: Option<Command>) -> bool {
 
 /// Run the daemon (the receiver service). A redundant instance self-exits.
 fn run_daemon() -> Result<(), HopsError> {
-    match run_async(run_service()) {
+    daemon_ended(run_async(run_service()))
+}
+
+/// What the daemon's end means for how the process exits. One that found
+/// another daemon running leaves quietly. Any other error exits 1: that
+/// includes a macOS permission granted while it ran (#221), whose exit is
+/// what makes launchd, which restarts it only after a failure, start a fresh
+/// process with the grant.
+fn daemon_ended(ended: Result<(), HopsError>) -> Result<(), HopsError> {
+    match ended {
         Err(HopsError::Service(ServiceError::IpcListen(
             IpcListenerCreationError::AlreadyRunning,
         ))) => {
@@ -367,6 +376,33 @@ mod keylog_is_never_shipped {
     }
 }
 
+#[cfg(test)]
+mod a_daemon_ended_for_a_grant_exits_unsuccessfully {
+    //! launchd restarts the daemon only after it fails (#221), so the error a
+    //! grant ends it with must reach `main`, which exits 1 on any error.
+    use super::{HopsError, IpcListenerCreationError, ServiceError, daemon_ended};
+
+    // LEDGER T2251 | class B | 1 return value of daemon_ended
+    #[test]
+    fn only_a_daemon_that_found_another_running_leaves_quietly() {
+        let granted = daemon_ended(Err(HopsError::Service(ServiceError::PermissionGranted(
+            "Accessibility".into(),
+        ))));
+        let beside = daemon_ended(Err(HopsError::Service(ServiceError::IpcListen(
+            IpcListenerCreationError::AlreadyRunning,
+        ))));
+        assert!(
+            matches!(
+                granted,
+                Err(HopsError::Service(ServiceError::PermissionGranted(_)))
+            ),
+            "a daemon that ended for a grant must exit 1, or launchd leaves it down \
+             until the next login: {granted:?}"
+        );
+        assert!(beside.is_ok(), "{beside:?}");
+    }
+}
+
 #[cfg(all(test, any(feature = "tui", feature = "slint")))]
 mod the_front_door_shows_what_became_of_its_start {
     //! A start that did not come up left the app at "connecting", with the
@@ -380,6 +416,34 @@ mod the_front_door_shows_what_became_of_its_start {
     //! behavioural test can reach is `front_door` itself, which opens a
     //! window or a terminal UI: that it hands the report to the frontend it
     //! opens is checked here, on its source with comments stripped.
+
+    /// A daemon of another build that the front door left running is named
+    /// before the app connects. One from before the token cannot be
+    /// connected to at all, and the app sat at "connecting" with nothing
+    /// said: the very thing #222 is about.
+    // LEDGER T2250 | class B | 1 AppModel::service_problem over main's launch()
+    #[test]
+    fn a_service_left_running_is_named_before_the_app_connects() {
+        use hops::daemon_start::{DaemonStart, StartReport};
+        let why = "On Windows hops does not restart its service. Sign out and back in \
+                   to run this version.";
+        let report = StartReport {
+            outcome: DaemonStart::AlreadyRunning,
+            why: None,
+            log_file: None,
+            within: std::time::Duration::from_secs(5),
+            replaced: None,
+            left: Some(why.into()),
+            left_build: Some("hops 0.12.0 (1111111)".into()),
+        };
+        let model = hops_frontend_core::AppModel::launched(super::launch(Some(report)));
+        let said = model.service_problem().unwrap_or_default();
+        assert!(
+            !model.connected && said.contains("hops 0.12.0 (1111111)") && said.ends_with(why),
+            "the app has not connected, and must already say which build still runs \
+             and why: {said:?}"
+        );
+    }
 
     // LEDGER T70 | class S | source text | pair T64 (report text), T61 (model), T62 (render), T2224 (restart report), T2230 (model)
     #[test]

@@ -1624,9 +1624,21 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(" ")
         };
-        let clipped: Vec<(u16, Vec<u16>)> = [&failed, &mismatch, &left]
+        // The same, before the app connects: a daemon from before the token
+        // cannot be connected to at all.
+        let mut left_unreached = AppModel::default();
+        left_unreached.start_problem = Some(
+            "The hops service is running hops 0.12.0 (1111111), not this version. hops \
+             did not restart it, because the hops service runs another copy of hops, \
+             /Applications/hops.app/Contents/MacOS/hops. Stop it, then open hops again."
+                .into(),
+        );
+        if let Some(out) = std::env::var_os("HOPS_TUI_RENDER") {
+            let _ = std::fs::write(out, render_at(&left_unreached, 0, 80, 24).join("\n"));
+        }
+        let clipped: Vec<(u16, Vec<u16>)> = [&failed, &mismatch, &left, &left_unreached]
             .into_iter()
-            .zip([0, 1, 2])
+            .zip([0, 1, 2, 3])
             .map(|(model, case)| {
                 let problem = model.service_problem().expect("a problem to show");
                 let problem = problem.split_whitespace().collect::<Vec<_>>().join(" ");

@@ -122,7 +122,10 @@ impl Running for ThisMachine {
             launchd_origin(
                 endpoint.listener(),
                 this_user(),
-                agent_path().is_ok_and(|path| path.exists()),
+                installed(
+                    agent_path().and_then(|path| read_agent(&path)),
+                    &std::env::current_exe().unwrap_or_default(),
+                ),
                 || run_launchctl(&["list"]),
             )
         }
@@ -277,7 +280,14 @@ pub struct StartReport {
     /// Why a daemon of another build was left running, and what to do; `None`
     /// when none was.
     pub left: Option<String>,
+    /// The build the daemon left running states, in words, with [`Self::left`].
+    pub left_build: Option<String>,
 }
+
+/// Why the daemon of another build still runs after a restart that did not
+/// stop it.
+const DID_NOT_STOP: &str = "hops tried to restart it, and it did not stop. Stop it, then open \
+                            hops again.";
 
 impl StartReport {
     /// What to show the user, or `None` when a daemon is running.
@@ -285,6 +295,16 @@ impl StartReport {
     /// Without this a start that failed reached the screen as "connecting",
     /// indefinitely, with the reason in a log nobody was pointed at (#189).
     pub fn problem(&self) -> Option<String> {
+        if self.outcome == DaemonStart::AlreadyRunning {
+            // A daemon of another build still serves. Said here as well as
+            // beside the build once connected: a daemon from before the
+            // token cannot be connected to at all (#222).
+            let why = self.left.as_deref()?;
+            let theirs = self.left_build.as_deref().unwrap_or("another build");
+            return Some(format!(
+                "The hops service is running {theirs}, not this version. {why}"
+            ));
+        }
         let log = |lead: &str| match &self.log_file {
             // On a line of its own, so a wrapped line does not split the path.
             Some(path) => format!("{lead}:\n{}", path.display()),
@@ -374,16 +394,24 @@ pub fn start_or_restart_reported<W: Watch + Running>(
 /// Ask the daemon on `endpoint` which build it is until it says, it stops
 /// answering, or `within` is over: one that has just bound its endpoint says
 /// nothing until it has read its token and its config.
+///
+/// A daemon that sends state without its build is asked once more before it
+/// counts as one from before the statement, since that is concluded from a
+/// wait running out: a daemon of this build that was slow to handle the
+/// first ask states its build on the second.
 fn ask_build(
     endpoint: &DaemonEndpoint,
     watch: &mut impl Running,
     within: Duration,
 ) -> Option<StatedBuild> {
     let deadline = Instant::now() + within;
+    let mut unstated_once = false;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
-        if let Some(stated) = watch.build(endpoint, left.min(BUILD_ASK)) {
-            return Some(stated);
+        match watch.build(endpoint, left.min(BUILD_ASK)) {
+            Some(StatedBuild::Unstated) if !unstated_once => unstated_once = true,
+            Some(stated) => return Some(stated),
+            None => {}
         }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() || !endpoint.answers() {
@@ -410,6 +438,7 @@ fn front_door<W: Watch>(
         within,
         replaced: None,
         left: None,
+        left_build: None,
     };
     let endpoint = match endpoint {
         Ok(endpoint) => endpoint,
@@ -433,6 +462,7 @@ fn front_door<W: Watch>(
                 );
                 return StartReport {
                     left: Some(why),
+                    left_build: stated.as_ref().map(in_words),
                     ..report(DaemonStart::AlreadyRunning, None)
                 };
             }
@@ -458,6 +488,20 @@ fn front_door<W: Watch>(
             };
         }
     };
+    if how == Launch::Restart(pid) {
+        // The service still runs the daemon it was to replace: a restart
+        // that stopped nothing is no restart.
+        log::warn!(
+            "the hops service still runs process {pid}, the daemon of the other build; \
+             it did not stop"
+        );
+        return StartReport {
+            left: Some(DID_NOT_STOP.to_string()),
+            left_build: replaced.clone(),
+            replaced,
+            ..report(DaemonStart::AlreadyRunning, None)
+        };
+    }
     let outcome = wait_for_daemon(&endpoint, pid, watch, within);
     let log_file = watch.log_file();
     match outcome {
@@ -472,13 +516,11 @@ fn front_door<W: Watch>(
     }
     // A daemon still answers beside the one this restart started, which
     // stopped: the one it was to replace did not stop.
-    let left = (outcome == DaemonStart::AlreadyRunning && replaced.is_some()).then(|| {
-        "hops tried to restart its service, and the daemon of the other build did not \
-         stop. Stop it, then open hops again."
-            .to_string()
-    });
+    let left = (outcome == DaemonStart::AlreadyRunning && replaced.is_some())
+        .then(|| DID_NOT_STOP.to_string());
     StartReport {
         log_file,
+        left_build: left.as_ref().and(replaced.clone()),
         replaced,
         left,
         ..report(outcome, None)
@@ -745,7 +787,18 @@ fn start_through_launchd(
 
     let loaded = launch(&["print", &service])?.succeeded();
     let agent = agent()?;
-    let reload = loaded && (agent.rewritten || replacing.is_some());
+    // The daemon to replace has already exited: another front door restarted
+    // the service, and a bootout now would stop the daemon of this build it
+    // started. Nothing is stopped; the kickstart names what runs.
+    let mut replacing = replacing;
+    let replaced_already = match replacing.as_mut() {
+        Some(Replacing { pid, gone }) => gone(*pid),
+        None => false,
+    };
+    let reload = loaded && !replaced_already && (agent.rewritten || replacing.is_some());
+    if replaced_already {
+        log::info!("the daemon to replace has already stopped; not stopping the job");
+    }
     if reload {
         stop_service_daemon(Stop::Job {
             launch: &mut launch,
@@ -1003,15 +1056,57 @@ fn job_runs(list: &str, pid: u32) -> bool {
     })
 }
 
+/// What hops' launchd job would run, as its plist says, beside this binary.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Installed {
+    /// There is no plist, or it could not be looked at.
+    No,
+    /// It runs this binary, or one that is no longer there, or it cannot be
+    /// read: a restart points it at this binary.
+    ThisCopy,
+    /// It runs another copy of hops, which is there: a build in a checkout,
+    /// say, beside the installed app.
+    AnotherCopy(String),
+}
+
+/// [`Installed`], from the plist `agent` and this binary, `exe`.
+///
+/// A restart points the plist at the binary that restarts it, and on macOS
+/// the permissions hops holds belong to the binary the plist names. So the
+/// service is restarted only by the copy of hops it runs: an app replaced in
+/// place, or one moved. Another copy would take the service over without
+/// them.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn installed(agent: io::Result<OnDisk>, exe: &Path) -> Installed {
+    let plist = match agent {
+        Ok(OnDisk::Found(plist)) => plist,
+        Ok(OnDisk::Unreadable(_)) => return Installed::ThisCopy,
+        Ok(OnDisk::Missing) | Err(_) => return Installed::No,
+    };
+    let program = plist
+        .get("ProgramArguments")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|args| args.first())
+        .and_then(serde_json::Value::as_str);
+    match program {
+        Some(other) if !names_file(other, exe) && Path::new(other).exists() => {
+            Installed::AnotherCopy(other.to_string())
+        }
+        _ => Installed::ThisCopy,
+    }
+}
+
 /// Who started the daemon `listener` names, on macOS: hops' launchd job when
-/// its plist is `installed` and `launchctl list` says the job runs that
-/// process. The restart boots out and bootstraps that job, which can stop
-/// nothing else, so any other daemon is left running with the reason.
+/// its plist is `installed` for this copy of hops and `launchctl list` says
+/// the job runs that process. The restart boots out and bootstraps that job,
+/// which can stop nothing else, so any other daemon is left running with the
+/// reason.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn launchd_origin(
     listener: io::Result<Listener>,
     uid: u32,
-    installed: bool,
+    installed: Installed,
     list: impl FnOnce() -> io::Result<LaunchctlRun>,
 ) -> Origin {
     let listener = match listener {
@@ -1025,10 +1120,18 @@ fn launchd_origin(
     if listener.uid != uid {
         return Origin::Other(not_restarted("it runs as another user"));
     }
-    if !installed {
-        return Origin::Other(not_restarted(
-            "the hops service is not installed, so it did not start it",
-        ));
+    match installed {
+        Installed::ThisCopy => {}
+        Installed::No => {
+            return Origin::Other(not_restarted(
+                "the hops service is not installed, so it did not start it",
+            ));
+        }
+        Installed::AnotherCopy(program) => {
+            return Origin::Other(not_restarted(&format!(
+                "the hops service runs another copy of hops, {program}"
+            )));
+        }
     }
     match list() {
         Ok(run) if run.succeeded() && job_runs(&run.stdout, listener.pid) => {
@@ -1052,14 +1155,25 @@ fn launchd_origin(
 /// daemon after a failure (#221).
 #[cfg(target_os = "macos")]
 pub fn launchd_restarts_this_process() -> bool {
-    let Ok(path) = agent_path() else {
-        return false;
-    };
-    let restarts =
-        matches!(read_agent(&path), Ok(OnDisk::Found(plist)) if restarts_after_failure(&plist));
-    restarts
-        && run_launchctl(&["list"])
-            .is_ok_and(|run| run.succeeded() && job_runs(&run.stdout, std::process::id()))
+    launchd_restarts(
+        agent_path().and_then(|path| read_agent(&path)),
+        || run_launchctl(&["list"]),
+        std::process::id(),
+    )
+}
+
+/// Whether launchd starts process `pid` again after it exits unsuccessfully:
+/// hops' job, whose plist is `agent`, restarts its daemon after a failure,
+/// and `launchctl list`, asked only then, says the job runs `pid`. A daemon
+/// run any other way that exits stays down.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn launchd_restarts(
+    agent: io::Result<OnDisk>,
+    list: impl FnOnce() -> io::Result<LaunchctlRun>,
+    pid: u32,
+) -> bool {
+    matches!(agent, Ok(OnDisk::Found(plist)) if restarts_after_failure(&plist))
+        && list().is_ok_and(|run| run.succeeded() && job_runs(&run.stdout, pid))
 }
 
 /// Whether a job with this plist is started again after an unsuccessful exit.
@@ -1771,6 +1885,7 @@ mod waiting_for_the_daemon {
             within: Duration::from_secs(5),
             replaced: None,
             left: None,
+            left_build: None,
         };
         let exited = report(DaemonStart::Exited(PID), None).problem();
         let silent = report(DaemonStart::NoAnswer(PID), None).problem();
@@ -2288,7 +2403,7 @@ mod through_launchd {
     // LEDGER T2225 | class B | 1 return value + calls, pauses and asks recorded by the injected runner
     #[test]
     fn restarting_an_outdated_service_boots_its_job_out_waits_for_it_then_starts_it_again() {
-        let (got, calls, pauses, asked) = restart_with(4444, 2, |sub| match sub {
+        let (got, calls, pauses, asked) = restart_with(4444, 3, |sub| match sub {
             "print" => ok("gui/501/com.grabbr.hops = {\n\tstate = running\n}\n"),
             "bootout" | "bootstrap" => ok(""),
             "kickstart" => already_running(5555),
@@ -2307,10 +2422,38 @@ mod through_launchd {
         );
         assert_eq!(
             (got.as_ref().ok(), asked, pauses.len()),
-            (Some(&5555), vec![4444, 4444, 4444], 2),
+            (Some(&5555), vec![4444; 4], 2),
             "the restart must wait for the old daemon (4444) to exit before it \
              bootstraps the job: while it holds the endpoint, this build's daemon \
              stops beside it and the old one goes on serving"
+        );
+    }
+
+    /// Two front doors can both find the old daemon and both restart the
+    /// service. The second finds it gone, and must not boot out the job,
+    /// which now runs the daemon of this build the first one started.
+    // LEDGER T2247 | class B | 1 return value + calls recorded by the injected runner
+    #[test]
+    fn a_restart_that_finds_the_old_daemon_gone_stops_nothing() {
+        let (got, calls, pauses, asked) = restart_with(4444, 0, |sub| match sub {
+            "print" => ok("gui/501/com.grabbr.hops = {\n\tstate = running\n}\n"),
+            "bootout" | "bootstrap" => ok(""),
+            "kickstart" => already_running(5555),
+            other => failed(1, &format!("unexpected {other}")),
+        });
+        stops_only_to_restart(&calls, 0);
+        assert_eq!(
+            (got.as_ref().ok(), calls, pauses, asked),
+            (
+                Some(&5555),
+                vec![
+                    format!("print {SERVICE}"),
+                    format!("kickstart -p {SERVICE}")
+                ],
+                vec![],
+                vec![4444]
+            ),
+            "the daemon being replaced had already exited: the job runs a newer one"
         );
     }
 
@@ -2347,6 +2490,7 @@ mod through_launchd {
                     5555\t0\tcom.grabbr.hops\n\
                     6666\t-15\tapplication.com.apple.Terminal.1 2\n";
         let listing = |stdout: &'static str| move || Ok(ok(stdout));
+        use super::Installed::{AnotherCopy, No, ThisCopy};
         let from = |pid, uid, installed, stdout: &'static str| {
             super::launchd_origin(
                 Ok(hops_ipc::Listener { pid, uid }),
@@ -2356,26 +2500,149 @@ mod through_launchd {
             )
         };
         assert_eq!(
-            from(5555, UID, true, list),
+            from(5555, UID, ThisCopy, list),
             super::Origin::Service(5555),
             "the job runs the daemon that answers"
         );
+        let checkout = || AnotherCopy("/Users/me/src/hops/target/debug/hops".into());
         for (what, got) in [
-            ("the tray's job runs it", from(4444, UID, true, list)),
-            ("no job runs it", from(7777, UID, true, list)),
+            ("the tray's job runs it", from(4444, UID, ThisCopy, list)),
+            ("no job runs it", from(7777, UID, ThisCopy, list)),
             (
                 "the job has no process",
-                from(5555, UID, true, "-\t0\tcom.grabbr.hops\n"),
+                from(5555, UID, ThisCopy, "-\t0\tcom.grabbr.hops\n"),
             ),
-            ("no plist is installed", from(5555, UID, false, list)),
-            ("another user runs it", from(5555, UID + 1, true, list)),
+            ("no plist is installed", from(5555, UID, No, list)),
+            ("another user runs it", from(5555, UID + 1, ThisCopy, list)),
+            (
+                "the job runs another copy of hops",
+                from(5555, UID, checkout(), list),
+            ),
         ] {
             assert!(
                 matches!(&got, super::Origin::Other(why) if why.contains("Stop it")),
-                "{what}, and it counted as the service's daemon: {got:?}. A restart \
-                 boots out a job that does not run it, and it goes on serving."
+                "{what}, and it counted as the service's daemon to restart: {got:?}. \
+                 A restart boots out the job: one that does not run the daemon leaves \
+                 it serving, and one that runs another copy of hops hands the service \
+                 to a binary without its permissions."
             );
         }
+    }
+
+    /// A restart points the plist at the binary that restarts, and on macOS
+    /// hops' permissions belong to the binary the plist names: only the copy
+    /// of hops the service runs restarts it. A build in a checkout beside the
+    /// installed app would take the service over without them.
+    // LEDGER T2246 | class B | 1 return value over real files
+    #[test]
+    fn only_the_copy_of_hops_the_service_runs_counts_as_this_one() {
+        use super::{Installed, OnDisk, installed};
+        let dir = std::env::temp_dir().join(format!("h-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let (this, other) = (dir.join("this-hops"), dir.join("other-hops"));
+        std::fs::write(&this, "").expect("this binary");
+        std::fs::write(&other, "").expect("another copy");
+        let runs = |program: &std::path::Path| {
+            let serde_json::Value::Object(plist) = serde_json::json!({
+                "Label": "com.grabbr.hops",
+                "ProgramArguments": [program.to_string_lossy(), "daemon"],
+            }) else {
+                unreachable!("a JSON object literal")
+            };
+            Ok(OnDisk::Found(plist))
+        };
+        let got = [
+            installed(runs(&this), &this),
+            installed(runs(&dir.join("moved-away")), &this),
+            installed(Ok(OnDisk::Unreadable("garbled".into())), &this),
+            installed(runs(&other), &this),
+            installed(Ok(OnDisk::Missing), &this),
+        ];
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            got,
+            [
+                Installed::ThisCopy,
+                Installed::ThisCopy,
+                Installed::ThisCopy,
+                Installed::AnotherCopy(other.to_string_lossy().into_owned()),
+                Installed::No,
+            ],
+            "(runs this binary, one no longer there, an unreadable plist, another \
+             copy that is there, no plist)"
+        );
+    }
+
+    /// The daemon exits after a grant only when launchd will start it again
+    /// (#221): its job restarts after a failure and runs this very process.
+    /// Exiting otherwise leaves no daemon until the next login.
+    // LEDGER T2245 | class B | 1 return value + 6 whether launchctl was asked
+    #[test]
+    fn only_the_process_of_a_job_that_restarts_after_a_failure_exits_for_a_grant() {
+        use super::{OnDisk, launchd_restarts};
+        let plist = |keep_alive: serde_json::Value| {
+            let serde_json::Value::Object(plist) = serde_json::json!({
+                "Label": "com.grabbr.hops",
+                "ProgramArguments": ["/Applications/hops.app/Contents/MacOS/hops", "daemon"],
+                "KeepAlive": keep_alive,
+            }) else {
+                unreachable!("a JSON object literal")
+            };
+            Ok(OnDisk::Found(plist))
+        };
+        let restarts = || plist(serde_json::json!({ "SuccessfulExit": false }));
+        let list = "PID\tStatus\tLabel\n5555\t0\tcom.grabbr.hops\n";
+        let asked = std::cell::Cell::new(0);
+        let listing = |run: LaunchctlRun| {
+            let asked = &asked;
+            move || {
+                asked.set(asked.get() + 1);
+                Ok(run)
+            }
+        };
+
+        assert!(
+            launchd_restarts(restarts(), listing(ok(list)), 5555),
+            "the job restarts after a failure and runs this process"
+        );
+        for (what, got) in [
+            (
+                "the job runs another process: this one was started from a terminal",
+                launchd_restarts(restarts(), listing(ok(list)), 7777),
+            ),
+            (
+                "launchctl list failed",
+                launchd_restarts(restarts(), listing(failed(1, "no")), 5555),
+            ),
+        ] {
+            assert!(
+                !got,
+                "{what}, and the daemon would exit for a grant and stay down"
+            );
+        }
+        let before = asked.get();
+        for (what, agent) in [
+            (
+                "the plist never restarts it",
+                plist(serde_json::json!(false)),
+            ),
+            (
+                "the plist restarts it only after a success",
+                plist(serde_json::json!({ "SuccessfulExit": true })),
+            ),
+            ("there is no plist", Ok(OnDisk::Missing)),
+        ] {
+            assert!(
+                !launchd_restarts(agent, listing(ok(list)), 5555),
+                "{what}, and the daemon would exit for a grant and stay down"
+            );
+        }
+        assert_eq!(
+            asked.get(),
+            before,
+            "launchctl is asked only when the plist restarts"
+        );
     }
 }
 
@@ -2408,10 +2675,11 @@ mod restarting_an_outdated_service {
         build("0.13.0", "abcd123")
     }
 
-    /// The daemon that answers says `stated` and was started as `origin`;
-    /// whatever the front door starts serves at once.
+    /// The daemon that answers says `stated`, one answer an ask, the last
+    /// one again once they run out, and was started as `origin`; whatever
+    /// the front door starts serves at once.
     struct Scripted {
-        stated: Option<StatedBuild>,
+        stated: Vec<Option<StatedBuild>>,
         origin: Origin,
         asked_origin: usize,
     }
@@ -2430,7 +2698,11 @@ mod restarting_an_outdated_service {
 
     impl Running for Scripted {
         fn build(&mut self, _: &DaemonEndpoint, _: Duration) -> Option<StatedBuild> {
-            self.stated.clone()
+            if self.stated.len() > 1 {
+                self.stated.remove(0)
+            } else {
+                self.stated.first().cloned().flatten()
+            }
         }
         fn origin(&mut self, _: &DaemonEndpoint) -> Origin {
             self.asked_origin += 1;
@@ -2443,6 +2715,15 @@ mod restarting_an_outdated_service {
     /// started the daemon.
     fn door(
         stated: Option<StatedBuild>,
+        origin: Origin,
+        launched: std::io::Result<u32>,
+    ) -> (StartReport, Vec<Launch>, usize) {
+        door_answering(vec![stated], origin, launched)
+    }
+
+    /// [`door`], with the daemon giving `stated` in turn as it is asked.
+    fn door_answering(
+        stated: Vec<Option<StatedBuild>>,
         origin: Origin,
         launched: std::io::Result<u32>,
     ) -> (StartReport, Vec<Launch>, usize) {
@@ -2528,9 +2809,74 @@ mod restarting_an_outdated_service {
              start is not the app's to stop."
         );
         assert_eq!(
-            (same.note(), same.left, terminal.left.as_deref()),
+            (same.note(), same.left.as_deref(), terminal.left.as_deref()),
             (None, None, Some(why)),
             "only the daemon left running with another build carries words for it"
+        );
+        // Said before the app connects too: a daemon from before the token
+        // cannot be connected to, and the app would wait on it in silence.
+        assert_eq!(
+            (same.problem(), silent.problem(), terminal.problem()),
+            (
+                None,
+                None,
+                Some(format!(
+                    "The hops service is running hops 0.12.0 (1111111), not this version. \
+                     {why}"
+                ))
+            ),
+            "(this build, said nothing, left running) in words before the app connects"
+        );
+    }
+
+    /// A daemon that sends state without its build is asked again before it
+    /// is restarted: that it states none is concluded from a wait running
+    /// out, and one of this build that was slow to answer states it next.
+    // LEDGER T2248 | class B | 1 return value + 6 launches recorded
+    #[test]
+    fn a_daemon_that_states_no_build_is_asked_again_before_it_is_restarted() {
+        let (late, asked_late, _) = door_answering(
+            vec![Some(StatedBuild::Unstated), Some(StatedBuild::Is(this()))],
+            Origin::Service(OLD),
+            Ok(NEW),
+        );
+        let (never, asked_never, _) = door_answering(
+            vec![Some(StatedBuild::Unstated), Some(StatedBuild::Unstated)],
+            Origin::Service(OLD),
+            Ok(NEW),
+        );
+        assert_eq!(
+            ((late.outcome, asked_late), (never.outcome, asked_never)),
+            (
+                (DaemonStart::AlreadyRunning, vec![]),
+                (DaemonStart::Started(NEW), vec![Launch::Restart(OLD)])
+            ),
+            "((stated this build when asked again), (stated none twice)). A daemon \
+             of this build is never restarted by the app."
+        );
+    }
+
+    /// A restart that hands back the daemon it was to replace stopped
+    /// nothing: the old build still serves, and the app says so rather than
+    /// that it restarted the service.
+    // LEDGER T2249 | class B | 1 return value
+    #[test]
+    fn a_restart_that_leaves_the_old_daemon_running_is_not_a_restart() {
+        let (report, asked, _) = door(older(), Origin::Service(OLD), Ok(OLD));
+        let problem = report.problem().unwrap_or_default();
+        assert_eq!(
+            (report.outcome, asked, report.note()),
+            (
+                DaemonStart::AlreadyRunning,
+                vec![Launch::Restart(OLD)],
+                None
+            ),
+            "the service still runs process {OLD}, the old build, and the app said \
+             it restarted it: {report:?}"
+        );
+        assert!(
+            problem.contains("hops 0.12.0 (1111111)") && problem.contains("did not stop"),
+            "{problem:?}"
         );
     }
 
@@ -2551,6 +2897,105 @@ mod restarting_an_outdated_service {
             "{problem:?}"
         );
         assert_eq!(report.note(), None, "{report:?}");
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod stopping_an_outdated_daemon_on_linux {
+    //! The restart signals only the process that holds the endpoint, and
+    //! only when that is the service's hops daemon (#222). These hand it
+    //! bystanders while this test holds the endpoint.
+
+    use super::{Origin, proc_origin, stop_outdated_daemon, this_user};
+    use hops_ipc::{DaemonEndpoint, Listener};
+    use std::os::unix::process::CommandExt;
+    use std::path::PathBuf;
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// Whether `child` is still running after `within`.
+    fn still_runs(child: &mut Child, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if !matches!(child.try_wait(), Ok(None)) {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        true
+    }
+
+    // LEDGER T2252 | class B | 5 processes left running + 1 return value
+    #[test]
+    fn a_process_that_does_not_hold_the_endpoint_is_never_signalled() {
+        let dir = PathBuf::from(format!("/tmp/h-by-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let path = dir.join("s.sock");
+        // This test holds the endpoint, and is no hops daemon.
+        let held = std::os::unix::net::UnixListener::bind(&path).expect("a unix listener");
+        let endpoint = DaemonEndpoint::Unix(path);
+
+        let mut plain = Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("sleep starts");
+        // One that looks like the service's daemon in every other way: a
+        // program named hops, run with `daemon`, in a session of its own.
+        let hops = dir.join("hops");
+        std::fs::copy("/bin/sh", &hops).expect("a program named hops");
+        let mut command = Command::new(&hops);
+        command
+            .args(["-c", "read line", "daemon"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null());
+        // SAFETY: setsid is async-signal-safe and touches only the child.
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let mut lookalike = command.spawn().expect("the lookalike starts");
+        let looks = proc_origin(
+            Ok(Listener {
+                pid: lookalike.id(),
+                uid: this_user(),
+            }),
+            this_user(),
+            &PathBuf::from(format!("/proc/{}", lookalike.id())),
+        );
+
+        let within = Duration::from_secs(1);
+        let refused = (
+            stop_outdated_daemon(plain.id(), &endpoint, within).is_err(),
+            stop_outdated_daemon(lookalike.id(), &endpoint, within).is_err(),
+        );
+        let alive = (
+            still_runs(&mut plain, within),
+            still_runs(&mut lookalike, within),
+        );
+        for child in [&mut plain, &mut lookalike] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            looks,
+            Origin::Service(lookalike.id()),
+            "the lookalike must pass for the service's daemon, or this proves nothing \
+             about the check that it holds the endpoint"
+        );
+        assert_eq!(
+            (refused, alive),
+            ((true, true), (true, true)),
+            "((refused sleep, refused the lookalike), (sleep alive, lookalike alive)). \
+             Neither holds the endpoint, so neither is the daemon to restart; the \
+             front door stops nothing but that one."
+        );
     }
 }
 

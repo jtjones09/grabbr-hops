@@ -137,7 +137,7 @@ async fn attached(client: &FrontendClient, within: Duration) -> hops_frontend_co
     }
 }
 
-// LEDGER T58+T59 | class B | 2 events over real IPC from 5 the built daemon; 6 FrontendClient state
+// LEDGER T58+T59+T2222 | class B | 2 events over real IPC from 5 the built daemon; 6 FrontendClient state; 1 the listener's pid from the kernel
 #[tokio::test(flavor = "current_thread")]
 async fn the_daemon_states_its_build_first_and_the_app_names_another() {
     let daemon = start();
@@ -219,6 +219,18 @@ async fn the_daemon_states_its_build_first_and_the_app_names_another() {
         Some(hops_ipc::StatedBuild::Is(ours.clone())),
         "the front door read the daemon of its own build as another, and would \
          restart it"
+    );
+
+    // T2222 across processes: the process the front door would stop is the
+    // daemon listening, not the one asking, as the kernel names it.
+    let endpoint = hops_ipc::DaemonEndpoint::of_this_platform().expect("the scratch endpoint");
+    let listener = endpoint.listener().map_err(|e| e.to_string());
+    assert_eq!(
+        listener.map(|l| l.pid),
+        Ok(daemon.child.id()),
+        "the endpoint named another process than the daemon listening on it \
+         (this test is {}); a restart would stop the wrong program",
+        std::process::id()
     );
 
     // T59: the app's own client, as this build and as another.

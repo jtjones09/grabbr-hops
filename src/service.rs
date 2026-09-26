@@ -55,7 +55,7 @@ pub enum ServiceError {
     Signal(io::Error),
     /// A macOS permission was granted while the daemon ran, and launchd
     /// starts it again after an unsuccessful exit, which this is (#221).
-    #[error("{0} is now granted; exiting so that launchd starts hops again with it")]
+    #[error("macOS now grants hops {0}; exiting so that launchd starts it again with the grant")]
     PermissionGranted(String),
 }
 
@@ -720,13 +720,13 @@ impl Service {
             AfterGrant::Exit(_) => Some(granted),
             AfterGrant::Tell(_) => {
                 log::warn!(
-                    "{granted} is now granted, and takes effect once the hops service \
-                     restarts; launchd did not start this daemon, so it cannot restart \
-                     itself"
+                    "macOS now grants hops {granted}, which takes effect once the hops \
+                     service restarts; launchd did not start this daemon, so it cannot \
+                     restart itself"
                 );
                 self.notify_frontend(FrontendEvent::Error(format!(
-                    "{granted} is now granted. It takes effect once the hops service \
-                     restarts: stop it and start it again."
+                    "macOS now grants hops {granted}. It takes effect once the hops \
+                     service restarts: stop it and start it again."
                 )));
                 None
             }
@@ -2763,6 +2763,9 @@ mod a_second_daemon_leaves_the_running_daemons_files_alone {
         );
     }
 }
+
+#[cfg(all(test, unix))]
+mod a_permission_granted_while_it_runs;
 
 #[cfg(test)]
 mod replay_on_attach {

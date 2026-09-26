@@ -3084,8 +3084,9 @@ mod the_front_door_restarts_only_an_outdated_service_it_installed {
 
     /// A backstop over `src/daemon_start.rs` as source text, for what the
     /// behavioural tests cannot show: that nothing ELSE in the front door can
-    /// stop a daemon. Every way of stopping one there (a launchd bootout, a
-    /// `kickstart -k`, a signal) must sit inside `stop_service_daemon`, whose
+    /// stop a daemon. Every way of stopping one there (a launchd bootout,
+    /// `stop`, `unload`, `remove` or `kill`, a `kickstart -k`, a signal, a
+    /// `kill` command) must sit inside `stop_service_daemon`, whose
     /// callers are the restart of an outdated service and the reload of a
     /// rewritten plist. Scans product code with comments stripped, never this
     /// file. Paired with T2223 above and T2225 in `daemon_start`, which run the
@@ -3105,9 +3106,15 @@ mod the_front_door_restarts_only_an_outdated_service_it_installed {
             "\"-k\"",
             "kickstart -k",
             "kill(",
+            "\"kill\"",
+            "\"stop\"",
+            "\"unload\"",
+            "\"remove\"",
             "pidfd_send_signal",
             "SIGTERM",
             "SIGKILL",
+            "SIGINT",
+            "SIGQUIT",
             "TerminateProcess",
             "taskkill",
         ] {

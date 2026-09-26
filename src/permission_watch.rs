@@ -6,12 +6,18 @@
 //! already running, and the app does not restart a daemon of its own build.
 //! So while capture or emulation is not running, the daemon asks the same
 //! silent checks the backends use, every few seconds and off its loop. When a
-//! permission that was missing is granted, a daemon that launchd starts again
-//! after a failure exits unsuccessfully, and its launchd job starts a fresh
-//! process, which sees the grant. Any other daemon says that the permission is
-//! granted and takes effect once hops restarts.
+//! side that was missing a permission has everything it needs, a daemon that
+//! launchd starts again after a failure exits unsuccessfully, and its launchd
+//! job starts a fresh process, which sees the grant. Any other daemon says
+//! that the permission is granted and takes effect once hops restarts.
+//!
+//! Each side is settled on its own. A Mac that is only ever controlled never
+//! grants Input Monitoring, which only capture needs, and emulation must still
+//! start once Accessibility is granted. The side still missing a permission
+//! reads as missing on the fresh process's first check, so the exit does not
+//! repeat.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,6 +36,16 @@ pub enum Permission {
     /// Posting input events, granted with Accessibility
     /// (`CGPreflightPostEventAccess`).
     PostEvents,
+}
+
+impl Permission {
+    /// The System Settings list that grants it.
+    fn pane(self) -> &'static str {
+        match self {
+            Self::Accessibility | Self::PostEvents => "Accessibility",
+            Self::InputMonitoring => "Input Monitoring",
+        }
+    }
 }
 
 impl fmt::Display for Permission {
@@ -59,13 +75,22 @@ impl Side {
     }
 }
 
+impl fmt::Display for Side {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Capture => "input capture",
+            Self::Emulation => "input emulation",
+        })
+    }
+}
+
 /// Asks whether a permission is granted, without raising a prompt.
 pub type Probe = Arc<dyn Fn(Permission) -> bool + Send + Sync>;
 
 /// Whether launchd starts this process again after an unsuccessful exit.
 pub type Restarts = Arc<dyn Fn() -> bool + Send + Sync>;
 
-/// What the daemon does once the permissions it was missing are granted.
+/// What the daemon does once a side has the permissions it was missing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AfterGrant {
     /// Exit unsuccessfully: launchd starts a fresh process, which has them.
@@ -76,31 +101,38 @@ pub enum AfterGrant {
 }
 
 impl AfterGrant {
-    /// The permissions granted, in words: "Accessibility and Input Monitoring".
+    /// What was granted, as the System Settings lists that grant it, each
+    /// named once: "Accessibility and Input Monitoring".
     pub fn granted(&self) -> String {
         let (Self::Exit(granted) | Self::Tell(granted)) = self;
-        let names: Vec<String> = granted.iter().map(ToString::to_string).collect();
-        match names.as_slice() {
+        let mut panes: Vec<&str> = Vec::new();
+        for pane in granted.iter().map(|p| p.pane()) {
+            if !panes.contains(&pane) {
+                panes.push(pane);
+            }
+        }
+        match panes.as_slice() {
             [] => "the permission".to_string(),
-            [one] => one.clone(),
+            [one] => one.to_string(),
             [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
         }
     }
 }
 
-/// What one check found, and whether launchd would restart this process.
-type Checked = (BTreeSet<Permission>, bool);
+/// What one check found: each permission asked, and whether it is granted;
+/// and whether launchd would restart this process, asked only when a side
+/// that was missing something has it all.
+type Checked = (BTreeMap<Permission, bool>, bool);
 
-/// Watches the permissions of a side that is not running (see the module).
+/// Watches the permissions of each side that is not running (see the module).
 pub struct PermissionWatch {
     probe: Probe,
     restarts: Restarts,
     every: Duration,
-    /// Sides that are not running, whose permissions are checked.
-    waiting: BTreeSet<Side>,
-    /// What the checks found missing, once one has run since a side stopped.
-    /// `None` until then; a check that finds nothing missing ends the watch.
-    missing: Option<BTreeSet<Permission>>,
+    /// Sides that are not running, each with what the checks found it
+    /// missing: `None` until a check has run since it stopped. A side found
+    /// missing nothing stopped for another reason, and is not watched.
+    waiting: BTreeMap<Side, Option<BTreeSet<Permission>>>,
     ticks: Option<Interval>,
     /// A check running off the loop, kept across a `select!` that drops
     /// [`Self::granted`] before it resolves.
@@ -113,15 +145,14 @@ pub struct PermissionWatch {
 const CHECK_EVERY: Duration = Duration::from_secs(2);
 
 impl PermissionWatch {
-    /// A watch that asks `probe`, and `restarts` once everything is granted,
-    /// every `every`. Nothing is watched until a side stops.
+    /// A watch that asks `probe`, and `restarts` once a side has what it was
+    /// missing, every `every`. Nothing is watched until a side stops.
     pub fn new(probe: Probe, restarts: Restarts, every: Duration) -> Self {
         Self {
             probe,
             restarts,
             every,
-            waiting: BTreeSet::new(),
-            missing: None,
+            waiting: BTreeMap::new(),
             ticks: None,
             pending: None,
             enabled: true,
@@ -155,7 +186,7 @@ impl PermissionWatch {
     /// `side` is not running: watch what it needs.
     pub fn stopped(&mut self, side: Side) {
         if self.enabled {
-            self.waiting.insert(side);
+            self.waiting.entry(side).or_insert(None);
         }
     }
 
@@ -163,14 +194,13 @@ impl PermissionWatch {
     pub fn started(&mut self, side: Side) {
         self.waiting.remove(&side);
         if self.waiting.is_empty() {
-            self.missing = None;
             self.pending = None;
         }
     }
 
-    /// Resolves once every permission that was missing is granted, with what
-    /// to do about it. Never resolves while no side is waiting, or while
-    /// nothing was found missing.
+    /// Resolves once a side that was missing a permission has every one it
+    /// needs, with what to do about it. Never resolves while no side is
+    /// waiting, or while each waiting side lacks something.
     ///
     /// The checks run on a blocking thread, so a slow answer from the
     /// system never holds the daemon's loop. Safe to drop at any await.
@@ -190,16 +220,24 @@ impl PermissionWatch {
                 let (probe, restarts) = (self.probe.clone(), self.restarts.clone());
                 let needed: BTreeSet<Permission> = self
                     .waiting
-                    .iter()
+                    .keys()
                     .flat_map(|side| side.needs().iter().copied())
                     .collect();
-                let watching = self.missing.is_some();
+                // The sides a grant can complete: those seen missing something.
+                let armed: Vec<&'static [Permission]> = self
+                    .waiting
+                    .iter()
+                    .filter(|(_, missing)| missing.is_some())
+                    .map(|(side, _)| side.needs())
+                    .collect();
                 self.pending = Some(tokio::task::spawn_blocking(move || {
-                    let missing: BTreeSet<Permission> =
-                        needed.into_iter().filter(|&p| !probe(p)).collect();
+                    let answers: BTreeMap<Permission, bool> =
+                        needed.into_iter().map(|p| (p, probe(p))).collect();
+                    let complete = armed
+                        .iter()
+                        .any(|needs| needs.iter().all(|p| answers.get(p) == Some(&true)));
                     // Asked only when about to act: it runs `launchctl`.
-                    let restarts = watching && missing.is_empty() && restarts();
-                    (missing, restarts)
+                    (answers, complete && restarts())
                 }));
             }
             let Some(check) = self.pending.as_mut() else {
@@ -208,41 +246,69 @@ impl PermissionWatch {
             let checked = check.await;
             self.pending = None;
             // A check that panicked is tried again at the next tick.
-            if let Ok((missing, restarts)) = checked {
-                if let Some(after) = self.settle(missing, restarts) {
+            if let Ok((answers, restarts)) = checked {
+                if let Some(after) = self.settle(&answers, restarts) {
                     return after;
                 }
             }
         }
     }
 
-    /// Fold one check into the watch; `Some` once what was missing is granted.
-    fn settle(&mut self, missing: BTreeSet<Permission>, restarts: bool) -> Option<AfterGrant> {
-        let Some(was) = self.missing.take() else {
-            if missing.is_empty() {
-                // Nothing was missing when the side stopped, so no grant
-                // will start it: stop watching until another side stops.
-                self.waiting.clear();
-            } else {
-                log::info!(
-                    "missing macOS permission(s): {}; checking again every {} s until granted",
-                    missing
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    self.every.as_secs_f64()
-                );
-                self.missing = Some(missing);
+    /// Fold one check into each waiting side; `Some` once a side that was
+    /// missing something has all it needs.
+    fn settle(
+        &mut self,
+        answers: &BTreeMap<Permission, bool>,
+        restarts: bool,
+    ) -> Option<AfterGrant> {
+        let mut granted = BTreeSet::new();
+        let sides: Vec<Side> = self.waiting.keys().copied().collect();
+        for side in sides {
+            // A side that stopped after the check began was not asked about.
+            let Some(missing) = side
+                .needs()
+                .iter()
+                .map(|p| answers.get(p).map(|&ok| (!ok).then_some(*p)))
+                .collect::<Option<Vec<Option<Permission>>>>()
+            else {
+                continue;
+            };
+            let missing: BTreeSet<Permission> = missing.into_iter().flatten().collect();
+            match (
+                self.waiting.get(&side).cloned().flatten(),
+                missing.is_empty(),
+            ) {
+                // It stopped with everything it needs: for another reason,
+                // which no grant mends.
+                (None, true) => {
+                    self.waiting.remove(&side);
+                }
+                (None, false) => {
+                    log::info!(
+                        "missing macOS permission(s) for {side}: {}; checking again every \
+                         {} s until granted",
+                        missing
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        self.every.as_secs_f64()
+                    );
+                    self.waiting.insert(side, Some(missing));
+                }
+                (Some(was), true) => {
+                    granted.extend(was);
+                    self.waiting.remove(&side);
+                }
+                (Some(_), false) => {
+                    self.waiting.insert(side, Some(missing));
+                }
             }
-            return None;
-        };
-        if !missing.is_empty() {
-            self.missing = Some(missing);
+        }
+        if granted.is_empty() {
             return None;
         }
-        self.waiting.clear();
-        let granted = was.into_iter().collect();
+        let granted = granted.into_iter().collect();
         Some(if restarts {
             AfterGrant::Exit(granted)
         } else {
@@ -308,6 +374,12 @@ mod a_grant_made_while_the_daemon_runs {
         fn grant(&self) {
             self.denied.lock().expect("lock").clear();
         }
+        fn grant_only(&self, permission: Permission) {
+            self.denied
+                .lock()
+                .expect("lock")
+                .retain(|&p| p != permission);
+        }
     }
 
     fn watch(system: &Arc<System>, restarts: bool) -> PermissionWatch {
@@ -362,6 +434,70 @@ mod a_grant_made_while_the_daemon_runs {
                  (launchd restarts the daemon: {restarts}). The daemon must exit \
                  for launchd to start it with the grant, and must not exit when \
                  nothing would start it again."
+            );
+        }
+    }
+
+    /// Each side is settled on its own: a Mac that is only ever controlled
+    /// never grants Input Monitoring, which only capture needs, and emulation
+    /// must start once Accessibility is granted.
+    // LEDGER T2240 | class B | 1 return value of PermissionWatch::granted
+    #[test]
+    fn a_side_that_has_all_it_needs_restarts_the_daemon_while_the_other_still_lacks_one() {
+        let system = System::new(&[Permission::Accessibility, Permission::InputMonitoring]);
+        let mut both = watch(&system, true);
+        both.stopped(Side::Capture);
+        both.stopped(Side::Emulation);
+        let got = runtime().block_on(async {
+            let granter = system.clone();
+            tokio::spawn(async move {
+                while granter.asked.load(Ordering::SeqCst) < 12 {
+                    tokio::time::sleep(EVERY).await;
+                }
+                granter.grant_only(Permission::Accessibility);
+            });
+            tokio::time::timeout(DEADLINE, both.granted()).await
+        });
+        assert_eq!(
+            got,
+            Ok(AfterGrant::Exit(vec![Permission::Accessibility])),
+            "Accessibility, all emulation needs, was granted while Input Monitoring, \
+             which only capture needs, stayed off. Emulation must start with it; \
+             waiting for both leaves a controlled-only Mac without input until \
+             someone clicks enable input or logs in again."
+        );
+
+        // The fresh process: capture still lacks Input Monitoring, and that
+        // alone never ends the daemon again.
+        let fresh = System::new(&[Permission::InputMonitoring]);
+        let mut again = watch(&fresh, true);
+        again.stopped(Side::Capture);
+        let after =
+            runtime().block_on(async { tokio::time::timeout(NOTHING_FOR, again.granted()).await });
+        assert!(
+            fresh.asked.load(Ordering::SeqCst) > 0 && after.is_err(),
+            "a side that still lacks a permission after the restart ended the \
+             daemon again: {after:?}"
+        );
+    }
+
+    /// The words name each System Settings list once.
+    // LEDGER T2241 | class B | 1 return value of AfterGrant::granted
+    #[test]
+    fn what_was_granted_is_named_as_the_settings_that_grant_it() {
+        use Permission::{Accessibility, InputMonitoring, PostEvents};
+        for (granted, said) in [
+            (vec![Accessibility], "Accessibility"),
+            (vec![Accessibility, PostEvents], "Accessibility"),
+            (
+                vec![Accessibility, InputMonitoring, PostEvents],
+                "Accessibility and Input Monitoring",
+            ),
+        ] {
+            assert_eq!(
+                AfterGrant::Exit(granted.clone()).granted(),
+                said,
+                "{granted:?}"
             );
         }
     }

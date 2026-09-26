@@ -619,8 +619,26 @@ pub fn command_from_args() -> Option<Command> {
 
 impl Config {
     pub fn new() -> Result<Self, ConfigError> {
-        let args = Args::parse();
+        Self::with_args(Args::parse())
+    }
 
+    /// The config of a daemon a test runs in-process: `hops --config
+    /// <config> --cert-path <cert> daemon`, never the test's own arguments.
+    #[cfg(test)]
+    pub(crate) fn in_scratch(config: &Path, cert: &Path) -> Result<Self, ConfigError> {
+        use std::ffi::OsStr;
+        let args = [
+            OsStr::new("hops"),
+            OsStr::new("--config"),
+            config.as_os_str(),
+            OsStr::new("--cert-path"),
+            cert.as_os_str(),
+            OsStr::new("daemon"),
+        ];
+        Self::with_args(Args::try_parse_from(args).expect("a daemon's arguments"))
+    }
+
+    fn with_args(args: Args) -> Result<Self, ConfigError> {
         // --config <file> overrules default location
         let config_path = args
             .config
