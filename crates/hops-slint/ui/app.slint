@@ -35,6 +35,9 @@ export struct DeviceRow {
     has-send: bool,      // has an outgoing (send-to) facet
     fingerprint: string, // short fingerprint (display)
     fp-full: string,     // full fingerprint (for revoke)
+    pin: string,         // the send facet's pin, "" if none: what delete and
+                         // rename carry, so the daemon can refuse them once
+                         // the device is pinned to another machine (#94)
     online: bool,        // a peer with this fingerprint is connected in
     trusted: bool,       // its fingerprint is in authorized_fingerprints
     revoked: bool,       // the user expelled it; shown, not forgotten
@@ -83,12 +86,21 @@ export component AppWindow inherits Window {
     in property <int> notice-seq: 0;
     property <int> dismissed-seq: 0;
     in property <bool> connected: false;
+    // What is wrong with the service, or empty: why the service the app
+    // started did not come up, or that the daemon runs another build than
+    // this app. Not dismissible: it stays while it is true.
+    in property <string> service-problem: "";
     in property <string> capture: "—";
     in property <string> emulation: "—";
     in property <string> port: "—";
     in property <string> fingerprint: "—";
     in property <[DeviceRow]> devices: [];
     in property <string> pairing-fp: "";
+    // The name typed into the pairing card. Held here rather than only in the
+    // field so Rust can clear it when the card changes machine: a name typed
+    // for one machine must never be sent to approve another (#168). `in-out`
+    // because the field writes it and Rust clears it.
+    in-out property <string> pairing-name: "";
     // true when WE dialled out and found this untrusted receiver, rather than it
     // connecting to us. A console verb can cause the former, so the card must not
     // present it as a peer knocking (#61).
@@ -108,6 +120,9 @@ export component AppWindow inherits Window {
     in-out property <string> confirm-revoke-fp: "";
     // `in-out` so the render_png self-review harness can open it for a look.
     in-out property <string> confirm-delete-handle: "";
+    // The row's pin when delete was armed. The delete carries it, and Rust
+    // clears both once the device behind the handle changes (#94).
+    in-out property <string> confirm-delete-pin: "";
     // handle of the device being renamed ("" = none). The rename FIELD lives
     // in a single shared panel below the list, NOT inline per-row — `devices`
     // is a brand-new VecModel every ~250ms poll tick, so a TextField inside
@@ -118,6 +133,8 @@ export component AppWindow inherits Window {
     // the loop, and is just re-read fresh each time a row re-renders.
     // `in-out` so the render_png self-review harness can open it for a look.
     in-out property <string> editing-device: "";
+    // The row's pin when its rename opened, carried like confirm-delete-pin.
+    in-out property <string> editing-pin: "";
     // `in-out` (not a plain internal property) so the render_png self-review
     // harness can open these overlays from outside for a look — not used by the
     // real app's Rust side, which only ever reads them indirectly via clicks.
@@ -151,8 +168,8 @@ export component AppWindow inherits Window {
     callback enable-input();
     callback activate-device(string /* handle */, bool /* active */);
     callback reposition-device(string /* handle */, string /* new position */);
-    callback rename-device(string /* handle */, string /* new name */);
-    callback delete-device(string /* handle */);
+    callback rename-device(string /* handle */, string /* pin */, string /* new name */);
+    callback delete-device(string /* handle */, string /* pin */);
     callback revoke(string /* full fingerprint */);
     callback approve-pairing(string /* name */, string /* full fingerprint */);
     callback deny-pairing(string /* full fingerprint */);
@@ -247,6 +264,24 @@ export component AppWindow inherits Window {
             }
         }
 
+        // --- the service: a start that did not come up, or another build ------
+        if root.service-problem != "": Rectangle {
+            vertical-stretch: 0;
+            background: Theme.c.warn.transparentize(0.9);
+            border-radius: Radius.lg;
+            border-width: 1px;
+            border-color: Theme.c.warn.transparentize(0.55);
+            HorizontalLayout {
+                padding: Space.md;
+                Text {
+                    text: root.service-problem;
+                    color: Theme.c.foreground;
+                    font-size: Type.small;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
         // Everything between the fixed header/status and the fixed footer
         // scrolls, so the window stays a fixed size no matter how many
         // devices are paired (few -> some slack above the footer; many ->
@@ -337,7 +372,11 @@ export component AppWindow inherits Window {
                             wrap: word-wrap;
                         }
                         if root.pairing-addr != "": Text {
-                            text: root.pairing-addr + " answered";
+                            // our dial: the address that answered (#93);
+                            // a knock: the address it came from (#83)
+                            text: root.pairing-from-our-dial
+                                ? root.pairing-addr + " answered"
+                                : "from " + root.pairing-addr;
                             color: Theme.c.foreground;
                             font-family: Type.mono;
                             font-size: Type.caption;
@@ -353,20 +392,21 @@ export component AppWindow inherits Window {
                         }
                         HorizontalLayout {
                             spacing: Space.sm;
-                            name := TextField {
+                            // Rust clears the name once an approval is sent, and
+                            // refuses one for a machine the card only just showed.
+                            TextField {
                                 placeholder: "name this device";
                                 horizontal-stretch: 1;
+                                text <=> root.pairing-name;
                                 accepted => {
-                                    root.approve-pairing(self.text, root.pairing-fp);
-                                    self.text = "";
+                                    root.approve-pairing(root.pairing-name, root.pairing-fp);
                                 }
                             }
                             PillButton {
                                 text: "trust & name";
                                 primary: true;
                                 clicked => {
-                                    root.approve-pairing(name.text, root.pairing-fp);
-                                    name.text = "";
+                                    root.approve-pairing(root.pairing-name, root.pairing-fp);
                                 }
                             }
                             PillButton {
@@ -686,6 +726,7 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                         text: "edit";
                                         ghost: true;
                                         clicked => {
+                                            root.editing-pin = d.pin;
                                             root.editing-device = root.editing-device == (d.has-send ? d.handle : d.fp-full)
                                                 ? ""
                                                 : (d.has-send ? d.handle : d.fp-full);
@@ -699,6 +740,7 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                         ghost: true;
                                         clicked => {
                                             root.confirm-revoke-fp = "";
+                                            root.confirm-delete-pin = d.pin;
                                             root.confirm-delete-handle = d.handle;
                                         }
                                     }
@@ -730,7 +772,7 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                         text: "yes";
                                         danger: true;
                                         clicked => {
-                                            root.delete-device(d.handle);
+                                            root.delete-device(d.handle, root.confirm-delete-pin);
                                             root.confirm-delete-handle = "";
                                             root.editing-device = "";
                                         }
@@ -839,7 +881,7 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                         placeholder: "new name";
                                         horizontal-stretch: 1;
                                         accepted => {
-                                            root.rename-device(root.editing-device, self.text);
+                                            root.rename-device(root.editing-device, root.editing-pin, self.text);
                                             self.text = "";
                                             root.editing-device = "";
                                         }
@@ -848,7 +890,7 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                         text: "save";
                                         primary: true;
                                         clicked => {
-                                            root.rename-device(root.editing-device, rename-field.text);
+                                            root.rename-device(root.editing-device, root.editing-pin, rename-field.text);
                                             rename-field.text = "";
                                             root.editing-device = "";
                                         }

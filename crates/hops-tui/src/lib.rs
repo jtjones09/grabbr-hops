@@ -37,8 +37,8 @@ use std::{
 };
 
 use hops_frontend_core::{
-    AppModel, AttemptOrigin, ClientHandle, Device, DeviceSend, FrontendClient, FrontendRequest,
-    Position, Status, TrustState,
+    AppModel, ApprovalRefused, AttemptOrigin, ClientHandle, Device, DeviceSend, FrontendClient,
+    FrontendRequest, Launch, PairingAttempt, PairingCard, Position, Status, TrustState,
     prefs::Frontend,
     theme::{self, Rgb, Theme},
 };
@@ -56,9 +56,6 @@ use tokio::sync::mpsc;
 
 /// How long a denied pairing stays snoozed before a fresh attempt re-prompts.
 const DISMISS_TTL: Duration = Duration::from_secs(120);
-/// If no new ConnectionAttempt refreshes a pending pairing within this window,
-/// treat it as stale (the peer gave up) and stop showing the prompt.
-const STALE_TTL: Duration = Duration::from_secs(12);
 /// How long a locally-generated notice (a rejected add, an inapplicable key)
 /// stays in the footer before the keymap comes back.
 const NOTICE_TTL: Duration = Duration::from_secs(6);
@@ -69,12 +66,29 @@ pub enum TuiError {
     Io(#[from] io::Error),
 }
 
+/// `y` on the pairing prompt: the name prompt for `fp`, bound to that machine,
+/// if the prompt has shown it long enough for the key to have been meant for
+/// it (#168).
+fn approve_prompt(card: &PairingCard, fp: String, now: Instant) -> Result<Input, ApprovalRefused> {
+    card.approve(&fp, now)?;
+    Ok(Input::TrustedName {
+        fp,
+        buf: String::new(),
+        granting: true,
+    })
+}
+
 /// Active text-input edit, if any.
 enum Input {
     /// Adding a device: `host` or `host:port`.
     Add { buf: String },
-    /// Editing an outgoing client's hostname.
-    Hostname { handle: ClientHandle, buf: String },
+    /// Editing an outgoing client's hostname. `pin` is the client's pin when
+    /// the edit opened, which the request carries (#94).
+    Hostname {
+        handle: ClientHandle,
+        pin: Option<String>,
+        buf: String,
+    },
     /// Naming a peer. `granting` distinguishes the two things this used to
     /// conflate: approving a NEW device (a trust grant) versus renaming one that
     /// is already trusted. They were the same wire request, so a rename could
@@ -110,8 +124,43 @@ enum Confirm {
         label: String,
         handle: Option<ClientHandle>,
         fp: Option<String>,
+        /// The outgoing client's pin when this was armed, which the delete
+        /// carries (#94).
+        pin: Option<String>,
         destructive: bool,
     },
+}
+
+/// What the TUI says when it drops an armed action.
+const CHANGED_NOTE: &str = "That device changed, so nothing was done. Check it and try again.";
+
+/// Drop an armed delete or an open rename whose device is gone or now pinned
+/// to another machine. Returns whether anything was dropped.
+///
+/// Both hold a handle while the user decides. A reload can replace the device
+/// behind it, and a dial can pin it to a different machine, and a delete
+/// revokes the pin: confirming then would act on something the screen no
+/// longer shows (#94).
+fn drop_stale(model: &AppModel, confirm: &mut Option<Confirm>, input: &mut Option<Input>) -> bool {
+    let mut dropped = false;
+    if let Some(Confirm::Remove {
+        handle: Some(h),
+        pin,
+        ..
+    }) = confirm.as_ref()
+    {
+        if !model.still_names(*h, pin.as_deref()) {
+            *confirm = None;
+            dropped = true;
+        }
+    }
+    if let Some(Input::Hostname { handle, pin, .. }) = input.as_ref() {
+        if !model.still_names(*handle, pin.as_deref()) {
+            *input = None;
+            dropped = true;
+        }
+    }
+    dropped
 }
 
 /// Map a theme [`Rgb`] to a true-color ratatui [`Color`].
@@ -201,8 +250,10 @@ fn parse_port(s: &str) -> Result<u16, &'static str> {
 }
 
 /// Run the TUI front-end. Must be called within a tokio `LocalSet`.
-pub async fn run() -> Result<(), TuiError> {
-    let client = FrontendClient::spawn();
+/// `launch` is what the binary knows as it opens: its own build, and why a
+/// service it tried to start did not come up.
+pub async fn run(launch: Launch) -> Result<(), TuiError> {
+    let client = FrontendClient::spawn(launch);
 
     // crossterm's event::read() blocks, so read keys on a dedicated OS thread.
     let (key_tx, mut key_rx) = mpsc::unbounded_channel::<KeyEvent>();
@@ -234,6 +285,10 @@ pub async fn run() -> Result<(), TuiError> {
     // fingerprint -> when the user last denied it; snoozes the prompt for
     // DISMISS_TTL so a retrying peer doesn't nag, but a later attempt re-asks.
     let mut dismissed: HashMap<String, Instant> = HashMap::new();
+    // Which machine the pairing prompt shows. It keeps that machine while its
+    // request is live, so another machine asking cannot take over the prompt
+    // between reading it and pressing `y` (#168).
+    let mut card = PairingCard::default();
     let mut show_log = false;
     let mut notice: Option<(String, Instant)> = None;
     // A device the user just asked to create, awaiting the handle the daemon
@@ -254,7 +309,12 @@ pub async fn run() -> Result<(), TuiError> {
             if let Some((host, port, pos)) = pending_new.take() {
                 match current.difference(&known_handles).copied().next() {
                     Some(h) => {
-                        client.request(FrontendRequest::UpdateHostname(h, Some(host)));
+                        // Just created: never connected, so no pin.
+                        client.request(FrontendRequest::UpdateHostname {
+                            handle: h,
+                            hostname: Some(host),
+                            fingerprint: None,
+                        });
                         client.request(FrontendRequest::UpdatePort(h, port));
                         client.request(FrontendRequest::UpdatePosition(h, pos));
                         // actually try the machine: an inert card that is never
@@ -266,6 +326,10 @@ pub async fn run() -> Result<(), TuiError> {
                 }
             }
             known_handles = current;
+        }
+
+        if drop_stale(&model, &mut confirm, &mut input) {
+            notice = Some((CHANGED_NOTE.to_string(), Instant::now()));
         }
 
         let devices = listable(&model);
@@ -282,20 +346,11 @@ pub async fn run() -> Result<(), TuiError> {
 
         // a live pending pairing: untrusted, still actively attempting (not a
         // stale prompt for a peer that left), and not currently snooze-dismissed
-        let pairing: Option<String> = model.pending_pairing.clone().filter(|fp| {
-            if model.authorized.contains_key(fp) {
-                return false;
-            }
-            let fresh = model
-                .pending_pairing_since
-                .map(|t| t.elapsed() < STALE_TTL)
-                .unwrap_or(false);
-            let snoozed = dismissed
-                .get(fp)
-                .map(|t| t.elapsed() < DISMISS_TTL)
-                .unwrap_or(false);
-            fresh && !snoozed
-        });
+        let pairing: Option<PairingAttempt> = card
+            .show(&model, Instant::now(), |fp| {
+                dismissed.get(fp).is_some_and(|t| t.elapsed() < DISMISS_TTL)
+            })
+            .cloned();
 
         let mut list_state = ListState::default();
         if count > 0 {
@@ -311,7 +366,7 @@ pub async fn run() -> Result<(), TuiError> {
                 &mut list_state,
                 input.as_ref(),
                 confirm.as_ref(),
-                pairing.as_deref(),
+                pairing.as_ref(),
                 notice.as_ref().map(|(m, _)| m.as_str()),
                 show_log,
                 theme,
@@ -345,9 +400,13 @@ pub async fn run() -> Result<(), TuiError> {
                                         notice = Some((msg.to_string(), Instant::now()));
                                     }
                                 },
-                                Input::Hostname { handle, buf } => {
+                                Input::Hostname { handle, pin, buf } => {
                                     let val = (!buf.trim().is_empty()).then_some(buf);
-                                    client.request(FrontendRequest::UpdateHostname(handle, val));
+                                    client.request(FrontendRequest::UpdateHostname {
+                                        handle,
+                                        hostname: val,
+                                        fingerprint: pin,
+                                    });
                                 }
                                 Input::TrustedName { fp, buf, granting } => {
                                     let desc = if buf.trim().is_empty() {
@@ -389,13 +448,19 @@ pub async fn run() -> Result<(), TuiError> {
                         // ---- confirmation mode ----
                         match k.code {
                             KeyCode::Char('y') => {
-                                if let Some(Confirm::Remove { handle, fp, .. }) = confirm.take() {
+                                if let Some(Confirm::Remove {
+                                    handle, fp, pin, ..
+                                }) = confirm.take()
+                                {
                                     // Deleting the outgoing client is the whole
                                     // removal: the daemon tombstones the pinned
                                     // fingerprint with it. Only a peer we have no
                                     // client for needs the allowlist request.
                                     if let Some(h) = handle {
-                                        client.request(FrontendRequest::Delete(h));
+                                        client.request(FrontendRequest::Delete {
+                                            handle: h,
+                                            fingerprint: pin,
+                                        });
                                     } else if let Some(fp) = fp {
                                         client.request(FrontendRequest::RemoveAuthorizedKey(fp));
                                     }
@@ -404,16 +469,18 @@ pub async fn run() -> Result<(), TuiError> {
                             KeyCode::Char('n') | KeyCode::Esc => confirm = None,
                             _ => {}
                         }
-                    } else if let Some(fp) = pairing.clone() {
+                    } else if let Some(fp) = pairing.as_ref().map(|a| a.fingerprint.clone()) {
                         // ---- pairing-approval prompt ----
                         match k.code {
-                            KeyCode::Char('y') => {
-                                input = Some(Input::TrustedName {
-                                    fp,
-                                    buf: String::new(),
-                                    granting: true,
-                                });
-                            }
+                            // The name prompt that follows is bound to this
+                            // machine, and only if the prompt has shown it long
+                            // enough for the key to have been meant for it.
+                            KeyCode::Char('y') => match approve_prompt(&card, fp, Instant::now()) {
+                                Ok(naming) => input = Some(naming),
+                                Err(refused) => {
+                                    notice = Some((refused.notice().to_string(), Instant::now()));
+                                }
+                            },
                             KeyCode::Char('n') | KeyCode::Esc => {
                                 dismissed.insert(fp, Instant::now());
                             }
@@ -477,6 +544,7 @@ pub async fn run() -> Result<(), TuiError> {
                                     let s = d.send.as_ref().expect("send facet");
                                     input = Some(Input::Hostname {
                                         handle: s.handle,
+                                        pin: s.state.peer_fingerprint.clone(),
                                         buf: s.config.hostname.clone().unwrap_or_default(),
                                     });
                                 }
@@ -517,11 +585,16 @@ pub async fn run() -> Result<(), TuiError> {
                                 }
                                 Some(d) => {
                                     let handle = d.send.as_ref().map(|s| s.handle);
+                                    let pin = d
+                                        .send
+                                        .as_ref()
+                                        .and_then(|s| s.state.peer_fingerprint.clone());
                                     let fp = d.fingerprint.clone();
                                     confirm = Some(Confirm::Remove {
                                         label: d.label.clone(),
                                         handle,
                                         fp: fp.clone(),
+                                        pin,
                                         // nothing is burned if we never learned
                                         // who this machine is
                                         destructive: fp.is_some(),
@@ -827,7 +900,7 @@ fn ui(
     list_state: &mut ListState,
     input: Option<&Input>,
     confirm: Option<&Confirm>,
-    pairing: Option<&str>,
+    pairing: Option<&PairingAttempt>,
     notice: Option<&str>,
     show_log: bool,
     theme: &Theme,
@@ -859,22 +932,13 @@ fn ui(
     // paint the whole window in the theme background first
     f.render_widget(Block::default().style(base), f.area());
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(6),
-        ])
-        .split(f.area());
-
     // header: connection + capture/emulation status
     let conn = if model.connected {
         Span::styled("● connected", Style::default().fg(col(theme.success)))
     } else {
         Span::styled("○ connecting…", Style::default().fg(col(theme.warn)))
     };
-    let header = Line::from(vec![
+    let status = Line::from(vec![
         conn,
         Span::raw("   capture: "),
         status_span(model.capture, theme),
@@ -891,13 +955,37 @@ fn ui(
             muted,
         ),
     ]);
+    // What is wrong with the service: a start that did not come up, or a
+    // daemon of another build. Wrapped under the status line.
+    let mut header = vec![status];
+    if let Some(problem) = model.service_problem() {
+        for line in problem.lines() {
+            header.push(Line::from(Span::styled(
+                line.to_string(),
+                Style::default().fg(col(theme.warn)),
+            )));
+        }
+    }
     let title = format!(" hops · {} ", theme.name);
-    f.render_widget(
-        Paragraph::new(header)
-            .style(base)
-            .block(panel(Span::styled(title, accent), false)),
-        chunks[0],
-    );
+    let header = Paragraph::new(header)
+        .wrap(Wrap { trim: false })
+        .style(base)
+        .block(panel(Span::styled(title, accent), false));
+    // Sized by the same word wrapping that renders it, so its last line (a
+    // log path, say) is never cut off. The device list keeps three rows.
+    let header_rows = u16::try_from(header.line_count(f.area().width.saturating_sub(2)))
+        .unwrap_or(u16::MAX)
+        .min(f.area().height.saturating_sub(6 + 3))
+        .max(3);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(header_rows),
+            Constraint::Min(0),
+            Constraint::Length(6),
+        ])
+        .split(f.area());
+    f.render_widget(header, chunks[0]);
 
     // body: one row per physical peer, both directions on the same line
     let rows: Vec<ListItem> = if devices.is_empty() {
@@ -953,13 +1041,15 @@ fn ui(
     );
 
     // overlays (only when nothing else is capturing input): pairing takes priority
-    if let Some(fp) = pairing {
+    if let Some(attempt) = pairing {
         if input.is_none() && confirm.is_none() {
+            // The shown machine's own origin and address, not the latest
+            // request's: they are different machines when two are waiting.
             pairing_popup(
                 f,
-                fp,
-                model.pending_pairing_origin,
-                model.pending_pairing_addr,
+                &attempt.fingerprint,
+                Some(attempt.origin),
+                attempt.addr,
                 theme,
             );
         }
@@ -994,7 +1084,7 @@ fn footer_line(
     if let Some(inp) = input {
         let (label, buf) = match inp {
             Input::Add { buf } => ("add device — host or host:port: ".to_string(), buf.clone()),
-            Input::Hostname { handle, buf } => (format!("name [{handle}]: "), buf.clone()),
+            Input::Hostname { handle, buf, .. } => (format!("name [{handle}]: "), buf.clone()),
             Input::TrustedName { buf, .. } => ("trust as: ".to_string(), buf.clone()),
             Input::Port { buf } => ("listen port: ".to_string(), buf.clone()),
         };
@@ -1128,7 +1218,13 @@ fn pairing_popup(
         ]),
     ];
     if let Some(a) = addr {
-        body.insert(1, Line::from(Span::styled(format!("{a} answered"), key)));
+        // our dial: the address that answered (#93); a knock: where from (#83)
+        let line = if ours {
+            format!("{a} answered")
+        } else {
+            format!("from {a}")
+        };
+        body.insert(1, Line::from(Span::styled(line, key)));
     }
     f.render_widget(Clear, area);
     f.render_widget(
@@ -1208,24 +1304,86 @@ fn short_fp(fp: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hops_frontend_core::{ClientConfig, ClientState, RevokedEntry};
+    use hops_frontend_core::{ClientConfig, ClientState, FrontendEvent, RevokedEntry};
     use ratatui::{Terminal, backend::TestBackend};
 
     const FP: &str = "1e:19:1b:2c:3d:4e:5f:60:71:82:93:a4:b5:c6:d7:e8";
     const OTHER_FP: &str = "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
+
+    // LEDGER T15 | class B | 6 struct state: the TUI's armed Confirm and Input after drop_stale
+    /// An armed delete and an open rename go once their device changes, and
+    /// stay while it does not (#94).
+    #[test]
+    fn an_armed_delete_or_rename_is_dropped_when_its_device_changes() {
+        let pinned = |fp: &str| ClientState {
+            peer_fingerprint: Some(fp.to_string()),
+            ..Default::default()
+        };
+        let mut model = AppModel::default();
+        model.apply(FrontendEvent::Created(
+            3,
+            ClientConfig::default(),
+            pinned(FP),
+        ));
+        let arm = || {
+            (
+                Some(Confirm::Remove {
+                    label: "desk".into(),
+                    handle: Some(3),
+                    fp: Some(FP.into()),
+                    pin: Some(FP.into()),
+                    destructive: true,
+                }),
+                Some(Input::Hostname {
+                    handle: 3,
+                    pin: Some(FP.into()),
+                    buf: String::new(),
+                }),
+            )
+        };
+
+        let (mut confirm, mut input) = arm();
+        assert!(
+            !drop_stale(&model, &mut confirm, &mut input) && confirm.is_some() && input.is_some(),
+            "nothing about the device changed, and the armed actions were dropped"
+        );
+
+        model.apply(FrontendEvent::State(
+            3,
+            ClientConfig::default(),
+            pinned(OTHER_FP),
+        ));
+        let (mut confirm, mut input) = arm();
+        assert!(
+            drop_stale(&model, &mut confirm, &mut input) && confirm.is_none() && input.is_none(),
+            "the device is pinned to another machine now; confirming would act \
+             on a machine this prompt never showed"
+        );
+
+        model.apply(FrontendEvent::Deleted(3));
+        let (mut confirm, mut input) = arm();
+        assert!(
+            drop_stale(&model, &mut confirm, &mut input) && confirm.is_none() && input.is_none(),
+            "the device is gone, and its armed actions stayed"
+        );
+    }
 
     /// Render `ui` into an off-screen terminal and return the visible text, one
     /// String per row. Rendering is the only way to catch a row that the
     /// projection produces but the view silently filters out — a logic-level
     /// assertion on `devices()` would have passed for every bug below.
     fn render(model: &AppModel, sel: usize) -> Vec<String> {
+        render_at(model, sel, 120, 24)
+    }
+
+    fn render_at(model: &AppModel, sel: usize, width: u16, height: u16) -> Vec<String> {
         let devices = listable(model);
         let mut state = ListState::default();
         if !devices.is_empty() {
             state.select(Some(sel));
         }
         let theme = theme::default_theme();
-        let mut term = Terminal::new(TestBackend::new(120, 24)).expect("test terminal");
+        let mut term = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
         term.draw(|f| {
             ui(
                 f, model, &devices, &mut state, None, None, None, None, false, &theme,
@@ -1246,6 +1404,121 @@ mod tests {
         render(model, sel).join("\n")
     }
 
+    /// A machine that may already drive this one answers this machine's dial.
+    /// The TUI asks whether this machine may drive it: one approval grants one
+    /// direction, so the reverse needs its own card (#166).
+    // LEDGER T8 | class B | 3 widget tree: PairingCard::show, ui() into a TestBackend
+    #[test]
+    fn the_card_for_the_second_direction_is_shown() {
+        use hops_frontend_core::{AttemptOrigin, FrontendEvent};
+        let mut model = AppModel::default();
+        model.apply(FrontendEvent::AuthorizedUpdated(
+            [(FP.to_owned(), "desk mac".to_owned())].into(),
+        ));
+        model.apply(FrontendEvent::ConnectionAttempt {
+            fingerprint: FP.into(),
+            origin: AttemptOrigin::OutboundDial,
+            addr: Some("10.0.0.5:4242".parse().expect("addr")),
+        });
+
+        let pairing = PairingCard::default()
+            .show(&model, Instant::now(), |_| false)
+            .cloned();
+        let devices = listable(&model);
+        let mut state = ListState::default();
+        let theme = theme::default_theme();
+        let mut term = Terminal::new(TestBackend::new(120, 24)).expect("test terminal");
+        term.draw(|f| {
+            ui(
+                f,
+                &model,
+                &devices,
+                &mut state,
+                None,
+                None,
+                pairing.as_ref(),
+                None,
+                false,
+                &theme,
+            )
+        })
+        .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let out = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            out.contains("we dialled this device") && out.contains("10.0.0.5:4242 answered"),
+            "no card asks whether this machine may drive a peer that may \
+             already drive it:\n{out}"
+        );
+    }
+
+    /// The pairing prompt names the machine it shows by that machine's own
+    /// origin and address. The prompt can show an earlier request than the
+    /// latest (#168), and the latest one's details were what it printed.
+    // LEDGER T12 | class B | 3 render: ui() on ratatui TestBackend, PairingCard::show
+    #[test]
+    fn the_pairing_prompt_describes_the_machine_it_shows() {
+        let mut model = AppModel::default();
+        let knocked: std::net::SocketAddr = "10.0.0.7:51234".parse().expect("addr");
+        let dialled: std::net::SocketAddr = "10.0.0.9:4242".parse().expect("addr");
+        model.apply(FrontendEvent::ConnectionAttempt {
+            fingerprint: FP.into(),
+            origin: AttemptOrigin::Inbound,
+            addr: Some(knocked),
+        });
+        model.apply(FrontendEvent::ConnectionAttempt {
+            fingerprint: OTHER_FP.into(),
+            origin: AttemptOrigin::OutboundDial,
+            addr: Some(dialled),
+        });
+        let shown = PairingCard::default()
+            .show(&model, Instant::now(), |_| false)
+            .cloned()
+            .expect("a prompt");
+        assert_eq!(shown.fingerprint, FP);
+        let theme = theme::default_theme();
+        let mut term = Terminal::new(TestBackend::new(120, 24)).expect("test terminal");
+        term.draw(|f| {
+            ui(
+                f,
+                &model,
+                &[],
+                &mut ListState::default(),
+                None,
+                None,
+                Some(&shown),
+                None,
+                false,
+                &theme,
+            )
+        })
+        .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let out: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            out.contains("pairing request") && out.contains("from 10.0.0.7:51234"),
+            "the prompt for a machine that knocked from 10.0.0.7:51234 does not say so:\n{out}"
+        );
+        assert!(
+            !out.contains("10.0.0.9") && !out.contains("we dialled"),
+            "the prompt described the other waiting machine:\n{out}"
+        );
+    }
+
     /// While pairing prompts may appear here, the footer says so and for how
     /// long; once the window closes, the line goes (#195).
     #[test]
@@ -1262,6 +1535,98 @@ mod tests {
             "the open pairing window is not shown with its time left:\n{out}"
         );
         assert!(out.contains("open add device on the other machine too"));
+    }
+
+    /// The service's trouble is on screen, not only in a log: a start that
+    /// did not come up (#189), or a daemon of another build.
+    // LEDGER T62 | class B | 3 widget tree rendered to a test terminal
+    #[test]
+    fn the_header_says_what_is_wrong_with_the_service() {
+        let mut model = AppModel::default();
+        model.start_problem = Some(
+            "The hops service started and stopped again before it answered. \
+             Its log says why:\n/tmp/hops/daemon.log"
+                .into(),
+        );
+        let out = screen(&model, 0);
+        assert!(
+            out.contains("stopped again") && out.contains("daemon.log"),
+            "a failed start is not on screen:\n{out}"
+        );
+
+        model.connected = true;
+        model.start_problem = None;
+        model.this_build = Some(hops_frontend_core::Build {
+            version: "0.13.0".into(),
+            commit: "abcd1234".into(),
+        });
+        model.apply(hops_frontend_core::FrontendEvent::Enumerate(vec![]));
+        let out = screen(&model, 0);
+        assert!(
+            out.contains("older build"),
+            "a daemon of an older build is not on screen:\n{out}"
+        );
+
+        model.apply(hops_frontend_core::FrontendEvent::DaemonBuild(
+            hops_frontend_core::Build {
+                version: "0.13.0".into(),
+                commit: "abcd1234".into(),
+            },
+        ));
+        let out = screen(&model, 0);
+        assert!(
+            !out.contains("older build") && !out.contains("This app is"),
+            "the same build is reported as a problem:\n{out}"
+        );
+    }
+
+    /// The header grows by the rows its text wraps to at word boundaries, so
+    /// the last line of a problem is on screen at every width. That line is
+    /// the log path a failed start exists to show (#189).
+    // LEDGER T72 | class B | 3 widget tree rendered at many terminal widths
+    #[test]
+    fn the_whole_service_problem_is_on_screen_at_every_width() {
+        let mut failed = AppModel::default();
+        failed.start_problem = Some(
+            "The hops service started and stopped again before it answered. \
+             Its log says why:\n/tmp/hops/daemon.log"
+                .into(),
+        );
+        let mut mismatch = AppModel::default();
+        mismatch.connected = true;
+        mismatch.this_build = Some(hops_frontend_core::Build {
+            version: "0.13.0".into(),
+            commit: "abcd1234".into(),
+        });
+        mismatch.apply(hops_frontend_core::FrontendEvent::Enumerate(vec![]));
+
+        // The words inside the header box, in order, with the wrapping undone.
+        let header_words = |model: &AppModel, width: u16| -> String {
+            render_at(model, 0, width, 30)
+                .iter()
+                .skip(1)
+                .take_while(|row| !row.starts_with('└'))
+                .flat_map(|row| row.trim_matches('│').split_whitespace().map(str::to_owned))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let clipped: Vec<(u16, Vec<u16>)> = [&failed, &mismatch]
+            .into_iter()
+            .zip([0, 1])
+            .map(|(model, case)| {
+                let problem = model.service_problem().expect("a problem to show");
+                let problem = problem.split_whitespace().collect::<Vec<_>>().join(" ");
+                let widths = (50..=120)
+                    .filter(|&width| !header_words(model, width).ends_with(&problem))
+                    .collect();
+                (case, widths)
+            })
+            .collect();
+        assert!(
+            clipped.iter().all(|(_, widths)| widths.is_empty()),
+            "the header ends before the problem's last line, (case, widths): {clipped:?}\n{}",
+            render_at(&failed, 0, 66, 30).join("\n")
+        );
     }
 
     /// One machine we both cross to AND trust must be ONE row.

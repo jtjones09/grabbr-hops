@@ -75,8 +75,8 @@ fn run() -> Result<(), HopsError> {
             // Taken above, before the config was read. Kept so the match
             // stays exhaustive.
             Command::Daemon => run_daemon()?,
-            Command::Gui { hidden } => run_gui(hidden)?,
-            Command::Tui => run_tui()?,
+            Command::Gui { hidden } => run_gui(hidden, None)?,
+            Command::Tui => run_tui(None)?,
             // Normally handled in `main` before the config is loaded; kept
             // here so the match stays exhaustive and both paths behave alike.
             Command::BuildCheck { repo, strict } => run_build_check(repo.clone(), strict),
@@ -125,17 +125,28 @@ fn run_daemon() -> Result<(), HopsError> {
     }
 }
 
+/// What a frontend is told as it opens: this build, to compare with the
+/// daemon's, and why the service the front door started did not come up.
+#[cfg(any(feature = "tui", feature = "slint"))]
+fn launch(start_problem: Option<String>) -> hops_frontend_core::Launch {
+    hops_frontend_core::Launch {
+        build: Some(hops::config::this_build()),
+        start_problem,
+    }
+}
+
 /// Open the Slint GUI (attach-only). No-op with a hint if this build lacks it.
 /// `hidden` starts the app in the menu bar / tray only, no window shown.
-fn run_gui(hidden: bool) -> Result<(), HopsError> {
+/// `start_problem` is why the service the front door started did not come up.
+fn run_gui(hidden: bool, start_problem: Option<String>) -> Result<(), HopsError> {
     #[cfg(feature = "slint")]
     {
-        hops_slint::run(hidden)?;
+        hops_slint::run(hidden, launch(start_problem))?;
         Ok(())
     }
     #[cfg(not(feature = "slint"))]
     {
-        let _ = hidden;
+        let _ = (hidden, start_problem);
         log::error!("this build has no GUI — rebuild with `--features slint`");
         Ok(())
     }
@@ -175,14 +186,16 @@ fn install_panic_logger() {
 }
 
 /// Open the Ratatui TUI (attach-only). No-op with a hint if this build lacks it.
-fn run_tui() -> Result<(), HopsError> {
+/// `start_problem` is why the service the front door started did not come up.
+fn run_tui(start_problem: Option<String>) -> Result<(), HopsError> {
     #[cfg(feature = "tui")]
     {
-        run_async(hops_tui::run())?;
+        run_async(hops_tui::run(launch(start_problem)))?;
         Ok(())
     }
     #[cfg(not(feature = "tui"))]
     {
+        let _ = start_problem;
         log::error!("this build has no TUI — rebuild with `--features tui`");
         Ok(())
     }
@@ -197,7 +210,9 @@ fn front_door() -> Result<(), HopsError> {
     use hops_frontend_core::prefs::{
         Frontend, load_frontend, onboarding_done, save_frontend, set_onboarding_done,
     };
-    hops::daemon_start::ensure_running();
+    // What became of the start goes to the screen: a service that did not
+    // come up used to leave the app at "connecting" with nothing said (#189).
+    let start_problem = hops::daemon_start::ensure_running().problem();
 
     let frontend = if onboarding_done() {
         load_frontend().unwrap_or_else(default_frontend)
@@ -212,9 +227,9 @@ fn front_door() -> Result<(), HopsError> {
     };
 
     match frontend {
-        Frontend::Tui => run_tui(),
+        Frontend::Tui => run_tui(start_problem),
         // front door = the user actively opening the app, so show the window
-        Frontend::Gui => run_gui(false),
+        Frontend::Gui => run_gui(false, start_problem),
     }
 }
 
@@ -342,5 +357,48 @@ mod keylog_is_never_shipped {
             ROOT_MANIFEST.contains(r#"keylog = ["input-event/keylog"]"#),
             "the `keylog` feature must still exist and forward to input-event"
         );
+    }
+}
+
+#[cfg(all(test, any(feature = "tui", feature = "slint")))]
+mod the_front_door_shows_what_became_of_its_start {
+    //! A start that did not come up left the app at "connecting", with the
+    //! reason in a log nobody was pointed at (#189).
+    //!
+    //! The text is tested where it is made (`StartReport::problem` against a
+    //! real daemon that exits, in tests/failed_start.rs) and where it is shown
+    //! (`AppModel::service_problem`, and the TUI's rendered header). What no
+    //! behavioural test can reach is `front_door` itself, which opens a
+    //! window or a terminal UI: that it hands the report to the frontend it
+    //! opens is checked here, on its source with comments stripped.
+
+    // LEDGER T70 | class S | source text | pair T64 (report text), T61 (model), T62 (render)
+    #[test]
+    fn front_door_hands_its_start_report_to_the_frontend_it_opens() {
+        let src = include_str!("main.rs");
+        let code: String = src
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap_or(src)
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at = code
+            .find("fn front_door(")
+            .expect("front_door must exist; if it moved, point this check there");
+        let body = &code[at..];
+        let body = &body[..body.find("\n}").unwrap_or(body.len())];
+        for needed in [
+            "let start_problem = hops::daemon_start::ensure_running().problem();",
+            "Frontend::Tui => run_tui(start_problem)",
+            "Frontend::Gui => run_gui(false, start_problem)",
+        ] {
+            assert!(
+                body.contains(needed),
+                "front_door no longer has `{needed}`. A service that did not come \
+                 up then reaches the screen as \"connecting\", with nothing said."
+            );
+        }
     }
 }

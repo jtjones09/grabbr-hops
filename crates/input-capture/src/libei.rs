@@ -205,7 +205,12 @@ async fn libei_event_handler(
             .next()
             .await
             .ok_or(CaptureError::EndOfStream)??;
-        log::trace!("from ei: {ei_event:?}");
+        // A keyboard event's Debug names the key. It is traced once it is a
+        // CaptureEvent, which does not (#117).
+        match &ei_event {
+            EiEvent::KeyboardKey(_) | EiEvent::KeyboardModifiers(_) => {}
+            other => log::trace!("from ei: {other:?}"),
+        }
         let client = current_pos.get();
         handle_ei_event(ei_event, client, &context, &event_tx, &release_session).await?;
     }
@@ -551,7 +556,7 @@ async fn handle_ei_event(
             context.flush().map_err(|e| io::Error::new(e.kind(), e))?;
         }
         EiEvent::SeatRemoved(_) | /* EiEvent::DeviceAdded(_) | */ EiEvent::DeviceRemoved(_) => {
-            log::debug!("releasing session: {ei_event:?}");
+            log::debug!("releasing session: a seat or device was removed");
             release_session.notify_waiters();
         }
         EiEvent::DevicePaused(_) | EiEvent::DeviceResumed(_) => {}

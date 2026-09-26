@@ -64,7 +64,12 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
     ui.global::<Theme>().set_index(theme_idx);
 
     // 3) Representative mock data so every region is exercised in one shot.
-    ui.set_connected(true);
+    // PREVIEW_SERVICE_PROBLEM=<text> shows the service banner; with
+    // PREVIEW_DISCONNECTED set, as the app shows it before a daemon answers.
+    ui.set_connected(std::env::var_os("PREVIEW_DISCONNECTED").is_none());
+    if let Ok(problem) = std::env::var("PREVIEW_SERVICE_PROBLEM") {
+        ui.set_service_problem(problem.into());
+    }
     ui.set_capture("enabled".into());
     ui.set_emulation("enabled".into());
     ui.set_port("4242".into());
@@ -104,6 +109,12 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
     if std::env::var_os("PREVIEW_OUR_DIAL").is_some() {
         ui.set_pairing_addr("10.0.0.5:4242".into());
     }
+    // PREVIEW_KNOCK_ADDR=1: an inbound request with the address it came from
+    // (#83), and a name typed into the card (#168).
+    if std::env::var_os("PREVIEW_KNOCK_ADDR").is_some() {
+        ui.set_pairing_addr("10.0.0.7:51234".into());
+        ui.set_pairing_name("laptop".into());
+    }
     // the notice banner — the daemon's only "that didn't work" channel
     ui.set_notice(
         "Refused to grant trust: this machine is being controlled remotely. \
@@ -127,6 +138,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             has_send: true,
             fingerprint: "1e:19:1b".into(),
             fp_full: "1e:19:1b:c4:a8:44".into(),
+            pin: "1e:19:1b:c4:a8:44".into(),
             online: true,
             trusted: true,
             revoked: false,
@@ -143,6 +155,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             has_send: true,
             fingerprint: "".into(),
             fp_full: "".into(),
+            pin: "".into(),
             online: false,
             trusted: false,
             revoked: false,
@@ -159,6 +172,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             has_send: false,
             fingerprint: "b7:2a:55".into(),
             fp_full: "b7:2a:55:e1:90:33".into(),
+            pin: "b7:2a:55:e1:90:33".into(),
             online: true,
             trusted: true,
             revoked: false,
@@ -175,6 +189,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             has_send: false,
             fingerprint: "c3:de:04".into(),
             fp_full: "c3:de:04:aa:11:22".into(),
+            pin: "c3:de:04:aa:11:22".into(),
             online: false,
             trusted: true,
             revoked: false,
@@ -192,6 +207,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             has_send: false,
             fingerprint: "9f:04:7c".into(),
             fp_full: "9f:04:7c:12:aa:03".into(),
+            pin: "9f:04:7c:12:aa:03".into(),
             online: false,
             trusted: false,
             revoked: true,

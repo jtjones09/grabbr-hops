@@ -17,6 +17,11 @@ on:
     branches: [main]
   pull_request:
 
+# Nothing here writes to the repository. Without this line every job gets the
+# repository's default token permissions, which may include write.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
@@ -32,9 +37,11 @@ jobs:
     name: default features
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.98.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: system deps
         run: |
           sudo apt-get update
@@ -56,9 +63,11 @@ jobs:
           - { os: windows-latest, features: "tui slint" }
           - { os: ubuntu-latest,  features: "tui" }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.98.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: system deps (linux)
         if: runner.os == 'Linux'
         run: |
@@ -82,9 +91,11 @@ jobs:
     name: workspace tests
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.98.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # Was `-p hops-ipc -p hops-frontend-core`, which ran 121 of 166 tests. The
       # hops-slint guards — the sole evidence for four merged PRs — had never
       # executed in CI. A guard that does not run is a comment.
@@ -103,7 +114,9 @@ jobs:
     name: no /dev/input access
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: the input path must stay portal-mediated
         run: |
           if grep -rnE '/dev/(input|uinput)|EVIOCGRAB|\bevdev::' \
@@ -141,7 +154,9 @@ jobs:
     name: build scripts read the target, not the host
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: no host platform predicates in build.rs
         run: |
           # strip comment lines first — the fixed scripts explain the trap in prose
@@ -161,8 +176,10 @@ jobs:
     name: dependency advisories
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2, cargo-deny 0.20.2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1, cargo-deny 0.20.2
         with:
           command: check advisories
           arguments: --all-features --workspace
@@ -171,7 +188,9 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: rustfmt

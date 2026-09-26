@@ -12,6 +12,7 @@ pub mod discovery;
 mod dns;
 mod emulation;
 pub mod emulation_test;
+pub(crate) mod enter_hook;
 mod git_env;
 mod hop_log;
 mod listen;
@@ -24,6 +25,7 @@ pub mod service;
 mod transport;
 pub mod trust;
 pub mod trust_file;
+mod trust_save;
 
 /// Guards for decisions already made — and, three times now, rebuilt anyway.
 /// See the module docs for the bar each guard is held to.

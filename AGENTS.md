@@ -85,7 +85,8 @@ and there is **no restore path**. Do not add one.
   keylogging for a capability hops does not have. Enforced by the `no /dev/input access` CI
   job. If a privileged backend is ever wanted, update the guard and the security model **in
   the same PR**.
-- **The frontend IPC channel must never reach a shell.** `spawn_hook_command` runs `sh -c`;
+- **The frontend IPC channel must never reach a shell.** `spawn_hook_command` runs a
+  config-supplied command (as a program, never through a shell, never elevated);
   `enter_hook` is therefore **config-file-only**, and no `FrontendRequest` variant may set it or
   otherwise reach command execution. Enforced by the `ipc_shell_guard` tests in `src/service.rs`,
   both mutation-tested. If a privileged verb is ever genuinely needed, update the security model
@@ -147,8 +148,11 @@ silently drops every Unix backend and reports success — build Linux natively (
 ## CI
 
 `check.yml` runs on every push to `main` and every PR: default features, the three release feature sets, workspace tests, rustfmt, and the
-`no /dev/input access` guard. `release.yml` runs on `v*` tags and asserts the built Linux
-binary actually contains real input backends.
+`no /dev/input access` guard. `release.yml` runs on `v*` tags and by hand (a run by hand
+publishes nothing), asserts the built Linux binary actually contains real input backends,
+signs the dmg in `sign-macos` (the only job that sees a secret; it runs no cargo), and
+publishes only a release holding all four assets. `tests/release_pipeline.rs` runs its gates
+and checks secrets, write permission and action pins.
 
 ## Workflow
 

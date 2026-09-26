@@ -28,7 +28,7 @@ pub use connect::{FrontendEventReader, FrontendRequestWriter, connect, connect_t
 pub use connect_async::{
     AsyncFrontendEventReader, AsyncFrontendRequestWriter, connect_async, connect_async_to,
 };
-pub use listen::AsyncFrontendListener;
+pub use listen::{AsyncFrontendListener, PREAUTH_CONNECTIONS_MAX, PREAUTH_DEADLINE};
 pub use pairing::{PairingCode, PairingError};
 
 #[derive(Debug, Error)]
@@ -368,16 +368,40 @@ pub enum FrontendEvent {
     ConnectionAttempt {
         fingerprint: String,
         origin: AttemptOrigin,
-        /// The address that answered, when we know it. Present for
-        /// `OutboundDial` — the user typed an address and something answered,
-        /// and they cannot judge the fingerprint without seeing which address
-        /// it came from (#93). `None` inbound, because `ListenEvent::Rejected`
-        /// does not carry one (see #83).
+        /// Where the attempt came from, when we know it. For `OutboundDial`,
+        /// the address that answered: the user typed an address and something
+        /// answered, and they cannot judge the fingerprint without seeing
+        /// which address it came from (#93). For `Inbound`, the address the
+        /// refused connection came from (#83).
         addr: Option<SocketAddr>,
     },
     /// Pairing prompts may appear on this machine for this many more seconds.
     /// Zero means the window is closed (#195).
     PairingOpen { seconds: u32 },
+    /// The build this daemon runs. Sent first on every sync, before any
+    /// state, so a frontend that sees state without it knows the daemon
+    /// predates this event.
+    ///
+    /// A daemon can be another build than the app talking to it: launchd
+    /// keeps the previous version's daemon running when the app is replaced
+    /// in place, and it still serves.
+    DaemonBuild(Build),
+}
+
+/// Which build a program is: its package version and the commit it was built
+/// from. Two builds are the same only when both match.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Build {
+    /// The package version, as `hops --version` prints it.
+    pub version: String,
+    /// The short commit it was built from, or `unknown`.
+    pub commit: String,
+}
+
+impl Display for Build {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.version, self.commit)
+    }
 }
 
 /// A machine advertising itself on the local network.
@@ -421,14 +445,27 @@ pub enum FrontendRequest {
     Create,
     /// change the listen port (recreate udp listener)
     ChangePort(u16),
-    /// remove a client
-    Delete(ClientHandle),
+    /// Remove a device, and revoke the machine it is pinned to.
+    ///
+    /// `fingerprint` is the device's pin as the frontend showed it (`None` for
+    /// one never connected). The daemon refuses the request if the device's
+    /// pin is no longer that, so a delete aimed at what the user saw cannot
+    /// revoke a machine the user never saw on that row (#94).
+    Delete {
+        handle: ClientHandle,
+        fingerprint: Option<String>,
+    },
     /// request an enumeration of all clients
     Enumerate(),
     /// resolve dns
     ResolveDns(ClientHandle),
-    /// update hostname
-    UpdateHostname(ClientHandle, Option<String>),
+    /// Rename a device: set the hostname it dials. `fingerprint` is its pin as
+    /// the frontend showed it, and a mismatch is refused, as for `Delete`.
+    UpdateHostname {
+        handle: ClientHandle,
+        hostname: Option<String>,
+        fingerprint: Option<String>,
+    },
     /// update port
     UpdatePort(ClientHandle, u16),
     /// update position
@@ -457,7 +494,7 @@ pub enum FrontendRequest {
     /// not inserted (#117-adjacent, Layer 1 of CONSENT-ARCHITECTURE.md).
     SetLabel(String, String),
     // NOTE: there is deliberately NO verb here for the enter hook. It is
-    // executed with `sh -c` (src/service.rs), so exposing it on this channel
+    // run as a command (src/enter_hook.rs), so exposing it on this channel
     // made reaching the frontend socket equivalent to arbitrary command
     // execution. `enter_hook` is a CONFIG-FILE-ONLY field; setting it requires
     // write access to the config directory. See issue #56, and the guard test

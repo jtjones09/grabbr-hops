@@ -261,7 +261,6 @@ mod a_grant_carries_only_the_direction_that_was_approved {
         use rustls::client::danger::ServerCertVerifier;
         use rustls::pki_types::{ServerName, UnixTime};
         use rustls::server::danger::ClientCertVerifier;
-        use std::collections::VecDeque;
         use std::sync::{Arc, Mutex, RwLock};
 
         crate::transport::install_crypto_provider();
@@ -278,7 +277,7 @@ mod a_grant_carries_only_the_direction_that_was_approved {
         let trust = Arc::new(RwLock::new(store));
 
         let outbound = FpServerVerifier::new(trust.clone(), Arc::new(Mutex::new(None)));
-        let inbound = FpClientVerifier::new(trust, Arc::new(Mutex::new(VecDeque::new())));
+        let inbound = FpClientVerifier::new(trust, Arc::new(Mutex::new(None)));
         let now = UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_700_000_000));
 
         assert!(
@@ -454,6 +453,162 @@ mod an_upgrade_mints_no_permission_the_old_config_never_granted {
 }
 
 // ---------------------------------------------------------------------------
+// #186 — pairings made before #182 keep the clipboard direction their lease
+// grants
+// ---------------------------------------------------------------------------
+
+mod pairings_made_before_182_keep_the_clipboard_direction_their_lease_grants {
+    //! **Decided 2026-09-16 (#186).** A pairing made before #182 asks about the
+    //! clipboard keeps what its lease already carries: text copied on the
+    //! machine doing the driving reaches the machine being driven, and nothing
+    //! flows the other way. Nothing on disk changes; enforcement starts
+    //! reading bits that were already there.
+    //!
+    //! **Why not the alternatives.** Keeping both directions leaves a flow
+    //! nobody granted. Switching it off for every existing pairing breaks
+    //! working setups silently, and turning it back on needs the enable arm of
+    //! the per-device switch, which waits for #107.
+    //!
+    //! The choice is one function, `trust::existing_pairing_clipboard`, and
+    //! this runs both machines' real transports over loopback, so swapping the
+    //! direction there fails here.
+
+    use std::collections::{HashMap, HashSet};
+
+    use hops_ipc::{AttemptOrigin, RevokedEntry};
+
+    use crate::service::grant_for_attempt;
+    use crate::test_harness::{
+        ARRIVES_WITHIN, Machine, NEVER_WITHIN, applied_within, clipboard_pair, machine, run_local,
+    };
+    use crate::trust::TrustStore;
+    use crate::trust_file::{rebuild, records_of};
+
+    /// Through disk, as every start after the one that made the pairing
+    /// loads it. The start that made it runs on the store in memory, so each
+    /// pairing is checked both ways.
+    fn reloaded(store: &TrustStore) -> TrustStore {
+        let (loaded, refused) =
+            rebuild(store.ours(), store.now(), &records_of(store)).expect("rebuild");
+        assert!(
+            refused.is_empty(),
+            "the store refused its own records: {refused:?}"
+        );
+        loaded
+    }
+
+    /// Paired on a build with the trust store: each machine approved the
+    /// other's prompt once, in the direction it was asked.
+    fn approved(driven: &Machine, driver: &Machine) -> (TrustStore, TrustStore) {
+        let mut on_driven = TrustStore::new(&driven.fingerprint, 0).expect("ours");
+        grant_for_attempt(
+            &mut on_driven,
+            &driver.fingerprint,
+            "driver",
+            Some(AttemptOrigin::Inbound),
+        )
+        .expect("grant");
+        let mut on_driver = TrustStore::new(&driver.fingerprint, 0).expect("ours");
+        grant_for_attempt(
+            &mut on_driver,
+            &driven.fingerprint,
+            "driven",
+            Some(AttemptOrigin::OutboundDial),
+        )
+        .expect("grant");
+        (on_driven, on_driver)
+    }
+
+    /// Paired on v0.12, which kept one flat allowlist: each machine listed the
+    /// other, and only the driver had a client entry dialling its peer.
+    fn migrated(driven: &Machine, driver: &Machine) -> (TrustStore, TrustStore) {
+        let migrate = |me: &Machine, peer: &Machine, dialled: bool| {
+            let mut store = TrustStore::new(&me.fingerprint, 0).expect("ours");
+            let authorized: HashMap<String, String> =
+                [(peer.fingerprint.clone(), "peer".to_string())].into();
+            let dialled: HashSet<String> = if dialled {
+                [peer.fingerprint.clone()].into()
+            } else {
+                HashSet::new()
+            };
+            let now = store.now();
+            store.migrate_from_config(
+                &authorized,
+                &HashMap::<String, RevokedEntry>::new(),
+                &dialled,
+                now,
+            );
+            store
+        };
+        (
+            migrate(driven, driver, false),
+            migrate(driver, driven, true),
+        )
+    }
+
+    // LEDGER T1861 | class B | 1 return value: ClipboardInbox::next over the queue transport::clipboard_accept_loop fills; ClipboardSender::broadcast, ClipboardSenderListen::broadcast, grant_for_attempt, migrate_from_config, trust_file::rebuild
+    #[test]
+    fn existing_pairings_keep_their_clipboard_direction() {
+        run_local(async {
+            type Pairing = fn(&Machine, &Machine) -> (TrustStore, TrustStore);
+            let pairings: [(&str, Pairing, bool); 4] = [
+                ("approved, in the run that approved it", approved, false),
+                ("approved, loaded at a later start", approved, true),
+                (
+                    "carried forward from a v0.12 config, in the upgrade's run",
+                    migrated,
+                    false,
+                ),
+                (
+                    "carried forward from a v0.12 config, loaded at a later start",
+                    migrated,
+                    true,
+                ),
+            ];
+            for (how, pair_up, reload) in pairings {
+                let (driven, driver) = (machine(), machine());
+                let (mut on_driven, mut on_driver) = pair_up(&driven, &driver);
+                if reload {
+                    (on_driven, on_driver) = (reloaded(&on_driven), reloaded(&on_driver));
+                }
+                let mut pair = clipboard_pair(driven, on_driven, driver, on_driver).await;
+                // What each machine's service would apply, through the check
+                // it makes first.
+                let (mut on_driven, mut on_driver) = pair.inboxes();
+
+                pair.driver_sends
+                    .broadcast("copied on the driver".to_string())
+                    .await;
+                assert_eq!(
+                    applied_within(&mut on_driven, ARRIVES_WITHIN)
+                        .await
+                        .as_deref(),
+                    Some("copied on the driver"),
+                    "{how}: text copied on the machine doing the driving no longer \
+                     reaches the machine it drives. #186 keeps that direction for \
+                     every existing pairing; losing it breaks a working setup with \
+                     nothing on screen to explain it."
+                );
+
+                pair.driven_sends
+                    .broadcast("copied on the driven machine".to_string())
+                    .await;
+                assert_eq!(
+                    applied_within(&mut on_driver, NEVER_WITHIN)
+                        .await
+                        .as_deref(),
+                    None,
+                    "{how}: text copied on the machine being driven reached the \
+                     machine driving it. Nobody granted that direction: the lease \
+                     carries clipboard from the driver to the driven machine only, \
+                     and #186 stops the reverse (issues #182, #186)."
+                );
+            }
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
 // #183 — no pairing expires until renewal exists
 // ---------------------------------------------------------------------------
 
@@ -493,7 +648,7 @@ mod no_pairing_expires_until_renewal_exists {
     //! Leases already sealed with a 30-day or 400-day term are covered by
     //! `trust_file`'s `a_sealed_store_holding_thirty_and_four_hundred_day_terms_…`.
 
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex, RwLock};
     use std::time::Duration;
@@ -529,8 +684,7 @@ mod no_pairing_expires_until_renewal_exists {
         let mut admitted = Vec::new();
         let tls_now =
             UnixTime::since_unix_epoch(Duration::from_secs(receiving.read().expect("lock").now()));
-        let inbound =
-            FpClientVerifier::new(receiving.clone(), Arc::new(Mutex::new(VecDeque::new())));
+        let inbound = FpClientVerifier::new(receiving.clone(), Arc::new(Mutex::new(None)));
         if inbound.verify_client_cert(peer, &[], tls_now).is_ok() {
             admitted.push(DOORS[0]);
         }
@@ -2050,7 +2204,6 @@ mod the_wire_contract_is_frozen {
         use crate::transport::{self, FpClientVerifier, FpServerVerifier};
         use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
         use quinn::{ClientConfig, Endpoint, ServerConfig};
-        use std::collections::VecDeque;
         use std::net::SocketAddr;
         use std::sync::{Arc, Mutex, RwLock};
         use std::time::Duration;
@@ -2086,7 +2239,7 @@ mod the_wire_contract_is_frozen {
             let mut server_crypto = rustls::ServerConfig::builder()
                 .with_client_cert_verifier(Arc::new(FpClientVerifier::new(
                     server_trust,
-                    Arc::new(Mutex::new(VecDeque::new())),
+                    Arc::new(Mutex::new(None)),
                 )))
                 .with_single_cert(vec![server.cert.clone()], server.key.clone_key())
                 .expect("server cert");
@@ -3085,6 +3238,387 @@ mod discovery_is_declared_to_the_operating_system {
             "_hops._udp",
             "NSBonjourServices takes the bare service type. Leaving the trailing \
              `.local.` on it makes the declaration silently fail to match."
+        );
+    }
+}
+
+mod no_log_line_in_the_input_path_names_a_key {
+    //! **#117.** A log line may say that a key went down or up, never which
+    //! key. Raising the log level to look at a handshake must not record what
+    //! someone types, and a warn line is written with no level raised at all.
+    //! Key identity goes to the opt-in, time-boxed `keylog` file instead.
+    //!
+    //! **Why a text scan.** The type every event log line prints through is
+    //! covered by calling it (`input_event`'s `no_key_identity` tests), and
+    //! the daemon's own lines by running two machines over loopback
+    //! (`a_key_released_at_teardown_is_not_named_in_the_log`,
+    //! `keys_captured_and_sent_are_not_named_in_the_log`). What is left are
+    //! the platform backends: wlroots, libei, the Windows hook and the macOS
+    //! HID path compile only on their own OS and act only in a live session,
+    //! so no test here can run them. For those, this checks that no log call
+    //! formats a variable that holds a key.
+
+    /// Names that hold a key, a scancode, a keysym, a modifier set, or a raw
+    /// libei event (whose Debug prints the key).
+    const KEY_HOLDERS: &[&str] = &[
+        "key",
+        "keys",
+        "keycode",
+        "key_code",
+        "linux_keycode",
+        "scancode",
+        "scan_code",
+        "scan",
+        "win_scan_code",
+        "linux_scan_code",
+        "linux_scancode",
+        "windows_scancode",
+        "scanCode",
+        "vkCode",
+        "vk",
+        "nx_keytype",
+        "keysym",
+        "mods",
+        "ei_event",
+    ];
+
+    /// Every source file on the input path that logs.
+    const FILES: &[(&str, &str)] = &[
+        (
+            "crates/input-capture/src/lib.rs",
+            include_str!("../crates/input-capture/src/lib.rs"),
+        ),
+        (
+            "crates/input-capture/src/libei.rs",
+            include_str!("../crates/input-capture/src/libei.rs"),
+        ),
+        (
+            "crates/input-capture/src/macos.rs",
+            include_str!("../crates/input-capture/src/macos.rs"),
+        ),
+        (
+            "crates/input-capture/src/layer_shell.rs",
+            include_str!("../crates/input-capture/src/layer_shell.rs"),
+        ),
+        (
+            "crates/input-capture/src/windows/event_thread.rs",
+            include_str!("../crates/input-capture/src/windows/event_thread.rs"),
+        ),
+        (
+            "crates/input-emulation/src/lib.rs",
+            include_str!("../crates/input-emulation/src/lib.rs"),
+        ),
+        (
+            "crates/input-emulation/src/dummy.rs",
+            include_str!("../crates/input-emulation/src/dummy.rs"),
+        ),
+        (
+            "crates/input-emulation/src/libei.rs",
+            include_str!("../crates/input-emulation/src/libei.rs"),
+        ),
+        (
+            "crates/input-emulation/src/macos.rs",
+            include_str!("../crates/input-emulation/src/macos.rs"),
+        ),
+        (
+            "crates/input-emulation/src/windows.rs",
+            include_str!("../crates/input-emulation/src/windows.rs"),
+        ),
+        (
+            "crates/input-emulation/src/wlroots.rs",
+            include_str!("../crates/input-emulation/src/wlroots.rs"),
+        ),
+        (
+            "crates/input-emulation/src/xdg_desktop_portal.rs",
+            include_str!("../crates/input-emulation/src/xdg_desktop_portal.rs"),
+        ),
+        (
+            "crates/input-event/src/keylog.rs",
+            include_str!("../crates/input-event/src/keylog.rs"),
+        ),
+        ("src/capture.rs", include_str!("capture.rs")),
+        ("src/emulation.rs", include_str!("emulation.rs")),
+        ("src/connect.rs", include_str!("connect.rs")),
+        ("src/listen.rs", include_str!("listen.rs")),
+    ];
+
+    const LEVELS: &[&str] = &["trace!(", "debug!(", "info!(", "warn!(", "error!(", "log!("];
+
+    /// Each `log::…!( … )` call in `code`: its line and the text between the
+    /// parentheses. `Err` names a call whose closing parenthesis was not found,
+    /// which would otherwise hide every call after it.
+    fn log_calls(code: &str) -> Result<Vec<(usize, &str)>, usize> {
+        let mut calls = vec![];
+        for (at, _) in code.match_indices("log::") {
+            let rest = &code[at + "log::".len()..];
+            let Some(level) = LEVELS.iter().find(|l| rest.starts_with(**l)) else {
+                continue;
+            };
+            let line = code[..at].matches('\n').count() + 1;
+            let open = at + "log::".len() + level.len();
+            let close = closing(&code[open..]).ok_or(line)?;
+            calls.push((line, &code[open..open + close]));
+        }
+        Ok(calls)
+    }
+
+    /// Offset of the `)` closing an already-open parenthesis, outside strings.
+    fn closing(s: &str) -> Option<usize> {
+        let (mut depth, mut in_str, mut escaped) = (0usize, false, false);
+        for (i, c) in s.char_indices() {
+            if in_str {
+                match c {
+                    _ if escaped => escaped = false,
+                    '\\' => escaped = true,
+                    '"' => in_str = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                '"' => in_str = true,
+                '(' | '[' | '{' => depth += 1,
+                ')' if depth == 0 => return Some(i),
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The arguments of a call, split on commas outside strings and brackets.
+    fn arguments(body: &str) -> Vec<&str> {
+        let (mut args, mut start) = (vec![], 0);
+        let (mut depth, mut in_str, mut escaped) = (0usize, false, false);
+        for (i, c) in body.char_indices() {
+            if in_str {
+                match c {
+                    _ if escaped => escaped = false,
+                    '\\' => escaped = true,
+                    '"' => in_str = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                '"' => in_str = true,
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    args.push(body[start..i].trim());
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        args.push(body[start..].trim());
+        args.retain(|a| !a.is_empty());
+        args
+    }
+
+    /// The names a log call prints: `{name}` captures in its format string,
+    /// and arguments that are a plain variable or field, cast or not. A
+    /// function call is not a name: it is how a value is printed without its
+    /// key.
+    fn printed(body: &str) -> Vec<String> {
+        let mut args = arguments(body).into_iter().peekable();
+        if args.peek().is_some_and(|a| a.starts_with("target:")) {
+            args.next();
+        }
+        // `log::log!(level, "…")` names its level first.
+        if args.peek().is_some_and(|a| !a.starts_with('"')) {
+            args.next();
+        }
+        let mut names = vec![];
+        if let Some(format) = args.next() {
+            let mut rest = format;
+            while let Some(open) = rest.find('{') {
+                rest = &rest[open + 1..];
+                if let Some(escaped) = rest.strip_prefix('{') {
+                    rest = escaped;
+                    continue;
+                }
+                let end = rest.find('}').unwrap_or(rest.len());
+                let name = rest[..end].split(':').next().unwrap_or("").trim();
+                if !name.is_empty() && !name.chars().all(|c| c.is_ascii_digit()) {
+                    names.push(name.to_owned());
+                }
+                rest = &rest[end..];
+            }
+        }
+        for arg in args {
+            let value = arg.split_once('=').map_or(arg, |(_, v)| v).trim();
+            let value = uncast(value.trim_start_matches(['&', '*']));
+            if value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+            {
+                if let Some(last) = value.rsplit('.').next() {
+                    names.push(last.to_owned());
+                }
+            }
+        }
+        names
+    }
+
+    /// `x as u16`, `(x as u32)`: a cast prints `x`.
+    fn uncast(mut value: &str) -> &str {
+        loop {
+            let inner = value
+                .strip_prefix('(')
+                .and_then(|v| v.strip_suffix(')'))
+                .map(str::trim);
+            let bare = match value.rsplit_once(" as ") {
+                Some((head, ty))
+                    if ty
+                        .trim()
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':') =>
+                {
+                    Some(head.trim())
+                }
+                _ => None,
+            };
+            match inner.or(bare) {
+                Some(next) => value = next.trim_start_matches(['&', '*']),
+                None => return value,
+            }
+        }
+    }
+
+    #[test]
+    fn the_scan_reads_calls_the_way_the_compiler_does() {
+        let code = "log::trace!(\"{key:#?} is not a modifier\");\n\
+                    log::warn!(\n    \"a (b) {} (vk={:#04x})\",\n    scan_code,\n    hook.vkCode\n);\n\
+                    log::debug!(\"{}\", describe(&key));\n\
+                    log::log!(level, \"{{literal}} {n} {0}\", mods);\n\
+                    log::info!(\"released {} stuck key(s)\", keys.len());\n\
+                    log::warn!(\"no scancode: {} {}\", linux_keycode as u16, (key as u32));";
+        let calls = log_calls(code).expect("every call closes");
+        let names: Vec<Vec<String>> = calls.iter().map(|(_, b)| printed(b)).collect();
+        assert_eq!(
+            names,
+            vec![
+                vec!["key".to_owned()],
+                vec!["scan_code".to_owned(), "vkCode".to_owned()],
+                vec![],
+                vec!["n".to_owned(), "mods".to_owned()],
+                vec![],
+                vec!["linux_keycode".to_owned(), "key".to_owned()],
+            ],
+            "the scan misreads a log call, so the guard below would miss a key \
+             printed that way"
+        );
+        assert_eq!(
+            calls.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+            vec![1, 2, 7, 8, 9, 10]
+        );
+    }
+
+    #[test]
+    fn no_log_call_on_the_input_path_prints_a_key() {
+        let mut offenders = vec![];
+        let mut seen = 0;
+        for (file, src) in FILES {
+            let code = super::scan::code_only(src);
+            let calls = log_calls(&code).unwrap_or_else(|line| {
+                panic!("{file}:{line}: a log call with no closing parenthesis")
+            });
+            assert!(
+                !calls.is_empty(),
+                "{file}: no log call found. It logs, so the scan is not reading it \
+                 and would pass whatever it printed."
+            );
+            seen += calls.len();
+            for (line, body) in calls {
+                for name in printed(body) {
+                    if KEY_HOLDERS.contains(&name.as_str()) {
+                        offenders.push(format!("{file}:{line} prints `{name}`"));
+                    }
+                }
+            }
+        }
+        assert!(
+            seen > 200,
+            "only {seen} log calls read; files have gone missing"
+        );
+        assert!(
+            offenders.is_empty(),
+            "log calls on the input path print which key was pressed:\n  {}\n\n\
+             Anyone who raises HOPS_LOG_LEVEL to look at something else would \
+             start recording what is typed, and a warn line does it with no \
+             level raised at all (#117). Say that a key went down or up; send \
+             its identity to `input_event::keylog::key`, which is compiled out \
+             of release builds and time-boxed when armed.",
+            offenders.join("\n  ")
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the daemon runs as the user
+// ---------------------------------------------------------------------------
+
+mod the_windows_daemon_is_never_installed_elevated {
+    //! **Decided 2026-09-15 (#109).** The Windows daemon runs as the user and
+    //! is never elevated. An administrator process started from a folder the
+    //! user can write hands administrator to anything that can replace the
+    //! file, and its enter hook comes from a config file the user can write.
+    //!
+    //! The runtime half is `crate::enter_hook`, which refuses the hook in an
+    //! elevated process and is tested by calling it. This half is about the
+    //! words that ship: the install script and the instructions for it. No CI
+    //! runner registers a Windows scheduled task, so the text is what can be
+    //! checked.
+
+    const SCRIPT: &str = include_str!("../service/windows/install-hops-daemon.ps1");
+    const README: &str = include_str!("../service/README.md");
+
+    /// PowerShell with `#` comments removed, lower-cased, since PowerShell
+    /// reads its parameter names without regard to case.
+    fn powershell_code(src: &str) -> String {
+        src.lines()
+            .map(|l| l.split('#').next().unwrap_or("").to_lowercase())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    // LEDGER T69 | class S | source text
+    #[test]
+    fn the_install_script_and_its_instructions_never_ask_for_elevation() {
+        let code = powershell_code(SCRIPT);
+        let run_levels: Vec<&str> = code
+            .split("-runlevel")
+            .skip(1)
+            .map(|after| after.split_whitespace().next().unwrap_or(""))
+            .collect();
+        assert!(
+            !run_levels.is_empty() && run_levels.iter().all(|level| *level == "limited"),
+            "install-hops-daemon.ps1 registers the daemon's task with run level \
+             {run_levels:?}; it must name `-RunLevel Limited` and nothing else. \
+             A task with the highest run level runs hops as an administrator from \
+             a folder the user can write, and runs its enter hook from a config \
+             file the user can write."
+        );
+
+        let mut asks = Vec::new();
+        for (file, text) in [
+            ("service/windows/install-hops-daemon.ps1", SCRIPT),
+            ("service/README.md", README),
+        ] {
+            let lower = text.to_lowercase();
+            for phrase in ["run as administrator", "elevated powershell"] {
+                if lower.contains(phrase) {
+                    asks.push(format!("{file}: \"{phrase}\""));
+                }
+            }
+        }
+        assert!(
+            asks.is_empty(),
+            "the Windows install instructions still ask for elevation: {asks:?}. \
+             The daemon runs as the user, so its install needs no administrator, \
+             and telling users to use one invites the elevated install that \
+             2026-09-15 took out."
         );
     }
 }

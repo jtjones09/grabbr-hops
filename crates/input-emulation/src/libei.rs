@@ -308,7 +308,10 @@ async fn ei_event_handler(
             DeviceCapability::Scroll,
             DeviceCapability::Button,
         ];
-        log::debug!("{event:?}");
+        // The modifier masks beside each key give away case (#117).
+        if !matches!(event, EiEvent::KeyboardModifiers(_)) {
+            log::debug!("{event:?}");
+        }
         match event {
             EiEvent::Disconnected(e) => {
                 log::debug!("ei disconnected: {e:?}");
@@ -364,8 +367,8 @@ async fn ei_event_handler(
                 log::debug!("device resumed: {:?}", e.device().device_type());
                 e.device().device().start_emulating(0, 0);
             }
-            EiEvent::KeyboardModifiers(e) => {
-                log::debug!("modifiers: {e:?}");
+            EiEvent::KeyboardModifiers(_) => {
+                log::debug!("keyboard modifiers changed");
             }
             // only for receiver context
             // EiEvent::Frame(_) => { },

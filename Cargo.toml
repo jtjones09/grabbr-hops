@@ -70,7 +70,6 @@ tokio = { version = "1.32.0", features = [
 ] }
 futures = "0.3.28"
 clap = { version = "4.4.11", features = ["derive"] }
-slab = "0.4.9"
 thiserror = "2.0.0"
 tokio-util = "0.7.11"
 local-channel = "0.1.5"
@@ -112,15 +111,24 @@ mdns-sd = { version = "0.21.2", features = ["unstable-fuzz-api"] }
 # feature of this crate forwards to either.
 input-emulation = { path = "crates/input-emulation", version = "0.4.0", default-features = false, features = ["recording"] }
 input-capture = { path = "crates/input-capture", version = "0.4.0", default-features = false, features = ["scripted"] }
+# The release workflows are YAML that only GitHub runs; the release pipeline
+# tests parse them to run each gate's shell and to read which job holds a
+# secret or may write.
+yaml-rust2 = { version = "0.13", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.148"
+# Splits the enter hook into a program and its arguments the way a POSIX shell
+# would, so it runs without one (#108). Already in the tree through `cc`.
+shlex = "1.3"
 
 [target.'cfg(windows)'.dependencies]
-# OpenProcess and GetExitCodeProcess, to tell whether a process has ended.
-# The same version and features the input crates already build.
+# OpenProcess and GetExitCodeProcess, to tell whether a process has ended, and
+# OpenProcessToken and GetTokenInformation, to tell whether it is elevated.
+# The same version the input crates already build.
 windows = { version = "0.61.2", features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_System_Threading",
 ] }
 

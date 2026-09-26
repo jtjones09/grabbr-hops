@@ -17,7 +17,7 @@ use futures::StreamExt;
 use tokio::sync::{Notify, mpsc};
 
 pub use hops_ipc::{
-    AttemptOrigin, ClientConfig, ClientHandle, ClientState, DiscoveredDevice, FrontendEvent,
+    AttemptOrigin, Build, ClientConfig, ClientHandle, ClientState, DiscoveredDevice, FrontendEvent,
     FrontendRequest, Position, RevokedEntry, Status, connect_async,
 };
 
@@ -27,11 +27,42 @@ pub mod theme;
 /// How many transient event/error lines to keep for the UI log pane.
 const MAX_MESSAGES: usize = 50;
 
+/// What the binary tells its frontend as the frontend opens.
+#[derive(Debug, Clone, Default)]
+pub struct Launch {
+    /// This binary's own build, to compare with the daemon's. `None` compares
+    /// nothing.
+    pub build: Option<Build>,
+    /// Why the service the app tried to start is not running, in words, with
+    /// the file that says more. `None` when the app started nothing or the
+    /// service came up.
+    pub start_problem: Option<String>,
+}
+
+/// What the daemon on this connection said about its build.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ServiceBuild {
+    /// Nothing yet on this connection.
+    #[default]
+    Unknown,
+    /// It sent state without saying: a daemon older than the event.
+    Unstated,
+    /// It said which build it is.
+    Is(Build),
+}
+
 /// Reduced, UI-facing snapshot of daemon state. Cloned cheaply for rendering.
 #[derive(Debug, Default, Clone)]
 pub struct AppModel {
     /// True while the IPC socket is connected.
     pub connected: bool,
+    /// This binary's build, from [`Launch::build`].
+    pub this_build: Option<Build>,
+    /// The daemon's build, as it stated it on this connection.
+    pub service_build: ServiceBuild,
+    /// Why the service the app tried to start did not come up, from
+    /// [`Launch::start_problem`]. Cleared once a daemon answers.
+    pub start_problem: Option<String>,
     /// Configured clients, keyed + ordered by handle.
     pub clients: BTreeMap<ClientHandle, (ClientConfig, ClientState)>,
     /// Local input-capture status.
@@ -96,6 +127,11 @@ pub struct AppModel {
     /// A front-end can treat the prompt as stale (the peer gave up) once this is
     /// older than a small TTL, since the daemon emits no retraction event.
     pub pending_pairing_since: Option<Instant>,
+    /// Every machine awaiting an answer, oldest first. `pending_pairing` is
+    /// only the latest; the prompt is chosen from this, through
+    /// [`PairingCard`], so another machine's request cannot replace the one on
+    /// screen (#168).
+    pub pairing_attempts: Vec<PairingAttempt>,
     /// Maps a connected peer's socket address -> fingerprint, so the addr-only
     /// `IncomingDisconnected` event can be correlated back to a fingerprint.
     peer_addrs: HashMap<SocketAddr, String>,
@@ -118,7 +154,14 @@ impl AppModel {
     /// Fold one daemon event into the model.
     pub fn apply(&mut self, event: FrontendEvent) {
         match event {
+            FrontendEvent::DaemonBuild(build) => self.service_build = ServiceBuild::Is(build),
             FrontendEvent::Enumerate(list) => {
+                // A daemon states its build before its state on every sync,
+                // so state with nothing stated first is from one that never
+                // does. A statement that arrives later still replaces this.
+                if self.service_build == ServiceBuild::Unknown {
+                    self.service_build = ServiceBuild::Unstated;
+                }
                 self.clients = list.into_iter().map(|(h, c, s)| (h, (c, s))).collect();
             }
             FrontendEvent::Created(h, c, s) | FrontendEvent::State(h, c, s) => {
@@ -136,9 +179,15 @@ impl AppModel {
             FrontendEvent::RevokedUpdated(map) => self.revoked = map,
             FrontendEvent::AuthorizedUpdated(map) => {
                 self.authorized = map;
-                // a pending request that just became trusted is resolved
+                let attempts = std::mem::take(&mut self.pairing_attempts);
+                self.pairing_attempts = attempts
+                    .into_iter()
+                    .filter(|a| !self.arrival_permitted(&a.fingerprint, Some(a.origin)))
+                    .collect();
+                // a pending request whose direction just became permitted is
+                // resolved
                 if let Some(fp) = self.pending_pairing.clone() {
-                    if self.authorized.contains_key(&fp) {
+                    if self.arrival_permitted(&fp, self.pending_pairing_origin) {
                         self.pending_pairing = None;
                         self.pending_pairing_since = None;
                     }
@@ -175,17 +224,27 @@ impl AppModel {
                 addr,
             } => {
                 self.push_message(match origin {
-                    AttemptOrigin::Inbound => format!("pairing request: {fingerprint}"),
+                    AttemptOrigin::Inbound => match addr {
+                        Some(a) => format!("pairing request from {a}: {fingerprint}"),
+                        None => format!("pairing request: {fingerprint}"),
+                    },
                     AttemptOrigin::OutboundDial => match addr {
                         Some(a) => format!("{a} answered our dial, untrusted: {fingerprint}"),
                         None => format!("we dialled an untrusted receiver: {fingerprint}"),
                     },
                 });
-                if !self.authorized.contains_key(&fingerprint) {
+                if !self.arrival_permitted(&fingerprint, Some(origin)) {
+                    let now = Instant::now();
+                    self.note_attempt(PairingAttempt {
+                        fingerprint: fingerprint.clone(),
+                        origin,
+                        addr,
+                        since: now,
+                    });
                     self.pending_pairing = Some(fingerprint);
                     self.pending_pairing_origin = Some(origin);
                     self.pending_pairing_addr = addr;
-                    self.pending_pairing_since = Some(Instant::now());
+                    self.pending_pairing_since = Some(now);
                 }
             }
             FrontendEvent::Discovered { active, peers } => {
@@ -198,6 +257,98 @@ impl AppModel {
             }
             FrontendEvent::NoSuchClient(_) => {}
         }
+    }
+
+    /// The pairing request to put in front of the user: the pending attempt,
+    /// unless the direction it arrived in is already permitted. Freshness and
+    /// the user's snooze are the front-end's.
+    pub fn pairing_request(&self) -> Option<&str> {
+        let fp = self.pending_pairing.as_deref()?;
+        (!self.arrival_permitted(fp, self.pending_pairing_origin)).then_some(fp)
+    }
+
+    /// Is what an attempt from `fp`, arriving by `origin`, asks for already
+    /// permitted?
+    ///
+    /// A peer that may drive this machine can still ask to be driven by it:
+    /// one approval grants one direction, and a pair that works both ways is
+    /// approved twice (#166). So being in `authorized` answers only the
+    /// inbound question. Nothing here says whether this machine may drive a
+    /// peer, and the daemon raises an attempt from its own dial only after its
+    /// trust store said it may not, so that attempt is never already answered.
+    fn arrival_permitted(&self, fp: &str, origin: Option<AttemptOrigin>) -> bool {
+        match origin {
+            Some(AttemptOrigin::OutboundDial) => false,
+            Some(AttemptOrigin::Inbound) | None => self.authorized.contains_key(fp),
+        }
+    }
+
+    /// The pin of device `handle` as this model has it: the fingerprint a
+    /// delete or rename of it must carry (`None` if it has none, or no such
+    /// device).
+    pub fn pin_of(&self, handle: ClientHandle) -> Option<String> {
+        self.clients
+            .get(&handle)
+            .and_then(|(_, s)| s.peer_fingerprint.clone())
+    }
+
+    /// Whether device `handle` is still here and still pinned to `pin`, as it
+    /// was when a frontend armed a delete or opened a rename on it.
+    ///
+    /// A frontend drops an armed action once this is false. The daemon would
+    /// refuse it anyway, but only after the user confirmed something the row
+    /// no longer shows (#94).
+    pub fn still_names(&self, handle: ClientHandle, pin: Option<&str>) -> bool {
+        self.clients
+            .get(&handle)
+            .is_some_and(|(_, s)| s.peer_fingerprint.as_deref() == pin)
+    }
+
+    /// Add an attempt, or refresh the one already held for that machine in
+    /// place, keeping its position in the queue.
+    fn note_attempt(&mut self, attempt: PairingAttempt) {
+        if let Some(held) = self
+            .pairing_attempts
+            .iter_mut()
+            .find(|a| a.fingerprint == attempt.fingerprint)
+        {
+            *held = attempt;
+            return;
+        }
+        // Anyone who can reach the daemon while add device is open can add
+        // one, so the queue is bounded.
+        if self.pairing_attempts.len() >= MAX_PAIRING_ATTEMPTS {
+            self.pairing_attempts.remove(0);
+        }
+        self.pairing_attempts.push(attempt);
+    }
+
+    /// What is wrong with the service this app talks to, in words, or `None`.
+    ///
+    /// While nothing is connected: why the service the app started did not
+    /// come up. Once connected: that the daemon runs another build than this
+    /// app, which it keeps doing until it restarts.
+    pub fn service_problem(&self) -> Option<String> {
+        if !self.connected {
+            return self.start_problem.clone();
+        }
+        let this = self.this_build.as_ref()?;
+        let theirs = match &self.service_build {
+            ServiceBuild::Unknown => return None,
+            ServiceBuild::Is(build) if build == this => return None,
+            ServiceBuild::Is(build) => format!("hops {build}"),
+            ServiceBuild::Unstated => "an older build that does not say which".to_string(),
+        };
+        let restart = if cfg!(target_os = "linux") {
+            "restart the computer"
+        } else {
+            "log out and back in"
+        };
+        Some(format!(
+            "This app is hops {this}, but the service it is connected to is {theirs}. \
+             The service keeps running its own version until it restarts: {restart} \
+             to run this one."
+        ))
     }
 
     /// Whole seconds left in the pairing window, or `None` when it is closed.
@@ -247,6 +398,116 @@ impl AppModel {
     /// IPC token — reached the user as silence.
     pub fn latest_message(&self) -> Option<&str> {
         self.messages.back().map(|s| s.as_str())
+    }
+}
+
+/// How many machines awaiting an answer the model holds at once.
+const MAX_PAIRING_ATTEMPTS: usize = 16;
+
+/// A machine waiting for an answer to a pairing prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingAttempt {
+    pub fingerprint: String,
+    /// Whether it knocked or we dialled it (#61).
+    pub origin: AttemptOrigin,
+    /// Where it came from, or the address that answered our dial (#83, #93).
+    pub addr: Option<SocketAddr>,
+    /// When the daemon last reported it.
+    pub since: Instant,
+}
+
+/// Why an approval was not sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalRefused {
+    /// The fingerprint is not the one on the card.
+    NotOnScreen,
+    /// The card switched to this machine too recently for the click to have
+    /// been meant for it.
+    JustChanged,
+}
+
+impl ApprovalRefused {
+    /// What to tell the person who clicked.
+    pub fn notice(self) -> &'static str {
+        match self {
+            ApprovalRefused::NotOnScreen => {
+                "That pairing request is no longer on screen, so nothing was trusted."
+            }
+            ApprovalRefused::JustChanged => {
+                "The pairing request changed just before you approved it, so nothing \
+                 was trusted. Check which device it is now, then approve again."
+            }
+        }
+    }
+}
+
+/// Which pairing request the prompt shows, and whether an approval of it
+/// counts (#168).
+///
+/// The prompt used to show whichever machine asked last, so a second machine
+/// dialling while someone read the card, or typed a name into it, replaced the
+/// machine under the click: approving then trusted the second machine under
+/// the name meant for the first. A card now keeps its machine for as long as
+/// that machine's request is live, and a click is refused unless the card has
+/// shown that machine for at least [`Self::ARM_AFTER`], so a click aimed at
+/// the card before it changed does not land on the one after.
+#[derive(Debug, Default)]
+pub struct PairingCard {
+    shown: Option<(String, Instant)>,
+}
+
+impl PairingCard {
+    /// A request nobody has repeated for this long is taken as abandoned: the
+    /// daemon sends no retraction.
+    pub const STALE_AFTER: Duration = Duration::from_secs(12);
+
+    /// How long a card must have shown a machine before approving it counts.
+    pub const ARM_AFTER: Duration = Duration::from_secs(1);
+
+    /// The request to show at `now`: the one already on screen while it is
+    /// still live, otherwise the oldest live one. Live means the direction it
+    /// asks for is not yet permitted (#166), repeated within
+    /// [`Self::STALE_AFTER`], and not `snoozed` (denied).
+    pub fn show<'m>(
+        &mut self,
+        model: &'m AppModel,
+        now: Instant,
+        snoozed: impl Fn(&str) -> bool,
+    ) -> Option<&'m PairingAttempt> {
+        let live = |a: &&PairingAttempt| {
+            !model.arrival_permitted(&a.fingerprint, Some(a.origin))
+                && now.saturating_duration_since(a.since) < Self::STALE_AFTER
+                && !snoozed(&a.fingerprint)
+        };
+        let on_screen = self.shown.as_ref().map(|(fp, _)| fp.as_str());
+        let pick = model
+            .pairing_attempts
+            .iter()
+            .filter(live)
+            .find(|a| Some(a.fingerprint.as_str()) == on_screen)
+            .or_else(|| model.pairing_attempts.iter().find(live));
+        match pick {
+            Some(a) if Some(a.fingerprint.as_str()) != on_screen => {
+                self.shown = Some((a.fingerprint.clone(), now));
+            }
+            Some(_) => {}
+            None => self.shown = None,
+        }
+        pick
+    }
+
+    /// Whether approving `fingerprint` at `now` binds to the card on screen.
+    pub fn approve(&self, fingerprint: &str, now: Instant) -> Result<(), ApprovalRefused> {
+        match &self.shown {
+            Some((fp, since)) if fp == fingerprint => {
+                if now.saturating_duration_since(*since) >= Self::ARM_AFTER {
+                    Ok(())
+                } else {
+                    Err(ApprovalRefused::JustChanged)
+                }
+            }
+            _ => Err(ApprovalRefused::NotOnScreen),
+        }
     }
 }
 
@@ -543,8 +804,12 @@ pub struct FrontendClient {
 impl FrontendClient {
     /// Spawn the auto-reconnecting connection task and return a handle. Must be
     /// called within a tokio `LocalSet` (it uses `spawn_local`).
-    pub fn spawn() -> Self {
-        let model = Arc::new(Mutex::new(AppModel::default()));
+    pub fn spawn(launch: Launch) -> Self {
+        let model = Arc::new(Mutex::new(AppModel {
+            this_build: launch.build,
+            start_problem: launch.start_problem,
+            ..AppModel::default()
+        }));
         let changed = Arc::new(Notify::new());
         let (requests, request_rx) = mpsc::unbounded_channel();
         tokio::task::spawn_local(connection_loop(model.clone(), changed.clone(), request_rx));
@@ -587,7 +852,14 @@ async fn connection_loop(
                 continue;
             }
         };
-        model.lock().expect("model lock poisoned").connected = true;
+        {
+            let mut m = model.lock().expect("model lock poisoned");
+            m.connected = true;
+            // A daemon answers, so a failed start no longer describes it; and
+            // it may be another build than the last one.
+            m.start_problem = None;
+            m.service_build = ServiceBuild::Unknown;
+        }
         changed.notify_one();
         // pull full initial state
         let _ = writer.request(FrontendRequest::Sync).await;
@@ -627,9 +899,160 @@ async fn connection_loop(
             m.peer_addrs.clear();
             m.pending_pairing = None;
             m.pending_pairing_since = None;
+            m.pairing_attempts.clear();
         }
         changed.notify_one();
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+#[cfg(test)]
+mod armed_actions {
+    //! A frontend arms a delete or opens a rename on a row, and the user
+    //! confirms later. By then the device can be gone, replaced by a reload,
+    //! or pinned to another machine; the armed action must not survive that.
+
+    use super::*;
+
+    fn pinned(fp: Option<&str>) -> (ClientConfig, ClientState) {
+        let state = ClientState {
+            peer_fingerprint: fp.map(str::to_string),
+            ..Default::default()
+        };
+        (ClientConfig::default(), state)
+    }
+
+    // LEDGER T14 | class B | 1 return value: AppModel::still_names after AppModel::apply
+    #[test]
+    fn an_armed_action_outlives_nothing_about_its_device() {
+        let x = "aa:".repeat(31) + "aa";
+        let y = "bb:".repeat(31) + "bb";
+        let mut m = AppModel::default();
+        let (c, s) = pinned(Some(&x));
+        m.apply(FrontendEvent::Created(7, c, s));
+        assert!(
+            m.still_names(7, Some(&x)),
+            "unchanged: still the device shown"
+        );
+
+        // The device learns another identity.
+        let (c, s) = pinned(Some(&y));
+        m.apply(FrontendEvent::State(7, c, s));
+        assert!(
+            !m.still_names(7, Some(&x)),
+            "the device is now pinned to another machine, and a delete armed on \
+             the old one would revoke this one"
+        );
+
+        // Or it is replaced by a reload: removed, and another added.
+        let (c, s) = pinned(Some(&x));
+        m.apply(FrontendEvent::Enumerate(vec![(8, c, s)]));
+        assert!(
+            !m.still_names(7, Some(&x)),
+            "the device is gone; an action armed on it must go with it"
+        );
+        assert_eq!(m.pin_of(8), Some(x), "the pin a request for 8 carries");
+    }
+}
+
+#[cfg(test)]
+mod pairing_card {
+    //! The approval a person gives binds to the machine the card showed them
+    //! (#168).
+    use super::{
+        AppModel, ApprovalRefused, AttemptOrigin, FrontendEvent, PairingAttempt, PairingCard,
+    };
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    const B: &str = "bb:bb:bb";
+    const C: &str = "cc:cc:cc";
+
+    fn knock(m: &mut AppModel, fp: &str) {
+        m.apply(FrontendEvent::ConnectionAttempt {
+            fingerprint: fp.into(),
+            origin: AttemptOrigin::Inbound,
+            addr: None,
+        });
+    }
+
+    fn attempt(fp: &str, since: Instant) -> PairingAttempt {
+        PairingAttempt {
+            fingerprint: fp.into(),
+            origin: AttemptOrigin::Inbound,
+            addr: None,
+            since,
+        }
+    }
+
+    /// The #168 repro: B's card is on screen, C dials before the click.
+    // LEDGER T9 | class B | 1 return value: PairingCard::show over AppModel::apply
+    #[test]
+    fn a_card_on_screen_keeps_its_machine_when_another_knocks() {
+        let mut m = AppModel::default();
+        let mut card = PairingCard::default();
+        knock(&mut m, B);
+        let now = Instant::now();
+        assert_eq!(
+            card.show(&m, now, |_| false)
+                .map(|a| a.fingerprint.as_str()),
+            Some(B)
+        );
+        knock(&mut m, C);
+        assert_eq!(
+            card.show(&m, now, |_| false)
+                .map(|a| a.fingerprint.as_str()),
+            Some(B),
+            "a second machine's knock replaced the machine on the card"
+        );
+        assert_eq!(card.approve(B, now + PairingCard::ARM_AFTER), Ok(()));
+        assert_eq!(
+            card.approve(C, now + PairingCard::ARM_AFTER),
+            Err(ApprovalRefused::NotOnScreen),
+            "a machine that is not on the card was approved"
+        );
+        // Once B is answered, C's request is next.
+        m.apply(FrontendEvent::AuthorizedUpdated(HashMap::from([(
+            B.to_string(),
+            "laptop".to_string(),
+        )])));
+        assert_eq!(
+            card.show(&m, now, |_| false)
+                .map(|a| a.fingerprint.as_str()),
+            Some(C),
+            "the waiting machine was lost when the first was answered"
+        );
+    }
+
+    /// When the card does change machine, a click that lands in the next
+    /// moment was aimed at the card before it.
+    // LEDGER T10 | class B | 1 return value: PairingCard::approve
+    #[test]
+    fn an_approval_right_after_the_card_changed_machine_is_refused() {
+        let mut m = AppModel::default();
+        let mut card = PairingCard::default();
+        let t0 = Instant::now();
+        m.pairing_attempts = vec![attempt(B, t0)];
+        card.show(&m, t0, |_| false);
+        // B stops asking; C, which asked later, is still live.
+        let t1 = t0 + PairingCard::STALE_AFTER + Duration::from_secs(1);
+        m.pairing_attempts.push(attempt(C, t1));
+        assert_eq!(
+            card.show(&m, t1, |_| false).map(|a| a.fingerprint.as_str()),
+            Some(C)
+        );
+        assert_eq!(
+            card.approve(C, t1 + Duration::from_millis(200)),
+            Err(ApprovalRefused::JustChanged),
+            "a click 200 ms after the card switched machine was taken as approving \
+             the new one"
+        );
+        assert_eq!(
+            card.approve(B, t1 + PairingCard::ARM_AFTER),
+            Err(ApprovalRefused::NotOnScreen),
+            "the machine that left the card was approved"
+        );
+        assert_eq!(card.approve(C, t1 + PairingCard::ARM_AFTER), Ok(()));
     }
 }
 
@@ -863,5 +1286,246 @@ mod pairing_window {
             None,
             "the daemon closed the window and the model kept it open"
         );
+    }
+}
+
+#[cfg(test)]
+mod second_direction {
+    //! A machine already paired one way is asked about the other (#166). One
+    //! approval grants one direction, so the card for the second one has to
+    //! reach the user even though the peer is already in `authorized`.
+    use super::*;
+
+    const PEER: &str = "aa:bb";
+
+    /// PEER may drive this machine, and this machine's dial just reached it.
+    fn driven_by_peer_then_dialled_it() -> AppModel {
+        let mut m = AppModel::default();
+        m.apply(FrontendEvent::AuthorizedUpdated(HashMap::from([(
+            PEER.to_owned(),
+            "desk mac".to_owned(),
+        )])));
+        m.apply(FrontendEvent::ConnectionAttempt {
+            fingerprint: PEER.into(),
+            origin: AttemptOrigin::OutboundDial,
+            addr: Some("10.0.0.5:4242".parse().expect("addr")),
+        });
+        m
+    }
+
+    // LEDGER T5 | class B | 6 struct state + 1 return value: AppModel::apply, AppModel::pairing_request
+    #[test]
+    fn a_second_direction_raises_a_card_for_an_authorized_peer() {
+        let m = driven_by_peer_then_dialled_it();
+        assert_eq!(
+            m.pairing_request(),
+            Some(PEER),
+            "a peer that may drive this machine answered this machine's dial, \
+             and no card asks whether this machine may drive it; pending {:?}",
+            m.pending_pairing
+        );
+    }
+
+    // LEDGER T6 | class B | 6 struct state + 1 return value: AppModel::apply, AppModel::pairing_request
+    #[test]
+    fn a_trust_update_does_not_retire_a_card_for_the_other_direction() {
+        let mut m = driven_by_peer_then_dialled_it();
+        m.apply(FrontendEvent::AuthorizedUpdated(HashMap::from([
+            (PEER.to_owned(), "desk mac".to_owned()),
+            ("cc:dd".to_owned(), "another machine".to_owned()),
+        ])));
+        assert_eq!(
+            m.pairing_request(),
+            Some(PEER),
+            "a change to who may drive this machine withdrew the card asking \
+             whether this machine may drive PEER"
+        );
+    }
+
+    /// The same, through the queue the frontends render from (#168): the
+    /// card is picked from `pairing_attempts`, so the update must not drop
+    /// the other direction's attempt from it either.
+    // LEDGER T6b | class B | 1 return value: AppModel::apply, PairingCard::show
+    #[test]
+    fn a_trust_update_keeps_the_other_direction_on_the_card() {
+        let mut m = driven_by_peer_then_dialled_it();
+        m.apply(FrontendEvent::AuthorizedUpdated(HashMap::from([
+            (PEER.to_owned(), "desk mac".to_owned()),
+            ("cc:dd".to_owned(), "another machine".to_owned()),
+        ])));
+        assert_eq!(
+            PairingCard::default()
+                .show(&m, Instant::now(), |_| false)
+                .map(|a| a.fingerprint.as_str()),
+            Some(PEER),
+            "a change to who may drive this machine took the card asking \
+             whether this machine may drive PEER off the screen"
+        );
+    }
+
+    // LEDGER T7 | class B | 6 struct state + 1 return value: AppModel::apply, AppModel::pairing_request
+    #[test]
+    fn a_knock_from_a_peer_that_may_already_drive_us_raises_no_card() {
+        let mut m = AppModel::default();
+        m.apply(FrontendEvent::AuthorizedUpdated(HashMap::from([(
+            PEER.to_owned(),
+            "desk mac".to_owned(),
+        )])));
+        m.apply(FrontendEvent::ConnectionAttempt {
+            fingerprint: PEER.into(),
+            origin: AttemptOrigin::Inbound,
+            addr: None,
+        });
+        assert_eq!(
+            m.pairing_request(),
+            None,
+            "a card asks to let PEER drive this machine, which it already may"
+        );
+    }
+}
+
+#[cfg(test)]
+mod a_closed_link_shows_down {
+    //! What the daemon sends when a link closes has to take the device out of
+    //! "connected" and "refusing" in the model the frontends render (#34).
+    use super::*;
+
+    const FP: &str = "aa:bb";
+
+    fn device(m: &AppModel) -> Device {
+        m.devices()
+            .into_iter()
+            .find(|d| d.fingerprint.as_deref() == Some(FP))
+            .expect("the device is listed")
+    }
+
+    // LEDGER T68 | class B | 6 struct state: AppModel::apply + AppModel::devices()
+    #[test]
+    fn a_closed_link_takes_the_device_out_of_connected_and_refusing() {
+        let addr: std::net::SocketAddr = "10.0.0.5:51000".parse().unwrap();
+        let mut m = AppModel::default();
+        m.apply(FrontendEvent::AuthorizedUpdated(HashMap::from([(
+            FP.to_string(),
+            "peer".to_string(),
+        )])));
+        m.apply(FrontendEvent::DeviceConnected {
+            addr,
+            fingerprint: FP.into(),
+        });
+        let refusing = ClientState {
+            active: true,
+            alive: false,
+            active_addr: Some("10.0.0.5:4242".parse().unwrap()),
+            peer_fingerprint: Some(FP.into()),
+            ..Default::default()
+        };
+        m.apply(FrontendEvent::State(
+            0,
+            ClientConfig::default(),
+            refusing.clone(),
+        ));
+        assert!(
+            device(&m).online && device(&m).refuses_our_input(),
+            "precondition: connected in, and refusing our input"
+        );
+
+        m.apply(FrontendEvent::IncomingDisconnected(addr));
+        m.apply(FrontendEvent::State(
+            0,
+            ClientConfig::default(),
+            ClientState {
+                active_addr: None,
+                ..refusing
+            },
+        ));
+
+        let d = device(&m);
+        assert!(
+            !d.online,
+            "the inbound link closed and the device still shows connected"
+        );
+        assert!(
+            !d.refuses_our_input(),
+            "the outbound link closed and the device still shows as up and refusing"
+        );
+    }
+}
+
+#[cfg(test)]
+mod the_service_problem {
+    //! What the app says about the service it talks to: a start that did not
+    //! come up (#189), or a daemon of another build left running across an
+    //! update.
+    use super::*;
+
+    fn build(version: &str, commit: &str) -> Build {
+        Build {
+            version: version.into(),
+            commit: commit.into(),
+        }
+    }
+
+    /// Connected, as this build, with the daemon's state still to come.
+    fn attached() -> AppModel {
+        AppModel {
+            connected: true,
+            this_build: Some(build("0.13.0", "abcd1234")),
+            ..AppModel::default()
+        }
+    }
+
+    // LEDGER T60 | class B | 6 struct state after AppModel::apply
+    #[test]
+    fn a_daemon_of_another_build_or_one_that_never_says_is_named() {
+        let mut same = attached();
+        same.apply(FrontendEvent::DaemonBuild(build("0.13.0", "abcd1234")));
+        same.apply(FrontendEvent::Enumerate(vec![]));
+        assert_eq!(same.service_problem(), None, "{:?}", same.service_build);
+
+        let mut other = attached();
+        other.apply(FrontendEvent::DaemonBuild(build("0.13.0", "ffff0000")));
+        other.apply(FrontendEvent::Enumerate(vec![]));
+        let said = other.service_problem().unwrap_or_default();
+        assert!(
+            said.contains("0.13.0 (abcd1234)") && said.contains("0.13.0 (ffff0000)"),
+            "a daemon built from another commit was not named: {said:?}"
+        );
+
+        // A v0.12 daemon sends its state and never its build.
+        let mut older = attached();
+        older.apply(FrontendEvent::PortChanged(4242, None));
+        assert_eq!(older.service_problem(), None, "nothing is known yet");
+        older.apply(FrontendEvent::Enumerate(vec![]));
+        let said = older.service_problem().unwrap_or_default();
+        assert!(
+            said.contains("older build"),
+            "state with no build before it is from a daemon that predates the \
+             statement, and the app said {said:?}"
+        );
+
+        // A state broadcast can reach a frontend before its own sync does;
+        // the statement that follows still counts.
+        older.apply(FrontendEvent::DaemonBuild(build("0.13.0", "abcd1234")));
+        assert_eq!(older.service_problem(), None);
+    }
+
+    // LEDGER T61 | class B | 6 struct state
+    #[test]
+    fn a_failed_start_shows_until_a_daemon_answers() {
+        let mut model = AppModel {
+            start_problem: Some("The hops service started and stopped again.".into()),
+            this_build: Some(build("0.13.0", "abcd1234")),
+            ..AppModel::default()
+        };
+        assert_eq!(
+            model.service_problem().as_deref(),
+            Some("The hops service started and stopped again."),
+            "the app would read \"connecting\" with nothing said"
+        );
+        // What the connection loop does once a daemon answers.
+        model.connected = true;
+        model.start_problem = None;
+        model.apply(FrontendEvent::DaemonBuild(build("0.13.0", "abcd1234")));
+        assert_eq!(model.service_problem(), None);
     }
 }
