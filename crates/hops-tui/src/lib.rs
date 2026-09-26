@@ -861,34 +861,13 @@ fn ui(
     // paint the whole window in the theme background first
     f.render_widget(Block::default().style(base), f.area());
 
-    // What is wrong with the service: a start that did not come up, or a
-    // daemon of another build. Wrapped under the status line, with the header
-    // grown to fit it.
-    let problem = model.service_problem();
-    let problem_rows = problem.as_deref().map_or(0, |p| {
-        let width = usize::from(f.area().width.saturating_sub(2)).max(1);
-        let rows: usize = p
-            .lines()
-            .map(|line| line.chars().count().div_ceil(width).max(1))
-            .sum();
-        rows.min(6) as u16
-    });
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3 + problem_rows),
-            Constraint::Min(0),
-            Constraint::Length(6),
-        ])
-        .split(f.area());
-
     // header: connection + capture/emulation status
     let conn = if model.connected {
         Span::styled("● connected", Style::default().fg(col(theme.success)))
     } else {
         Span::styled("○ connecting…", Style::default().fg(col(theme.warn)))
     };
-    let header = Line::from(vec![
+    let status = Line::from(vec![
         conn,
         Span::raw("   capture: "),
         status_span(model.capture, theme),
@@ -905,8 +884,10 @@ fn ui(
             muted,
         ),
     ]);
-    let mut header = vec![header];
-    if let Some(problem) = problem {
+    // What is wrong with the service: a start that did not come up, or a
+    // daemon of another build. Wrapped under the status line.
+    let mut header = vec![status];
+    if let Some(problem) = model.service_problem() {
         for line in problem.lines() {
             header.push(Line::from(Span::styled(
                 line.to_string(),
@@ -915,13 +896,25 @@ fn ui(
         }
     }
     let title = format!(" hops · {} ", theme.name);
-    f.render_widget(
-        Paragraph::new(header)
-            .wrap(Wrap { trim: false })
-            .style(base)
-            .block(panel(Span::styled(title, accent), false)),
-        chunks[0],
-    );
+    let header = Paragraph::new(header)
+        .wrap(Wrap { trim: false })
+        .style(base)
+        .block(panel(Span::styled(title, accent), false));
+    // Sized by the same word wrapping that renders it, so its last line (a
+    // log path, say) is never cut off. The device list keeps three rows.
+    let header_rows = u16::try_from(header.line_count(f.area().width.saturating_sub(2)))
+        .unwrap_or(u16::MAX)
+        .min(f.area().height.saturating_sub(6 + 3))
+        .max(3);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(header_rows),
+            Constraint::Min(0),
+            Constraint::Length(6),
+        ])
+        .split(f.area());
+    f.render_widget(header, chunks[0]);
 
     // body: one row per physical peer, both directions on the same line
     let rows: Vec<ListItem> = if devices.is_empty() {
@@ -1243,13 +1236,17 @@ mod tests {
     /// projection produces but the view silently filters out — a logic-level
     /// assertion on `devices()` would have passed for every bug below.
     fn render(model: &AppModel, sel: usize) -> Vec<String> {
+        render_at(model, sel, 120, 24)
+    }
+
+    fn render_at(model: &AppModel, sel: usize, width: u16, height: u16) -> Vec<String> {
         let devices = listable(model);
         let mut state = ListState::default();
         if !devices.is_empty() {
             state.select(Some(sel));
         }
         let theme = theme::default_theme();
-        let mut term = Terminal::new(TestBackend::new(120, 24)).expect("test terminal");
+        let mut term = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
         term.draw(|f| {
             ui(
                 f, model, &devices, &mut state, None, None, None, None, false, &theme,
@@ -1328,6 +1325,55 @@ mod tests {
         assert!(
             !out.contains("older build") && !out.contains("This app is"),
             "the same build is reported as a problem:\n{out}"
+        );
+    }
+
+    /// The header grows by the rows its text wraps to at word boundaries, so
+    /// the last line of a problem is on screen at every width. That line is
+    /// the log path a failed start exists to show (#189).
+    // LEDGER T72 | class B | 3 widget tree rendered at many terminal widths
+    #[test]
+    fn the_whole_service_problem_is_on_screen_at_every_width() {
+        let mut failed = AppModel::default();
+        failed.start_problem = Some(
+            "The hops service started and stopped again before it answered. \
+             Its log says why:\n/tmp/hops/daemon.log"
+                .into(),
+        );
+        let mut mismatch = AppModel::default();
+        mismatch.connected = true;
+        mismatch.this_build = Some(hops_frontend_core::Build {
+            version: "0.13.0".into(),
+            commit: "abcd1234".into(),
+        });
+        mismatch.apply(hops_frontend_core::FrontendEvent::Enumerate(vec![]));
+
+        // The words inside the header box, in order, with the wrapping undone.
+        let header_words = |model: &AppModel, width: u16| -> String {
+            render_at(model, 0, width, 30)
+                .iter()
+                .skip(1)
+                .take_while(|row| !row.starts_with('└'))
+                .flat_map(|row| row.trim_matches('│').split_whitespace().map(str::to_owned))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let clipped: Vec<(u16, Vec<u16>)> = [&failed, &mismatch]
+            .into_iter()
+            .zip([0, 1])
+            .map(|(model, case)| {
+                let problem = model.service_problem().expect("a problem to show");
+                let problem = problem.split_whitespace().collect::<Vec<_>>().join(" ");
+                let widths = (50..=120)
+                    .filter(|&width| !header_words(model, width).ends_with(&problem))
+                    .collect();
+                (case, widths)
+            })
+            .collect();
+        assert!(
+            clipped.iter().all(|(_, widths)| widths.is_empty()),
+            "the header ends before the problem's last line, (case, widths): {clipped:?}\n{}",
+            render_at(&failed, 0, 66, 30).join("\n")
         );
     }
 
