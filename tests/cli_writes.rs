@@ -341,3 +341,37 @@ fn a_save_over_a_config_that_does_not_parse_fails_and_leaves_it() {
         said(&out)
     );
 }
+
+// LEDGER T21 | class B | 4 config file written by the hops daemon on hops cli set-host
+#[test]
+fn renaming_a_paired_device_keeps_its_entry_in_place() {
+    // Pinned, and known by its name alone. The daemon drops a pin its trust
+    // store does not know, and a rename forgets it too: either way memory
+    // holds no pin where the file has one.
+    let pin = ["ab"; 32].join(":");
+    let tables = format!(
+        "[[clients]]\nhostname = \"desk-mac\" # the old name\nfingerprint = \"{pin}\"\n\
+         future_client_key = 7\n\n{}",
+        one_device()
+    );
+    let d = Daemon::start("pinname", &tables);
+    ok(&d, &["set-host", "0", "den"]);
+    let clients = d.saved_clients();
+    assert_eq!(
+        value(&clients[0], "hostname"),
+        "\"den\"",
+        "the renamed device's entry is not where it was:\n{}",
+        d.saved_text()
+    );
+    assert_eq!(
+        value(&clients[0], "future_client_key"),
+        "7",
+        "renaming a paired device rewrote its entry:\n{}",
+        d.saved_text()
+    );
+    assert!(
+        d.saved_text().contains("# the old name"),
+        "{}",
+        d.saved_text()
+    );
+}

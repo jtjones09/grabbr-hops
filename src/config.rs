@@ -1936,4 +1936,234 @@ position = \"right\"
             "the trust cache must follow the store:\n{doc}"
         );
     }
+
+    const OTHER: &str = "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99:\
+aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
+
+    // LEDGER T15 | class B | 4 file on disk written by Config::write_back
+    #[test]
+    fn renaming_or_readdressing_a_paired_device_changes_its_entry_in_place() {
+        // A new name or address makes the daemon forget the pin until the next
+        // handshake (ClientManager::set_hostname, set_fix_ips), so memory
+        // differs from the file in the pin as well as in what was changed.
+        let (s, mut config) = scratch(
+            "pinrename",
+            &format!(
+                "[[clients]]\nhostname = \"desk-mac\" # the old name\n\
+                 fingerprint = \"{DESK}\"\nfuture_client_key = 7\n\n\
+                 [[clients]]\nhostname = \"laptop\"\n"
+            ),
+        );
+        let mut clients = config.clients();
+        clients[0].hostname = Some("den".to_string());
+        clients[0].fingerprint = None;
+        config.set_clients(clients);
+        config.write_back().expect("the save");
+        let doc = on_disk(&s);
+        assert_eq!(
+            text(entry(&doc, 0), "hostname"),
+            "\"den\"",
+            "the renamed paired device's entry is not where it was:\n{doc}"
+        );
+        assert_eq!(
+            text(entry(&doc, 0), "future_client_key"),
+            "7",
+            "renaming a paired device rewrote its entry:\n{doc}"
+        );
+        assert!(doc.to_string().contains("# the old name"), "{doc}");
+        assert_eq!(
+            doc["clients"].as_array_of_tables().map(|a| a.len()),
+            Some(2)
+        );
+
+        let text_before = format!(
+            "[[clients]]\nips = [\"192.0.2.10\"]\nfingerprint = \"{DESK}\"\n\
+             position = \"left\"\n"
+        );
+        let (s, mut config) = scratch("pinaddr", &text_before);
+        // edited by hand, and not read back
+        fs::write(&s.path, text_before.replace("\"left\"", "\"top\"")).expect("the hand edit");
+        let mut clients = config.clients();
+        clients[0].ips = HashSet::from(["192.0.2.20".parse().expect("ip")]);
+        clients[0].fingerprint = None;
+        config.set_clients(clients);
+        config.write_back().expect("the save");
+        let doc = on_disk(&s);
+        assert_eq!(
+            text(entry(&doc, 0), "ips"),
+            "[\"192.0.2.20\"]",
+            "the new address was not saved:\n{doc}"
+        );
+        assert_eq!(
+            text(entry(&doc, 0), "position"),
+            "\"top\"",
+            "a new address for a paired device put back the position edited by \
+             hand:\n{doc}"
+        );
+    }
+
+    // LEDGER T16 | class B | 4 file on disk written by Config::write_back
+    #[test]
+    fn a_change_never_lands_on_an_entry_pinned_to_another_machine() {
+        for (tag, id) in [
+            ("hostname", "hostname = \"desk-mac\""),
+            ("address", "ips = [\"192.0.2.10\"]"),
+        ] {
+            let (s, mut config) = scratch(
+                &format!("apart{tag}"),
+                &format!("[[clients]]\n{id}\nfingerprint = \"{DESK}\"\nposition = \"left\"\n"),
+            );
+            // replaced by hand with another machine known by the same name or
+            // address, and not read back
+            let other =
+                format!("[[clients]]\n{id}\nfingerprint = \"{OTHER}\"\nposition = \"left\"\n");
+            fs::write(&s.path, &other).expect("the hand edit");
+            let mut clients = config.clients();
+            clients[0].pos = Position::Top;
+            config.set_clients(clients);
+            config.write_back().expect("the save");
+            assert_eq!(
+                fs::read_to_string(&s.path).expect("the config"),
+                other,
+                "{tag}: a change to one machine landed on the entry of another \
+                 that shares its {tag}"
+            );
+        }
+    }
+
+    // LEDGER T17 | class B | 1 error + 4 file on disk: Config::write_back
+    #[test]
+    fn devices_written_as_plain_arrays_are_left_as_they_are() {
+        // `TomlClient` also reads from an array of its fields in order.
+        let positional = "clients = [ [\"desk-mac\", \"desk-mac\", [\"192.0.2.10\"], 4242, \
+                          \"left\", false, \"x\"] ]\n";
+        for tag in ["remove", "change"] {
+            let (s, mut config) = scratch(&format!("plain{tag}"), positional);
+            assert_eq!(config.clients().len(), 1, "the device did not load");
+            let mut clients = config.clients();
+            if tag == "remove" {
+                clients.clear();
+            } else {
+                clients[0].pos = Position::Top;
+            }
+            config.set_clients(clients);
+            let saved = config.write_back();
+            assert!(
+                saved.is_err(),
+                "{tag}: a save that cannot edit the file reported success"
+            );
+            assert_eq!(
+                fs::read_to_string(&s.path).expect("the config"),
+                positional,
+                "{tag}: devices the save could not edit were changed or dropped"
+            );
+        }
+    }
+
+    // LEDGER T18 | class B | 4 file on disk written by Config::write_back
+    #[test]
+    fn a_rewritten_entry_carries_only_a_hook_the_file_still_holds() {
+        // Renamed and moved at once: two changes, so the entry is not
+        // recognised and is written again from memory.
+        let with_hook = format!(
+            "[[clients]]\nhostname = \"desk-mac\"\nfingerprint = \"{DESK}\"\n\
+             enter_hook = \"run-me\"\n"
+        );
+        for (tag, deleted_by_hand) in [("kept", false), ("deleted", true)] {
+            let (s, mut config) = scratch(&format!("rehook{tag}"), &with_hook);
+            if deleted_by_hand {
+                // not read back
+                fs::write(
+                    &s.path,
+                    format!("[[clients]]\nhostname = \"desk-mac\"\nfingerprint = \"{DESK}\"\n"),
+                )
+                .expect("the hand edit");
+            }
+            let mut clients = config.clients();
+            clients[0].hostname = Some("den".to_string());
+            clients[0].pos = Position::Top;
+            clients[0].fingerprint = None;
+            config.set_clients(clients);
+            config.write_back().expect("the save");
+            let saved = fs::read_to_string(&s.path).expect("the config");
+            assert!(
+                saved.contains("\"den\""),
+                "{tag}: the rename was not saved:\n{saved}"
+            );
+            assert_eq!(
+                saved.contains("run-me"),
+                !deleted_by_hand,
+                "{tag}: a save wrote a hook the file does not hold, or dropped one \
+                 it does (#56):\n{saved}"
+            );
+        }
+    }
+
+    // LEDGER T19 | class B | 4 file on disk written by Config::write_back
+    #[test]
+    fn the_revocation_cache_is_rewritten_only_when_the_store_changed() {
+        let old = RevokedEntry {
+            label: "old laptop".to_string(),
+            revoked_at: 5,
+        };
+        let (s, mut config) = scratch(
+            "revcache",
+            &format!(
+                "{TWO_DEVICES}\n[revoked_fingerprints.\"{DESK}\"] # since spring\n\
+                 label = \"old laptop\"\nrevoked_at = 5\n"
+            ),
+        );
+        config.set_revoked_fingerprints(HashMap::from([(DESK.to_string(), old.clone())]));
+        config.write_back().expect("the save");
+        assert!(
+            fs::read_to_string(&s.path)
+                .expect("the config")
+                .contains("# since spring"),
+            "an unchanged revocation cache was rewritten"
+        );
+
+        let both = HashMap::from([
+            (DESK.to_string(), old),
+            (
+                OTHER.to_string(),
+                RevokedEntry {
+                    label: "den".to_string(),
+                    revoked_at: 9,
+                },
+            ),
+        ]);
+        config.set_revoked_fingerprints(both.clone());
+        config.write_back().expect("the save");
+        let saved: ConfigToml =
+            toml_edit::de::from_str(&fs::read_to_string(&s.path).expect("the config"))
+                .expect("the saved config parses");
+        assert_eq!(
+            saved.revoked_fingerprints,
+            Some(both),
+            "the revocation cache must follow the store"
+        );
+        assert_eq!(saved.clients.map(|c| c.len()), Some(2));
+    }
+
+    // LEDGER T20 | class B | 4 file on disk written by Config::write_back
+    #[test]
+    fn a_device_removed_by_hand_stays_removed_when_the_daemon_changed_it() {
+        let (s, mut config) = scratch("gone", TWO_DEVICES);
+        // the laptop removed by hand, and not read back
+        let cut = TWO_DEVICES
+            .find("\n[[clients]]\nhostname = \"laptop\"")
+            .expect("the laptop's entry");
+        fs::write(&s.path, &TWO_DEVICES[..cut]).expect("the hand edit");
+        let mut clients = config.clients();
+        clients[1].pos = Position::Bottom;
+        config.set_clients(clients);
+        config.write_back().expect("the save");
+        let doc = on_disk(&s);
+        assert_eq!(
+            doc["clients"].as_array_of_tables().map(|a| a.len()),
+            Some(1),
+            "a device removed from the file by hand was written back:\n{doc}"
+        );
+        assert_eq!(text(entry(&doc, 0), "hostname"), "\"desk-mac\"");
+    }
 }

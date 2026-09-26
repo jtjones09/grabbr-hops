@@ -17,12 +17,18 @@
 //!   the entry is kept, and so is every other entry.
 //! * Everything else is the file's.
 //!
-//! `enter_hook` is never written into an entry the file already has: it is
-//! set by editing the file, and only there (#56).
+//! A save never writes a hook the file does not hold: `enter_hook` is set by
+//! editing the file, and only there (#56). It is never written into an entry
+//! the file has, and an entry written again from memory carries it only if
+//! the entry it replaces held it. (With no file on disk at all, memory is
+//! written whole.)
+//!
+//! A file whose devices a save cannot edit without losing some of them is
+//! left as it is, and the save fails.
 
 use std::collections::HashMap;
 
-use toml_edit::{ArrayOfTables, DocumentMut, Item, Table};
+use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, Value};
 
 use super::{ConfigClient, ConfigToml, TomlClient};
 
@@ -34,6 +40,11 @@ pub(super) enum MergeError {
     Content(#[from] toml_edit::de::Error),
     #[error("the config in memory could not be written out: {0}")]
     Render(#[from] toml_edit::ser::Error),
+    #[error(
+        "its devices are not written as [[clients]] tables, and a save cannot \
+         change them without losing some; write each device as a [[clients]] table"
+    )]
+    Shape,
 }
 
 /// The text to save: `disk` with the daemon's changes since `base` applied.
@@ -73,7 +84,7 @@ pub(super) fn merge(
         &entries(&ours.clients),
         &entries(&theirs.clients),
         &fresh_entries,
-    );
+    )?;
     Ok(doc.to_string())
 }
 
@@ -99,7 +110,7 @@ fn merge_clients(
     ours: &[ConfigClient],
     theirs: &[ConfigClient],
     fresh: &[Table],
-) {
+) -> Result<(), MergeError> {
     let kept = pair(base, ours);
     let on_disk = pair(base, theirs);
     let mut claimed = vec![false; ours.len()];
@@ -122,27 +133,53 @@ fn merge_clients(
     }
     let created: Vec<usize> = (0..ours.len()).filter(|&o| !claimed[o]).collect();
     if edits.is_empty() && removed.is_empty() && created.is_empty() {
-        return;
+        return Ok(());
     }
-    let Some(file) = clients_of(doc) else { return };
+    // Every index below is one into `theirs`, read from this array.
+    let file = clients_of(doc)?;
     for (t, o, b) in edits {
         if let (Some(entry), Some(new)) = (file.get_mut(t), fresh.get(o)) {
             change_fields(entry, &base[b], &ours[o], new);
         }
     }
+    // The hooks of the entries this save removes: the only ones an entry it
+    // writes may carry. A device not recognised is removed and written again.
+    let mut hooks: Vec<&String> = removed
+        .iter()
+        .filter_map(|&t| theirs.get(t)?.enter_hook.as_ref())
+        .collect();
     removed.sort_unstable();
     for t in removed.into_iter().rev() {
-        file.remove(t);
+        if t < file.len() {
+            file.remove(t);
+        }
     }
     for o in created {
-        if let Some(Item::Table(new)) = fresh.get(o).map(|t| detached(&Item::Table(t.clone()))) {
+        if let Some(Item::Table(mut new)) = fresh.get(o).map(|t| detached(&Item::Table(t.clone())))
+        {
+            let held = ours[o]
+                .enter_hook
+                .as_ref()
+                .and_then(|h| hooks.iter().position(|k| *k == h));
+            match held {
+                Some(i) => {
+                    hooks.swap_remove(i);
+                }
+                None => {
+                    new.remove("enter_hook");
+                }
+            }
             file.push(new);
         }
     }
+    Ok(())
 }
 
 /// The file's `[[clients]]`, made one if it is missing or written inline.
-fn clients_of(doc: &mut DocumentMut) -> Option<&mut ArrayOfTables> {
+///
+/// Refused when that would lose entries: a device can also be written as an
+/// array of its fields in order, which has no table to edit.
+fn clients_of(doc: &mut DocumentMut) -> Result<&mut ArrayOfTables, MergeError> {
     let table = doc.as_table_mut();
     let inline = table
         .get("clients")
@@ -150,25 +187,42 @@ fn clients_of(doc: &mut DocumentMut) -> Option<&mut ArrayOfTables> {
     if inline {
         // `clients = [ { .. } ]`, or `clients = []`
         let item = table.remove("clients").unwrap_or_default();
-        let entries = item.into_array_of_tables().unwrap_or_default();
+        let entries = match item.into_array_of_tables() {
+            Ok(entries) => entries,
+            Err(Item::Value(Value::Array(a))) if a.is_empty() => ArrayOfTables::new(),
+            Err(_) => return Err(MergeError::Shape),
+        };
         table.insert("clients", Item::ArrayOfTables(entries));
     }
     table
         .entry("clients")
         .or_insert(Item::ArrayOfTables(ArrayOfTables::new()))
         .as_array_of_tables_mut()
+        .ok_or(MergeError::Shape)
 }
 
 /// Write into `entry` the fields the daemon changed between `base` and
 /// `ours`, as `fresh` renders them, and nothing else.
 fn change_fields(entry: &mut Table, base: &ConfigClient, ours: &ConfigClient, fresh: &Table) {
+    // Every field named, so a field added to `ConfigClient` does not compile
+    // until it is placed here.
+    let ConfigClient {
+        ips,
+        hostname,
+        port,
+        pos,
+        active,
+        // the file's alone (#56)
+        enter_hook: _,
+        fingerprint,
+    } = base;
     let changed = [
-        ("hostname", base.hostname != ours.hostname),
-        ("ips", base.ips != ours.ips),
-        ("port", base.port != ours.port),
-        ("position", base.pos != ours.pos),
-        ("activate_on_startup", base.active != ours.active),
-        ("fingerprint", base.fingerprint != ours.fingerprint),
+        ("hostname", *hostname != ours.hostname),
+        ("ips", *ips != ours.ips),
+        ("port", *port != ours.port),
+        ("position", *pos != ours.pos),
+        ("activate_on_startup", *active != ours.active),
+        ("fingerprint", *fingerprint != ours.fingerprint),
     ];
     for (key, _) in changed.iter().filter(|(_, changed)| *changed) {
         match fresh.get(key) {
@@ -248,7 +302,9 @@ fn place(table: &mut Table, at: usize) {
 /// hostname or its addresses, in that order. Two entries pinned to different
 /// machines are never the same device. After that, the one entry left on
 /// each side is the same device if they differ in a single field, which is
-/// what one edit changes: a rename of a device with no pin and no address.
+/// what one edit changes: a rename of a device known by nothing else. A pin
+/// on the left missing on the right is not counted: memory forgets a pin
+/// with every new name or address, until the next handshake learns it.
 /// Anything else left over is a device removed on one side and another added
 /// on the other, never one device edited, so no field of one lands on the
 /// other.
@@ -257,14 +313,24 @@ fn pair(left: &[ConfigClient], right: &[ConfigClient]) -> Vec<Option<usize>> {
         matches!((&a.fingerprint, &b.fingerprint), (Some(x), Some(y)) if x != y)
     }
     fn differences(a: &ConfigClient, b: &ConfigClient) -> usize {
+        // Every field named, as in `change_fields`.
+        let ConfigClient {
+            ips,
+            hostname,
+            port,
+            pos,
+            active,
+            enter_hook,
+            fingerprint,
+        } = a;
         [
-            a.hostname != b.hostname,
-            a.ips != b.ips,
-            a.port != b.port,
-            a.pos != b.pos,
-            a.active != b.active,
-            a.enter_hook != b.enter_hook,
-            a.fingerprint != b.fingerprint,
+            *hostname != b.hostname,
+            *ips != b.ips,
+            *port != b.port,
+            *pos != b.pos,
+            *active != b.active,
+            *enter_hook != b.enter_hook,
+            b.fingerprint.is_some() && *fingerprint != b.fingerprint,
         ]
         .into_iter()
         .filter(|&d| d)
