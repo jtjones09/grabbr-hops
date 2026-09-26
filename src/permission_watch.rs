@@ -159,20 +159,27 @@ impl PermissionWatch {
         }
     }
 
-    /// This machine's: the macOS checks and launchd, with both sides waiting
-    /// to start. Elsewhere there are no such permissions, and nothing is ever
-    /// watched.
+    /// The watch a daemon starts with: neither side runs yet, so both are
+    /// watched until each says it runs. A backend that cannot be created
+    /// never says it stopped, so a daemon started without a permission is
+    /// watched only because of this.
+    pub fn at_daemon_start(probe: Probe, restarts: Restarts, every: Duration) -> Self {
+        let mut watch = Self::new(probe, restarts, every);
+        watch.stopped(Side::Capture);
+        watch.stopped(Side::Emulation);
+        watch
+    }
+
+    /// This machine's: the macOS checks and launchd, as a daemon starts.
+    /// Elsewhere there are no such permissions, and nothing is ever watched.
     pub fn of_this_machine() -> Self {
         #[cfg(target_os = "macos")]
         {
-            let mut watch = Self::new(
+            Self::at_daemon_start(
                 Arc::new(tcc::granted),
                 Arc::new(crate::daemon_start::launchd_restarts_this_process),
                 CHECK_EVERY,
-            );
-            watch.stopped(Side::Capture);
-            watch.stopped(Side::Emulation);
-            watch
+            )
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -478,6 +485,31 @@ mod a_grant_made_while_the_daemon_runs {
             fresh.asked.load(Ordering::SeqCst) > 0 && after.is_err(),
             "a side that still lacks a permission after the restart ended the \
              daemon again: {after:?}"
+        );
+    }
+
+    /// The watch the daemon is built with. On a Mac it watches both sides
+    /// from the start: a backend macOS refuses is never created, so neither
+    /// side would ever say it stopped. Elsewhere it watches nothing, ever.
+    // LEDGER T2255 | class B | 6 state of PermissionWatch::of_this_machine()
+    #[test]
+    fn this_machines_watch_waits_on_both_sides_from_the_start_only_on_a_mac() {
+        let mut watch = PermissionWatch::of_this_machine();
+        let at_start: Vec<Side> = watch.waiting.keys().copied().collect();
+        watch.stopped(Side::Capture);
+        let after_a_stop: Vec<Side> = watch.waiting.keys().copied().collect();
+        let expected = if cfg!(target_os = "macos") {
+            vec![Side::Capture, Side::Emulation]
+        } else {
+            vec![]
+        };
+        assert_eq!(
+            (at_start, after_a_stop),
+            (expected.clone(), expected),
+            "(watched as the daemon starts, watched after capture stops). On a Mac \
+             a daemon started without a permission has no backend to say a side \
+             stopped, so both must be watched from the start; elsewhere there is \
+             no such permission to wait for."
         );
     }
 

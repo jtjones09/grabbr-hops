@@ -414,6 +414,25 @@ impl Service {
         config: Config,
         frontend_listener: AsyncFrontendListener,
     ) -> Result<Self, ServiceError> {
+        let capture_backend = config.capture_backend().map(|b| b.into());
+        let emulation_backend = config.emulation_backend().map(|b| b.into());
+        Self::with_backends(
+            config,
+            frontend_listener,
+            capture_backend,
+            emulation_backend,
+        )
+        .await
+    }
+
+    /// [`Self::new`] with the capture and emulation backends chosen by the
+    /// caller, which a config file cannot name for every backend.
+    async fn with_backends(
+        config: Config,
+        frontend_listener: AsyncFrontendListener,
+        capture_backend: Option<input_capture::Backend>,
+        emulation_backend: Option<input_emulation::Backend>,
+    ) -> Result<Self, ServiceError> {
         let client_manager = ClientManager::default();
         for client in config.clients() {
             client_manager.add_with_config(client);
@@ -535,9 +554,7 @@ impl Service {
         let revoke_listen = listener.revoker();
 
         // input capture + emulation
-        let capture_backend = config.capture_backend().map(|b| b.into());
         let capture = Capture::new(capture_backend, conn, config.release_bind());
-        let emulation_backend = config.emulation_backend().map(|b| b.into());
         let emulation = Emulation::new(emulation_backend, listener, trust.clone());
 
         // create dns resolver

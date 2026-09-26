@@ -3,16 +3,17 @@
 //! permission checks and launchd's answer are scripted.
 //!
 //! Its every file is in a scratch directory, its QUIC listener is on
-//! loopback, capture and emulation are the dummy backends, and discovery is
-//! off. Both sides start out stopped, as on a Mac. A side's status changes
-//! reach the daemon through its own handlers; what it does then is observed
-//! where a user would see it: whether `Service::run` returns, with what, and
-//! what a frontend connected over the real IPC socket is told.
+//! loopback, capture and emulation are the dummy backends or ones that are
+//! never created, and discovery is off. Its watch is the one a daemon starts
+//! with on a Mac. A side's status changes reach the daemon through its own
+//! handlers; what it does then is observed where a user would see it:
+//! whether `Service::run` returns, with what, and what a frontend connected
+//! over the real IPC socket is told.
 
 use super::{Service, ServiceError};
 use crate::capture::ICaptureEvent;
 use crate::emulation::EmulationEvent;
-use crate::permission_watch::{Permission, PermissionWatch, Side};
+use crate::permission_watch::{Permission, PermissionWatch};
 use crate::test_harness::run_local;
 use hops_ipc::{AsyncFrontendListener, DaemonEndpoint, FrontendEvent, Status};
 use std::path::PathBuf;
@@ -77,9 +78,40 @@ impl Drop for Scratch {
     }
 }
 
+/// The backends a daemon is given.
+#[derive(Clone, Copy)]
+enum Backends {
+    /// The dummy ones, which start.
+    Dummy,
+    /// Ones that fail as they are created, as the macOS ones do while a
+    /// permission is missing: neither side ever says it started or stopped.
+    NeverCreated,
+}
+
+impl Backends {
+    fn chosen(self) -> (input_capture::Backend, input_emulation::Backend) {
+        match self {
+            Self::Dummy => (
+                input_capture::Backend::Dummy,
+                input_emulation::Backend::Dummy,
+            ),
+            // Each names a script that is gone by the time it is created.
+            Self::NeverCreated => (
+                input_capture::scripted::Script::new().backend(),
+                input_emulation::recording::Recording::new().backend(),
+            ),
+        }
+    }
+}
+
 /// A daemon whose permissions `system` reports, and which launchd starts
 /// again after a failure when `restarts`.
-async fn daemon(tag: &str, system: &Arc<System>, restarts: bool) -> (Service, Scratch) {
+async fn daemon(
+    tag: &str,
+    system: &Arc<System>,
+    restarts: bool,
+    backends: Backends,
+) -> (Service, Scratch) {
     // Short, for a socket path in it (`sun_path`).
     let dir = PathBuf::from(format!("/tmp/h-pg-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -100,12 +132,13 @@ async fn daemon(tag: &str, system: &Arc<System>, restarts: bool) -> (Service, Sc
         .expect("the scratch endpoint");
     let config = crate::config::Config::in_scratch(&config, &dir.join("hops.pem"))
         .expect("the scratch config");
-    let mut service = Service::new(config, frontends)
+    let (capture, emulation) = backends.chosen();
+    let mut service = Service::with_backends(config, frontends, Some(capture), Some(emulation))
         .await
         .expect("a daemon in the scratch directory");
 
     let probe = system.clone();
-    let mut watch = PermissionWatch::new(
+    service.permission_watch = PermissionWatch::at_daemon_start(
         Arc::new(move |p| {
             probe.asked.fetch_add(1, Ordering::SeqCst);
             !probe.denied.lock().expect("lock").contains(&p)
@@ -113,9 +146,6 @@ async fn daemon(tag: &str, system: &Arc<System>, restarts: bool) -> (Service, Sc
         Arc::new(move || restarts),
         EVERY,
     );
-    watch.stopped(Side::Capture);
-    watch.stopped(Side::Emulation);
-    service.permission_watch = watch;
     (service, scratch)
 }
 
@@ -185,7 +215,7 @@ impl Frontend {
 fn a_grant_to_a_side_that_stopped_ends_the_daemon_for_launchd_to_start_again() {
     run_local(async {
         let system = System::new(&[Permission::Accessibility, Permission::InputMonitoring]);
-        let (mut service, _scratch) = daemon("exit", &system, true).await;
+        let (mut service, _scratch) = daemon("exit", &system, true, Backends::Dummy).await;
         until_both_run(&mut service).await;
         service.handle_emulation_event(EmulationEvent::EmulationDisabled);
 
@@ -215,6 +245,50 @@ fn a_grant_to_a_side_that_stopped_ends_the_daemon_for_launchd_to_start_again() {
     });
 }
 
+/// A daemon started without its permissions: macOS refuses both backends,
+/// so neither side is ever created, and neither says it stopped. Once the
+/// permissions are granted, the daemon ends with the error that exits
+/// unsuccessfully, as for a side that stopped while it ran. This is the
+/// first start after an install.
+// LEDGER T2254 | class B | 1 return value of Service::run, the whole daemon in-process
+#[test]
+fn a_daemon_started_without_the_permissions_ends_once_they_are_granted() {
+    run_local(async {
+        let system = System::new(&[Permission::Accessibility, Permission::InputMonitoring]);
+        let (mut service, _scratch) = daemon("start", &system, true, Backends::NeverCreated).await;
+
+        let granter = async {
+            // Both sides seen missing twice, then granted.
+            system.asked_at_least(6).await;
+            system.grant_all();
+            std::future::pending::<()>().await
+        };
+        let ended = tokio::select! {
+            ended = service.run() => Some(ended),
+            _ = granter => None,
+            _ = tokio::time::sleep(DEADLINE) => None,
+        };
+        let ran = (service.capture_status, service.emulation_status);
+        assert_eq!(
+            ran,
+            (Status::Disabled, Status::Disabled),
+            "a backend was created, so this did not test a daemon that never started one"
+        );
+        assert!(
+            matches!(
+                &ended,
+                Some(Err(ServiceError::PermissionGranted(granted)))
+                    if granted == "Accessibility and Input Monitoring"
+            ),
+            "Accessibility and Input Monitoring were granted to a daemon that started \
+             without them. It must end with the error that exits 1, so launchd starts \
+             one that has them; otherwise input stays off until the next login. It \
+             ended with {ended:?} (None: it did not end), the permissions asked {} times.",
+            system.asked()
+        );
+    });
+}
+
 /// Capture stopped for want of Input Monitoring, and launchd did not start
 /// this daemon. Once it is granted, the daemon keeps running and tells the
 /// user a restart is what applies it.
@@ -223,7 +297,7 @@ fn a_grant_to_a_side_that_stopped_ends_the_daemon_for_launchd_to_start_again() {
 fn a_grant_to_a_daemon_launchd_does_not_restart_is_told_and_the_daemon_runs_on() {
     run_local(async {
         let system = System::new(&[Permission::InputMonitoring]);
-        let (mut service, scratch) = daemon("tell", &system, false).await;
+        let (mut service, scratch) = daemon("tell", &system, false, Backends::Dummy).await;
         until_both_run(&mut service).await;
         service.handle_capture_event(ICaptureEvent::CaptureDisabled);
 
@@ -270,7 +344,7 @@ fn sides_that_run_are_not_watched() {
             Permission::InputMonitoring,
             Permission::PostEvents,
         ]);
-        let (mut service, _scratch) = daemon("runs", &system, true).await;
+        let (mut service, _scratch) = daemon("runs", &system, true, Backends::Dummy).await;
         until_both_run(&mut service).await;
 
         let granter = async {
