@@ -196,6 +196,46 @@ fn free_edge(model: &AppModel) -> Position {
     .unwrap_or(Position::Left)
 }
 
+/// A device the user asked to add: its address, port and edge, waiting for
+/// the handle the daemon assigns.
+type NewDevice = (String, u16, Position);
+
+/// Ask the daemon to create a device, and stage `device` for its handle.
+///
+/// `request` returns the connection that took the request, the model's
+/// `link`, or `None` when no daemon did. Then nothing is staged: a staged add
+/// with none in flight would claim whichever handle appears next, another
+/// device's.
+fn stage_add(
+    request: impl FnOnce(FrontendRequest) -> Option<u64>,
+    device: NewDevice,
+) -> Option<(u64, NewDevice)> {
+    request(FrontendRequest::Create).map(|link| (link, device))
+}
+
+/// The staged add and its handle, once `arrived` is a handle this frontend
+/// had not seen; left staged until then.
+///
+/// `link` is the connection the model now describes. An add staged on
+/// another one is dropped: that connection was lost, and the `Create` or any
+/// word of its handle with it, so the next handle to appear is another
+/// device's, and would be given this one's address, edge and a switch-on
+/// (#34).
+fn claim_add(
+    staged: &mut Option<(u64, NewDevice)>,
+    link: u64,
+    arrived: Option<ClientHandle>,
+) -> Option<(ClientHandle, NewDevice)> {
+    match (staged.take()?, arrived) {
+        ((on, _), _) if on != link => None,
+        ((_, device), Some(handle)) => Some((handle, device)),
+        (kept, None) => {
+            *staged = Some(kept);
+            None
+        }
+    }
+}
+
 /// Split a typed `host` / `host:port` into its parts.
 ///
 /// A bare IPv6 literal is all host and no port, so it is recognised *before*
@@ -299,7 +339,7 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
     // handle we have not seen before shows up. Without this, TUI "add" made a
     // blank unnamed card with no address, no port and no edge — a device that
     // could never connect and that the TUI had no way to finish configuring.
-    let mut pending_new: Option<(String, u16, Position)> = None;
+    let mut pending_new: Option<(u64, NewDevice)> = None;
     let mut known_handles: HashSet<ClientHandle> = HashSet::new();
 
     let result = loop {
@@ -307,28 +347,21 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
 
         // finish an add as soon as the daemon hands back a handle
         let current: HashSet<ClientHandle> = model.clients.keys().copied().collect();
-        if current != known_handles {
-            if let Some((host, port, pos)) = pending_new.take() {
-                match current.difference(&known_handles).copied().next() {
-                    Some(h) => {
-                        // Just created: never connected, so no pin.
-                        client.request(FrontendRequest::UpdateHostname {
-                            handle: h,
-                            hostname: Some(host),
-                            fingerprint: None,
-                        });
-                        client.request(FrontendRequest::UpdatePort(h, port));
-                        client.request(FrontendRequest::UpdatePosition(h, pos));
-                        // actually try the machine: an inert card that is never
-                        // dialed looks identical to a broken one.
-                        client.request(FrontendRequest::Activate(h, true));
-                    }
-                    // Created hasn't reached a snapshot yet — retry next tick
-                    None => pending_new = Some((host, port, pos)),
-                }
-            }
-            known_handles = current;
+        let arrived = current.difference(&known_handles).copied().next();
+        if let Some((h, (host, port, pos))) = claim_add(&mut pending_new, model.link, arrived) {
+            // Just created: never connected, so no pin.
+            client.request(FrontendRequest::UpdateHostname {
+                handle: h,
+                hostname: Some(host),
+                fingerprint: None,
+            });
+            client.request(FrontendRequest::UpdatePort(h, port));
+            client.request(FrontendRequest::UpdatePosition(h, pos));
+            // actually try the machine: an inert card that is never
+            // dialed looks identical to a broken one.
+            client.request(FrontendRequest::Activate(h, true));
         }
+        known_handles = current;
 
         // A request refused with no daemon, or one the daemon never took, is
         // said here rather than only in the log (#34).
@@ -400,14 +433,11 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                         match k.code {
                             KeyCode::Enter => match input.take().expect("input set") {
                                 Input::Add { buf } => match parse_target(&buf) {
-                                    // Staged only if the Create reached a
-                                    // daemon: a staged add with none in
-                                    // flight would claim whichever handle
-                                    // appears next, another device's.
                                     Ok((host, port)) => {
-                                        if client.request(FrontendRequest::Create) {
-                                            pending_new = Some((host, port, free_edge(&model)));
-                                        }
+                                        pending_new = stage_add(
+                                            |r| client.request_on(r),
+                                            (host, port, free_edge(&model)),
+                                        );
                                     }
                                     Err(msg) => {
                                         notice = Some((msg.to_string(), Instant::now()));
@@ -1373,6 +1403,71 @@ mod tests {
 
     const FP: &str = "1e:19:1b:2c:3d:4e:5f:60:71:82:93:a4:b5:c6:d7:e8";
     const OTHER_FP: &str = "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
+
+    // LEDGER T531 | class B | 1 return value + requests passed to stage_add's sender
+    /// An add no daemon took stages nothing: the first handles a daemon
+    /// reports later are the existing devices', and one of them would take
+    /// this address and edge.
+    #[test]
+    fn an_add_no_daemon_took_stages_nothing() {
+        let mut sent = Vec::new();
+        let staged = stage_add(
+            |r| {
+                sent.push(r);
+                None
+            },
+            ("desk-pc.local".into(), 4242, Position::Left),
+        );
+        assert!(
+            matches!(sent.as_slice(), [FrontendRequest::Create]),
+            "the add did not ask the daemon for a handle: {sent:?}"
+        );
+        assert_eq!(
+            staged, None,
+            "an add that never reached a daemon was left waiting for a handle"
+        );
+        assert_eq!(
+            stage_add(|_| Some(2), ("desk-pc.local".into(), 4242, Position::Left)),
+            Some((2, ("desk-pc.local".into(), 4242, Position::Left))),
+            "an add a daemon took must wait for its handle on that connection"
+        );
+    }
+
+    // LEDGER T532 | class B | 1 return value + 6 struct state: claim_add and its staged add
+    /// An add waits for its handle on the connection that took it, and is
+    /// dropped once that connection is lost (#34).
+    #[test]
+    fn an_add_is_claimed_once_and_only_on_its_connection() {
+        let add = || Some((0, ("desk-pc.local".to_string(), 4242, Position::Left)));
+
+        let mut staged = add();
+        assert_eq!(claim_add(&mut staged, 0, None), None);
+        assert_eq!(
+            staged,
+            add(),
+            "an add whose handle has not come yet was lost"
+        );
+        assert_eq!(
+            claim_add(&mut staged, 0, Some(7)),
+            Some((7, ("desk-pc.local".to_string(), 4242, Position::Left)))
+        );
+        assert_eq!(
+            staged, None,
+            "a claimed add would configure the next handle too"
+        );
+
+        let mut staged = add();
+        assert_eq!(
+            claim_add(&mut staged, 1, Some(7)),
+            None,
+            "an add staged before the daemon was lost gave its address, edge and \
+             a switch-on to the next handle to appear"
+        );
+        assert_eq!(
+            staged, None,
+            "an add from a lost connection stayed staged, to claim a later handle"
+        );
+    }
 
     // LEDGER T15 | class B | 6 struct state: the TUI's armed Confirm and Input after drop_stale
     /// An armed delete and an open rename go once their device changes, and

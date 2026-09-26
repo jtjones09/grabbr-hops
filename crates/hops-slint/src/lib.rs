@@ -512,21 +512,22 @@ type PendingCreate = (String, u16, Position, Vec<std::net::IpAddr>);
 /// Taking the request as an argument is what makes that testable: the omission
 /// was invisible precisely because nothing could observe it.
 ///
-/// `request` returns whether the request reached a daemon. When it did not,
-/// nothing is staged: a staged create with none in flight would claim the
-/// next handle to appear, which is another device's once a daemon answers.
+/// `request` returns the connection that took the request, the model's
+/// `link`, or `None` when no daemon did. Then nothing is staged: a staged
+/// create with none in flight would claim the next handle to appear, which
+/// is another device's once a daemon answers. What is staged is kept with
+/// its connection, so [`claim_pending`] can drop it once that one is lost.
 fn stage_create(
-    pending: &RefCell<Option<PendingCreate>>,
-    request: impl FnOnce(FrontendRequest) -> bool,
+    pending: &RefCell<Option<(u64, PendingCreate)>>,
+    request: impl FnOnce(FrontendRequest) -> Option<u64>,
     name: String,
     port: u16,
     position: Position,
     fix_ips: Vec<std::net::IpAddr>,
 ) {
-    *pending.borrow_mut() = Some((name, port, position, fix_ips));
-    if !request(FrontendRequest::Create) {
-        *pending.borrow_mut() = None;
-    }
+    let staged =
+        request(FrontendRequest::Create).map(|link| (link, (name, port, position, fix_ips)));
+    *pending.borrow_mut() = staged;
 }
 
 /// Put `fingerprint`'s request on the pairing card.
@@ -581,14 +582,22 @@ fn approval(
 /// tick right after "add". The window died there with no message, because a
 /// panic under `panic = "abort"` was the last thing the process wrote and
 /// nothing was reading its output.
+///
+/// `link` is the connection the model now describes. A create staged on
+/// another one is dropped, never claimed: its connection was lost, and with
+/// it the `Create`, or at least any word of its handle. Kept, it would give
+/// its name, edge and a switch-on to the next handle to appear, another
+/// device's (#34).
 fn claim_pending<T>(
-    cell: &RefCell<Option<T>>,
+    cell: &RefCell<Option<(u64, T)>>,
+    link: u64,
     arrived: Option<ClientHandle>,
 ) -> Option<(ClientHandle, T)> {
     // Ends at the semicolon, before anything else can borrow.
     let taken = cell.borrow_mut().take();
     match (arrived, taken) {
-        (Some(handle), Some(value)) => Some((handle, value)),
+        (_, Some((on, _))) if on != link => None,
+        (Some(handle), Some((_, value))) => Some((handle, value)),
         // No handle yet — put it back and try again next tick.
         (None, Some(value)) => {
             *cell.borrow_mut() = Some(value);
@@ -843,7 +852,7 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
     // hand-typed device (resolve the name) and populated for one picked off the
     // network list, where we already know exactly where it is and should not
     // make DNS agree with mDNS before it will connect (#136).
-    let pending_new_device: Rc<RefCell<Option<PendingCreate>>> = Rc::new(RefCell::new(None));
+    let pending_new_device: Rc<RefCell<Option<(u64, PendingCreate)>>> = Rc::new(RefCell::new(None));
     let known_handles: Rc<RefCell<HashSet<ClientHandle>>> = Rc::new(RefCell::new(HashSet::new()));
     {
         // Add a machine picked off the network list. Same create sequence as a
@@ -864,8 +873,8 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
             }
             let port = port.trim().parse::<u16>().unwrap_or(DEFAULT_PORT);
             let position = Position::try_from(position.as_str()).unwrap_or_default();
-            // Store the mDNS hostname, not the bare label. `ScornMBP23` does not
-            // resolve; `ScornMBP23.local` does, through the OS name stack
+            // Store the mDNS hostname, not the bare label. `desk-mac` does not
+            // resolve; `desk-mac.local` does, through the OS name stack
             // (Bonjour on macOS, Avahi via nsswitch on Linux) -- see
             // resolve_hostname in src/dns.rs.
             //
@@ -875,7 +884,14 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
             // resolved ones on every reconnect, so a resolvable `.local` name
             // keeps working after every address it was added with has changed.
             let hostname = hops_frontend_core::discovered_hostname(&label);
-            stage_create(&pending, |r| c.request(r), hostname, port, position, addrs);
+            stage_create(
+                &pending,
+                |r| c.request_on(r),
+                hostname,
+                port,
+                position,
+                addrs,
+            );
         });
     }
     {
@@ -916,7 +932,14 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
                 }
             };
             let position = Position::try_from(position.as_str()).unwrap_or_default();
-            stage_create(&pending, |r| c.request(r), name, port, position, Vec::new());
+            stage_create(
+                &pending,
+                |r| c.request_on(r),
+                name,
+                port,
+                position,
+                Vec::new(),
+            );
         });
     }
     {
@@ -1002,7 +1025,7 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
                 let current: HashSet<ClientHandle> = m.clients.keys().copied().collect();
                 let arrived = current.difference(&known_handles.borrow()).next().copied();
                 if let Some((new_handle, (name, port, position, fix_ips))) =
-                    claim_pending(&pending_new_device, arrived)
+                    claim_pending(&pending_new_device, m.link, arrived)
                 {
                     if !name.is_empty() {
                         // Just created: never connected, so no pin.
@@ -1499,17 +1522,17 @@ mod pending_create {
 
     #[test]
     fn a_handle_that_has_not_arrived_yet_leaves_the_create_in_place() {
-        let cell = RefCell::new(Some(("mac", 4242u16)));
+        let cell = RefCell::new(Some((0, ("mac", 4242u16))));
 
         // This is the tick right after "add": the create was sent, no handle
         // has reached a snapshot. It must not panic, and must not lose the
         // create — losing it means the device is never configured or dialed.
-        let claimed = claim_pending(&cell, None);
+        let claimed = claim_pending(&cell, 0, None);
 
         assert!(claimed.is_none(), "nothing to claim without a handle");
         assert_eq!(
             *cell.borrow(),
-            Some(("mac", 4242)),
+            Some((0, ("mac", 4242))),
             "the pending create must survive for the next tick. Taking it and \
              failing to put it back loses the device silently; borrowing twice \
              to put it back panics with `RefCell already borrowed`, which is \
@@ -1519,8 +1542,8 @@ mod pending_create {
 
     #[test]
     fn an_arrived_handle_claims_the_create_exactly_once() {
-        let cell = RefCell::new(Some(("mac", 4242u16)));
-        let claimed = claim_pending(&cell, Some(7));
+        let cell = RefCell::new(Some((0, ("mac", 4242u16))));
+        let claimed = claim_pending(&cell, 0, Some(7));
         assert_eq!(claimed, Some((7, ("mac", 4242))));
         assert!(
             cell.borrow().is_none(),
@@ -1528,16 +1551,37 @@ mod pending_create {
              same device again"
         );
         assert!(
-            claim_pending(&cell, Some(8)).is_none(),
+            claim_pending(&cell, 0, Some(8)).is_none(),
             "and there must be nothing left to claim"
         );
     }
 
     #[test]
     fn no_pending_create_is_not_an_error() {
-        let cell: RefCell<Option<(&str, u16)>> = RefCell::new(None);
-        assert!(claim_pending(&cell, Some(7)).is_none());
-        assert!(claim_pending(&cell, None).is_none());
+        let cell: RefCell<Option<(u64, (&str, u16))>> = RefCell::new(None);
+        assert!(claim_pending(&cell, 0, Some(7)).is_none());
+        assert!(claim_pending(&cell, 0, None).is_none());
+    }
+
+    /// The daemon connection that took the `Create` was lost before its
+    /// handle came back. The request was dropped with it, or its handle will
+    /// never be reported on this connection, so the next handle to appear is
+    /// another device's: one renumbered by the next daemon, or added from the
+    /// other frontend or the command line (#34).
+    // LEDGER T530 | class B | 1 return value + 6 struct state: claim_pending and its cell
+    #[test]
+    fn a_create_staged_on_a_lost_connection_claims_nothing() {
+        let cell = RefCell::new(Some((0, ("mac", 4242u16))));
+        assert_eq!(
+            claim_pending(&cell, 1, Some(7)),
+            None,
+            "a create staged before the daemon was lost gave its name, edge \
+             and a switch-on to the next handle to appear"
+        );
+        assert!(
+            cell.borrow().is_none(),
+            "a create from a lost connection stayed staged, to claim a later handle"
+        );
     }
 }
 
@@ -1565,12 +1609,12 @@ mod staging_a_create {
             &pending,
             |r| {
                 sent.borrow_mut().push(r);
-                true
+                Some(0)
             },
-            "SCORNW20.local".into(),
+            "desk-pc.local".into(),
             4242,
             Position::Left,
-            vec!["10.0.0.5".parse().unwrap()],
+            vec!["192.0.2.5".parse().unwrap()],
         );
 
         assert!(
@@ -1593,12 +1637,12 @@ mod staging_a_create {
     fn what_was_staged_is_what_was_given() {
         let pending = RefCell::new(None);
         let sent: RefCell<Vec<FrontendRequest>> = RefCell::new(Vec::new());
-        let ips: Vec<std::net::IpAddr> = vec!["10.0.0.5".parse().unwrap()];
+        let ips: Vec<std::net::IpAddr> = vec!["192.0.2.5".parse().unwrap()];
         stage_create(
             &pending,
             |r| {
                 sent.borrow_mut().push(r);
-                true
+                Some(3)
             },
             "host".into(),
             9999,
@@ -1607,7 +1651,7 @@ mod staging_a_create {
         );
         assert_eq!(
             *pending.borrow(),
-            Some(("host".to_string(), 9999u16, Position::Right, ips)),
+            Some((3, ("host".to_string(), 9999u16, Position::Right, ips))),
             "a discovered machine's pinned addresses are why it connects \
              without DNS agreeing first — dropping them there would be silent"
         );
@@ -1621,7 +1665,7 @@ mod staging_a_create {
         let pending = RefCell::new(None);
         stage_create(
             &pending,
-            |_| false,
+            |_| None,
             "host".into(),
             4242,
             Position::Left,

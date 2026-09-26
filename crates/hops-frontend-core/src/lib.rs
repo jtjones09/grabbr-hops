@@ -58,6 +58,11 @@ pub enum ServiceBuild {
 pub struct AppModel {
     /// True while the IPC socket is connected.
     pub connected: bool,
+    /// Which daemon connection this model describes, bumped each time one is
+    /// lost. What a frontend keeps against a request, such as the name for a
+    /// device it asked to create, belongs to the connection that took the
+    /// request, and is void once that connection is gone (#34).
+    pub link: u64,
     /// This binary's build, from [`Launch::build`].
     pub this_build: Option<Build>,
     /// The daemon's build, as it stated it on this connection.
@@ -417,6 +422,7 @@ impl AppModel {
     /// the user configured stays, to be shown as it was last known.
     fn daemon_gone(&mut self) {
         self.connected = false;
+        self.link = self.link.wrapping_add(1);
         self.connected_peers.clear();
         self.peer_addrs.clear();
         self.pending_pairing = None;
@@ -899,17 +905,23 @@ impl FrontendClient {
     /// and replay into whichever daemon answered next, however much later
     /// and against whatever the device list had become (#34).
     pub fn request(&self, request: FrontendRequest) -> bool {
+        self.request_on(request).is_some()
+    }
+
+    /// [`Self::request`], saying which connection took it: the
+    /// [`AppModel::link`] it was queued on, or `None` when it was refused.
+    pub fn request_on(&self, request: FrontendRequest) -> Option<u64> {
         // Under the model lock, which the connection loop also holds while it
         // marks the daemon gone and empties the queue, so a request is either
         // queued for a live connection or refused here, never left behind.
         let mut model = self.model.lock().expect("model lock poisoned");
         if model.connected && self.requests.send(request).is_ok() {
-            return true;
+            return Some(model.link);
         }
         model.push_error(NOT_CONNECTED.to_string());
         drop(model);
         self.changed.notify_one();
-        false
+        None
     }
 }
 
@@ -2118,10 +2130,12 @@ mod the_daemon_gone {
                 .await;
 
                 // The daemon stops taking requests with two queued: the first
-                // fails to write, the second is still waiting.
+                // fails to write, the second, an add, is still waiting.
                 drop(first.received);
                 assert!(client.request(FrontendRequest::RemoveAuthorizedKey(FP.into())));
-                assert!(client.request(FrontendRequest::Activate(0, false)));
+                let add_on = client
+                    .request_on(FrontendRequest::Create)
+                    .expect("a daemon is connected");
                 until(&client, "the loss is noticed", |m| !m.connected).await;
                 let gone = client.snapshot();
 
@@ -2174,6 +2188,12 @@ mod the_daemon_gone {
                         .is_some_and(|e| e.contains("your last 2 changes")),
                     "two requests the daemon never took were dropped without a word: {:?}",
                     gone.latest_error()
+                );
+                assert!(
+                    gone.link != add_on,
+                    "the add was dropped with its connection, but the link it was \
+                     queued on still reads current: a frontend keeping its name \
+                     and edge would give them to the next handle to appear"
                 );
                 assert!(
                     refused && said.as_deref() == Some(NOT_CONNECTED),
