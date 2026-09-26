@@ -3264,8 +3264,9 @@ mod no_log_line_in_the_input_path_names_a_key {
     }
 
     /// The names a log call prints: `{name}` captures in its format string,
-    /// and arguments that are a plain variable or field. A function call is
-    /// not a name: it is how a value is printed without its key.
+    /// and arguments that are a plain variable or field, cast or not. A
+    /// function call is not a name: it is how a value is printed without its
+    /// key.
     fn printed(body: &str) -> Vec<String> {
         let mut args = arguments(body).into_iter().peekable();
         if args.peek().is_some_and(|a| a.starts_with("target:")) {
@@ -3294,7 +3295,7 @@ mod no_log_line_in_the_input_path_names_a_key {
         }
         for arg in args {
             let value = arg.split_once('=').map_or(arg, |(_, v)| v).trim();
-            let value = value.trim_start_matches(['&', '*']);
+            let value = uncast(value.trim_start_matches(['&', '*']));
             if value
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
@@ -3307,13 +3308,39 @@ mod no_log_line_in_the_input_path_names_a_key {
         names
     }
 
+    /// `x as u16`, `(x as u32)`: a cast prints `x`.
+    fn uncast(mut value: &str) -> &str {
+        loop {
+            let inner = value
+                .strip_prefix('(')
+                .and_then(|v| v.strip_suffix(')'))
+                .map(str::trim);
+            let bare = match value.rsplit_once(" as ") {
+                Some((head, ty))
+                    if ty
+                        .trim()
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':') =>
+                {
+                    Some(head.trim())
+                }
+                _ => None,
+            };
+            match inner.or(bare) {
+                Some(next) => value = next.trim_start_matches(['&', '*']),
+                None => return value,
+            }
+        }
+    }
+
     #[test]
     fn the_scan_reads_calls_the_way_the_compiler_does() {
         let code = "log::trace!(\"{key:#?} is not a modifier\");\n\
                     log::warn!(\n    \"a (b) {} (vk={:#04x})\",\n    scan_code,\n    hook.vkCode\n);\n\
                     log::debug!(\"{}\", describe(&key));\n\
                     log::log!(level, \"{{literal}} {n} {0}\", mods);\n\
-                    log::info!(\"released {} stuck key(s)\", keys.len());";
+                    log::info!(\"released {} stuck key(s)\", keys.len());\n\
+                    log::warn!(\"no scancode: {} {}\", linux_keycode as u16, (key as u32));";
         let calls = log_calls(code).expect("every call closes");
         let names: Vec<Vec<String>> = calls.iter().map(|(_, b)| printed(b)).collect();
         assert_eq!(
@@ -3324,13 +3351,14 @@ mod no_log_line_in_the_input_path_names_a_key {
                 vec![],
                 vec!["n".to_owned(), "mods".to_owned()],
                 vec![],
+                vec!["linux_keycode".to_owned(), "key".to_owned()],
             ],
             "the scan misreads a log call, so the guard below would miss a key \
              printed that way"
         );
         assert_eq!(
             calls.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
-            vec![1, 2, 7, 8, 9]
+            vec![1, 2, 7, 8, 9, 10]
         );
     }
 

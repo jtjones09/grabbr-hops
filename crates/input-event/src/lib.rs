@@ -167,9 +167,12 @@ mod no_key_identity {
                     state,
                 };
                 for text in printed(event) {
+                    let lower = text.to_ascii_lowercase();
                     assert!(
-                        !text.contains(&code.to_string()) && !text.contains("KeyA"),
-                        "{text:?} names key {code}"
+                        !text.contains(&code.to_string())
+                            && !lower.contains(&format!("{code:x}"))
+                            && !text.contains("KeyA"),
+                        "{text:?} names key {code} ({code:#x})"
                     );
                     assert!(
                         text.contains(&state.to_string()),

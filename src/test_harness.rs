@@ -320,7 +320,8 @@ pub(crate) mod logs {
 
     /// Whether `text` identifies `key`, by name or by number.
     ///
-    /// By number means a run of digits equal to the key's code. Addresses,
+    /// By number means a run of digits equal to the key's code, or a `0x`
+    /// hex number equal to it. Addresses,
     /// fingerprints and hex such as a build commit carry digit runs that are
     /// not keys, so they are set aside first; otherwise a port or a
     /// fingerprint byte that happens to read `30` would look like `KEY_A`.
@@ -328,11 +329,24 @@ pub(crate) mod logs {
         if text.contains(&format!("{key:?}")) {
             return true;
         }
-        let code = (key as u32).to_string();
-        text.split(|c: char| c.is_whitespace() || "()[]{},;\"'<>=".contains(c))
-            .filter(|token| !carries_other_numbers(token))
-            .flat_map(|token| token.split(|c: char| !c.is_ascii_digit()))
-            .any(|run| run == code)
+        let code = key as u32;
+        let tokens = || text.split(|c: char| c.is_whitespace() || "()[]{},;\"'<>=".contains(c));
+        let in_hex = tokens().any(|token| {
+            let token = token.to_ascii_lowercase();
+            token.match_indices("0x").any(|(at, _)| {
+                let digits: String = token[at + 2..]
+                    .chars()
+                    .take_while(char::is_ascii_hexdigit)
+                    .collect();
+                u32::from_str_radix(&digits, 16) == Ok(code)
+            })
+        });
+        let code = code.to_string();
+        in_hex
+            || tokens()
+                .filter(|token| !carries_other_numbers(token))
+                .flat_map(|token| token.split(|c: char| !c.is_ascii_digit()))
+                .any(|run| run == code)
     }
 
     fn carries_other_numbers(token: &str) -> bool {
@@ -352,6 +366,8 @@ pub(crate) mod logs {
         assert!(names_key("key(30, 1)", a));
         assert!(names_key("Key { time: 0, key: 30, state: 1 }", a));
         assert!(names_key("releasing stuck key: 30", a));
+        assert!(names_key("key(0x1e, 0)", a));
+        assert!(names_key("key: 0X001E", a));
         for other in [
             "key(<hidden>, 1) <-<-<-<-<- 127.0.0.1:53012",
             "peer 30:1e:19:1b:c4:a8:40:f5:26:37:39:9d:c7:c7:75:fe:17:4f:03:d5:a9:76:49:cd:b1:12:d1:2f:6c:1f:d2:22",
