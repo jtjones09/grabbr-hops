@@ -97,6 +97,11 @@ struct PolledUi {
         bool,
         String,
     )>,
+    /// Each row's clipboard words and switch, in `devices` order (#182).
+    /// Without them the edit panel kept offering "turn off" after the
+    /// clipboard went off. A field of its own because `PartialEq` stops at
+    /// twelve-element tuples.
+    clipboards: Vec<(String, bool)>,
 }
 
 /// Whether an action armed on `handle` (as the UI holds it) with `pin` no
@@ -1059,6 +1064,10 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
                             d.pin.to_string(),
                         )
                     })
+                    .collect(),
+                clipboards: devices
+                    .iter()
+                    .map(|d| (d.clipboard.to_string(), d.clipboard_on))
                     .collect(),
             };
 

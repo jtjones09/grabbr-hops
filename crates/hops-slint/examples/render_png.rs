@@ -251,6 +251,12 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
         }
         // laptop-air: a receive-only row, keyed by fingerprint, clipboard off
         Some("edit-clipboard-off") => ui.set_editing_device("c3:de:04:aa:11:22".into()),
+        // the question left open while the clipboard went off from another
+        // app: the row must say off, not ask
+        Some("clipboard-confirm-after-off") => {
+            ui.set_editing_device("c3:de:04:aa:11:22".into());
+            ui.set_confirm_clipboard_off(true);
+        }
         // media-rig: never connected, so no pairing and no clipboard to show
         Some("edit-unpaired") => ui.set_editing_device("2".into()),
         Some("delete-confirm") => ui.set_confirm_delete_handle("1".into()),

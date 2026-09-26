@@ -924,6 +924,10 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                     spacing: 0;
                                     for d in root.devices: VerticalLayout {
                                         if d.clipboard != "" && (d.has-send ? d.handle : d.fp-full) == root.editing-device: VerticalLayout {
+                                            // The question stands only while
+                                            // the clipboard is on: once it is
+                                            // off, from any app, the row says so.
+                                            property <bool> asking: root.confirm-clipboard-off && d.clipboard-on;
                                             spacing: Space.sm;
                                             Text {
                                                 text: "clipboard";
@@ -936,16 +940,16 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                                     alignment: center;
                                                     horizontal-stretch: 1;
                                                     Text {
-                                                        text: root.confirm-clipboard-off
+                                                        text: asking
                                                             ? "turn it off? it cannot be turned back on here yet"
                                                             : d.clipboard;
-                                                        color: root.confirm-clipboard-off ? Theme.c.warn
+                                                        color: asking ? Theme.c.warn
                                                             : d.clipboard-on ? Theme.c.foreground : Theme.c.muted;
                                                         font-size: Type.small;
                                                         overflow: elide;
                                                     }
                                                 }
-                                                if d.clipboard-on && !root.confirm-clipboard-off: VerticalLayout {
+                                                if d.clipboard-on && !asking: VerticalLayout {
                                                     alignment: center;
                                                     PillButton {
                                                         text: "turn off";
@@ -953,7 +957,7 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                                         clicked => { root.confirm-clipboard-off = true; }
                                                     }
                                                 }
-                                                if d.clipboard-on && root.confirm-clipboard-off: VerticalLayout {
+                                                if asking: VerticalLayout {
                                                     alignment: center;
                                                     PillButton {
                                                         text: "yes";
@@ -964,7 +968,7 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                                         }
                                                     }
                                                 }
-                                                if d.clipboard-on && root.confirm-clipboard-off: VerticalLayout {
+                                                if asking: VerticalLayout {
                                                     alignment: center;
                                                     PillButton {
                                                         text: "no";
