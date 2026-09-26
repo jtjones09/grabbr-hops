@@ -96,6 +96,11 @@ pub struct AppModel {
     /// A front-end can treat the prompt as stale (the peer gave up) once this is
     /// older than a small TTL, since the daemon emits no retraction event.
     pub pending_pairing_since: Option<Instant>,
+    /// Every machine awaiting an answer, oldest first. `pending_pairing` is
+    /// only the latest; the prompt is chosen from this, through
+    /// [`PairingCard`], so another machine's request cannot replace the one on
+    /// screen (#168).
+    pub pairing_attempts: Vec<PairingAttempt>,
     /// Maps a connected peer's socket address -> fingerprint, so the addr-only
     /// `IncomingDisconnected` event can be correlated back to a fingerprint.
     peer_addrs: HashMap<SocketAddr, String>,
@@ -136,6 +141,11 @@ impl AppModel {
             FrontendEvent::RevokedUpdated(map) => self.revoked = map,
             FrontendEvent::AuthorizedUpdated(map) => {
                 self.authorized = map;
+                let attempts = std::mem::take(&mut self.pairing_attempts);
+                self.pairing_attempts = attempts
+                    .into_iter()
+                    .filter(|a| !self.arrival_permitted(&a.fingerprint, Some(a.origin)))
+                    .collect();
                 // a pending request whose direction just became permitted is
                 // resolved
                 if let Some(fp) = self.pending_pairing.clone() {
@@ -176,17 +186,27 @@ impl AppModel {
                 addr,
             } => {
                 self.push_message(match origin {
-                    AttemptOrigin::Inbound => format!("pairing request: {fingerprint}"),
+                    AttemptOrigin::Inbound => match addr {
+                        Some(a) => format!("pairing request from {a}: {fingerprint}"),
+                        None => format!("pairing request: {fingerprint}"),
+                    },
                     AttemptOrigin::OutboundDial => match addr {
                         Some(a) => format!("{a} answered our dial, untrusted: {fingerprint}"),
                         None => format!("we dialled an untrusted receiver: {fingerprint}"),
                     },
                 });
                 if !self.arrival_permitted(&fingerprint, Some(origin)) {
+                    let now = Instant::now();
+                    self.note_attempt(PairingAttempt {
+                        fingerprint: fingerprint.clone(),
+                        origin,
+                        addr,
+                        since: now,
+                    });
                     self.pending_pairing = Some(fingerprint);
                     self.pending_pairing_origin = Some(origin);
                     self.pending_pairing_addr = addr;
-                    self.pending_pairing_since = Some(Instant::now());
+                    self.pending_pairing_since = Some(now);
                 }
             }
             FrontendEvent::Discovered { active, peers } => {
@@ -246,6 +266,25 @@ impl AppModel {
             .is_some_and(|(_, s)| s.peer_fingerprint.as_deref() == pin)
     }
 
+    /// Add an attempt, or refresh the one already held for that machine in
+    /// place, keeping its position in the queue.
+    fn note_attempt(&mut self, attempt: PairingAttempt) {
+        if let Some(held) = self
+            .pairing_attempts
+            .iter_mut()
+            .find(|a| a.fingerprint == attempt.fingerprint)
+        {
+            *held = attempt;
+            return;
+        }
+        // Anyone who can reach the daemon while add device is open can add
+        // one, so the queue is bounded.
+        if self.pairing_attempts.len() >= MAX_PAIRING_ATTEMPTS {
+            self.pairing_attempts.remove(0);
+        }
+        self.pairing_attempts.push(attempt);
+    }
+
     /// Whole seconds left in the pairing window, or `None` when it is closed.
     pub fn pairing_seconds_left(&self, now: Instant) -> Option<u64> {
         let left = self.pairing_open_until?.checked_duration_since(now)?;
@@ -293,6 +332,116 @@ impl AppModel {
     /// IPC token — reached the user as silence.
     pub fn latest_message(&self) -> Option<&str> {
         self.messages.back().map(|s| s.as_str())
+    }
+}
+
+/// How many machines awaiting an answer the model holds at once.
+const MAX_PAIRING_ATTEMPTS: usize = 16;
+
+/// A machine waiting for an answer to a pairing prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingAttempt {
+    pub fingerprint: String,
+    /// Whether it knocked or we dialled it (#61).
+    pub origin: AttemptOrigin,
+    /// Where it came from, or the address that answered our dial (#83, #93).
+    pub addr: Option<SocketAddr>,
+    /// When the daemon last reported it.
+    pub since: Instant,
+}
+
+/// Why an approval was not sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalRefused {
+    /// The fingerprint is not the one on the card.
+    NotOnScreen,
+    /// The card switched to this machine too recently for the click to have
+    /// been meant for it.
+    JustChanged,
+}
+
+impl ApprovalRefused {
+    /// What to tell the person who clicked.
+    pub fn notice(self) -> &'static str {
+        match self {
+            ApprovalRefused::NotOnScreen => {
+                "That pairing request is no longer on screen, so nothing was trusted."
+            }
+            ApprovalRefused::JustChanged => {
+                "The pairing request changed just before you approved it, so nothing \
+                 was trusted. Check which device it is now, then approve again."
+            }
+        }
+    }
+}
+
+/// Which pairing request the prompt shows, and whether an approval of it
+/// counts (#168).
+///
+/// The prompt used to show whichever machine asked last, so a second machine
+/// dialling while someone read the card, or typed a name into it, replaced the
+/// machine under the click: approving then trusted the second machine under
+/// the name meant for the first. A card now keeps its machine for as long as
+/// that machine's request is live, and a click is refused unless the card has
+/// shown that machine for at least [`Self::ARM_AFTER`], so a click aimed at
+/// the card before it changed does not land on the one after.
+#[derive(Debug, Default)]
+pub struct PairingCard {
+    shown: Option<(String, Instant)>,
+}
+
+impl PairingCard {
+    /// A request nobody has repeated for this long is taken as abandoned: the
+    /// daemon sends no retraction.
+    pub const STALE_AFTER: Duration = Duration::from_secs(12);
+
+    /// How long a card must have shown a machine before approving it counts.
+    pub const ARM_AFTER: Duration = Duration::from_secs(1);
+
+    /// The request to show at `now`: the one already on screen while it is
+    /// still live, otherwise the oldest live one. Live means the direction it
+    /// asks for is not yet permitted (#166), repeated within
+    /// [`Self::STALE_AFTER`], and not `snoozed` (denied).
+    pub fn show<'m>(
+        &mut self,
+        model: &'m AppModel,
+        now: Instant,
+        snoozed: impl Fn(&str) -> bool,
+    ) -> Option<&'m PairingAttempt> {
+        let live = |a: &&PairingAttempt| {
+            !model.arrival_permitted(&a.fingerprint, Some(a.origin))
+                && now.saturating_duration_since(a.since) < Self::STALE_AFTER
+                && !snoozed(&a.fingerprint)
+        };
+        let on_screen = self.shown.as_ref().map(|(fp, _)| fp.as_str());
+        let pick = model
+            .pairing_attempts
+            .iter()
+            .filter(live)
+            .find(|a| Some(a.fingerprint.as_str()) == on_screen)
+            .or_else(|| model.pairing_attempts.iter().find(live));
+        match pick {
+            Some(a) if Some(a.fingerprint.as_str()) != on_screen => {
+                self.shown = Some((a.fingerprint.clone(), now));
+            }
+            Some(_) => {}
+            None => self.shown = None,
+        }
+        pick
+    }
+
+    /// Whether approving `fingerprint` at `now` binds to the card on screen.
+    pub fn approve(&self, fingerprint: &str, now: Instant) -> Result<(), ApprovalRefused> {
+        match &self.shown {
+            Some((fp, since)) if fp == fingerprint => {
+                if now.saturating_duration_since(*since) >= Self::ARM_AFTER {
+                    Ok(())
+                } else {
+                    Err(ApprovalRefused::JustChanged)
+                }
+            }
+            _ => Err(ApprovalRefused::NotOnScreen),
+        }
     }
 }
 
@@ -673,6 +822,7 @@ async fn connection_loop(
             m.peer_addrs.clear();
             m.pending_pairing = None;
             m.pending_pairing_since = None;
+            m.pairing_attempts.clear();
         }
         changed.notify_one();
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -725,6 +875,107 @@ mod armed_actions {
             "the device is gone; an action armed on it must go with it"
         );
         assert_eq!(m.pin_of(8), Some(x), "the pin a request for 8 carries");
+    }
+}
+
+#[cfg(test)]
+mod pairing_card {
+    //! The approval a person gives binds to the machine the card showed them
+    //! (#168).
+    use super::{
+        AppModel, ApprovalRefused, AttemptOrigin, FrontendEvent, PairingAttempt, PairingCard,
+    };
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    const B: &str = "bb:bb:bb";
+    const C: &str = "cc:cc:cc";
+
+    fn knock(m: &mut AppModel, fp: &str) {
+        m.apply(FrontendEvent::ConnectionAttempt {
+            fingerprint: fp.into(),
+            origin: AttemptOrigin::Inbound,
+            addr: None,
+        });
+    }
+
+    fn attempt(fp: &str, since: Instant) -> PairingAttempt {
+        PairingAttempt {
+            fingerprint: fp.into(),
+            origin: AttemptOrigin::Inbound,
+            addr: None,
+            since,
+        }
+    }
+
+    /// The #168 repro: B's card is on screen, C dials before the click.
+    // LEDGER T9 | class B | 1 return value: PairingCard::show over AppModel::apply
+    #[test]
+    fn a_card_on_screen_keeps_its_machine_when_another_knocks() {
+        let mut m = AppModel::default();
+        let mut card = PairingCard::default();
+        knock(&mut m, B);
+        let now = Instant::now();
+        assert_eq!(
+            card.show(&m, now, |_| false)
+                .map(|a| a.fingerprint.as_str()),
+            Some(B)
+        );
+        knock(&mut m, C);
+        assert_eq!(
+            card.show(&m, now, |_| false)
+                .map(|a| a.fingerprint.as_str()),
+            Some(B),
+            "a second machine's knock replaced the machine on the card"
+        );
+        assert_eq!(card.approve(B, now + PairingCard::ARM_AFTER), Ok(()));
+        assert_eq!(
+            card.approve(C, now + PairingCard::ARM_AFTER),
+            Err(ApprovalRefused::NotOnScreen),
+            "a machine that is not on the card was approved"
+        );
+        // Once B is answered, C's request is next.
+        m.apply(FrontendEvent::AuthorizedUpdated(HashMap::from([(
+            B.to_string(),
+            "laptop".to_string(),
+        )])));
+        assert_eq!(
+            card.show(&m, now, |_| false)
+                .map(|a| a.fingerprint.as_str()),
+            Some(C),
+            "the waiting machine was lost when the first was answered"
+        );
+    }
+
+    /// When the card does change machine, a click that lands in the next
+    /// moment was aimed at the card before it.
+    // LEDGER T10 | class B | 1 return value: PairingCard::approve
+    #[test]
+    fn an_approval_right_after_the_card_changed_machine_is_refused() {
+        let mut m = AppModel::default();
+        let mut card = PairingCard::default();
+        let t0 = Instant::now();
+        m.pairing_attempts = vec![attempt(B, t0)];
+        card.show(&m, t0, |_| false);
+        // B stops asking; C, which asked later, is still live.
+        let t1 = t0 + PairingCard::STALE_AFTER + Duration::from_secs(1);
+        m.pairing_attempts.push(attempt(C, t1));
+        assert_eq!(
+            card.show(&m, t1, |_| false).map(|a| a.fingerprint.as_str()),
+            Some(C)
+        );
+        assert_eq!(
+            card.approve(C, t1 + Duration::from_millis(200)),
+            Err(ApprovalRefused::JustChanged),
+            "a click 200 ms after the card switched machine was taken as approving \
+             the new one"
+        );
+        assert_eq!(
+            card.approve(B, t1 + PairingCard::ARM_AFTER),
+            Err(ApprovalRefused::NotOnScreen),
+            "the machine that left the card was approved"
+        );
+        assert_eq!(card.approve(C, t1 + PairingCard::ARM_AFTER), Ok(()));
     }
 }
 
@@ -1011,6 +1262,27 @@ mod second_direction {
             Some(PEER),
             "a change to who may drive this machine withdrew the card asking \
              whether this machine may drive PEER"
+        );
+    }
+
+    /// The same, through the queue the frontends render from (#168): the
+    /// card is picked from `pairing_attempts`, so the update must not drop
+    /// the other direction's attempt from it either.
+    // LEDGER T6b | class B | 1 return value: AppModel::apply, PairingCard::show
+    #[test]
+    fn a_trust_update_keeps_the_other_direction_on_the_card() {
+        let mut m = driven_by_peer_then_dialled_it();
+        m.apply(FrontendEvent::AuthorizedUpdated(HashMap::from([
+            (PEER.to_owned(), "desk mac".to_owned()),
+            ("cc:dd".to_owned(), "another machine".to_owned()),
+        ])));
+        assert_eq!(
+            PairingCard::default()
+                .show(&m, Instant::now(), |_| false)
+                .map(|a| a.fingerprint.as_str()),
+            Some(PEER),
+            "a change to who may drive this machine took the card asking \
+             whether this machine may drive PEER off the screen"
         );
     }
 

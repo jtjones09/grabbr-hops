@@ -261,7 +261,6 @@ mod a_grant_carries_only_the_direction_that_was_approved {
         use rustls::client::danger::ServerCertVerifier;
         use rustls::pki_types::{ServerName, UnixTime};
         use rustls::server::danger::ClientCertVerifier;
-        use std::collections::VecDeque;
         use std::sync::{Arc, Mutex, RwLock};
 
         crate::transport::install_crypto_provider();
@@ -278,7 +277,7 @@ mod a_grant_carries_only_the_direction_that_was_approved {
         let trust = Arc::new(RwLock::new(store));
 
         let outbound = FpServerVerifier::new(trust.clone(), Arc::new(Mutex::new(None)));
-        let inbound = FpClientVerifier::new(trust, Arc::new(Mutex::new(VecDeque::new())));
+        let inbound = FpClientVerifier::new(trust, Arc::new(Mutex::new(None)));
         let now = UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_700_000_000));
 
         assert!(
@@ -649,7 +648,7 @@ mod no_pairing_expires_until_renewal_exists {
     //! Leases already sealed with a 30-day or 400-day term are covered by
     //! `trust_file`'s `a_sealed_store_holding_thirty_and_four_hundred_day_terms_…`.
 
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex, RwLock};
     use std::time::Duration;
@@ -685,8 +684,7 @@ mod no_pairing_expires_until_renewal_exists {
         let mut admitted = Vec::new();
         let tls_now =
             UnixTime::since_unix_epoch(Duration::from_secs(receiving.read().expect("lock").now()));
-        let inbound =
-            FpClientVerifier::new(receiving.clone(), Arc::new(Mutex::new(VecDeque::new())));
+        let inbound = FpClientVerifier::new(receiving.clone(), Arc::new(Mutex::new(None)));
         if inbound.verify_client_cert(peer, &[], tls_now).is_ok() {
             admitted.push(DOORS[0]);
         }
@@ -2206,7 +2204,6 @@ mod the_wire_contract_is_frozen {
         use crate::transport::{self, FpClientVerifier, FpServerVerifier};
         use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
         use quinn::{ClientConfig, Endpoint, ServerConfig};
-        use std::collections::VecDeque;
         use std::net::SocketAddr;
         use std::sync::{Arc, Mutex, RwLock};
         use std::time::Duration;
@@ -2242,7 +2239,7 @@ mod the_wire_contract_is_frozen {
             let mut server_crypto = rustls::ServerConfig::builder()
                 .with_client_cert_verifier(Arc::new(FpClientVerifier::new(
                     server_trust,
-                    Arc::new(Mutex::new(VecDeque::new())),
+                    Arc::new(Mutex::new(None)),
                 )))
                 .with_single_cert(vec![server.cert.clone()], server.key.clone_key())
                 .expect("server cert");

@@ -169,7 +169,8 @@ pub struct Service {
     /// Sealed persistence for the store above, and whether a change is still
     /// waiting to reach it.
     trust_saver: crate::trust_save::TrustSaver,
-    /// The provenance of the prompt each fingerprint is currently waiting on.
+    /// The prompt each fingerprint is currently waiting on: its provenance,
+    /// where it came from, and when it was admitted.
     ///
     /// A grant has to be shaped by HOW the peer arrived: an unsolicited knock
     /// asks "may this machine drive mine", our own dial asks "may I drive that
@@ -177,9 +178,10 @@ pub struct Service {
     /// the same capability, so confirming a receiver handed it control of this
     /// machine — the exact harm the direction split exists to remove.
     ///
-    /// Bounded like the TLS attempt queue, and for the same reason: anyone on
-    /// the network can cause an entry.
-    pending_origin: HashMap<String, AttemptOrigin>,
+    /// Also what a frontend that attaches later is shown (#114).
+    ///
+    /// Bounded, because anyone on the network can cause an entry.
+    pending_attempts: HashMap<String, PendingAttempt>,
     /// Whether a pairing prompt may appear right now (#195).
     prompt_gate: crate::prompt_gate::PromptGate,
     /// Devices switched on while the pairing window was open and not yet
@@ -251,6 +253,36 @@ struct Incoming {
     addr: SocketAddr,
     pos: Position,
 }
+
+/// A prompt raised and not yet answered.
+#[derive(Debug, Clone, Copy)]
+struct PendingAttempt {
+    origin: AttemptOrigin,
+    addr: Option<SocketAddr>,
+    admitted: Instant,
+}
+
+/// The held prompts a frontend attaching at `now` is shown (#114): those the
+/// gate would still allow on screen, less any from a removed device.
+fn attempts_to_replay(
+    pending: &HashMap<String, PendingAttempt>,
+    gate: &crate::prompt_gate::PromptGate,
+    removed: impl Fn(&str) -> bool,
+    now: Instant,
+) -> Vec<(String, PendingAttempt)> {
+    pending
+        .iter()
+        .filter(|(fp, a)| gate.replayable(a.admitted, now) && !removed(fp))
+        .map(|(fp, a)| (fp.clone(), *a))
+        .collect()
+}
+
+/// How many unanswered prompts are remembered at once.
+///
+/// Anyone on the network can add one by dialling with a certificate we do not
+/// recognise while add device is open. Well past any real fleet, small enough
+/// that a flood costs nothing.
+const MAX_PENDING_ATTEMPTS: usize = 32;
 
 /// Drop any persisted client pin naming a fingerprint that is not in the
 /// allowlist.
@@ -527,7 +559,7 @@ impl Service {
             discovered: HashMap::new(),
             trust,
             trust_saver: crate::trust_save::TrustSaver::new(trust_file),
-            pending_origin: HashMap::new(),
+            pending_attempts: HashMap::new(),
             prompt_gate: crate::prompt_gate::PromptGate::new(),
             adding: HashMap::new(),
             public_key_fingerprint,
@@ -883,8 +915,8 @@ impl Service {
                      missing Accessibility permission for hops."
                 )));
             }
-            EmulationEvent::ConnectionAttempt { fingerprint } => {
-                self.raise_connection_attempt(fingerprint, AttemptOrigin::Inbound, None);
+            EmulationEvent::ConnectionAttempt { fingerprint, addr } => {
+                self.raise_connection_attempt(fingerprint, AttemptOrigin::Inbound, Some(addr));
             }
             EmulationEvent::Entered {
                 addr,
@@ -1226,6 +1258,9 @@ impl Service {
         for (addr, fingerprint) in connected {
             self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
         }
+        // Last, after the trusted set: a frontend drops a prompt for a machine
+        // it believes is already trusted.
+        self.replay_pending_attempts();
     }
 
     const ENTER_HANDLE_BEGIN: u64 = u64::MAX / 2 + 1;
@@ -1326,7 +1361,7 @@ impl Service {
             return;
         }
         // Shaped by how the peer arrived; see `grant_for_attempt`.
-        let origin = self.pending_origin.remove(&fp);
+        let origin = self.pending_attempts.remove(&fp).map(|a| a.origin);
         // The lock is taken on one line on purpose: the named-door guard scans
         // for that call, and a chain split across lines drops this door out of
         // its match set without failing anything.
@@ -1422,26 +1457,78 @@ impl Service {
                 return;
             }
         }
-        if origin == AttemptOrigin::OutboundDial {
-            // Say so. A console verb can cause this, and a prompt the console
-            // summoned must not look like a peer knocking (#61).
-            log::info!(
-                "{fingerprint} at {addr:?} was reached by OUR OWN dial, not by an \
-                 unsolicited connection — the prompt will say so, and will show the \
-                 address so it can be compared with the one that was typed"
-            );
+        match origin {
+            AttemptOrigin::OutboundDial => {
+                // Say so. A console verb can cause this, and a prompt the console
+                // summoned must not look like a peer knocking (#61).
+                log::info!(
+                    "{fingerprint} at {addr:?} was reached by OUR OWN dial, not by an \
+                     unsolicited connection — the prompt will say so, and will show the \
+                     address so it can be compared with the one that was typed"
+                );
+            }
+            AttemptOrigin::Inbound => {
+                // In the log as well as on screen: with no frontend attached,
+                // this line is the only place the request appears (#114).
+                if let Some(unlogged) = self.prompt_gate.note_admitted(now) {
+                    let from =
+                        addr.map_or_else(|| "an unknown address".to_owned(), |a| a.to_string());
+                    let more = if unlogged > 0 {
+                        format!(" ({unlogged} more requests since the last line were not logged)")
+                    } else {
+                        String::new()
+                    };
+                    log::info!(
+                        "pairing request from {from}, fingerprint {fingerprint}: approve it \
+                         in the app, or run `hops cli authorize-key <name> {fingerprint}`{more}"
+                    );
+                }
+            }
         }
         // Remembered so the grant door mints the capability that matches how
-        // this peer actually arrived, rather than a fixed one.
-        if self.pending_origin.len() >= crate::transport::MAX_PENDING_ATTEMPTS {
-            self.pending_origin.clear();
+        // this peer actually arrived, rather than a fixed one, and so a frontend
+        // that attaches later is shown it.
+        if self.pending_attempts.len() >= MAX_PENDING_ATTEMPTS {
+            self.pending_attempts.clear();
         }
-        self.pending_origin.insert(fingerprint.clone(), origin);
+        self.pending_attempts.insert(
+            fingerprint.clone(),
+            PendingAttempt {
+                origin,
+                addr,
+                admitted: now,
+            },
+        );
         self.notify_frontend(FrontendEvent::ConnectionAttempt {
             fingerprint,
             origin,
             addr,
         });
+    }
+
+    /// Show a newly attached frontend the prompts raised before it attached.
+    ///
+    /// Without this, a request that arrived while no frontend was connected,
+    /// or while one was reconnecting, was never shown to anyone (#114). Only
+    /// prompts the gate admitted are held, and only those it would still allow
+    /// on screen now are shown again.
+    fn replay_pending_attempts(&mut self) {
+        let replay = {
+            let trust = self.trust.read().expect("lock");
+            attempts_to_replay(
+                &self.pending_attempts,
+                &self.prompt_gate,
+                |fp| trust.denial(fp).is_some(),
+                Instant::now(),
+            )
+        };
+        for (fingerprint, attempt) in replay {
+            self.notify_frontend(FrontendEvent::ConnectionAttempt {
+                fingerprint,
+                origin: attempt.origin,
+                addr: attempt.addr,
+            });
+        }
     }
 
     /// Tear down every live session with `fp`, in both directions.
@@ -2624,6 +2711,74 @@ mod a_second_daemon_leaves_the_running_daemons_files_alone {
             ),
             (true, false),
             "(refused as already running, read the config) for a claim refused"
+        );
+    }
+}
+
+#[cfg(test)]
+mod replay_on_attach {
+    //! A frontend that attaches late is shown the prompts it missed, but only
+    //! those the pairing window still allows (#114, #195).
+    use super::{AttemptOrigin, PendingAttempt, attempts_to_replay};
+    use crate::prompt_gate::PromptGate;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    const S: Duration = Duration::from_secs(1);
+
+    fn held(admitted: Instant) -> PendingAttempt {
+        PendingAttempt {
+            origin: AttemptOrigin::Inbound,
+            addr: None,
+            admitted,
+        }
+    }
+
+    fn replayed(
+        pending: &HashMap<String, PendingAttempt>,
+        gate: &PromptGate,
+        removed: &str,
+        now: Instant,
+    ) -> Vec<String> {
+        let mut fps: Vec<String> = attempts_to_replay(pending, gate, |fp| fp == removed, now)
+            .into_iter()
+            .map(|(fp, _)| fp)
+            .collect();
+        fps.sort();
+        fps
+    }
+
+    // LEDGER T13 | class B | 1 return value: attempts_to_replay
+    #[test]
+    fn only_prompts_the_window_still_allows_are_replayed() {
+        let t0 = Instant::now();
+        let mut gate = PromptGate::new();
+        gate.open(t0);
+        let pending = HashMap::from([
+            ("aa".to_string(), held(t0 + S)),
+            ("dd".to_string(), held(t0 + S)),
+        ]);
+        assert_eq!(
+            replayed(&pending, &gate, "dd", t0 + 30 * S),
+            vec!["aa".to_string()],
+            "half a minute into the window, the live request must be replayed and \
+             the removed device's must not"
+        );
+        assert_eq!(
+            replayed(&pending, &gate, "dd", t0 + PromptGate::WINDOW + 5 * S),
+            Vec::<String>::new(),
+            "a request was replayed after the pairing window closed"
+        );
+        gate.open(t0 + 130 * S);
+        let pending = HashMap::from([
+            ("xx".to_string(), held(t0 + 100 * S)),
+            ("yy".to_string(), held(t0 + 131 * S)),
+        ]);
+        assert_eq!(
+            replayed(&pending, &gate, "dd", t0 + 135 * S),
+            vec!["yy".to_string()],
+            "add device reopened for one machine replayed another machine's \
+             request from the window before"
         );
     }
 }

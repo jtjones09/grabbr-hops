@@ -37,8 +37,8 @@ use std::{
 };
 
 use hops_frontend_core::{
-    AppModel, AttemptOrigin, ClientHandle, Device, DeviceSend, FrontendClient, FrontendRequest,
-    Position, Status, TrustState,
+    AppModel, ApprovalRefused, AttemptOrigin, ClientHandle, Device, DeviceSend, FrontendClient,
+    FrontendRequest, PairingAttempt, PairingCard, Position, Status, TrustState,
     prefs::Frontend,
     theme::{self, Rgb, Theme},
 };
@@ -56,9 +56,6 @@ use tokio::sync::mpsc;
 
 /// How long a denied pairing stays snoozed before a fresh attempt re-prompts.
 const DISMISS_TTL: Duration = Duration::from_secs(120);
-/// If no new ConnectionAttempt refreshes a pending pairing within this window,
-/// treat it as stale (the peer gave up) and stop showing the prompt.
-const STALE_TTL: Duration = Duration::from_secs(12);
 /// How long a locally-generated notice (a rejected add, an inapplicable key)
 /// stays in the footer before the keymap comes back.
 const NOTICE_TTL: Duration = Duration::from_secs(6);
@@ -67,6 +64,18 @@ const NOTICE_TTL: Duration = Duration::from_secs(6);
 pub enum TuiError {
     #[error("terminal io error: {0}")]
     Io(#[from] io::Error),
+}
+
+/// `y` on the pairing prompt: the name prompt for `fp`, bound to that machine,
+/// if the prompt has shown it long enough for the key to have been meant for
+/// it (#168).
+fn approve_prompt(card: &PairingCard, fp: String, now: Instant) -> Result<Input, ApprovalRefused> {
+    card.approve(&fp, now)?;
+    Ok(Input::TrustedName {
+        fp,
+        buf: String::new(),
+        granting: true,
+    })
 }
 
 /// Active text-input edit, if any.
@@ -274,6 +283,10 @@ pub async fn run() -> Result<(), TuiError> {
     // fingerprint -> when the user last denied it; snoozes the prompt for
     // DISMISS_TTL so a retrying peer doesn't nag, but a later attempt re-asks.
     let mut dismissed: HashMap<String, Instant> = HashMap::new();
+    // Which machine the pairing prompt shows. It keeps that machine while its
+    // request is live, so another machine asking cannot take over the prompt
+    // between reading it and pressing `y` (#168).
+    let mut card = PairingCard::default();
     let mut show_log = false;
     let mut notice: Option<(String, Instant)> = None;
     // A device the user just asked to create, awaiting the handle the daemon
@@ -329,7 +342,13 @@ pub async fn run() -> Result<(), TuiError> {
             notice = None;
         }
 
-        let pairing = live_pairing(&model, &dismissed);
+        // a live pending pairing: untrusted, still actively attempting (not a
+        // stale prompt for a peer that left), and not currently snooze-dismissed
+        let pairing: Option<PairingAttempt> = card
+            .show(&model, Instant::now(), |fp| {
+                dismissed.get(fp).is_some_and(|t| t.elapsed() < DISMISS_TTL)
+            })
+            .cloned();
 
         let mut list_state = ListState::default();
         if count > 0 {
@@ -345,7 +364,7 @@ pub async fn run() -> Result<(), TuiError> {
                 &mut list_state,
                 input.as_ref(),
                 confirm.as_ref(),
-                pairing.as_deref(),
+                pairing.as_ref(),
                 notice.as_ref().map(|(m, _)| m.as_str()),
                 show_log,
                 theme,
@@ -448,16 +467,18 @@ pub async fn run() -> Result<(), TuiError> {
                             KeyCode::Char('n') | KeyCode::Esc => confirm = None,
                             _ => {}
                         }
-                    } else if let Some(fp) = pairing.clone() {
+                    } else if let Some(fp) = pairing.as_ref().map(|a| a.fingerprint.clone()) {
                         // ---- pairing-approval prompt ----
                         match k.code {
-                            KeyCode::Char('y') => {
-                                input = Some(Input::TrustedName {
-                                    fp,
-                                    buf: String::new(),
-                                    granting: true,
-                                });
-                            }
+                            // The name prompt that follows is bound to this
+                            // machine, and only if the prompt has shown it long
+                            // enough for the key to have been meant for it.
+                            KeyCode::Char('y') => match approve_prompt(&card, fp, Instant::now()) {
+                                Ok(naming) => input = Some(naming),
+                                Err(refused) => {
+                                    notice = Some((refused.notice().to_string(), Instant::now()));
+                                }
+                            },
                             KeyCode::Char('n') | KeyCode::Esc => {
                                 dismissed.insert(fp, Instant::now());
                             }
@@ -877,7 +898,7 @@ fn ui(
     list_state: &mut ListState,
     input: Option<&Input>,
     confirm: Option<&Confirm>,
-    pairing: Option<&str>,
+    pairing: Option<&PairingAttempt>,
     notice: Option<&str>,
     show_log: bool,
     theme: &Theme,
@@ -1003,13 +1024,15 @@ fn ui(
     );
 
     // overlays (only when nothing else is capturing input): pairing takes priority
-    if let Some(fp) = pairing {
+    if let Some(attempt) = pairing {
         if input.is_none() && confirm.is_none() {
+            // The shown machine's own origin and address, not the latest
+            // request's: they are different machines when two are waiting.
             pairing_popup(
                 f,
-                fp,
-                model.pending_pairing_origin,
-                model.pending_pairing_addr,
+                &attempt.fingerprint,
+                Some(attempt.origin),
+                attempt.addr,
                 theme,
             );
         }
@@ -1118,18 +1141,6 @@ fn footer_line(
     Line::from(spans)
 }
 
-/// The pairing prompt to show: a request for a direction not yet permitted,
-/// still actively attempting (not a stale prompt for a peer that left), and not
-/// currently snooze-dismissed.
-fn live_pairing(model: &AppModel, dismissed: &HashMap<String, Instant>) -> Option<String> {
-    let fp = model.pairing_request()?;
-    let fresh = model
-        .pending_pairing_since
-        .is_some_and(|t| t.elapsed() < STALE_TTL);
-    let snoozed = dismissed.get(fp).is_some_and(|t| t.elapsed() < DISMISS_TTL);
-    (fresh && !snoozed).then(|| fp.to_owned())
-}
-
 /// Render a centered approve/deny popup for an untrusted incoming peer.
 fn pairing_popup(
     f: &mut Frame,
@@ -1190,7 +1201,13 @@ fn pairing_popup(
         ]),
     ];
     if let Some(a) = addr {
-        body.insert(1, Line::from(Span::styled(format!("{a} answered"), key)));
+        // our dial: the address that answered (#93); a knock: where from (#83)
+        let line = if ours {
+            format!("{a} answered")
+        } else {
+            format!("from {a}")
+        };
+        body.insert(1, Line::from(Span::styled(line, key)));
     }
     f.render_widget(Clear, area);
     f.render_widget(
@@ -1369,7 +1386,7 @@ mod tests {
     /// A machine that may already drive this one answers this machine's dial.
     /// The TUI asks whether this machine may drive it: one approval grants one
     /// direction, so the reverse needs its own card (#166).
-    // LEDGER T8 | class B | 3 widget tree: live_pairing, ui() into a TestBackend
+    // LEDGER T8 | class B | 3 widget tree: PairingCard::show, ui() into a TestBackend
     #[test]
     fn the_card_for_the_second_direction_is_shown() {
         use hops_frontend_core::{AttemptOrigin, FrontendEvent};
@@ -1383,7 +1400,9 @@ mod tests {
             addr: Some("10.0.0.5:4242".parse().expect("addr")),
         });
 
-        let pairing = live_pairing(&model, &HashMap::new());
+        let pairing = PairingCard::default()
+            .show(&model, Instant::now(), |_| false)
+            .cloned();
         let devices = listable(&model);
         let mut state = ListState::default();
         let theme = theme::default_theme();
@@ -1396,7 +1415,7 @@ mod tests {
                 &mut state,
                 None,
                 None,
-                pairing.as_deref(),
+                pairing.as_ref(),
                 None,
                 false,
                 &theme,
@@ -1416,6 +1435,66 @@ mod tests {
             out.contains("we dialled this device") && out.contains("10.0.0.5:4242 answered"),
             "no card asks whether this machine may drive a peer that may \
              already drive it:\n{out}"
+        );
+    }
+
+    /// The pairing prompt names the machine it shows by that machine's own
+    /// origin and address. The prompt can show an earlier request than the
+    /// latest (#168), and the latest one's details were what it printed.
+    // LEDGER T12 | class B | 3 render: ui() on ratatui TestBackend, PairingCard::show
+    #[test]
+    fn the_pairing_prompt_describes_the_machine_it_shows() {
+        let mut model = AppModel::default();
+        let knocked: std::net::SocketAddr = "10.0.0.7:51234".parse().expect("addr");
+        let dialled: std::net::SocketAddr = "10.0.0.9:4242".parse().expect("addr");
+        model.apply(FrontendEvent::ConnectionAttempt {
+            fingerprint: FP.into(),
+            origin: AttemptOrigin::Inbound,
+            addr: Some(knocked),
+        });
+        model.apply(FrontendEvent::ConnectionAttempt {
+            fingerprint: OTHER_FP.into(),
+            origin: AttemptOrigin::OutboundDial,
+            addr: Some(dialled),
+        });
+        let shown = PairingCard::default()
+            .show(&model, Instant::now(), |_| false)
+            .cloned()
+            .expect("a prompt");
+        assert_eq!(shown.fingerprint, FP);
+        let theme = theme::default_theme();
+        let mut term = Terminal::new(TestBackend::new(120, 24)).expect("test terminal");
+        term.draw(|f| {
+            ui(
+                f,
+                &model,
+                &[],
+                &mut ListState::default(),
+                None,
+                None,
+                Some(&shown),
+                None,
+                false,
+                &theme,
+            )
+        })
+        .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let out: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            out.contains("pairing request") && out.contains("from 10.0.0.7:51234"),
+            "the prompt for a machine that knocked from 10.0.0.7:51234 does not say so:\n{out}"
+        );
+        assert!(
+            !out.contains("10.0.0.9") && !out.contains("we dialled"),
+            "the prompt described the other waiting machine:\n{out}"
         );
     }
 

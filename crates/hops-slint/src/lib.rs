@@ -22,7 +22,8 @@ use std::{
 };
 
 use hops_frontend_core::{
-    ClientHandle, FrontendClient, FrontendRequest, Position, Status, TrustState, prefs, theme,
+    ApprovalRefused, ClientHandle, FrontendClient, FrontendRequest, PairingCard, Position, Status,
+    TrustState, prefs, theme,
 };
 use hops_ipc::{DEFAULT_PORT, Geometry};
 use slint::{ComponentHandle, ModelRc, VecModel};
@@ -33,9 +34,6 @@ slint::include_modules!();
 #[cfg(target_os = "macos")]
 mod macos_app;
 
-/// A pairing prompt is "live" only this long after the last connection attempt
-/// (the daemon emits no retraction); matches the TUI's `STALE_TTL`.
-const STALE_TTL: Duration = Duration::from_secs(12);
 /// After the user denies a pairing, snooze the prompt this long so a retrying
 /// peer doesn't nag — but a later attempt re-asks; matches the TUI's `DISMISS_TTL`.
 const DISMISS_TTL: Duration = Duration::from_secs(120);
@@ -139,22 +137,6 @@ pub fn theme_colors(t: &theme::Theme) -> ThemeColors {
         warn: slint_color(t.warn),
         error: slint_color(t.error),
     }
-}
-
-/// The pairing prompt to show, or `""` for none: a request for a direction
-/// not yet permitted, still actively attempting (not a stale prompt for a peer
-/// that left), and not currently snooze-dismissed.
-fn live_pairing(m: &hops_frontend_core::AppModel, dismissed: &HashMap<String, Instant>) -> String {
-    m.pairing_request()
-        .filter(|fp| {
-            m.pending_pairing_since
-                .is_some_and(|t| t.elapsed() < STALE_TTL)
-                && dismissed
-                    .get(*fp)
-                    .is_none_or(|t| t.elapsed() >= DISMISS_TTL)
-        })
-        .unwrap_or_default()
-        .to_owned()
 }
 
 /// First 16 hex chars of a fingerprint for a glanceable id.
@@ -342,6 +324,34 @@ fn stage_create(
     request(FrontendRequest::Create);
 }
 
+/// Put `fingerprint`'s request on the pairing card.
+///
+/// A name typed while the card showed another machine is cleared, so it can
+/// never be sent to approve this one (#168).
+fn show_pairing_card(ui: &AppWindow, fingerprint: &str) {
+    if ui.get_pairing_fp().as_str() != fingerprint {
+        ui.set_pairing_name("".into());
+    }
+    ui.set_pairing_fp(fingerprint.into());
+}
+
+/// The request a click on "trust & name" sends: `name` for `fingerprint`, if
+/// that is the machine the card has been showing (#168).
+fn approval(
+    card: &PairingCard,
+    name: &str,
+    fingerprint: &str,
+    now: Instant,
+) -> Result<FrontendRequest, ApprovalRefused> {
+    card.approve(fingerprint, now)?;
+    let desc = if name.trim().is_empty() {
+        hops_frontend_core::fallback_label(fingerprint)
+    } else {
+        name.trim().to_string()
+    };
+    Ok(FrontendRequest::AuthorizeKey(desc, fingerprint.to_string()))
+}
+
 /// Claim a pending "create device" once its handle appears, or leave it for the
 /// next tick.
 ///
@@ -498,6 +508,9 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
     // fingerprints the user has denied -> when (UI-local snooze; see DISMISS_TTL).
     // Shared between the deny callback and the poll loop, both on the UI thread.
     let dismissed: Rc<RefCell<HashMap<String, Instant>>> = Rc::new(RefCell::new(HashMap::new()));
+    // Which machine the pairing card shows, shared by the poll that fills it
+    // and the approve callback that checks a click against it (#168).
+    let card: Rc<RefCell<PairingCard>> = Rc::default();
 
     // --- wire UI actions -> FrontendRequests (each closure owns a client clone) ---
     {
@@ -572,13 +585,19 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
     }
     {
         let c = client.clone();
+        let card = card.clone();
+        let weak = ui.as_weak();
+        let notice = notice_sink.clone();
         ui.on_approve_pairing(move |name, fp| {
-            let desc = if name.trim().is_empty() {
-                hops_frontend_core::fallback_label(fp.as_str())
-            } else {
-                name.trim().to_string()
-            };
-            c.request(FrontendRequest::AuthorizeKey(desc, fp.to_string()));
+            match approval(&card.borrow(), name.as_str(), fp.as_str(), Instant::now()) {
+                Ok(request) => {
+                    c.request(request);
+                    if let Some(ui) = weak.upgrade() {
+                        ui.set_pairing_name("".into());
+                    }
+                }
+                Err(refused) => notice(refused.notice()),
+            }
         });
     }
     {
@@ -833,17 +852,31 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
             // repaints the window constantly (flickering VRR displays); when
             // nothing changed we touch nothing and the window stays static.
 
-            let pairing = live_pairing(&m, &dismissed.borrow());
-            let pairing_addr = if pairing.is_empty() {
-                String::new()
-            } else {
-                m.pending_pairing_addr
-                    .map(|a| a.to_string())
-                    .unwrap_or_default()
-            };
-            let pairing_from_our_dial = !pairing.is_empty()
-                && m.pending_pairing_origin
-                    == Some(hops_frontend_core::AttemptOrigin::OutboundDial);
+            // a live pairing prompt: untrusted, still actively attempting (not a
+            // stale prompt for a peer that left), and not currently snooze-dismissed.
+            // The card keeps the machine it shows while that request is live, so
+            // another machine asking cannot take it over (#168).
+            let shown = card
+                .borrow_mut()
+                .show(&m, Instant::now(), |fp| {
+                    dismissed
+                        .borrow()
+                        .get(fp)
+                        .is_some_and(|t| t.elapsed() < DISMISS_TTL)
+                })
+                .cloned();
+            let pairing = shown
+                .as_ref()
+                .map(|a| a.fingerprint.clone())
+                .unwrap_or_default();
+            let pairing_addr = shown
+                .as_ref()
+                .and_then(|a| a.addr)
+                .map(|a| a.to_string())
+                .unwrap_or_default();
+            let pairing_from_our_dial = shown
+                .as_ref()
+                .is_some_and(|a| a.origin == hops_frontend_core::AttemptOrigin::OutboundDial);
 
             // unified device view: one row per physical peer. AppModel::devices()
             // joins the outgoing clients with the trusted-fingerprint set by
@@ -1014,7 +1047,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
             ui.set_emulation(snap.emulation.as_str().into());
             ui.set_port(snap.port.as_str().into());
             ui.set_fingerprint(snap.fingerprint.as_str().into());
-            ui.set_pairing_fp(snap.pairing.as_str().into());
+            show_pairing_card(&ui, &snap.pairing);
             ui.set_discovered(ModelRc::new(VecModel::from(snap.discovered.clone())));
             ui.set_discovery_active(snap.discovery_active);
             ui.set_pairing_from_our_dial(snap.pairing_from_our_dial);
@@ -1623,7 +1656,7 @@ mod second_direction {
 
     const FP: &str = "1e:19:1b:2c:3d:4e:5f:60:71:82:93:a4:b5:c6:d7:e8";
 
-    // LEDGER T9 | class B | 1 return value: live_pairing, the value the poll loop sets as pairing-fp
+    // LEDGER T9 | class B | 1 return value: PairingCard::show, which the poll loop sets as pairing-fp
     #[test]
     fn the_card_for_the_second_direction_is_shown() {
         let mut m = AppModel::default();
@@ -1635,11 +1668,94 @@ mod second_direction {
             origin: AttemptOrigin::OutboundDial,
             addr: Some("10.0.0.5:4242".parse().expect("addr")),
         });
+        let mut card = hops_frontend_core::PairingCard::default();
         assert_eq!(
-            live_pairing(&m, &HashMap::new()),
-            FP,
+            card.show(&m, Instant::now(), |_| false)
+                .map(|a| a.fingerprint.as_str()),
+            Some(FP),
             "no card asks whether this machine may drive a peer that may \
              already drive it"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pairing_card_binds_the_approval {
+    //! What "trust & name" sends is decided by the card the window shows, and a
+    //! name typed for one machine is never sent for another (#168).
+    //!
+    //! Drives a real `AppWindow` on Slint's headless testing backend, through
+    //! the same functions the poll and the approve callback use.
+    use super::*;
+    use hops_frontend_core::{AppModel, AttemptOrigin, PairingAttempt};
+
+    fn attempt(fp: &str, since: Instant) -> PairingAttempt {
+        PairingAttempt {
+            fingerprint: fp.into(),
+            origin: AttemptOrigin::Inbound,
+            addr: None,
+            since,
+        }
+    }
+
+    /// One poll tick: choose the card's machine and put it in the window.
+    fn tick(ui: &AppWindow, card: &mut PairingCard, m: &AppModel, now: Instant) {
+        let fp = card
+            .show(m, now, |_| false)
+            .map(|a| a.fingerprint.clone())
+            .unwrap_or_default();
+        show_pairing_card(ui, &fp);
+    }
+
+    /// A click on "trust & name": what the card's button passes.
+    fn click(
+        ui: &AppWindow,
+        card: &PairingCard,
+        now: Instant,
+    ) -> Result<FrontendRequest, ApprovalRefused> {
+        approval(
+            card,
+            ui.get_pairing_name().as_str(),
+            ui.get_pairing_fp().as_str(),
+            now,
+        )
+    }
+
+    // LEDGER T11 | class B | 6 struct state + 1 return value: AppWindow pairing-fp/pairing-name via show_pairing_card, approval
+    #[test]
+    fn the_card_decides_what_trust_and_name_sends() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = AppWindow::new().expect("window");
+        let mut card = PairingCard::default();
+        let mut m = AppModel::default();
+        let t0 = Instant::now();
+
+        m.pairing_attempts = vec![attempt("bb:bb", t0)];
+        tick(&ui, &mut card, &m, t0);
+        ui.set_pairing_name("laptop".into()); // typed into the card's field
+        assert_eq!(
+            click(&ui, &card, t0 + Duration::from_secs(2)),
+            Ok(FrontendRequest::AuthorizeKey(
+                "laptop".into(),
+                "bb:bb".into()
+            )),
+            "the approval did not carry the name typed and the machine on the card"
+        );
+
+        // B stops asking while the name is still in the field; C is live.
+        let t1 = t0 + PairingCard::STALE_AFTER + Duration::from_secs(1);
+        m.pairing_attempts.push(attempt("cc:cc", t1));
+        tick(&ui, &mut card, &m, t1);
+        assert_eq!(ui.get_pairing_fp().as_str(), "cc:cc");
+        assert_eq!(
+            ui.get_pairing_name().as_str(),
+            "",
+            "the name typed for bb:bb was left in the card once it showed cc:cc"
+        );
+        assert_eq!(
+            click(&ui, &card, t1 + Duration::from_millis(300)),
+            Err(ApprovalRefused::JustChanged),
+            "a click 300 ms after the card switched to cc:cc approved it"
         );
     }
 }

@@ -368,11 +368,11 @@ pub enum FrontendEvent {
     ConnectionAttempt {
         fingerprint: String,
         origin: AttemptOrigin,
-        /// The address that answered, when we know it. Present for
-        /// `OutboundDial` — the user typed an address and something answered,
-        /// and they cannot judge the fingerprint without seeing which address
-        /// it came from (#93). `None` inbound, because `ListenEvent::Rejected`
-        /// does not carry one (see #83).
+        /// Where the attempt came from, when we know it. For `OutboundDial`,
+        /// the address that answered: the user typed an address and something
+        /// answered, and they cannot judge the fingerprint without seeing
+        /// which address it came from (#93). For `Inbound`, the address the
+        /// refused connection came from (#83).
         addr: Option<SocketAddr>,
     },
     /// Pairing prompts may appear on this machine for this many more seconds.
