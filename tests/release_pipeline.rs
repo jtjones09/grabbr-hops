@@ -986,58 +986,41 @@ fn the_workspace_tests_run_on_linux_and_on_macos() {
     );
 
     let wanted = ["--locked", "--workspace", "--all-targets"];
-    // Flags that run fewer tests, and shell that hides a failure.
-    let narrowing = [
-        "-p",
-        "--package",
-        "--exclude",
-        "--lib",
-        "--bin",
-        "--bins",
-        "--test",
-        "--tests",
-        "--example",
-        "--examples",
-        "--bench",
-        "--benches",
-        "--doc",
-        "--no-run",
-        "||",
-        "|",
-        ";",
-        "&",
-    ];
     let mut found = 0;
     for step in steps(job) {
-        let tokens: Vec<&str> = step["run"]
-            .as_str()
-            .unwrap_or("")
-            .split_whitespace()
-            .filter(|t| *t != "\\")
-            .collect();
-        let Some(at) = tokens.windows(2).position(|w| w == ["cargo", "test"]) else {
-            continue;
-        };
-        let args = &tokens[at + 2..];
         let name = step["name"].as_str().unwrap_or("cargo test");
-        if !wanted.iter().all(|w| args.contains(w)) {
-            continue;
-        }
-        assert!(
-            step["if"].is_badvalue() && !may_fail(step),
-            "{WORKSPACE_TESTS}/{name:?} is conditional or allowed to fail, so some runner \
-             can skip the workspace tests"
-        );
-        for arg in args {
+        // One command a line, and a line ending in `\` goes on to the next.
+        let run = step["run"].as_str().unwrap_or("").replace("\\\n", " ");
+        for command in run.lines() {
+            let tokens: Vec<&str> = command.split_whitespace().collect();
+            let Some(at) = tokens.windows(2).position(|w| w == ["cargo", "test"]) else {
+                continue;
+            };
+            let args = &tokens[at + 2..];
+            if !wanted.iter().all(|w| args.contains(w)) {
+                continue;
+            }
             assert!(
-                !narrowing
-                    .iter()
-                    .any(|n| arg == n || arg.starts_with(&format!("{n}="))),
-                "{WORKSPACE_TESTS}/{name:?} passes {arg:?}, which runs fewer tests than the \
-                 workspace or hides a failure"
+                step["if"].is_badvalue() && !may_fail(step),
+                "{WORKSPACE_TESTS}/{name:?} is conditional or allowed to fail, so some runner \
+                 can skip the workspace tests"
             );
+            // Exactly these: anything more is a package, a target, a test name
+            // filter or `-- --skip`, which runs fewer tests, or shell that
+            // hides a failure.
+            let mut sorted = args.to_vec();
+            sorted.sort_unstable();
+            let mut want = wanted.to_vec();
+            want.sort_unstable();
+            assert!(
+                sorted == want,
+                "{WORKSPACE_TESTS}/{name:?} runs `cargo test {}`; it must pass exactly `{}`, \
+                 since anything more runs fewer tests than the workspace or hides a failure",
+                args.join(" "),
+                wanted.join(" ")
+            );
+            found += 1;
         }
-        found += 1;
     }
     assert_eq!(
         found,
