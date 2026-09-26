@@ -37,6 +37,12 @@ pub struct Launch {
     /// the file that says more. `None` when the app started nothing or the
     /// service came up.
     pub start_problem: Option<String>,
+    /// That the app restarted a service running another build, in words, to
+    /// show once as a notice. `None` when it restarted nothing.
+    pub restarted: Option<String>,
+    /// Why the app left a service of another build running, and what to do,
+    /// shown with the mismatch in place of the general advice.
+    pub left_running: Option<String>,
 }
 
 /// What the daemon on this connection said about its build.
@@ -63,6 +69,9 @@ pub struct AppModel {
     /// Why the service the app tried to start did not come up, from
     /// [`Launch::start_problem`]. Cleared once a daemon answers.
     pub start_problem: Option<String>,
+    /// Why the app left a service of another build running, from
+    /// [`Launch::left_running`].
+    pub left_running: Option<String>,
     /// Configured clients, keyed + ordered by handle.
     pub clients: BTreeMap<ClientHandle, (ClientConfig, ClientState)>,
     /// Local input-capture status.
@@ -339,16 +348,39 @@ impl AppModel {
             ServiceBuild::Is(build) => format!("hops {build}"),
             ServiceBuild::Unstated => "an older build that does not say which".to_string(),
         };
-        let restart = if cfg!(target_os = "linux") {
-            "restart the computer"
-        } else {
-            "log out and back in"
+        let advice = match &self.left_running {
+            Some(why) => why.clone(),
+            None => {
+                let restart = if cfg!(target_os = "linux") {
+                    "restart the computer"
+                } else {
+                    "log out and back in"
+                };
+                format!(
+                    "The service keeps running its own version until it restarts: \
+                     {restart} to run this one."
+                )
+            }
         };
         Some(format!(
             "This app is hops {this}, but the service it is connected to is {theirs}. \
-             The service keeps running its own version until it restarts: {restart} \
-             to run this one."
+             {advice}"
         ))
+    }
+
+    /// The model a frontend opens with: this build, and what the front door
+    /// found. A service it restarted is told as a notice.
+    pub fn launched(launch: Launch) -> Self {
+        let mut model = AppModel {
+            this_build: launch.build,
+            start_problem: launch.start_problem,
+            left_running: launch.left_running,
+            ..AppModel::default()
+        };
+        if let Some(restarted) = launch.restarted {
+            model.push_message(restarted);
+        }
+        model
     }
 
     /// Whole seconds left in the pairing window, or `None` when it is closed.
@@ -805,11 +837,7 @@ impl FrontendClient {
     /// Spawn the auto-reconnecting connection task and return a handle. Must be
     /// called within a tokio `LocalSet` (it uses `spawn_local`).
     pub fn spawn(launch: Launch) -> Self {
-        let model = Arc::new(Mutex::new(AppModel {
-            this_build: launch.build,
-            start_problem: launch.start_problem,
-            ..AppModel::default()
-        }));
+        let model = Arc::new(Mutex::new(AppModel::launched(launch)));
         let changed = Arc::new(Notify::new());
         let (requests, request_rx) = mpsc::unbounded_channel();
         tokio::task::spawn_local(connection_loop(model.clone(), changed.clone(), request_rx));
@@ -1527,5 +1555,44 @@ mod the_service_problem {
         model.start_problem = None;
         model.apply(FrontendEvent::DaemonBuild(build("0.13.0", "abcd1234")));
         assert_eq!(model.service_problem(), None);
+    }
+
+    /// What the front door did about a service of another build reaches the
+    /// screen (#222): a restart as a notice, and a service it left running
+    /// with the reason in place of the general advice.
+    // LEDGER T2230 | class B | 6 struct state after AppModel::launched and apply
+    #[test]
+    fn what_the_front_door_did_about_another_build_is_what_the_app_says() {
+        let restarted = AppModel::launched(Launch {
+            build: Some(build("0.13.0", "abcd1234")),
+            restarted: Some(
+                "hops restarted its service because it was running hops 0.12.0.".into(),
+            ),
+            ..Launch::default()
+        });
+        assert_eq!(
+            restarted.latest_message(),
+            Some("hops restarted its service because it was running hops 0.12.0."),
+            "the app restarted the service and said nothing about it"
+        );
+
+        let why = "hops did not restart it, because it was started from a terminal. \
+                   Stop it, then open hops again.";
+        let mut left = AppModel::launched(Launch {
+            build: Some(build("0.13.0", "abcd1234")),
+            left_running: Some(why.into()),
+            ..Launch::default()
+        });
+        left.connected = true;
+        left.apply(FrontendEvent::DaemonBuild(build("0.12.0", "11111111")));
+        let said = left.service_problem().unwrap_or_default();
+        assert!(
+            said.contains("0.12.0 (11111111)") && said.ends_with(why) && !said.contains("log out"),
+            "the app left a daemon of another build running and must say why, not \
+             tell the user to log out: {said:?}"
+        );
+        // Once the daemon is this build, nothing is said.
+        left.apply(FrontendEvent::DaemonBuild(build("0.13.0", "abcd1234")));
+        assert_eq!(left.service_problem(), None);
     }
 }

@@ -2750,6 +2750,10 @@ mod the_front_door_starts_a_daemon_only_when_none_answers {
     //! beside the one serving input, and that one loaded the identity key
     //! before it found the IPC port taken.
     //!
+    //! **Amended 2026-09-26 (#222):** the app may also restart the service
+    //! it installed when the daemon that answers is another build, or states
+    //! none. That case, and nothing else, is guarded in the next module.
+    //!
     //! The rule has two halves, tested where each one lives:
     //!
     //! * **Started only when none answers.** The decision, here, against real
@@ -2999,6 +3003,133 @@ mod the_front_door_starts_a_daemon_only_when_none_answers {
                      door's own check."
                 );
             }
+        }
+    }
+}
+
+mod the_front_door_restarts_only_an_outdated_service_it_installed {
+    //! **Decided 2026-09-26 (#222), amending 2026-09-16 (#159).** The app may
+    //! restart the service it installed when the daemon that answers is a
+    //! different build from the app, or reports no build. A daemon of the same
+    //! build is never restarted by the app, and a daemon the service did not
+    //! start (one run from a terminal, say) is never restarted: the app says
+    //! so instead.
+    //!
+    //! **Why.** An app replaced in place attaches to whatever daemon answers.
+    //! Without this the previous release's daemon went on serving the new app
+    //! until the next login, with its fixes, security fixes included, not
+    //! running. And a restart is not free: it drops every connected peer and
+    //! any key held on this machine, which is why a daemon of this build is
+    //! never touched.
+
+    use crate::daemon_start::{Origin, Verdict, verdict};
+    use hops_ipc::{Build, StatedBuild};
+    use std::cell::Cell;
+
+    fn build(version: &str, commit: &str) -> Build {
+        Build {
+            version: version.into(),
+            commit: commit.into(),
+        }
+    }
+
+    /// The decision itself, for every kind of daemon that can answer.
+    // LEDGER T2223 | class B | 1 return value: daemon_start::verdict
+    #[test]
+    fn only_another_build_that_the_service_started_is_restarted() {
+        let this = build("0.13.0", "abcd123");
+        let same = StatedBuild::Is(this.clone());
+        let same_version_other_commit = StatedBuild::Is(build("0.13.0", "ffff000"));
+        let older = StatedBuild::Is(build("0.12.0", "1111111"));
+        let terminal = || Origin::Other("it was started from a terminal".into());
+
+        let asked = Cell::new(0);
+        let service = || {
+            asked.set(asked.get() + 1);
+            Origin::Service(4444)
+        };
+        assert_eq!(
+            (verdict(&this, Some(&same), service), asked.get()),
+            (Verdict::Keep, 0),
+            "a daemon of this build must be kept without even asking who started \
+             it. Restarting it drops every peer and every held key for nothing."
+        );
+        for (what, stated) in [
+            (
+                "another commit of the same version",
+                &same_version_other_commit,
+            ),
+            ("an older release", &older),
+            ("a daemon that states no build", &StatedBuild::Unstated),
+        ] {
+            assert_eq!(
+                verdict(&this, Some(stated), || Origin::Service(4444)),
+                Verdict::Restart(4444),
+                "{what}, started by the hops service, was not restarted. It goes on \
+                 serving the new app with the old build's code."
+            );
+            assert_eq!(
+                verdict(&this, Some(stated), terminal),
+                Verdict::LeaveOutdated("it was started from a terminal".into()),
+                "{what}, NOT started by the hops service, must be left running with \
+                 the reason: the app has no business stopping it."
+            );
+        }
+        assert_eq!(
+            verdict(&this, None, || Origin::Service(4444)),
+            Verdict::Keep,
+            "a daemon that said nothing may be one of this build still starting"
+        );
+    }
+
+    /// A backstop over `src/daemon_start.rs` as source text, for what the
+    /// behavioural tests cannot show: that nothing ELSE in the front door can
+    /// stop a daemon. Every way of stopping one there (a launchd bootout, a
+    /// `kickstart -k`, a signal) must sit inside `stop_service_daemon`, whose
+    /// callers are the restart of an outdated service and the reload of a
+    /// rewritten plist. Scans product code with comments stripped, never this
+    /// file. Paired with T2223 above and T2225 in `daemon_start`, which run the
+    /// restart and the start against a scripted `launchctl`.
+    // LEDGER T2226 | class S | source text | pair T2223, T2225
+    #[test]
+    fn nothing_but_the_one_stop_function_can_stop_a_daemon() {
+        const ALLOWED_IN: &str = "fn stop_service_daemon";
+        let code = super::scan::code_only(include_str!("daemon_start.rs"));
+        assert!(
+            code.contains(&format!("{ALLOWED_IN}(")),
+            "`{ALLOWED_IN}` is gone from src/daemon_start.rs, so this check compares \
+             nothing. If it was renamed, point the check at the new name."
+        );
+        for stop in [
+            "bootout",
+            "\"-k\"",
+            "kickstart -k",
+            "kill(",
+            "pidfd_send_signal",
+            "SIGTERM",
+            "SIGKILL",
+            "TerminateProcess",
+            "taskkill",
+        ] {
+            for (at, _) in code.match_indices(stop) {
+                let inside = super::scan::enclosing_fn(&code, at);
+                assert_eq!(
+                    inside, ALLOWED_IN,
+                    "src/daemon_start.rs has `{stop}` in `{inside}`. The front door \
+                     stops a daemon only through `stop_service_daemon`, to restart a \
+                     service running another build or reload a rewritten plist. A \
+                     stop anywhere else can end the daemon serving input, of this \
+                     build, which the app must never restart."
+                );
+            }
+        }
+        let main = super::scan::without_comments(include_str!("main.rs"));
+        for stop in ["bootout", "kill(", "SIGTERM", "TerminateProcess"] {
+            assert!(
+                !main.contains(stop),
+                "src/main.rs has `{stop}`. Stopping a daemon belongs in \
+                 `stop_service_daemon`, behind the build check."
+            );
         }
     }
 }

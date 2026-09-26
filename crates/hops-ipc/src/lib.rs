@@ -650,6 +650,204 @@ impl DaemonEndpoint {
         };
         exchange().unwrap_or(false)
     }
+
+    /// Which build the daemon here says it is, asked once within `within`.
+    ///
+    /// Presents `token`, when there is one, and reads what comes back until
+    /// the daemon states its build or `within` is over. A daemon states its
+    /// build first on every sync, but an event it sends to every frontend can
+    /// arrive before that, so no other event ends the ask.
+    ///
+    /// A daemon that sends state and never states its build predates the
+    /// statement: [`StatedBuild::Unstated`]. That includes one from before
+    /// the token, which sends its state to anything that connects. `None` when
+    /// nothing is said by then: nothing answers, the daemon is still starting,
+    /// or it closed on the token.
+    pub fn build(&self, token: Option<&str>, within: Duration) -> Option<StatedBuild> {
+        let deadline = Instant::now() + within;
+        let exchange = || -> io::Result<Option<StatedBuild>> {
+            match self {
+                #[cfg(unix)]
+                Self::Unix(path) => build_follows(connect_unix_now(path)?, token, deadline),
+                Self::Tcp(addr) => {
+                    let stream = std::net::TcpStream::connect_timeout(addr, time_left(deadline)?)?;
+                    build_follows(stream, token, deadline)
+                }
+            }
+        };
+        exchange().unwrap_or(None)
+    }
+
+    /// The process listening here, as the kernel reports it for a connection
+    /// made now: its id and the user it runs as.
+    ///
+    /// Taken from the socket, not from anything the process says, so it names
+    /// whatever holds the endpoint, hops or not. Unix sockets on macOS and
+    /// Linux only; elsewhere the error is `Unsupported`.
+    pub fn listener(&self) -> io::Result<Listener> {
+        match self {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            Self::Unix(path) => listener_of(&connect_unix_now(path)?),
+            #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+            Self::Unix(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this system does not say which process listens on a socket",
+            )),
+            Self::Tcp(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "a loopback port does not say which process listens on it",
+            )),
+        }
+    }
+}
+
+/// What a daemon said about its build when asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatedBuild {
+    /// It said which build it is.
+    Is(Build),
+    /// It sent state without saying: a daemon from before the statement.
+    Unstated,
+}
+
+/// The process listening on a daemon endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Listener {
+    /// Its process id.
+    pub pid: u32,
+    /// The user id it runs as.
+    pub uid: u32,
+}
+
+/// The process at the other end of `stream`, a connection to a listener.
+///
+/// Both systems record the listener's credentials when it starts listening
+/// and hand them to every connection, accepted or not.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn listener_of(stream: &std::os::unix::net::UnixStream) -> io::Result<Listener> {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `ucred` is plain data, for which all zeroes is a valid value.
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: `fd` is open, and `cred` and `len` outlive the call and
+        // describe a buffer of `len` bytes.
+        let got = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                std::ptr::addr_of_mut!(cred).cast(),
+                &mut len,
+            )
+        };
+        if got == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let pid = u32::try_from(cred.pid)
+            .ok()
+            .filter(|&pid| pid > 0)
+            .ok_or_else(|| io::Error::other("the socket named no listening process"))?;
+        Ok(Listener { pid, uid: cred.uid })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut pid: libc::pid_t = 0;
+        let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+        // SAFETY: `fd` is open, and `pid` and `len` outlive the call and
+        // describe a buffer of `len` bytes.
+        let got = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
+                std::ptr::addr_of_mut!(pid).cast(),
+                &mut len,
+            )
+        };
+        if got == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let (mut uid, mut gid) = (0, 0);
+        // SAFETY: `fd` is open, and `uid` and `gid` outlive the call.
+        if unsafe { libc::getpeereid(fd, &mut uid, &mut gid) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let pid = u32::try_from(pid)
+            .ok()
+            .filter(|&pid| pid > 0)
+            .ok_or_else(|| io::Error::other("the socket named no listening process"))?;
+        Ok(Listener { pid, uid })
+    }
+}
+
+/// What one whole line from a daemon says about its build: `Some(Some(_))`
+/// for a statement, `Some(None)` for any other event, `None` for a line that
+/// is not JSON.
+fn build_in(line: &[u8]) -> Option<Option<Build>> {
+    let event = serde_json::from_slice::<serde_json::Value>(line).ok()?;
+    // Read as JSON rather than as this build's `FrontendEvent`: the daemon may
+    // be another version, whose other events this build cannot parse.
+    Some(
+        event
+            .get("DaemonBuild")
+            .and_then(|build| serde_json::from_value::<Build>(build.clone()).ok()),
+    )
+}
+
+/// Present `token`, if any, on `stream`, and read until the daemon states its
+/// build or `deadline` passes. See [`DaemonEndpoint::build`].
+fn build_follows(
+    mut stream: impl Timed,
+    token: Option<&str>,
+    deadline: Instant,
+) -> io::Result<Option<StatedBuild>> {
+    stream.wait_at_most(time_left(deadline)?)?;
+    if let Some(token) = token {
+        stream.write_all(format!("{token}\n").as_bytes())?;
+    }
+    let mut served = false;
+    let mut line = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let unstated = |served: bool| served.then_some(StatedBuild::Unstated);
+    loop {
+        let Ok(left) = time_left(deadline) else {
+            return Ok(unstated(served));
+        };
+        stream.wait_at_most(left)?;
+        let read = match stream.read(&mut chunk) {
+            Ok(0) => return Ok(unstated(served)),
+            Ok(n) => &chunk[..n],
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(unstated(served));
+            }
+            Err(e) => return Err(e),
+        };
+        for piece in read.split_inclusive(|&b| b == b'\n') {
+            let Some(end) = piece.strip_suffix(b"\n") else {
+                line.extend_from_slice(piece);
+                continue;
+            };
+            line.extend_from_slice(end);
+            match build_in(&line) {
+                Some(Some(build)) => return Ok(Some(StatedBuild::Is(build))),
+                Some(None) => served = true,
+                None => {}
+            }
+            line.clear();
+        }
+        if line.len() > EVENT_LINE_LIMIT {
+            return Ok(unstated(served));
+        }
+    }
 }
 
 /// A connected stream whose reads and writes can be given a timeout.
@@ -906,6 +1104,120 @@ mod serves_whatever_its_version {
             "`serves` said {serves} after {took:?} of {within:?}, for a peer that \
              sent more of one line than any event has. Reading on holds all of it \
              in memory for as long as the ask lasts."
+        );
+    }
+}
+
+#[cfg(test)]
+mod asks_a_daemon_its_build {
+    //! The front door restarts the service only when the daemon that answers
+    //! is another build (#222), so what a daemon says about its build decides
+    //! whether it is stopped. A daemon of this build that answers slowly, or
+    //! whose statement comes after another event, must still read as itself.
+
+    use super::{Build, DaemonEndpoint, StatedBuild};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::time::{Duration, Instant};
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// A daemon stand-in on a loopback port. It reads the token first when
+    /// `takes_token`, then sends `lines`, then stays connected until the asker
+    /// hangs up.
+    fn saying(takes_token: bool, lines: &'static [&'static str]) -> DaemonEndpoint {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        let endpoint = DaemonEndpoint::Tcp(listener.local_addr().expect("its address"));
+        std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = BufReader::new(stream.try_clone().expect("a second handle"));
+            if takes_token {
+                let _ = reader.read_line(&mut String::new());
+            }
+            let mut writer = stream;
+            for line in lines {
+                let _ = writer.write_all(line.as_bytes());
+            }
+            let _ = reader.read_to_end(&mut Vec::new());
+        });
+        endpoint
+    }
+
+    const STATED: &str = "{\"DaemonBuild\":{\"version\":\"0.13.0\",\"commit\":\"abcd1234\"}}\n";
+
+    fn stated() -> Option<StatedBuild> {
+        Some(StatedBuild::Is(Build {
+            version: "0.13.0".into(),
+            commit: "abcd1234".into(),
+        }))
+    }
+
+    // LEDGER T2220 | class B | bytes over a real socket + 1 return value
+    #[test]
+    fn a_daemon_that_states_its_build_reads_as_that_build_even_after_another_event() {
+        let within = Duration::from_secs(5);
+        let first = saying(true, &[STATED]).build(Some(TOKEN), within);
+        let began = Instant::now();
+        let after = saying(true, &["{\"Enumerate\":[]}\n", "{\"Other\":1}\n", STATED])
+            .build(Some(TOKEN), within);
+        let took = began.elapsed();
+        assert_eq!(
+            (first, after),
+            (stated(), stated()),
+            "(stated at once, stated after other events). A daemon of this build \
+             read as one that states nothing is restarted by the app."
+        );
+        assert!(
+            took < within / 2,
+            "the statement came at once and the ask still took {took:?} of {within:?}"
+        );
+    }
+
+    // LEDGER T2221 | class B | bytes over a real socket + 1 return value
+    #[test]
+    fn a_daemon_that_sends_state_and_no_build_is_one_from_before_the_statement() {
+        let within = Duration::from_millis(600);
+        let with_token = saying(true, &["{\"Enumerate\":[]}\n"]).build(Some(TOKEN), within);
+        // A daemon from before the token sends its state to any connection.
+        let before_token = saying(false, &["{\"Enumerate\":[]}\n"]).build(None, within);
+        let silent = saying(true, &[]).build(Some(TOKEN), within);
+        let garbage = saying(true, &["not json\n"]).build(Some(TOKEN), within);
+        assert_eq!(
+            (with_token, before_token, silent, garbage),
+            (
+                Some(StatedBuild::Unstated),
+                Some(StatedBuild::Unstated),
+                None,
+                None
+            ),
+            "(state and no build, state without a token, nothing, not JSON). \
+             Only a daemon that sends state and never says its build is one from \
+             before the statement; one that says nothing may be still starting."
+        );
+    }
+
+    /// The listener named is the process that listens, as the kernel says.
+    // LEDGER T2222 | class B | 1 return value from a real socket
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_listener_is_the_process_that_listens() {
+        let path = std::path::PathBuf::from(format!("/tmp/h-lsn-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listening = std::os::unix::net::UnixListener::bind(&path).expect("a unix listener");
+        let got = DaemonEndpoint::Unix(path.clone()).listener();
+        drop(listening);
+        let _ = std::fs::remove_file(&path);
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        assert_eq!(
+            got.map_err(|e| e.to_string()),
+            Ok(super::Listener {
+                pid: std::process::id(),
+                uid
+            }),
+            "the front door stops the process this names; naming any other is \
+             stopping the wrong program"
         );
     }
 }

@@ -122,6 +122,11 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             .into(),
     );
     ui.set_notice_seq(1);
+    // PREVIEW_NOTICE="..." shows another notice, such as the front door's
+    // restart of a service running another build (#222).
+    if let Ok(notice) = std::env::var("PREVIEW_NOTICE") {
+        ui.set_notice(notice.into());
+    }
 
     // Exercise all four merged-card states in one shot.
     ui.set_devices(ModelRc::new(VecModel::from(vec![

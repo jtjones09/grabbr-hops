@@ -205,6 +205,22 @@ async fn the_daemon_states_its_build_first_and_the_app_names_another() {
     assert_eq!(syncs, 2, "two syncs were asked for: {names:?}");
     drop((events, requests));
 
+    // T2220 end to end: what the front door asks before it decides whether
+    // to restart the service (#222) reads this daemon as its own build.
+    let endpoint = hops_ipc::DaemonEndpoint::of_this_platform().expect("the scratch endpoint");
+    let token = hops_ipc::token::read().ok();
+    let asked = tokio::task::spawn_blocking(move || {
+        endpoint.build(token.as_deref(), Duration::from_secs(10))
+    })
+    .await
+    .expect("the ask ran");
+    assert_eq!(
+        asked,
+        Some(hops_ipc::StatedBuild::Is(ours.clone())),
+        "the front door read the daemon of its own build as another, and would \
+         restart it"
+    );
+
     // T59: the app's own client, as this build and as another.
     let local = tokio::task::LocalSet::new();
     local
@@ -212,6 +228,7 @@ async fn the_daemon_states_its_build_first_and_the_app_names_another() {
             let same = FrontendClient::spawn(Launch {
                 build: Some(ours.clone()),
                 start_problem: Some("stale: a start that did not come up".into()),
+                ..Launch::default()
             });
             let model = attached(&same, Duration::from_secs(10)).await;
             assert_eq!(
@@ -232,7 +249,7 @@ async fn the_daemon_states_its_build_first_and_the_app_names_another() {
             };
             let newer = FrontendClient::spawn(Launch {
                 build: Some(other.clone()),
-                start_problem: None,
+                ..Launch::default()
             });
             let model = attached(&newer, Duration::from_secs(10)).await;
             let said = model.service_problem().unwrap_or_default();
