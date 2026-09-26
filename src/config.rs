@@ -630,7 +630,8 @@ impl Config {
 
     /// The config of a daemon a test runs in-process: `hops --config
     /// <config> --cert-path <cert> daemon`, never the test's own arguments.
-    #[cfg(test)]
+    /// Unix only, like the one test module that runs a daemon this way.
+    #[cfg(all(test, unix))]
     pub(crate) fn in_scratch(config: &Path, cert: &Path) -> Result<Self, ConfigError> {
         use std::ffi::OsStr;
         let args = [
