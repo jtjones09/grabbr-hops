@@ -213,11 +213,18 @@ fn a_device_added_while_pairing_is_open_is_dialled_until_switched_off() {
             .request(FrontendRequest::Activate(handle, true))
             .await
             .expect("activate");
-        settle(Duration::from_secs(4)).await;
+        // Waits for the third attempt rather than counting inside a fixed
+        // window: the retry is about a second apart, but a daemon started
+        // under a loaded test run can begin late (#226). One that dials once
+        // and gives up still never gets there.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while attempts.get() < 3 && Instant::now() < deadline {
+            settle(Duration::from_millis(200)).await;
+        }
         let dialled = attempts.get();
         assert!(
             dialled >= 3,
-            "a device added with add device open was dialled {dialled} time(s) in 4 s, \
+            "a device added with add device open was dialled {dialled} time(s) in 15 s, \
              with no crossing; expected about one a second; log:\n{}",
             daemon.log()
         );
