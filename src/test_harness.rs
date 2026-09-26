@@ -210,3 +210,156 @@ impl Dialer {
             .unwrap_or_else(|e| panic!("sending {event}: {e}"));
     }
 }
+
+/// What reached the log from this thread, for a test about what the log says.
+///
+/// One logger for the whole test binary, installed once: `log` takes a global
+/// logger and refuses a second one. It keeps the records of a thread holding a
+/// [`LogCapture`] and drops everyone else's, so tests running in parallel do
+/// not see each other's lines. [`run_local`] runs a whole two-machine session
+/// on the test's own thread, so that thread sees all of it.
+pub(crate) mod logs {
+    use std::cell::RefCell;
+    use std::marker::PhantomData;
+    use std::net::SocketAddr;
+    use std::sync::Once;
+
+    use input_event::scancode;
+
+    /// One record, as the daemon's own log would carry it.
+    #[derive(Clone, Debug)]
+    pub(crate) struct Line {
+        pub(crate) level: log::Level,
+        pub(crate) target: String,
+        pub(crate) text: String,
+    }
+
+    impl Line {
+        /// From one of hops' own crates rather than a dependency. A bare
+        /// `HOPS_LOG_LEVEL` raises only these; dependencies stay at `warn`.
+        pub(crate) fn is_ours(&self) -> bool {
+            let crate_name = self.target.split("::").next().unwrap_or_default();
+            crate_name == "hops"
+                || crate_name.starts_with("hops_")
+                || crate_name.starts_with("input_")
+        }
+    }
+
+    thread_local! {
+        static LINES: RefCell<Option<Vec<Line>>> = const { RefCell::new(None) };
+    }
+
+    struct ToTheCapturingThread;
+
+    impl log::Log for ToTheCapturingThread {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            LINES.try_with(|l| l.borrow().is_some()).unwrap_or(false)
+        }
+
+        fn log(&self, record: &log::Record) {
+            if !self.enabled(record.metadata()) {
+                return;
+            }
+            // Formatted before the borrow: a Display impl that logs must not
+            // find the buffer already borrowed.
+            let line = Line {
+                level: record.level(),
+                target: record.target().to_owned(),
+                text: record.args().to_string(),
+            };
+            let _ = LINES.try_with(|l| {
+                if let Some(lines) = l.borrow_mut().as_mut() {
+                    lines.push(line);
+                }
+            });
+        }
+
+        fn flush(&self) {}
+    }
+
+    static INSTALL: Once = Once::new();
+
+    /// Records this thread's log lines, at every level, until dropped.
+    pub(crate) struct LogCapture {
+        /// Bound to the thread whose lines it holds.
+        _here: PhantomData<*const ()>,
+    }
+
+    /// Start keeping this thread's log lines, at trace and above.
+    pub(crate) fn capture() -> LogCapture {
+        INSTALL.call_once(|| {
+            log::set_boxed_logger(Box::new(ToTheCapturingThread))
+                .expect("another logger is installed in this test binary");
+            log::set_max_level(log::LevelFilter::Trace);
+        });
+        LINES.with(|l| *l.borrow_mut() = Some(Vec::new()));
+        LogCapture { _here: PhantomData }
+    }
+
+    impl LogCapture {
+        /// Every line so far, oldest first.
+        pub(crate) fn lines(&self) -> Vec<Line> {
+            LINES.with(|l| l.borrow().clone().unwrap_or_default())
+        }
+
+        /// Lines from hops' own crates that name `key`: its scancode name, or
+        /// its number anywhere a number stands alone.
+        pub(crate) fn naming(&self, key: scancode::Linux) -> Vec<Line> {
+            self.lines()
+                .into_iter()
+                .filter(|l| l.is_ours() && names_key(&l.text, key))
+                .collect()
+        }
+    }
+
+    impl Drop for LogCapture {
+        fn drop(&mut self) {
+            let _ = LINES.try_with(|l| *l.borrow_mut() = None);
+        }
+    }
+
+    /// Whether `text` identifies `key`, by name or by number.
+    ///
+    /// By number means a run of digits equal to the key's code. Addresses,
+    /// fingerprints and hex such as a build commit carry digit runs that are
+    /// not keys, so they are set aside first; otherwise a port or a
+    /// fingerprint byte that happens to read `30` would look like `KEY_A`.
+    pub(crate) fn names_key(text: &str, key: scancode::Linux) -> bool {
+        if text.contains(&format!("{key:?}")) {
+            return true;
+        }
+        let code = (key as u32).to_string();
+        text.split(|c: char| c.is_whitespace() || "()[]{},;\"'<>=".contains(c))
+            .filter(|token| !carries_other_numbers(token))
+            .flat_map(|token| token.split(|c: char| !c.is_ascii_digit()))
+            .any(|run| run == code)
+    }
+
+    fn carries_other_numbers(token: &str) -> bool {
+        let hex_pairs = token.contains(':')
+            && token
+                .split(':')
+                .all(|b| b.len() == 2 && b.chars().all(|c| c.is_ascii_hexdigit()));
+        let hex_word = token.chars().all(|c| c.is_ascii_hexdigit())
+            && token.chars().any(|c| c.is_ascii_alphabetic());
+        token.parse::<SocketAddr>().is_ok() || hex_pairs || hex_word
+    }
+
+    #[test]
+    fn a_key_is_found_by_name_and_by_number_and_nothing_else_is() {
+        let a = scancode::Linux::KeyA; // 30
+        assert!(names_key("key(KeyA, 1)", a));
+        assert!(names_key("key(30, 1)", a));
+        assert!(names_key("Key { time: 0, key: 30, state: 1 }", a));
+        assert!(names_key("releasing stuck key: 30", a));
+        for other in [
+            "key(<hidden>, 1) <-<-<-<-<- 127.0.0.1:53012",
+            "peer 30:1e:19:1b:c4:a8:40:f5:26:37:39:9d:c7:c7:75:fe:17:4f:03:d5:a9:76:49:cd:b1:12:d1:2f:6c:1f:d2:22",
+            "Hello(a30f1b2c)",
+            "button(left, 1) 0x130",
+            "releasing 1 stuck key(s)",
+        ] {
+            assert!(!names_key(other, a), "{other:?} does not name KeyA");
+        }
+    }
+}

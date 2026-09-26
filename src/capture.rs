@@ -599,7 +599,7 @@ impl CaptureTask {
                 if *state == 0 {
                     self.held_lock_keys.remove(key);
                 } else if !self.held_lock_keys.insert(*key) {
-                    log::trace!("swallowing auto-repeat for lock key {key}");
+                    log::trace!("swallowing a lock key's auto-repeat");
                     return Ok(());
                 }
             }
@@ -1257,6 +1257,67 @@ mod release_mid_drag {
                  and Leave: {:?}",
                 v.frames()
             );
+        });
+    }
+
+    // LEDGER T117-2 | class B | 5 log line: Capture task and LanMouseConnection::send over loopback
+    /// The sender's side of #117: every key it captures and sends is traced,
+    /// and a held lock key's auto-repeat is traced as it is dropped. At trace,
+    /// which a developer turns on to look at something else, none of those
+    /// lines may say which key.
+    #[test]
+    fn keys_captured_and_sent_are_not_named_in_the_log() {
+        const TYPED: scancode::Linux = scancode::Linux::KeyA;
+        const LOCK: scancode::Linux = scancode::Linux::KeyCapsLock;
+        run_local(async {
+            let logs = crate::test_harness::logs::capture();
+            let v = Visit::start(true).await;
+
+            // Caps Lock held long enough to repeat: the repeat is dropped.
+            v.script.push(Position::Left, key(LOCK, 1));
+            v.script.push(Position::Left, key(LOCK, 1));
+            v.script.push(Position::Left, key(LOCK, 0));
+            v.script.push(Position::Left, key(TYPED, 1));
+            v.script.push(Position::Left, key(TYPED, 0));
+            let up = ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                time: 0,
+                key: TYPED as u32,
+                state: 0,
+            }));
+            wait_until("the key-up to reach the peer", PATIENCE, || {
+                v.count(&up) > 0
+            })
+            .await;
+
+            let lines = logs.lines();
+            let seen = |target: &str, needles: &[&str]| {
+                lines.iter().any(|l| {
+                    l.level == log::Level::Trace
+                        && l.target == target
+                        && needles.iter().all(|n| l.text.contains(n))
+                })
+            };
+            // Without these, a capture that never saw the lines would pass.
+            assert!(
+                seen("hops::capture", &["Keyboard"]),
+                "the capture task's trace line for a key never reached the capture: {lines:#?}"
+            );
+            assert!(
+                seen("hops::connect", &[">->->->->-", "key("]),
+                "the sender's trace line for a key on the wire never reached the capture: {lines:#?}"
+            );
+            assert!(
+                seen("hops::capture", &["auto-repeat"]),
+                "the trace line for the dropped lock-key repeat never reached the capture: {lines:#?}"
+            );
+            for held in [TYPED, LOCK] {
+                let naming = logs.naming(held);
+                assert!(
+                    naming.is_empty(),
+                    "the log names {held:?}. Raising the log level must not record \
+                     what someone types: {naming:#?}"
+                );
+            }
         });
     }
 }

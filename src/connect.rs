@@ -1278,15 +1278,24 @@ mod tests {
         );
     }
 
-    /// A sender dialled into a receiver that records every frame it is sent,
-    /// as text: `ProtoEvent` has no equality.
+    /// A sender dialled into a receiver that records every frame it is sent.
     struct Recorded {
         conn: LanMouseConnection,
         handle: ClientHandle,
         trust: Trust,
         receiver: String,
         addr: SocketAddr,
-        frames: Rc<RefCell<Vec<String>>>,
+        frames: Rc<RefCell<Vec<ProtoEvent>>>,
+    }
+
+    /// `ProtoEvent` has no equality. An input frame is compared by its event,
+    /// since its text no longer says which key (#117); any other by its text.
+    fn same(a: &ProtoEvent, b: &ProtoEvent) -> bool {
+        match (a, b) {
+            (ProtoEvent::Input(a), ProtoEvent::Input(b)) => a == b,
+            (ProtoEvent::Input(_), _) | (_, ProtoEvent::Input(_)) => false,
+            _ => a.to_string() == b.to_string(),
+        }
     }
 
     fn key(key: u32, state: u8) -> ProtoEvent {
@@ -1305,7 +1314,7 @@ mod tests {
         let ep = Endpoint::server(open_server(&server), "127.0.0.1:0".parse().expect("addr"))
             .expect("server endpoint");
         let addr = ep.local_addr().expect("local addr");
-        let frames: Rc<RefCell<Vec<String>>> = Default::default();
+        let frames: Rc<RefCell<Vec<ProtoEvent>>> = Default::default();
         let heard = frames.clone();
         spawn_local(async move {
             while let Some(incoming) = ep.accept().await {
@@ -1316,7 +1325,7 @@ mod tests {
                         return;
                     };
                     while let Ok(Some(frame)) = transport::read_frame(&mut recv).await {
-                        heard.borrow_mut().push(frame.to_string());
+                        heard.borrow_mut().push(frame);
                     }
                 });
             }
@@ -1364,9 +1373,8 @@ mod tests {
 
     impl Recorded {
         async fn heard(&self, frame: ProtoEvent) -> bool {
-            let frame = frame.to_string();
             for _ in 0..100 {
-                if self.frames.borrow().contains(&frame) {
+                if self.frames.borrow().iter().any(|f| same(f, &frame)) {
                     return true;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;

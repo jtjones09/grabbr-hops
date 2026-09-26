@@ -3088,3 +3088,288 @@ mod discovery_is_declared_to_the_operating_system {
         );
     }
 }
+
+mod no_log_line_in_the_input_path_names_a_key {
+    //! **#117.** A log line may say that a key went down or up, never which
+    //! key. Raising the log level to look at a handshake must not record what
+    //! someone types, and a warn line is written with no level raised at all.
+    //! Key identity goes to the opt-in, time-boxed `keylog` file instead.
+    //!
+    //! **Why a text scan.** The type every event log line prints through is
+    //! covered by calling it (`input_event`'s `no_key_identity` tests), and
+    //! the daemon's own lines by running two machines over loopback
+    //! (`a_key_released_at_teardown_is_not_named_in_the_log`,
+    //! `keys_captured_and_sent_are_not_named_in_the_log`). What is left are
+    //! the platform backends: wlroots, libei, the Windows hook and the macOS
+    //! HID path compile only on their own OS and act only in a live session,
+    //! so no test here can run them. For those, this checks that no log call
+    //! formats a variable that holds a key.
+
+    /// Names that hold a key, a scancode, a keysym, a modifier set, or a raw
+    /// libei event (whose Debug prints the key).
+    const KEY_HOLDERS: &[&str] = &[
+        "key",
+        "keys",
+        "keycode",
+        "key_code",
+        "linux_keycode",
+        "scancode",
+        "scan_code",
+        "scan",
+        "win_scan_code",
+        "linux_scan_code",
+        "linux_scancode",
+        "windows_scancode",
+        "scanCode",
+        "vkCode",
+        "vk",
+        "nx_keytype",
+        "keysym",
+        "mods",
+        "ei_event",
+    ];
+
+    /// Every source file on the input path that logs.
+    const FILES: &[(&str, &str)] = &[
+        (
+            "crates/input-capture/src/lib.rs",
+            include_str!("../crates/input-capture/src/lib.rs"),
+        ),
+        (
+            "crates/input-capture/src/libei.rs",
+            include_str!("../crates/input-capture/src/libei.rs"),
+        ),
+        (
+            "crates/input-capture/src/macos.rs",
+            include_str!("../crates/input-capture/src/macos.rs"),
+        ),
+        (
+            "crates/input-capture/src/layer_shell.rs",
+            include_str!("../crates/input-capture/src/layer_shell.rs"),
+        ),
+        (
+            "crates/input-capture/src/windows/event_thread.rs",
+            include_str!("../crates/input-capture/src/windows/event_thread.rs"),
+        ),
+        (
+            "crates/input-emulation/src/lib.rs",
+            include_str!("../crates/input-emulation/src/lib.rs"),
+        ),
+        (
+            "crates/input-emulation/src/dummy.rs",
+            include_str!("../crates/input-emulation/src/dummy.rs"),
+        ),
+        (
+            "crates/input-emulation/src/libei.rs",
+            include_str!("../crates/input-emulation/src/libei.rs"),
+        ),
+        (
+            "crates/input-emulation/src/macos.rs",
+            include_str!("../crates/input-emulation/src/macos.rs"),
+        ),
+        (
+            "crates/input-emulation/src/windows.rs",
+            include_str!("../crates/input-emulation/src/windows.rs"),
+        ),
+        (
+            "crates/input-emulation/src/wlroots.rs",
+            include_str!("../crates/input-emulation/src/wlroots.rs"),
+        ),
+        (
+            "crates/input-emulation/src/xdg_desktop_portal.rs",
+            include_str!("../crates/input-emulation/src/xdg_desktop_portal.rs"),
+        ),
+        (
+            "crates/input-event/src/keylog.rs",
+            include_str!("../crates/input-event/src/keylog.rs"),
+        ),
+        ("src/capture.rs", include_str!("capture.rs")),
+        ("src/emulation.rs", include_str!("emulation.rs")),
+        ("src/connect.rs", include_str!("connect.rs")),
+        ("src/listen.rs", include_str!("listen.rs")),
+    ];
+
+    const LEVELS: &[&str] = &["trace!(", "debug!(", "info!(", "warn!(", "error!(", "log!("];
+
+    /// Each `log::…!( … )` call in `code`: its line and the text between the
+    /// parentheses. `Err` names a call whose closing parenthesis was not found,
+    /// which would otherwise hide every call after it.
+    fn log_calls(code: &str) -> Result<Vec<(usize, &str)>, usize> {
+        let mut calls = vec![];
+        for (at, _) in code.match_indices("log::") {
+            let rest = &code[at + "log::".len()..];
+            let Some(level) = LEVELS.iter().find(|l| rest.starts_with(**l)) else {
+                continue;
+            };
+            let line = code[..at].matches('\n').count() + 1;
+            let open = at + "log::".len() + level.len();
+            let close = closing(&code[open..]).ok_or(line)?;
+            calls.push((line, &code[open..open + close]));
+        }
+        Ok(calls)
+    }
+
+    /// Offset of the `)` closing an already-open parenthesis, outside strings.
+    fn closing(s: &str) -> Option<usize> {
+        let (mut depth, mut in_str, mut escaped) = (0usize, false, false);
+        for (i, c) in s.char_indices() {
+            if in_str {
+                match c {
+                    _ if escaped => escaped = false,
+                    '\\' => escaped = true,
+                    '"' => in_str = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                '"' => in_str = true,
+                '(' | '[' | '{' => depth += 1,
+                ')' if depth == 0 => return Some(i),
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The arguments of a call, split on commas outside strings and brackets.
+    fn arguments(body: &str) -> Vec<&str> {
+        let (mut args, mut start) = (vec![], 0);
+        let (mut depth, mut in_str, mut escaped) = (0usize, false, false);
+        for (i, c) in body.char_indices() {
+            if in_str {
+                match c {
+                    _ if escaped => escaped = false,
+                    '\\' => escaped = true,
+                    '"' => in_str = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                '"' => in_str = true,
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    args.push(body[start..i].trim());
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        args.push(body[start..].trim());
+        args.retain(|a| !a.is_empty());
+        args
+    }
+
+    /// The names a log call prints: `{name}` captures in its format string,
+    /// and arguments that are a plain variable or field. A function call is
+    /// not a name: it is how a value is printed without its key.
+    fn printed(body: &str) -> Vec<String> {
+        let mut args = arguments(body).into_iter().peekable();
+        if args.peek().is_some_and(|a| a.starts_with("target:")) {
+            args.next();
+        }
+        // `log::log!(level, "…")` names its level first.
+        if args.peek().is_some_and(|a| !a.starts_with('"')) {
+            args.next();
+        }
+        let mut names = vec![];
+        if let Some(format) = args.next() {
+            let mut rest = format;
+            while let Some(open) = rest.find('{') {
+                rest = &rest[open + 1..];
+                if let Some(escaped) = rest.strip_prefix('{') {
+                    rest = escaped;
+                    continue;
+                }
+                let end = rest.find('}').unwrap_or(rest.len());
+                let name = rest[..end].split(':').next().unwrap_or("").trim();
+                if !name.is_empty() && !name.chars().all(|c| c.is_ascii_digit()) {
+                    names.push(name.to_owned());
+                }
+                rest = &rest[end..];
+            }
+        }
+        for arg in args {
+            let value = arg.split_once('=').map_or(arg, |(_, v)| v).trim();
+            let value = value.trim_start_matches(['&', '*']);
+            if value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+            {
+                if let Some(last) = value.rsplit('.').next() {
+                    names.push(last.to_owned());
+                }
+            }
+        }
+        names
+    }
+
+    #[test]
+    fn the_scan_reads_calls_the_way_the_compiler_does() {
+        let code = "log::trace!(\"{key:#?} is not a modifier\");\n\
+                    log::warn!(\n    \"a (b) {} (vk={:#04x})\",\n    scan_code,\n    hook.vkCode\n);\n\
+                    log::debug!(\"{}\", describe(&key));\n\
+                    log::log!(level, \"{{literal}} {n} {0}\", mods);\n\
+                    log::info!(\"released {} stuck key(s)\", keys.len());";
+        let calls = log_calls(code).expect("every call closes");
+        let names: Vec<Vec<String>> = calls.iter().map(|(_, b)| printed(b)).collect();
+        assert_eq!(
+            names,
+            vec![
+                vec!["key".to_owned()],
+                vec!["scan_code".to_owned(), "vkCode".to_owned()],
+                vec![],
+                vec!["n".to_owned(), "mods".to_owned()],
+                vec![],
+            ],
+            "the scan misreads a log call, so the guard below would miss a key \
+             printed that way"
+        );
+        assert_eq!(
+            calls.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+            vec![1, 2, 7, 8, 9]
+        );
+    }
+
+    #[test]
+    fn no_log_call_on_the_input_path_prints_a_key() {
+        let mut offenders = vec![];
+        let mut seen = 0;
+        for (file, src) in FILES {
+            let code = super::scan::code_only(src);
+            let calls = log_calls(&code).unwrap_or_else(|line| {
+                panic!("{file}:{line}: a log call with no closing parenthesis")
+            });
+            assert!(
+                !calls.is_empty(),
+                "{file}: no log call found. It logs, so the scan is not reading it \
+                 and would pass whatever it printed."
+            );
+            seen += calls.len();
+            for (line, body) in calls {
+                for name in printed(body) {
+                    if KEY_HOLDERS.contains(&name.as_str()) {
+                        offenders.push(format!("{file}:{line} prints `{name}`"));
+                    }
+                }
+            }
+        }
+        assert!(
+            seen > 200,
+            "only {seen} log calls read; files have gone missing"
+        );
+        assert!(
+            offenders.is_empty(),
+            "log calls on the input path print which key was pressed:\n  {}\n\n\
+             Anyone who raises HOPS_LOG_LEVEL to look at something else would \
+             start recording what is typed, and a warn line does it with no \
+             level raised at all (#117). Say that a key went down or up; send \
+             its identity to `input_event::keylog::key`, which is compiled out \
+             of release builds and time-boxed when armed.",
+            offenders.join("\n  ")
+        );
+    }
+}
