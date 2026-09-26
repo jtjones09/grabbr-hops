@@ -389,6 +389,7 @@ impl LanMouseListener {
                                         let closer = ReplyQueueGuard { replies, ready };
                                         let clipboard = ClipboardInlet {
                                             from: fingerprint.clone(),
+                                            dialled_for: None,
                                             trust: trust.clone(),
                                             tx: clipboard_in,
                                         };
@@ -590,7 +591,7 @@ impl ClipboardSenderListen {
             conns
                 .iter()
                 .filter(|e| trust.clipboard_to(&e.fingerprint))
-                .filter(|e| self.clients.switch_allows_clipboard(&e.fingerprint))
+                .filter(|e| self.clients.switch_allows_clipboard(&e.fingerprint, None))
                 .map(|e| e.conn.clone())
                 .collect()
         };

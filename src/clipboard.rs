@@ -137,6 +137,12 @@ impl Clipboard {
     }
 }
 
+const SWITCHED_OFF_LOG_DEBOUNCE: Duration = Duration::from_secs(60);
+thread_local! {
+    static PREV_SWITCHED_OFF_LOG: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Clipboard text from peers, on its way to being applied here.
 ///
 /// The transports check the pairing when a transfer arrives and when it
@@ -164,8 +170,18 @@ impl ClipboardInbox {
     pub(crate) async fn next(&mut self) -> Option<String> {
         loop {
             let received = self.rx.recv().await?;
-            if !self.clients.switch_allows_clipboard(&received.from) {
-                log::info!("clipboard text dropped: its sender is switched off on this machine");
+            if !self
+                .clients
+                .switch_allows_clipboard(&received.from, received.dialled_for)
+            {
+                // Debounced: a paired machine keeps sending on every copy.
+                crate::debounce!(
+                    PREV_SWITCHED_OFF_LOG,
+                    SWITCHED_OFF_LOG_DEBOUNCE,
+                    log::info!(
+                        "clipboard text dropped: its sender is switched off on this machine"
+                    )
+                );
                 continue;
             }
             if self
@@ -433,6 +449,7 @@ mod clipboard_follows_the_pairing {
             let mut inbox = ClipboardInbox::new(rx, trust.clone(), Default::default());
             let from_peer = |text: &str| PeerClipboard {
                 from: peer.fingerprint.clone(),
+                dialled_for: None,
                 text: text.to_string(),
             };
             queue.send(from_peer("before")).expect("queue");
@@ -484,6 +501,7 @@ mod clipboard_follows_the_switch {
     //! loopback; only the system clipboard at each end is left out.
 
     use std::collections::HashSet;
+    use std::net::{Ipv4Addr, Ipv6Addr};
     use std::time::Duration;
 
     use futures::StreamExt;
@@ -519,7 +537,7 @@ mod clipboard_follows_the_switch {
             .map(|(text, _)| text)
     }
 
-    // LEDGER T2181 | class B | 1 return value: ClipboardInbox::next on each machine, after ClipboardSender::broadcast and ClipboardSenderListen::broadcast; OutboundRevoker::close_fingerprint, LanMouseConnection::send
+    // LEDGER T2181 | class B | 1 return value: ClipboardInbox::next on each machine, after ClipboardSender::broadcast and ClipboardSenderListen::broadcast; OutboundRevoker::close_device, LanMouseConnection::send
     #[test]
     fn a_device_switched_off_is_sent_no_clipboard_over_the_link_dialled_to_it_and_none_of_its_is_applied()
      {
@@ -574,13 +592,22 @@ mod clipboard_follows_the_switch {
                  stopped"
             );
 
-            // What switching it off does to the link: closed by the
-            // fingerprint it proved. Switched back on, it is dialled at the
-            // next crossing, as any device that is on is.
+            // What switching it off does to the link, as the service does it:
+            // closed. Switched back on, it is dialled at the next crossing, as
+            // any device that is on is.
             assert!(switch.deactivate_client(device), "precondition");
-            let peer_fp = pair.driven.fingerprint.clone();
+            let pin = switch.peer_fingerprint(device);
             assert_eq!(
-                pair.dialer.conn.revoker().close_fingerprint(&peer_fp).await,
+                pin.as_deref(),
+                Some(pair.driven.fingerprint.as_str()),
+                "precondition: pinned to the machine it dialled"
+            );
+            assert_eq!(
+                pair.dialer
+                    .conn
+                    .revoker()
+                    .close_device(device, pin.as_deref())
+                    .await,
                 1,
                 "precondition: the link was up"
             );
@@ -599,6 +626,97 @@ mod clipboard_follows_the_switch {
                 "a device switched off and on again was not sent clipboard over \
                  its new link"
             );
+        });
+    }
+
+    // LEDGER T2185 | class B | 1 return value: ClipboardInbox::next on each machine after ClipboardSender::broadcast, OutboundRevoker::close_device; 6 struct state: LanMouseConnection::active_addr after LanMouseConnection::send
+    #[test]
+    fn a_device_edited_while_connected_and_then_switched_off_gets_no_clipboard_and_its_link_closes()
+    {
+        run_local(async {
+            let (peer, me) = (machine(), machine());
+            let (on_peer, on_me) = (both_ways(&peer, &me), both_ways(&me, &peer));
+            let mut pair = clipboard_pair(peer, on_peer, me, on_me).await;
+            let (mut peer_applies, mut here_applies) = pair.inboxes();
+            let (switch, device) = (pair.dialer.clients.clone(), pair.dialer.handle);
+
+            // Each edit forgets the machine the device was pinned to and
+            // leaves its link up: a rename from the app, and a change of
+            // address.
+            type Edit = fn(&ClientManager, ClientHandle);
+            let edits: [(&str, Edit); 2] = [
+                ("renamed", |m, h| {
+                    m.set_hostname(h, Some("desk mac".into()));
+                }),
+                ("re-addressed", |m, h| {
+                    m.set_fix_ips(
+                        h,
+                        vec![Ipv4Addr::LOCALHOST.into(), Ipv6Addr::LOCALHOST.into()],
+                    )
+                }),
+            ];
+            for (edit, apply) in edits {
+                assert!(
+                    switch.peer_fingerprint(device).is_some(),
+                    "precondition: the device is pinned to the machine it dialled"
+                );
+                apply(&switch, device);
+                assert_eq!(
+                    switch.peer_fingerprint(device),
+                    None,
+                    "precondition: the {edit} device forgot its pin"
+                );
+
+                assert!(switch.deactivate_client(device), "precondition");
+                pair.driver_sends.broadcast(format!("{edit}, off")).await;
+                assert_eq!(
+                    applied_within(&mut peer_applies, NEVER_WITHIN).await,
+                    None,
+                    "text copied here went to a device {edit} and then switched off \
+                     here, over the link this machine dialled to it"
+                );
+                pair.driven_sends
+                    .broadcast(format!("its, {edit}, off"))
+                    .await;
+                assert_eq!(
+                    applied_within(&mut here_applies, NEVER_WITHIN).await,
+                    None,
+                    "text from a device {edit} and then switched off here was applied \
+                     here"
+                );
+
+                // What switching it off does to the link, as the service does
+                // it: closed, though the device no longer names the machine.
+                let pin = switch.peer_fingerprint(device);
+                assert_eq!(
+                    pair.dialer
+                        .conn
+                        .revoker()
+                        .close_device(device, pin.as_deref())
+                        .await,
+                    1,
+                    "switching off a device {edit} while connected closed no link"
+                );
+
+                // Switched back on, it is dialled and pinned again.
+                assert!(switch.activate_client(device), "precondition");
+                let _ = pair.dialer.conn.send(ProtoEvent::Ping, device).await;
+                wait_until(
+                    "the device switched back on to be dialled again",
+                    LINK_UP_WITHIN,
+                    || pair.dialer.conn.active_addr(device).is_some(),
+                )
+                .await;
+                pair.driver_sends
+                    .broadcast(format!("{edit}, back on"))
+                    .await;
+                assert_eq!(
+                    applied_within(&mut peer_applies, ARRIVES_WITHIN).await,
+                    Some(format!("{edit}, back on")),
+                    "a device {edit}, switched off and on again was not sent \
+                     clipboard over its new link"
+                );
+            }
         });
     }
 

@@ -1,5 +1,7 @@
-//! Switching a device off closes the link this machine dialled to it, and
-//! switching it back on dials it again (#218).
+//! Switching a device off closes the link this machine dialled to it, even
+//! after an edit made the device forget which machine it reached, and
+//! switching it back on dials it again. The session that machine opened to
+//! this one stays up, and none of its clipboard is applied here (#218).
 //!
 //! Runs the built daemon. Its dummy capture crosses at the left edge a
 //! thousand times a second, so a device on the left that is switched on is
@@ -15,7 +17,9 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use hops_ipc::{FrontendEvent, FrontendRequest, Position};
+use hops_ipc::{
+    AsyncFrontendEventReader, AsyncFrontendRequestWriter, FrontendEvent, FrontendRequest, Position,
+};
 use hops_proto::{MAX_EVENT_SIZE, ProtoEvent};
 
 /// Generous: a daemon started under a loaded test run can be slow to dial.
@@ -71,6 +75,41 @@ fn receiver(identity: &common::Identity) -> (quinn::Endpoint, Links) {
     (ep, links)
 }
 
+/// The daemon's reason for dropping clipboard text from a machine switched
+/// off here.
+const DROPPED: &str = "clipboard text dropped: its sender is switched off on this machine";
+
+/// Wait until the app shows `handle`'s link up, which is when the daemon
+/// holds it, not only when the receiver has counted it.
+async fn shown_up(
+    events: &mut AsyncFrontendEventReader,
+    requests: &mut AsyncFrontendRequestWriter,
+    handle: u64,
+    log: impl Fn() -> String,
+) {
+    requests
+        .request(FrontendRequest::Enumerate())
+        .await
+        .expect("enumerate");
+    let up = common::next_matching(events, PATIENCE, |e| match e {
+        FrontendEvent::State(h, _, s) if h == handle && s.active_addr.is_some() => Some(()),
+        FrontendEvent::Enumerate(clients)
+            if clients
+                .iter()
+                .any(|(h, _, s)| *h == handle && s.active_addr.is_some()) =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+    assert!(
+        up.is_some(),
+        "the app never showed the device's link up; log:\n{}",
+        log()
+    );
+}
+
 async fn wait_for(what: &str, log: impl Fn() -> String, done: impl Fn() -> bool) {
     let deadline = Instant::now() + PATIENCE;
     while !done() {
@@ -83,7 +122,7 @@ async fn wait_for(what: &str, log: impl Fn() -> String, done: impl Fn() -> bool)
     }
 }
 
-// LEDGER T2184 | class B | 5 process: the built daemon over IPC; 2 links opened and closed at a QUIC receiver
+// LEDGER T2184 | class B | 5 process: the built daemon over IPC, and its log; 2 links opened and closed at a QUIC receiver, and a session it opened to the daemon
 #[test]
 fn switching_a_device_off_closes_its_link_and_switching_it_on_dials_again() {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -102,7 +141,7 @@ fn switching_a_device_off_closes_its_link_and_switching_it_on_dials_again() {
             .and_then(|s| s.local_addr())
             .expect("a free port")
             .port();
-        let (daemon, _) = common::start(
+        let (daemon, daemon_port) = common::start(
             "h-switch",
             &format!(
                 "[authorized_fingerprints]\n\"{fp}\" = \"receiver\"\n\n\
@@ -134,7 +173,25 @@ fn switching_a_device_off_closes_its_link_and_switching_it_on_dials_again() {
         .await
         .expect("the configured devices are listed");
 
-        wait_for("the device to be dialled", log, || links.opened.get() > 0).await;
+        // The same machine also drives this one, over a session it opened.
+        let (_its_endpoint, its_session) = identity
+            .dial(daemon_port)
+            .await
+            .unwrap_or_else(|| panic!("the paired machine was refused; log:\n{}", log()));
+        let mut its_input = its_session.open_uni().await.expect("input stream");
+        common::write(&mut its_input, ProtoEvent::Ping).await;
+        let connected = common::next_matching(&mut events, PATIENCE, |e| match e {
+            FrontendEvent::DeviceConnected { fingerprint, .. } if fingerprint == fp => Some(()),
+            _ => None,
+        })
+        .await;
+        assert!(
+            connected.is_some(),
+            "the app never showed the session the machine opened; log:\n{}",
+            log()
+        );
+
+        shown_up(&mut events, &mut requests, handle, log).await;
 
         // Switched off: the link it dialled closes at the receiver.
         requests
@@ -171,6 +228,27 @@ fn switching_a_device_off_closes_its_link_and_switching_it_on_dials_again() {
             log()
         );
 
+        // The session that machine opened is the pairing's, not the
+        // switch's: still up. Its clipboard is the switch's: not applied.
+        assert_eq!(
+            its_session.close_reason(),
+            None,
+            "switching a device off closed the session its machine opened to this \
+             one; log:\n{}",
+            log()
+        );
+        let mut text = its_session.open_uni().await.expect("clipboard stream");
+        text.write_all(b"its, switched off")
+            .await
+            .expect("clipboard text");
+        text.finish().expect("finish");
+        wait_for(
+            "the text from the switched-off machine to be dropped",
+            log,
+            || log().contains(DROPPED),
+        )
+        .await;
+
         // Switched back on: dialled again, as any device that is on is.
         requests
             .request(FrontendRequest::Activate(handle, true))
@@ -180,9 +258,42 @@ fn switching_a_device_off_closes_its_link_and_switching_it_on_dials_again() {
             links.opened.get() > at_off && links.closed.get() < links.opened.get()
         })
         .await;
+        shown_up(&mut events, &mut requests, handle, log).await;
 
-        // Another device switched on at the same edge switches this one off,
-        // which closes its link too.
+        // Renamed while its link is up, the device forgets the machine it
+        // reached until it dials again. Switched off then, its link still
+        // closes.
+        requests
+            .request(FrontendRequest::UpdateHostname {
+                handle,
+                hostname: Some("127.0.0.1".into()),
+                fingerprint: Some(fp.clone()),
+            })
+            .await
+            .expect("rename");
+        requests
+            .request(FrontendRequest::Activate(handle, false))
+            .await
+            .expect("switch off");
+        wait_for(
+            "the link to the device renamed and switched off to close",
+            log,
+            || links.closed.get() >= links.opened.get(),
+        )
+        .await;
+
+        // Switched on again, and then off by another device switched on at
+        // the same edge: that closes its link too.
+        let at_rename = links.opened.get();
+        requests
+            .request(FrontendRequest::Activate(handle, true))
+            .await
+            .expect("switch on");
+        wait_for("the renamed device to be dialled again", log, || {
+            links.opened.get() > at_rename && links.closed.get() < links.opened.get()
+        })
+        .await;
+        shown_up(&mut events, &mut requests, handle, log).await;
         requests
             .request(FrontendRequest::Activate(other, true))
             .await
@@ -193,5 +304,24 @@ fn switching_a_device_off_closes_its_link_and_switching_it_on_dials_again() {
             || links.closed.get() >= links.opened.get(),
         )
         .await;
+
+        // Through all of it, the machine switched off here still drives this
+        // one over the session it opened.
+        common::write(
+            &mut its_input,
+            ProtoEvent::Enter(hops_proto::Position::Right),
+        )
+        .await;
+        let entered = common::next_matching(&mut events, PATIENCE, |e| match e {
+            FrontendEvent::DeviceEntered { fingerprint, .. } if fingerprint == fp => Some(()),
+            _ => None,
+        })
+        .await;
+        assert!(
+            entered.is_some(),
+            "a machine switched off here could no longer cross onto this one over \
+             the session it opened; log:\n{}",
+            log()
+        );
     });
 }

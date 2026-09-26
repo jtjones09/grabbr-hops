@@ -17,6 +17,7 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, Once, RwLock};
 
+use hops_ipc::ClientHandle;
 use hops_proto::{MAX_EVENT_SIZE, ProtoEvent, ProtocolError};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
@@ -398,6 +399,9 @@ pub async fn recv_clipboard(mut recv: quinn::RecvStream) -> Result<String, Clipb
 /// apply must not have its text land.
 pub(crate) struct PeerClipboard {
     pub(crate) from: String,
+    /// The device this machine dialled the link for; `None` over a link the
+    /// peer opened.
+    pub(crate) dialled_for: Option<ClientHandle>,
     pub(crate) text: String,
 }
 
@@ -405,6 +409,9 @@ pub(crate) struct PeerClipboard {
 pub(crate) struct ClipboardInlet {
     /// The fingerprint the peer presented at the handshake.
     pub(crate) from: String,
+    /// The device this machine dialled the link for; `None` for a link the
+    /// peer opened.
+    pub(crate) dialled_for: Option<ClientHandle>,
     pub(crate) trust: Trust,
     pub(crate) tx: local_channel::mpsc::Sender<PeerClipboard>,
 }
@@ -469,6 +476,7 @@ pub(crate) async fn clipboard_accept_loop(
                 Ok(Ok(text)) if inlet.permits() => {
                     let _ = inlet.tx.send(PeerClipboard {
                         from: inlet.from.clone(),
+                        dialled_for: inlet.dialled_for,
                         text,
                     });
                 }

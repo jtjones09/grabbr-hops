@@ -1761,19 +1761,18 @@ impl Service {
     /// that would drop the link for a change of edge.
     fn switch_off(&mut self, handle: ClientHandle) {
         self.deactivate_client(handle);
-        // By the fingerprint the link proved, never the address: a link
-        // outlives a change of the device's address, and an address can be
-        // another machine's by now. A device with no pin names no machine,
-        // so there is nothing to match. A dial still out when this runs is
-        // closed by the dialler when it lands.
-        let Some(fp) = self.client_manager.peer_fingerprint(handle) else {
-            return;
-        };
+        // By the link's own record, never the address: a link outlives a
+        // change of the device's address, and an address can be another
+        // machine's by now. The links dialled for it, and every link to the
+        // machine it is pinned to; a rename or a new address clears the pin
+        // and leaves its link up. A dial still out when this runs is closed
+        // by the dialler when it lands.
+        let pin = self.client_manager.peer_fingerprint(handle);
         let outbound = self.revoke_conn.clone();
         tokio::task::spawn_local(async move {
-            let closed = outbound.close_fingerprint(&fp).await;
+            let closed = outbound.close_device(handle, pin.as_deref()).await;
             if closed > 0 {
-                log::info!("client {handle} switched off: closed {closed} link(s) to {fp}");
+                log::info!("client {handle} switched off: closed {closed} link(s)");
             }
         });
     }

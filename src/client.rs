@@ -417,19 +417,29 @@ impl ClientManager {
 
     /// Whether the device switch lets clipboard text move between this
     /// machine and the one that proved `fingerprint`: sent to it or applied
-    /// from it, over a link either machine opened (#218).
+    /// from it, over a link either machine opened (#218). `dialled_for` is
+    /// the device this machine dialled the link for, `None` for a link the
+    /// peer opened.
     ///
-    /// Not when any device pinned to that fingerprint is switched off, even
-    /// if another entry for the same machine is on: off fails closed. A
-    /// device with no pin names no machine and gates nothing. The pairing's
-    /// own clipboard grant is a separate check, and both have to allow.
-    pub(crate) fn switch_allows_clipboard(&self, fingerprint: &str) -> bool {
-        !self.clients.borrow().iter().any(|(_, (_, s))| {
-            !s.active
-                && s.peer_fingerprint
-                    .as_deref()
-                    .is_some_and(|pin| pin.eq_ignore_ascii_case(fingerprint))
-        })
+    /// Not over a link dialled for a device that is switched off or gone:
+    /// renaming or re-addressing a device clears its pin, and its link is
+    /// still its link. Not when any device pinned to that fingerprint is
+    /// switched off, even if another entry for the same machine is on: off
+    /// fails closed. A device with no pin names no machine for links it did
+    /// not dial. The pairing's own clipboard grant is a separate check, and
+    /// both have to allow.
+    pub(crate) fn switch_allows_clipboard(
+        &self,
+        fingerprint: &str,
+        dialled_for: Option<ClientHandle>,
+    ) -> bool {
+        dialled_for.is_none_or(|handle| self.is_on(handle))
+            && !self.clients.borrow().iter().any(|(_, (_, s))| {
+                !s.active
+                    && s.peer_fingerprint
+                        .as_deref()
+                        .is_some_and(|pin| pin.eq_ignore_ascii_case(fingerprint))
+            })
     }
 
     /// Clear the pin on any client currently pinned to `fingerprint`, so its
@@ -753,13 +763,16 @@ mod the_switch_gates_clipboard_by_fingerprint {
         let a = device(&m, Some(A), true);
         device(&m, Some(B), true);
         assert!(
-            m.switch_allows_clipboard(A) && m.switch_allows_clipboard(B),
+            m.switch_allows_clipboard(A, None) && m.switch_allows_clipboard(B, None),
             "a device that is on stopped clipboard"
         );
 
         m.deactivate_client(a);
         assert_eq!(
-            (m.switch_allows_clipboard(A), m.switch_allows_clipboard(B)),
+            (
+                m.switch_allows_clipboard(A, None),
+                m.switch_allows_clipboard(B, None)
+            ),
             (false, true),
             "(switched off, still on): switching one device off must stop its \
              clipboard and only its"
@@ -768,24 +781,34 @@ mod the_switch_gates_clipboard_by_fingerprint {
         // A second entry for the same machine, switched on, does not reopen it.
         device(&m, Some(A), true);
         assert!(
-            !m.switch_allows_clipboard(A),
+            !m.switch_allows_clipboard(A, None),
             "one entry for a machine is on and another is off, and clipboard \
              flowed: off has to fail closed"
         );
 
-        // A device with no pin names no machine.
-        device(&m, None, false);
+        // A device with no pin names no machine, except over a link dialled
+        // for it: an edit that cleared its pin left that link up.
+        const C: &str = "cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc";
+        let unpinned = device(&m, None, false);
         m.activate_client(a);
         assert!(
-            m.switch_allows_clipboard(A),
+            m.switch_allows_clipboard(A, None) && m.switch_allows_clipboard(A, Some(a)),
             "switching the device back on left its clipboard stopped"
         );
         assert!(
-            m.switch_allows_clipboard(
-                "cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc"
-            ),
+            m.switch_allows_clipboard(C, None),
             "a device with no pin, switched off, stopped clipboard with a machine \
              no device names"
+        );
+        assert!(
+            !m.switch_allows_clipboard(C, Some(unpinned)),
+            "clipboard moved over a link dialled for a device that is switched \
+             off, because the device had lost its pin"
+        );
+        m.remove_client(unpinned);
+        assert!(
+            !m.switch_allows_clipboard(C, Some(unpinned)),
+            "clipboard moved over a link dialled for a device that is gone"
         );
     }
 }
