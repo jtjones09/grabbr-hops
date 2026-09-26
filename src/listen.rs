@@ -93,6 +93,12 @@ pub(crate) enum ListenEvent {
     Rejected {
         fingerprint: String,
     },
+    /// No connection from `addr` is left: the last one closed, however it
+    /// ended. Sent once that connection's events have all been sent, so
+    /// nothing from it follows.
+    Closed {
+        addr: SocketAddr,
+    },
 }
 
 /// A live inbound connection plus the queue its replies wait in and the
@@ -607,10 +613,25 @@ impl Stream for LanMouseListener {
     }
 }
 
-async fn remove_conn(conns: &Rc<AsyncMutex<Vec<ConnEntry>>>, addr: SocketAddr) {
+/// Forget a connection from `addr` that ended, and say so once no other
+/// connection from that address is left.
+///
+/// Sessions are kept per address, so a connection that ends while a newer one
+/// from the same address is up must not end the newer one's session: the
+/// sender reached this machine again before the old connection timed out here.
+async fn remove_conn(
+    conns: &Rc<AsyncMutex<Vec<ConnEntry>>>,
+    addr: SocketAddr,
+    listen_tx: &Sender<ListenEvent>,
+) {
     let mut conns = conns.lock().await;
     if let Some(index) = conns.iter().position(|e| e.addr == addr) {
         conns.remove(index);
+    }
+    // Sent with the list still held, so a new connection from this address
+    // cannot be added between the check and the event.
+    if !conns.iter().any(|e| e.addr == addr) {
+        let _ = listen_tx.send(ListenEvent::Closed { addr });
     }
 }
 
@@ -629,7 +650,7 @@ async fn read_loop(
         Ok(recv) => recv,
         Err(e) => {
             log::info!("{addr}: no inbound stream: {e}");
-            remove_conn(&conns, addr).await;
+            remove_conn(&conns, addr, &listen_tx).await;
             return;
         }
     };
@@ -666,7 +687,7 @@ async fn read_loop(
     // alive connection (primary input stream finished/reset while keep-alive
     // holds the connection up) would leak the clipboard task and the connection.
     conn.close(0u32.into(), b"bye");
-    remove_conn(&conns, addr).await;
+    remove_conn(&conns, addr, &listen_tx).await;
 }
 
 #[cfg(test)]

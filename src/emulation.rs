@@ -283,8 +283,7 @@ impl ListenTask {
         }
         if refused.insert(addr) {
             // Its button- and key-ups are refused from here on too, so whatever
-            // it holds would stay down until the session is cut and the
-            // watchdog notices.
+            // it holds would stay down until its connection ends.
             log::warn!("releasing held keys and buttons: {addr} may no longer drive this machine");
             self.emulation_proxy.remove(addr);
         }
@@ -302,8 +301,9 @@ impl ListenTask {
         // inject: a paired peer that never sent Enter would otherwise type into
         // this machine with no crossing, no "entered" line in the log and
         // nothing in the app saying it was in control (#102). The session ends
-        // on the peer's Leave, its reaping or a new connection, never on our
-        // own release: its key-ups are still on the way then.
+        // on the peer's Leave, its connection closing, its reaping or a new
+        // connection, never on our own release: its key-ups are still on the
+        // way then.
         let mut driving: HashSet<SocketAddr> = HashSet::new();
         // Peers already logged for sending input without crossing, so one
         // that keeps doing it costs one line, not one per event.
@@ -413,6 +413,22 @@ impl ListenTask {
                     // behind the pairing window (`prompt_gate`, #195).
                     Some(ListenEvent::Rejected { fingerprint }) => {
                         self.event_tx.send(EmulationEvent::ConnectionAttempt { fingerprint }).expect("channel closed");
+                    }
+                    // The peer's link is gone, so its button- and key-ups can
+                    // no longer arrive. Let go of what it held now, after
+                    // anything it sent first, rather than at the watchdog
+                    // 10-15 s later, and end its session (#156).
+                    Some(ListenEvent::Closed { addr }) => {
+                        log::debug!("{addr} closed its connection: letting go of anything it held");
+                        self.emulation_proxy.remove(addr);
+                        absmotion.forget(addr);
+                        refused.remove(&addr);
+                        driving.remove(&addr);
+                        unentered_logged.remove(&addr);
+                        // The watchdog has nothing left to find for it.
+                        last_response.remove(&addr);
+                        self.peer_of.remove(&addr);
+                        self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
                     }
                     None => break
                 }}
@@ -1177,13 +1193,15 @@ mod held_input_is_released {
     //! the OS.
 
     use super::*;
-    use crate::test_harness::{Dialer, dialer, machine, run_local, trust, wait_until};
+    use crate::test_harness::{Dialer, Machine, dialer, machine, run_local, trust, wait_until};
     use crate::trust::Caps;
     use input_emulation::ButtonScope;
     use input_emulation::recording::{Recorded, Recording};
     use input_event::{BTN_LEFT, BTN_RIGHT, KeyboardEvent, scancode};
 
     const KEY_A: u32 = scancode::Linux::KeyA as u32;
+    const KEY_B: u32 = scancode::Linux::KeyB as u32;
+    const KEY_C: u32 = scancode::Linux::KeyC as u32;
 
     struct Session {
         recording: Recording,
@@ -1194,6 +1212,13 @@ mod held_input_is_released {
         trust: crate::transport::Trust,
         /// Each peer's fingerprint, in the order of `peers`.
         fingerprints: Vec<String>,
+        /// This machine, and the port it listens on, for a test that dials it
+        /// without the production dialler.
+        receiver: Machine,
+        port: u16,
+        /// Closes this machine's side of a peer's link, as removing the
+        /// device does.
+        revoker: crate::listen::ConnRevoker,
     }
 
     /// `n` senders that have crossed onto this machine and are ready to inject,
@@ -1224,6 +1249,7 @@ mod held_input_is_released {
         )
         .await
         .expect("listener");
+        let revoker = listener.revoker();
         let recording = Recording::with_button_scope(scope);
         let emulation = Emulation::new(Some(recording.backend()), listener, receiver_trust.clone());
         let mut peers = vec![];
@@ -1246,6 +1272,9 @@ mod held_input_is_released {
             peers,
             trust: receiver_trust,
             fingerprints: senders.iter().map(|m| m.fingerprint.clone()).collect(),
+            receiver,
+            port,
+            revoker,
         }
     }
 
@@ -1343,17 +1372,124 @@ mod held_input_is_released {
         }
     }
 
+    /// A peer that speaks the wire protocol directly, from one socket of its
+    /// own, so a test can do what the production dialler never does: go
+    /// quiet without closing, or open a second connection from the address
+    /// of the first.
+    struct RawPeer {
+        endpoint: quinn::Endpoint,
+        at: SocketAddr,
+    }
+
+    impl RawPeer {
+        /// A peer the session's machine trusts to drive it.
+        fn new(s: &Session) -> RawPeer {
+            let peer = machine();
+            s.trust
+                .write()
+                .expect("trust lock")
+                .issue(&peer.fingerprint, "raw peer", Caps::INBOUND)
+                .expect("grant");
+            let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().expect("loopback"))
+                .expect("endpoint");
+            endpoint.set_default_client_config(crate::test_harness::raw_client_config(
+                &peer,
+                trust(&peer, &[&s.receiver], Caps::OUTBOUND),
+                1 << 20,
+            ));
+            RawPeer {
+                endpoint,
+                at: SocketAddr::new("127.0.0.1".parse().expect("loopback"), s.port),
+            }
+        }
+
+        /// A new connection, crossed onto the session's machine, and the
+        /// stream its input goes on.
+        async fn connect(&self) -> (quinn::Connection, quinn::SendStream) {
+            let conn = self
+                .endpoint
+                .connect(self.at, "grabbr")
+                .expect("dial")
+                .await
+                .expect("handshake");
+            let mut input = conn.open_uni().await.expect("input stream");
+            crate::transport::write_frame(&mut input, ProtoEvent::Enter(Position::Right))
+                .await
+                .expect("enter");
+            (conn, input)
+        }
+    }
+
+    impl Session {
+        /// Send `event` on `input` and wait until it reaches the backend.
+        /// Returns the emulation handle it was injected under.
+        async fn inject_on(&self, input: &mut quinn::SendStream, event: Event) -> EmulationHandle {
+            let before = self.consumed(event).len();
+            crate::transport::write_frame(input, ProtoEvent::Input(event))
+                .await
+                .expect("send");
+            wait_until(
+                &format!("{event} to reach the backend"),
+                Duration::from_secs(10),
+                || self.consumed(event).len() > before,
+            )
+            .await;
+            self.consumed(event)[before].1
+        }
+    }
+
     // LEDGER T1 | class B | 6 struct state: Recording::calls() after the ListenTask watchdog
-    /// The case in the issue: no Leave ever arrives. The link closes, the
-    /// watchdog notices 10-15 s later, and whatever was held must come up then.
+    /// The case the watchdog is still for: no Leave and no close. The peer
+    /// sends nothing more while its connection stays up, as when the link
+    /// stalls or the other machine hangs. Only the watchdog can notice, 10-15 s
+    /// later, and whatever was held must come up then. A link that closes is
+    /// released at once (T60).
     #[test]
     fn a_peer_that_vanishes_mid_drag_leaves_no_button_held() {
+        run_local(async {
+            let s = session().await;
+            let peer = RawPeer::new(&s);
+            let (conn, mut input) = peer.connect().await;
+            let handle = s.inject_on(&mut input, button(BTN_LEFT, 1)).await;
+            s.inject_on(&mut input, key(KEY_A, 1)).await;
+
+            // Nothing more is sent, and the connection is kept open.
+            assert!(
+                s.released_before_destroy(handle, button(BTN_LEFT, 0)).await,
+                "the peer went quiet holding the left button and it was never \
+                 released here: {:?}",
+                s.recording.calls()
+            );
+            assert!(
+                s.released_before_destroy(handle, key(KEY_A, 0)).await,
+                "held keys must still be released: {:?}",
+                s.recording.calls()
+            );
+            assert!(
+                conn.close_reason().is_none(),
+                "the link closed, so this did not exercise the watchdog: {:?}",
+                conn.close_reason()
+            );
+        });
+    }
+
+    /// How soon a closed link must be let go of here. Loopback delivers the
+    /// close in about a millisecond; the watchdog, which used to be the only
+    /// release, takes 10 to 15 seconds.
+    const AT_ONCE: Duration = Duration::from_secs(1);
+
+    // LEDGER T60 | class B | 6 struct state: Recording::calls() within 1 s of the peer's link closing
+    /// A link that closes lets go of what its peer held at once. The peer can
+    /// no longer send the ups, so nothing else will (#156).
+    #[test]
+    fn a_closed_link_releases_held_input_at_once() {
         run_local(async {
             let s = session().await;
             let handle = s.inject(button(BTN_LEFT, 1)).await;
             s.inject(key(KEY_A, 1)).await;
 
-            // Close without a Leave, as a killed process or a dropped link does.
+            // Close without a Leave, as a stopped service or a removed device
+            // does.
             let addr = s
                 .dialer()
                 .clients
@@ -1361,15 +1497,202 @@ mod held_input_is_released {
                 .expect("connected");
             s.dialer().conn.revoker().close_addr(addr).await;
 
+            wait_until(
+                "the closed link's held input to be released",
+                AT_ONCE,
+                || s.recording.calls().contains(&Recorded::Destroy(handle)),
+            )
+            .await;
             assert!(
                 s.released_before_destroy(handle, button(BTN_LEFT, 0)).await,
-                "the peer went away holding the left button and it was never \
-                 released here: {:?}",
+                "the link closed while the left button was held and it was not \
+                 released: {:?}",
                 s.recording.calls()
             );
             assert!(
                 s.released_before_destroy(handle, key(KEY_A, 0)).await,
-                "held keys must still be released: {:?}",
+                "the link closed while a key was held and it was not released: {:?}",
+                s.recording.calls()
+            );
+        });
+    }
+
+    // LEDGER T63 | class B | 6 struct state: Recording::calls() within 1 s of removing a peer that sent nothing since its press
+    /// Removing a device while it holds a key, with nothing more on the way
+    /// from it: its link is cut here, and what it held comes up at once
+    /// rather than at the watchdog (#216).
+    #[test]
+    fn removing_a_peer_that_holds_a_key_releases_it_at_once() {
+        run_local(async {
+            let s = session().await;
+            let handle = s.inject(key(KEY_A, 1)).await;
+
+            // What removing the device does: no more trust, and its link cut.
+            s.trust
+                .write()
+                .expect("trust lock")
+                .revoke(&s.fingerprints[0]);
+            s.revoker.close_fingerprint(&s.fingerprints[0]).await;
+
+            wait_until(
+                "the removed peer's held key to be released",
+                AT_ONCE,
+                || s.recording.calls().contains(&Recorded::Destroy(handle)),
+            )
+            .await;
+            assert!(
+                s.released_before_destroy(handle, key(KEY_A, 0)).await,
+                "the peer was removed while holding a key and it was not \
+                 released: {:?}",
+                s.recording.calls()
+            );
+        });
+    }
+
+    // LEDGER T61 | class B | 1 return value: Emulation::event() within 1 s of the peer's link closing
+    /// The service is told at once that a link closed, including one from a
+    /// peer that never crossed onto this machine, so the app stops showing it
+    /// as connected (#34).
+    #[test]
+    fn a_closed_link_is_reported_at_once_even_if_the_peer_never_crossed() {
+        run_local(async {
+            let mut s = connected(1, ButtonScope::Machine, false).await;
+            let addr = sync(&mut s, 0)
+                .await
+                .iter()
+                .find_map(|e| match e {
+                    EmulationEvent::Connected { addr, .. } => Some(*addr),
+                    _ => None,
+                })
+                .expect("the peer's connection was reported");
+
+            let remote = s
+                .dialer()
+                .clients
+                .active_addr(s.dialer().handle)
+                .expect("connected");
+            s.dialer().conn.revoker().close_addr(remote).await;
+
+            let reported = tokio::time::timeout(AT_ONCE, async {
+                loop {
+                    if let EmulationEvent::Disconnected { addr: gone } = s.emulation.event().await {
+                        if gone == addr {
+                            break;
+                        }
+                    }
+                }
+            })
+            .await;
+            assert!(
+                reported.is_ok(),
+                "a peer that never crossed closed its link, and that was not \
+                 reported within {AT_ONCE:?}"
+            );
+        });
+    }
+
+    // LEDGER T62 | class B | 6 struct state: Recording::calls() after an older connection from the same address closes
+    /// Two connections from one address: the sender reached this machine
+    /// again from the same socket before its old connection ended here. The
+    /// old one closing must not end the new one's session or let go of what
+    /// it holds.
+    #[test]
+    fn a_late_close_from_an_older_connection_keeps_the_newer_session() {
+        run_local(async {
+            let s = session().await;
+            // One socket, so both connections come from one address.
+            let peer = RawPeer::new(&s);
+            let (older, mut older_input) = peer.connect().await;
+            s.inject_on(&mut older_input, key(KEY_A, 1)).await;
+            let (_newer, mut newer_input) = peer.connect().await;
+            let handle = s.inject_on(&mut newer_input, key(KEY_B, 1)).await;
+
+            older.close(0u32.into(), b"gone");
+            // Loopback delivers the close in about a millisecond.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            s.inject_on(&mut newer_input, key(KEY_C, 1)).await;
+            assert!(
+                !s.recording.calls().contains(&Recorded::Destroy(handle)),
+                "the older connection closed and the newer one's held keys were \
+                 let go: {:?}",
+                s.recording.calls()
+            );
+        });
+    }
+
+    // LEDGER T69 | class B | 6 struct state + 1 return value: Recording::calls() and Emulation::event() within 1 s of one of two peers' links closing
+    /// Two peers drive this machine and one link closes. That peer's held
+    /// input comes up and the service is told at once, whether or not another
+    /// peer is still connected; the other peer's session is left alone.
+    #[test]
+    fn a_closed_link_is_let_go_while_another_peer_stays_connected() {
+        run_local(async {
+            let mut s = session_with(2).await;
+            let closing = s.inject_from(0, key(KEY_A, 1)).await;
+            let staying = s.inject_from(1, key(KEY_B, 1)).await;
+            assert_ne!(closing, staying, "precondition: one handle per peer");
+            let addr = sync(&mut s, 0)
+                .await
+                .iter()
+                .find_map(|e| match e {
+                    EmulationEvent::Connected { addr, fingerprint }
+                        if *fingerprint == s.fingerprints[0] =>
+                    {
+                        Some(*addr)
+                    }
+                    _ => None,
+                })
+                .expect("the closing peer's connection was reported");
+
+            let remote = s.peers[0]
+                .clients
+                .active_addr(s.peers[0].handle)
+                .expect("connected");
+            s.peers[0].conn.revoker().close_addr(remote).await;
+
+            let reported = tokio::time::timeout(AT_ONCE, async {
+                loop {
+                    if let EmulationEvent::Disconnected { addr: gone } = s.emulation.event().await {
+                        if gone == addr {
+                            break;
+                        }
+                    }
+                }
+            })
+            .await;
+            assert!(
+                reported.is_ok(),
+                "one of two connected peers closed its link, and that was not \
+                 reported within {AT_ONCE:?}"
+            );
+            wait_until(
+                "the closed link's held key to be released while another peer \
+                 stays connected",
+                AT_ONCE,
+                || s.recording.calls().contains(&Recorded::Destroy(closing)),
+            )
+            .await;
+            assert!(
+                s.released_before_destroy(closing, key(KEY_A, 0)).await,
+                "the closed link's held key was not released: {:?}",
+                s.recording.calls()
+            );
+
+            // Its link is still up, so it keeps what it holds and still drives.
+            let kept = || {
+                !s.recording.calls().contains(&Recorded::Destroy(staying))
+                    && s.position(key(KEY_B, 0)).is_none()
+            };
+            assert!(
+                kept(),
+                "one peer's link closed and the other's held key was let go: {:?}",
+                s.recording.calls()
+            );
+            s.inject_from(1, key(KEY_C, 1)).await;
+            assert!(
+                kept(),
+                "one peer's link closed and the other's held key was let go: {:?}",
                 s.recording.calls()
             );
         });

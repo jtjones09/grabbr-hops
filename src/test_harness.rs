@@ -150,7 +150,9 @@ pub(crate) struct Notices {
     pub(crate) clipboard: Receiver<crate::transport::PeerClipboard>,
     _untrusted: Receiver<(String, std::net::SocketAddr)>,
     _persist: Receiver<ClientHandle>,
-    _state: Receiver<ClientHandle>,
+    /// Which client's live state changed: what the service republishes to
+    /// the frontend.
+    pub(crate) state: Receiver<ClientHandle>,
 }
 
 pub(crate) fn dialer(me: &Machine, trust: Trust, port: u16, pos: Position) -> Dialer {
@@ -182,7 +184,7 @@ pub(crate) fn dialer(me: &Machine, trust: Trust, port: u16, pos: Position) -> Di
             clipboard,
             _untrusted: untrusted,
             _persist: persist,
-            _state: state,
+            state,
         },
     }
 }
