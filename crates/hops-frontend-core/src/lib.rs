@@ -1792,30 +1792,28 @@ mod projection {
     }
 
     /// The daemon's only channel for "that didn't work": each failure must
-    /// be something a UI can tell is new.
-    // LEDGER T507 | class B | 6 struct state: AppModel::apply
+    /// be something a UI can tell is new. The banner reads the latest error
+    /// and its sequence, not the activity log (#150).
+    // LEDGER T507 | class B | 6 struct state: AppModel::apply, latest_error/error_seq
     #[test]
     fn errors_become_a_notice_the_ui_can_tell_is_new() {
         let mut m = AppModel::default();
-        assert_eq!(m.latest_message(), None, "nothing to show at rest");
-        assert_eq!(m.message_seq, 0);
+        assert_eq!(m.latest_error(), None, "nothing to show at rest");
+        assert_eq!(m.error_seq, 0);
 
         m.apply(FrontendEvent::Error("could not resolve studio-pc".into()));
-        assert_eq!(
-            m.latest_message(),
-            Some("error: could not resolve studio-pc")
-        );
-        let first = m.message_seq;
+        assert_eq!(m.latest_error(), Some("could not resolve studio-pc"));
+        let first = m.error_seq;
         assert!(
             first > 0,
-            "a notice must bump the seq or the UI cannot raise it"
+            "an error must bump the seq or the UI cannot raise it"
         );
 
         // A second, identical error must still be distinguishable, or a
         // dismissed banner would stay hidden through a repeat of the failure.
         m.apply(FrontendEvent::Error("could not resolve studio-pc".into()));
         assert!(
-            m.message_seq > first,
+            m.error_seq > first,
             "a repeated failure must re-raise the banner"
         );
     }

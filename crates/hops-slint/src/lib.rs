@@ -1946,12 +1946,35 @@ mod the_banner_shows_errors {
         assert_eq!(ui.get_notice().as_str(), "could not resolve studio-pc");
         let raised = ui.get_notice_seq();
 
+        // The cursor enters again on a tick that also changes a row, so the
+        // tick reaches the window: nothing new went wrong, so a banner the
+        // user dismissed must stay dismissed.
         entered(&mut m);
-        repaint.push(&ui, polled_ui(&m, None, Instant::now()), &seq);
+        m.apply(FrontendEvent::Created(
+            0,
+            ClientConfig {
+                hostname: Some("studio-pc".into()),
+                ..Default::default()
+            },
+            ClientState::default(),
+        ));
+        assert!(
+            repaint.push(&ui, polled_ui(&m, None, Instant::now()), &seq),
+            "precondition: a tick that adds a row reaches the window"
+        );
         assert_eq!(
             (ui.get_notice().as_str(), ui.get_notice_seq()),
             ("could not resolve studio-pc", raised),
             "a cursor entering replaced the error or raised a dismissed banner again"
+        );
+
+        // The same failure again is a new error, and raises the banner even
+        // if the user dismissed the first one.
+        m.apply(FrontendEvent::Error("could not resolve studio-pc".into()));
+        repaint.push(&ui, polled_ui(&m, None, Instant::now()), &seq);
+        assert!(
+            ui.get_notice_seq() != raised,
+            "a repeat of the same failure did not raise the banner again"
         );
     }
 
