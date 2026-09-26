@@ -8,16 +8,23 @@
 //! tests can run side by side.
 #![cfg(unix)]
 
-use std::net::UdpSocket;
+use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, SignatureScheme};
+use sha2::{Digest, Sha256};
 
 struct Daemon {
     child: Child,
     dir: PathBuf,
     config: PathBuf,
     log: PathBuf,
+    port: u16,
 }
 
 impl Drop for Daemon {
@@ -48,12 +55,12 @@ impl Daemon {
         std::fs::create_dir_all(&config_dir).expect("a scratch config directory");
         std::fs::create_dir_all(dir.join("Library/Caches")).expect("scratch caches");
         let config = config_dir.join("config.toml");
+        let port = free_port();
         std::fs::write(
             &config,
             format!(
-                "port = {}\ncapture_backend = \"dummy\"\nemulation_backend = \"dummy\"\n\
-                 discovery = false\n\n{tables}",
-                free_port()
+                "port = {port}\ncapture_backend = \"dummy\"\nemulation_backend = \"dummy\"\n\
+                 discovery = false\n\n{tables}"
             ),
         )
         .expect("a config");
@@ -71,6 +78,7 @@ impl Daemon {
             dir,
             config,
             log,
+            port,
         };
         let deadline = Instant::now() + Duration::from_secs(60);
         while !daemon.log().contains("service running; stops on") {
@@ -140,6 +148,106 @@ impl Daemon {
     fn saved_text(&self) -> String {
         std::fs::read_to_string(&self.config).expect("the config")
     }
+
+    /// A machine this daemon has never seen asks to pair, and waits: its
+    /// fingerprint, once the daemon has admitted the request.
+    fn asked_to_pair(&self) -> String {
+        // add device, which is what lets a request prompt
+        ok(self, &["add-client"]);
+        let fp = knock(self.port);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !self.log().contains(&format!("fingerprint {fp}")) {
+            assert!(
+                Instant::now() < deadline,
+                "the daemon never admitted the pairing request; log:\n{}",
+                self.log()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        fp
+    }
+}
+
+/// Accepts any server certificate: the stranger does not care who answers.
+#[derive(Debug)]
+struct AnyServer;
+
+impl ServerCertVerifier for AnyServer {
+    fn verify_server_cert(
+        &self,
+        _: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: &ServerName<'_>,
+        _: &[u8],
+        _: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Dial the daemon on `port` once, as a machine it has never seen, and
+/// return that machine's fingerprint in the daemon's format. The daemon
+/// refuses the handshake; what matters is the request it leaves.
+fn knock(port: u16) -> String {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let key = rcgen::KeyPair::generate().expect("a key");
+    let cert = rcgen::CertificateParams::new(vec!["grabbr".to_owned()])
+        .expect("params")
+        .self_signed(&key)
+        .expect("a certificate");
+    let fingerprint = Sha256::digest(cert.der())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":");
+    let mut crypto = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AnyServer))
+        .with_client_auth_cert(
+            vec![cert.der().clone()],
+            PrivateKeyDer::try_from(key.serialize_der()).expect("the key"),
+        )
+        .expect("client auth");
+    crypto.alpn_protocols = vec![b"grabbr-hop/1".to_vec()];
+    let config = quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(crypto).expect("a QUIC client"),
+    ));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    runtime.block_on(async {
+        let endpoint =
+            quinn::Endpoint::client("127.0.0.1:0".parse().expect("addr")).expect("an endpoint");
+        let at: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        if let Ok(connecting) = endpoint.connect_with(config, at, "grabbr") {
+            if let Ok(Ok(conn)) = tokio::time::timeout(Duration::from_secs(5), connecting).await {
+                let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
+            }
+        }
+    });
+    fingerprint
 }
 
 fn said(out: &Output) -> String {
@@ -225,6 +333,25 @@ fn a_grant_nobody_asked_for_fails_with_the_reason() {
         "the refusal did not say why:\n{}",
         said(&out)
     );
+
+    // refused for another reason: an identity removed for good, and a
+    // fingerprint that is not one
+    let gone = ["ef"; 32].join(":");
+    ok(&d, &["remove-authorized-key", &gone]);
+    for (why, fp) in [("removed", gone.as_str()), ("valid", "not-a-fingerprint")] {
+        let out = d.cli(&["authorize-key", "desk mac", fp]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success() && err.contains("not done: nothing was trusted"),
+            "a grant the service refused was not reported as refused:\n{}",
+            said(&out)
+        );
+        assert!(
+            err.contains(why),
+            "the refusal did not say why:\n{}",
+            said(&out)
+        );
+    }
 }
 
 // LEDGER T3 | class B | 4 config file written by the hops daemon, read the moment hops cli exits 0
@@ -373,5 +500,87 @@ fn renaming_a_paired_device_keeps_its_entry_in_place() {
         d.saved_text().contains("# the old name"),
         "{}",
         d.saved_text()
+    );
+}
+
+// LEDGER T22 | class B | 5 process: hops cli exit code and output, after a grant the hops daemon made
+#[test]
+fn a_grant_made_is_reported_made_when_the_config_is_not_saved() {
+    let d = Daemon::start("grantok", "");
+    let fp = d.asked_to_pair();
+    // an edit in progress: the config the daemon copies trust into does not parse
+    std::fs::write(&d.config, "port = 4343\n[[clients]\n").expect("an edit in progress");
+    let out = d.cli_beside(&["authorize-key", "laptop", &fp]);
+    let text = said(&out);
+    assert!(
+        !text.contains("nothing was trusted") && !text.contains("not trusted"),
+        "the device was trusted, and the command said it was not:\n{text}"
+    );
+    assert!(
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains(&fp),
+        "the grant was made and saved in the trust store, and the command did \
+         not report it:\n{text}\ndaemon log:\n{}",
+        d.log()
+    );
+}
+
+/// Makes a directory read-only until dropped.
+struct ReadOnly(PathBuf);
+
+impl ReadOnly {
+    fn new(dir: PathBuf) -> Option<ReadOnly> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        let guard = ReadOnly(dir);
+        // Some users write anyway (root): nothing to test then.
+        let probe = guard.0.join("probe");
+        if std::fs::write(&probe, "").is_ok() {
+            let _ = std::fs::remove_file(&probe);
+            return None;
+        }
+        Some(guard)
+    }
+}
+
+impl Drop for ReadOnly {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+// LEDGER T23 | class B | 5 process: hops cli exit code and output, after a grant the hops daemon could not save
+#[test]
+fn a_grant_the_trust_store_could_not_save_fails_and_says_it_is_in_effect() {
+    let d = Daemon::start("grantro", "");
+    let fp = d.asked_to_pair();
+    let Some(_read_only) = ReadOnly::new(d.config.parent().expect("dir").to_path_buf()) else {
+        eprintln!("this user writes to read-only directories: skipped");
+        return;
+    };
+    let out = d.cli_beside(&["authorize-key", "laptop", &fp]);
+    let text = said(&out);
+    assert!(
+        !text.contains("nothing was trusted"),
+        "the device was trusted until a restart, and the command said nothing \
+         was:\n{text}"
+    );
+    assert!(
+        !out.status.success() && text.contains("not saved: the change is in effect"),
+        "a grant the trust store could not save was reported saved:\n{text}"
+    );
+}
+
+// LEDGER T24 | class B | 5 process: hops cli exit code and stderr; the notice comes from the hops daemon
+#[test]
+fn a_device_change_that_was_not_saved_fails_and_says_so() {
+    let d = Daemon::start("unsaved", &one_device());
+    std::fs::write(&d.config, "port = 4343\n[[clients]\n").expect("an edit in progress");
+    let out = d.cli_beside(&["set-position", "0", "right"]);
+    assert!(
+        !out.status.success()
+            && String::from_utf8_lossy(&out.stderr).contains("not saved: the change is in effect"),
+        "a change the daemon could not save was reported saved:\n{}",
+        said(&out)
     );
 }
