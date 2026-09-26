@@ -142,6 +142,8 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             online: true,
             trusted: true,
             revoked: false,
+            clipboard: "shared both ways".into(),
+            clipboard_on: true,
         },
         // send-only, never connected (provisional — no fingerprint learned yet)
         DeviceRow {
@@ -159,6 +161,8 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             online: false,
             trusted: false,
             revoked: false,
+            clipboard: "".into(),
+            clipboard_on: false,
         },
         // receive-only trusted peer, connected in
         DeviceRow {
@@ -176,6 +180,8 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             online: true,
             trusted: true,
             revoked: false,
+            clipboard: "arrives here from this device".into(),
+            clipboard_on: true,
         },
         // receive-only trusted peer, offline
         DeviceRow {
@@ -193,6 +199,8 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             online: false,
             trusted: true,
             revoked: false,
+            clipboard: "off — it cannot be turned back on here yet".into(),
+            clipboard_on: false,
         },
         // the user deliberately expelled this one — it must read as EXPELLED,
         // not as a stranger, and offer a deliberate way back
@@ -211,6 +219,8 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             online: false,
             trusted: false,
             revoked: true,
+            clipboard: "".into(),
+            clipboard_on: false,
         },
     ])));
 
@@ -260,6 +270,20 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
         Some("settings") => ui.set_show_settings(true),
         Some("add-device") => ui.set_show_add_device(true),
         Some("edit-device") => ui.set_editing_device("1".into()), // matches the mock studio-pc handle
+        Some("clipboard-confirm") => {
+            ui.set_editing_device("1".into());
+            ui.set_confirm_clipboard_off(true);
+        }
+        // laptop-air: a receive-only row, keyed by fingerprint, clipboard off
+        Some("edit-clipboard-off") => ui.set_editing_device("c3:de:04:aa:11:22".into()),
+        // the question left open while the clipboard went off from another
+        // app: the row must say off, not ask
+        Some("clipboard-confirm-after-off") => {
+            ui.set_editing_device("c3:de:04:aa:11:22".into());
+            ui.set_confirm_clipboard_off(true);
+        }
+        // media-rig: never connected, so no pairing and no clipboard to show
+        Some("edit-unpaired") => ui.set_editing_device("2".into()),
         Some("delete-confirm") => ui.set_confirm_delete_handle("1".into()),
         // b7:2a:55 is the mock windows-pc — a trusted, receive-capable peer
         Some("revoke-confirm") => ui.set_confirm_revoke_fp("b7:2a:55:e1:90:33".into()),

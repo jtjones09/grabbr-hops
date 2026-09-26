@@ -23,6 +23,8 @@ pub struct Daemon {
     child: Child,
     dir: PathBuf,
     log: PathBuf,
+    config: PathBuf,
+    starts: u32,
 }
 
 impl Drop for Daemon {
@@ -37,6 +39,56 @@ impl Daemon {
     pub fn log(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
+
+    /// Stop the daemon and start it again on the same files, logging to a
+    /// new file, and return once it reports its service loop running.
+    pub fn restart(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.starts += 1;
+        self.log = self.dir.join(format!("daemon.{}.log", self.starts));
+        self.child = spawn(&self.dir, &self.config, &self.log);
+        self.wait_until_running();
+    }
+
+    fn wait_until_running(&self) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !self.log().contains("service running; stops on") {
+            assert!(
+                Instant::now() < deadline,
+                "the daemon never reported its service loop running; log:\n{}",
+                self.log()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Starting writes the token, keys and trust files next to the config, and
+        // the config watcher reports each. A config write while those are still
+        // queued can stop the daemon on macOS (a defect of the watcher, not of
+        // what these tests are about), so let it drain them first.
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn spawn(dir: &std::path::Path, config: &std::path::Path, log: &std::path::Path) -> Child {
+    let config_dir = config.parent().expect("the config's directory");
+    Command::new(env!("CARGO_BIN_EXE_hops"))
+        .arg("--config")
+        .arg(config)
+        .arg("--cert-path")
+        .arg(config_dir.join("lan-mouse.pem"))
+        .arg("daemon")
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", dir)
+        .env("XDG_RUNTIME_DIR", dir)
+        .env("XDG_CONFIG_HOME", dir.join(".config"))
+        .env("XDG_STATE_HOME", dir)
+        .env("HOPS_LOG_FILE", log)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the hops binary starts")
 }
 
 /// Start the built daemon in a scratch directory named for `tag`, with
@@ -74,39 +126,15 @@ pub fn start(tag: &str, tables: &str) -> (Daemon, u16) {
     )
     .expect("a config");
     let log = dir.join("daemon.log");
-    let child = Command::new(env!("CARGO_BIN_EXE_hops"))
-        .arg("--config")
-        .arg(&config)
-        .arg("--cert-path")
-        .arg(config_dir.join("lan-mouse.pem"))
-        .arg("daemon")
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", &dir)
-        .env("XDG_RUNTIME_DIR", &dir)
-        .env("XDG_CONFIG_HOME", dir.join(".config"))
-        .env("XDG_STATE_HOME", &dir)
-        .env("HOPS_LOG_FILE", &log)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("the hops binary starts");
-    let daemon = Daemon { child, dir, log };
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while !daemon.log().contains("service running; stops on") {
-        assert!(
-            Instant::now() < deadline,
-            "the daemon never reported its service loop running; log:\n{}",
-            daemon.log()
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    // Starting writes the token, keys and trust files next to the config, and
-    // the config watcher reports each. A config write while those are still
-    // queued can stop the daemon on macOS (a defect of the watcher, not of
-    // what these tests are about), so let it drain them first.
-    std::thread::sleep(Duration::from_secs(1));
+    let child = spawn(&dir, &config, &log);
+    let daemon = Daemon {
+        child,
+        dir,
+        log,
+        config,
+        starts: 0,
+    };
+    daemon.wait_until_running();
     (daemon, port)
 }
 

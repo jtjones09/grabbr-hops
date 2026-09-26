@@ -22,7 +22,7 @@ use std::{
 };
 
 use hops_frontend_core::{
-    AppModel, ApprovalRefused, ClientHandle, FrontendClient, FrontendRequest, Launch,
+    AppModel, ApprovalRefused, ClientHandle, Clipboard, FrontendClient, FrontendRequest, Launch,
     PairingAttempt, PairingCard, Position, Status, TrustState, prefs, theme,
 };
 use hops_ipc::{DEFAULT_PORT, Geometry};
@@ -106,6 +106,7 @@ fn device_rows(m: &AppModel) -> Vec<DeviceRow> {
         .into_iter()
         .filter(|d| d.is_listable())
         .map(|d| {
+            let clipboard = d.fingerprint.as_deref().and_then(|fp| m.clipboard(fp));
             let (handle, addr, pos, active, alive, has_send) = match &d.send {
                 Some(s) => {
                     let addr = s
@@ -169,6 +170,8 @@ fn device_rows(m: &AppModel) -> Vec<DeviceRow> {
                 online: d.online,
                 trusted: d.receive,
                 revoked: d.trust == TrustState::Revoked,
+                clipboard: clipboard.map(clipboard_words).unwrap_or_default().into(),
+                clipboard_on: clipboard.is_some_and(|c| c.is_on()),
             }
         })
         .collect()
@@ -335,6 +338,17 @@ pub fn theme_colors(t: &theme::Theme) -> ThemeColors {
         success: slint_color(t.success),
         warn: slint_color(t.warn),
         error: slint_color(t.error),
+    }
+}
+
+/// What the edit panel says under "clipboard". Off says it cannot be turned
+/// back on here, because nothing in this frontend can (#182, #107).
+fn clipboard_words(c: Clipboard) -> &'static str {
+    match c {
+        Clipboard::BothWays => "shared both ways",
+        Clipboard::FromIt => "arrives here from this device",
+        Clipboard::ToIt => "goes from here to this device",
+        Clipboard::Off => "off — it cannot be turned back on here yet",
     }
 }
 
@@ -796,6 +810,12 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
         let c = client.clone();
         ui.on_revoke(move |fp| {
             c.request(FrontendRequest::RemoveAuthorizedKey(fp.to_string()));
+        });
+    }
+    {
+        let c = client.clone();
+        ui.on_disable_clipboard(move |fp| {
+            c.request(FrontendRequest::DisableClipboard(fp.to_string()));
         });
     }
     {

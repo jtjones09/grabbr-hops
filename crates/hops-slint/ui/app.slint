@@ -41,6 +41,9 @@ export struct DeviceRow {
     online: bool,        // a peer with this fingerprint is connected in
     trusted: bool,       // its fingerprint is in authorized_fingerprints
     revoked: bool,       // the user expelled it; shown, not forgotten
+    clipboard: string,   // which way the clipboard goes, for the edit panel,
+                         // or "" when no pairing holds one (#182)
+    clipboard-on: bool,  // some direction is on, so it can be switched off
 }
 
 // A machine announcing itself on the LAN. NOT a device and NOT an identity —
@@ -135,6 +138,9 @@ export component AppWindow inherits Window {
     in-out property <string> editing-device: "";
     // The row's pin when its rename opened, carried like confirm-delete-pin.
     in-out property <string> editing-pin: "";
+    // The edit panel is asking whether to turn the device's clipboard off.
+    // Asked, because nothing here turns it back on (#182, #107).
+    in-out property <bool> confirm-clipboard-off: false;
     // `in-out` (not a plain internal property) so the render_png self-review
     // harness can open these overlays from outside for a look — not used by the
     // real app's Rust side, which only ever reads them indirectly via clicks.
@@ -171,6 +177,7 @@ export component AppWindow inherits Window {
     callback rename-device(string /* handle */, string /* pin */, string /* new name */);
     callback delete-device(string /* handle */, string /* pin */);
     callback revoke(string /* full fingerprint */);
+    callback disable-clipboard(string /* full fingerprint */);
     callback approve-pairing(string /* name */, string /* full fingerprint */);
     callback deny-pairing(string /* full fingerprint */);
     callback set-theme(int /* palette index */);
@@ -746,6 +753,7 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                         text: "edit";
                                         ghost: true;
                                         clicked => {
+                                            root.confirm-clipboard-off = false;
                                             root.editing-pin = d.pin;
                                             root.editing-device = root.editing-device == (d.has-send ? d.handle : d.fp-full)
                                                 ? ""
@@ -924,6 +932,74 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                         clicked => {
                                             rename-field.text = "";
                                             root.editing-device = "";
+                                        }
+                                    }
+                                }
+                                // The device's clipboard (#182), found in the
+                                // fresh `devices` model by the key the edit
+                                // button set, so it shows the daemon's latest
+                                // word. Off offers nothing: nothing here turns
+                                // it back on.
+                                // One wrapper with no spacing: every device
+                                // adds an element here, empty but for the one
+                                // being edited.
+                                VerticalLayout {
+                                    spacing: 0;
+                                    for d in root.devices: VerticalLayout {
+                                        if d.clipboard != "" && (d.has-send ? d.handle : d.fp-full) == root.editing-device: VerticalLayout {
+                                            // The question stands only while
+                                            // the clipboard is on: once it is
+                                            // off, from any app, the row says so.
+                                            property <bool> asking: root.confirm-clipboard-off && d.clipboard-on;
+                                            spacing: Space.sm;
+                                            Text {
+                                                text: "clipboard";
+                                                color: Theme.c.muted;
+                                                font-size: Type.caption;
+                                            }
+                                            HorizontalLayout {
+                                                spacing: Space.sm;
+                                                VerticalLayout {
+                                                    alignment: center;
+                                                    horizontal-stretch: 1;
+                                                    Text {
+                                                        text: asking
+                                                            ? "turn it off? it cannot be turned back on here yet"
+                                                            : d.clipboard;
+                                                        color: asking ? Theme.c.warn
+                                                            : d.clipboard-on ? Theme.c.foreground : Theme.c.muted;
+                                                        font-size: Type.small;
+                                                        overflow: elide;
+                                                    }
+                                                }
+                                                if d.clipboard-on && !asking: VerticalLayout {
+                                                    alignment: center;
+                                                    PillButton {
+                                                        text: "turn off";
+                                                        ghost: true;
+                                                        clicked => { root.confirm-clipboard-off = true; }
+                                                    }
+                                                }
+                                                if asking: VerticalLayout {
+                                                    alignment: center;
+                                                    PillButton {
+                                                        text: "yes";
+                                                        danger: true;
+                                                        clicked => {
+                                                            root.disable-clipboard(d.fp-full);
+                                                            root.confirm-clipboard-off = false;
+                                                        }
+                                                    }
+                                                }
+                                                if asking: VerticalLayout {
+                                                    alignment: center;
+                                                    PillButton {
+                                                        text: "no";
+                                                        ghost: true;
+                                                        clicked => { root.confirm-clipboard-off = false; }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
