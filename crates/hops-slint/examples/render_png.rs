@@ -64,7 +64,12 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
     ui.global::<Theme>().set_index(theme_idx);
 
     // 3) Representative mock data so every region is exercised in one shot.
-    ui.set_connected(true);
+    // PREVIEW_SERVICE_PROBLEM=<text> shows the service banner; with
+    // PREVIEW_DISCONNECTED set, as the app shows it before a daemon answers.
+    ui.set_connected(std::env::var_os("PREVIEW_DISCONNECTED").is_none());
+    if let Ok(problem) = std::env::var("PREVIEW_SERVICE_PROBLEM") {
+        ui.set_service_problem(problem.into());
+    }
     ui.set_capture("enabled".into());
     ui.set_emulation("enabled".into());
     ui.set_port("4242".into());

@@ -17,7 +17,7 @@ use futures::StreamExt;
 use tokio::sync::{Notify, mpsc};
 
 pub use hops_ipc::{
-    AttemptOrigin, ClientConfig, ClientHandle, ClientState, DiscoveredDevice, FrontendEvent,
+    AttemptOrigin, Build, ClientConfig, ClientHandle, ClientState, DiscoveredDevice, FrontendEvent,
     FrontendRequest, Position, RevokedEntry, Status, connect_async,
 };
 
@@ -27,11 +27,42 @@ pub mod theme;
 /// How many transient event/error lines to keep for the UI log pane.
 const MAX_MESSAGES: usize = 50;
 
+/// What the binary tells its frontend as the frontend opens.
+#[derive(Debug, Clone, Default)]
+pub struct Launch {
+    /// This binary's own build, to compare with the daemon's. `None` compares
+    /// nothing.
+    pub build: Option<Build>,
+    /// Why the service the app tried to start is not running, in words, with
+    /// the file that says more. `None` when the app started nothing or the
+    /// service came up.
+    pub start_problem: Option<String>,
+}
+
+/// What the daemon on this connection said about its build.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ServiceBuild {
+    /// Nothing yet on this connection.
+    #[default]
+    Unknown,
+    /// It sent state without saying: a daemon older than the event.
+    Unstated,
+    /// It said which build it is.
+    Is(Build),
+}
+
 /// Reduced, UI-facing snapshot of daemon state. Cloned cheaply for rendering.
 #[derive(Debug, Default, Clone)]
 pub struct AppModel {
     /// True while the IPC socket is connected.
     pub connected: bool,
+    /// This binary's build, from [`Launch::build`].
+    pub this_build: Option<Build>,
+    /// The daemon's build, as it stated it on this connection.
+    pub service_build: ServiceBuild,
+    /// Why the service the app tried to start did not come up, from
+    /// [`Launch::start_problem`]. Cleared once a daemon answers.
+    pub start_problem: Option<String>,
     /// Configured clients, keyed + ordered by handle.
     pub clients: BTreeMap<ClientHandle, (ClientConfig, ClientState)>,
     /// Local input-capture status.
@@ -123,7 +154,14 @@ impl AppModel {
     /// Fold one daemon event into the model.
     pub fn apply(&mut self, event: FrontendEvent) {
         match event {
+            FrontendEvent::DaemonBuild(build) => self.service_build = ServiceBuild::Is(build),
             FrontendEvent::Enumerate(list) => {
+                // A daemon states its build before its state on every sync,
+                // so state with nothing stated first is from one that never
+                // does. A statement that arrives later still replaces this.
+                if self.service_build == ServiceBuild::Unknown {
+                    self.service_build = ServiceBuild::Unstated;
+                }
                 self.clients = list.into_iter().map(|(h, c, s)| (h, (c, s))).collect();
             }
             FrontendEvent::Created(h, c, s) | FrontendEvent::State(h, c, s) => {
@@ -283,6 +321,34 @@ impl AppModel {
             self.pairing_attempts.remove(0);
         }
         self.pairing_attempts.push(attempt);
+    }
+
+    /// What is wrong with the service this app talks to, in words, or `None`.
+    ///
+    /// While nothing is connected: why the service the app started did not
+    /// come up. Once connected: that the daemon runs another build than this
+    /// app, which it keeps doing until it restarts.
+    pub fn service_problem(&self) -> Option<String> {
+        if !self.connected {
+            return self.start_problem.clone();
+        }
+        let this = self.this_build.as_ref()?;
+        let theirs = match &self.service_build {
+            ServiceBuild::Unknown => return None,
+            ServiceBuild::Is(build) if build == this => return None,
+            ServiceBuild::Is(build) => format!("hops {build}"),
+            ServiceBuild::Unstated => "an older build that does not say which".to_string(),
+        };
+        let restart = if cfg!(target_os = "linux") {
+            "restart the computer"
+        } else {
+            "log out and back in"
+        };
+        Some(format!(
+            "This app is hops {this}, but the service it is connected to is {theirs}. \
+             The service keeps running its own version until it restarts: {restart} \
+             to run this one."
+        ))
     }
 
     /// Whole seconds left in the pairing window, or `None` when it is closed.
@@ -738,8 +804,12 @@ pub struct FrontendClient {
 impl FrontendClient {
     /// Spawn the auto-reconnecting connection task and return a handle. Must be
     /// called within a tokio `LocalSet` (it uses `spawn_local`).
-    pub fn spawn() -> Self {
-        let model = Arc::new(Mutex::new(AppModel::default()));
+    pub fn spawn(launch: Launch) -> Self {
+        let model = Arc::new(Mutex::new(AppModel {
+            this_build: launch.build,
+            start_problem: launch.start_problem,
+            ..AppModel::default()
+        }));
         let changed = Arc::new(Notify::new());
         let (requests, request_rx) = mpsc::unbounded_channel();
         tokio::task::spawn_local(connection_loop(model.clone(), changed.clone(), request_rx));
@@ -782,7 +852,14 @@ async fn connection_loop(
                 continue;
             }
         };
-        model.lock().expect("model lock poisoned").connected = true;
+        {
+            let mut m = model.lock().expect("model lock poisoned");
+            m.connected = true;
+            // A daemon answers, so a failed start no longer describes it; and
+            // it may be another build than the last one.
+            m.start_problem = None;
+            m.service_build = ServiceBuild::Unknown;
+        }
         changed.notify_one();
         // pull full initial state
         let _ = writer.request(FrontendRequest::Sync).await;
@@ -1371,5 +1448,84 @@ mod a_closed_link_shows_down {
             !d.refuses_our_input(),
             "the outbound link closed and the device still shows as up and refusing"
         );
+    }
+}
+
+#[cfg(test)]
+mod the_service_problem {
+    //! What the app says about the service it talks to: a start that did not
+    //! come up (#189), or a daemon of another build left running across an
+    //! update.
+    use super::*;
+
+    fn build(version: &str, commit: &str) -> Build {
+        Build {
+            version: version.into(),
+            commit: commit.into(),
+        }
+    }
+
+    /// Connected, as this build, with the daemon's state still to come.
+    fn attached() -> AppModel {
+        AppModel {
+            connected: true,
+            this_build: Some(build("0.13.0", "abcd1234")),
+            ..AppModel::default()
+        }
+    }
+
+    // LEDGER T60 | class B | 6 struct state after AppModel::apply
+    #[test]
+    fn a_daemon_of_another_build_or_one_that_never_says_is_named() {
+        let mut same = attached();
+        same.apply(FrontendEvent::DaemonBuild(build("0.13.0", "abcd1234")));
+        same.apply(FrontendEvent::Enumerate(vec![]));
+        assert_eq!(same.service_problem(), None, "{:?}", same.service_build);
+
+        let mut other = attached();
+        other.apply(FrontendEvent::DaemonBuild(build("0.13.0", "ffff0000")));
+        other.apply(FrontendEvent::Enumerate(vec![]));
+        let said = other.service_problem().unwrap_or_default();
+        assert!(
+            said.contains("0.13.0 (abcd1234)") && said.contains("0.13.0 (ffff0000)"),
+            "a daemon built from another commit was not named: {said:?}"
+        );
+
+        // A v0.12 daemon sends its state and never its build.
+        let mut older = attached();
+        older.apply(FrontendEvent::PortChanged(4242, None));
+        assert_eq!(older.service_problem(), None, "nothing is known yet");
+        older.apply(FrontendEvent::Enumerate(vec![]));
+        let said = older.service_problem().unwrap_or_default();
+        assert!(
+            said.contains("older build"),
+            "state with no build before it is from a daemon that predates the \
+             statement, and the app said {said:?}"
+        );
+
+        // A state broadcast can reach a frontend before its own sync does;
+        // the statement that follows still counts.
+        older.apply(FrontendEvent::DaemonBuild(build("0.13.0", "abcd1234")));
+        assert_eq!(older.service_problem(), None);
+    }
+
+    // LEDGER T61 | class B | 6 struct state
+    #[test]
+    fn a_failed_start_shows_until_a_daemon_answers() {
+        let mut model = AppModel {
+            start_problem: Some("The hops service started and stopped again.".into()),
+            this_build: Some(build("0.13.0", "abcd1234")),
+            ..AppModel::default()
+        };
+        assert_eq!(
+            model.service_problem().as_deref(),
+            Some("The hops service started and stopped again."),
+            "the app would read \"connecting\" with nothing said"
+        );
+        // What the connection loop does once a daemon answers.
+        model.connected = true;
+        model.start_problem = None;
+        model.apply(FrontendEvent::DaemonBuild(build("0.13.0", "abcd1234")));
+        assert_eq!(model.service_problem(), None);
     }
 }

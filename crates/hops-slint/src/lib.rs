@@ -22,8 +22,8 @@ use std::{
 };
 
 use hops_frontend_core::{
-    ApprovalRefused, ClientHandle, FrontendClient, FrontendRequest, PairingCard, Position, Status,
-    TrustState, prefs, theme,
+    ApprovalRefused, ClientHandle, FrontendClient, FrontendRequest, Launch, PairingCard, Position,
+    Status, TrustState, prefs, theme,
 };
 use hops_ipc::{DEFAULT_PORT, Geometry};
 use slint::{ComponentHandle, ModelRc, VecModel};
@@ -75,6 +75,9 @@ struct PolledUi {
     pairing_seconds: i32,
     notice: String,
     notice_seq: i32,
+    /// What is wrong with the service, from `AppModel::service_problem`, or
+    /// empty.
+    service_problem: String,
     // An 11-field positional tuple against a 13-field DeviceRow, which is why
     // the repaint gate silently misses the two fields added most recently. The
     // fix is a named struct, and it belongs with the device-model work rather
@@ -397,7 +400,9 @@ fn claim_pending<T>(
 /// quits (macOS: via the menu bar "Quit"); the daemon keeps running regardless.
 /// `hidden` starts with only the menu-bar/tray icon and no window (login
 /// autostart); the window then opens on tray click or a second `hops gui` launch.
-pub fn run(hidden: bool) -> Result<(), SlintError> {
+/// `launch` is what the binary knows as it opens: its own build, and why a
+/// service it tried to start did not come up.
+pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
     // A second launch surfaces the resident window rather than duplicating the
     // tray icon; the flag is flipped by the single-instance socket thread and
     // read by the poll timer (both below). Also the vehicle for "reopen".
@@ -417,7 +422,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
             .expect("tokio runtime");
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, async move {
-            let client = FrontendClient::spawn();
+            let client = FrontendClient::spawn(launch);
             let _ = tx.send(client);
             std::future::pending::<()>().await;
         });
@@ -1015,6 +1020,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                 notice: m.latest_message().unwrap_or_default().to_string(),
                 // i32 is Slint's integer; the seq only needs to CHANGE, not be exact
                 notice_seq: (m.message_seq % (i32::MAX as u64)) as i32,
+                service_problem: m.service_problem().unwrap_or_default(),
                 devices: devices
                     .iter()
                     .map(|d| {
@@ -1043,6 +1049,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
             }
 
             ui.set_connected(snap.connected);
+            ui.set_service_problem(snap.service_problem.as_str().into());
             ui.set_capture(snap.capture.as_str().into());
             ui.set_emulation(snap.emulation.as_str().into());
             ui.set_port(snap.port.as_str().into());

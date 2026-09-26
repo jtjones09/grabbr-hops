@@ -47,6 +47,8 @@ case "$(uname -s)" in
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ThrottleInterval</key><integer>10</integer>
   <key>ProcessType</key><string>Interactive</string>
+  <!-- Lists the job under hops in System Settings → Login Items. -->
+  <key>AssociatedBundleIdentifiers</key><array><string>com.grabbr.hops</string></array>
   ${session}
   <key>StandardOutPath</key><string>${HOME}/hops/logs/${log}</string>
   <key>StandardErrorPath</key><string>${HOME}/hops/logs/${log}</string>

@@ -58,6 +58,15 @@ pub fn local_caps() -> u32 {
     }
 }
 
+/// This build, as a daemon states it to its frontends and a frontend compares
+/// it with the daemon's: the same two values `hops --version` prints.
+pub fn this_build() -> hops_ipc::Build {
+    hops_ipc::Build {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        commit: env!("HOPS_SHORT_COMMIT").to_string(),
+    }
+}
+
 /// `--version` string: package version + short git commit (both compile-time).
 const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
