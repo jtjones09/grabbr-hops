@@ -136,9 +136,10 @@ impl AppModel {
             FrontendEvent::RevokedUpdated(map) => self.revoked = map,
             FrontendEvent::AuthorizedUpdated(map) => {
                 self.authorized = map;
-                // a pending request that just became trusted is resolved
+                // a pending request whose direction just became permitted is
+                // resolved
                 if let Some(fp) = self.pending_pairing.clone() {
-                    if self.authorized.contains_key(&fp) {
+                    if self.arrival_permitted(&fp, self.pending_pairing_origin) {
                         self.pending_pairing = None;
                         self.pending_pairing_since = None;
                     }
@@ -181,7 +182,7 @@ impl AppModel {
                         None => format!("we dialled an untrusted receiver: {fingerprint}"),
                     },
                 });
-                if !self.authorized.contains_key(&fingerprint) {
+                if !self.arrival_permitted(&fingerprint, Some(origin)) {
                     self.pending_pairing = Some(fingerprint);
                     self.pending_pairing_origin = Some(origin);
                     self.pending_pairing_addr = addr;
@@ -197,6 +198,30 @@ impl AppModel {
                     .then(|| Instant::now() + std::time::Duration::from_secs(seconds.into()));
             }
             FrontendEvent::NoSuchClient(_) => {}
+        }
+    }
+
+    /// The pairing request to put in front of the user: the pending attempt,
+    /// unless the direction it arrived in is already permitted. Freshness and
+    /// the user's snooze are the front-end's.
+    pub fn pairing_request(&self) -> Option<&str> {
+        let fp = self.pending_pairing.as_deref()?;
+        (!self.arrival_permitted(fp, self.pending_pairing_origin)).then_some(fp)
+    }
+
+    /// Is what an attempt from `fp`, arriving by `origin`, asks for already
+    /// permitted?
+    ///
+    /// A peer that may drive this machine can still ask to be driven by it:
+    /// one approval grants one direction, and a pair that works both ways is
+    /// approved twice (#166). So being in `authorized` answers only the
+    /// inbound question. Nothing here says whether this machine may drive a
+    /// peer, and the daemon raises an attempt from its own dial only after its
+    /// trust store said it may not, so that attempt is never already answered.
+    fn arrival_permitted(&self, fp: &str, origin: Option<AttemptOrigin>) -> bool {
+        match origin {
+            Some(AttemptOrigin::OutboundDial) => false,
+            Some(AttemptOrigin::Inbound) | None => self.authorized.contains_key(fp),
         }
     }
 
@@ -862,6 +887,80 @@ mod pairing_window {
             m.pairing_seconds_left(Instant::now()),
             None,
             "the daemon closed the window and the model kept it open"
+        );
+    }
+}
+
+#[cfg(test)]
+mod second_direction {
+    //! A machine already paired one way is asked about the other (#166). One
+    //! approval grants one direction, so the card for the second one has to
+    //! reach the user even though the peer is already in `authorized`.
+    use super::*;
+
+    const PEER: &str = "aa:bb";
+
+    /// PEER may drive this machine, and this machine's dial just reached it.
+    fn driven_by_peer_then_dialled_it() -> AppModel {
+        let mut m = AppModel::default();
+        m.apply(FrontendEvent::AuthorizedUpdated(HashMap::from([(
+            PEER.to_owned(),
+            "desk mac".to_owned(),
+        )])));
+        m.apply(FrontendEvent::ConnectionAttempt {
+            fingerprint: PEER.into(),
+            origin: AttemptOrigin::OutboundDial,
+            addr: Some("10.0.0.5:4242".parse().expect("addr")),
+        });
+        m
+    }
+
+    // LEDGER T5 | class B | 6 struct state + 1 return value: AppModel::apply, AppModel::pairing_request
+    #[test]
+    fn a_second_direction_raises_a_card_for_an_authorized_peer() {
+        let m = driven_by_peer_then_dialled_it();
+        assert_eq!(
+            m.pairing_request(),
+            Some(PEER),
+            "a peer that may drive this machine answered this machine's dial, \
+             and no card asks whether this machine may drive it; pending {:?}",
+            m.pending_pairing
+        );
+    }
+
+    // LEDGER T6 | class B | 6 struct state + 1 return value: AppModel::apply, AppModel::pairing_request
+    #[test]
+    fn a_trust_update_does_not_retire_a_card_for_the_other_direction() {
+        let mut m = driven_by_peer_then_dialled_it();
+        m.apply(FrontendEvent::AuthorizedUpdated(HashMap::from([
+            (PEER.to_owned(), "desk mac".to_owned()),
+            ("cc:dd".to_owned(), "another machine".to_owned()),
+        ])));
+        assert_eq!(
+            m.pairing_request(),
+            Some(PEER),
+            "a change to who may drive this machine withdrew the card asking \
+             whether this machine may drive PEER"
+        );
+    }
+
+    // LEDGER T7 | class B | 6 struct state + 1 return value: AppModel::apply, AppModel::pairing_request
+    #[test]
+    fn a_knock_from_a_peer_that_may_already_drive_us_raises_no_card() {
+        let mut m = AppModel::default();
+        m.apply(FrontendEvent::AuthorizedUpdated(HashMap::from([(
+            PEER.to_owned(),
+            "desk mac".to_owned(),
+        )])));
+        m.apply(FrontendEvent::ConnectionAttempt {
+            fingerprint: PEER.into(),
+            origin: AttemptOrigin::Inbound,
+            addr: None,
+        });
+        assert_eq!(
+            m.pairing_request(),
+            None,
+            "a card asks to let PEER drive this machine, which it already may"
         );
     }
 }
