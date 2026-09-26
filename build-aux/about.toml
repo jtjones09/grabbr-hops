@@ -1,0 +1,29 @@
+# cargo-about configuration: the third-party licence notices every release
+# archive carries (THIRD-PARTY-NOTICES.txt, rendered with
+# build-aux/third-party-notices.hbs by .github/workflows/release.yml).
+#
+# A crate under a licence missing from `accepted` fails the release build,
+# so a new licence is a reviewed change to this list, never a silent one.
+# Where a crate offers a choice, the first licence listed here is the one
+# its notice is reproduced under.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "WTFPL",
+    # hops' own crates, and Slint, which hops uses under the GPL.
+    "GPL-3.0-or-later",
+    "GPL-3.0-only",
+]
+
+# The notices cover what is in the binary. Build scripts and tests are not
+# shipped.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true

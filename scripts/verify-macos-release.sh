@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Verify a release dmg the way the Mac that opens it will: Gatekeeper accepts
 # the image and the app inside it as notarized Developer ID code, both carry a
-# stapled ticket, and the app is signed as com.grabbr.hops.
+# stapled ticket, and the app is signed as com.grabbr.hops. Then check that it
+# carries what every release artifact does: LICENSE, the third-party notices,
+# an SBOM for each target of the universal binary, and a binary built with
+# cargo auditable.
 #
 #   scripts/verify-macos-release.sh <dmg>
 #
@@ -59,4 +62,13 @@ id="$(codesign -dv "$APP" 2>&1 | sed -n 's/^Identifier=//p')"
 [ "$id" = "$IDENTIFIER" ] ||
     fail "hops.app is signed as '$id', not $IDENTIFIER; macOS would not apply its grants."
 
-echo "OK: $DMG and the hops.app inside it are notarized, stapled and signed as $IDENTIFIER."
+for f in LICENSE THIRD-PARTY-NOTICES.txt \
+         hops-aarch64-apple-darwin.cdx.json hops-x86_64-apple-darwin.cdx.json; do
+    [ -s "$APP/Contents/Resources/$f" ] || fail "hops.app carries no $f."
+done
+# The section cargo auditable embeds the dependency list in.
+grep -qaF .dep-v0 "$APP/Contents/MacOS/hops" ||
+    fail "hops.app's binary embeds no dependency list; it was not built with cargo auditable."
+
+echo "OK: $DMG and the hops.app inside it are notarized, stapled and signed as $IDENTIFIER,"
+echo "    and the app carries its licence, notices, SBOMs and dependency list."

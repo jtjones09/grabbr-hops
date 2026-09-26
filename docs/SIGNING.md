@@ -54,7 +54,9 @@ DEVELOPER_ID="Developer ID Application: … (TEAMID)" NOTARY_PROFILE=hops-notary
 
 `release.yml` signs and notarizes the macOS `.dmg` in its own job,
 `sign-macos`. That job runs no `cargo`: it receives only the unsigned universal
-binary from the build job, bundles it with `package-macos.sh`, signs it with
+build from the build job (the binary, `LICENSE`, `THIRD-PARTY-NOTICES.txt` and
+the SBOMs, which go into the app's `Contents/Resources`), bundles it with
+`package-macos.sh`, signs it with
 `sign-macos.sh`, and checks the result with `verify-macos-release.sh` before
 uploading it. The build job compiles every dependency's build script and proc
 macro, so no secret is visible there.
@@ -76,7 +78,8 @@ copies; otherwise any job in any workflow can still reference them.
 
 `sign-macos` fails when any of the six is missing, on every run. A tag whose
 run cannot produce a verified dmg publishes nothing, and the publish job
-refuses a release that lacks any of its four assets.
+refuses a release that lacks any of its assets or whose assets do not match
+`SHA256SUMS`.
 
 To get a signed dmg without releasing, run the workflow by hand (Actions →
 release → Run workflow) from any branch. Every job except publish runs, and the
@@ -84,7 +87,9 @@ dmg is attached to the run as the `hops-macos-universal-dmg` artifact.
 
 `verify-macos-release.sh` passes only when `spctl` reports
 `source=Notarized Developer ID` for the dmg and for the app inside it, both
-carry a stapled ticket, and the app is signed as `com.grabbr.hops`. Run it on
+carry a stapled ticket, the app is signed as `com.grabbr.hops`, and it carries
+its licence, notices, an SBOM per target and a binary built with
+`cargo auditable`. Run it on
 any dmg you are about to distribute:
 
 ```sh
