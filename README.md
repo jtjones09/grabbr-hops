@@ -54,9 +54,11 @@ you want to share the keyboard & mouse across.
 | OS | File |
 | --- | --- |
 | macOS (Intel + Apple Silicon) | `hops-macos-universal.dmg` — open it, drag **hops** to Applications |
-| macOS (CLI / headless) | `hops-macos-universal.tar.gz` — just the `hops` binary |
+| macOS (CLI / headless) | `hops-macos-universal.tar.gz` — the `hops` binary, with its licence and notices |
 | Windows | `hops-windows-x86_64.zip` |
 | Linux (terminal UI + daemon) | `hops-linux-x86_64.tar.gz` |
+
+Each archive also holds `LICENSE`, `THIRD-PARTY-NOTICES.txt` and an SBOM. To check a download, see [Verifying a release](SECURITY.md#verifying-a-release).
 
 First-launch notes:
 - **macOS** — the `.dmg` is **signed & notarized by Apple**, so it opens with no Gatekeeper warning. On first run, switch **hops** on under System Settings → Privacy & Security → **Accessibility** (it can't move your cursor without it). *(The bare `.tar.gz` CLI binary is unsigned — right-click it → **Open** the first time.)*

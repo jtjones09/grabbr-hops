@@ -1,0 +1,25 @@
+THIRD-PARTY NOTICES
+
+hops is free software, licensed under the GNU General Public License,
+version 3 or later; see LICENSE. Its source code is at
+https://github.com/jtjones09/grabbr-hops.
+
+This build also contains the Rust crates listed below. Each licence is
+reproduced once, followed by the crates distributed under it.
+
+Licences:
+{{#each overview}}
+  {{{name}}}: {{count}} crate(s)
+{{/each}}
+{{#each licenses}}
+
+================================================================================
+{{{name}}} ({{id}})
+
+Used by:
+{{#each used_by}}
+  {{{crate.name}}} {{crate.version}}{{#if crate.repository}} ({{{crate.repository}}}){{/if}}
+{{/each}}
+
+{{{text}}}
+{{/each}}

@@ -21,8 +21,8 @@ ignore = [
     # its own crate. No input from a peer, a user or the network reaches it.
     # wayland-scanner 0.31 requires quick-xml 0.39; remove these two once a
     # release accepts 0.41.
-    { id = "RUSTSEC-2026-0194", reason = "build-time only, parses vendored Wayland protocol XML" },
-    { id = "RUSTSEC-2026-0195", reason = "build-time only, parses vendored Wayland protocol XML" },
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml: build-time only, parses vendored Wayland protocol XML" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml: build-time only, parses vendored Wayland protocol XML" },
     # paste is a compile-time macro used at two call sites in hops-proto. It
     # generates code and has no runtime presence; being unmaintained is not a
     # defect in the code it emits.
