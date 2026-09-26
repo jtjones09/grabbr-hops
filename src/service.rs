@@ -846,6 +846,12 @@ impl Service {
         self.config.set_revoked_fingerprints(tombstones);
         if let Err(e) = self.config.write_back() {
             log::warn!("failed to write config: {e}");
+            // The change is in memory only, for one when the file does not
+            // parse and is left as it is: say so, or it looks saved until the
+            // next start.
+            self.notify_frontend(FrontendEvent::Error(format!(
+                "The change was made but not saved: {e}"
+            )));
         }
     }
 

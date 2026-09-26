@@ -23,6 +23,8 @@ use input_event::scancode::{
     Linux::{KeyLeftAlt, KeyLeftCtrl, KeyLeftMeta, KeyLeftShift},
 };
 
+mod merge;
+
 /// Local build's 8-byte ASCII short commit hash, suitable for use
 /// in [`hops_proto::ProtoEvent::Hello`]. Set by `build.rs` (via the `git` CLI —
 /// no libgit2). Pads with `'?'` if it's an unexpected length so the field is
@@ -352,6 +354,10 @@ pub struct Config {
     config_dir: PathBuf,
     /// the (optional) toml config and it's path
     config_toml: Option<ConfigToml>,
+    /// `[[clients]]` as this process last read them from the file or wrote
+    /// them to it: what a save compares memory against to find what the
+    /// daemon changed, which is all it may write (#7).
+    synced: Vec<ConfigClient>,
     // filesystem watcher
     watcher: notify::RecommendedWatcher,
     // channel for filesystem events
@@ -619,8 +625,10 @@ pub fn command_from_args() -> Option<Command> {
 
 impl Config {
     pub fn new() -> Result<Self, ConfigError> {
-        let args = Args::parse();
+        Self::with_args(Args::parse())
+    }
 
+    fn with_args(args: Args) -> Result<Self, ConfigError> {
         // --config <file> overrules default location
         let config_path = args
             .config
@@ -683,9 +691,11 @@ impl Config {
             config_path,
             config_dir,
             config_toml,
+            synced: vec![],
             watcher,
             watch_rx,
         };
+        config.synced = config.clients();
         config.watch()?;
         Ok(config)
     }
@@ -873,6 +883,7 @@ impl Config {
                     .as_ref()
                     .is_none_or(|c| c != &current_config);
                 self.config_toml.replace(current_config);
+                self.synced = self.clients();
             }
             Err(e) => log::warn!("{:?} {e}", self.config_path()),
         };
@@ -884,14 +895,20 @@ impl Config {
         Ok(changed)
     }
 
+    /// Save what the daemon changed, and nothing else (#7).
+    ///
+    /// Reads the file and applies to it only the changes the daemon made since
+    /// it last read or wrote it (see [`merge`]), so an edit made by hand that
+    /// the daemon has not read back, a key this build does not know, and the
+    /// comments all survive. A file that does not parse is left as it is and
+    /// the save fails: overwriting it would throw away the edit that broke it.
     pub fn write_back(&mut self) -> Result<(), io::Error> {
         log::info!("writing config to {:?}", self.config_path);
-        /* the new config */
         // Never serialise `unwrap_or_default()`. If there is no parsed config in
         // memory, writing is the one thing this must not do — that is how a parse
         // failure became a zero-byte trust store. Unreachable since a corrupt
         // config is now fatal at startup, and kept as the second gate anyway.
-        let Some(new_config) = self.config_toml.clone() else {
+        let Some(ours) = self.config_toml.clone() else {
             log::error!(
                 "refusing to write {:?}: there is no parsed config in memory, and \
                  writing defaults here would erase the trust store",
@@ -899,16 +916,6 @@ impl Config {
             );
             return Ok(());
         };
-        let new_config = toml_edit::ser::to_string_pretty(&new_config).expect("config");
-
-        /*
-         * TODO merge with current config file to preserve comments
-         * => eventually we might want to split this up into clients configured
-         * via the config file and clients managed through the GUI / frontend.
-         * The latter should be saved to $XDG_DATA_HOME instead of $XDG_CONFIG_HOME,
-         * and clients configured through .config could be made permanent.
-         * For now we just override the config file.
-         */
 
         // Bracket the write. EVERY exit between unwatch and watch must re-arm,
         // and the way to guarantee that is to have exactly one exit — not to
@@ -918,18 +925,32 @@ impl Config {
         // the re-arm to the write-error path only. The `?` on create_dir_all
         // above it still returned early with the watcher off.
         let _ = self.unwatch();
-        let result = self.write_config_file(&new_config);
+        let result = self.write_config_file(&ours);
         let _ = self.watch();
         result
     }
 
-    /// The actual write. Called only between `unwatch` and `watch`, so it is
-    /// free to use `?` — its caller re-arms on every path.
-    fn write_config_file(&mut self, new_config: &str) -> Result<(), io::Error> {
-        /* write new config to file */
+    /// The actual read, merge and write. Called only between `unwatch` and
+    /// `watch`, so it is free to use `?` — its caller re-arms on every path.
+    ///
+    /// Reading inside the bracket narrows what can still be lost to an edit
+    /// saved between this read and the rename below.
+    fn write_config_file(&mut self, ours: &ConfigToml) -> Result<(), io::Error> {
         if let Some(p) = self.config_path().parent() {
             fs::create_dir_all(p)?;
         }
+        let new_config = match fs::read_to_string(self.config_path()) {
+            Ok(disk) => merge::merge(&disk, &self.synced, ours).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{} was left as it is: {e}", self.config_path.display()),
+                )
+            })?,
+            // nothing on disk to keep
+            Err(e) if e.kind() == io::ErrorKind::NotFound => toml_edit::ser::to_string_pretty(ours)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+            Err(e) => return Err(e),
+        };
         // Write to a sibling temp file, flush it, then RENAME over the real one.
         // The previous code opened the trust store with `truncate(true)` and only
         // then wrote it, so any kill inside that window — a launchd KeepAlive
@@ -940,7 +961,9 @@ impl Config {
         // rename(2) is atomic within a filesystem, and the temp file is a sibling
         // so it is always the same one. A reader sees either the whole old file
         // or the whole new one, never a truncated one.
-        write_atomically(self.config_path(), new_config.as_bytes())
+        write_atomically(self.config_path(), new_config.as_bytes())?;
+        self.synced = self.clients();
+        Ok(())
     }
 }
 
@@ -1543,5 +1566,374 @@ mod the_watcher_never_blocks {
             event(EventKind::Create(CreateKind::File), &config),
         );
         assert!(rx.try_recv().is_ok(), "a new config file was not passed on");
+    }
+}
+
+#[cfg(test)]
+mod saves_keep_what_they_did_not_set {
+    //! A save changes in the file only what the daemon changed (#7).
+    //!
+    //! Each test loads a real `Config` from a scratch file, changes the file
+    //! the way a hand edit does without the daemon reading it back (on
+    //! Windows the watcher never reports one, #5), changes memory the way
+    //! `save_config` does, saves, and reads what landed on disk.
+    use super::*;
+
+    const DESK: &str = "11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:\
+11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00";
+
+    struct Scratch {
+        dir: PathBuf,
+        path: PathBuf,
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn scratch(tag: &str, text: &str) -> (Scratch, Config) {
+        let dir = std::env::temp_dir().join(format!("hops-merge-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("a scratch directory");
+        let path = dir.join("config.toml");
+        fs::write(&path, text).expect("a config");
+        let args = Args::parse_from([
+            "hops".as_ref(),
+            "--config".as_ref(),
+            path.as_os_str(),
+            "--cert-path".as_ref(),
+            dir.join("cert.pem").as_os_str(),
+        ]);
+        let config = Config::with_args(args).expect("the config loads");
+        (Scratch { dir, path }, config)
+    }
+
+    fn on_disk(s: &Scratch) -> DocumentMut {
+        fs::read_to_string(&s.path)
+            .expect("the config")
+            .parse()
+            .expect("the saved config parses")
+    }
+
+    fn entry(doc: &DocumentMut, i: usize) -> &toml_edit::Table {
+        doc["clients"]
+            .as_array_of_tables()
+            .and_then(|a| a.get(i))
+            .unwrap_or_else(|| panic!("no entry {i} in:\n{doc}"))
+    }
+
+    /// The value of `key`, without the whitespace and comment around it.
+    fn text(t: &toml_edit::Table, key: &str) -> String {
+        t.get(key)
+            .and_then(|i| i.as_value())
+            .map(|v| {
+                let mut v = v.clone();
+                v.decor_mut().clear();
+                v.to_string()
+            })
+            .unwrap_or_default()
+    }
+
+    const TWO_DEVICES: &str = "\
+# where this machine listens
+port = 4343
+future_setting = \"kept\" # a key this build does not know
+
+# the desk mac
+[[clients]]
+hostname = \"desk-mac\"
+ips = [\"192.0.2.10\"]
+position = \"left\" # beside the monitor
+future_client_key = 7
+
+[[clients]]
+hostname = \"laptop\"
+ips = [\"192.0.2.11\"]
+position = \"right\"
+";
+
+    // LEDGER T4 | class B | 4 file on disk written by Config::write_back
+    #[test]
+    fn a_hand_edit_not_yet_read_back_survives_a_save_of_another_field() {
+        let (s, mut config) = scratch("handedit", TWO_DEVICES);
+        // edited by hand, and not read back
+        let edited = TWO_DEVICES
+            .replace("port = 4343", "port = 4444")
+            .replace("position = \"left\"", "position = \"top\"");
+        fs::write(&s.path, &edited).expect("the hand edit");
+        // the daemon switches the desk mac on, from its stale memory
+        let mut clients = config.clients();
+        clients[0].active = true;
+        config.set_clients(clients);
+        config.write_back().expect("the save");
+
+        let doc = on_disk(&s);
+        let desk = entry(&doc, 0);
+        assert_eq!(
+            text(desk, "activate_on_startup"),
+            "true",
+            "the daemon's change was not saved:\n{doc}"
+        );
+        assert_eq!(
+            text(desk, "position"),
+            "\"top\"",
+            "the save put back the position the daemon remembered over the one \
+             edited by hand:\n{doc}"
+        );
+        assert_eq!(
+            doc["port"].as_integer(),
+            Some(4444),
+            "the save put back the port the daemon remembered:\n{doc}"
+        );
+        assert_eq!(text(entry(&doc, 1), "position"), "\"right\"");
+    }
+
+    // LEDGER T5 | class B | 4 file on disk written by Config::write_back
+    #[test]
+    fn keys_this_build_does_not_know_and_comments_survive_a_save() {
+        let (s, mut config) = scratch("unknown", TWO_DEVICES);
+        let mut clients = config.clients();
+        clients[1].pos = Position::Bottom;
+        config.set_clients(clients);
+        config.write_back().expect("the save");
+
+        let doc = on_disk(&s);
+        let saved = doc.to_string();
+        assert_eq!(text(entry(&doc, 1), "position"), "\"bottom\"");
+        assert_eq!(
+            doc.get("future_setting").and_then(|i| i.as_str()),
+            Some("kept"),
+            "a key this build does not know was dropped by a save:\n{saved}"
+        );
+        assert_eq!(
+            text(entry(&doc, 0), "future_client_key"),
+            "7",
+            "a device key this build does not know was dropped by a save:\n{saved}"
+        );
+        for comment in [
+            "# where this machine listens",
+            "# a key this build does not know",
+            "# the desk mac",
+            "# beside the monitor",
+        ] {
+            assert!(
+                saved.contains(comment),
+                "the comment {comment:?} was dropped by a save:\n{saved}"
+            );
+        }
+    }
+
+    // LEDGER T6 | class B | 1 error + 4 file on disk: Config::write_back
+    #[test]
+    fn a_config_that_no_longer_parses_is_left_as_it_is() {
+        for (tag, broken) in [
+            (
+                "syntax",
+                "port = 4343\n[[clients]\nhostname = \"desk-mac\"\n",
+            ),
+            ("type", "port = \"4343\"\n"),
+        ] {
+            let (s, mut config) = scratch(tag, TWO_DEVICES);
+            fs::write(&s.path, broken).expect("an edit in progress");
+            let mut clients = config.clients();
+            clients[0].active = true;
+            config.set_clients(clients);
+            let saved = config.write_back();
+            assert!(
+                saved.is_err(),
+                "{tag}: a save over a config that does not parse reported success"
+            );
+            assert_eq!(
+                fs::read_to_string(&s.path).expect("the config"),
+                broken,
+                "{tag}: a config that does not parse was overwritten, and the edit \
+                 in progress with it"
+            );
+        }
+    }
+
+    // LEDGER T7 | class B | 4 file on disk written by Config::write_back
+    #[test]
+    fn devices_the_daemon_adds_and_removes_change_and_a_hand_added_one_stays() {
+        let (s, mut config) = scratch("addremove", TWO_DEVICES);
+        let by_hand = "\n[[clients]]\nhostname = \"garage-pc\"\nposition = \"top\"\n";
+        fs::write(&s.path, format!("{TWO_DEVICES}{by_hand}")).expect("the hand edit");
+        // the daemon removes the desk mac and adds a device
+        let mut clients = config.clients();
+        clients.remove(0);
+        clients.push(ConfigClient {
+            ips: HashSet::from(["192.0.2.12".parse().expect("ip")]),
+            hostname: None,
+            port: DEFAULT_PORT,
+            pos: Position::Bottom,
+            active: false,
+            enter_hook: None,
+            fingerprint: Some(DESK.to_string()),
+        });
+        config.set_clients(clients);
+        config.write_back().expect("the save");
+
+        let doc = on_disk(&s);
+        let names: Vec<String> = doc["clients"]
+            .as_array_of_tables()
+            .expect("[[clients]]")
+            .iter()
+            .map(|t| format!("{} {}", text(t, "hostname"), text(t, "ips")))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "\"laptop\" [\"192.0.2.11\"]",
+                "\"garage-pc\" ",
+                " [\"192.0.2.12\"]"
+            ],
+            "the removed device must go, the one added by hand stay, and the \
+             new one be added:\n{doc}"
+        );
+    }
+
+    // LEDGER T10 | class B | 4 file on disk written by Config::write_back
+    #[test]
+    fn a_renamed_device_keeps_what_was_written_into_its_entry_by_hand() {
+        // no pin and no address: the rename changes all it can be known by
+        let (s, mut config) = scratch(
+            "rename",
+            "[[clients]]\nhostname = \"garage-pc\" # the old name\nfuture_client_key = 7\n\n\
+             [[clients]]\nhostname = \"laptop\"\nposition = \"right\"\n",
+        );
+        let mut clients = config.clients();
+        clients[0].hostname = Some("workshop-pc".to_string());
+        config.set_clients(clients);
+        config.write_back().expect("the save");
+
+        let doc = on_disk(&s);
+        let renamed = entry(&doc, 0);
+        assert_eq!(
+            text(renamed, "hostname"),
+            "\"workshop-pc\"",
+            "the renamed device's entry is not where it was:\n{doc}"
+        );
+        assert_eq!(
+            text(renamed, "future_client_key"),
+            "7",
+            "a rename rewrote the device's entry instead of changing its name:\n{doc}"
+        );
+        assert!(doc.to_string().contains("# the old name"), "{doc}");
+    }
+
+    // LEDGER T11 | class B | 4 file on disk written by Config::write_back
+    #[test]
+    fn a_save_never_writes_an_enter_hook_into_the_file() {
+        let (s, mut config) = scratch(
+            "hook",
+            &format!(
+                "[[clients]]\nhostname = \"desk-mac\"\nfingerprint = \"{DESK}\"\n\
+                 enter_hook = \"from-the-file\"\n"
+            ),
+        );
+        let mut clients = config.clients();
+        clients[0].pos = Position::Top;
+        clients[0].enter_hook = Some("from-memory".to_string());
+        config.set_clients(clients);
+        config.write_back().expect("the save");
+
+        let doc = on_disk(&s);
+        assert_eq!(text(entry(&doc, 0), "position"), "\"top\"", "{doc}");
+        assert_eq!(
+            text(entry(&doc, 0), "enter_hook"),
+            "\"from-the-file\"",
+            "a save wrote a command into the file: the hook is set by editing \
+             the file and nowhere else (#56)"
+        );
+    }
+
+    // LEDGER T12 | class B | 4 file on disk written by Config::write_back, twice
+    #[test]
+    fn a_change_once_saved_is_not_written_again_over_a_later_hand_edit() {
+        let (s, mut config) = scratch("twice", TWO_DEVICES);
+        let mut clients = config.clients();
+        clients[1].pos = Position::Bottom;
+        config.set_clients(clients.clone());
+        config.write_back().expect("the first save");
+        // then edited by hand, and not read back
+        let edited = fs::read_to_string(&s.path)
+            .expect("the config")
+            .replace("position = \"bottom\"", "position = \"top\"");
+        fs::write(&s.path, edited).expect("the hand edit");
+        clients[0].active = true;
+        config.set_clients(clients);
+        config.write_back().expect("the second save");
+
+        let doc = on_disk(&s);
+        assert_eq!(
+            text(entry(&doc, 1), "position"),
+            "\"top\"",
+            "a later save wrote the daemon's earlier change again, over a hand \
+             edit made since:\n{doc}"
+        );
+        assert_eq!(text(entry(&doc, 0), "activate_on_startup"), "true", "{doc}");
+    }
+
+    // LEDGER T13 | class B | 4 file on disk written by Config::write_back after Config::read_from_disk
+    #[test]
+    fn an_edit_read_back_is_what_the_next_save_starts_from() {
+        let (s, mut config) = scratch(
+            "reread",
+            "[[clients]]\nhostname = \"garage-pc\"\n\n[[clients]]\nhostname = \"laptop\"\n",
+        );
+        // renamed by hand, with a note, and read back
+        fs::write(
+            &s.path,
+            "[[clients]]\nhostname = \"workshop-pc\"\nfuture_client_key = 7\n\n\
+             [[clients]]\nhostname = \"laptop\"\n",
+        )
+        .expect("the hand edit");
+        assert!(config.read_from_disk().expect("the reload"));
+        let mut clients = config.clients();
+        clients[0].pos = Position::Top;
+        config.set_clients(clients);
+        config.write_back().expect("the save");
+
+        let doc = on_disk(&s);
+        assert_eq!(
+            text(entry(&doc, 0), "position"),
+            "\"top\"",
+            "the device's entry is not where it was:\n{doc}"
+        );
+        assert_eq!(
+            text(entry(&doc, 0), "future_client_key"),
+            "7",
+            "the save compared memory with the file as it was before the reload, \
+             and rewrote the device's entry:\n{doc}"
+        );
+    }
+
+    // LEDGER T8 | class B | 4 file on disk written by Config::write_back
+    #[test]
+    fn the_trust_cache_is_rewritten_only_when_the_store_changed() {
+        let with_cache = format!(
+            "{TWO_DEVICES}\n[authorized_fingerprints]\n\"{DESK}\" = \"desk mac\" # since spring\n"
+        );
+        let (s, mut config) = scratch("cache", &with_cache);
+        config.set_authorized_keys(HashMap::from([(DESK.to_string(), "desk mac".to_string())]));
+        config.write_back().expect("the save");
+        assert!(
+            fs::read_to_string(&s.path)
+                .expect("the config")
+                .contains("# since spring"),
+            "an unchanged trust cache was rewritten"
+        );
+
+        config.set_authorized_keys(HashMap::new());
+        config.write_back().expect("the save");
+        let doc = on_disk(&s);
+        assert!(
+            doc["authorized_fingerprints"]
+                .as_table()
+                .is_some_and(|t| t.is_empty()),
+            "the trust cache must follow the store:\n{doc}"
+        );
     }
 }
