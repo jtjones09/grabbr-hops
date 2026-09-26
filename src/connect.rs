@@ -59,6 +59,10 @@ struct PeerLink {
     /// this on every send, not only at the handshake: trust can be withdrawn
     /// while the link stays open (#156).
     fingerprint: String,
+    /// The device this machine dialled it for. An edit to the device can
+    /// make it forget the fingerprint above and its address while this link
+    /// stays up, and it is still that device's link (#218).
+    handle: ClientHandle,
 }
 
 fn client_config(
@@ -106,6 +110,7 @@ async fn connect(
     addr: SocketAddr,
     expected_fp: Option<String>,
     trust: Trust,
+    handle: ClientHandle,
 ) -> Result<(PeerLink, SocketAddr), (SocketAddr, LanMouseConnectionError)> {
     log::info!("connecting to {addr} ...");
     // server_name is the SNI label; trust is by fingerprint, so it is not
@@ -152,6 +157,7 @@ async fn connect(
             conn,
             send: Arc::new(Mutex::new(send)),
             fingerprint,
+            handle,
         },
         addr,
     ))
@@ -230,6 +236,7 @@ async fn connect_any(
     dials: &[Dial],
     expected_fp: Option<String>,
     trust: &Trust,
+    handle: ClientHandle,
 ) -> Result<(PeerLink, SocketAddr), LanMouseConnectionError> {
     let addrs: Vec<SocketAddr> = dials.iter().map(|d| d.addr).collect();
     let mut joinset = JoinSet::new();
@@ -238,7 +245,14 @@ async fn connect_any(
         let cfg = d.cfg.clone();
         let addr = d.addr;
         let expected = expected_fp.clone();
-        joinset.spawn_local(connect(endpoint, cfg, addr, expected, trust.clone()));
+        joinset.spawn_local(connect(
+            endpoint,
+            cfg,
+            addr,
+            expected,
+            trust.clone(),
+            handle,
+        ));
     }
     // if every candidate failed the identity pin (not a transport error), surface
     // that distinctly so the caller logs the right recovery guidance.
@@ -363,6 +377,7 @@ impl LanMouseConnection {
         ClipboardSender {
             conns: self.conns.clone(),
             trust: self.trust.clone(),
+            clients: self.client_manager.clone(),
         }
     }
 
@@ -391,6 +406,7 @@ impl LanMouseConnection {
                         &self.client_manager,
                         handle,
                         addr,
+                        Some(&link.conn),
                         &self.conns,
                         &self.state_tx,
                     )
@@ -410,7 +426,7 @@ impl LanMouseConnection {
                     transport::write_frame(&mut send, event).await
                 })
                 .await;
-                self.settle(result, event, handle, addr).await;
+                self.settle(result, event, handle, addr, &link).await;
                 return Ok(());
             }
         }
@@ -480,7 +496,7 @@ impl LanMouseConnection {
             transport::write_frame(&mut send, event).await
         })
         .await;
-        self.settle(result, event, handle, addr).await;
+        self.settle(result, event, handle, addr, &link).await;
         Ok(())
     }
 
@@ -499,6 +515,7 @@ impl LanMouseConnection {
         event: ProtoEvent,
         handle: ClientHandle,
         addr: SocketAddr,
+        link: &PeerLink,
     ) {
         match result {
             Ok(Ok(())) => log::trace!("{event} >->->->->- {addr}"),
@@ -508,6 +525,7 @@ impl LanMouseConnection {
                     &self.client_manager,
                     handle,
                     addr,
+                    Some(&link.conn),
                     &self.conns,
                     &self.state_tx,
                 )
@@ -523,6 +541,7 @@ impl LanMouseConnection {
                     &self.client_manager,
                     handle,
                     addr,
+                    Some(&link.conn),
                     &self.conns,
                     &self.state_tx,
                 )
@@ -539,6 +558,9 @@ impl LanMouseConnection {
 pub(crate) struct ClipboardSender {
     conns: Rc<Mutex<HashMap<SocketAddr, PeerLink>>>,
     trust: Trust,
+    /// The device switches: none of the clipboard goes to a machine that is
+    /// switched off.
+    clients: ClientManager,
 }
 
 /// One clipboard-failure line a minute is enough to tell you it is dropping,
@@ -555,10 +577,15 @@ impl ClipboardSender {
             let conns = self.conns.lock().await;
             let trust = self.trust.read().expect("lock");
             // Sent only where the lease says so (#186), so a device that was
-            // removed while its link stayed up is not sent it either.
+            // removed while its link stayed up is not sent it either, and
+            // never to a machine switched off here (#218).
             conns
                 .values()
                 .filter(|l| trust.clipboard_to(&l.fingerprint))
+                .filter(|l| {
+                    self.clients
+                        .switch_allows_clipboard(&l.fingerprint, Some(l.handle))
+                })
                 .map(|l| l.conn.clone())
                 .collect()
         };
@@ -677,7 +704,7 @@ async fn connect_to_handle(
                 }
             })
             .collect();
-        let (link, addr) = match connect_any(&endpoint, &dials, expected_fp, &trust).await {
+        let (link, addr) = match connect_any(&endpoint, &dials, expected_fp, &trust, handle).await {
             Ok(c) => c,
             Err(e) => {
                 connecting.lock().await.remove(&handle);
@@ -752,6 +779,19 @@ async fn connect_to_handle(
             connecting.lock().await.remove(&handle);
             return Err(LanMouseConnectionError::NotConnected);
         }
+        // Switched off while the handshake ran: a device that is off holds
+        // no link (#218), and switching it off closed only the links already
+        // open.
+        if !client_manager.is_on(handle) {
+            drop(open);
+            log::info!(
+                "client {handle}: the dial to {addr} finished after the device was \
+                 switched off; closing it"
+            );
+            link.conn.close(0u32.into(), b"switched off");
+            connecting.lock().await.remove(&handle);
+            return Err(LanMouseConnectionError::NotConnected);
+        }
         log::info!("client ({handle}) connected @ {addr}");
         // Stamp the receiver's leaf-cert fingerprint from THIS connection — the
         // pin identity + the key the frontend uses to correlate this client with
@@ -818,6 +858,7 @@ async fn connect_to_handle(
         ));
         let clipboard = ClipboardInlet {
             from: link.fingerprint.clone(),
+            dialled_for: Some(handle),
             trust,
             tx: clipboard_in,
         };
@@ -856,7 +897,15 @@ async fn ping_pong(
             };
             if let Err(e) = result {
                 log::warn!("{addr}: send error `{e}`, closing connection");
-                disconnect(&client_manager, handle, addr, &conns, &state_tx).await;
+                disconnect(
+                    &client_manager,
+                    handle,
+                    addr,
+                    Some(&link.conn),
+                    &conns,
+                    &state_tx,
+                )
+                .await;
                 return;
             }
             log::trace!("PING >->->->->- {addr}");
@@ -894,7 +943,15 @@ async fn receive_loop(
         Ok(recv) => recv,
         Err(e) => {
             log::warn!("{addr}: no inbound stream: {e}");
-            disconnect(&client_manager, handle, addr, &conns, &state_tx).await;
+            disconnect(
+                &client_manager,
+                handle,
+                addr,
+                Some(&link.conn),
+                &conns,
+                &state_tx,
+            )
+            .await;
             return;
         }
     };
@@ -947,7 +1004,15 @@ async fn receive_loop(
             }
         }
     }
-    disconnect(&client_manager, handle, addr, &conns, &state_tx).await;
+    disconnect(
+        &client_manager,
+        handle,
+        addr,
+        Some(&link.conn),
+        &conns,
+        &state_tx,
+    )
+    .await;
 }
 
 /// Force-closes outgoing sessions when we revoke trust in the receiver.
@@ -987,6 +1052,31 @@ impl OutboundRevoker {
         closed
     }
 
+    /// Close every link that is the device `handle`'s: each one dialled for
+    /// it, and each one whose receiver proved `pin`, the machine it is pinned
+    /// to. Returns how many.
+    ///
+    /// Both, because renaming or re-addressing a device while its link is up
+    /// clears its pin and, until the next answer, its address, and leaves the
+    /// link open (#218).
+    pub(crate) async fn close_device(&self, handle: ClientHandle, pin: Option<&str>) -> usize {
+        let addrs: Vec<SocketAddr> = self
+            .conns
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, link)| link.handle == handle || pin == Some(link.fingerprint.as_str()))
+            .map(|(addr, _)| *addr)
+            .collect();
+        let mut closed = 0;
+        for addr in addrs {
+            if self.close_addr(addr).await {
+                closed += 1;
+            }
+        }
+        closed
+    }
+
     /// Close the link open to `addr`, if there is one, and clear it from any
     /// device still recorded as connected there. Returns whether one was open.
     pub(crate) async fn close_addr(&self, addr: SocketAddr) -> bool {
@@ -1002,6 +1092,7 @@ impl OutboundRevoker {
                 &self.client_manager,
                 handle,
                 addr,
+                None,
                 &self.conns,
                 &self.state_tx,
             )
@@ -1013,21 +1104,49 @@ impl OutboundRevoker {
 
 /// End `handle`'s link at `addr`, clear what it said about the peer, and tell
 /// the service the client's state changed, so the frontend shows it down.
+///
+/// `ended` is the link whose end this is, when the caller holds one. Its
+/// ping and receive tasks find it ended some time after it closed, and by
+/// then the device can hold a newer link to the same address, dialled when
+/// it was switched back on: that one is not theirs to end. `None` ends
+/// whatever link is open at `addr`.
 async fn disconnect(
     client_manager: &ClientManager,
     handle: ClientHandle,
     addr: SocketAddr,
+    ended: Option<&Connection>,
     conns: &Mutex<HashMap<SocketAddr, PeerLink>>,
     state_tx: &Sender<ClientHandle>,
 ) {
-    log::warn!("client ({handle}) @ {addr} connection closed");
-    let removed = match conns.lock().await.remove(&addr) {
-        Some(link) => {
-            link.conn.close(0u32.into(), b"bye");
-            true
+    let removed = {
+        let mut open = conns.lock().await;
+        let newer = match (open.get(&addr), ended) {
+            (Some(open), Some(ended)) if open.conn.stable_id() != ended.stable_id() => {
+                Some(open.handle)
+            }
+            _ => None,
+        };
+        match newer {
+            Some(newer) => {
+                if let Some(ended) = ended {
+                    ended.close(0u32.into(), b"bye");
+                }
+                if newer == handle {
+                    log::debug!("client ({handle}) @ {addr}: an ended link, and a newer one is up");
+                    return;
+                }
+                false
+            }
+            None => match open.remove(&addr) {
+                Some(link) => {
+                    link.conn.close(0u32.into(), b"bye");
+                    true
+                }
+                None => false,
+            },
         }
-        None => false,
     };
+    log::warn!("client ({handle}) @ {addr} connection closed");
     let was_up = client_manager.active_addr(handle).is_some();
     client_manager.set_active_addr(handle, None);
     // `alive` is only ever SET from the pong path, so without clearing it here
@@ -1169,14 +1288,16 @@ mod tests {
                     cfgs[0].clone(),
                     addrs[0],
                     None,
-                    empty.clone()
+                    empty.clone(),
+                    0,
                 ),
                 connect(
                     client_ep.clone(),
                     cfgs[1].clone(),
                     addrs[1],
                     None,
-                    empty.clone()
+                    empty.clone(),
+                    0,
                 ),
             );
 
@@ -1435,11 +1556,18 @@ mod tests {
         )
         .expect("connection");
         let cfg = client_config(&client, trust.clone(), Arc::new(StdMutex::new(None)));
-        let (link, addr) = connect(conn.endpoint.clone(), cfg, addr, None, trust.clone())
-            .await
-            .expect("a permitted receiver is dialled");
-        conn.conns.lock().await.insert(addr, link);
         let handle = conn.client_manager.add_client();
+        let (link, addr) = connect(
+            conn.endpoint.clone(),
+            cfg,
+            addr,
+            None,
+            trust.clone(),
+            handle,
+        )
+        .await
+        .expect("a permitted receiver is dialled");
+        conn.conns.lock().await.insert(addr, link);
         conn.client_manager.set_active_addr(handle, Some(addr));
         conn.client_manager.set_alive(handle, true);
         Recorded {
@@ -1565,7 +1693,7 @@ mod tests {
 
             let ep = Endpoint::client("127.0.0.1:0".parse().expect("addr")).expect("endpoint");
             let cfg = client_config(&client, then, Arc::new(StdMutex::new(None)));
-            let dialled = connect(ep, cfg, addr, None, now).await;
+            let dialled = connect(ep, cfg, addr, None, now, 0).await;
             assert!(
                 matches!(dialled, Err((_, LanMouseConnectionError::NotPermitted))),
                 "a dial whose permission was withdrawn after the handshake was kept: {:?}",
@@ -1704,7 +1832,7 @@ mod tests {
                 })
                 .collect();
 
-            let _ = connect_any(&client_ep, &dials, None, &empty).await;
+            let _ = connect_any(&client_ep, &dials, None, &empty, 0).await;
 
             for (i, d) in dials.iter().enumerate() {
                 assert_eq!(
@@ -1902,6 +2030,91 @@ mod a_device_edit_touches_only_that_device {
                  elsewhere. Written means the old machine's identity became the \
                  device's pin and its link the device's connection, so input \
                  meant for the new address goes to the old machine (#97)."
+            );
+        });
+    }
+
+    // LEDGER T2183 | class B | 6 struct state: ClientManager after LanMouseConnection::send's dial, 2 connections knocked and closed at the receiver
+    #[test]
+    fn a_dial_that_lands_after_its_device_was_switched_off_keeps_no_link() {
+        run_local(async {
+            let (door, d, _) = a_dial_held_at_the_door().await;
+
+            // The user switches the device off while its dial is out.
+            assert!(d.clients.deactivate_client(d.handle), "precondition");
+
+            let landed = once_let_in(&door, || d.clients.active_addr(d.handle).is_some()).await;
+            assert_eq!(
+                landed,
+                Landed::Closed,
+                "a dial finished after its device was switched off. Written means \
+                 the device holds a link while it shows as off, LeftOpen that the \
+                 link was kept anyway; switching a device off closes its link (#218)."
+            );
+
+            // Switched back on, it is dialled again.
+            assert!(d.clients.activate_client(d.handle), "precondition");
+            let started = tokio::time::Instant::now();
+            while door.knocks() < 2 {
+                assert!(
+                    started.elapsed() < PATIENCE,
+                    "a device whose late dial was closed was never dialled again \
+                     after it was switched back on"
+                );
+                let _ = d.conn.send(ProtoEvent::Ping, d.handle).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            wait_until("the new dial to hold the link", PATIENCE, || {
+                d.clients.active_addr(d.handle).is_some()
+            })
+            .await;
+        });
+    }
+
+    // LEDGER T2186 | class B | 6 struct state: ClientManager::active_addr after LanMouseConnection::send's second dial; 2 connections closed at the receiver
+    #[test]
+    fn a_link_dialled_again_to_the_same_address_outlives_the_old_links_tasks() {
+        run_local(async {
+            let (receiver, sender) = (machine(), machine());
+            let door = door(&receiver);
+            door.open();
+            let d = dialer(
+                &sender,
+                trust(&sender, &[&receiver], Caps::OUTBOUND),
+                door.port,
+                Position::Left,
+            );
+            let _ = d.conn.send(ProtoEvent::Ping, d.handle).await;
+            wait_until("the first dial to hold the link", PATIENCE, || {
+                d.clients.active_addr(d.handle).is_some()
+            })
+            .await;
+
+            // Switched off and straight back on: the link closes, and the
+            // next crossing dials the same address again.
+            let pin = d.clients.peer_fingerprint(d.handle);
+            assert_eq!(
+                d.conn
+                    .revoker()
+                    .close_device(d.handle, pin.as_deref())
+                    .await,
+                1,
+                "precondition: the link was up"
+            );
+            let _ = d.conn.send(ProtoEvent::Ping, d.handle).await;
+            wait_until("the second dial to hold the link", PATIENCE, || {
+                door.knocks() == 2 && d.clients.active_addr(d.handle).is_some()
+            })
+            .await;
+
+            // The old link's ping task finds it ended within one ping
+            // interval, 500 ms. Three of them later, the new link is up.
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            assert_eq!(
+                (door.closed(), d.clients.active_addr(d.handle).is_some()),
+                (1, true),
+                "(links closed at the receiver, device shown connected): the old \
+                 link's tasks ended the new link to the same address"
             );
         });
     }

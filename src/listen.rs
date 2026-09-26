@@ -19,6 +19,7 @@ use tokio::{
     task::{JoinHandle, spawn_local},
 };
 
+use crate::client::ClientManager;
 use crate::crypto::Identity;
 use crate::transport::{self, ClipboardInlet, FpClientVerifier, PeerClipboard, Trust};
 
@@ -388,6 +389,7 @@ impl LanMouseListener {
                                         let closer = ReplyQueueGuard { replies, ready };
                                         let clipboard = ClipboardInlet {
                                             from: fingerprint.clone(),
+                                            dialled_for: None,
                                             trust: trust.clone(),
                                             tx: clipboard_in,
                                         };
@@ -516,10 +518,14 @@ impl LanMouseListener {
     /// A handle for broadcasting local clipboard changes to the connected
     /// peers the pairing shares it with. Grabbed before this listener is moved
     /// into `Emulation` so the service can drive it directly.
-    pub(crate) fn clipboard_sender(&self) -> ClipboardSenderListen {
+    ///
+    /// `clients` holds the device switches: a machine switched off there is
+    /// sent none of it, over the link it opened to this one either (#218).
+    pub(crate) fn clipboard_sender(&self, clients: ClientManager) -> ClipboardSenderListen {
         ClipboardSenderListen {
             conns: self.conns.clone(),
             trust: self.trust.clone(),
+            clients,
         }
     }
 }
@@ -563,6 +569,7 @@ impl ConnRevoker {
 pub(crate) struct ClipboardSenderListen {
     conns: Rc<AsyncMutex<Vec<ConnEntry>>>,
     trust: Trust,
+    clients: ClientManager,
 }
 
 /// One clipboard-failure line a minute is enough to tell you it is dropping,
@@ -584,6 +591,7 @@ impl ClipboardSenderListen {
             conns
                 .iter()
                 .filter(|e| trust.clipboard_to(&e.fingerprint))
+                .filter(|e| self.clients.switch_allows_clipboard(&e.fingerprint, None))
                 .map(|e| e.conn.clone())
                 .collect()
         };

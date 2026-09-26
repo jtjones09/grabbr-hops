@@ -513,7 +513,7 @@ impl Service {
         // clipboard broadcast handles — grabbed before the transports are moved
         // into capture/emulation below.
         let clipboard_out_conn = conn.clipboard_sender();
-        let clipboard_out_listen = listener.clipboard_sender();
+        let clipboard_out_listen = listener.clipboard_sender(client_manager.clone());
         // revocation handles, grabbed before both are moved into capture/emulation
         let revoke_conn = conn.revoker();
         let revoke_listen = listener.revoker();
@@ -540,7 +540,7 @@ impl Service {
         );
 
         let port = config.port();
-        let clipboard_in = ClipboardInbox::new(clipboard_in, trust.clone());
+        let clipboard_in = ClipboardInbox::new(clipboard_in, trust.clone(), client_manager.clone());
         let service = Self {
             config,
             capture,
@@ -1799,8 +1799,35 @@ impl Service {
         if active {
             self.activate_client(handle);
         } else {
-            self.deactivate_client(handle);
+            self.switch_off(handle);
         }
+    }
+
+    /// Switch a device off: off means off (#218). No pointer crosses to it,
+    /// and the link this machine dialled to it closes. Clipboard to and from
+    /// that machine stops on every link, including one it opened to this
+    /// machine, because the transports ask
+    /// [`ClientManager::switch_allows_clipboard`] for each transfer. Input over
+    /// a link it opened stays the pairing's decision, not the switch's.
+    ///
+    /// Not for the momentary off-and-on that re-creates a device's capture:
+    /// that would drop the link for a change of edge.
+    fn switch_off(&mut self, handle: ClientHandle) {
+        self.deactivate_client(handle);
+        // By the link's own record, never the address: a link outlives a
+        // change of the device's address, and an address can be another
+        // machine's by now. The links dialled for it, and every link to the
+        // machine it is pinned to; a rename or a new address clears the pin
+        // and leaves its link up. A dial still out when this runs is closed
+        // by the dialler when it lands.
+        let pin = self.client_manager.peer_fingerprint(handle);
+        let outbound = self.revoke_conn.clone();
+        tokio::task::spawn_local(async move {
+            let closed = outbound.close_device(handle, pin.as_deref()).await;
+            if closed > 0 {
+                log::info!("client {handle} switched off: closed {closed} link(s)");
+            }
+        });
     }
 
     /// Start dialling a device just switched on from a frontend, if the pairing
@@ -1888,7 +1915,7 @@ impl Service {
                     .client_manager
                     .get_hostname(other)
                     .unwrap_or_else(|| format!("device {other}"));
-                self.deactivate_client(other);
+                self.switch_off(other);
                 self.notify_frontend(FrontendEvent::Error(format!(
                     "Switched off \"{name}\" — it was using the {pos} edge, \
                      and two devices cannot share one edge."
