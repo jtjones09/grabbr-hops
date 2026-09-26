@@ -46,7 +46,7 @@ RULES = [
         "not optional.",
     ),
     (
-        r"\bssh\b.*10\.110\.20\.138.*(?:rm |del |Remove-Item|format|shutdown|Stop-Process|taskkill)",
+        r"\bssh\b.*192\.0\.2\.138.*(?:rm |del |Remove-Item|format|shutdown|Stop-Process|taskkill)",
         "deny",
         "That deletes or kills something on his Windows machine. Read-only "
         "inspection there is fine; anything that changes state needs him to say "
@@ -90,11 +90,11 @@ RULES = [
         "and why it was wrong before — not what you did today.",
     ),
     (
-        r"\bssh\b.*10\.110\.20\.138",
+        r"\bssh\b.*192\.0\.2\.138",
         "warn",
         "Windows box: non-interactive ssh lands in cmd.exe, where a cross-drive "
         "cd needs /d. He uses PowerShell, where /d is an error. Sidestep both "
-        "with `git -C D:\\LocalRepos\\grabbr-hop ...` and absolute paths. "
+        "with `git -C <repo> ...` and absolute paths. "
         "Read-only unless he asked for a change. He relaunches hops from his "
         "own session — ssh cannot capture input.",
     ),

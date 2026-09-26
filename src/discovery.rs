@@ -277,8 +277,8 @@ pub(crate) fn classify(a: Announcement, our_fingerprint: &str) -> Option<Discove
 /// Strip mDNS's conflict suffix: `studio-pc (2)` -> `studio-pc`.
 ///
 /// mDNS renames on collision, and a machine can ANNOUNCE under one form and be
-/// WITHDRAWN under another — observed on the rig as `LOST SCORNW20SIM (2)` for
-/// a peer filed as `SCORNW20SIM`. Comparing raw labels there misses the removal
+/// WITHDRAWN under another — observed on the rig as `LOST WINDOWS-SIM (2)` for
+/// a peer filed as `WINDOWS-SIM`. Comparing raw labels there misses the removal
 /// and the row never disappears.
 pub fn base_label(label: &str) -> &str {
     let t = label.trim_end();
@@ -597,11 +597,11 @@ mod bind_family {
 mod suffix {
     use super::base_label;
 
-    /// Observed on the rig: a peer filed as `SCORNW20SIM` was withdrawn as
-    /// `SCORNW20SIM (2)`. Matching raw labels missed it and left a stale row.
+    /// Observed on the rig: a peer filed as `WINDOWS-SIM` was withdrawn as
+    /// `WINDOWS-SIM (2)`. Matching raw labels missed it and left a stale row.
     #[test]
     fn the_mdns_conflict_suffix_is_stripped() {
-        assert_eq!(base_label("SCORNW20SIM (2)"), "SCORNW20SIM");
+        assert_eq!(base_label("WINDOWS-SIM (2)"), "WINDOWS-SIM");
         assert_eq!(base_label("peer-alpha (13)"), "peer-alpha");
     }
 

@@ -1948,7 +1948,7 @@ mod tests {
             0,
             (
                 ClientConfig {
-                    hostname: Some("ScornW20".into()),
+                    hostname: Some("WINDOWS-PC".into()),
                     ..Default::default()
                 },
                 ClientState {
@@ -1959,11 +1959,11 @@ mod tests {
                 },
             ),
         );
-        model.authorized.insert(FP.into(), "ScornW20".into());
+        model.authorized.insert(FP.into(), "WINDOWS-PC".into());
 
         let out = screen(&model, 0);
         assert_eq!(
-            out.matches("ScornW20").count(),
+            out.matches("WINDOWS-PC").count(),
             1,
             "one machine must occupy exactly one row, got:\n{out}"
         );
@@ -1977,9 +1977,9 @@ mod tests {
     #[test]
     fn a_receive_only_peer_is_listed() {
         let mut model = AppModel::default();
-        model.authorized.insert(FP.into(), "Carrier MBP".into());
+        model.authorized.insert(FP.into(), "Work MBP".into());
         let out = screen(&model, 0);
-        assert!(out.contains("Carrier MBP"), "missing peer:\n{out}");
+        assert!(out.contains("Work MBP"), "missing peer:\n{out}");
         assert!(out.contains('←'), "should be badged inbound-only:\n{out}");
     }
 
@@ -2210,7 +2210,7 @@ mod tests {
             0,
             (
                 ClientConfig {
-                    hostname: Some("ScornW20".into()),
+                    hostname: Some("WINDOWS-PC".into()),
                     ..Default::default()
                 },
                 ClientState {
