@@ -287,7 +287,7 @@ pub struct LeaseRecord {
     pub revoked_at: Option<u64>,
     /// Empty for a revoked record.
     pub caps: Vec<DiskCap>,
-    /// Both machines confirmed this pairing (2026-09-10). A lease that is not
+    /// Both machines confirmed this pairing (#11, #167). A lease that is not
     /// confirmed is a pairing interrupted before it finished: it is dropped
     /// when the store loads, and the device is added again ([`start`]).
     /// Every lease a version 1 store held predates the confirmation and is
@@ -354,7 +354,7 @@ mod v1 {
 
     impl From<LeaseRecordV1> for LeaseRecord {
         /// Confirmed, because version 1 predates the confirmation and a
-        /// person cannot compare a number they were never shown (2026-09-10).
+        /// person cannot compare a number they were never shown (#11, #167).
         /// No clipboard, because nobody chose one (#186).
         fn from(r: LeaseRecordV1) -> Self {
             LeaseRecord {
@@ -1117,7 +1117,7 @@ pub fn rebuild(
             // A pairing interrupted before both machines confirmed it. The
             // number it was confirmed with died with that session, and a
             // reconnect must not summon the comparison again, so it is dropped
-            // and the device added again (2026-09-10). `start` saves the store
+            // and the device added again (#11, #167). `start` saves the store
             // without it.
             DiskState::Active if !r.confirmed => {
                 refused.push(format!(
@@ -2623,7 +2623,7 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
             assert!(
                 r.confirmed,
                 "{} was saved unconfirmed; a pairing made before the \
-                 confirmation is confirmed (2026-09-10)",
+                 confirmation is confirmed (#11, #167)",
                 r.fingerprint
             );
             assert_eq!(
@@ -2653,43 +2653,57 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
     }
 
     /// Approving the other direction of a pairing adds that direction (#166)
-    /// and leaves a clipboard switched off, off, across a restart too.
+    /// and leaves a clipboard switched off, off: approved in the run that
+    /// switched it off, or in a later one that read the choice back from disk,
+    /// and across a restart after the approval too.
     // LEDGER E2A-3 | class B | 4 file on disk: service::grant_for_attempt, TrustStore::disable_clipboard, TrustFile::save, start
     #[test]
     fn approving_the_second_direction_keeps_the_clipboard_off() {
         use crate::service::grant_for_attempt;
         use hops_ipc::AttemptOrigin;
 
-        let d = tmpdir("second-direction-clipboard");
-        let auth = authority(&d);
-        let (mut file, _) = TrustFile::open(&d, auth.clone()).expect("open");
-        let mut store = TrustStore::new(&ours(), file.now()).expect("ours");
-        grant_for_attempt(&mut store, B, "desk mac", Some(AttemptOrigin::Inbound))
-            .expect("the first approval grants");
-        assert!(store.disable_clipboard(B), "a lease to switch off");
-        grant_for_attempt(&mut store, B, "desk mac", Some(AttemptOrigin::OutboundDial))
-            .expect("the second approval grants");
-        file.save(&records_of(&store)).expect("save");
-        let (_, reloaded) = start_in(&d, &auth);
+        for (approved, restart_first) in [("in the same run", false), ("after a restart", true)] {
+            let d = tmpdir(if restart_first {
+                "second-direction-later"
+            } else {
+                "second-direction-clipboard"
+            });
+            let auth = authority(&d);
+            let (mut file, _) = TrustFile::open(&d, auth.clone()).expect("open");
+            let mut store = TrustStore::new(&ours(), file.now()).expect("ours");
+            grant_for_attempt(&mut store, B, "desk mac", Some(AttemptOrigin::Inbound))
+                .expect("the first approval grants");
+            assert!(store.disable_clipboard(B), "a lease to switch off");
+            if restart_first {
+                file.save(&records_of(&store)).expect("save");
+                std::mem::drop(file);
+                (file, store) = start_in(&d, &auth);
+            }
+            grant_for_attempt(&mut store, B, "desk mac", Some(AttemptOrigin::OutboundDial))
+                .expect("the second approval grants");
+            file.save(&records_of(&store)).expect("save");
+            let (_, reloaded) = start_in(&d, &auth);
 
-        for (when, s) in [
-            ("after the approval", &store),
-            ("after a restart", &reloaded),
-        ] {
-            assert!(
-                s.may_drive_us(B) && s.we_may_drive(B),
-                "{when}, the pairing does not drive both ways: {}",
-                s.capabilities(B)
-            );
-            assert!(
-                !s.capabilities(B).intersects(Caps::CLIPBOARD),
-                "{when}, approving the second direction turned the clipboard back \
-                 on: {}. It was switched off, and an approval to drive is not an \
-                 answer about the clipboard",
-                s.capabilities(B)
-            );
+            for (when, s) in [
+                ("after the approval", &store),
+                ("after a restart", &reloaded),
+            ] {
+                assert!(
+                    s.may_drive_us(B) && s.we_may_drive(B),
+                    "second direction approved {approved}: {when}, the pairing does \
+                     not drive both ways: {}",
+                    s.capabilities(B)
+                );
+                assert!(
+                    !s.capabilities(B).intersects(Caps::CLIPBOARD),
+                    "second direction approved {approved}: {when}, the clipboard is \
+                     back on: {}. It was switched off, and an approval to drive is \
+                     not an answer about the clipboard",
+                    s.capabilities(B)
+                );
+            }
+            let _ = fs::remove_dir_all(&d);
         }
-        let _ = fs::remove_dir_all(&d);
     }
 
     /// A pairing interrupted before both machines confirmed it does not load,
@@ -2812,7 +2826,8 @@ cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc";
                 copies_exist(&d),
                 [false, false],
                 "{what} after the migration left the version 1 copy on disk, \
-                 where a build that reads it trusts what this machine dropped"
+                 where a build that reads it still acts on a record this machine \
+                 dropped"
             );
             let _ = fs::remove_dir_all(&d);
         }
