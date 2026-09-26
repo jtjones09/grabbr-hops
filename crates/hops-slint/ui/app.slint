@@ -89,6 +89,11 @@ export component AppWindow inherits Window {
     in property <string> fingerprint: "—";
     in property <[DeviceRow]> devices: [];
     in property <string> pairing-fp: "";
+    // The name typed into the pairing card. Held here rather than only in the
+    // field so Rust can clear it when the card changes machine: a name typed
+    // for one machine must never be sent to approve another (#168). `in-out`
+    // because the field writes it and Rust clears it.
+    in-out property <string> pairing-name: "";
     // true when WE dialled out and found this untrusted receiver, rather than it
     // connecting to us. A console verb can cause the former, so the card must not
     // present it as a peer knocking (#61).
@@ -337,7 +342,11 @@ export component AppWindow inherits Window {
                             wrap: word-wrap;
                         }
                         if root.pairing-addr != "": Text {
-                            text: root.pairing-addr + " answered";
+                            // our dial: the address that answered (#93);
+                            // a knock: the address it came from (#83)
+                            text: root.pairing-from-our-dial
+                                ? root.pairing-addr + " answered"
+                                : "from " + root.pairing-addr;
                             color: Theme.c.foreground;
                             font-family: Type.mono;
                             font-size: Type.caption;
@@ -353,20 +362,21 @@ export component AppWindow inherits Window {
                         }
                         HorizontalLayout {
                             spacing: Space.sm;
-                            name := TextField {
+                            // Rust clears the name once an approval is sent, and
+                            // refuses one for a machine the card only just showed.
+                            TextField {
                                 placeholder: "name this device";
                                 horizontal-stretch: 1;
+                                text <=> root.pairing-name;
                                 accepted => {
-                                    root.approve-pairing(self.text, root.pairing-fp);
-                                    self.text = "";
+                                    root.approve-pairing(root.pairing-name, root.pairing-fp);
                                 }
                             }
                             PillButton {
                                 text: "trust & name";
                                 primary: true;
                                 clicked => {
-                                    root.approve-pairing(name.text, root.pairing-fp);
-                                    name.text = "";
+                                    root.approve-pairing(root.pairing-name, root.pairing-fp);
                                 }
                             }
                             PillButton {

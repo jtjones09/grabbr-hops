@@ -29,6 +29,7 @@ pub(crate) struct PromptGate {
     opened: Option<Instant>,
     recent: RecentPrompts,
     refusals: RefusalLog,
+    admitted: AdmittedLog,
 }
 
 impl PromptGate {
@@ -40,6 +41,7 @@ impl PromptGate {
             opened: None,
             recent: RecentPrompts::new(),
             refusals: RefusalLog::new(),
+            admitted: AdmittedLog::new(),
         }
     }
 
@@ -80,6 +82,22 @@ impl PromptGate {
     /// summarised at most once per `RefusalLog::EVERY`.
     pub(crate) fn note_refusal(&mut self, fingerprint: &str, now: Instant) -> Option<String> {
         self.refusals.note(fingerprint, now)
+    }
+
+    /// Record an admitted request from another machine. `Some(n)` when it
+    /// should be logged, `n` being how many before it were not.
+    pub(crate) fn note_admitted(&mut self, now: Instant) -> Option<u32> {
+        self.admitted.note(now)
+    }
+
+    /// Whether a prompt admitted at `admitted` may be shown again now, to a
+    /// frontend that was not attached when it was raised (#114).
+    ///
+    /// Only while the window is open, as for any prompt, and only for a request
+    /// from the last two minutes: opening add device for one machine must not
+    /// bring back a request some other machine made in an earlier window.
+    pub(crate) fn replayable(&self, admitted: Instant, now: Instant) -> bool {
+        self.remaining(now).is_some() && now.saturating_duration_since(admitted) < Self::WINDOW
     }
 }
 
@@ -125,6 +143,50 @@ impl RecentPrompts {
         match self.seen.insert(fingerprint.to_owned(), now) {
             None => false,
             Some(at) => now.saturating_duration_since(at) < Self::WINDOW,
+        }
+    }
+}
+
+/// Bounds the log lines written for admitted requests.
+///
+/// Each one is logged with its fingerprint, so a machine without a frontend
+/// attached can still be approved from the command line (#114). Admission is
+/// per fingerprint, though, so a stranger generating a fresh key per dial is
+/// admitted on every dial while the window is open. A handful of lines per
+/// period covers any real pairing; past that, requests are counted and the
+/// count goes on the next line written.
+struct AdmittedLog {
+    period: Option<Instant>,
+    lines: u32,
+    unlogged: u32,
+}
+
+impl AdmittedLog {
+    const EVERY: Duration = Duration::from_secs(10);
+    const LINES: u32 = 8;
+
+    fn new() -> Self {
+        Self {
+            period: None,
+            lines: 0,
+            unlogged: 0,
+        }
+    }
+
+    fn note(&mut self, now: Instant) -> Option<u32> {
+        if self
+            .period
+            .is_none_or(|start| now.saturating_duration_since(start) >= Self::EVERY)
+        {
+            self.period = Some(now);
+            self.lines = 0;
+        }
+        if self.lines < Self::LINES {
+            self.lines += 1;
+            Some(std::mem::take(&mut self.unlogged))
+        } else {
+            self.unlogged = self.unlogged.saturating_add(1);
+            None
         }
     }
 }
@@ -269,6 +331,68 @@ mod tests {
                 "a peer retrying inside the window must not raise a second prompt"
             );
         }
+    }
+
+    /// A frontend that attaches while add device is open is shown what was
+    /// admitted in the last two minutes, and nothing else (#114, #195).
+    // LEDGER T7 | class B | 1 return value: PromptGate::replayable
+    #[test]
+    fn a_prompt_is_shown_again_only_inside_the_window_it_was_raised_in() {
+        let mut gate = PromptGate::new();
+        let now = Instant::now();
+        gate.open(now);
+        assert!(
+            gate.replayable(now + S, now + 30 * S),
+            "a request admitted half a minute ago, with the window open, was not \
+             shown to a frontend that attached since"
+        );
+        assert!(
+            !gate.replayable(now + 100 * S, now + PromptGate::WINDOW + 5 * S),
+            "a request 25 seconds old was shown again after the window closed"
+        );
+        gate.open(now + 200 * S);
+        assert!(
+            !gate.replayable(now + S, now + 201 * S),
+            "opening add device again brought back a request from an earlier window"
+        );
+        assert!(gate.replayable(now + 200 * S, now + 201 * S));
+    }
+
+    /// Each admitted request is logged with its fingerprint, but a stranger
+    /// offering a fresh key per dial cannot turn that into a line per dial.
+    // LEDGER T8 | class B | 1 return value: PromptGate::note_admitted
+    #[test]
+    fn admitted_requests_are_each_logged_until_they_become_a_flood() {
+        let mut gate = PromptGate::new();
+        let now = Instant::now();
+        assert_eq!(
+            gate.note_admitted(now),
+            Some(0),
+            "the first request is logged"
+        );
+        assert_eq!(
+            gate.note_admitted(now + S),
+            Some(0),
+            "a second machine a second later is logged too"
+        );
+        let logged = (0..1200u64)
+            .filter(|i| {
+                gate.note_admitted(now + 2 * S + Duration::from_millis(i * 5))
+                    .is_some()
+            })
+            .count();
+        assert!(
+            logged <= AdmittedLog::LINES as usize,
+            "1,200 admitted requests in six seconds wrote {logged} lines"
+        );
+        let next = gate
+            .note_admitted(now + 11 * S)
+            .expect("a new period logs again");
+        assert_eq!(
+            next as usize,
+            1200 - logged,
+            "the requests that were not logged were not counted"
+        );
     }
 
     /// A flood of refusals becomes a handful of log lines, and none is lost

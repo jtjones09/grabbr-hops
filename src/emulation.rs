@@ -35,8 +35,10 @@ pub(crate) enum EmulationEvent {
         addr: SocketAddr,
         fingerprint: String,
     },
+    /// A refused handshake, with the address it came from (#83).
     ConnectionAttempt {
         fingerprint: String,
+        addr: SocketAddr,
     },
     /// new connection
     Entered {
@@ -48,9 +50,7 @@ pub(crate) enum EmulationEvent {
         fingerprint: String,
     },
     /// connection closed
-    Disconnected {
-        addr: SocketAddr,
-    },
+    Disconnected { addr: SocketAddr },
     /// the port of the listener has changed
     PortChanged(Result<u16, ListenerCreationError>),
     /// emulation was disabled
@@ -76,19 +76,13 @@ pub(crate) enum EmulationEvent {
     /// broken (one-way setups, asymmetric NAT, peer's TCP listener
     /// down). The connect-side path stays as the primary source;
     /// this is the defensive fallback.
-    PeerHello {
-        addr: SocketAddr,
-        commit: [u8; 8],
-    },
+    PeerHello { addr: SocketAddr, commit: [u8; 8] },
     /// peer sent us a Capability event advertising its supported
     /// features. Routed upward (mirroring `PeerHello`) so the service
     /// can record it via `client_manager.set_peer_caps` — the receiver
     /// side needs the sender's caps to gate the future Trueloop
     /// return-channel, just as the sender needs the receiver's.
-    PeerCaps {
-        addr: SocketAddr,
-        flags: u32,
-    },
+    PeerCaps { addr: SocketAddr, flags: u32 },
 }
 
 enum EmulationRequest {
@@ -411,8 +405,8 @@ impl ListenTask {
                     // Every refused handshake goes up. Whether it may prompt, and
                     // whether it repeats one just shown, is decided in one place,
                     // behind the pairing window (`prompt_gate`, #195).
-                    Some(ListenEvent::Rejected { fingerprint }) => {
-                        self.event_tx.send(EmulationEvent::ConnectionAttempt { fingerprint }).expect("channel closed");
+                    Some(ListenEvent::Rejected { fingerprint, addr }) => {
+                        self.event_tx.send(EmulationEvent::ConnectionAttempt { fingerprint, addr }).expect("channel closed");
                     }
                     None => break
                 }}

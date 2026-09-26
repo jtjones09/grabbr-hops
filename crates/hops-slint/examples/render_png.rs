@@ -104,6 +104,12 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
     if std::env::var_os("PREVIEW_OUR_DIAL").is_some() {
         ui.set_pairing_addr("10.0.0.5:4242".into());
     }
+    // PREVIEW_KNOCK_ADDR=1: an inbound request with the address it came from
+    // (#83), and a name typed into the card (#168).
+    if std::env::var_os("PREVIEW_KNOCK_ADDR").is_some() {
+        ui.set_pairing_addr("10.0.0.7:51234".into());
+        ui.set_pairing_name("laptop".into());
+    }
     // the notice banner — the daemon's only "that didn't work" channel
     ui.set_notice(
         "Refused to grant trust: this machine is being controlled remotely. \

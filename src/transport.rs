@@ -13,7 +13,6 @@
 //! signature proves the peer holds the matching private key. Skipping that
 //! delegation would reopen the MITM hole this migration closes.
 
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, Once, RwLock};
 
 use hops_proto::{MAX_EVENT_SIZE, ProtoEvent, ProtocolError};
@@ -151,29 +150,31 @@ impl ServerCertVerifier for FpServerVerifier {
 // ---------------------------------------------------------------------------
 
 /// rustls [`ClientCertVerifier`] that accepts a sender iff its leaf-cert
-/// fingerprint is in the allowlist; otherwise records the attempt (so the
-/// frontend can prompt to authorize it) and rejects.
+/// fingerprint is in the allowlist; otherwise records the refused fingerprint
+/// (so the frontend can prompt to authorize it) and rejects.
+///
+/// One per connection. rustls hands a verifier the certificate and nothing
+/// else, so the only way to know which connection a rejection belongs to is
+/// for the verifier itself to belong to one: the listener accepts every
+/// connection with its own config, and reads this connection's slot when its
+/// handshake fails. A single verifier shared by every connection fed one queue
+/// that failed handshakes popped from in whatever order they finished, so a
+/// prompt could carry another machine's fingerprint (#83).
 #[derive(Debug)]
 pub struct FpClientVerifier {
     provider: Arc<CryptoProvider>,
     trust: Trust,
-    attempts: Arc<Mutex<VecDeque<String>>>,
+    refused: Arc<Mutex<Option<String>>>,
 }
 
-/// How many distinct unknown fingerprints may await a prompt at once.
-///
-/// Anyone on the network can add to this queue by dialling with a certificate
-/// we do not recognise, before any authorization has happened. The bound is
-/// what stops that from being unbounded memory growth driven by a stranger.
-/// Well past any real fleet, small enough that the flood costs nothing.
-pub(crate) const MAX_PENDING_ATTEMPTS: usize = 32;
-
 impl FpClientVerifier {
-    pub fn new(trust: Trust, attempts: Arc<Mutex<VecDeque<String>>>) -> Self {
+    /// `refused` receives the fingerprint of a certificate this verifier
+    /// turned away. Give each connection its own.
+    pub fn new(trust: Trust, refused: Arc<Mutex<Option<String>>>) -> Self {
         Self {
             provider: provider(),
             trust,
-            attempts,
+            refused,
         }
     }
 }
@@ -205,25 +206,10 @@ impl ClientCertVerifier for FpClientVerifier {
         if self.trust.read().expect("lock").may_drive_us(&fingerprint) {
             Ok(ClientCertVerified::assertion())
         } else {
-            // Bounded and deduplicated. This queue is the only channel from
-            // the TLS verifier to the accept loop, and it is filled by anyone
-            // on the network who dials with a certificate we do not know —
-            // before any authorization. Unbounded, a stranger retrying in a
-            // loop grows it without limit; duplicated, one stranger produces a
-            // thousand identical prompts.
-            //
-            // rustls gives a client-certificate verifier the certificate and
-            // nothing else — no address, no connection handle — so this cannot
-            // be keyed by connection. The fingerprint is the whole of what the
-            // event carries, which is why a set, not a queue of one per dial,
-            // is the honest shape.
-            let mut attempts = self.attempts.lock().expect("lock");
-            if !attempts.contains(&fingerprint) {
-                if attempts.len() >= MAX_PENDING_ATTEMPTS {
-                    attempts.pop_front();
-                }
-                attempts.push_back(fingerprint);
-            }
+            // This connection's own slot, so the rejection reaches the accept
+            // loop tied to the connection that presented it. One value per
+            // connection: nothing a stranger does grows it.
+            *self.refused.lock().expect("lock") = Some(fingerprint);
             Err(TlsError::General(
                 "no live lease permits that sender to drive this machine".into(),
             ))

@@ -22,7 +22,8 @@ use std::{
 };
 
 use hops_frontend_core::{
-    ClientHandle, FrontendClient, FrontendRequest, Position, Status, TrustState, prefs, theme,
+    ApprovalRefused, ClientHandle, FrontendClient, FrontendRequest, PairingCard, Position, Status,
+    TrustState, prefs, theme,
 };
 use hops_ipc::{DEFAULT_PORT, Geometry};
 use slint::{ComponentHandle, ModelRc, VecModel};
@@ -33,9 +34,6 @@ slint::include_modules!();
 #[cfg(target_os = "macos")]
 mod macos_app;
 
-/// A pairing prompt is "live" only this long after the last connection attempt
-/// (the daemon emits no retraction); matches the TUI's `STALE_TTL`.
-const STALE_TTL: Duration = Duration::from_secs(12);
 /// After the user denies a pairing, snooze the prompt this long so a retrying
 /// peer doesn't nag — but a later attempt re-asks; matches the TUI's `DISMISS_TTL`.
 const DISMISS_TTL: Duration = Duration::from_secs(120);
@@ -338,6 +336,34 @@ fn stage_create(
 /// tick right after "add". The window died there with no message, because a
 /// panic under `panic = "abort"` was the last thing the process wrote and
 /// nothing was reading its output.
+/// Put `fingerprint`'s request on the pairing card.
+///
+/// A name typed while the card showed another machine is cleared, so it can
+/// never be sent to approve this one (#168).
+fn show_pairing_card(ui: &AppWindow, fingerprint: &str) {
+    if ui.get_pairing_fp().as_str() != fingerprint {
+        ui.set_pairing_name("".into());
+    }
+    ui.set_pairing_fp(fingerprint.into());
+}
+
+/// The request a click on "trust & name" sends: `name` for `fingerprint`, if
+/// that is the machine the card has been showing (#168).
+fn approval(
+    card: &PairingCard,
+    name: &str,
+    fingerprint: &str,
+    now: Instant,
+) -> Result<FrontendRequest, ApprovalRefused> {
+    card.approve(fingerprint, now)?;
+    let desc = if name.trim().is_empty() {
+        hops_frontend_core::fallback_label(fingerprint)
+    } else {
+        name.trim().to_string()
+    };
+    Ok(FrontendRequest::AuthorizeKey(desc, fingerprint.to_string()))
+}
+
 fn claim_pending<T>(
     cell: &RefCell<Option<T>>,
     arrived: Option<ClientHandle>,
@@ -470,6 +496,9 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
     // fingerprints the user has denied -> when (UI-local snooze; see DISMISS_TTL).
     // Shared between the deny callback and the poll loop, both on the UI thread.
     let dismissed: Rc<RefCell<HashMap<String, Instant>>> = Rc::new(RefCell::new(HashMap::new()));
+    // Which machine the pairing card shows, shared by the poll that fills it
+    // and the approve callback that checks a click against it (#168).
+    let card: Rc<RefCell<PairingCard>> = Rc::default();
 
     // --- wire UI actions -> FrontendRequests (each closure owns a client clone) ---
     {
@@ -537,13 +566,19 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
     }
     {
         let c = client.clone();
+        let card = card.clone();
+        let weak = ui.as_weak();
+        let notice = notice_sink.clone();
         ui.on_approve_pairing(move |name, fp| {
-            let desc = if name.trim().is_empty() {
-                hops_frontend_core::fallback_label(fp.as_str())
-            } else {
-                name.trim().to_string()
-            };
-            c.request(FrontendRequest::AuthorizeKey(desc, fp.to_string()));
+            match approval(&card.borrow(), name.as_str(), fp.as_str(), Instant::now()) {
+                Ok(request) => {
+                    c.request(request);
+                    if let Some(ui) = weak.upgrade() {
+                        ui.set_pairing_name("".into());
+                    }
+                }
+                Err(refused) => notice(refused.notice()),
+            }
         });
     }
     {
@@ -770,33 +805,30 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
             // nothing changed we touch nothing and the window stays static.
 
             // a live pairing prompt: untrusted, still actively attempting (not a
-            // stale prompt for a peer that left), and not currently snooze-dismissed
-            let pairing = m
-                .pending_pairing
-                .as_ref()
-                .filter(|fp| {
-                    !m.authorized.contains_key(*fp)
-                        && m.pending_pairing_since
-                            .map(|t| t.elapsed() < STALE_TTL)
-                            .unwrap_or(false)
-                        && dismissed
-                            .borrow()
-                            .get(*fp)
-                            .map(|t| t.elapsed() >= DISMISS_TTL)
-                            .unwrap_or(true)
+            // stale prompt for a peer that left), and not currently snooze-dismissed.
+            // The card keeps the machine it shows while that request is live, so
+            // another machine asking cannot take it over (#168).
+            let shown = card
+                .borrow_mut()
+                .show(&m, Instant::now(), |fp| {
+                    dismissed
+                        .borrow()
+                        .get(fp)
+                        .is_some_and(|t| t.elapsed() < DISMISS_TTL)
                 })
-                .cloned()
+                .cloned();
+            let pairing = shown
+                .as_ref()
+                .map(|a| a.fingerprint.clone())
                 .unwrap_or_default();
-            let pairing_addr = if pairing.is_empty() {
-                String::new()
-            } else {
-                m.pending_pairing_addr
-                    .map(|a| a.to_string())
-                    .unwrap_or_default()
-            };
-            let pairing_from_our_dial = !pairing.is_empty()
-                && m.pending_pairing_origin
-                    == Some(hops_frontend_core::AttemptOrigin::OutboundDial);
+            let pairing_addr = shown
+                .as_ref()
+                .and_then(|a| a.addr)
+                .map(|a| a.to_string())
+                .unwrap_or_default();
+            let pairing_from_our_dial = shown
+                .as_ref()
+                .is_some_and(|a| a.origin == hops_frontend_core::AttemptOrigin::OutboundDial);
 
             // unified device view: one row per physical peer. AppModel::devices()
             // joins the outgoing clients with the trusted-fingerprint set by
@@ -960,7 +992,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
             ui.set_emulation(snap.emulation.as_str().into());
             ui.set_port(snap.port.as_str().into());
             ui.set_fingerprint(snap.fingerprint.as_str().into());
-            ui.set_pairing_fp(snap.pairing.as_str().into());
+            show_pairing_card(&ui, &snap.pairing);
             ui.set_discovered(ModelRc::new(VecModel::from(snap.discovered.clone())));
             ui.set_discovery_active(snap.discovery_active);
             ui.set_pairing_from_our_dial(snap.pairing_from_our_dial);
@@ -1506,6 +1538,87 @@ mod add_opens_pairing {
             handler.contains("root.open-pairing()"),
             "the + add button no longer opens the pairing window, so no pairing \
              prompt can appear on this machine:\n{handler}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pairing_card_binds_the_approval {
+    //! What "trust & name" sends is decided by the card the window shows, and a
+    //! name typed for one machine is never sent for another (#168).
+    //!
+    //! Drives a real `AppWindow` on Slint's headless testing backend, through
+    //! the same functions the poll and the approve callback use.
+    use super::*;
+    use hops_frontend_core::{AppModel, AttemptOrigin, PairingAttempt};
+
+    fn attempt(fp: &str, since: Instant) -> PairingAttempt {
+        PairingAttempt {
+            fingerprint: fp.into(),
+            origin: AttemptOrigin::Inbound,
+            addr: None,
+            since,
+        }
+    }
+
+    /// One poll tick: choose the card's machine and put it in the window.
+    fn tick(ui: &AppWindow, card: &mut PairingCard, m: &AppModel, now: Instant) {
+        let fp = card
+            .show(m, now, |_| false)
+            .map(|a| a.fingerprint.clone())
+            .unwrap_or_default();
+        show_pairing_card(ui, &fp);
+    }
+
+    /// A click on "trust & name": what the card's button passes.
+    fn click(
+        ui: &AppWindow,
+        card: &PairingCard,
+        now: Instant,
+    ) -> Result<FrontendRequest, ApprovalRefused> {
+        approval(
+            card,
+            ui.get_pairing_name().as_str(),
+            ui.get_pairing_fp().as_str(),
+            now,
+        )
+    }
+
+    // LEDGER T11 | class B | 6 struct state + 1 return value: AppWindow pairing-fp/pairing-name via show_pairing_card, approval
+    #[test]
+    fn the_card_decides_what_trust_and_name_sends() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = AppWindow::new().expect("window");
+        let mut card = PairingCard::default();
+        let mut m = AppModel::default();
+        let t0 = Instant::now();
+
+        m.pairing_attempts = vec![attempt("bb:bb", t0)];
+        tick(&ui, &mut card, &m, t0);
+        ui.set_pairing_name("laptop".into()); // typed into the card's field
+        assert_eq!(
+            click(&ui, &card, t0 + Duration::from_secs(2)),
+            Ok(FrontendRequest::AuthorizeKey(
+                "laptop".into(),
+                "bb:bb".into()
+            )),
+            "the approval did not carry the name typed and the machine on the card"
+        );
+
+        // B stops asking while the name is still in the field; C is live.
+        let t1 = t0 + PairingCard::STALE_AFTER + Duration::from_secs(1);
+        m.pairing_attempts.push(attempt("cc:cc", t1));
+        tick(&ui, &mut card, &m, t1);
+        assert_eq!(ui.get_pairing_fp().as_str(), "cc:cc");
+        assert_eq!(
+            ui.get_pairing_name().as_str(),
+            "",
+            "the name typed for bb:bb was left in the card once it showed cc:cc"
+        );
+        assert_eq!(
+            click(&ui, &card, t1 + Duration::from_millis(300)),
+            Err(ApprovalRefused::JustChanged),
+            "a click 300 ms after the card switched to cc:cc approved it"
         );
     }
 }
