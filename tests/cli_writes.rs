@@ -35,9 +35,10 @@ impl Drop for Daemon {
     }
 }
 
-/// A port nothing listens on: a device there is never reached.
+/// A port nothing listens on, on every address as the daemon binds it: a
+/// device there is never reached.
 fn free_port() -> u16 {
-    UdpSocket::bind("127.0.0.1:0")
+    UdpSocket::bind("0.0.0.0:0")
         .and_then(|s| s.local_addr())
         .expect("a free port")
         .port()
@@ -45,7 +46,22 @@ fn free_port() -> u16 {
 
 impl Daemon {
     /// Start a daemon whose config is the dummy backends plus `tables`.
+    ///
+    /// A port free when it is picked can be bound by any other socket before
+    /// the daemon binds it, a dial from a test running beside this one
+    /// included. The daemon then exits at once, and is started again on
+    /// another port.
     fn start(tag: &str, tables: &str) -> Daemon {
+        for _ in 0..5 {
+            if let Some(daemon) = Self::start_once(tag, tables) {
+                return daemon;
+            }
+        }
+        panic!("every port picked for the daemon was taken before it bound it");
+    }
+
+    /// `None` when the daemon exited because its port was taken.
+    fn start_once(tag: &str, tables: &str) -> Option<Daemon> {
         // Short, for `sun_path` (about 104 bytes on macOS).
         let dir = PathBuf::from(format!("/tmp/h-cw{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -73,7 +89,7 @@ impl Daemon {
             .arg("daemon")
             .spawn()
             .expect("the hops binary starts");
-        let daemon = Daemon {
+        let mut daemon = Daemon {
             child,
             dir,
             config,
@@ -82,6 +98,14 @@ impl Daemon {
         };
         let deadline = Instant::now() + Duration::from_secs(60);
         while !daemon.log().contains("service running; stops on") {
+            if let Ok(Some(status)) = daemon.child.try_wait() {
+                let log = daemon.log();
+                assert!(
+                    log.contains("Address already in use"),
+                    "the daemon exited ({status}) before its service loop ran; log:\n{log}"
+                );
+                return None;
+            }
             assert!(
                 Instant::now() < deadline,
                 "the daemon never reported its service loop running; log:\n{}",
@@ -89,7 +113,7 @@ impl Daemon {
             );
             std::thread::sleep(Duration::from_millis(50));
         }
-        daemon
+        Some(daemon)
     }
 
     /// The hops binary, with an environment that points only at `dir`.
