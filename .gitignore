@@ -25,3 +25,4 @@ RESUME-PAUSED-WORK.md
 
 # points at the private design-record repo; must never be committed
 .claude/private-record.local
+.claude/hosts.local

@@ -26,6 +26,28 @@ import re
 import sys
 
 
+def _windows_hosts() -> str:
+    """Hosts of Windows machines, one per line as `windows <host>` in
+    .claude/hosts.local beside this directory. The file is local and ignored
+    by git, so no address of a real machine is committed. With no file the
+    Windows rule matches nothing."""
+    import os
+
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hosts.local")
+    hosts = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) == 2 and parts[0] == "windows":
+                    hosts.append(re.escape(parts[1]))
+    except OSError:
+        pass
+    return "|".join(hosts) or r"(?!)"
+
+
+WINDOWS_HOSTS = _windows_hosts()
+
 # (pattern, strength, message). Order matters: first match wins.
 RULES = [
     # ---- DENY: damages the owner's machines, or is irreversible ----
@@ -46,9 +68,10 @@ RULES = [
         "not optional.",
     ),
     (
-        r"\bssh\b.*192\.0\.2\.138.*(?:rm |del |Remove-Item|format|shutdown|Stop-Process|taskkill)",
+        # Any host: every machine reachable over ssh here is one of his.
+        r"\bssh\b.*(?:\brm\s|\bdel\s|Remove-Item|\bformat\s+[a-z]:|\bshutdown\b|Stop-Process|taskkill)",
         "deny",
-        "That deletes or kills something on his Windows machine. Read-only "
+        "That deletes or kills something on another of his machines. Read-only "
         "inspection there is fine; anything that changes state needs him to say "
         "so first, in this session, for this action.",
     ),
@@ -90,7 +113,8 @@ RULES = [
         "and why it was wrong before — not what you did today.",
     ),
     (
-        r"\bssh\b.*192\.0\.2\.138",
+        # Filled from .claude/hosts.local, which is not committed.
+        r"\bssh\b.*(?:" + WINDOWS_HOSTS + ")",
         "warn",
         "Windows box: non-interactive ssh lands in cmd.exe, where a cross-drive "
         "cd needs /d. He uses PowerShell, where /d is an error. Sidestep both "
