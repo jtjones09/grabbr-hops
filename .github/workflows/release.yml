@@ -181,10 +181,10 @@ jobs:
           path: hops-${{ matrix.name }}.*
           if-no-files-found: error
 
-  # The only job that sees a signing secret. It runs no cargo and executes
-  # nothing it receives: its scripts come from its own checkout, and the
-  # unsigned binary is only bundled, signed and submitted. No step is
-  # conditional, so every run signs or fails.
+  # The only job that sees a signing secret. It runs no cargo, its scripts
+  # come from its own checkout, and it receives only the unsigned binary to
+  # bundle, sign and submit. No step is conditional, so every run signs or
+  # fails.
   sign-macos:
     name: sign-macos
     needs: build

@@ -68,40 +68,83 @@ fn steps(job: &Yaml) -> &[Yaml] {
     job["steps"].as_vec().map(Vec::as_slice).unwrap_or(&[])
 }
 
-/// Every string in `y`, keys included.
-fn strings(y: &Yaml, out: &mut Vec<String>) {
+/// The text inside every `${{ }}` in `s`. An expression left open runs to the
+/// end of the string.
+fn expressions(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = s;
+    while let Some(i) = rest.find("${{") {
+        let inner = &rest[i + 3..];
+        let end = inner.find("}}").unwrap_or(inner.len());
+        out.push(&inner[..end]);
+        rest = &inner[end..];
+    }
+    out
+}
+
+fn is_ident(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
+}
+
+/// Every use of the `secrets` context in `y`: the name, upper-cased as GitHub
+/// matches it, for `secrets.NAME` and `secrets['NAME']`, and `*` for any use
+/// that can reach every secret: `toJSON(secrets)`, a computed index, or a
+/// `secrets:` key, which hands secrets to a called workflow (`inherit`).
+fn secret_refs(y: &Yaml) -> BTreeSet<String> {
+    let mut refs = BTreeSet::new();
+    walk_secret_refs(y, &mut refs);
+    refs
+}
+
+fn walk_secret_refs(y: &Yaml, refs: &mut BTreeSet<String>) {
     match y {
-        Yaml::String(s) => out.push(s.clone()),
-        Yaml::Array(a) => a.iter().for_each(|v| strings(v, out)),
+        Yaml::String(s) => {
+            for e in expressions(s) {
+                for (i, _) in e.match_indices("secrets") {
+                    let after = &e[i + "secrets".len()..];
+                    if e[..i].chars().next_back().is_some_and(is_ident)
+                        || after.chars().next().is_some_and(is_ident)
+                    {
+                        continue;
+                    }
+                    let after = after.trim_start();
+                    let name = if let Some(r) = after.strip_prefix('.') {
+                        r.trim_start()
+                            .chars()
+                            .take_while(|c| is_ident(*c))
+                            .collect()
+                    } else if let Some(r) = after.strip_prefix('[') {
+                        r.trim_start()
+                            .strip_prefix('\'')
+                            .and_then(|r| r.split_once('\''))
+                            .filter(|(_, tail)| tail.trim_start().starts_with(']'))
+                            .map(|(n, _)| n.to_owned())
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    refs.insert(if name.is_empty() {
+                        "*".to_owned()
+                    } else {
+                        name.to_ascii_uppercase()
+                    });
+                }
+            }
+        }
+        Yaml::Array(a) => a.iter().for_each(|v| walk_secret_refs(v, refs)),
         Yaml::Hash(h) => h.iter().for_each(|(k, v)| {
-            strings(k, out);
-            strings(v, out);
+            if k.as_str() == Some("secrets") {
+                refs.insert("*".to_owned());
+            }
+            walk_secret_refs(k, refs);
+            walk_secret_refs(v, refs);
         }),
         _ => {}
     }
 }
 
 fn mentions_secret(y: &Yaml) -> bool {
-    let mut all = Vec::new();
-    strings(y, &mut all);
-    all.iter().any(|s| s.contains("secrets."))
-}
-
-/// The names in every `secrets.NAME` inside `y`.
-fn secret_names(y: &Yaml) -> BTreeSet<String> {
-    let mut all = Vec::new();
-    strings(y, &mut all);
-    let mut names = BTreeSet::new();
-    for s in all {
-        for (i, _) in s.match_indices("secrets.") {
-            let name: String = s[i + "secrets.".len()..]
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
-            names.insert(name);
-        }
-    }
-    names
+    !secret_refs(y).is_empty()
 }
 
 fn uses(step: &Yaml) -> &str {
@@ -300,23 +343,30 @@ mod gates {
         let empty_dmg = stage(&ASSETS[1..], &[DMG], &[]);
         assert!(!empty_dmg.ok, "an empty dmg passed:\n{}", empty_dmg.text);
 
-        let extra = stage(&ASSETS, &[], &["hops-macos-unsigned.dmg"]);
-        assert!(
-            !extra.ok,
-            "an asset nobody listed would have been published:\n{}",
-            extra.text
-        );
+        // The unsigned dmg, and names that are part of a listed name: matching
+        // a whole line, not a substring, is what refuses the last two.
+        for name in ["hops-macos-unsigned.dmg", "hops", "hops-macos-universal"] {
+            let extra = stage(&ASSETS, &[], &[name]);
+            assert!(
+                !extra.ok,
+                "{name}, which nobody listed, would have been published:\n{}",
+                extra.text
+            );
+        }
     }
 
     /// Stand-ins for the macOS tools the verify script calls, each answering the
     /// way the real one was measured to: `spctl` and `stapler` on a notarized app
     /// and on an unsigned dmg, `codesign -dv` on a bundle signed by
-    /// scripts/sign-macos.sh's commands.
+    /// scripts/sign-macos.sh's commands, and `codesign --verify --strict` on a
+    /// bundle whose sealed resources were changed after signing.
     struct Tools {
         spctl_dmg: (i32, &'static str),
         spctl_app: (i32, &'static str),
         stapler_dmg: i32,
         stapler_app: i32,
+        /// Exit status of `codesign --verify --strict` on the app.
+        verify_app: i32,
         identifier: &'static str,
     }
 
@@ -339,6 +389,7 @@ mod gates {
                 spctl_app: NOTARIZED,
                 stapler_dmg: 0,
                 stapler_app: 0,
+                verify_app: 0,
                 identifier: "com.grabbr.hops",
             }
         }
@@ -386,11 +437,14 @@ exit "$code"
                     r#"for a; do target="$a"; done
 case "$1" in
   -dv|--display) printf 'Executable=%s/Contents/MacOS/hops\nIdentifier={}\nFormat=app bundle with Mach-O universal (x86_64 arm64)\n' "$target" >&2 ;;
-  --verify) : ;;
+  --verify)
+    [ "$2" = --strict ] || exit 64
+    [ {verify} = 0 ] || {{ printf '%s: a sealed resource is missing or invalid\n' "$target" >&2; exit {verify}; }} ;;
   *) exit 64 ;;
 esac
 "#,
-                    self.identifier
+                    self.identifier,
+                    verify = self.verify_app
                 ),
             );
             write(
@@ -453,7 +507,7 @@ esac
             good.text
         );
 
-        let cases: [(&str, Tools, Option<&[u8]>); 9] = [
+        let cases: [(&str, Tools, Option<&[u8]>); 10] = [
             ("there is no dmg", Tools::release(), None),
             ("the dmg is empty", Tools::release(), Some(empty)),
             (
@@ -505,6 +559,14 @@ esac
                 Some(image),
             ),
             (
+                "the app's signature does not verify under --strict",
+                Tools {
+                    verify_app: 1,
+                    ..Tools::release()
+                },
+                Some(image),
+            ),
+            (
                 "the app is signed under another identifier, which voids the Accessibility grant",
                 Tools {
                     identifier: "hops",
@@ -544,7 +606,7 @@ fn only_the_environment_scoped_signing_job_can_read_a_secret() {
             assert!(
                 rel == RELEASE && id == SIGN,
                 "{rel}: job {id} references {:?}; only {SIGN} in {RELEASE} may",
-                secret_names(job)
+                secret_refs(job)
             );
             assert!(
                 job["environment"].as_str().is_some_and(|e| !e.is_empty()),
@@ -571,7 +633,7 @@ fn only_the_environment_scoped_signing_job_can_read_a_secret() {
         checked.insert(k.to_owned());
     }
     assert_eq!(
-        secret_names(sign),
+        secret_refs(sign),
         checked,
         "every secret {SIGN} uses is checked for presence before it is used"
     );
