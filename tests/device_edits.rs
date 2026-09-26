@@ -508,13 +508,37 @@ fn a_delete_or_rename_for_a_pin_the_device_no_longer_has_is_refused() {
             .await;
         frontend.next("the rename's refusal", refusal).await;
 
+        // A request made while the device showed no pin is refused too: the
+        // device learnt its pin after the row was drawn, so the pin being
+        // revoked is one the user never saw.
+        frontend
+            .send(FrontendRequest::Delete {
+                handle,
+                fingerprint: None,
+            })
+            .await;
+        frontend
+            .next("the unpinned delete's refusal", refusal)
+            .await;
+        frontend
+            .send(FrontendRequest::UpdateHostname {
+                handle,
+                hostname: Some("renamed.invalid".into()),
+                fingerprint: None,
+            })
+            .await;
+        frontend
+            .next("the unpinned rename's refusal", refusal)
+            .await;
+
         let after = frontend.devices().await;
         assert_eq!(
             after
                 .get(&handle)
                 .map(|(c, s)| (c.hostname.clone(), s.peer_fingerprint.clone())),
             Some((Some("desk.invalid".to_string()), Some(pin.clone()))),
-            "a delete and a rename made for another pin changed the device; log:\n{}",
+            "a delete or a rename made for another pin, or for none, changed the \
+             device; log:\n{}",
             daemon.log()
         );
 
