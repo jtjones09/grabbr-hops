@@ -466,10 +466,10 @@ mod pairings_made_before_182_keep_the_clipboard_direction_their_lease_grants {
     //!
     //! **Why not the alternatives.** Keeping both directions leaves a flow
     //! nobody granted. Switching it off for every existing pairing breaks
-    //! working setups silently, and turning it back on needs the enable arm of
-    //! the per-device switch, which waits for #107.
+    //! working setups silently.
     //!
-    //! The choice is one function, `trust::existing_pairing_clipboard`, and
+    //! The choice is one function, `trust::existing_pairing_clipboard`, which
+    //! the on arm of the per-device switch also turns a clipboard back on by, and
     //! this runs both machines' real transports over loopback, so swapping the
     //! direction there fails here.
 
@@ -1622,7 +1622,8 @@ mod taking_trust_away_is_never_gated_the_way_giving_it_is {
     //! peer is injecting input into this machine. (2) Revoke and delete succeed
     //! while a peer is driving this machine — the quiet window gates grants
     //! only. Turning a pairing's clipboard off (#182) takes permission away
-    //! too, and is held to the same rule.
+    //! too, and is held to the same rule; turning it on widens, and is gated
+    //! like a grant (#107).
     //!
     //! **Why the asymmetry is deliberate.** On a KVM the pointer is not proof
     //! of local presence: a peer that still holds control can move the cursor
@@ -1681,9 +1682,11 @@ mod taking_trust_away_is_never_gated_the_way_giving_it_is {
     /// this becomes a real behavioural test the moment the gate is a free
     /// function over an "am I being driven" predicate.
     ///
-    /// Scans `service.rs`, never this file.
+    /// Scans `service.rs`, never this file. What the gated arms do while a
+    /// peer drives is observed, not scanned, by
+    /// `a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_on`.
     #[test]
-    fn only_the_grant_arm_consults_the_quiet_window() {
+    fn only_the_arms_that_widen_trust_consult_the_quiet_window() {
         let src = super::scan::code_only(include_str!("service.rs"));
         let gate = "refuse_while_remotely_driven";
 
@@ -1707,12 +1710,11 @@ mod taking_trust_away_is_never_gated_the_way_giving_it_is {
              against state only it holds."
         );
 
-        // The one arm that MUST consult the gate.
-        {
-            const GRANT: &str = "FrontendRequest::AuthorizeKey";
+        // The arms that MUST consult the gate: they widen trust.
+        for arm in ["AuthorizeKey", "EnableClipboard"] {
             let at = dispatch
-                .find(GRANT)
-                .unwrap_or_else(|| panic!("{GRANT} must be dispatched; update this guard"));
+                .find(&format!("FrontendRequest::{arm}"))
+                .unwrap_or_else(|| panic!("{arm} must be dispatched; update this guard"));
             let after = &dispatch[at..];
             let arm_end = after[1..]
                 .find("FrontendRequest::")
@@ -1720,12 +1722,12 @@ mod taking_trust_away_is_never_gated_the_way_giving_it_is {
                 .unwrap_or(after.len());
             assert!(
                 after[..arm_end].contains(gate),
-                "the AuthorizeKey arm no longer refuses while a peer is driving \
-                 this machine. On a KVM the pointer is not proof of local \
-                 presence: the peer holding your keyboard can move the cursor \
-                 onto the approval button and click it, manufacturing its own \
-                 consent. Granting trust is the one verb a remote peer can \
-                 usefully click for itself."
+                "the {arm} arm no longer refuses while a peer is driving this \
+                 machine. On a KVM the pointer is not proof of local presence: \
+                 the peer holding your keyboard can move the cursor onto the \
+                 approval button and click it, manufacturing its own consent. \
+                 Widening trust is what a remote peer can usefully click for \
+                 itself."
             );
         }
 
@@ -1837,69 +1839,345 @@ mod removing_a_device_takes_its_key_and_not_merely_its_address {
 // no UI is trusted; nothing reaches a shell
 // ---------------------------------------------------------------------------
 
-mod no_frontend_can_cause_a_trust_write {
-    //! **Decided 2026-08-30 (#107).** No frontend — Slint, TUI, CLI, or a
-    //! served page — can cause a trust write; a privileged verb is not
-    //! serialisable over the frontend IPC socket.
+mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_on {
+    //! **Decided 2026-09-26 (#107): retired, as a stated limit.** It replaces
+    //! 2026-08-30's rule that no frontend can cause a trust write, whose two
+    //! guards stood red until the grant verb left the IPC channel. It stays.
     //!
-    //! **Why.** lan-mouse assumed the frontend is trusted; hops does not.
-    //! `Create`, then `UpdateFixIps(attacker_ip)`, then `Activate` makes the
-    //! daemon dial an attacker and raise a genuine approval prompt for a
-    //! fingerprint the attacker chose, at a moment the attacker chose.
+    //! **The limit.** Two frontend requests widen trust, and nothing else a
+    //! frontend can send does: `AuthorizeKey`, which approves a prompt the
+    //! daemon raised for a machine that arrived while the pairing window was
+    //! open, and `EnableClipboard`, which turns a paired machine's clipboard
+    //! back on in the directions it already drives. The daemon refuses both
+    //! while a peer is driving this machine, so the machine holding the
+    //! keyboard and pointer cannot click its own approval.
+    //!
+    //! **Why it is a limit and not a boundary.** Anything running as the user
+    //! can read the IPC token, send both, open add device and add a device to
+    //! dial, and re-sign the trust store on disk (`src/authority.rs`). The
+    //! channel cannot defend against that program, so the rule is stated
+    //! where a reader finds it (the `hops_ipc` crate docs) and pinned here, so
+    //! a third widening request, or either one without the driving check,
+    //! fails a test instead of passing review.
+    //!
+    //! **Behavioural.** The whole daemon runs in this process with a real
+    //! frontend on its IPC socket and real peers on loopback QUIC: one drives
+    //! it, one knocks while add device is open. The store read is the daemon's
+    //! own.
+    #![cfg(unix)]
 
-    /// **RED TODAY (#107).**
-    ///
-    /// Type-level and behavioural: it constructs the verb and serialises it. If
-    /// `AuthorizeKey` cannot be built and put on the wire, this stops compiling
-    /// — which is the point. The failure message tells you to delete the test
-    /// along with the variant.
-    #[test]
-    #[ignore = "RED: AuthorizeKey is still a frontend IPC verb. Closed by #107. Kept red-and-visible rather than deleted: this is the decision with the fullest documented attack chain behind it."]
-    fn no_privileged_verb_can_be_serialised_over_the_frontend_socket() {
-        use hops_ipc::FrontendRequest;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, RwLock};
+    use std::time::Duration;
 
-        let grant = FrontendRequest::AuthorizeKey("a device".to_string(), super::fp32(0xdd));
-        let on_the_wire = serde_json::to_string(&grant).expect("serialise");
+    use hops_ipc::{ClientHandle, FrontendEvent, FrontendRequest, Position};
+    use hops_proto::ProtoEvent;
+    use input_emulation::recording::{Recorded, Recording};
+    use input_event::{Event, PointerEvent};
 
-        assert!(
-            !on_the_wire.contains("AuthorizeKey"),
-            "the trust grant is still a frontend IPC verb, serialisable as \
-             {on_the_wire} (#107). Anything that can write a line to that socket \
-             can grant keyboard control of this machine — and the full chain is \
-             intact beside it: Create, then UpdateFixIps(attacker_ip), then \
-             Activate makes the daemon dial an address of the attacker's \
-             choosing and raise a GENUINE approval prompt for a fingerprint the \
-             attacker chose, at a moment the attacker chose. When the grant verb \
-             moves off this socket, delete the variant and this test together."
-        );
+    use crate::service::in_process::{DEADLINE, Daemon, Frontend};
+    use crate::test_harness::{Machine, dialer, machine, run_local};
+    use crate::transport::Trust;
+    use crate::trust::{Caps, TrustStore};
+
+    /// Whether a request can widen trust. There is no wildcard: a new request
+    /// fails to compile here until it is placed on one side, and one placed
+    /// on the `false` side belongs in [`every_other_request`] as well.
+    fn widens(request: &FrontendRequest) -> bool {
+        use FrontendRequest as R;
+        match request {
+            R::AuthorizeKey(..) | R::EnableClipboard(_) => true,
+            R::Activate(..)
+            | R::Create
+            | R::ChangePort(_)
+            | R::Delete { .. }
+            | R::Enumerate()
+            | R::ResolveDns(_)
+            | R::UpdateHostname { .. }
+            | R::UpdatePort(..)
+            | R::UpdatePosition(..)
+            | R::UpdateGeometry(..)
+            | R::UpdateFixIps(..)
+            | R::EnableCapture
+            | R::EnableEmulation
+            | R::Sync
+            | R::RemoveAuthorizedKey(_)
+            | R::SetLabel(..)
+            | R::SaveConfiguration
+            | R::OpenPairing
+            | R::DisableClipboard(_)
+            | R::Barrier(_) => false,
+        }
     }
 
-    /// **Also RED TODAY, and the reason the #130 door cannot be fixed in
-    /// isolation.** The approval message carries a description and a
-    /// fingerprint and nothing else — so the wire itself cannot say whether the
-    /// user was answering an inbound knock or their own outbound dial, and the
-    /// door has no origin to derive capabilities from.
-    ///
-    /// This is why `approving_our_own_dial_never_lets_that_machine_type_into_this_one`
-    /// is red: the information needed to fix it does not reach the door.
+    /// One of every request that does not widen trust, each aimed where a
+    /// widening would show: at the machine whose prompt is waiting, at the
+    /// paired machine whose clipboard is off, and at a device added here,
+    /// which is pointed at a port nothing answers on. The one removal is aimed
+    /// at a machine never paired, so the pairings above are still there to
+    /// widen afterwards.
+    fn every_other_request(
+        stranger: &str,
+        paired: &str,
+        added: ClientHandle,
+        port: u16,
+        nowhere: u16,
+    ) -> Vec<FrontendRequest> {
+        use FrontendRequest as R;
+        let loopback = std::net::IpAddr::from([127, 0, 0, 1]);
+        vec![
+            R::OpenPairing,
+            R::UpdateFixIps(added, vec![loopback]),
+            R::UpdatePort(added, nowhere),
+            R::UpdateHostname {
+                handle: added,
+                hostname: None,
+                fingerprint: None,
+            },
+            R::UpdatePosition(added, Position::Right),
+            R::UpdateGeometry(added, None),
+            R::Activate(added, true),
+            R::ResolveDns(added),
+            R::Enumerate(),
+            R::Sync,
+            R::ChangePort(port),
+            R::EnableCapture,
+            R::EnableEmulation,
+            R::SetLabel(stranger.to_owned(), "a stranger, renamed".to_owned()),
+            R::SetLabel(paired.to_owned(), "desk mac, renamed".to_owned()),
+            R::DisableClipboard(paired.to_owned()),
+            R::DisableClipboard(stranger.to_owned()),
+            R::SaveConfiguration,
+            R::Barrier(u64::MAX),
+            R::Activate(added, false),
+            R::Delete {
+                handle: added,
+                fingerprint: None,
+            },
+            R::RemoveAuthorizedKey(super::fp32(0x5e)),
+        ]
+    }
+
+    /// What the daemon's store grants each machine it holds a pairing for.
+    fn granted(trust: &Trust) -> BTreeMap<String, Caps> {
+        trust.read().expect("lock").pairings().into_iter().collect()
+    }
+
+    /// A store for `me` that may drive the daemon, as a peer's would be.
+    fn trusting(me: &Machine, daemon: &str) -> Trust {
+        let mut store = TrustStore::new(&me.fingerprint, 0).expect("our fingerprint");
+        store
+            .issue(daemon, "the daemon", Caps::OUTBOUND)
+            .expect("issue");
+        Arc::new(RwLock::new(store))
+    }
+
+    fn refusals(events: &[FrontendEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                FrontendEvent::Error(text) if text.starts_with(hops_ipc::GRANT_REFUSED) => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Ask until the daemon has admitted `stranger`'s knock as a prompt.
+    async fn prompt_from(app: &mut Frontend, stranger: &Machine, port: u16, daemon: &str) {
+        let knocker = dialer(stranger, trusting(stranger, daemon), port, Position::Left);
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        loop {
+            let _ = knocker.conn.send(ProtoEvent::Ping, knocker.handle).await;
+            let events = app.exchange(&[]).await;
+            let prompted = events.iter().any(|e| {
+                matches!(e, FrontendEvent::ConnectionAttempt { fingerprint, .. }
+                    if *fingerprint == stranger.fingerprint)
+            });
+            if prompted {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a machine knocking while add device was open raised no prompt"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    // LEDGER EN-3 | class B | 5 process-in-test + 1 struct state: FrontendRequest over the daemon's IPC socket, a peer driving it over loopback QUIC, the daemon's trust store
     #[test]
-    #[ignore = "RED: FrontendRequest::AuthorizeKey carries no origin, so the wire cannot express which act was approved. Closed by #107, which moves the grant verb off IPC entirely. The store now refuses an incoherent grant, so this is a wire gap rather than a live over-grant."]
-    fn an_approval_says_which_act_it_is_approving() {
-        use hops_ipc::FrontendRequest;
+    fn only_approving_a_prompt_or_turning_the_clipboard_on_widens_trust_and_neither_while_driven() {
+        run_local(async {
+            let (desk, laptop, stranger) = (machine(), machine(), machine());
+            let tables = format!(
+                "[authorized_fingerprints]\n\"{}\" = \"desk mac\"\n\"{}\" = \"laptop\"\n",
+                desk.fingerprint, laptop.fingerprint
+            );
+            let recording = Recording::new();
+            let daemon = Daemon::start("widen", &tables, recording.backend()).await;
+            let (ours, port, trust, ipc) = (
+                daemon.fingerprint(),
+                daemon.port(),
+                daemon.trust(),
+                daemon.ipc(),
+            );
+            // Held for the whole test, so nothing else can answer on it.
+            let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("a silent port");
+            let nowhere = silent.local_addr().expect("its address").port();
+            let (desk_fp, laptop_fp, stranger_fp) = (
+                desk.fingerprint.clone(),
+                laptop.fingerprint.clone(),
+                stranger.fingerprint.clone(),
+            );
 
-        let grant = FrontendRequest::AuthorizeKey("a device".to_string(), super::fp32(0xdd));
-        let on_the_wire = serde_json::to_string(&grant).expect("serialise");
+            daemon
+                .run_while(async {
+                    use FrontendRequest as R;
+                    let mut app = ipc.connect().await;
+                    app.exchange(&[
+                        R::OpenPairing,
+                        R::DisableClipboard(desk_fp.clone()),
+                        R::DisableClipboard(laptop_fp.clone()),
+                    ])
+                    .await;
+                    prompt_from(&mut app, &stranger, port, &ours).await;
+                    let before = granted(&trust);
+                    assert!(
+                        !before[&desk_fp].intersects(Caps::CLIPBOARD)
+                            && !before.contains_key(&stranger_fp),
+                        "precondition: the paired machine's clipboard is off and the \
+                         prompting one holds nothing: {before:?}"
+                    );
 
-        assert!(
-            on_the_wire.contains("Inbound")
-                || on_the_wire.contains("OutboundDial")
-                || on_the_wire.contains("origin"),
-            "the approval message {on_the_wire} carries no origin, so the grant \
-             door cannot tell an inbound knock from our own dial and hardcodes \
-             one direction for both (#130). Direction is a capability; a message \
-             that cannot express which act was approved cannot mint the right \
-             one."
-        );
+                    // Driven: the paired machine crosses onto this one and keeps
+                    // moving the pointer while both widening requests are sent.
+                    let driver = dialer(&desk, trusting(&desk, &ours), port, Position::Left);
+                    driver.until_alive().await;
+                    driver
+                        .send(ProtoEvent::Enter(hops_proto::Position::Right))
+                        .await;
+                    let motion = Event::Pointer(PointerEvent::Motion {
+                        time: 0,
+                        dx: 1.0,
+                        dy: 0.0,
+                    });
+                    let driving = async {
+                        loop {
+                            driver.send(ProtoEvent::Input(motion)).await;
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    };
+                    let asked = async {
+                        crate::test_harness::wait_until("the pointer moves", DEADLINE, || {
+                            recording
+                                .calls()
+                                .iter()
+                                .any(|c| matches!(c, Recorded::Consume(e, _) if *e == motion))
+                        })
+                        .await;
+                        app.exchange(&[
+                            R::AuthorizeKey("new laptop".to_owned(), stranger_fp.clone()),
+                            R::EnableClipboard(desk_fp.clone()),
+                        ])
+                        .await
+                    };
+                    let events = tokio::select! {
+                        () = driving => unreachable!("the driver stops only with the test"),
+                        events = asked => events,
+                    };
+                    assert_eq!(
+                        granted(&trust),
+                        before,
+                        "a request sent while a peer drove this machine widened trust. \
+                         On a KVM the pointer is not proof that anyone is at this \
+                         machine: the peer holding it can move it onto the approval \
+                         and click, manufacturing its own consent. Refusals: {:?}",
+                        refusals(&events)
+                    );
+                    let refused = refusals(&events);
+                    assert!(
+                        refused.len() == 2
+                            && refused.iter().all(|r| r.contains("controlled remotely")),
+                        "both widening requests must be refused, each saying why, while a \
+                         peer drives this machine; the app was told {refused:?}"
+                    );
+
+                    // No longer driven: once the quiet window has passed, a
+                    // widening request on a third pairing is honoured.
+                    let deadline = tokio::time::Instant::now() + DEADLINE;
+                    while !trust.read().expect("lock").clipboard_from(&laptop_fp) {
+                        assert!(
+                            tokio::time::Instant::now() < deadline,
+                            "turning a clipboard on was still refused long after the \
+                             peer stopped driving"
+                        );
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        app.exchange(&[R::EnableClipboard(laptop_fp.clone())]).await;
+                    }
+                    let before = granted(&trust);
+
+                    // Everything else, aimed where a widening would show.
+                    let created = app.exchange(&[R::Create]).await;
+                    let added = created
+                        .iter()
+                        .find_map(|e| match e {
+                            FrontendEvent::Created(handle, ..) => Some(*handle),
+                            _ => None,
+                        })
+                        .expect("a device added from the app is announced");
+                    let others = every_other_request(&stranger_fp, &desk_fp, added, port, nowhere);
+                    assert!(
+                        !others.iter().any(widens),
+                        "every_other_request holds a request that widens trust"
+                    );
+                    // One at a time, checked after each: a later request that
+                    // narrows must not hide an earlier one that widened.
+                    for request in others {
+                        app.exchange(std::slice::from_ref(&request)).await;
+                        let after = granted(&trust);
+                        let widened: Vec<_> = after
+                            .iter()
+                            .filter(|(fp, caps)| {
+                                !before.get(*fp).is_some_and(|b| b.contains(**caps))
+                            })
+                            .collect();
+                        assert!(
+                            widened.is_empty(),
+                            "{request:?} widened trust: {widened:?} (before: {before:?}). \
+                             Only approving a prompt and turning a clipboard on may. \
+                             A same-user program holding the IPC token can send any of \
+                             them, and the stated limit is that it can do exactly two \
+                             things to trust, neither while this machine is driven. A \
+                             third is a new verb for that program; if one is genuinely \
+                             needed, it goes through the driving check and into the \
+                             stated limit in the same change."
+                        );
+                    }
+
+                    // And the two that widen, do: the steps above could have
+                    // seen a widening.
+                    app.exchange(&[
+                        R::AuthorizeKey("new laptop".to_owned(), stranger_fp.clone()),
+                        R::EnableClipboard(desk_fp.clone()),
+                    ])
+                    .await;
+                    let now = granted(&trust);
+                    assert_eq!(
+                        (now.get(&stranger_fp).copied(), now.get(&desk_fp).copied()),
+                        (
+                            Some(Caps::INBOUND),
+                            Some(Caps::DRIVE_ME | Caps::CLIPBOARD_FROM)
+                        ),
+                        "approving the prompt must pair the machine that knocked as \
+                         one that may drive this one, and turning the clipboard on \
+                         must give the paired machine the clipboard its drive bits \
+                         allow and nothing else"
+                    );
+                })
+                .await;
+        });
     }
 }
 
@@ -1935,6 +2213,10 @@ mod every_trust_mutation_happens_at_a_named_door {
         // Added with the clipboard off switch (#182, #187). It narrows only,
         // dropping the clipboard bits of one lease, and needs no authority.
         "fn disable_clipboard",
+        // Added with the on arm (#182, #107). It widens one lease's clipboard
+        // to what its drive bits allow, and its caller refuses it while a peer
+        // drives this machine.
+        "fn enable_clipboard",
     ];
 
     /// The needle a scan must actually find. If the store is renamed again,

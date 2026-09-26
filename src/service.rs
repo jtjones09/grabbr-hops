@@ -185,7 +185,8 @@ pub struct Service {
     ///
     /// Also what a frontend that attaches later is shown (#114).
     ///
-    /// Bounded, because anyone on the network can cause an entry.
+    /// Bounded, because anyone on the network can cause an entry, and
+    /// forgotten when the pairing window closes ([`expire_attempts`]).
     pending_attempts: HashMap<String, PendingAttempt>,
     /// Whether a pairing prompt may appear right now (#195).
     prompt_gate: crate::prompt_gate::PromptGate,
@@ -283,6 +284,34 @@ fn attempts_to_replay(
         .filter(|(fp, a)| gate.replayable(a.admitted, now) && !removed(fp))
         .map(|(fp, a)| (fp.clone(), *a))
         .collect()
+}
+
+/// Forget every held prompt whose pairing window has closed since it was
+/// raised (#107).
+///
+/// A prompt may be approved only while the window that admitted it is still
+/// open. Once it closes nothing may grant from it, even after add device is
+/// opened again, so a program holding the IPC token cannot keep a prompt
+/// from one window and approve it in another. Run wherever the held prompts
+/// are read, so none is read after its window closes.
+fn expire_attempts(
+    pending: &mut HashMap<String, PendingAttempt>,
+    gate: &crate::prompt_gate::PromptGate,
+    now: Instant,
+) {
+    pending.retain(|_, a| gate.open_throughout(a.admitted, now));
+}
+
+/// The held prompt from `fingerprint`, taken for a grant: its provenance, or
+/// `None` when there is none or its pairing window has closed.
+fn take_attempt(
+    pending: &mut HashMap<String, PendingAttempt>,
+    gate: &crate::prompt_gate::PromptGate,
+    fingerprint: &str,
+    now: Instant,
+) -> Option<AttemptOrigin> {
+    expire_attempts(pending, gate, now);
+    pending.remove(fingerprint).map(|a| a.origin)
 }
 
 /// How many unanswered prompts are remembered at once.
@@ -876,6 +905,14 @@ impl Service {
             // takes permission away, and a peer driving this machine gains
             // nothing by clicking it.
             FrontendRequest::DisableClipboard(fp) => self.disable_clipboard(fp),
+            // Behind it, like a grant: it widens a pairing, and a peer driving
+            // this machine could click it for itself.
+            FrontendRequest::EnableClipboard(fp) => {
+                if self.refuse_while_remotely_driven("turn the clipboard on") {
+                    return;
+                }
+                self.enable_clipboard(fp);
+            }
         }
     }
 
@@ -1430,8 +1467,14 @@ impl Service {
             )));
             return;
         }
-        // Shaped by how the peer arrived; see `grant_for_attempt`.
-        let origin = self.pending_attempts.remove(&fp).map(|a| a.origin);
+        // Shaped by how the peer arrived; see `grant_for_attempt`. A prompt
+        // whose pairing window has closed grants nothing.
+        let origin = take_attempt(
+            &mut self.pending_attempts,
+            &self.prompt_gate,
+            &fp,
+            Instant::now(),
+        );
         // The lock is taken on one line on purpose: the named-door guard scans
         // for that call, and a chain split across lines drops this door out of
         // its match set without failing anything.
@@ -1468,7 +1511,8 @@ impl Service {
         self.publish_trust();
     }
 
-    /// Refuse a trust GRANT while a peer is driving this machine's input.
+    /// Refuse a request that WIDENS trust, a grant or turning a clipboard on,
+    /// while a peer is driving this machine's input (#107).
     ///
     /// On a KVM the pointer is not proof of local presence: a peer that still
     /// holds control can move the cursor onto an approval button and click it,
@@ -1572,6 +1616,7 @@ impl Service {
         // Remembered so the grant door mints the capability that matches how
         // this peer actually arrived, rather than a fixed one, and so a frontend
         // that attaches later is shown it.
+        expire_attempts(&mut self.pending_attempts, &self.prompt_gate, now);
         if self.pending_attempts.len() >= MAX_PENDING_ATTEMPTS {
             self.pending_attempts.clear();
         }
@@ -1597,6 +1642,11 @@ impl Service {
     /// prompts the gate admitted are held, and only those it would still allow
     /// on screen now are shown again.
     fn replay_pending_attempts(&mut self) {
+        expire_attempts(
+            &mut self.pending_attempts,
+            &self.prompt_gate,
+            Instant::now(),
+        );
         let replay = {
             let trust = self.trust.read().expect("lock");
             attempts_to_replay(
@@ -1781,6 +1831,46 @@ impl Service {
         log::info!("clipboard off for {}", named(&label, &fp));
         self.persist_trust(format!(
             "turning the clipboard off for {}",
+            named(&label, &fp)
+        ));
+        self.publish_trust();
+    }
+
+    /// Turn a pairing's clipboard back on (#182), in the directions the
+    /// pairing drives and no others. Saved and published as the off arm is.
+    /// The caller has already refused it while a peer drives this machine.
+    fn enable_clipboard(&mut self, fp: String) {
+        let Some(fp) = hops_ipc::pairing::canonical_fingerprint(&fp) else {
+            log::warn!("refusing to turn the clipboard on for {fp:?}: not a fingerprint");
+            return;
+        };
+        // The lock is taken on one line on purpose: the named-door guard scans
+        // for that call.
+        let changed = self.trust.write().expect("lock").enable_clipboard(&fp);
+        match changed {
+            None => {
+                log::warn!("not turning the clipboard on for {fp}: it is not a paired device");
+                self.notify_frontend(FrontendEvent::Error(
+                    "That device is not paired, so it has no clipboard to turn on.".to_string(),
+                ));
+                return;
+            }
+            // Already on: nothing to save, and every app already shows it.
+            Some(false) => {
+                log::debug!("the clipboard for {fp} is already on");
+                return;
+            }
+            Some(true) => {}
+        }
+        let label = self
+            .trust
+            .read()
+            .expect("lock")
+            .label(&fp)
+            .unwrap_or_default();
+        log::info!("clipboard on for {}", named(&label, &fp));
+        self.persist_trust(format!(
+            "turning the clipboard on for {}",
             named(&label, &fp)
         ));
         self.publish_trust();
@@ -2522,6 +2612,7 @@ mod one_trust_write_site {
         "fn handle_config_change",  // reload: the config file is a door too
         "fn new",                   // startup load
         "fn disable_clipboard",     // narrows one lease's clipboard, never widens
+        "fn enable_clipboard",      // widens one lease's clipboard to its drive bits
     ];
 
     #[test]
@@ -2950,6 +3041,11 @@ mod a_second_daemon_leaves_the_running_daemons_files_alone {
 #[cfg(all(test, unix))]
 mod a_permission_granted_while_it_runs;
 
+/// The whole daemon in this process, for a test that drives it the way a
+/// frontend and a peer do.
+#[cfg(all(test, unix))]
+pub(crate) mod in_process;
+
 #[cfg(test)]
 mod replay_on_attach {
     //! A frontend that attaches late is shown the prompts it missed, but only
@@ -3014,6 +3110,97 @@ mod replay_on_attach {
             vec!["yy".to_string()],
             "add device reopened for one machine replayed another machine's \
              request from the window before"
+        );
+    }
+}
+
+#[cfg(test)]
+mod a_prompt_expires_with_its_pairing_window {
+    //! A held prompt can be approved only while the pairing window that
+    //! admitted it is still open (#107). It used to be forgotten only on a
+    //! grant or when the table overflowed, so a prompt from one window could
+    //! be approved in the next.
+    use super::{AttemptOrigin, GrantRefused, PendingAttempt, grant_for_attempt, take_attempt};
+    use crate::prompt_gate::PromptGate;
+    use crate::trust::TrustStore;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    const S: Duration = Duration::from_secs(1);
+
+    fn fp(tag: u8) -> String {
+        (0u8..32)
+            .map(|i| format!("{:02x}", tag.wrapping_add(i)))
+            .collect::<Vec<_>>()
+            .join(":")
+    }
+
+    fn held(admitted: Instant) -> HashMap<String, PendingAttempt> {
+        HashMap::from([
+            (
+                fp(0xa0),
+                PendingAttempt {
+                    origin: AttemptOrigin::Inbound,
+                    addr: None,
+                    admitted,
+                },
+            ),
+            (
+                fp(0xb0),
+                PendingAttempt {
+                    origin: AttemptOrigin::OutboundDial,
+                    addr: None,
+                    admitted,
+                },
+            ),
+        ])
+    }
+
+    // LEDGER EN-2 | class B | 2 return value + 1 struct state: take_attempt, grant_for_attempt, the held prompts
+    #[test]
+    fn a_prompt_cannot_be_approved_once_its_pairing_window_has_closed() {
+        let t0 = Instant::now();
+        let mut gate = PromptGate::new();
+        gate.open(t0);
+        let knocked = t0 + S;
+
+        let mut pending = held(knocked);
+        gate.open(t0 + 60 * S);
+        assert_eq!(
+            take_attempt(&mut pending, &gate, &fp(0xa0), t0 + 100 * S),
+            Some(AttemptOrigin::Inbound),
+            "add device opened again while its window was still open ended a \
+             prompt that was on screen"
+        );
+
+        let closed = t0 + 60 * S + PromptGate::WINDOW;
+        let mut pending = held(knocked);
+        assert_eq!(
+            take_attempt(&mut pending, &gate, &fp(0xa0), closed),
+            None,
+            "a prompt could still be approved after its pairing window closed"
+        );
+        assert!(
+            pending.is_empty(),
+            "a prompt from a closed pairing window was kept: {:?}",
+            pending.keys().collect::<Vec<_>>()
+        );
+
+        let mut pending = held(knocked);
+        gate.open(closed + 10 * S);
+        let origin = take_attempt(&mut pending, &gate, &fp(0xb0), closed + 11 * S);
+        let mut store = TrustStore::new(&fp(0x01), 0).expect("our fingerprint");
+        assert_eq!(
+            grant_for_attempt(&mut store, &fp(0xb0), "a stranger", origin),
+            Err(GrantRefused::NoAttempt),
+            "a prompt from a pairing window that had closed was approved after add \
+             device was opened again. The window is what makes a prompt answerable: \
+             a prompt kept past it can be approved at any later moment by anything \
+             that can send the approval."
+        );
+        assert!(
+            !store.is_known(&fp(0xb0)),
+            "the approval of an expired prompt left a record"
         );
     }
 }

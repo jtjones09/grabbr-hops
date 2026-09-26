@@ -208,7 +208,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             online: false,
             trusted: true,
             revoked: false,
-            clipboard: "off — it cannot be turned back on here yet".into(),
+            clipboard: "off".into(),
             clipboard_on: false,
         },
         // the user deliberately expelled this one — it must read as EXPELLED,

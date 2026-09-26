@@ -144,7 +144,7 @@ export component AppWindow inherits Window {
     // The row's pin when its rename opened, carried like confirm-delete-pin.
     in-out property <string> editing-pin: "";
     // The edit panel is asking whether to turn the device's clipboard off.
-    // Asked, because nothing here turns it back on (#182, #107).
+    // "turn on" puts it back (#182).
     in-out property <bool> confirm-clipboard-off: false;
     // `in-out` (not a plain internal property) so the render_png self-review
     // harness can open these overlays from outside for a look — not used by the
@@ -183,6 +183,7 @@ export component AppWindow inherits Window {
     callback delete-device(string /* handle */, string /* pin */);
     callback revoke(string /* full fingerprint */);
     callback disable-clipboard(string /* full fingerprint */);
+    callback enable-clipboard(string /* full fingerprint */);
     callback approve-pairing(string /* name */, string /* full fingerprint */);
     callback deny-pairing(string /* full fingerprint */);
     callback set-theme(int /* palette index */);
@@ -974,8 +975,9 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                 // The device's clipboard (#182), found in the
                                 // fresh `devices` model by the key the edit
                                 // button set, so it shows the daemon's latest
-                                // word. Off offers nothing: nothing here turns
-                                // it back on.
+                                // word. On offers "turn off", asked first; off
+                                // offers "turn on", which the daemon does in
+                                // the directions the pairing drives.
                                 // One wrapper with no spacing: every device
                                 // adds an element here, empty but for the one
                                 // being edited.
@@ -999,9 +1001,7 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                                     alignment: center;
                                                     horizontal-stretch: 1;
                                                     Text {
-                                                        text: asking
-                                                            ? "turn it off? it cannot be turned back on here yet"
-                                                            : d.clipboard;
+                                                        text: asking ? "turn it off?" : d.clipboard;
                                                         color: asking ? Theme.c.warn
                                                             : d.clipboard-on ? Theme.c.foreground : Theme.c.muted;
                                                         font-size: Type.small;
@@ -1014,6 +1014,14 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                                         text: "turn off";
                                                         ghost: true;
                                                         clicked => { root.confirm-clipboard-off = true; }
+                                                    }
+                                                }
+                                                if !d.clipboard-on: VerticalLayout {
+                                                    alignment: center;
+                                                    PillButton {
+                                                        text: "turn on";
+                                                        ghost: true;
+                                                        clicked => { root.enable-clipboard(d.fp-full); }
                                                     }
                                                 }
                                                 if asking: VerticalLayout {

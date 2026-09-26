@@ -341,14 +341,13 @@ pub fn theme_colors(t: &theme::Theme) -> ThemeColors {
     }
 }
 
-/// What the edit panel says under "clipboard". Off says it cannot be turned
-/// back on here, because nothing in this frontend can (#182, #107).
+/// What the edit panel says under "clipboard", beside its switch (#182).
 fn clipboard_words(c: Clipboard) -> &'static str {
     match c {
         Clipboard::BothWays => "shared both ways",
         Clipboard::FromIt => "arrives here from this device",
         Clipboard::ToIt => "goes from here to this device",
-        Clipboard::Off => "off — it cannot be turned back on here yet",
+        Clipboard::Off => "off",
     }
 }
 
@@ -828,6 +827,12 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
         let c = client.clone();
         ui.on_disable_clipboard(move |fp| {
             c.request(FrontendRequest::DisableClipboard(fp.to_string()));
+        });
+    }
+    {
+        let c = client.clone();
+        ui.on_enable_clipboard(move |fp| {
+            c.request(FrontendRequest::EnableClipboard(fp.to_string()));
         });
     }
     {

@@ -27,6 +27,9 @@ pub(crate) enum Admit {
 
 pub(crate) struct PromptGate {
     opened: Option<Instant>,
+    /// When the window last opened while it was closed. Opening it again
+    /// while it is open moves `opened` and not this: the window never closed.
+    open_since: Option<Instant>,
     recent: RecentPrompts,
     refusals: RefusalLog,
     admitted: AdmittedLog,
@@ -39,6 +42,7 @@ impl PromptGate {
     pub(crate) fn new() -> Self {
         Self {
             opened: None,
+            open_since: None,
             recent: RecentPrompts::new(),
             refusals: RefusalLog::new(),
             admitted: AdmittedLog::new(),
@@ -47,6 +51,9 @@ impl PromptGate {
 
     /// Someone opened the add-device flow on this machine.
     pub(crate) fn open(&mut self, now: Instant) {
+        if self.remaining(now).is_none() {
+            self.open_since = Some(now);
+        }
         self.opened = Some(now);
     }
 
@@ -101,6 +108,18 @@ impl PromptGate {
     /// asking knocks again, and its next knock is admitted in the new window.
     pub(crate) fn replayable(&self, admitted: Instant, now: Instant) -> bool {
         self.remaining(now).is_some() && self.opened.is_some_and(|opened| admitted >= opened)
+    }
+
+    /// Whether the window has stayed open from `admitted` until `now`, so a
+    /// prompt admitted then may still be approved (#107).
+    ///
+    /// A prompt lapses when the window closes, and opening add device again
+    /// afterwards does not bring it back. Opening it again while the window
+    /// is still open closes nothing, so a prompt already on screen can still
+    /// be answered, though a reopen ends its being shown again to a frontend
+    /// that attaches later ([`Self::replayable`]).
+    pub(crate) fn open_throughout(&self, admitted: Instant, now: Instant) -> bool {
+        self.remaining(now).is_some() && self.open_since.is_some_and(|since| admitted >= since)
     }
 }
 

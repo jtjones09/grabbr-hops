@@ -377,7 +377,8 @@ impl Caps {
 /// on which nobody chose a clipboard (#187). The decision's guard,
 /// `decision_guards::pairings_made_before_182_keep_the_clipboard_direction_their_lease_grants`,
 /// runs both machines' transports on each of those, so a change here fails
-/// there.
+/// there. Turning a clipboard back on ([`TrustStore::enable_clipboard`])
+/// restores this mapping too, and never more.
 pub const fn existing_pairing_clipboard(drive: Caps) -> Caps {
     let mut clipboard = Caps::NONE;
     if drive.contains(Caps::DRIVE_ME) {
@@ -1017,8 +1018,7 @@ impl TrustStore {
     /// later approval of the other direction keeps it off.
     ///
     /// Narrowing, like [`TrustStore::drop_capabilities`], so it needs no
-    /// authority. There is deliberately no verb that turns it back on here:
-    /// widening a pairing waits for #107.
+    /// authority. [`TrustStore::enable_clipboard`] is its other arm.
     ///
     /// `None` when there is no pairing to change: no lease, or the device
     /// was removed. `Some(false)` when its clipboard is already off by
@@ -1037,6 +1037,39 @@ impl TrustStore {
         if let Some(lease) = self.entries.get_mut(&fp).and_then(|e| e.lease.as_mut()) {
             lease.clipboard_chosen = true;
         }
+        Some(true)
+    }
+
+    /// Turn a pairing's clipboard back on: the on arm of #182's per-device
+    /// switch. Adds the clipboard the lease's drive bits allow, and nothing
+    /// else: [`existing_pairing_clipboard`], the mapping every pairing made
+    /// before #182 keeps (#186). A machine that may drive this one sends its
+    /// clipboard here; one this machine may drive is sent this machine's.
+    /// Records that the clipboard was chosen, as the off arm does, so the
+    /// choice is saved and a later approval of another direction to drive
+    /// adds no clipboard with it.
+    ///
+    /// Widening, so the caller decides whether the request may be honoured:
+    /// the daemon refuses it while a peer drives this machine (#107). It
+    /// never makes a lease, and never grants or changes a direction to drive.
+    ///
+    /// `None` when there is no pairing in force to change: no lease, a lapsed
+    /// one, or the device was removed. `Some(false)` when every direction
+    /// its drive bits allow is already on, so there is nothing to save.
+    pub fn enable_clipboard(&mut self, fingerprint: &str) -> Option<bool> {
+        let fp = key(fingerprint);
+        let now = self.now();
+        let entry = self.entries.get_mut(&fp)?;
+        if effective_capabilities(entry, &self.ours, now).is_empty() {
+            return None;
+        }
+        let lease = entry.lease.as_mut()?;
+        let allowed = existing_pairing_clipboard(lease.caps);
+        if lease.caps.contains(allowed) {
+            return Some(false);
+        }
+        lease.caps = lease.caps | allowed;
+        lease.clipboard_chosen = true;
         Some(true)
     }
 
@@ -1575,6 +1608,72 @@ mod tests {
             "a removed device reports a clipboard to turn off"
         );
         assert_eq!(s.disable_clipboard(&fp(0x30)), None, "an unknown device");
+    }
+
+    /// Turning a clipboard back on gives a pairing the clipboard its drive
+    /// bits allow and nothing more: in from a machine that may drive this
+    /// one, out to a machine this one may drive (#182, #186). It never grants
+    /// or changes a direction to drive, asked again it changes nothing, and a
+    /// removed or unknown device gets nothing.
+    // LEDGER EN-1 | class B | 1 return value + 2 struct state: TrustStore::enable_clipboard, capabilities
+    #[test]
+    fn turning_the_clipboard_on_follows_the_drive_bits_and_grants_nothing_else() {
+        let mut s = store();
+        let (inbound, outbound, both, gone) = (fp(0x10), fp(0x11), fp(0x12), fp(0x20));
+        s.issue(&inbound, "drives this machine", Caps::INBOUND)
+            .expect("issue");
+        s.issue(&outbound, "driven from here", Caps::OUTBOUND)
+            .expect("issue");
+        s.issue(&both, "both ways", Caps::INBOUND).expect("issue");
+        s.issue(&both, "both ways", Caps::OUTBOUND).expect("issue");
+        s.issue(&gone, "old laptop", Caps::INBOUND).expect("issue");
+        for f in [&inbound, &outbound, &both, &gone] {
+            assert_eq!(s.disable_clipboard(f), Some(true), "precondition: {f} off");
+        }
+        s.revoke(&gone);
+
+        let drive_both = Caps::DRIVE_ME | Caps::I_MAY_DRIVE;
+        for (f, drive, clipboard) in [
+            (&inbound, Caps::DRIVE_ME, Caps::CLIPBOARD_FROM),
+            (&outbound, Caps::I_MAY_DRIVE, Caps::CLIPBOARD_TO),
+            (&both, drive_both, Caps::CLIPBOARD),
+        ] {
+            assert_eq!(
+                s.enable_clipboard(f),
+                Some(true),
+                "{f} has a lease to change"
+            );
+            assert_eq!(
+                s.capabilities(f),
+                drive | clipboard,
+                "turning the clipboard on for a pairing that drives {drive} must \
+                 give it {clipboard} and leave its drive bits alone. Anything more \
+                 is a direction nobody granted: text copied here would reach a \
+                 machine this one does not drive, or text from a machine that may \
+                 not drive this one would land in this clipboard."
+            );
+            assert_eq!(
+                s.enable_clipboard(f),
+                Some(false),
+                "a clipboard already on reports a change, so every request saves \
+                 the store and tells every app again"
+            );
+        }
+        assert_eq!(
+            s.enable_clipboard(&gone),
+            None,
+            "a removed device reports a clipboard to turn on"
+        );
+        assert_eq!(
+            s.capabilities(&gone),
+            Caps::NONE,
+            "turning the clipboard on gave a removed device something"
+        );
+        assert_eq!(s.enable_clipboard(&fp(0x30)), None, "an unknown device");
+        assert!(
+            !s.is_known(&fp(0x30)),
+            "turning the clipboard on made a record for a device never paired"
+        );
     }
 
     fn allow(pairs: &[(&str, &str)]) -> HashMap<String, String> {
