@@ -656,8 +656,8 @@ pub struct Device {
 
 /// The hostname to store for a machine picked off the network list.
 ///
-/// mDNS advertises a host as `<instance>.local.`, and a bare `ScornMBP23` does
-/// not resolve while `ScornMBP23.local` does — through the OS name stack
+/// mDNS advertises a host as `<instance>.local.`, and a bare `desk-mac` does
+/// not resolve while `desk-mac.local` does — through the OS name stack
 /// (Bonjour on macOS, Avahi via nsswitch on Linux), which `src/dns.rs` uses
 /// deliberately for exactly this.
 ///
@@ -1425,14 +1425,14 @@ mod discovered_hostnames {
 
     #[test]
     fn a_bare_mdns_label_becomes_resolvable() {
-        assert_eq!(discovered_hostname("ScornMBP23"), "ScornMBP23.local");
+        assert_eq!(discovered_hostname("desk-mac"), "desk-mac.local");
     }
 
     /// Already-qualified names are left alone rather than becoming
     /// `host.local.local`, which resolves to nothing.
     #[test]
     fn an_already_qualified_name_is_untouched() {
-        for n in ["ScornMBP23.local", "box.lan", "10.110.20.99"] {
+        for n in ["desk-mac.local", "box.lan", "192.0.2.99"] {
             assert_eq!(discovered_hostname(n), n, "{n:?} must not be re-suffixed");
         }
     }

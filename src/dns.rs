@@ -116,7 +116,7 @@ impl DnsTask {
 /// `/etc/nsswitch.conf` on Linux — picking up mDNS via Avahi, /etc/hosts,
 /// and DNS — and uses Bonjour for `.local` names on macOS. Pure-DNS
 /// resolvers like hickory miss all of those, which is why a Bonjour
-/// hostname (e.g. `JKMBP-M4-Max.local`) wouldn't resolve before.
+/// hostname (e.g. `LabMBP-M4-Max.local`) wouldn't resolve before.
 ///
 /// Port `0` is a placeholder — `lookup_host` requires `host:port` but we
 /// only care about the IPs at this stage; the actual port is appended at

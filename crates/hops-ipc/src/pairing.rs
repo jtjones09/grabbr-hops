@@ -160,7 +160,7 @@ mod tests {
     fn code(label: &str) -> PairingCode {
         PairingCode {
             fingerprint: fp(),
-            addrs: vec!["10.110.20.42:4242".parse().unwrap()],
+            addrs: vec!["192.0.2.42:4242".parse().unwrap()],
             label: label.to_string(),
         }
     }
@@ -178,7 +178,7 @@ mod tests {
         let c = PairingCode {
             fingerprint: fp(),
             addrs: vec![
-                "10.110.20.42:4242".parse().unwrap(),
+                "192.0.2.42:4242".parse().unwrap(),
                 "[fe80::1]:4242".parse().unwrap(),
             ],
             label: "rig".into(),

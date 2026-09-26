@@ -90,15 +90,15 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             DiscoveredRow {
                 label: "linux-box".into(),
                 fingerprint: "9c:2e:11".into(),
-                addr_summary: "10.110.20.51 +2 more".into(),
-                ips: "10.110.20.51,10.110.21.51,172.26.141.9".into(),
+                addr_summary: "192.0.2.51 +2 more".into(),
+                ips: "192.0.2.51,198.51.100.51,203.0.113.9".into(),
                 port: "4242".into(),
             },
             DiscoveredRow {
-                label: "jk-mbp-m4-max".into(),
+                label: "lab-mbp-m4-max".into(),
                 fingerprint: "".into(),
-                addr_summary: "10.110.20.99".into(),
-                ips: "10.110.20.99".into(),
+                addr_summary: "192.0.2.99".into(),
+                ips: "192.0.2.99".into(),
                 port: "4242".into(),
             },
         ]
@@ -130,7 +130,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
         DeviceRow {
             handle: "1".into(),
             name: "studio-pc".into(),
-            addr: "10.110.20.42:4242".into(),
+            addr: "192.0.2.42:4242".into(),
             pos: "left".into(),
             active: true,
             alive: false,
