@@ -1,21 +1,31 @@
-# Build pre-built hops binaries and publish them to a GitHub Release.
+# Build pre-built hops binaries, sign the macOS app, and publish a GitHub Release.
 #
 # Trigger: push a version tag (e.g. `git tag v0.11.0 && git push origin v0.11.0`),
-# or run it by hand from the Actions tab ("Run workflow").
+# or run it by hand from the Actions tab ("Run workflow"). Both run every job
+# except publish: a run by hand from any branch builds all three platforms and
+# produces the signed, notarized dmg as the `hops-macos-universal-dmg` artifact,
+# and publishes nothing. Only a pushed `v*` tag publishes.
 #
 # Produces, per release:
-#   - hops-macos-universal.dmg       (Intel + Apple Silicon GUI app — SIGNED +
-#                                     notarized when the macOS signing secrets are
-#                                     configured; see docs/SIGNING.md)
+#   - hops-macos-universal.dmg       (Intel + Apple Silicon GUI app, signed and
+#                                     notarized; see docs/SIGNING.md)
 #   - hops-macos-universal.tar.gz    (the bare universal CLI binary; unsigned)
 #   - hops-windows-x86_64.zip        (GUI build)
 #   - hops-linux-x86_64.tar.gz       (daemon + terminal UI; the Slint GUI on Linux
 #                                     needs desktop libs, so the Linux artifact is
 #                                     TUI-only for a reliable, dependency-light build)
 #
-# The macOS .dmg is signed + notarized when the MACOS_* secrets are present (it
-# then opens with no Gatekeeper warning). Without those secrets — e.g. on a fork —
-# the signing steps are skipped and only the unsigned artifacts are produced.
+# Signing runs in its own job, sign-macos, which runs no cargo and receives only
+# the unsigned universal binary. The build job compiles every dependency's build
+# script and proc macro, so nothing secret may be visible there. The signing
+# secrets live in the `macos-signing` environment and are read only by
+# sign-macos, which fails when any of them is missing: a run that cannot sign
+# is a failed run, never a release without its dmg.
+#
+# Every action is pinned to a commit, with the tag it stands for in a comment.
+# A tag can be moved to other code after review; a commit cannot. The one
+# exception is dtolnay/rust-toolchain, whose ref is also the compiler version
+# that `chore::toolchain_pin` in src/lib.rs checks against rust-toolchain.toml.
 # Windows signing is still a TODO (see the marker below).
 name: release
 
@@ -24,8 +34,9 @@ on:
     tags: ["v*"]
   workflow_dispatch: {}
 
+# Read-only for every job. Only publish asks for more, for itself.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # A tag is a claim about which build this is, and nothing checked it. The crate
@@ -33,14 +44,25 @@ jobs:
   # files, and the artifact carries the crate's — so a v0.14.0 tag on a 0.12.0
   # crate ships a bundle that identifies itself as 0.12.0, with no failure
   # anywhere. Joining the two costs one job.
+  #
+  # The job runs on every event, because a job that is skipped skips every job
+  # that needs it: gated on the tag, it left a run by hand with nothing built.
   version-matches-tag:
     name: the artifact says which build it is
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
     steps:
-      - uses: actions/checkout@v4
-      - name: tag must equal the crate version
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: a tag must equal the crate version
         run: |
+          case "$GITHUB_REF" in
+            refs/tags/v*) ;;
+            *)
+              echo "::notice::$GITHUB_REF is not a version tag. This run publishes nothing, so there is no version claim to check."
+              exit 0
+              ;;
+          esac
           tag="${GITHUB_REF#refs/tags/v}"
           crate=$(grep -m1 -E '^version = ' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
           echo "tag=$tag crate=$crate"
@@ -58,19 +80,19 @@ jobs:
     name: dependency advisories
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2, cargo-deny 0.20.2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1, cargo-deny 0.20.2
         with:
           command: check advisories
           arguments: --all-features --workspace
 
+  # No secret reaches this job: it compiles third-party build scripts and proc
+  # macros, and any of them can read the environment it runs in.
   build:
     needs: [version-matches-tag, advisories]
     name: build-${{ matrix.name }}
-    # Surfaced so the macOS signing steps can gate on "are the secrets set?"
-    # (secrets aren't allowed directly in `if:`, but job env is).
-    env:
-      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
     strategy:
       fail-fast: false
       matrix:
@@ -86,9 +108,10 @@ jobs:
           - { os: ubuntu-latest,  name: linux-x86_64,      features: "tui libei_capture libei_emulation layer_shell_capture wlroots_emulation x11_capture x11_emulation rdp_emulation" }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0   # so build.rs can read the git commit
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@1.98.0
 
@@ -103,33 +126,9 @@ jobs:
           lipo -create -output dist/hops \
             target/aarch64-apple-darwin/release/hops \
             target/x86_64-apple-darwin/release/hops
-          # bare universal CLI binary (unsigned; for headless / daemon use)
+          # The bare universal CLI binary, unsigned. It is also the one input
+          # sign-macos receives, so the dmg holds exactly this binary.
           tar -C dist -czf hops-${{ matrix.name }}.tar.gz hops
-
-      # Sign + notarize a .dmg when the signing secrets are configured
-      # (docs/SIGNING.md). Skipped automatically on forks/PRs without the
-      # secrets — the unsigned .tar.gz above is still produced either way.
-      - name: Import Developer ID certificate (macOS)
-        if: runner.os == 'macOS' && env.MACOS_CERT_P12 != ''
-        uses: apple-actions/import-codesign-certs@5142e029c445c10ffc7149d172e540235a065466 # v7
-        with:
-          p12-file-base64: ${{ secrets.MACOS_CERT_P12 }}
-          p12-password: ${{ secrets.MACOS_CERT_PASSWORD }}
-
-      - name: Package + sign + notarize macOS .dmg
-        if: runner.os == 'macOS' && env.MACOS_CERT_P12 != ''
-        env:
-          DEVELOPER_ID: ${{ secrets.MACOS_DEVELOPER_ID }}
-          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
-          NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
-          MACOS_NOTARY_KEY_B64: ${{ secrets.MACOS_NOTARY_KEY }}
-        run: |
-          scripts/package-macos.sh dist/hops "$RUNNER_TEMP/dist"
-          KEYFILE="$RUNNER_TEMP/notary_key.p8"
-          printf '%s' "$MACOS_NOTARY_KEY_B64" | base64 --decode > "$KEYFILE"
-          NOTARY_KEY="$KEYFILE" scripts/sign-macos.sh "$RUNNER_TEMP/dist"
-          rm -f "$KEYFILE"
-          cp "$RUNNER_TEMP/dist/hops-macos.dmg" "hops-${{ matrix.name }}.dmg"
 
       - name: Build (Windows)
         if: runner.os == 'Windows'
@@ -176,21 +175,136 @@ jobs:
           cp target/release/hops dist/hops
           tar -C dist -czf hops-${{ matrix.name }}.tar.gz hops
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: hops-${{ matrix.name }}
           path: hops-${{ matrix.name }}.*
+          if-no-files-found: error
 
-  release:
-    name: publish-release
+  # The only job that sees a signing secret. It runs no cargo and executes
+  # nothing it receives: its scripts come from its own checkout, and the
+  # unsigned binary is only bundled, signed and submitted. No step is
+  # conditional, so every run signs or fails.
+  sign-macos:
+    name: sign-macos
     needs: build
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: macos-latest
+    environment: macos-signing
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # Each value is whether the secret is set, never the secret itself.
+      - name: every signing secret is set
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 != '' }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD != '' }}
+          MACOS_DEVELOPER_ID: ${{ secrets.MACOS_DEVELOPER_ID != '' }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY != '' }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID != '' }}
+          MACOS_NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER != '' }}
+        run: |
+          missing=0
+          for name in MACOS_CERT_P12 MACOS_CERT_PASSWORD MACOS_DEVELOPER_ID \
+                      MACOS_NOTARY_KEY MACOS_NOTARY_KEY_ID MACOS_NOTARY_ISSUER; do
+            if [ "${!name}" != true ]; then
+              echo "::error::the $name secret is not set in the macos-signing environment."
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "Without every signing secret there is no signed dmg, and a release"
+            echo "without its dmg is not published. See docs/SIGNING.md."
+            exit 1
+          fi
+          echo "OK: every signing secret is set."
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: hops-macos-universal
+          path: ${{ runner.temp }}/unsigned
+
+      - name: Import Developer ID certificate
+        uses: apple-actions/import-codesign-certs@5142e029c445c10ffc7149d172e540235a065466 # v7.0.0
+        with:
+          p12-file-base64: ${{ secrets.MACOS_CERT_P12 }}
+          p12-password: ${{ secrets.MACOS_CERT_PASSWORD }}
+
+      - name: Package, sign and notarize the dmg
+        env:
+          DEVELOPER_ID: ${{ secrets.MACOS_DEVELOPER_ID }}
+          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
+          MACOS_NOTARY_KEY_B64: ${{ secrets.MACOS_NOTARY_KEY }}
+        run: |
+          BIN="$RUNNER_TEMP/bin"
+          mkdir -p "$BIN"
+          tar -xzf "$RUNNER_TEMP/unsigned/hops-macos-universal.tar.gz" -C "$BIN" hops
+          if [ ! -f "$BIN/hops" ] || [ -L "$BIN/hops" ]; then
+            echo "::error::the unsigned artifact does not hold a plain hops binary."
+            exit 1
+          fi
+          scripts/package-macos.sh "$BIN/hops" "$RUNNER_TEMP/dist"
+          KEYFILE="$RUNNER_TEMP/notary_key.p8"
+          (umask 077 && printf '%s' "$MACOS_NOTARY_KEY_B64" | base64 --decode > "$KEYFILE")
+          NOTARY_KEY="$KEYFILE" scripts/sign-macos.sh "$RUNNER_TEMP/dist"
+          rm -f "$KEYFILE"
+          cp "$RUNNER_TEMP/dist/hops-macos.dmg" hops-macos-universal.dmg
+
+      - name: Gatekeeper accepts the dmg and the app inside it
+        run: |
+          scripts/verify-macos-release.sh hops-macos-universal.dmg
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hops-macos-universal-dmg
+          path: hops-macos-universal.dmg
+          if-no-files-found: error
+
+  # The only job that may write, and it runs no code from the repository.
+  publish:
+    name: publish-release
+    needs: [version-matches-tag, build, sign-macos]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: artifacts
-      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+          pattern: hops-*
+          merge-multiple: true
+
+      - name: the release is exactly its four assets
+        run: |
+          expected="hops-linux-x86_64.tar.gz
+          hops-macos-universal.dmg
+          hops-macos-universal.tar.gz
+          hops-windows-x86_64.zip"
+          status=0
+          for f in $expected; do
+            if [ ! -s "artifacts/$f" ]; then
+              echo "::error::artifacts/$f is missing or empty. A release is published with every asset or not at all."
+              status=1
+            fi
+          done
+          for path in artifacts/* artifacts/.[!.]*; do
+            [ -e "$path" ] || continue
+            f="${path#artifacts/}"
+            if ! printf '%s\n' $expected | grep -qxF -- "$f"; then
+              echo "::error::artifacts/$f is not a release asset; nothing unlisted is published."
+              status=1
+            fi
+          done
+          if [ "$status" -ne 0 ]; then
+            exit 1
+          fi
+          echo "OK: all four release assets are present, and nothing else."
+
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          files: artifacts/**/*
+          files: artifacts/*
+          fail_on_unmatched_files: true
           generate_release_notes: true
