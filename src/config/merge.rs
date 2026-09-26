@@ -288,10 +288,18 @@ fn replace(doc: &mut DocumentMut, fresh: &DocumentMut, key: &str) {
                     place(table, at);
                 }
                 *table.decor_mut() = old.decor().clone();
+                // An implicit table has no header to carry that comment, and
+                // a table of tables (the revocation cache) is rendered that
+                // way: keep the header the file had.
+                if !old.is_implicit() {
+                    table.set_implicit(false);
+                }
             }
-            // written inline, with the comment above it on its key
+            // written inline, with the comment above it on its key; the
+            // header is what carries it now
             Some(_) => {
                 if let Some(above) = comment_above(doc.as_table(), key) {
+                    table.set_implicit(false);
                     table.decor_mut().set_prefix(above);
                 }
             }

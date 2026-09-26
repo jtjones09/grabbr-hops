@@ -2271,8 +2271,27 @@ aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
     fn a_comment_above_a_table_written_inline_stays_when_a_save_rewrites_it() {
         const TRUST: &str = "# who may drive this machine\n";
         const DEVICES: &str = "# the machines beside this one\n";
+        const REVOKED: &str = "# revoked devices\n";
         type Change = fn(&mut Config);
-        let cases: [(&str, String, Change, String); 3] = [
+        fn revoke_another(c: &mut Config) {
+            c.set_revoked_fingerprints(HashMap::from([
+                (
+                    DESK.to_string(),
+                    RevokedEntry {
+                        label: "old".to_string(),
+                        revoked_at: 5,
+                    },
+                ),
+                (
+                    OTHER.to_string(),
+                    RevokedEntry {
+                        label: "older".to_string(),
+                        revoked_at: 6,
+                    },
+                ),
+            ]))
+        }
+        let cases: [(&str, String, Change, String); 5] = [
             (
                 "trust",
                 format!(
@@ -2315,6 +2334,22 @@ aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
                     c.set_clients(clients);
                 },
                 format!("{DEVICES}[[clients]]\n"),
+            ),
+            (
+                "revoked",
+                format!(
+                    "port = 4343\n{REVOKED}revoked_fingerprints = {{ \"{DESK}\" = {{ label = \"old\", revoked_at = 5 }} }}\n"
+                ),
+                revoke_another,
+                format!("{REVOKED}[revoked_fingerprints]\n"),
+            ),
+            (
+                "revoked-header",
+                format!(
+                    "port = 4343\n{REVOKED}[revoked_fingerprints]\n[revoked_fingerprints.\"{DESK}\"]\nlabel = \"old\"\nrevoked_at = 5\n"
+                ),
+                revoke_another,
+                format!("{REVOKED}[revoked_fingerprints]\n"),
             ),
         ];
         let mut wrong = vec![];
