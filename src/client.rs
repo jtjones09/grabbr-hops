@@ -26,6 +26,10 @@ pub struct ClientManager {
 struct Clients {
     next: ClientHandle,
     entries: BTreeMap<ClientHandle, (ClientConfig, ClientState)>,
+    /// Each device's last pin, kept when an edit to its address or name
+    /// clears the pin and replaced only by the next pin. The device switch
+    /// gates the machine it names (#218), so an edit cannot lift the switch.
+    last_pins: BTreeMap<ClientHandle, String>,
 }
 
 impl Clients {
@@ -108,8 +112,13 @@ impl ClientManager {
 
     /// set the state of the given client
     pub fn set_state(&self, handle: ClientHandle, state: ClientState) {
-        if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle) {
+        let mut clients = self.clients.borrow_mut();
+        let pin = state.peer_fingerprint.clone();
+        if let Some((_, s)) = clients.get_mut(handle) {
             *s = state;
+            if let Some(pin) = pin {
+                clients.last_pins.insert(handle, pin);
+            }
         }
     }
 
@@ -171,7 +180,9 @@ impl ClientManager {
 
     /// remove a client from the list
     pub fn remove_client(&self, client: ClientHandle) -> Option<(ClientConfig, ClientState)> {
-        self.clients.borrow_mut().entries.remove(&client)
+        let mut clients = self.clients.borrow_mut();
+        clients.last_pins.remove(&client);
+        clients.entries.remove(&client)
     }
 
     /// get the config & state of the given client
@@ -399,8 +410,12 @@ impl ClientManager {
     }
 
     pub(crate) fn set_peer_fingerprint(&self, handle: ClientHandle, fingerprint: Option<String>) {
-        if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle) {
-            s.peer_fingerprint = fingerprint;
+        let mut clients = self.clients.borrow_mut();
+        if let Some((_, s)) = clients.get_mut(handle) {
+            s.peer_fingerprint = fingerprint.clone();
+            if let Some(pin) = fingerprint {
+                clients.last_pins.insert(handle, pin);
+            }
         }
     }
 
@@ -423,22 +438,26 @@ impl ClientManager {
     ///
     /// Not over a link dialled for a device that is switched off or gone:
     /// renaming or re-addressing a device clears its pin, and its link is
-    /// still its link. Not when any device pinned to that fingerprint is
-    /// switched off, even if another entry for the same machine is on: off
-    /// fails closed. A device with no pin names no machine for links it did
-    /// not dial. The pairing's own clipboard grant is a separate check, and
-    /// both have to allow.
+    /// still its link. Not when any device switched off is, or was last,
+    /// pinned to that fingerprint, even if another entry for the same machine
+    /// is on: off fails closed, and an edit that clears the pin, before the
+    /// switch or while it is off, leaves the machine switched off. A device
+    /// never pinned names no machine for links it did not dial. The
+    /// pairing's own clipboard grant is a separate check, and both have to
+    /// allow.
     pub(crate) fn switch_allows_clipboard(
         &self,
         fingerprint: &str,
         dialled_for: Option<ClientHandle>,
     ) -> bool {
+        let clients = self.clients.borrow();
+        let names =
+            |pin: Option<&str>| pin.is_some_and(|pin| pin.eq_ignore_ascii_case(fingerprint));
         dialled_for.is_none_or(|handle| self.is_on(handle))
-            && !self.clients.borrow().iter().any(|(_, (_, s))| {
+            && !clients.iter().any(|(h, (_, s))| {
                 !s.active
-                    && s.peer_fingerprint
-                        .as_deref()
-                        .is_some_and(|pin| pin.eq_ignore_ascii_case(fingerprint))
+                    && (names(s.peer_fingerprint.as_deref())
+                        || names(clients.last_pins.get(&h).map(String::as_str)))
             })
     }
 

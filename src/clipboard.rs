@@ -736,7 +736,11 @@ mod clipboard_follows_the_switch {
     async fn dialled_into() -> DialledInto {
         let me = machine();
         let trust = trust(&me, &[], Caps::KNOWN);
-        let clients = ClientManager::default();
+        listening_as(me, trust, ClientManager::default()).await
+    }
+
+    /// `me` listening, with this trust and device list.
+    async fn listening_as(me: Machine, trust: Trust, clients: ClientManager) -> DialledInto {
         let (heard_tx, heard) = channel();
         let (listener, port) =
             LanMouseListener::bind_loopback(me.identity.clone(), trust.clone(), heard_tx)
@@ -765,12 +769,16 @@ mod clipboard_follows_the_switch {
                 .issue(&peer.fingerprint, "peer", Caps::KNOWN)
                 .expect("issue");
             let device = self.entry_for(peer);
-            let d = dialer(
-                peer,
-                trust(peer, &[&self.me], Caps::KNOWN),
-                self.port,
-                Position::Left,
-            );
+            let d = self
+                .dialled_by(peer, trust(peer, &[&self.me], Caps::KNOWN))
+                .await;
+            (d, device)
+        }
+
+        /// `peer`, trusting this machine as `peer_trust` says, dials it, and
+        /// its link is up.
+        async fn dialled_by(&mut self, peer: &Machine, peer_trust: Trust) -> Dialer {
+            let d = dialer(peer, peer_trust, self.port, Position::Left);
             d.conn.dial(d.handle).await;
             let accepted = tokio::time::timeout(LINK_UP_WITHIN, async {
                 while let Some(event) = self.listener.next().await {
@@ -791,7 +799,7 @@ mod clipboard_follows_the_switch {
                 d.conn.active_addr(d.handle).is_some()
             })
             .await;
-            (d, device)
+            d
         }
 
         /// Another entry here pinned to `peer`, switched on.
@@ -894,6 +902,195 @@ mod clipboard_follows_the_switch {
                 Some("its, back on".into()),
                 "switching the device back on left clipboard from it stopped"
             );
+        });
+    }
+
+    // LEDGER T2187 | class B | 1 return value: ClipboardInbox::next; 6 struct state: the peer's transport queue after ClipboardSenderListen::broadcast
+    #[test]
+    fn a_device_edited_and_switched_off_is_sent_no_clipboard_over_the_link_it_opened() {
+        run_local(async {
+            let mut here = dialled_into().await;
+            let peer = machine();
+            let (mut peer_link, mut device) = here.device_dialling_in(&peer).await;
+            let peer_sends = peer_link.conn.clipboard_sender();
+
+            // A rename clears the pin. The switch has to keep naming the
+            // machine whether the rename comes before it or after it. Each
+            // case takes a fresh entry for the machine, pinned to it.
+            type Step = fn(&ClientManager, ClientHandle);
+            let rename: Step = |m, h| {
+                m.set_hostname(h, Some("desk mac".into()));
+            };
+            let off: Step = |m, h| assert!(m.deactivate_client(h), "precondition");
+            let cases: [(&str, [Step; 2]); 2] = [
+                ("renamed and then switched off", [rename, off]),
+                ("switched off and then renamed", [off, rename]),
+            ];
+            for (case, steps) in cases {
+                here.sends.broadcast(format!("on, before {case}")).await;
+                peer_sends
+                    .broadcast(format!("its, on, before {case}"))
+                    .await;
+                assert_eq!(
+                    (
+                        heard(&mut peer_link, ARRIVES_WITHIN).await,
+                        applied_within(&mut here.applies, ARRIVES_WITHIN).await,
+                    ),
+                    (
+                        Some(format!("on, before {case}")),
+                        Some(format!("its, on, before {case}"))
+                    ),
+                    "(there, here): precondition: clipboard flows both ways with the \
+                     device on"
+                );
+
+                for step in steps {
+                    step(&here.clients, device);
+                }
+                assert_eq!(
+                    here.clients.peer_fingerprint(device),
+                    None,
+                    "precondition: the rename cleared the pin"
+                );
+                here.sends.broadcast(case.to_string()).await;
+                assert_eq!(
+                    heard(&mut peer_link, NEVER_WITHIN).await,
+                    None,
+                    "text copied here went to a device {case} here, over the link it \
+                     opened to this machine"
+                );
+                peer_sends.broadcast(format!("its, {case}")).await;
+                assert_eq!(
+                    applied_within(&mut here.applies, NEVER_WITHIN).await,
+                    None,
+                    "text from a device {case} here was applied, over the link it \
+                     opened to this machine"
+                );
+
+                assert!(here.clients.activate_client(device), "precondition");
+                here.sends.broadcast(format!("{case}, back on")).await;
+                peer_sends.broadcast(format!("its, {case}, back on")).await;
+                assert_eq!(
+                    (
+                        heard(&mut peer_link, ARRIVES_WITHIN).await,
+                        applied_within(&mut here.applies, ARRIVES_WITHIN).await,
+                    ),
+                    (
+                        Some(format!("{case}, back on")),
+                        Some(format!("its, {case}, back on"))
+                    ),
+                    "(there, here): switching the device back on left its clipboard \
+                     stopped"
+                );
+                device = here.entry_for(&peer);
+            }
+        });
+    }
+
+    // LEDGER T2188 | class B | 1 return value: ClipboardInbox::next; 6 struct state: the peer's transport queue after ClipboardSenderListen::broadcast; OutboundRevoker::close_device, LanMouseConnection::send
+    #[test]
+    fn a_device_edited_while_linked_both_ways_and_switched_off_is_sent_no_clipboard_over_the_link_it_opened()
+     {
+        run_local(async {
+            let (peer, me) = (machine(), machine());
+            let (on_peer, on_me) = (both_ways(&peer, &me), both_ways(&me, &peer));
+            // This machine dialled the peer, and that dial pinned its device...
+            let pair = clipboard_pair(peer, on_peer, me, on_me).await;
+            let (switch, device) = (pair.dialer.clients.clone(), pair.dialer.handle);
+            // ...and the peer opened a link to this machine as well.
+            let me = Machine {
+                identity: pair.driver.identity.clone(),
+                fingerprint: pair.driver.fingerprint.clone(),
+            };
+            let mut here = listening_as(me, pair.driver_trust.clone(), switch.clone()).await;
+            let mut peer_link = here
+                .dialled_by(&pair.driven, pair.driven_trust.clone())
+                .await;
+            let peer_sends = peer_link.conn.clipboard_sender();
+            here.sends.broadcast("on".into()).await;
+            peer_sends.broadcast("its, on".into()).await;
+            assert_eq!(
+                (
+                    heard(&mut peer_link, ARRIVES_WITHIN).await,
+                    applied_within(&mut here.applies, ARRIVES_WITHIN).await,
+                ),
+                (Some("on".into()), Some("its, on".into())),
+                "(there, here): precondition: clipboard flows both ways over the \
+                 link the peer opened"
+            );
+
+            type Edit = fn(&ClientManager, ClientHandle);
+            let edits: [(&str, Edit); 2] = [
+                ("renamed", |m, h| {
+                    m.set_hostname(h, Some("desk mac".into()));
+                }),
+                ("re-addressed", |m, h| {
+                    m.set_fix_ips(
+                        h,
+                        vec![Ipv4Addr::LOCALHOST.into(), Ipv6Addr::LOCALHOST.into()],
+                    )
+                }),
+            ];
+            for (edit, apply) in edits {
+                assert_eq!(
+                    switch.peer_fingerprint(device).as_deref(),
+                    Some(pair.driven.fingerprint.as_str()),
+                    "precondition: the device is pinned by this machine's own dial"
+                );
+                apply(&switch, device);
+                assert!(switch.deactivate_client(device), "precondition");
+
+                here.sends.broadcast(format!("{edit}, off")).await;
+                assert_eq!(
+                    heard(&mut peer_link, NEVER_WITHIN).await,
+                    None,
+                    "text copied here went to a device {edit} and then switched off \
+                     here, over the link it opened to this machine"
+                );
+                peer_sends.broadcast(format!("its, {edit}, off")).await;
+                assert_eq!(
+                    applied_within(&mut here.applies, NEVER_WITHIN).await,
+                    None,
+                    "text from a device {edit} and then switched off here was applied, \
+                     over the link it opened to this machine"
+                );
+
+                // As the service switches it off: its own link closes. Back
+                // on, it is dialled and pinned again, and clipboard over the
+                // peer's link resumes.
+                let pin = switch.peer_fingerprint(device);
+                assert_eq!(
+                    pair.dialer
+                        .conn
+                        .revoker()
+                        .close_device(device, pin.as_deref())
+                        .await,
+                    1,
+                    "precondition: this machine's link to it was up"
+                );
+                assert!(switch.activate_client(device), "precondition");
+                let _ = pair.dialer.conn.send(ProtoEvent::Ping, device).await;
+                wait_until(
+                    "the device switched back on to be dialled again",
+                    LINK_UP_WITHIN,
+                    || pair.dialer.conn.active_addr(device).is_some(),
+                )
+                .await;
+                here.sends.broadcast(format!("{edit}, back on")).await;
+                peer_sends.broadcast(format!("its, {edit}, back on")).await;
+                assert_eq!(
+                    (
+                        heard(&mut peer_link, ARRIVES_WITHIN).await,
+                        applied_within(&mut here.applies, ARRIVES_WITHIN).await,
+                    ),
+                    (
+                        Some(format!("{edit}, back on")),
+                        Some(format!("its, {edit}, back on"))
+                    ),
+                    "(there, here): a device {edit}, switched off and on again, had \
+                     its clipboard stopped over the link the peer opened"
+                );
+            }
         });
     }
 }
