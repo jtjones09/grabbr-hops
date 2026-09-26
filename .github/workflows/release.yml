@@ -20,8 +20,12 @@
 # Every binary is built with `cargo auditable`, which embeds the list of crates
 # it was built from. Each archive, and the app in the dmg, holds LICENSE,
 # THIRD-PARTY-NOTICES.txt and the SBOM of each target its binary is compiled
-# for. The attest job signs a build-provenance attestation for every asset,
-# which `gh attestation verify <asset> --repo <owner>/<repo>` checks.
+# for. The attest job signs a build-provenance attestation for every asset.
+# Check one pinned to this workflow and the release's tag; without the two
+# flags, an attestation from any run in the repository, on any branch, passes:
+#   gh attestation verify <asset> --repo <owner>/<repo> \
+#     --signer-workflow <owner>/<repo>/.github/workflows/release.yml \
+#     --source-ref refs/tags/v<version>
 #
 # Signing runs in its own job, sign-macos, which runs no cargo and receives only
 # the unsigned universal build. The build job compiles every dependency's build
@@ -97,13 +101,36 @@ jobs:
           command: check advisories
           arguments: --all-features --workspace
 
-      # The release says which advisories the gate above lets through, and
-      # why. An ignore this step cannot read, or one with no reason, fails
-      # the run rather than reaching a release unexplained.
-      - name: the release notes name every ignored advisory
+      # The cargo-deny the gate above runs, for the report the notes are
+      # written from.
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master 2026-09-03, base of branch 1.98.0
+        with:
+          toolchain: 1.98.0
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny@0.20.2
+
+      # The release names every advisory the gate above lets through, and
+      # why. That is not only deny.toml's ignore list: its unmaintained and
+      # unsound scopes let advisories through too, without naming them. So
+      # the list is what cargo-deny reports with every exception removed,
+      # each given deny.toml's reason for ignoring it or the scope that left
+      # it out. An ignore this step cannot read, one with a blank reason, or
+      # an advisory neither explains fails the run.
+      - name: the release notes name every advisory the gate lets through
         run: |
-          entry='^\{ *id *= *"([A-Z]+-[0-9]+-[0-9]+)" *, *reason *= *"([^"]+)" *\},?$'
-          section=""; state=out; count=0; bad=0; list=""
+          entry='^\{ *id *= *"([A-Z]+-[0-9]+-[0-9]+)" *, *reason *= *"( *[^" ][^"]*)" *\},?$'
+          scope_line='^(unmaintained|unsound)[[:space:]]*=[[:space:]]*"([a-z]+)"[[:space:]]*(#.*)?$'
+          # cargo-deny 0.20.2's scopes when deny.toml sets none.
+          unmaintained=all
+          unsound=workspace
+          tmp="${RUNNER_TEMP:?}"
+          ignored="$tmp/deny-ignored.tsv"
+          widened="$tmp/deny-widened.toml"
+          report="$tmp/deny-report.jsonl"
+          found="$tmp/deny-found.tsv"
+          : > "$ignored"
+          : > "$widened"
+          section=""; state=out; seen=no; bad=0
           while IFS= read -r line || [ -n "$line" ]; do
             t="${line#"${line%%[![:space:]]*}"}"
             t="${t%"${t##*[![:space:]]}"}"
@@ -113,50 +140,125 @@ jobs:
                 "]"*) state=out; continue ;;
               esac
               if [[ "$t" =~ $entry ]]; then
-                id="${BASH_REMATCH[1]}"
-                list="$list- [$id](https://rustsec.org/advisories/$id.html): ${BASH_REMATCH[2]}"$'\n'
-                count=$((count + 1))
+                printf '%s\t%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" >> "$ignored"
               else
                 echo "::error::deny.toml ignores an advisory with no reason, or in a form this step cannot read: $t"
                 bad=1
               fi
               continue
             fi
-            if [[ "$t" =~ ^\[([^]]*)\]$ ]]; then
+            if [[ "$t" =~ ^\[\[?([^]]*)\]\]?$ ]]; then
               section="${BASH_REMATCH[1]}"
-            elif [ "$section" = advisories ] && [[ "$t" =~ ^ignore[[:space:]]*=[[:space:]]*\[(.*)$ ]]; then
-              rest="${BASH_REMATCH[1]}"
-              if [[ "$rest" =~ ^[[:space:]]*(#.*)?$ ]]; then
-                state=list
-              elif [[ ! "$rest" =~ ^[[:space:]]*\][[:space:]]*$ ]]; then
-                echo "::error::deny.toml lists ignored advisories on one line: $t. Write each as { id = \"...\", reason = \"...\" } on its own line."
-                bad=1
+              printf '%s\n' "$line" >> "$widened"
+              if [ "$section" = advisories ]; then
+                seen=yes
+                printf 'unmaintained = "all"\nunsound = "all"\n' >> "$widened"
+              fi
+              continue
+            fi
+            if [[ "$t" =~ ^advisories[[:space:]]*[.=] ]]; then
+              echo "::error::deny.toml sets advisories outside its [advisories] table: $t"
+              bad=1
+            elif [ "$section" = advisories ]; then
+              if [[ "$t" =~ ^ignore[[:space:]]*=[[:space:]]*\[(.*)$ ]]; then
+                rest="${BASH_REMATCH[1]}"
+                if [[ "$rest" =~ ^[[:space:]]*(#.*)?$ ]]; then
+                  state=list
+                elif [[ ! "$rest" =~ ^[[:space:]]*\][[:space:]]*(#.*)?$ ]]; then
+                  echo "::error::deny.toml lists ignored advisories on one line: $t. Write each as { id = \"...\", reason = \"...\" } on its own line."
+                  bad=1
+                fi
+                continue
+              fi
+              if [[ "$t" =~ $scope_line ]]; then
+                printf -v "${BASH_REMATCH[1]}" '%s' "${BASH_REMATCH[2]}"
+                continue
               fi
             fi
+            printf '%s\n' "$line" >> "$widened"
           done < deny.toml
           if [ "$state" = list ]; then
             echo "::error::the ignore list in deny.toml is never closed."
             bad=1
           fi
+          if [ "$seen" = no ]; then
+            printf '[advisories]\nunmaintained = "all"\nunsound = "all"\n' >> "$widened"
+          fi
           if [ "$bad" -ne 0 ]; then
             exit 1
           fi
+
+          # The gate with no ignores and every scope widened to all. The
+          # gate passed, so each advisory this reports is one it let through.
+          status=0
+          cargo deny --locked --format json --config "$widened" --all-features --workspace \
+            check advisories 2> "$report" || status=$?
+          summaries="$(jq -nR '[inputs | fromjson? | select(type == "object" and .type == "summary")] | length' "$report")"
+          if [ "$status" -gt 1 ] || [ "$summaries" != 1 ]; then
+            cat "$report"
+            echo "::error::cargo-deny did not finish its report (exit $status), so the notes cannot say which advisories the gate lets through."
+            exit 1
+          fi
+          jq -rnR '[inputs | fromjson? | select(type == "object" and .type == "diagnostic")
+              | .fields | select(.advisory.id? != null)
+              | [.advisory.id, .code, .advisory.package, .graphs[0].Krate.version?, .advisory.title]
+              | map(if . == null or . == "" then "?" else tostring | gsub("[\t\n\r]"; " ") end)
+              | join("\t")] | unique[]' "$report" > "$found"
+
+          count=0; list=""
+          while IFS=$'\t' read -r id kind krate version title; do
+            if [[ ! "$id" =~ ^[A-Z]+-[0-9]+-[0-9]+$ ]]; then
+              echo "::error::cargo-deny reports an advisory id this step cannot read: $id"
+              bad=1
+              continue
+            fi
+            why="$(awk -F'\t' -v id="$id" '$1 == id { print $2; exit }' "$ignored")"
+            if [ -z "$why" ]; then
+              case "$kind" in
+                unmaintained|unsound) scope="${!kind}" ;;
+                *) scope=all ;;
+              esac
+              case "$scope" in
+                workspace) why="$kind, and no hops crate depends on it directly; deny.toml fails on $kind crates only when one does (\`$kind = \"workspace\"\`)" ;;
+                transitive) why="$kind, and only hops crates depend on it directly; deny.toml fails on $kind crates only when another crate does (\`$kind = \"transitive\"\`)" ;;
+                none) why="$kind, and deny.toml does not check $kind crates (\`$kind = \"none\"\`)" ;;
+                *)
+                  echo "::error::cargo-deny reports $id against $krate $version, which deny.toml neither ignores nor leaves out of its $kind scope; the gate should have failed this run."
+                  bad=1
+                  continue
+                  ;;
+              esac
+            fi
+            list+="- [$id](https://rustsec.org/advisories/$id.html) \`$krate\` $version: $title. Not acted on: $why"$'\n'
+            count=$((count + 1))
+          done < "$found"
+          while IFS=$'\t' read -r id _; do
+            if ! cut -f1 "$found" | grep -qxF -- "$id"; then
+              echo "::warning::deny.toml ignores $id, which cargo-deny no longer reports against Cargo.lock; the ignore can go."
+            fi
+          done < "$ignored"
+          if [ "$bad" -ne 0 ]; then
+            exit 1
+          fi
+
+          signer="${GITHUB_WORKFLOW_REF:?}"
+          signer="${signer%%@*}"
           {
             echo "## Verifying a download"
             echo
-            echo "\`SHA256SUMS\` holds the SHA-256 of every other asset, and every asset has a build-provenance attestation from this repository's release workflow:"
+            echo "\`SHA256SUMS\` holds the SHA-256 of every other asset, and every asset has a build-provenance attestation. Check the attestation against this release's workflow and tag: without \`--signer-workflow\` and \`--source-ref\`, one from any workflow run in the repository, on any branch, passes."
             echo
             echo "    shasum -a 256 -c --ignore-missing SHA256SUMS"
-            echo "    gh attestation verify <asset> --repo ${GITHUB_REPOSITORY:?}"
+            echo "    gh attestation verify <asset> --repo ${GITHUB_REPOSITORY:?} --signer-workflow $signer --source-ref ${GITHUB_REF:?}"
             echo
             echo "Each archive, and the app in the dmg, holds \`LICENSE\`, \`THIRD-PARTY-NOTICES.txt\` and a CycloneDX SBOM for each target its binary is built for. Each binary also embeds the list of crates it was built from, which \`cargo audit bin <binary>\` reads."
             echo
             echo "## Advisories this release does not act on"
             echo
             if [ "$count" -eq 0 ]; then
-              echo "None: \`deny.toml\` ignores no advisory."
+              echo "None: cargo-deny reports no advisory against a crate in \`Cargo.lock\`."
             else
-              echo "Every release build is gated on \`cargo deny check advisories\`. \`deny.toml\` ignores these, each for the reason given:"
+              echo "Every release build is gated on \`cargo deny check advisories\`, which lets these through: each advisory \`deny.toml\` ignores, for the reason given there, and each outside the scope it checks unmaintained and unsound crates in. The list is what cargo-deny reports for \`Cargo.lock\` with those exceptions removed."
               echo
               printf '%s' "$list"
             fi
@@ -278,12 +380,17 @@ jobs:
       # What every archive carries beside the binary: the licence, the
       # third-party notices, and a CycloneDX SBOM per target, all for this
       # build's features and targets. cargo-about fails on a licence that
-      # build-aux/about.toml does not accept, and runs offline, reading the
-      # crate sources the build used.
+      # build-aux/about.toml does not accept. After the fetch nothing here
+      # reaches the network: cargo-cyclonedx has no --locked, so it runs
+      # offline, and the step fails if Cargo.lock changed under it, since
+      # the SBOMs would then describe another resolution than the build.
       - name: Licence notices and SBOMs
         shell: bash
         run: |
           cargo fetch --locked
+          export CARGO_NET_OFFLINE=true
+          lock="$(mktemp)"
+          cp Cargo.lock "$lock"
           mkdir -p dist
           cp LICENSE dist/LICENSE
           selected=()
@@ -297,6 +404,10 @@ jobs:
               --override-filename "hops-$t.cdx"
             cp "hops-$t.cdx.json" "dist/hops-$t.cdx.json"
           done
+          if ! cmp -s Cargo.lock "$lock"; then
+            echo "::error::generating the notices and SBOMs changed Cargo.lock, so they may not describe the binary that was built."
+            exit 1
+          fi
 
       - name: Package (Linux, macOS)
         if: runner.os != 'Windows'
@@ -361,21 +472,50 @@ jobs:
           name: hops-macos-universal
           path: ${{ runner.temp }}/unsigned
 
-      # Everything build put in the archive goes beside the binary, where
-      # package-macos.sh takes the licence, notices and SBOMs into the app.
+      # The archive comes from the job that runs third-party build scripts,
+      # so it must hold exactly the binary, its licence, notices and SBOMs,
+      # and only those are extracted: beside the binary, where
+      # package-macos.sh takes all but the binary into the app.
       - name: Unpack the unsigned build
         run: |
           BIN="$RUNNER_TEMP/bin"
-          mkdir -p "$BIN"
-          tar -xzf "$RUNNER_TEMP/unsigned/hops-macos-universal.tar.gz" -C "$BIN"
-          if [ ! -f "$BIN/hops" ] || [ -L "$BIN/hops" ]; then
-            echo "::error::the unsigned artifact does not hold a plain hops binary."
+          ARCHIVE="$RUNNER_TEMP/unsigned/hops-macos-universal.tar.gz"
+          members="hops LICENSE THIRD-PARTY-NOTICES.txt hops-aarch64-apple-darwin.cdx.json hops-x86_64-apple-darwin.cdx.json"
+          listed="$(tar -tzf "$ARCHIVE")" || {
+            echo "::error::cannot read the unsigned artifact."
+            exit 1
+          }
+          bad=0
+          for f in $members; do
+            n="$(printf '%s\n' "$listed" | grep -cxF -- "$f" || true)"
+            if [ "$n" = 0 ]; then
+              echo "::error::the unsigned artifact carries no $f, so the app would ship without it."
+              bad=1
+            elif [ "$n" != 1 ]; then
+              echo "::error::the unsigned artifact carries $f $n times."
+              bad=1
+            fi
+          done
+          while IFS= read -r m; do
+            [ -n "$m" ] || continue
+            known=no
+            for f in $members; do
+              if [ "$m" = "$f" ]; then known=yes; fi
+            done
+            if [ "$known" = no ]; then
+              echo "::error::the unsigned artifact carries $m, which is not part of the build."
+              bad=1
+            fi
+          done <<< "$listed"
+          if [ "$bad" -ne 0 ]; then
             exit 1
           fi
-          for f in LICENSE THIRD-PARTY-NOTICES.txt \
-                   hops-aarch64-apple-darwin.cdx.json hops-x86_64-apple-darwin.cdx.json; do
+          mkdir -p "$BIN"
+          # shellcheck disable=SC2086 # one word per member
+          tar -xzf "$ARCHIVE" -C "$BIN" $members
+          for f in $members; do
             if [ ! -f "$BIN/$f" ] || [ -L "$BIN/$f" ] || [ ! -s "$BIN/$f" ]; then
-              echo "::error::the unsigned artifact carries no $f, so the app would ship without it."
+              echo "::error::the unsigned artifact's $f is not a plain file with content."
               exit 1
             fi
           done
@@ -448,13 +588,28 @@ jobs:
               fail "$archive is missing or empty."
               return
             fi
+            local want=("$bin" LICENSE THIRD-PARTY-NOTICES.txt) listed m known
+            for t; do want+=("hops-$t.cdx.json"); done
+            # What is published is exactly what the build meant to ship.
+            case "$archive" in
+              *.zip) listed="$(unzip -Z1 "$archive")" || { fail "cannot read $archive."; return; } ;;
+              *) listed="$(tar -tzf "$archive")" || { fail "cannot read $archive."; return; } ;;
+            esac
+            while IFS= read -r m; do
+              [ -n "$m" ] || continue
+              known=no
+              for f in "${want[@]}"; do
+                if [ "$m" = "$f" ]; then known=yes; fi
+              done
+              if [ "$known" = no ]; then
+                fail "$archive carries $m, which is not part of the build."
+              fi
+            done <<< "$listed"
             mkdir -p "$dir"
             case "$archive" in
               *.zip) unzip -q "$archive" -d "$dir" || { fail "cannot unpack $archive."; return; } ;;
               *) tar -xzf "$archive" -C "$dir" || { fail "cannot unpack $archive."; return; } ;;
             esac
-            local want=("$bin" LICENSE THIRD-PARTY-NOTICES.txt)
-            for t; do want+=("hops-$t.cdx.json"); done
             for f in "${want[@]}"; do
               if [ ! -f "$dir/$f" ] || [ -L "$dir/$f" ]; then
                 fail "$archive carries no $f."

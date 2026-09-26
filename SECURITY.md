@@ -49,11 +49,17 @@ Out of scope:
 ## Verifying a release
 
 `SHA256SUMS` in each release holds the SHA-256 of every other asset, and
-every asset has a build-provenance attestation from the release workflow:
+every asset has a build-provenance attestation from the release workflow.
+Check the attestation against that workflow and the tag of the release
+downloaded, `v0.13.0` below: without `--signer-workflow` and
+`--source-ref`, an attestation from any workflow run in the repository, on
+any branch, passes.
 
 ```sh
 shasum -a 256 -c --ignore-missing SHA256SUMS
-gh attestation verify hops-linux-x86_64.tar.gz --repo jtjones09/grabbr-hops
+gh attestation verify hops-linux-x86_64.tar.gz --repo jtjones09/grabbr-hops \
+  --signer-workflow jtjones09/grabbr-hops/.github/workflows/release.yml \
+  --source-ref refs/tags/v0.13.0
 ```
 
 Each archive, and the app in the dmg, holds `LICENSE`,

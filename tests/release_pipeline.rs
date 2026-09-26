@@ -64,7 +64,7 @@ const UNPACK_STEP: &str = "Unpack the unsigned build";
 const ARCHIVE_GATE: &str = "every archive carries its licence, notices, SBOMs and audit data";
 const SUMS_STEP: &str = "SHA256SUMS";
 const PUBLISH_GATE: &str = "the release is exactly its assets, each as SHA256SUMS describes it";
-const NOTES_STEP: &str = "the release notes name every ignored advisory";
+const NOTES_STEP: &str = "the release notes name every advisory the gate lets through";
 const NOTES_CHECK: &str = "the release notes are present";
 
 /// The SBOM of one target, as the release names it.
@@ -618,11 +618,16 @@ mod gates {
         let s = scratch("notices");
         let stubs = s.0.join("stubs");
         // cargo, answering the way cargo-about and cargo-cyclonedx write
-        // their output: `-o FILE`, and `--override-filename NAME` → NAME.json.
+        // their output: `-o FILE`, and `--override-filename NAME` → NAME.json,
+        // and noting whether it may reach the network. With TOUCH_LOCK set,
+        // cargo-cyclonedx rewrites Cargo.lock, as a resolution without
+        // --locked can.
         tool(
             &stubs,
             "cargo",
-            r#"for a; do printf '[%s]' "$a"; done >> "$CARGO_LOG"; echo >> "$CARGO_LOG"
+            r#"for a; do printf '[%s]' "$a"; done >> "$CARGO_LOG"
+printf ' offline=%s\n' "${CARGO_NET_OFFLINE:-}" >> "$CARGO_LOG"
+[ "$1" != cyclonedx ] || [ -z "${TOUCH_LOCK:-}" ] || echo '# re-resolved' >> Cargo.lock
 out=; name=
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -650,21 +655,35 @@ done
             assert_eq!(&targets, want, "build {name} compiles other targets");
 
             let cwd = s.0.join(format!("checkout-{name}"));
-            reset(&cwd);
-            std::fs::copy(repo().join(LICENSE), cwd.join(LICENSE)).unwrap();
             let log = s.0.join(format!("cargo-{name}.log"));
-            let ran = bash(
-                &script,
-                &s.0,
-                &cwd,
-                &[
-                    ("PATH", &path_with(&stubs)),
-                    ("CARGO_LOG", log.to_str().unwrap()),
-                    ("FEATURES", features),
-                    ("TARGETS", &targets.join(" ")),
-                    ("NAME", name),
-                ],
+            let run = |touch_lock: &str| {
+                reset(&cwd);
+                let _ = std::fs::remove_file(&log);
+                for f in [LICENSE, "Cargo.lock"] {
+                    std::fs::copy(repo().join(f), cwd.join(f)).unwrap();
+                }
+                bash(
+                    &script,
+                    &s.0,
+                    &cwd,
+                    &[
+                        ("PATH", &path_with(&stubs)),
+                        ("CARGO_LOG", log.to_str().unwrap()),
+                        ("FEATURES", features),
+                        ("TARGETS", &targets.join(" ")),
+                        ("NAME", name),
+                        ("TOUCH_LOCK", touch_lock),
+                    ],
+                )
+            };
+            let relocked = run("1");
+            assert!(
+                !relocked.ok && relocked.text.contains("Cargo.lock"),
+                "{name}: the SBOMs were generated from a Cargo.lock that changed under them, \
+                 or the failure does not say so:\n{}",
+                relocked.text
             );
+            let ran = run("");
             assert!(ran.ok, "{name}: the notices step failed:\n{}", ran.text);
             let dist = cwd.join("dist");
             assert_eq!(
@@ -686,8 +705,11 @@ done
                 }
             }
 
-            let calls = std::fs::read_to_string(&log).unwrap_or_default();
-            let calls: Vec<&str> = calls.lines().collect();
+            let log = std::fs::read_to_string(&log).unwrap_or_default();
+            let (calls, offline): (Vec<&str>, Vec<&str>) = log
+                .lines()
+                .map(|l| l.rsplit_once(" offline=").unwrap_or((l, "")))
+                .unzip();
             let selects = |c: &str, t: &str| {
                 c.contains("[--no-default-features]")
                     && c.contains(&format!("[--features][{features}]"))
@@ -711,6 +733,18 @@ done
                         .iter()
                         .any(|c| c.starts_with("[cyclonedx]") && selects(c, t)),
                     "{name}: no SBOM is generated for {t} with this build's features:\n{calls:#?}"
+                );
+            }
+            // The fetch is the one call that may reach the network; every
+            // later one is held to what it fetched. cargo-cyclonedx has no
+            // --locked, so offline is all that holds it.
+            for (i, c) in calls.iter().enumerate() {
+                let want = if Some(i) == fetch { "" } else { "true" };
+                assert_eq!(
+                    offline[i], want,
+                    "{name}: `cargo {c}` runs with CARGO_NET_OFFLINE={:?}; only the fetch may \
+                     reach the network",
+                    offline[i]
                 );
             }
         }
@@ -774,10 +808,19 @@ done
     /// An archive's members, as (name, bytes).
     type Members = Vec<(String, Vec<u8>)>;
 
-    /// A zip of stored (uncompressed) entries, as `unzip` reads one.
+    /// Bytes that make a member a symbolic link to the path after them.
+    const LINK: &[u8] = b"\0link:";
+
+    /// A zip of stored (uncompressed) entries, as `unzip` reads one. A link is
+    /// stored as `zip -y` stores one: its target as the data, and a Unix mode
+    /// that marks it a link.
     fn zip(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
         let (mut out, mut central) = (Vec::new(), Vec::new());
         for (name, data) in entries {
+            let (data, made_by, mode) = match data.strip_prefix(LINK) {
+                Some(target) => (target, 0x0314u16, 0o120_777u32 << 16),
+                None => (&data[..], 20u16, 0u32),
+            };
             let offset = out.len() as u32;
             let (crc, size, len) = (crc32(data), data.len() as u32, name.len() as u16);
             out.extend(0x0403_4b50u32.to_le_bytes());
@@ -792,7 +835,7 @@ done
             out.extend(name.as_bytes());
             out.extend(data);
             central.extend(0x0201_4b50u32.to_le_bytes());
-            for v in [20u16, 20, 0, 0, 0, 0x21] {
+            for v in [made_by, 20, 0, 0, 0, 0x21] {
                 central.extend(v.to_le_bytes());
             }
             for v in [crc, size, size] {
@@ -801,7 +844,7 @@ done
             for v in [len, 0, 0, 0, 0] {
                 central.extend(v.to_le_bytes());
             }
-            central.extend(0u32.to_le_bytes());
+            central.extend(mode.to_le_bytes());
             central.extend(offset.to_le_bytes());
             central.extend(name.as_bytes());
         }
@@ -826,7 +869,14 @@ done
         let stage = s.join("stage");
         reset(&stage);
         for (name, data) in members {
-            std::fs::write(stage.join(name), data).unwrap();
+            match data.strip_prefix(LINK) {
+                Some(target) => std::os::unix::fs::symlink(
+                    std::str::from_utf8(target).unwrap(),
+                    stage.join(name),
+                )
+                .unwrap(),
+                None => std::fs::write(stage.join(name), data).unwrap(),
+            }
         }
         let ok = std::process::Command::new("tar")
             .arg("-C")
@@ -910,6 +960,27 @@ done
                     ran.text
                 );
             }
+            // A link passes `-f` and `-s` when its target is a file with
+            // content, here the notices beside it.
+            let linked = run(archive, &|m| {
+                m.iter_mut()
+                    .filter(|(n, _)| n == LICENSE)
+                    .for_each(|(_, d)| *d = [LINK, NOTICES.as_bytes()].concat())
+            });
+            assert!(
+                !linked.ok && linked.text.contains(archive) && linked.text.contains(LICENSE),
+                "{archive} with {LICENSE} as a link passed, or the failure does not name both:\n{}",
+                linked.text
+            );
+            let extra = run(archive, &|m| {
+                m.push(("extra.sh".to_owned(), b"echo\n".to_vec()))
+            });
+            assert!(
+                !extra.ok && extra.text.contains(archive) && extra.text.contains("extra.sh"),
+                "{archive} carrying a file the build does not make passed, or the failure \
+                 does not name both:\n{}",
+                extra.text
+            );
             let unaudited = run(archive, &|m| m[0].1 = b"\x7fELF code".to_vec());
             assert!(
                 !unaudited.ok && unaudited.text.contains("cargo auditable"),
@@ -936,6 +1007,22 @@ done
         let s = scratch("unpack");
         let (_, bin, targets) = ARCHIVES[1];
         let tmp = s.0.join("runner-temp");
+        // tar, as itself, keeping the arguments of every call.
+        let real = std::process::Command::new("sh")
+            .args(["-c", "command -v tar"])
+            .output()
+            .expect("sh runs");
+        let real = String::from_utf8_lossy(&real.stdout).trim().to_owned();
+        assert!(!real.is_empty(), "no tar on PATH");
+        let stubs = s.0.join("stubs");
+        tool(
+            &stubs,
+            "tar",
+            &format!(
+                "printf '%s\\037' \"$@\" >> \"$TAR_LOG\"; echo >> \"$TAR_LOG\"\nexec '{real}' \"$@\"\n"
+            ),
+        );
+        let log = s.0.join("tar.log");
         let run = |change: &dyn Fn(&Path)| {
             reset(&tmp);
             let stage = s.0.join("stage");
@@ -960,11 +1047,16 @@ done
                 .unwrap()
                 .success();
             assert!(ok, "could not write the unsigned archive");
+            let _ = std::fs::remove_file(&log);
             bash(
                 &script,
                 &s.0,
                 &s.0,
-                &[("RUNNER_TEMP", tmp.to_str().unwrap())],
+                &[
+                    ("RUNNER_TEMP", tmp.to_str().unwrap()),
+                    ("PATH", &path_with(&stubs)),
+                    ("TAR_LOG", log.to_str().unwrap()),
+                ],
             )
         };
 
@@ -980,6 +1072,50 @@ done
                 "{f} was not unpacked beside the binary, so the app would not carry it"
             );
         }
+
+        // Only the members the app is made from are extracted, by name, so
+        // nothing else in the archive reaches the disk of the signing job.
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        let extract: Vec<Vec<&str>> = calls
+            .lines()
+            .map(|l| {
+                l.split('\x1f')
+                    .filter(|a| !a.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|args| args.first().is_some_and(|a| a.starts_with("-x")))
+            .collect();
+        assert_eq!(
+            extract.len(),
+            1,
+            "the build is not extracted once: {calls:?}"
+        );
+        let named: BTreeSet<&str> = extract[0]
+            .iter()
+            .skip_while(|a| **a != "-C")
+            .skip(2)
+            .copied()
+            .collect();
+        let expected: BTreeSet<String> =
+            std::iter::once(bin.to_owned()).chain(app_docs()).collect();
+        assert_eq!(
+            named,
+            expected.iter().map(String::as_str).collect(),
+            "the unpack extracts {:?} rather than exactly the binary, licence, notices and SBOMs",
+            extract[0]
+        );
+
+        let extra = run(&|d| std::fs::write(d.join("extra.sh"), b"echo\n").unwrap());
+        assert!(
+            !extra.ok && extra.text.contains("extra.sh"),
+            "a build carrying a file it does not make was unpacked for signing, or the \
+             failure does not name it:\n{}",
+            extra.text
+        );
+        assert!(
+            !tmp.join("bin/extra.sh").exists(),
+            "a file the build does not make reached the signing job's disk"
+        );
 
         for missing in app_docs() {
             let ran = run(&|d| std::fs::remove_file(d.join(&missing)).unwrap());
@@ -1065,75 +1201,376 @@ cp -R "$src" "$out"
         }
     }
 
-    // LEDGER T2247 | class B | 5 process exit code + file contents: release.yml advisories notes step
+    /// An advisory as cargo-deny reports it: (id, kind, crate, version, title).
+    type Advisory = (
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+    );
+
+    /// What cargo-deny 0.20.2 reported for this lockfile on 2026-09-26 with
+    /// every exception removed (no ignores; `unmaintained` and `unsound` both
+    /// "all"): the three advisories deny.toml ignores, and four that its
+    /// scopes let through without naming them.
+    const REPORTED: [Advisory; 7] = [
+        (
+            "RUSTSEC-2026-0221",
+            "unsound",
+            "event-listener",
+            "5.4.1",
+            "`event-listener` allows `!Send` tags to cross thread boundaries via `StackSlot`",
+        ),
+        (
+            "RUSTSEC-2026-0253",
+            "unsound",
+            "lru",
+            "0.18.0",
+            "Potential use-after-free due to lack of panic safety in `LruCache::pop()`",
+        ),
+        (
+            "RUSTSEC-2024-0436",
+            "unmaintained",
+            "paste",
+            "1.0.15",
+            "paste - no longer maintained",
+        ),
+        (
+            "RUSTSEC-2026-0194",
+            "vulnerability",
+            "quick-xml",
+            "0.39.4",
+            "Quadratic run time when checking a start tag for duplicate attribute names",
+        ),
+        (
+            "RUSTSEC-2026-0195",
+            "vulnerability",
+            "quick-xml",
+            "0.39.4",
+            "Unbounded namespace-declaration allocation in `NsReader` enables memory-exhaustion denial of service",
+        ),
+        (
+            "RUSTSEC-2026-0206",
+            "unmaintained",
+            "rustybuzz",
+            "0.20.1",
+            "`rustybuzz` is unmaintained",
+        ),
+        (
+            "RUSTSEC-2026-0192",
+            "unmaintained",
+            "ttf-parser",
+            "0.25.1",
+            "`ttf-parser` is unmaintained",
+        ),
+    ];
+
+    /// cargo-deny's `--format json` output for `advisories`, one diagnostic a
+    /// line in the shape it writes them, after a line of cargo's own output.
+    fn deny_report(advisories: &[Advisory]) -> String {
+        let mut out = String::from("    Updating crates.io index\n");
+        for (id, kind, krate, version, title) in advisories {
+            let informational = match *kind {
+                "unmaintained" | "unsound" => serde_json::Value::from(*kind),
+                _ => serde_json::Value::Null,
+            };
+            let line = serde_json::json!({
+                "fields": {
+                    "advisory": {
+                        "id": id,
+                        "informational": informational,
+                        "package": krate,
+                        "title": title,
+                    },
+                    "code": kind,
+                    "graphs": [{ "Krate": { "name": krate, "version": version } }],
+                    "message": title,
+                    "severity": "error",
+                },
+                "type": "diagnostic",
+            });
+            out.push_str(&format!("{line}\n"));
+        }
+        out.push_str(&format!(
+            "{{\"fields\":{{\"advisories\":{{\"errors\":{},\"helps\":0,\"notes\":0,\"warnings\":0}}}},\"type\":\"summary\"}}\n",
+            advisories.len()
+        ));
+        out
+    }
+
+    struct Notes {
+        ran: Ran,
+        text: String,
+        /// The config the step handed cargo-deny.
+        config: String,
+        /// cargo-deny's arguments, one a line.
+        args: Vec<String>,
+    }
+
+    // LEDGER T2247 | class B | 5 process exit code + 4 files written: release.yml advisories notes step, stub cargo-deny
     #[test]
-    fn the_release_notes_name_every_ignored_advisory_with_its_reason() {
+    fn the_release_notes_name_every_advisory_the_gate_lets_through() {
         let script = step_script("advisories", NOTES_STEP);
         let s = scratch("notes");
-        let notes = |deny: &str| {
+        let stubs = s.0.join("stubs");
+        // cargo, answering `cargo deny` with the report it is given, and
+        // keeping the config and the arguments it was called with.
+        tool(
+            &stubs,
+            "cargo",
+            r#"[ "$1" = deny ] || exit 64
+shift
+printf '%s\n' "$@" > "$STUB/args"
+while [ $# -gt 0 ]; do
+  [ "$1" = --config ] && cp "$2" "$STUB/config"
+  shift
+done
+cat "$STUB/report" >&2
+exit "$(cat "$STUB/exit")"
+"#,
+        );
+        let tmp = s.0.join("runner-temp");
+        let notes = |deny: &str, report: &str, exit: i32| {
             std::fs::write(s.0.join("deny.toml"), deny).unwrap();
             let _ = std::fs::remove_file(s.0.join("release-notes.md"));
+            let stub = s.0.join("stub");
+            reset(&stub);
+            reset(&tmp);
+            std::fs::write(stub.join("report"), report).unwrap();
+            std::fs::write(stub.join("exit"), exit.to_string()).unwrap();
             let ran = bash(
                 &script,
                 &s.0,
                 &s.0,
-                &[("GITHUB_REPOSITORY", "example/hops")],
+                &[
+                    ("PATH", &path_with(&stubs)),
+                    ("STUB", stub.to_str().unwrap()),
+                    ("RUNNER_TEMP", tmp.to_str().unwrap()),
+                    ("GITHUB_REPOSITORY", "example/hops"),
+                    (
+                        "GITHUB_WORKFLOW_REF",
+                        "example/hops/.github/workflows/release.yml@refs/tags/v1.2.3",
+                    ),
+                    ("GITHUB_REF", "refs/tags/v1.2.3"),
+                ],
             );
-            let text = std::fs::read_to_string(s.0.join("release-notes.md")).unwrap_or_default();
-            (ran, text)
+            let read = |p: PathBuf| std::fs::read_to_string(p).unwrap_or_default();
+            Notes {
+                ran,
+                text: read(s.0.join("release-notes.md")),
+                config: read(stub.join("config")),
+                args: read(stub.join("args")).lines().map(str::to_owned).collect(),
+            }
         };
 
         let deny = read("deny.toml");
         let doc: toml_edit::DocumentMut = deny.parse().expect("deny.toml parses");
-        let ignored = doc["advisories"]["ignore"]
+        let ignored: Vec<(String, String)> = doc["advisories"]["ignore"]
             .as_array()
-            .expect("deny.toml ignores advisories as an array");
+            .expect("deny.toml ignores advisories as an array")
+            .iter()
+            .map(|entry| {
+                let t = entry.as_inline_table().expect("an ignore entry is a table");
+                let id = t.get("id").and_then(|v| v.as_str()).expect("id");
+                let reason = t
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_else(|| panic!("deny.toml ignores {id} with no reason"));
+                (id.to_owned(), reason.to_owned())
+            })
+            .collect();
         assert!(!ignored.is_empty(), "the real deny.toml ignores nothing");
-        let (ran, text) = notes(&deny);
-        assert!(ran.ok, "notes from deny.toml failed:\n{}", ran.text);
-        for entry in ignored.iter() {
-            let t = entry.as_inline_table().expect("an ignore entry is a table");
-            let id = t.get("id").and_then(|v| v.as_str()).expect("id");
-            let reason = t
-                .get("reason")
+        // cargo-deny 0.20.2's scopes when deny.toml sets none.
+        let scope = |kind: &str| {
+            doc["advisories"]
+                .get(kind)
                 .and_then(|v| v.as_str())
-                .unwrap_or_else(|| panic!("deny.toml ignores {id} with no reason"));
+                .unwrap_or(if kind == "unsound" {
+                    "workspace"
+                } else {
+                    "all"
+                })
+                .to_owned()
+        };
+
+        let real = notes(&deny, &deny_report(&REPORTED), 1);
+        assert!(
+            real.ran.ok,
+            "notes from deny.toml failed:\n{}",
+            real.ran.text
+        );
+        let listed: Vec<&str> = real
+            .text
+            .lines()
+            .filter(|l| l.starts_with("- [RUSTSEC-"))
+            .collect();
+        assert_eq!(
+            listed.len(),
+            REPORTED.len(),
+            "the notes must list each advisory cargo-deny reports once:\n{}",
+            real.text
+        );
+        for (id, kind, krate, version, _) in REPORTED {
+            let line = listed
+                .iter()
+                .find(|l| l.contains(&format!("[{id}]")))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the release notes do not name {id} ({krate} {version}), which the gate \
+                         lets through:\n{}",
+                        real.text
+                    )
+                });
             assert!(
-                text.lines().any(|l| l.contains(id) && l.contains(reason)),
-                "the release notes do not give {id} with its reason {reason:?}:\n{text}"
+                line.contains(krate) && line.contains(version),
+                "{id} is listed without its crate and version: {line}"
+            );
+            match ignored.iter().find(|(i, _)| i == id) {
+                Some((_, reason)) => assert!(
+                    line.contains(reason.as_str()),
+                    "{id} is listed without deny.toml's reason {reason:?}: {line}"
+                ),
+                None => {
+                    let why = format!("`{kind} = \"{}\"`", scope(kind));
+                    assert!(
+                        line.contains(&why),
+                        "{id} is listed without the scope that lets it through, {why}: {line}"
+                    );
+                }
+            }
+        }
+
+        // The report is of the gate with every exception removed.
+        let widened: toml_edit::DocumentMut = real.config.parse().unwrap_or_else(|e| {
+            panic!(
+                "cargo-deny was given no readable config ({e}):\n{}",
+                real.config
+            )
+        });
+        let key = |doc: &toml_edit::DocumentMut, table: &str, key: &str| {
+            doc.get(table)
+                .and_then(|t| t.get(key))
+                .map(|v| v.to_string().trim().to_owned())
+        };
+        for kind in ["unmaintained", "unsound"] {
+            assert_eq!(
+                key(&widened, "advisories", kind).as_deref(),
+                Some("\"all\""),
+                "the report leaves out {kind} advisories deny.toml's scope hides:\n{}",
+                real.config
             );
         }
         assert!(
-            text.contains("gh attestation verify") && text.contains("example/hops"),
-            "the notes do not say how to verify a download:\n{text}"
+            key(&widened, "advisories", "ignore").is_none(),
+            "the report still applies deny.toml's ignores:\n{}",
+            real.config
+        );
+        for k in ["db-path", "db-urls", "yanked"] {
+            assert_eq!(
+                key(&widened, "advisories", k),
+                key(&doc, "advisories", k),
+                "the report's config drops deny.toml's advisories.{k}"
+            );
+        }
+        assert_eq!(
+            key(&widened, "graph", "all-features"),
+            key(&doc, "graph", "all-features"),
+            "the report's config changes deny.toml's [graph]"
+        );
+        for flag in ["--locked", "--all-features", "--workspace"] {
+            assert!(
+                real.args.iter().any(|a| a == flag),
+                "cargo-deny runs without {flag}: {:?}",
+                real.args
+            );
+        }
+        assert!(
+            real.args.windows(2).any(|w| w == ["--format", "json"])
+                && real
+                    .args
+                    .ends_with(&["check".to_owned(), "advisories".to_owned()]),
+            "cargo-deny is not asked for its advisories report as JSON: {:?}",
+            real.args
         );
 
-        let no_reason =
-            "[advisories]\nignore = [\n    { id = \"RUSTSEC-2000-0001\" },\n]\n".to_owned();
-        let bare = "[advisories]\nignore = [\n    \"RUSTSEC-2000-0001\",\n]\n".to_owned();
-        let inline = "[advisories]\nignore = [\"RUSTSEC-2000-0001\"]\n".to_owned();
+        // A download is checked against this workflow and this tag, not any
+        // run in the repository.
+        let verify = "gh attestation verify <asset> --repo example/hops \
+                      --signer-workflow example/hops/.github/workflows/release.yml \
+                      --source-ref refs/tags/v1.2.3";
+        assert!(
+            real.text.lines().any(|l| l.trim() == verify),
+            "the notes do not give `{verify}`:\n{}",
+            real.text
+        );
+
+        // Refused: an ignore the step cannot read or that gives no reason.
+        let ignore = |entry: &str| format!("[advisories]\nignore = [\n    {entry}\n]\n");
         for (why, deny) in [
-            ("an entry with no reason", no_reason),
-            ("a bare advisory id", bare),
-            ("the list on one line", inline),
+            (
+                "an entry with no reason",
+                ignore("{ id = \"RUSTSEC-2000-0001\" },"),
+            ),
+            (
+                "an empty reason",
+                ignore("{ id = \"RUSTSEC-2000-0001\", reason = \"\" },"),
+            ),
+            (
+                "a blank reason",
+                ignore("{ id = \"RUSTSEC-2000-0001\", reason = \"   \" },"),
+            ),
+            ("a bare advisory id", ignore("\"RUSTSEC-2000-0001\",")),
+            (
+                "the list on one line",
+                "[advisories]\nignore = [\"RUSTSEC-2000-0001\"]\n".to_owned(),
+            ),
         ] {
-            let (ran, _) = notes(&deny);
+            let n = notes(&deny, &deny_report(&[]), 0);
             assert!(
-                !ran.ok && ran.text.contains("RUSTSEC-2000-0001"),
+                !n.ran.ok && n.ran.text.contains("RUSTSEC-2000-0001"),
                 "{why} was accepted, so an ignore could reach a release unexplained:\n{}",
-                ran.text
+                n.ran.text
             );
         }
 
-        let (ran, text) = notes("[advisories]\nyanked = \"deny\"\n");
+        // Refused: an advisory neither an ignore nor a scope explains, which
+        // only a gate that did not run could have let through.
+        let stray: Advisory = ("RUSTSEC-2099-0001", "vulnerability", "stray", "1.0.0", "t");
+        let mut more = REPORTED.to_vec();
+        more.push(stray);
+        let unexplained = notes(&deny, &deny_report(&more), 1);
         assert!(
-            ran.ok,
-            "a deny.toml that ignores nothing failed:\n{}",
-            ran.text
+            !unexplained.ran.ok && unexplained.ran.text.contains(stray.0),
+            "a vulnerability deny.toml does not ignore was written into the notes:\n{}",
+            unexplained.ran.text
+        );
+        let all = "[advisories]\nunmaintained = \"all\"\n";
+        let in_scope = notes(all, &deny_report(&[REPORTED[5]]), 1);
+        assert!(
+            !in_scope.ran.ok && in_scope.ran.text.contains(REPORTED[5].0),
+            "an unmaintained crate inside `unmaintained = \"all\"` was explained away:\n{}",
+            in_scope.ran.text
+        );
+
+        // Refused: a cargo-deny that did not finish its report.
+        let crashed = notes(&deny, "error: failed to load advisory database\n", 1);
+        assert!(
+            !crashed.ran.ok,
+            "cargo-deny wrote no report and the notes went out anyway:\n{}",
+            crashed.ran.text
+        );
+
+        let none = notes("[advisories]\nyanked = \"deny\"\n", &deny_report(&[]), 0);
+        assert!(
+            none.ran.ok,
+            "a lockfile with no advisory failed:\n{}",
+            none.ran.text
         );
         assert!(
-            text.contains("None"),
-            "the notes do not say that nothing is ignored:\n{text}"
+            none.text.contains("None"),
+            "the notes do not say that nothing is let through:\n{}",
+            none.text
         );
 
         // The notes reach the release, and a release without them is refused.
@@ -1176,7 +1613,7 @@ cp -R "$src" "$out"
              falls back to an empty body when body_path cannot be read:\n{}",
             absent.text
         );
-        std::fs::write(s.0.join("notes/release-notes.md"), text).unwrap();
+        std::fs::write(s.0.join("notes/release-notes.md"), real.text).unwrap();
         let present = bash(&check, &s.0, &s.0, &[]);
         assert!(present.ok, "notes present, yet refused:\n{}", present.text);
     }
@@ -1196,6 +1633,8 @@ cp -R "$src" "$out"
         identifier: &'static str,
         /// A file under hops.app/Contents that the mounted image leaves out.
         omit: Option<String>,
+        /// A file under hops.app/Contents that the mounted image holds empty.
+        empty: Option<String>,
         /// Whether the binary in the app carries cargo auditable's section.
         audited: bool,
     }
@@ -1222,6 +1661,7 @@ cp -R "$src" "$out"
                 verify_app: 0,
                 identifier: "com.grabbr.hops",
                 omit: None,
+                empty: None,
                 audited: true,
             }
         }
@@ -1298,7 +1738,11 @@ esac
                 .iter()
                 .filter(|(f, _)| self.omit.as_deref() != Some(f.as_str()))
                 .map(|(f, body)| {
-                    format!("    printf '%s\\n' '{body}' > \"$mnt/hops.app/Contents/{f}\"\n")
+                    if self.empty.as_deref() == Some(f.as_str()) {
+                        format!("    : > \"$mnt/hops.app/Contents/{f}\"\n")
+                    } else {
+                        format!("    printf '%s\\n' '{body}' > \"$mnt/hops.app/Contents/{f}\"\n")
+                    }
                 })
                 .collect();
             write(
@@ -1437,6 +1881,14 @@ esac
                 format!("the app carries no {doc}"),
                 Tools {
                     omit: Some(format!("Resources/{doc}")),
+                    ..Tools::release()
+                },
+                Some(image),
+            ));
+            cases.push((
+                format!("the app carries an empty {doc}"),
+                Tools {
+                    empty: Some(format!("Resources/{doc}")),
                     ..Tools::release()
                 },
                 Some(image),
@@ -2046,6 +2498,243 @@ fn every_asset_is_attested_by_a_job_that_can_do_nothing_else() {
                 .position(|s| uses(s).starts_with("softprops/action-gh-release@"))
                 .unwrap(),
         "publish checks the assets before it releases them"
+    );
+}
+
+/// Every `gh attestation verify` a reader is told to run: in the Markdown
+/// documents and in the workflows' comments, with a line ending in `\` joined
+/// to the next.
+fn documented_verify_commands() -> Vec<(String, String)> {
+    fn markdown(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if path.is_dir() {
+                if (!name.starts_with('.') || name == ".github") && name != "target" {
+                    markdown(&path, out);
+                }
+            } else if name.ends_with(".md") && name != "PR_BODY.md" {
+                out.push(path);
+            }
+        }
+    }
+    let root = repo();
+    let mut files = Vec::new();
+    markdown(&root, &mut files);
+    let mut out = Vec::new();
+    let mut scan = |rel: String, lines: Vec<String>| {
+        let joined = lines.join("\n").replace("\\\n", " ");
+        for l in joined.lines() {
+            if let Some(at) = l.find("gh attestation verify") {
+                out.push((
+                    rel.clone(),
+                    l[at..].split_whitespace().collect::<Vec<_>>().join(" "),
+                ));
+            }
+        }
+    };
+    for path in files {
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        scan(rel, text.lines().map(str::to_owned).collect());
+    }
+    for (rel, text, _) in workflows() {
+        let comments = text
+            .lines()
+            .filter_map(|l| l.trim_start().strip_prefix('#'))
+            .map(|l| l.trim().to_owned())
+            .collect();
+        scan(rel, comments);
+    }
+    out
+}
+
+// LEDGER T22412 | class S | source text (Markdown, workflow comments) | pair T2247
+#[test]
+fn every_documented_provenance_check_pins_the_workflow_and_the_tag() {
+    let found = documented_verify_commands();
+    assert!(
+        found.iter().any(|(rel, _)| rel == "SECURITY.md"),
+        "SECURITY.md no longer says how to verify a release; this guard is checking nothing"
+    );
+    for (rel, cmd) in found {
+        let words: Vec<&str> = cmd.split_whitespace().collect();
+        let value = |flag: &str| {
+            words
+                .windows(2)
+                .find(|w| w[0] == flag)
+                .map(|w| w[1])
+                .unwrap_or("")
+        };
+        assert!(
+            value("--signer-workflow").ends_with("/.github/workflows/release.yml")
+                && value("--source-ref").starts_with("refs/tags/v"),
+            "{rel}: `{cmd}` accepts an attestation from any workflow run in the repository, \
+             on any branch; pin --signer-workflow to release.yml and --source-ref to the tag"
+        );
+    }
+}
+
+/// What `runner.os` is on a runner label.
+fn runner_os(label: &str) -> &'static str {
+    match label.split('-').next() {
+        Some("ubuntu") => "Linux",
+        Some("macos") => "macOS",
+        Some("windows") => "Windows",
+        _ => panic!("no runner.os known for {label}"),
+    }
+}
+
+/// Whether a step runs on a runner whose `runner.os` is `os`. Only the
+/// conditions the release uses can be read; any other fails the test, since
+/// nothing here can tell when it skips the step.
+fn runs_on(step: &Yaml, name: &str, os: &str) -> bool {
+    if step["if"].is_badvalue() {
+        return true;
+    }
+    let cond = step["if"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{name}: `if: {:?}` is not an expression", step["if"]));
+    let cond = cond.trim();
+    let cond = cond
+        .strip_prefix("${{")
+        .and_then(|c| c.strip_suffix("}}"))
+        .unwrap_or(cond);
+    match cond.split_whitespace().collect::<Vec<_>>()[..] {
+        ["runner.os", "==", v] => os == v.trim_matches('\''),
+        ["runner.os", "!=", v] => os != v.trim_matches('\''),
+        _ => panic!("{name}: cannot tell on which runner `if: {cond}` skips it"),
+    }
+}
+
+// LEDGER T22413 | class S | parsed workflow YAML | pair T2242, T2243, T2244 (a step's `if` is evaluated only on GitHub)
+#[test]
+fn every_step_that_makes_or_checks_an_asset_runs_on_every_leg_that_ships_one() {
+    let wf = parse(RELEASE);
+    let build = &wf["jobs"][BUILD];
+    let entries = build["strategy"]["matrix"]["include"]
+        .as_vec()
+        .expect("build has a matrix");
+    for entry in entries {
+        let leg = entry["name"].as_str().expect("matrix name");
+        let os = runner_os(entry["os"].as_str().expect("matrix os"));
+        let running: Vec<(String, &Yaml)> = steps(build)
+            .iter()
+            .map(|s| (s["name"].as_str().unwrap_or(uses(s)).to_owned(), s))
+            .filter(|(name, s)| runs_on(s, name, os))
+            .collect();
+        let named = |n: &str| running.iter().filter(|(name, _)| name == n).count();
+        for step in [TOOLS_STEP, NOTICES_STEP] {
+            assert_eq!(
+                named(step),
+                1,
+                "{step} does not run on the {leg} leg, whose archive would ship without it"
+            );
+        }
+        for (what, prefix) in [("builds", "Build ("), ("packages", "Package (")] {
+            let n = running
+                .iter()
+                .filter(|(name, _)| name.starts_with(prefix))
+                .count();
+            assert_eq!(
+                n, 1,
+                "{n} steps that {what} the release run on the {leg} leg"
+            );
+        }
+        assert!(
+            running
+                .iter()
+                .any(|(_, s)| uses(s).starts_with("actions/upload-artifact@")),
+            "the {leg} leg uploads nothing"
+        );
+    }
+    // The advisories, signing and attest jobs each run on one runner, and
+    // every step of theirs runs.
+    for job in ["advisories", SIGN, ATTEST] {
+        for step in steps(&wf["jobs"][job]) {
+            let name = step["name"].as_str().unwrap_or(uses(step));
+            assert!(
+                step["if"].is_badvalue(),
+                "{job} step {name:?} is conditional, so a run can skip it"
+            );
+        }
+    }
+}
+
+// LEDGER T22414 | class S | parsed workflow YAML | pair NONE (whether a failure fails the run is decided only on GitHub)
+#[test]
+fn no_release_step_or_job_may_fail_without_failing_the_run() {
+    let wf = parse(RELEASE);
+    for (id, job) in jobs(&wf) {
+        assert!(
+            job["continue-on-error"].is_badvalue(),
+            "job {id} sets continue-on-error, so a release could go out after it failed"
+        );
+        for step in steps(job) {
+            let name = step["name"].as_str().unwrap_or(uses(step));
+            assert!(
+                step["continue-on-error"].is_badvalue(),
+                "{id} step {name:?} sets continue-on-error, so its failure fails nothing and \
+                 what it refused is checksummed, attested and published anyway"
+            );
+        }
+    }
+}
+
+// LEDGER T22415 | class S | raw workflow text + parsed workflow YAML | pair T2247
+#[test]
+fn the_notes_come_from_the_cargo_deny_the_gate_runs() {
+    const ACTION: &str = "EmbarkStudios/cargo-deny-action@";
+    let text = read(RELEASE);
+    let gate: Vec<&str> = text.lines().filter(|l| l.contains(ACTION)).collect();
+    assert_eq!(
+        gate.len(),
+        1,
+        "release.yml runs the cargo-deny action {} times",
+        gate.len()
+    );
+    // The version the pinned action runs, as its tag comment records it.
+    let version = gate[0]
+        .split_once("cargo-deny ")
+        .map(|(_, v)| v.trim())
+        .unwrap_or_else(|| panic!("`{}` does not say which cargo-deny it runs", gate[0].trim()));
+
+    let wf = parse(RELEASE);
+    let job = &wf["jobs"]["advisories"];
+    let action = steps(job)
+        .iter()
+        .position(|s| uses(s).starts_with(ACTION))
+        .expect("advisories runs the gate");
+    let install = step_position(job, "advisories", "Install cargo-deny");
+    let notes = step_position(job, "advisories", NOTES_STEP);
+    assert!(
+        action < install && install < notes,
+        "advisories must run the gate, install cargo-deny, then write the notes"
+    );
+    assert_eq!(
+        commands(&steps(job)[install]),
+        vec![
+            ["cargo", "install", "--locked"]
+                .iter()
+                .map(|w| w.to_string())
+                .chain([format!("cargo-deny@{version}")])
+                .collect::<Vec<_>>()
+        ],
+        "the notes are written from another cargo-deny than the gate's {version}"
+    );
+    let args: Vec<&str> = steps(job)[action]["with"]["arguments"]
+        .as_str()
+        .unwrap_or("")
+        .split_whitespace()
+        .collect();
+    assert_eq!(
+        args,
+        ["--all-features", "--workspace"],
+        "the gate checks another graph than the one the notes report on"
     );
 }
 
