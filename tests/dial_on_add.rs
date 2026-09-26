@@ -149,7 +149,11 @@ async fn add_device(
         }
     };
     for r in [
-        FrontendRequest::UpdateHostname(handle, Some("127.0.0.1".into())),
+        FrontendRequest::UpdateHostname {
+            handle,
+            hostname: Some("127.0.0.1".into()),
+            fingerprint: None,
+        },
         // Pinned, so the address is known the moment the device is switched on
         // and the first dial really reaches the receiver, as it does for a
         // device picked from the network list.

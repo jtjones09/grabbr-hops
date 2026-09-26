@@ -94,7 +94,19 @@ struct PolledUi {
         String,
         bool,
         bool,
+        String,
     )>,
+}
+
+/// Whether an action armed on `handle` (as the UI holds it) with `pin` no
+/// longer names the device it was armed on. Only a device handle can go stale
+/// this way: an empty handle is nothing armed, and a receive-only row is keyed
+/// by its fingerprint, which does not change under it.
+fn armed_is_stale(m: &hops_frontend_core::AppModel, handle: &str, pin: &str) -> bool {
+    let Ok(handle) = handle.parse::<ClientHandle>() else {
+        return false;
+    };
+    !m.still_names(handle, (!pin.is_empty()).then_some(pin))
 }
 
 fn status_text(s: Status) -> &'static str {
@@ -503,11 +515,15 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
         // handle, so keying this on the handle alone meant the parse failed and
         // the rename silently did nothing — which is why the GUI could not name
         // an inbound peer at all while the TUI could.
-        ui.on_rename_device(move |id, name| {
+        ui.on_rename_device(move |id, pin, name| {
             let name = name.trim();
             if let Ok(h) = id.as_str().parse::<u64>() {
                 let name = (!name.is_empty()).then(|| name.to_string());
-                c.request(FrontendRequest::UpdateHostname(h, name));
+                c.request(FrontendRequest::UpdateHostname {
+                    handle: h,
+                    hostname: name,
+                    fingerprint: (!pin.is_empty()).then(|| pin.to_string()),
+                });
                 return;
             }
             // A rename is a rename. This used to re-send AuthorizeKey, so the
@@ -523,9 +539,12 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
     }
     {
         let c = client.clone();
-        ui.on_delete_device(move |handle| {
+        ui.on_delete_device(move |handle, pin| {
             if let Ok(h) = handle.as_str().parse::<u64>() {
-                c.request(FrontendRequest::Delete(h));
+                c.request(FrontendRequest::Delete {
+                    handle: h,
+                    fingerprint: (!pin.is_empty()).then(|| pin.to_string()),
+                });
             }
         });
     }
@@ -713,6 +732,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
     let last_ui: RefCell<Option<PolledUi>> = RefCell::new(None);
     let timer = slint::Timer::default();
     let notice_seq_poll = notice_seq.clone();
+    let notice_sink_poll = notice_sink.clone();
     let last_daemon_notice = last_daemon_notice.clone();
     timer.start(
         slint::TimerMode::Repeated,
@@ -742,7 +762,12 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                     claim_pending(&pending_new_device, arrived)
                 {
                     if !name.is_empty() {
-                        client.request(FrontendRequest::UpdateHostname(new_handle, Some(name)));
+                        // Just created: never connected, so no pin.
+                        client.request(FrontendRequest::UpdateHostname {
+                            handle: new_handle,
+                            hostname: Some(name),
+                            fingerprint: None,
+                        });
                     }
                     if !fix_ips.is_empty() {
                         // Picked off the network list: pin what mDNS
@@ -762,6 +787,29 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                     client.request(FrontendRequest::Activate(new_handle, true));
                 }
                 *known_handles.borrow_mut() = current;
+            }
+
+            // An armed delete or an open rename names a device by handle and
+            // the pin it had. Once that device is gone or pinned to another
+            // machine, drop it rather than let the user confirm something the
+            // row no longer shows (#94).
+            if armed_is_stale(
+                &m,
+                &ui.get_confirm_delete_handle(),
+                &ui.get_confirm_delete_pin(),
+            ) {
+                ui.set_confirm_delete_handle("".into());
+                ui.set_confirm_delete_pin("".into());
+                notice_sink_poll(
+                    "That device changed, so it was not deleted. Check it and try again.",
+                );
+            }
+            if armed_is_stale(&m, &ui.get_editing_device(), &ui.get_editing_pin()) {
+                ui.set_editing_device("".into());
+                ui.set_editing_pin("".into());
+                notice_sink_poll(
+                    "That device changed, so it was not renamed. Check it and try again.",
+                );
             }
 
             // --- Build the derived UI state, then push to Slint ONLY if it
@@ -863,6 +911,12 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                             .unwrap_or_default()
                             .into(),
                         fp_full: d.fingerprint.clone().unwrap_or_default().into(),
+                        pin: d
+                            .send
+                            .as_ref()
+                            .and_then(|s| s.state.peer_fingerprint.clone())
+                            .unwrap_or_default()
+                            .into(),
                         online: d.online,
                         trusted: d.receive,
                         revoked: d.trust == TrustState::Revoked,
@@ -944,6 +998,7 @@ pub fn run(hidden: bool) -> Result<(), SlintError> {
                             d.fp_full.to_string(),
                             d.online,
                             d.trusted,
+                            d.pin.to_string(),
                         )
                     })
                     .collect(),
@@ -1089,6 +1144,55 @@ pub fn run_onboarding() -> Result<Option<hops_frontend_core::prefs::Frontend>, S
     ui.run()?;
     let picked = *choice.borrow();
     Ok(picked)
+}
+
+#[cfg(test)]
+mod armed_actions_follow_their_device {
+    //! The GUI holds an armed delete and an open rename as a handle string and
+    //! the row's pin. `armed_is_stale` is what the poll loop asks before
+    //! clearing them (#94).
+
+    use super::armed_is_stale;
+    use hops_frontend_core::{AppModel, ClientConfig, ClientState, FrontendEvent};
+
+    // LEDGER T16 | class B | 1 return value: armed_is_stale over AppModel::apply
+    #[test]
+    fn an_armed_action_goes_stale_exactly_when_its_device_changes() {
+        let x = format!("{}aa", "aa:".repeat(31));
+        let y = format!("{}bb", "bb:".repeat(31));
+        let pinned = |fp: &str| ClientState {
+            peer_fingerprint: Some(fp.to_string()),
+            ..Default::default()
+        };
+        let mut m = AppModel::default();
+        m.apply(FrontendEvent::Created(
+            4,
+            ClientConfig::default(),
+            pinned(&x),
+        ));
+        m.apply(FrontendEvent::Created(
+            5,
+            ClientConfig::default(),
+            ClientState::default(),
+        ));
+
+        let cases = [
+            ("", "", false),         // nothing armed
+            (x.as_str(), "", false), // a receive-only row, keyed by fingerprint
+            ("4", x.as_str(), false),
+            ("5", "", false), // armed on a device with no pin yet
+            ("4", "", true),  // armed before it learned a pin
+            ("4", y.as_str(), true),
+            ("9", "", true), // gone, or replaced by a reload
+        ];
+        for (handle, pin, stale) in cases {
+            assert_eq!(
+                armed_is_stale(&m, handle, pin),
+                stale,
+                "armed on handle {handle:?} with pin {pin:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

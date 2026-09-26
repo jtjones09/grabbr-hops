@@ -705,6 +705,22 @@ async fn connect_to_handle(
                 return Err(e);
             }
         };
+        // The device can have been deleted, re-addressed or replaced by a
+        // reload while the handshake ran. Then this link is not its link, and
+        // what it proved is not its identity: write nothing, keep nothing.
+        // Checked and recorded under the connection lock, so nothing can
+        // change the device between the check and the writes.
+        let mut open = conns.lock().await;
+        if !client_manager.targets(handle, addr) {
+            drop(open);
+            log::info!(
+                "client {handle}: the dial to {addr} finished after the device was \
+                 removed or re-addressed; closing it"
+            );
+            link.conn.close(0u32.into(), b"stale dial");
+            connecting.lock().await.remove(&handle);
+            return Err(LanMouseConnectionError::NotConnected);
+        }
         log::info!("client ({handle}) connected @ {addr}");
         // Stamp the receiver's leaf-cert fingerprint from THIS connection — the
         // pin identity + the key the frontend uses to correlate this client with
@@ -728,7 +744,8 @@ async fn connect_to_handle(
             ),
         }
         client_manager.set_active_addr(handle, Some(addr));
-        conns.lock().await.insert(addr, link.clone());
+        open.insert(addr, link.clone());
+        drop(open);
         connecting.lock().await.remove(&handle);
 
         // Best-effort version + capability handshake (see ProtoEvent::Hello and
@@ -904,18 +921,43 @@ pub(crate) struct OutboundRevoker {
 }
 
 impl OutboundRevoker {
-    /// Disconnect each handle's active session. Handles are resolved by the
-    /// caller BEFORE it clears the pins, since clearing erases the fingerprint
-    /// the match is made on.
-    pub(crate) async fn close_handles(&self, handles: &[ClientHandle]) -> usize {
+    /// Close every link whose receiver proved `fingerprint`. Returns how many.
+    ///
+    /// By the link's own certificate, not by which device points at it: the
+    /// device may already be deleted, re-addressed or replaced by a reload
+    /// when this runs, and a lookup through it then closes nothing.
+    pub(crate) async fn close_fingerprint(&self, fingerprint: &str) -> usize {
+        let addrs: Vec<SocketAddr> = self
+            .conns
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, link)| link.fingerprint == fingerprint)
+            .map(|(addr, _)| *addr)
+            .collect();
         let mut closed = 0;
-        for &handle in handles {
-            if let Some(addr) = self.client_manager.active_addr(handle) {
-                disconnect(&self.client_manager, handle, addr, &self.conns).await;
+        for addr in addrs {
+            if self.close_addr(addr).await {
                 closed += 1;
             }
         }
         closed
+    }
+
+    /// Close the link open to `addr`, if there is one, and clear it from any
+    /// device still recorded as connected there. Returns whether one was open.
+    pub(crate) async fn close_addr(&self, addr: SocketAddr) -> bool {
+        let open = self.conns.lock().await.contains_key(&addr);
+        let handles = self.client_manager.handles_at(addr);
+        if handles.is_empty() {
+            if let Some(link) = self.conns.lock().await.remove(&addr) {
+                link.conn.close(0u32.into(), b"bye");
+            }
+        }
+        for handle in handles {
+            disconnect(&self.client_manager, handle, addr, &self.conns).await;
+        }
+        open
     }
 }
 
@@ -1690,6 +1732,159 @@ mod tests {
                 !dials_ok(&client_ep, addr).await,
                 "REGRESSION: kept driving a REVOKED receiver — the outbound handshake \
                  resumed and skipped FpServerVerifier"
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod a_device_edit_touches_only_that_device {
+    //! A dial, a teardown and a revocation each belong to one device, and must
+    //! not land on another or outlive the one they belong to (#97, #94).
+    //!
+    //! A dial reads the device's address, waits for the handshake, then writes
+    //! the identity it learned and the link it opened back onto the device.
+    //! Anything can happen to the device during that wait: it can be deleted,
+    //! re-addressed, or replaced by a reload.
+
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        time::Duration,
+    };
+
+    use hops_ipc::Position;
+    use hops_proto::ProtoEvent;
+
+    use crate::test_harness::{Dialer, Door, dialer, door, machine, run_local, trust, wait_until};
+    use crate::trust::Caps;
+
+    const PATIENCE: Duration = Duration::from_secs(10);
+
+    /// A device whose dial has reached the receiver and is held there.
+    async fn a_dial_held_at_the_door() -> (Door, Dialer, String) {
+        let receiver = machine();
+        let sender = machine();
+        let door = door(&receiver);
+        let d = dialer(
+            &sender,
+            trust(&sender, &[&receiver], Caps::OUTBOUND),
+            door.port,
+            Position::Left,
+        );
+        let _ = d.conn.send(ProtoEvent::Ping, d.handle).await;
+        wait_until("the dial to reach the receiver", PATIENCE, || {
+            door.knocks() > 0
+        })
+        .await;
+        (door, d, receiver.fingerprint)
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Landed {
+        /// The dial wrote its identity or address onto a device.
+        Written,
+        /// The dial's connection was closed.
+        Closed,
+        /// Neither, within the patience.
+        LeftOpen,
+    }
+
+    async fn once_let_in(door: &Door, written: impl Fn() -> bool) -> Landed {
+        door.open();
+        let started = tokio::time::Instant::now();
+        while started.elapsed() < PATIENCE {
+            if written() {
+                return Landed::Written;
+            }
+            if door.closed() > 0 {
+                return Landed::Closed;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Landed::LeftOpen
+    }
+
+    // LEDGER T5 | class B | 6 struct state: ClientManager after LanMouseConnection::send's dial, 2 connection closed at the receiver
+    #[test]
+    fn a_dial_that_lands_after_its_device_was_removed_writes_nothing() {
+        run_local(async {
+            let (door, d, _) = a_dial_held_at_the_door().await;
+
+            // The user deletes the device while its dial is out, then adds
+            // another, which points nowhere yet.
+            assert!(d.clients.remove_client(d.handle).is_some(), "precondition");
+            let other = d.clients.add_client();
+
+            let landed = once_let_in(&door, || {
+                let (_, s) = d.clients.get_state(other).expect("the new device");
+                s.peer_fingerprint.is_some() || s.active_addr.is_some()
+            })
+            .await;
+            assert_eq!(
+                landed,
+                Landed::Closed,
+                "a dial for a deleted device finished after another device was \
+                 added. It must write nothing and close its connection; Written \
+                 means the deleted machine's identity and link landed on the new \
+                 device, LeftOpen means an open link nothing can address, which \
+                 still receives clipboard text (#97)."
+            );
+        });
+    }
+
+    // LEDGER T6 | class B | 6 struct state: ClientManager after LanMouseConnection::send's dial, 2 connection closed at the receiver
+    #[test]
+    fn a_dial_that_lands_after_its_device_was_readdressed_writes_nothing() {
+        run_local(async {
+            let (door, d, _) = a_dial_held_at_the_door().await;
+
+            // The user points the device at another machine while its dial to
+            // the old address is out.
+            d.clients
+                .set_fix_ips(d.handle, vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))]);
+
+            let landed = once_let_in(&door, || {
+                let (_, s) = d.clients.get_state(d.handle).expect("the device");
+                s.peer_fingerprint.is_some() || s.active_addr.is_some()
+            })
+            .await;
+            assert_eq!(
+                landed,
+                Landed::Closed,
+                "a dial to the device's OLD address finished after it was pointed \
+                 elsewhere. Written means the old machine's identity became the \
+                 device's pin and its link the device's connection, so input \
+                 meant for the new address goes to the old machine (#97)."
+            );
+        });
+    }
+
+    // LEDGER T7 | class B | 2 streams and close seen at the receiver: OutboundRevoker, ClipboardSender::broadcast
+    #[test]
+    fn deleting_a_connected_device_closes_its_link_and_sends_it_no_clipboard() {
+        run_local(async {
+            let (door, d, receiver) = a_dial_held_at_the_door().await;
+            door.open();
+            wait_until("the link to come up", PATIENCE, || door.streams() > 0).await;
+
+            // What deleting the device does: the device is removed, and the
+            // revocation that goes with it closes the link after that.
+            assert!(d.clients.remove_client(d.handle).is_some(), "precondition");
+            d.conn.revoker().close_fingerprint(&receiver).await;
+
+            let streams = door.streams();
+            d.conn
+                .clipboard_sender()
+                .broadcast("copied after the delete".to_string())
+                .await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert_eq!(
+                (door.closed(), door.streams() - streams),
+                (1, 0),
+                "(links closed, clipboard transfers sent) after deleting a \
+                 connected device. The link has to close whether or not a \
+                 device still points at it, or clipboard keeps flowing to a \
+                 machine the user removed."
             );
         });
     }

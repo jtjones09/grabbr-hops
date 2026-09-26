@@ -200,6 +200,27 @@ impl AppModel {
         }
     }
 
+    /// The pin of device `handle` as this model has it: the fingerprint a
+    /// delete or rename of it must carry (`None` if it has none, or no such
+    /// device).
+    pub fn pin_of(&self, handle: ClientHandle) -> Option<String> {
+        self.clients
+            .get(&handle)
+            .and_then(|(_, s)| s.peer_fingerprint.clone())
+    }
+
+    /// Whether device `handle` is still here and still pinned to `pin`, as it
+    /// was when a frontend armed a delete or opened a rename on it.
+    ///
+    /// A frontend drops an armed action once this is false. The daemon would
+    /// refuse it anyway, but only after the user confirmed something the row
+    /// no longer shows (#94).
+    pub fn still_names(&self, handle: ClientHandle, pin: Option<&str>) -> bool {
+        self.clients
+            .get(&handle)
+            .is_some_and(|(_, s)| s.peer_fingerprint.as_deref() == pin)
+    }
+
     /// Whole seconds left in the pairing window, or `None` when it is closed.
     pub fn pairing_seconds_left(&self, now: Instant) -> Option<u64> {
         let left = self.pairing_open_until?.checked_duration_since(now)?;
@@ -630,6 +651,55 @@ async fn connection_loop(
         }
         changed.notify_one();
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+#[cfg(test)]
+mod armed_actions {
+    //! A frontend arms a delete or opens a rename on a row, and the user
+    //! confirms later. By then the device can be gone, replaced by a reload,
+    //! or pinned to another machine; the armed action must not survive that.
+
+    use super::*;
+
+    fn pinned(fp: Option<&str>) -> (ClientConfig, ClientState) {
+        let state = ClientState {
+            peer_fingerprint: fp.map(str::to_string),
+            ..Default::default()
+        };
+        (ClientConfig::default(), state)
+    }
+
+    // LEDGER T14 | class B | 1 return value: AppModel::still_names after AppModel::apply
+    #[test]
+    fn an_armed_action_outlives_nothing_about_its_device() {
+        let x = "aa:".repeat(31) + "aa";
+        let y = "bb:".repeat(31) + "bb";
+        let mut m = AppModel::default();
+        let (c, s) = pinned(Some(&x));
+        m.apply(FrontendEvent::Created(7, c, s));
+        assert!(
+            m.still_names(7, Some(&x)),
+            "unchanged: still the device shown"
+        );
+
+        // The device learns another identity.
+        let (c, s) = pinned(Some(&y));
+        m.apply(FrontendEvent::State(7, c, s));
+        assert!(
+            !m.still_names(7, Some(&x)),
+            "the device is now pinned to another machine, and a delete armed on \
+             the old one would revoke this one"
+        );
+
+        // Or it is replaced by a reload: removed, and another added.
+        let (c, s) = pinned(Some(&x));
+        m.apply(FrontendEvent::Enumerate(vec![(8, c, s)]));
+        assert!(
+            !m.still_names(7, Some(&x)),
+            "the device is gone; an action armed on it must go with it"
+        );
+        assert_eq!(m.pin_of(8), Some(x), "the pin a request for 8 carries");
     }
 }
 

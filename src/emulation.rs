@@ -1354,11 +1354,12 @@ mod held_input_is_released {
             s.inject(key(KEY_A, 1)).await;
 
             // Close without a Leave, as a killed process or a dropped link does.
-            s.dialer()
-                .conn
-                .revoker()
-                .close_handles(&[s.dialer().handle])
-                .await;
+            let addr = s
+                .dialer()
+                .clients
+                .active_addr(s.dialer().handle)
+                .expect("connected");
+            s.dialer().conn.revoker().close_addr(addr).await;
 
             assert!(
                 s.released_before_destroy(handle, button(BTN_LEFT, 0)).await,

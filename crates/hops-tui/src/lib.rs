@@ -73,8 +73,13 @@ pub enum TuiError {
 enum Input {
     /// Adding a device: `host` or `host:port`.
     Add { buf: String },
-    /// Editing an outgoing client's hostname.
-    Hostname { handle: ClientHandle, buf: String },
+    /// Editing an outgoing client's hostname. `pin` is the client's pin when
+    /// the edit opened, which the request carries (#94).
+    Hostname {
+        handle: ClientHandle,
+        pin: Option<String>,
+        buf: String,
+    },
     /// Naming a peer. `granting` distinguishes the two things this used to
     /// conflate: approving a NEW device (a trust grant) versus renaming one that
     /// is already trusted. They were the same wire request, so a rename could
@@ -110,8 +115,43 @@ enum Confirm {
         label: String,
         handle: Option<ClientHandle>,
         fp: Option<String>,
+        /// The outgoing client's pin when this was armed, which the delete
+        /// carries (#94).
+        pin: Option<String>,
         destructive: bool,
     },
+}
+
+/// What the TUI says when it drops an armed action.
+const CHANGED_NOTE: &str = "That device changed, so nothing was done. Check it and try again.";
+
+/// Drop an armed delete or an open rename whose device is gone or now pinned
+/// to another machine. Returns whether anything was dropped.
+///
+/// Both hold a handle while the user decides. A reload can replace the device
+/// behind it, and a dial can pin it to a different machine, and a delete
+/// revokes the pin: confirming then would act on something the screen no
+/// longer shows (#94).
+fn drop_stale(model: &AppModel, confirm: &mut Option<Confirm>, input: &mut Option<Input>) -> bool {
+    let mut dropped = false;
+    if let Some(Confirm::Remove {
+        handle: Some(h),
+        pin,
+        ..
+    }) = confirm.as_ref()
+    {
+        if !model.still_names(*h, pin.as_deref()) {
+            *confirm = None;
+            dropped = true;
+        }
+    }
+    if let Some(Input::Hostname { handle, pin, .. }) = input.as_ref() {
+        if !model.still_names(*handle, pin.as_deref()) {
+            *input = None;
+            dropped = true;
+        }
+    }
+    dropped
 }
 
 /// Map a theme [`Rgb`] to a true-color ratatui [`Color`].
@@ -254,7 +294,12 @@ pub async fn run() -> Result<(), TuiError> {
             if let Some((host, port, pos)) = pending_new.take() {
                 match current.difference(&known_handles).copied().next() {
                     Some(h) => {
-                        client.request(FrontendRequest::UpdateHostname(h, Some(host)));
+                        // Just created: never connected, so no pin.
+                        client.request(FrontendRequest::UpdateHostname {
+                            handle: h,
+                            hostname: Some(host),
+                            fingerprint: None,
+                        });
                         client.request(FrontendRequest::UpdatePort(h, port));
                         client.request(FrontendRequest::UpdatePosition(h, pos));
                         // actually try the machine: an inert card that is never
@@ -266,6 +311,10 @@ pub async fn run() -> Result<(), TuiError> {
                 }
             }
             known_handles = current;
+        }
+
+        if drop_stale(&model, &mut confirm, &mut input) {
+            notice = Some((CHANGED_NOTE.to_string(), Instant::now()));
         }
 
         let devices = listable(&model);
@@ -345,9 +394,13 @@ pub async fn run() -> Result<(), TuiError> {
                                         notice = Some((msg.to_string(), Instant::now()));
                                     }
                                 },
-                                Input::Hostname { handle, buf } => {
+                                Input::Hostname { handle, pin, buf } => {
                                     let val = (!buf.trim().is_empty()).then_some(buf);
-                                    client.request(FrontendRequest::UpdateHostname(handle, val));
+                                    client.request(FrontendRequest::UpdateHostname {
+                                        handle,
+                                        hostname: val,
+                                        fingerprint: pin,
+                                    });
                                 }
                                 Input::TrustedName { fp, buf, granting } => {
                                     let desc = if buf.trim().is_empty() {
@@ -389,13 +442,19 @@ pub async fn run() -> Result<(), TuiError> {
                         // ---- confirmation mode ----
                         match k.code {
                             KeyCode::Char('y') => {
-                                if let Some(Confirm::Remove { handle, fp, .. }) = confirm.take() {
+                                if let Some(Confirm::Remove {
+                                    handle, fp, pin, ..
+                                }) = confirm.take()
+                                {
                                     // Deleting the outgoing client is the whole
                                     // removal: the daemon tombstones the pinned
                                     // fingerprint with it. Only a peer we have no
                                     // client for needs the allowlist request.
                                     if let Some(h) = handle {
-                                        client.request(FrontendRequest::Delete(h));
+                                        client.request(FrontendRequest::Delete {
+                                            handle: h,
+                                            fingerprint: pin,
+                                        });
                                     } else if let Some(fp) = fp {
                                         client.request(FrontendRequest::RemoveAuthorizedKey(fp));
                                     }
@@ -477,6 +536,7 @@ pub async fn run() -> Result<(), TuiError> {
                                     let s = d.send.as_ref().expect("send facet");
                                     input = Some(Input::Hostname {
                                         handle: s.handle,
+                                        pin: s.state.peer_fingerprint.clone(),
                                         buf: s.config.hostname.clone().unwrap_or_default(),
                                     });
                                 }
@@ -517,11 +577,16 @@ pub async fn run() -> Result<(), TuiError> {
                                 }
                                 Some(d) => {
                                     let handle = d.send.as_ref().map(|s| s.handle);
+                                    let pin = d
+                                        .send
+                                        .as_ref()
+                                        .and_then(|s| s.state.peer_fingerprint.clone());
                                     let fp = d.fingerprint.clone();
                                     confirm = Some(Confirm::Remove {
                                         label: d.label.clone(),
                                         handle,
                                         fp: fp.clone(),
+                                        pin,
                                         // nothing is burned if we never learned
                                         // who this machine is
                                         destructive: fp.is_some(),
@@ -994,7 +1059,7 @@ fn footer_line(
     if let Some(inp) = input {
         let (label, buf) = match inp {
             Input::Add { buf } => ("add device — host or host:port: ".to_string(), buf.clone()),
-            Input::Hostname { handle, buf } => (format!("name [{handle}]: "), buf.clone()),
+            Input::Hostname { handle, buf, .. } => (format!("name [{handle}]: "), buf.clone()),
             Input::TrustedName { buf, .. } => ("trust as: ".to_string(), buf.clone()),
             Input::Port { buf } => ("listen port: ".to_string(), buf.clone()),
         };
@@ -1208,11 +1273,69 @@ fn short_fp(fp: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hops_frontend_core::{ClientConfig, ClientState, RevokedEntry};
+    use hops_frontend_core::{ClientConfig, ClientState, FrontendEvent, RevokedEntry};
     use ratatui::{Terminal, backend::TestBackend};
 
     const FP: &str = "1e:19:1b:2c:3d:4e:5f:60:71:82:93:a4:b5:c6:d7:e8";
     const OTHER_FP: &str = "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
+
+    // LEDGER T15 | class B | 6 struct state: the TUI's armed Confirm and Input after drop_stale
+    /// An armed delete and an open rename go once their device changes, and
+    /// stay while it does not (#94).
+    #[test]
+    fn an_armed_delete_or_rename_is_dropped_when_its_device_changes() {
+        let pinned = |fp: &str| ClientState {
+            peer_fingerprint: Some(fp.to_string()),
+            ..Default::default()
+        };
+        let mut model = AppModel::default();
+        model.apply(FrontendEvent::Created(
+            3,
+            ClientConfig::default(),
+            pinned(FP),
+        ));
+        let arm = || {
+            (
+                Some(Confirm::Remove {
+                    label: "desk".into(),
+                    handle: Some(3),
+                    fp: Some(FP.into()),
+                    pin: Some(FP.into()),
+                    destructive: true,
+                }),
+                Some(Input::Hostname {
+                    handle: 3,
+                    pin: Some(FP.into()),
+                    buf: String::new(),
+                }),
+            )
+        };
+
+        let (mut confirm, mut input) = arm();
+        assert!(
+            !drop_stale(&model, &mut confirm, &mut input) && confirm.is_some() && input.is_some(),
+            "nothing about the device changed, and the armed actions were dropped"
+        );
+
+        model.apply(FrontendEvent::State(
+            3,
+            ClientConfig::default(),
+            pinned(OTHER_FP),
+        ));
+        let (mut confirm, mut input) = arm();
+        assert!(
+            drop_stale(&model, &mut confirm, &mut input) && confirm.is_none() && input.is_none(),
+            "the device is pinned to another machine now; confirming would act \
+             on a machine this prompt never showed"
+        );
+
+        model.apply(FrontendEvent::Deleted(3));
+        let (mut confirm, mut input) = arm();
+        assert!(
+            drop_stale(&model, &mut confirm, &mut input) && confirm.is_none() && input.is_none(),
+            "the device is gone, and its armed actions stayed"
+        );
+    }
 
     /// Render `ui` into an off-screen terminal and return the visible text, one
     /// String per row. Rendering is the only way to catch a row that the
