@@ -454,6 +454,162 @@ mod an_upgrade_mints_no_permission_the_old_config_never_granted {
 }
 
 // ---------------------------------------------------------------------------
+// #186 — pairings made before #182 keep the clipboard direction their lease
+// grants
+// ---------------------------------------------------------------------------
+
+mod pairings_made_before_182_keep_the_clipboard_direction_their_lease_grants {
+    //! **Decided 2026-09-16 (#186).** A pairing made before #182 asks about the
+    //! clipboard keeps what its lease already carries: text copied on the
+    //! machine doing the driving reaches the machine being driven, and nothing
+    //! flows the other way. Nothing on disk changes; enforcement starts
+    //! reading bits that were already there.
+    //!
+    //! **Why not the alternatives.** Keeping both directions leaves a flow
+    //! nobody granted. Switching it off for every existing pairing breaks
+    //! working setups silently, and turning it back on needs the enable arm of
+    //! the per-device switch, which waits for #107.
+    //!
+    //! The choice is one function, `trust::existing_pairing_clipboard`, and
+    //! this runs both machines' real transports over loopback, so swapping the
+    //! direction there fails here.
+
+    use std::collections::{HashMap, HashSet};
+
+    use hops_ipc::{AttemptOrigin, RevokedEntry};
+
+    use crate::service::grant_for_attempt;
+    use crate::test_harness::{
+        ARRIVES_WITHIN, Machine, NEVER_WITHIN, applied_within, clipboard_pair, machine, run_local,
+    };
+    use crate::trust::TrustStore;
+    use crate::trust_file::{rebuild, records_of};
+
+    /// Through disk, as every start after the one that made the pairing
+    /// loads it. The start that made it runs on the store in memory, so each
+    /// pairing is checked both ways.
+    fn reloaded(store: &TrustStore) -> TrustStore {
+        let (loaded, refused) =
+            rebuild(store.ours(), store.now(), &records_of(store)).expect("rebuild");
+        assert!(
+            refused.is_empty(),
+            "the store refused its own records: {refused:?}"
+        );
+        loaded
+    }
+
+    /// Paired on a build with the trust store: each machine approved the
+    /// other's prompt once, in the direction it was asked.
+    fn approved(driven: &Machine, driver: &Machine) -> (TrustStore, TrustStore) {
+        let mut on_driven = TrustStore::new(&driven.fingerprint, 0).expect("ours");
+        grant_for_attempt(
+            &mut on_driven,
+            &driver.fingerprint,
+            "driver",
+            Some(AttemptOrigin::Inbound),
+        )
+        .expect("grant");
+        let mut on_driver = TrustStore::new(&driver.fingerprint, 0).expect("ours");
+        grant_for_attempt(
+            &mut on_driver,
+            &driven.fingerprint,
+            "driven",
+            Some(AttemptOrigin::OutboundDial),
+        )
+        .expect("grant");
+        (on_driven, on_driver)
+    }
+
+    /// Paired on v0.12, which kept one flat allowlist: each machine listed the
+    /// other, and only the driver had a client entry dialling its peer.
+    fn migrated(driven: &Machine, driver: &Machine) -> (TrustStore, TrustStore) {
+        let migrate = |me: &Machine, peer: &Machine, dialled: bool| {
+            let mut store = TrustStore::new(&me.fingerprint, 0).expect("ours");
+            let authorized: HashMap<String, String> =
+                [(peer.fingerprint.clone(), "peer".to_string())].into();
+            let dialled: HashSet<String> = if dialled {
+                [peer.fingerprint.clone()].into()
+            } else {
+                HashSet::new()
+            };
+            let now = store.now();
+            store.migrate_from_config(
+                &authorized,
+                &HashMap::<String, RevokedEntry>::new(),
+                &dialled,
+                now,
+            );
+            store
+        };
+        (
+            migrate(driven, driver, false),
+            migrate(driver, driven, true),
+        )
+    }
+
+    // LEDGER T1861 | class B | 1 return value: ClipboardInbox::next over the queue transport::clipboard_accept_loop fills; ClipboardSender::broadcast, ClipboardSenderListen::broadcast, grant_for_attempt, migrate_from_config, trust_file::rebuild
+    #[test]
+    fn existing_pairings_keep_their_clipboard_direction() {
+        run_local(async {
+            type Pairing = fn(&Machine, &Machine) -> (TrustStore, TrustStore);
+            let pairings: [(&str, Pairing, bool); 4] = [
+                ("approved, in the run that approved it", approved, false),
+                ("approved, loaded at a later start", approved, true),
+                (
+                    "carried forward from a v0.12 config, in the upgrade's run",
+                    migrated,
+                    false,
+                ),
+                (
+                    "carried forward from a v0.12 config, loaded at a later start",
+                    migrated,
+                    true,
+                ),
+            ];
+            for (how, pair_up, reload) in pairings {
+                let (driven, driver) = (machine(), machine());
+                let (mut on_driven, mut on_driver) = pair_up(&driven, &driver);
+                if reload {
+                    (on_driven, on_driver) = (reloaded(&on_driven), reloaded(&on_driver));
+                }
+                let mut pair = clipboard_pair(driven, on_driven, driver, on_driver).await;
+                // What each machine's service would apply, through the check
+                // it makes first.
+                let (mut on_driven, mut on_driver) = pair.inboxes();
+
+                pair.driver_sends
+                    .broadcast("copied on the driver".to_string())
+                    .await;
+                assert_eq!(
+                    applied_within(&mut on_driven, ARRIVES_WITHIN)
+                        .await
+                        .as_deref(),
+                    Some("copied on the driver"),
+                    "{how}: text copied on the machine doing the driving no longer \
+                     reaches the machine it drives. #186 keeps that direction for \
+                     every existing pairing; losing it breaks a working setup with \
+                     nothing on screen to explain it."
+                );
+
+                pair.driven_sends
+                    .broadcast("copied on the driven machine".to_string())
+                    .await;
+                assert_eq!(
+                    applied_within(&mut on_driver, NEVER_WITHIN)
+                        .await
+                        .as_deref(),
+                    None,
+                    "{how}: text copied on the machine being driven reached the \
+                     machine driving it. Nobody granted that direction: the lease \
+                     carries clipboard from the driver to the driven machine only, \
+                     and #186 stops the reverse (issues #182, #186)."
+                );
+            }
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
 // #183 — no pairing expires until renewal exists
 // ---------------------------------------------------------------------------
 
