@@ -14,6 +14,8 @@
 //! delegation would reopen the MITM hole this migration closes.
 
 use std::collections::VecDeque;
+use std::net::SocketAddr;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex, Once, RwLock};
 
 use hops_proto::{MAX_EVENT_SIZE, ProtoEvent, ProtocolError};
@@ -26,7 +28,7 @@ use thiserror::Error;
 
 use crate::crypto::generate_fingerprint;
 
-/// The lease store, shared by both directions and by both clipboard loops.
+/// The lease store, shared by both directions and by the clipboard doors.
 ///
 /// Shared, but not symmetric: each verifier below asks it the question for its
 /// own direction. That is the whole of the fix — the store can express "this
@@ -401,4 +403,96 @@ pub async fn send_clipboard(conn: &quinn::Connection, text: &str) -> Result<(), 
 pub async fn recv_clipboard(mut recv: quinn::RecvStream) -> Result<String, ClipboardError> {
     let bytes = recv.read_to_end(MAX_CLIPBOARD_BYTES).await?;
     Ok(String::from_utf8(bytes)?)
+}
+
+/// Clipboard text a peer sent, with the fingerprint its connection presented.
+///
+/// The fingerprint travels with the text so the service can ask the store
+/// again before it applies it: a peer removed between the transfer and the
+/// apply must not have its text land.
+pub(crate) struct PeerClipboard {
+    pub(crate) from: String,
+    pub(crate) text: String,
+}
+
+/// Where one connection's clipboard transfers go, and whose connection it is.
+pub(crate) struct ClipboardInlet {
+    /// The fingerprint the peer presented at the handshake.
+    pub(crate) from: String,
+    pub(crate) trust: Trust,
+    pub(crate) tx: local_channel::mpsc::Sender<PeerClipboard>,
+}
+
+impl ClipboardInlet {
+    /// Whether the pairing takes clipboard from this peer, right now.
+    fn permits(&self) -> bool {
+        self.trust.read().expect("lock").clipboard_from(&self.from)
+    }
+}
+
+/// The stop code a peer sees when this machine refuses its clipboard.
+pub const CLIPBOARD_REFUSED: u32 = 1;
+
+const CLIP_REFUSED_LOG_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(60);
+thread_local! {
+    static PREV_CLIP_REFUSED_LOG: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn clipboard_refused(addr: SocketAddr) {
+    // Info and debounced: after an upgrade a machine being driven by an older
+    // build keeps sending in the direction nobody granted, on every copy.
+    crate::debounce!(
+        PREV_CLIP_REFUSED_LOG,
+        CLIP_REFUSED_LOG_DEBOUNCE,
+        log::info!(
+            "{addr}: clipboard not taken; the pairing does not share the clipboard \
+             in that direction"
+        )
+    );
+}
+
+/// Accepts the peer's clipboard uni streams (every stream after the primary
+/// one) and hands each payload on, with the peer's fingerprint, if the
+/// pairing takes clipboard from that peer.
+///
+/// One loop for both ends of a link. The listener and the dialler each had
+/// their own copy, and neither asked the store anything.
+///
+/// Asked twice. When a stream arrives, so a peer the pairing takes nothing
+/// from is stopped before it sends the rest; and when the transfer completes,
+/// because one begun while the peer was trusted can finish after it was
+/// removed.
+pub(crate) async fn clipboard_accept_loop(
+    conn: quinn::Connection,
+    addr: SocketAddr,
+    inlet: ClipboardInlet,
+) {
+    let inlet = Rc::new(inlet);
+    // `while let` rather than `loop`+`match`: the error arm is only ever
+    // "connection closed", handled by the input loop, so there is nothing to
+    // distinguish.
+    while let Ok(mut recv) = conn.accept_uni().await {
+        if !inlet.permits() {
+            let _ = recv.stop(CLIPBOARD_REFUSED.into());
+            clipboard_refused(addr);
+            continue;
+        }
+        let inlet = inlet.clone();
+        tokio::task::spawn_local(async move {
+            match tokio::time::timeout(CLIPBOARD_IO_TIMEOUT, recv_clipboard(recv)).await {
+                Ok(Ok(text)) if inlet.permits() => {
+                    let _ = inlet.tx.send(PeerClipboard {
+                        from: inlet.from.clone(),
+                        text,
+                    });
+                }
+                Ok(Ok(_)) => clipboard_refused(addr),
+                Ok(Err(e)) => log::debug!("{addr}: bad clipboard transfer: {e}"),
+                // dropping the recv future on timeout stops the stream
+                // and frees the uni-stream slot (never reaped otherwise)
+                Err(_) => log::debug!("{addr}: clipboard transfer timed out"),
+            }
+        });
+    }
 }

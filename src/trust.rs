@@ -42,10 +42,15 @@
 //! send input to that may not send input to us, and it is expressible because
 //! permission and identity are different fields.
 //!
-//! Every bit here is enforced at a real door in the same commit that adds it:
-//! the two input bits in the TLS verifiers, the two clipboard bits in the
-//! clipboard accept loops. A capability that is stored and never checked is a
-//! lie about what the store decides, and it is worse than not having the bit,
+//! Every bit here is enforced at a real door. The two input bits are checked
+//! in the TLS verifiers and again per event. The two clipboard bits were
+//! stored with nothing reading them, while this paragraph said otherwise;
+//! they are now checked where text leaves and where it lands:
+//! [`Caps::CLIPBOARD_TO`] per peer in both clipboard broadcasts,
+//! [`Caps::CLIPBOARD_FROM`] in the one clipboard accept loop, when a transfer
+//! starts and again when it completes, and once more before the service
+//! applies the text. A capability that is stored and never checked is a lie
+//! about what the store decides, and it is worse than not having the bit,
 //! because the UI would show it.
 //!
 //! # One record per identity
@@ -292,11 +297,14 @@ impl Caps {
     pub const KNOWN: Caps = Caps(0x000f);
 
     /// Everything the peer may do to us. The set a user is agreeing to when they
-    /// answer an unsolicited knock at the door.
-    pub const INBOUND: Caps = Caps(0x0005);
+    /// answer an unsolicited knock at the door: it may drive this machine, and
+    /// its clipboard follows it here ([`existing_pairing_clipboard`], #186).
+    pub const INBOUND: Caps = Caps::DRIVE_ME.union(existing_pairing_clipboard(Caps::DRIVE_ME));
     /// Everything we may do to the peer. The set a user is agreeing to when they
-    /// confirm the receiver our own dial reached.
-    pub const OUTBOUND: Caps = Caps(0x000a);
+    /// confirm the receiver our own dial reached: this machine may drive it,
+    /// and this machine's clipboard follows it there.
+    pub const OUTBOUND: Caps =
+        Caps::I_MAY_DRIVE.union(existing_pairing_clipboard(Caps::I_MAY_DRIVE));
 
     /// Name/bit pairs, for rendering, logging and the on-disk mapping.
     pub const NAMED: [(Caps, &'static str); 4] = [
@@ -343,6 +351,35 @@ impl Caps {
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
+}
+
+/// The clipboard a pairing made before #182 grants, from the drive bits it
+/// carries.
+///
+/// Decided 2026-09-16 (#186): text flows from the machine doing the driving to
+/// the machine being driven. A peer that may drive this machine
+/// ([`Caps::DRIVE_ME`]) may send this machine its clipboard; a peer this
+/// machine may drive ([`Caps::I_MAY_DRIVE`]) is sent this machine's. The
+/// reverse of each is nobody's grant, and stops. A pairing that goes both ways
+/// shares both ways.
+///
+/// These are exactly the bits [`Caps::INBOUND`] and [`Caps::OUTBOUND`] always
+/// carried, so no lease on disk changes. What changes is that the clipboard
+/// doors read them. Every existing pairing reaches this one function: the two
+/// constants, the migration from a v0.12 config, and through the constants
+/// the loader. The decision's guard,
+/// `decision_guards::pairings_made_before_182_keep_the_clipboard_direction_their_lease_grants`,
+/// runs both machines' transports on each of those, so a change here fails
+/// there.
+pub const fn existing_pairing_clipboard(drive: Caps) -> Caps {
+    let mut clipboard = Caps::NONE;
+    if drive.contains(Caps::DRIVE_ME) {
+        clipboard = clipboard.union(Caps::CLIPBOARD_FROM);
+    }
+    if drive.contains(Caps::I_MAY_DRIVE) {
+        clipboard = clipboard.union(Caps::CLIPBOARD_TO);
+    }
+    clipboard
 }
 
 impl std::ops::BitOr for Caps {
@@ -1221,6 +1258,8 @@ impl TrustStore {
     ///
     /// [`Caps::INBOUND`] always. [`Caps::OUTBOUND`] only when `dialled` names it
     /// — that is, when a `[[clients]]` entry actually pinned that fingerprint.
+    /// The clipboard half of each is [`existing_pairing_clipboard`] of the drive
+    /// bits (#186).
     ///
     /// The tempting answer is "both, because the old flat map fed both
     /// verifiers." It fed both, but membership was **necessary and not
@@ -1305,11 +1344,15 @@ impl TrustStore {
                 }
                 continue;
             }
-            let caps = if dialled.contains(&fp) {
-                Caps::INBOUND | Caps::OUTBOUND
+            let drive = if dialled.contains(&fp) {
+                Caps::DRIVE_ME | Caps::I_MAY_DRIVE
             } else {
-                Caps::INBOUND
+                Caps::DRIVE_ME
             };
+            // The v0.12 config never asked about the clipboard, so the
+            // pairing gets what #186 decided for every pairing made before
+            // that question existed.
+            let caps = drive | existing_pairing_clipboard(drive);
             let lease = Lease {
                 peer: fp.clone(),
                 issued_to: self.ours.clone(),

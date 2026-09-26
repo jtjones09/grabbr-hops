@@ -145,7 +145,9 @@ pub(crate) struct Dialer {
 }
 
 pub(crate) struct Notices {
-    _clipboard: Receiver<String>,
+    /// Clipboard text this machine's transport received and queued for the
+    /// service.
+    pub(crate) clipboard: Receiver<crate::transport::PeerClipboard>,
     _untrusted: Receiver<(String, std::net::SocketAddr)>,
     _persist: Receiver<ClientHandle>,
     _state: Receiver<ClientHandle>,
@@ -177,7 +179,7 @@ pub(crate) fn dialer(me: &Machine, trust: Trust, port: u16, pos: Position) -> Di
         clients,
         handle,
         notices: Notices {
-            _clipboard: clipboard,
+            clipboard,
             _untrusted: untrusted,
             _persist: persist,
             _state: state,
@@ -209,4 +211,128 @@ impl Dialer {
             .await
             .unwrap_or_else(|e| panic!("sending {event}: {e}"));
     }
+}
+
+/// Two paired machines with a link up between them: `driver` dialled
+/// `driven`, as a pairing's first crossing does. Each end's clipboard
+/// broadcast is the production one, and each end's queue is what its
+/// transport handed on towards the service.
+pub(crate) struct ClipboardPair {
+    pub(crate) driven: Machine,
+    pub(crate) driven_trust: Trust,
+    pub(crate) driven_sends: crate::listen::ClipboardSenderListen,
+    /// The driven machine's devices, which its broadcast asks about the switch.
+    pub(crate) driven_clients: ClientManager,
+    /// What the driven machine's transport queued for its service.
+    pub(crate) driven_heard: Receiver<crate::transport::PeerClipboard>,
+    _listener: crate::listen::LanMouseListener,
+    pub(crate) driver: Machine,
+    pub(crate) driver_trust: Trust,
+    pub(crate) driver_sends: crate::connect::ClipboardSender,
+    pub(crate) dialer: Dialer,
+}
+
+/// [`ClipboardPair`], each machine holding the store given for it.
+pub(crate) async fn clipboard_pair(
+    driven: Machine,
+    driven_store: TrustStore,
+    driver: Machine,
+    driver_store: TrustStore,
+) -> ClipboardPair {
+    use futures::StreamExt;
+    let driven_trust: Trust = Arc::new(RwLock::new(driven_store));
+    let driver_trust: Trust = Arc::new(RwLock::new(driver_store));
+    let (heard_tx, driven_heard) = channel();
+    let (mut listener, port) = crate::listen::LanMouseListener::bind_loopback(
+        driven.identity.clone(),
+        driven_trust.clone(),
+        heard_tx,
+    )
+    .await
+    .expect("listener");
+    let driven_clients = ClientManager::default();
+    let driven_sends = listener.clipboard_sender(driven_clients.clone());
+    let dialer = dialer(&driver, driver_trust.clone(), port, Position::Left);
+    dialer.conn.dial(dialer.handle).await;
+    let accepted = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = listener.next().await {
+            if let crate::listen::ListenEvent::Accept { .. } = event {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert!(
+        matches!(accepted, Ok(true)),
+        "the driven machine never accepted the driver's link"
+    );
+    wait_until(
+        "the driver to hold its link",
+        Duration::from_secs(10),
+        || dialer.conn.active_addr(dialer.handle).is_some(),
+    )
+    .await;
+    let driver_sends = dialer.conn.clipboard_sender();
+    ClipboardPair {
+        driven,
+        driven_trust,
+        driven_sends,
+        driven_clients,
+        driven_heard,
+        _listener: listener,
+        driver,
+        driver_trust,
+        driver_sends,
+        dialer,
+    }
+}
+
+/// How long a test waits for text that must arrive.
+pub(crate) const ARRIVES_WITHIN: Duration = Duration::from_secs(5);
+/// How long a test waits before concluding text that must not arrive did not.
+/// Loopback delivers in well under a millisecond.
+pub(crate) const NEVER_WITHIN: Duration = Duration::from_secs(1);
+
+/// The next item on `rx`, or `None` if nothing came within `limit`.
+pub(crate) async fn next_within<T>(rx: &mut Receiver<T>, limit: Duration) -> Option<T> {
+    tokio::time::timeout(limit, rx.recv()).await.ok().flatten()
+}
+
+/// The text of the next transfer queued on `rx`, and whose it says it is.
+pub(crate) async fn heard_within(
+    rx: &mut Receiver<crate::transport::PeerClipboard>,
+    limit: Duration,
+) -> Option<(String, String)> {
+    next_within(rx, limit).await.map(|c| (c.text, c.from))
+}
+
+impl ClipboardPair {
+    /// Each machine's queue behind the check the service makes before it
+    /// applies text, driven machine first. Takes the queues: what the
+    /// transports hand on is then only seen through the check.
+    pub(crate) fn inboxes(
+        &mut self,
+    ) -> (
+        crate::clipboard::ClipboardInbox,
+        crate::clipboard::ClipboardInbox,
+    ) {
+        let driven = std::mem::replace(&mut self.driven_heard, channel().1);
+        let driver = std::mem::replace(&mut self.dialer.notices.clipboard, channel().1);
+        (
+            crate::clipboard::ClipboardInbox::new(driven, self.driven_trust.clone()),
+            crate::clipboard::ClipboardInbox::new(driver, self.driver_trust.clone()),
+        )
+    }
+}
+
+/// The next text `inbox` lets through, or `None` if nothing did within `limit`.
+pub(crate) async fn applied_within(
+    inbox: &mut crate::clipboard::ClipboardInbox,
+    limit: Duration,
+) -> Option<String> {
+    tokio::time::timeout(limit, inbox.next())
+        .await
+        .ok()
+        .flatten()
 }

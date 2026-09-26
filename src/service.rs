@@ -1,7 +1,7 @@
 use crate::{
     capture::{Capture, CaptureType, ICaptureEvent},
     client::ClientManager,
-    clipboard::{Clipboard, ClipboardEvent},
+    clipboard::{Clipboard, ClipboardEvent, ClipboardInbox},
     config::{Config, ConfigClient, ConfigError},
     connect::{ClipboardSender, LanMouseConnection},
     crypto,
@@ -219,8 +219,9 @@ pub struct Service {
     /// whether the clipboard backend is still running (false once it stops, so
     /// the run loop does not busy-poll a closed channel)
     clipboard_alive: bool,
-    /// inbound clipboard text received from peers, applied to the local clipboard
-    clipboard_in: Receiver<String>,
+    /// inbound clipboard text received from peers, applied to the local
+    /// clipboard if the pairing still takes it from its sender
+    clipboard_in: ClipboardInbox,
     /// fingerprints of RECEIVERS we tried to dial but don't trust (from the
     /// connect side). Turned into `ConnectionAttempt` below so the UI can offer
     /// to authorize them — the outbound counterpart of the inbound pairing prompt.
@@ -442,12 +443,12 @@ impl Service {
         let trust: crate::transport::Trust = Arc::new(RwLock::new(store));
 
         // clipboard sync: a single inbound channel both transports push received
-        // payloads into, plus the local monitor/apply backend. The channel is
-        // unbounded — acceptable for the trusted KVM-pair model (peers are
-        // mutually fingerprint-authenticated). Each transfer is capped at
-        // transport::MAX_CLIPBOARD_BYTES and stalled transfers time out, but a
-        // malicious/buggy *authorized* peer flooding valid payloads is not yet
-        // back-pressured; a bounded/coalescing channel is the future hardening.
+        // payloads into, each with its sender's fingerprint, plus the local
+        // monitor/apply backend. Only a peer whose lease carries clipboard-from
+        // reaches the channel. It is unbounded: each transfer is capped at
+        // transport::MAX_CLIPBOARD_BYTES and stalled transfers time out, but
+        // such a peer flooding valid payloads is not yet back-pressured; a
+        // bounded/coalescing channel is the future hardening.
         let (clipboard_in_tx, clipboard_in) = channel();
         let (untrusted_tx, untrusted_receivers) = channel();
         let (persist_tx, persist_requests) = channel();
@@ -478,7 +479,7 @@ impl Service {
         // clipboard broadcast handles — grabbed before the transports are moved
         // into capture/emulation below.
         let clipboard_out_conn = conn.clipboard_sender();
-        let clipboard_out_listen = listener.clipboard_sender();
+        let clipboard_out_listen = listener.clipboard_sender(client_manager.clone());
         // revocation handles, grabbed before both are moved into capture/emulation
         let revoke_conn = conn.revoker();
         let revoke_listen = listener.revoker();
@@ -505,6 +506,7 @@ impl Service {
         );
 
         let port = config.port();
+        let clipboard_in = ClipboardInbox::new(clipboard_in, trust.clone());
         let service = Self {
             config,
             capture,
@@ -620,7 +622,7 @@ impl Service {
                         }
                     }
                 }
-                text = self.clipboard_in.recv() => {
+                text = self.clipboard_in.next() => {
                     if let Some(text) = text {
                         self.clipboard.apply(text);
                     }
@@ -648,8 +650,9 @@ impl Service {
         Ok(())
     }
 
-    /// A *local* clipboard change → broadcast it to every connected peer (both
-    /// directions). `None` means the clipboard backend stopped; disable the arm.
+    /// A *local* clipboard change → broadcast it to every connected peer the
+    /// pairing shares it with, on links in either direction. `None` means the
+    /// clipboard backend stopped; disable the arm.
     ///
     /// Content *applied from a peer* is intentionally NOT re-broadcast (apply()
     /// seeds the poll baseline, so it never fires `changed()`), which prevents

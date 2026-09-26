@@ -1,7 +1,7 @@
 use crate::client::ClientManager;
 use crate::config::{local_caps, local_commit};
 use crate::crypto::Identity;
-use crate::transport::{self, FpServerVerifier, Trust};
+use crate::transport::{self, ClipboardInlet, FpServerVerifier, PeerClipboard, Trust};
 use hops_ipc::{ClientHandle, DEFAULT_PORT};
 use hops_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender, channel};
@@ -59,6 +59,9 @@ struct PeerLink {
     /// this on every send, not only at the handshake: trust can be withdrawn
     /// while the link stays open (#156).
     fingerprint: String,
+    /// The client this link was dialled for, so a device switched off on its
+    /// card is not sent this machine's clipboard over a link still open.
+    handle: ClientHandle,
 }
 
 fn client_config(
@@ -106,6 +109,7 @@ async fn connect(
     addr: SocketAddr,
     expected_fp: Option<String>,
     trust: Trust,
+    handle: ClientHandle,
 ) -> Result<(PeerLink, SocketAddr), (SocketAddr, LanMouseConnectionError)> {
     log::info!("connecting to {addr} ...");
     // server_name is the SNI label; trust is by fingerprint, so it is not
@@ -152,6 +156,7 @@ async fn connect(
             conn,
             send: Arc::new(Mutex::new(send)),
             fingerprint,
+            handle,
         },
         addr,
     ))
@@ -230,6 +235,7 @@ async fn connect_any(
     dials: &[Dial],
     expected_fp: Option<String>,
     trust: &Trust,
+    handle: ClientHandle,
 ) -> Result<(PeerLink, SocketAddr), LanMouseConnectionError> {
     let addrs: Vec<SocketAddr> = dials.iter().map(|d| d.addr).collect();
     let mut joinset = JoinSet::new();
@@ -238,7 +244,14 @@ async fn connect_any(
         let cfg = d.cfg.clone();
         let addr = d.addr;
         let expected = expected_fp.clone();
-        joinset.spawn_local(connect(endpoint, cfg, addr, expected, trust.clone()));
+        joinset.spawn_local(connect(
+            endpoint,
+            cfg,
+            addr,
+            expected,
+            trust.clone(),
+            handle,
+        ));
     }
     // if every candidate failed the identity pin (not a transport error), surface
     // that distinctly so the caller logs the right recovery guidance.
@@ -281,7 +294,7 @@ pub(crate) struct LanMouseConnection {
     identity: Arc<Identity>,
     trust: Trust,
     /// inbound clipboard text received from peers, forwarded to the service.
-    clipboard_in: Sender<String>,
+    clipboard_in: Sender<PeerClipboard>,
     /// signals the service that this client's peer_fingerprint was just learned,
     /// so it can persist it AND push the new state to the frontend. Without this
     /// the join key is in-memory only and never reaches the UI, so every device
@@ -307,7 +320,7 @@ impl LanMouseConnection {
         identity: Arc<Identity>,
         client_manager: ClientManager,
         trust: Trust,
-        clipboard_in: Sender<String>,
+        clipboard_in: Sender<PeerClipboard>,
         untrusted_tx: Sender<(String, SocketAddr)>,
         persist_tx: Sender<ClientHandle>,
         state_tx: Sender<ClientHandle>,
@@ -355,12 +368,14 @@ impl LanMouseConnection {
         }
     }
 
-    /// A handle for broadcasting local clipboard changes to all connected
-    /// peers. Grabbed before this connection is moved into `Capture` so the
-    /// service can drive it directly.
+    /// A handle for broadcasting local clipboard changes to the connected
+    /// peers the pairing shares it with. Grabbed before this connection is
+    /// moved into `Capture` so the service can drive it directly.
     pub(crate) fn clipboard_sender(&self) -> ClipboardSender {
         ClipboardSender {
             conns: self.conns.clone(),
+            trust: self.trust.clone(),
+            clients: self.client_manager.clone(),
         }
     }
 
@@ -510,11 +525,14 @@ impl LanMouseConnection {
     }
 }
 
-/// Broadcasts clipboard text to every connected peer, each on its own
-/// ephemeral uni stream. Cloneable handle over the shared connection map.
+/// Broadcasts clipboard text to each connected peer the pairing shares it
+/// with, each on its own ephemeral uni stream. Cloneable handle over the
+/// shared connection map.
 #[derive(Clone)]
 pub(crate) struct ClipboardSender {
     conns: Rc<Mutex<HashMap<SocketAddr, PeerLink>>>,
+    trust: Trust,
+    clients: ClientManager,
 }
 
 /// One clipboard-failure line a minute is enough to tell you it is dropping,
@@ -529,7 +547,16 @@ impl ClipboardSender {
     pub(crate) async fn broadcast(&self, text: String) {
         let conns: Vec<Connection> = {
             let conns = self.conns.lock().await;
-            conns.values().map(|l| l.conn.clone()).collect()
+            let trust = self.trust.read().expect("lock");
+            // Every open link used to get it, including one to a device that
+            // was removed or switched off while the link stayed up. Sent only
+            // where the lease says so (#186) and the device is switched on.
+            conns
+                .values()
+                .filter(|l| trust.clipboard_to(&l.fingerprint))
+                .filter(|l| self.clients.is_active(l.handle))
+                .map(|l| l.conn.clone())
+                .collect()
         };
         for conn in conns {
             let text = text.clone();
@@ -608,7 +635,7 @@ async fn connect_to_handle(
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
     identity: Arc<Identity>,
     trust: Trust,
-    clipboard_in: Sender<String>,
+    clipboard_in: Sender<PeerClipboard>,
     untrusted_tx: Sender<(String, SocketAddr)>,
     persist_tx: Sender<ClientHandle>,
     state_tx: Sender<ClientHandle>,
@@ -646,7 +673,7 @@ async fn connect_to_handle(
                 }
             })
             .collect();
-        let (link, addr) = match connect_any(&endpoint, &dials, expected_fp, &trust).await {
+        let (link, addr) = match connect_any(&endpoint, &dials, expected_fp, &trust, handle).await {
             Ok(c) => c,
             Err(e) => {
                 connecting.lock().await.remove(&handle);
@@ -767,6 +794,11 @@ async fn connect_to_handle(
             conns.clone(),
             ping_response.clone(),
         ));
+        let clipboard = ClipboardInlet {
+            from: link.fingerprint.clone(),
+            trust,
+            tx: clipboard_in,
+        };
         spawn_local(receive_loop(
             client_manager,
             handle,
@@ -775,7 +807,7 @@ async fn connect_to_handle(
             conns,
             tx,
             ping_response.clone(),
-            clipboard_in,
+            clipboard,
             state_tx,
         ));
         return Ok(());
@@ -831,7 +863,7 @@ async fn receive_loop(
     conns: Rc<Mutex<HashMap<SocketAddr, PeerLink>>>,
     tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
-    clipboard_in: Sender<String>,
+    clipboard: ClipboardInlet,
     state_tx: Sender<ClientHandle>,
 ) {
     // the peer's reliable inbound stream (their uni stream to us)
@@ -845,7 +877,11 @@ async fn receive_loop(
     };
     // The reply stream above is accepted first (opened at connection setup);
     // clipboard transfers ride the subsequent uni streams on this connection.
-    spawn_local(clipboard_accept_loop(link.conn.clone(), addr, clipboard_in));
+    spawn_local(transport::clipboard_accept_loop(
+        link.conn.clone(),
+        addr,
+        clipboard,
+    ));
     loop {
         match transport::read_frame(&mut recv).await {
             Ok(Some(event)) => {
@@ -944,35 +980,6 @@ async fn disconnect(
     // is revoked (remove_authorized_key).
     let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
     log::info!("active connections: {active:?}");
-}
-
-/// Accepts the peer's ephemeral clipboard uni streams (everything after the
-/// primary reply stream) and forwards each payload to the service.
-async fn clipboard_accept_loop(conn: Connection, addr: SocketAddr, clipboard_in: Sender<String>) {
-    // `while let` rather than `loop`+`match`: the error arm is only ever
-    // "connection closed", handled by the input loop, so there is nothing to
-    // distinguish.
-    while let Ok(recv) = conn.accept_uni().await {
-        {
-            let clipboard_in = clipboard_in.clone();
-            spawn_local(async move {
-                match tokio::time::timeout(
-                    transport::CLIPBOARD_IO_TIMEOUT,
-                    transport::recv_clipboard(recv),
-                )
-                .await
-                {
-                    Ok(Ok(text)) => {
-                        let _ = clipboard_in.send(text);
-                    }
-                    Ok(Err(e)) => log::debug!("{addr}: bad clipboard transfer: {e}"),
-                    // dropping the recv future on timeout stops the stream
-                    // and frees the uni-stream slot (never reaped otherwise)
-                    Err(_) => log::debug!("{addr}: clipboard transfer timed out"),
-                }
-            });
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1088,14 +1095,16 @@ mod tests {
                     cfgs[0].clone(),
                     addrs[0],
                     None,
-                    empty.clone()
+                    empty.clone(),
+                    0
                 ),
                 connect(
                     client_ep.clone(),
                     cfgs[1].clone(),
                     addrs[1],
                     None,
-                    empty.clone()
+                    empty.clone(),
+                    1
                 ),
             );
 
@@ -1345,11 +1354,18 @@ mod tests {
         )
         .expect("connection");
         let cfg = client_config(&client, trust.clone(), Arc::new(StdMutex::new(None)));
-        let (link, addr) = connect(conn.endpoint.clone(), cfg, addr, None, trust.clone())
-            .await
-            .expect("a permitted receiver is dialled");
-        conn.conns.lock().await.insert(addr, link);
         let handle = conn.client_manager.add_client();
+        let (link, addr) = connect(
+            conn.endpoint.clone(),
+            cfg,
+            addr,
+            None,
+            trust.clone(),
+            handle,
+        )
+        .await
+        .expect("a permitted receiver is dialled");
+        conn.conns.lock().await.insert(addr, link);
         conn.client_manager.set_active_addr(handle, Some(addr));
         conn.client_manager.set_alive(handle, true);
         Recorded {
@@ -1476,7 +1492,7 @@ mod tests {
 
             let ep = Endpoint::client("127.0.0.1:0".parse().expect("addr")).expect("endpoint");
             let cfg = client_config(&client, then, Arc::new(StdMutex::new(None)));
-            let dialled = connect(ep, cfg, addr, None, now).await;
+            let dialled = connect(ep, cfg, addr, None, now, 0).await;
             assert!(
                 matches!(dialled, Err((_, LanMouseConnectionError::NotPermitted))),
                 "a dial whose permission was withdrawn after the handshake was kept: {:?}",
@@ -1615,7 +1631,7 @@ mod tests {
                 })
                 .collect();
 
-            let _ = connect_any(&client_ep, &dials, None, &empty).await;
+            let _ = connect_any(&client_ep, &dials, None, &empty, 0).await;
 
             for (i, d) in dials.iter().enumerate() {
                 assert_eq!(
