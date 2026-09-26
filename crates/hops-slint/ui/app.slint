@@ -83,6 +83,10 @@ export component AppWindow inherits Window {
     in property <int> notice-seq: 0;
     property <int> dismissed-seq: 0;
     in property <bool> connected: false;
+    // What is wrong with the service, or empty: why the service the app
+    // started did not come up, or that the daemon runs another build than
+    // this app. Not dismissible: it stays while it is true.
+    in property <string> service-problem: "";
     in property <string> capture: "—";
     in property <string> emulation: "—";
     in property <string> port: "—";
@@ -244,6 +248,24 @@ export component AppWindow inherits Window {
                 text: "enable input";
                 primary: true;
                 clicked => { root.enable-input(); }
+            }
+        }
+
+        // --- the service: a start that did not come up, or another build ------
+        if root.service-problem != "": Rectangle {
+            vertical-stretch: 0;
+            background: Theme.c.warn.transparentize(0.9);
+            border-radius: Radius.lg;
+            border-width: 1px;
+            border-color: Theme.c.warn.transparentize(0.55);
+            HorizontalLayout {
+                padding: Space.md;
+                Text {
+                    text: root.service-problem;
+                    color: Theme.c.foreground;
+                    font-size: Type.small;
+                    wrap: word-wrap;
+                }
             }
         }
 

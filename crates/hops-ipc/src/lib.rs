@@ -378,6 +378,30 @@ pub enum FrontendEvent {
     /// Pairing prompts may appear on this machine for this many more seconds.
     /// Zero means the window is closed (#195).
     PairingOpen { seconds: u32 },
+    /// The build this daemon runs. Sent first on every sync, before any
+    /// state, so a frontend that sees state without it knows the daemon
+    /// predates this event.
+    ///
+    /// A daemon can be another build than the app talking to it: launchd
+    /// keeps the previous version's daemon running when the app is replaced
+    /// in place, and it still serves.
+    DaemonBuild(Build),
+}
+
+/// Which build a program is: its package version and the commit it was built
+/// from. Two builds are the same only when both match.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Build {
+    /// The package version, as `hops --version` prints it.
+    pub version: String,
+    /// The short commit it was built from, or `unknown`.
+    pub commit: String,
+}
+
+impl Display for Build {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.version, self.commit)
+    }
 }
 
 /// A machine advertising itself on the local network.

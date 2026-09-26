@@ -1118,6 +1118,9 @@ impl Service {
     }
 
     fn sync_frontend(&mut self) {
+        // First, before any state: a frontend that receives state without it
+        // knows this daemon predates the event, and so is another build.
+        self.notify_frontend(FrontendEvent::DaemonBuild(crate::config::this_build()));
         self.publish_pairing_window();
         self.enumerate();
         // Tell a newly-attached frontend whether we are LOOKING, before anything

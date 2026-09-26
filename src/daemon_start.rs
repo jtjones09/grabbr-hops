@@ -110,23 +110,88 @@ pub fn start_unless_running(
     watch: &mut impl Watch,
     within: Duration,
 ) -> DaemonStart {
+    start_unless_running_reported(endpoint, start, watch, within).outcome
+}
+
+/// What the front door did about the daemon, with what a user needs to be
+/// shown when it did not come up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartReport {
+    pub outcome: DaemonStart,
+    /// Why nothing was started, or nothing could be asked, in words.
+    pub why: Option<String>,
+    /// The file the daemon logs to, where it says why it stopped.
+    pub log_file: Option<PathBuf>,
+    /// How long the front door waited for a daemon it started.
+    pub within: Duration,
+}
+
+impl StartReport {
+    /// What to show the user, or `None` when a daemon is running.
+    ///
+    /// Without this a start that failed reached the screen as "connecting",
+    /// indefinitely, with the reason in a log nobody was pointed at (#189).
+    pub fn problem(&self) -> Option<String> {
+        let log = |lead: &str| match &self.log_file {
+            // On a line of its own, so a wrapped line does not split the path.
+            Some(path) => format!("{lead}:\n{}", path.display()),
+            None => String::new(),
+        };
+        let why = self.why.as_deref().unwrap_or("no reason was given");
+        match self.outcome {
+            DaemonStart::AlreadyRunning | DaemonStart::Started(_) => None,
+            DaemonStart::Exited(_) => Some(format!(
+                "The hops service started and stopped again before it answered. {}",
+                log("Its log says why")
+            )),
+            DaemonStart::NoAnswer(_) => Some(format!(
+                "The hops service was started but did not answer within {}. It may still \
+                 be starting. {}",
+                seconds(self.within),
+                log("If this stays, its log may say why")
+            )),
+            DaemonStart::StartFailed => {
+                Some(format!("The hops service could not be started: {why}."))
+            }
+            DaemonStart::CannotProbe => Some(format!(
+                "hops could not work out where its service listens ({why}), so it did \
+                 not start one."
+            )),
+        }
+        .map(|text| text.trim_end().to_string())
+    }
+}
+
+/// [`start_unless_running`], reporting why a start did not come up.
+pub fn start_unless_running_reported(
+    endpoint: Result<DaemonEndpoint, SocketPathError>,
+    start: impl FnOnce() -> io::Result<u32>,
+    watch: &mut impl Watch,
+    within: Duration,
+) -> StartReport {
+    let report = |outcome, why: Option<String>, log_file| StartReport {
+        outcome,
+        why,
+        log_file,
+        within,
+    };
     let endpoint = match endpoint {
         Ok(endpoint) => endpoint,
         Err(e) => {
             log::warn!("cannot tell whether a daemon is running ({e}); not starting one");
-            return DaemonStart::CannotProbe;
+            return report(DaemonStart::CannotProbe, Some(e.to_string()), None);
         }
     };
     if endpoint.answers() {
         log::info!("a daemon answers on {endpoint}; not starting another");
-        return DaemonStart::AlreadyRunning;
+        return report(DaemonStart::AlreadyRunning, None, None);
     }
     log::info!("no daemon answers on {endpoint}; starting one");
     let pid = match start() {
         Ok(pid) => pid,
         Err(e) => {
             log::warn!("could not start the daemon: {e}");
-            return DaemonStart::StartFailed;
+            return report(DaemonStart::StartFailed, Some(e.to_string()), None);
         }
     };
     let outcome = wait_for_daemon(&endpoint, pid, watch, within);
@@ -141,7 +206,7 @@ pub fn start_unless_running(
             what_became_of(pid, outcome, &endpoint, within, log_file.as_deref())
         ),
     }
-    outcome
+    report(outcome, None, log_file)
 }
 
 /// Wait up to `within` for the daemon process `pid` to serve frontends on
@@ -232,13 +297,22 @@ pub fn ensure_running_with(
     start_unless_running(DaemonEndpoint::of_this_platform(), start, watch, within)
 }
 
+/// [`ensure_running_with`], reporting why a start did not come up.
+pub fn ensure_running_reported_with(
+    start: impl FnOnce() -> io::Result<u32>,
+    watch: &mut impl Watch,
+    within: Duration,
+) -> StartReport {
+    start_unless_running_reported(DaemonEndpoint::of_this_platform(), start, watch, within)
+}
+
 /// Make sure a daemon is running, starting one only if none answers.
 ///
 /// A daemon that answers is left alone whoever started it. On macOS that also
 /// means no LaunchAgent is installed beside it to race it at the next login.
 #[cfg(any(feature = "tui", feature = "slint"))]
-pub fn ensure_running() -> DaemonStart {
-    ensure_running_with(start_platform_daemon, &mut ThisMachine, START_WAIT)
+pub fn ensure_running() -> StartReport {
+    ensure_running_reported_with(start_platform_daemon, &mut ThisMachine, START_WAIT)
 }
 
 /// Start the daemon the way this platform runs it: the GRANTED launchd service
@@ -308,14 +382,26 @@ impl LaunchctlRun {
 
 /// Bring the launchd job up, and return the id of its running process.
 ///
-/// A job that is not loaded is bootstrapped from its plist, which `install`
-/// writes if it is missing. Either way the job is then kickstarted without
-/// `-k`: launchd starts a job that is loaded but has no process, and leaves
-/// a running one alone. The plist's `KeepAlive` restarts the daemon only after
-/// an unsuccessful exit, so a daemon that quit, or exited because another held
-/// the endpoint, stays loaded with no process until something starts it. Its
-/// `RunAtLoad` starts the daemon as the job is bootstrapped, so the kickstart
-/// after a bootstrap usually finds it running.
+/// Runs only when no daemon answers on the endpoint (see
+/// [`start_unless_running`]), so nothing it does can stop a daemon that
+/// serves.
+///
+/// `agent` first makes the job's plist run this binary the way this build
+/// runs the daemon, and says whether it had to change the file. A job that is
+/// not loaded is then bootstrapped from the plist. A loaded job keeps the
+/// definition it was loaded with, so one whose plist was just changed is
+/// booted out and bootstrapped again: until then launchd would go on starting
+/// the binary the old plist named, which after the app moves is a path that
+/// is not there (#170). A plist that could not be changed leaves the job
+/// loaded as it was, and the start fails naming the file.
+///
+/// Either way the job is then kickstarted without `-k`: launchd starts a job
+/// that is loaded but has no process, and leaves a running one alone. The
+/// plist's `KeepAlive` restarts the daemon only after an unsuccessful exit,
+/// so a daemon that quit, or exited because another held the endpoint, stays
+/// loaded with no process until something starts it. Its `RunAtLoad` starts
+/// the daemon as the job is bootstrapped, so the kickstart after a bootstrap
+/// usually finds it running.
 ///
 /// Succeeds only when `kickstart -p` names a process, having started it (exit
 /// 0) or found it running (exit 37). `launchctl print` says whether the job is
@@ -328,7 +414,8 @@ impl LaunchctlRun {
 fn start_through_launchd(
     uid: u32,
     launchctl: &mut dyn FnMut(&[&str]) -> io::Result<LaunchctlRun>,
-    install: impl FnOnce() -> io::Result<String>,
+    agent: impl FnOnce() -> io::Result<AgentFile>,
+    pause: &mut dyn FnMut(Duration),
 ) -> io::Result<u32> {
     let domain = format!("gui/{uid}");
     let service = format!("{domain}/{LAUNCHD_LABEL}");
@@ -341,17 +428,41 @@ fn start_through_launchd(
         })
     };
 
+    let loaded = launch(&["print", &service])?.succeeded();
+    let agent = agent()?;
+    let reload = loaded && agent.rewritten;
+    if reload {
+        // Nothing answers on the endpoint, so the job has no daemon that
+        // serves. Whether this succeeds is for the bootstrap below to say.
+        let out = launch(&["bootout", &service])?;
+        if !out.succeeded() {
+            log::debug!("`launchctl bootout {service}`: {}", out.reason());
+        }
+    }
+
     let mut not_loaded = String::new();
-    if !launch(&["print", &service])?.succeeded() {
-        let plist = install()?;
-        let bootstrap = launch(&["bootstrap", &domain, &plist])?;
-        if !bootstrap.succeeded() {
+    if !loaded || agent.rewritten {
+        // launchd tears a booted-out job down after `bootout` returns, and a
+        // bootstrap that comes too soon fails with an I/O error; so after a
+        // bootout a failed bootstrap is tried again.
+        let mut waits = if reload { REBOOTSTRAP_WAITS } else { &[] }.iter();
+        loop {
+            let bootstrap = launch(&["bootstrap", &domain, &agent.path])?;
+            if bootstrap.succeeded() {
+                break;
+            }
+            if let Some(&wait) = waits.next() {
+                pause(wait);
+                continue;
+            }
             // Another start may have loaded the job since `print`, so this is
             // not yet a failure: the kickstart below says whether it runs.
             not_loaded = format!(
-                "`launchctl bootstrap {domain} {plist}` failed: {}; ",
+                "`launchctl bootstrap {domain} {}` failed: {}; ",
+                agent.path,
                 bootstrap.reason()
             );
+            break;
         }
     }
 
@@ -369,6 +480,30 @@ fn start_through_launchd(
             kick.reason()
         ))),
     }
+}
+
+/// How long to wait before each further bootstrap of a job just booted out.
+#[cfg_attr(
+    not(all(target_os = "macos", any(feature = "tui", feature = "slint"))),
+    allow(dead_code)
+)]
+const REBOOTSTRAP_WAITS: &[Duration] = &[
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+];
+
+/// The job's plist as [`point_agent_at`] left it.
+#[cfg_attr(
+    not(all(target_os = "macos", any(feature = "tui", feature = "slint"))),
+    allow(dead_code)
+)]
+#[derive(Debug)]
+struct AgentFile {
+    /// Where it is.
+    path: String,
+    /// Whether it was written or changed, so a loaded job must be reloaded.
+    rewritten: bool,
 }
 
 /// The process id `launchctl kickstart -p` printed: a bare number when its
@@ -396,7 +531,12 @@ fn pid_in(stdout: &str) -> Option<u32> {
 fn ensure_launchd_daemon() -> io::Result<u32> {
     // SAFETY: getuid has no preconditions and cannot fail.
     let uid = unsafe { libc::getuid() };
-    start_through_launchd(uid, &mut run_launchctl, install_launchd_plist_if_missing)
+    start_through_launchd(
+        uid,
+        &mut run_launchctl,
+        keep_agent_pointing_here,
+        &mut std::thread::sleep,
+    )
 }
 
 #[cfg(all(target_os = "macos", any(feature = "tui", feature = "slint")))]
@@ -413,52 +553,242 @@ fn run_launchctl(args: &[&str]) -> io::Result<LaunchctlRun> {
     })
 }
 
-/// Write `~/Library/LaunchAgents/com.grabbr.hops.plist` (pointed at the current
-/// binary) if absent; returns its path. Grant is path-bound, so the plist must
-/// point at whatever `hops` binary the user actually launched.
+/// [`point_agent_at`] for `~/Library/LaunchAgents/com.grabbr.hops.plist` and
+/// the binary the user launched. The Accessibility grant can be bound to the
+/// path, so the plist must name whatever `hops` binary the user actually ran.
 #[cfg(all(target_os = "macos", any(feature = "tui", feature = "slint")))]
-fn install_launchd_plist_if_missing() -> io::Result<String> {
+fn keep_agent_pointing_here() -> io::Result<AgentFile> {
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "$HOME is not set"))?;
-    let plist_path = home.join(format!("Library/LaunchAgents/{LAUNCHD_LABEL}.plist"));
-    if plist_path.exists() {
-        return Ok(plist_path.to_string_lossy().into_owned());
-    }
-    let exe = std::env::current_exe()?;
+    let plist = home.join(format!("Library/LaunchAgents/{LAUNCHD_LABEL}.plist"));
     let logs = home.join("hops/logs");
     let _ = std::fs::create_dir_all(&logs);
-    let log = logs.join("daemon.log");
-    let plist = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key><string>{LAUNCHD_LABEL}</string>
-    <key>ProgramArguments</key>
-    <array><string>{exe}</string><string>daemon</string></array>
-    <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
-    <key>ThrottleInterval</key><integer>10</integer>
-    <key>ProcessType</key><string>Interactive</string>
-    <key>StandardOutPath</key><string>{log}</string>
-    <key>StandardErrorPath</key><string>{log}</string>
-</dict>
-</plist>
-"#,
-        exe = exe.display(),
-        log = log.display()
-    );
-    if let Some(dir) = plist_path.parent() {
-        std::fs::create_dir_all(dir)?;
+    point_agent_at(&plist, &std::env::current_exe()?, &logs.join("daemon.log"))
+}
+
+/// A plist's top-level dictionary, as `plutil` reads it into JSON.
+type Plist = serde_json::Map<String, serde_json::Value>;
+
+/// The plist this build writes for a job that runs `exe` as the daemon.
+#[cfg_attr(
+    not(all(target_os = "macos", any(feature = "tui", feature = "slint"))),
+    allow(dead_code)
+)]
+fn fresh_agent(exe: &str, log: &str) -> Plist {
+    let serde_json::Value::Object(plist) = serde_json::json!({
+        "Label": LAUNCHD_LABEL,
+        "ProgramArguments": [exe, "daemon"],
+        "RunAtLoad": true,
+        "KeepAlive": { "SuccessfulExit": false },
+        "ThrottleInterval": 10,
+        "ProcessType": "Interactive",
+        "StandardOutPath": log,
+        "StandardErrorPath": log,
+    }) else {
+        unreachable!("a JSON object literal")
+    };
+    plist
+}
+
+/// Make `agent` run `exe` as the daemon under this job's label, restarted
+/// after an unsuccessful exit, touching no other key: whoever wrote the file
+/// may have set its environment or its log paths. Returns what was wrong with
+/// it, empty when nothing was.
+///
+/// The program counts as `exe` when it names the same file, so a link to the
+/// binary is left alone. A path that names no file is always wrong: it is
+/// what launchd is left starting after the app moves.
+#[cfg_attr(
+    not(all(target_os = "macos", any(feature = "tui", feature = "slint"))),
+    allow(dead_code)
+)]
+fn repoint(agent: &mut Plist, exe: &Path, exe_text: &str) -> Vec<String> {
+    use serde_json::{Value, json};
+    let mut wrong = Vec::new();
+
+    if agent.get("Label").and_then(Value::as_str) != Some(LAUNCHD_LABEL) {
+        wrong.push(format!(
+            "its label was {}",
+            agent.get("Label").unwrap_or(&Value::Null)
+        ));
+        agent.insert("Label".into(), json!(LAUNCHD_LABEL));
     }
-    std::fs::write(&plist_path, plist).map_err(|e| {
+
+    let program: Vec<&str> = agent
+        .get("ProgramArguments")
+        .and_then(Value::as_array)
+        .map(|args| args.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let runs_exe = matches!(program.as_slice(), [bin, "daemon"] if names_file(bin, exe));
+    if !runs_exe {
+        wrong.push(format!("it ran `{}`", program.join(" ")));
+        agent.insert("ProgramArguments".into(), json!([exe_text, "daemon"]));
+    }
+
+    // `true` restarts after any exit; a dictionary restarts after a failure
+    // only when it says `SuccessfulExit` is false. v0.12 wrote `false`, so a
+    // daemon that crashed stayed down for the rest of the session.
+    let restarts = match agent.get("KeepAlive") {
+        Some(Value::Bool(always)) => *always,
+        Some(Value::Object(when)) => when.get("SuccessfulExit") == Some(&Value::Bool(false)),
+        _ => false,
+    };
+    if !restarts {
+        wrong.push("launchd would not restart it after a failure".into());
+        agent.insert("KeepAlive".into(), json!({ "SuccessfulExit": false }));
+        agent.entry("ThrottleInterval").or_insert_with(|| json!(10));
+    }
+    wrong
+}
+
+/// Whether `named` names the same file as `exe`: the same path, or one that
+/// resolves to it. A path that resolves to nothing names no file.
+#[cfg_attr(
+    not(all(target_os = "macos", any(feature = "tui", feature = "slint"))),
+    allow(dead_code)
+)]
+fn names_file(named: &str, exe: &Path) -> bool {
+    let named = Path::new(named);
+    match (std::fs::canonicalize(named), std::fs::canonicalize(exe)) {
+        (Ok(a), Ok(b)) => a == b,
+        (Err(_), _) => false,
+        (Ok(_), Err(_)) => named == exe,
+    }
+}
+
+/// What is at a plist's path.
+#[cfg_attr(
+    not(all(target_os = "macos", any(feature = "tui", feature = "slint"))),
+    allow(dead_code)
+)]
+#[derive(Debug)]
+enum OnDisk {
+    Missing,
+    /// There, but `plutil` could not read a dictionary from it.
+    Unreadable(String),
+    Found(Plist),
+}
+
+/// Read the plist at `path` with `plutil`, the parser launchd's own tools
+/// use, so any format and layout another writer used reads the same.
+#[cfg_attr(
+    not(all(target_os = "macos", any(feature = "tui", feature = "slint"))),
+    allow(dead_code)
+)]
+fn read_agent(path: &Path) -> io::Result<OnDisk> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(OnDisk::Missing),
+        Err(e) => return Err(e),
+        Ok(_) => {}
+    }
+    let out = std::process::Command::new("plutil")
+        .args(["-convert", "json", "-o", "-", "--"])
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    if !out.status.success() {
+        return Ok(OnDisk::Unreadable(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ));
+    }
+    Ok(match serde_json::from_slice(&out.stdout) {
+        Ok(serde_json::Value::Object(plist)) => OnDisk::Found(plist),
+        _ => OnDisk::Unreadable("it does not hold a dictionary".into()),
+    })
+}
+
+/// Write `plist` to `path` as an XML plist, replacing the file in one step.
+#[cfg_attr(
+    not(all(target_os = "macos", any(feature = "tui", feature = "slint"))),
+    allow(dead_code)
+)]
+fn write_agent(path: &Path, plist: &Plist) -> io::Result<()> {
+    use std::io::Write;
+    let fail =
+        |e: io::Error| io::Error::new(e.kind(), format!("could not write {}: {e}", path.display()));
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(fail)?;
+    }
+    let staged = path.with_extension("plist.new");
+    let mut plutil = std::process::Command::new("plutil")
+        .args(["-convert", "xml1", "-o"])
+        .arg(&staged)
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(fail)?;
+    if let Some(mut stdin) = plutil.stdin.take() {
+        stdin
+            .write_all(
+                serde_json::Value::Object(plist.clone())
+                    .to_string()
+                    .as_bytes(),
+            )
+            .map_err(fail)?;
+    }
+    let out = plutil.wait_with_output().map_err(fail)?;
+    if !out.status.success() {
+        let _ = std::fs::remove_file(&staged);
+        return Err(fail(io::Error::other(format!(
+            "plutil: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))));
+    }
+    std::fs::rename(&staged, path).map_err(fail)
+}
+
+/// Make the plist at `path` run `exe` as the daemon: write it when it is
+/// missing or unreadable, change it when it runs another binary or would not
+/// be restarted after a failure, and leave it alone otherwise.
+#[cfg_attr(
+    not(all(target_os = "macos", any(feature = "tui", feature = "slint"))),
+    allow(dead_code)
+)]
+fn point_agent_at(path: &Path, exe: &Path, log: &Path) -> io::Result<AgentFile> {
+    let exe_text = exe.to_str().ok_or_else(|| {
         io::Error::new(
-            e.kind(),
-            format!("could not write {}: {e}", plist_path.display()),
+            io::ErrorKind::InvalidData,
+            format!("{} cannot be written into a plist", exe.display()),
         )
     })?;
-    Ok(plist_path.to_string_lossy().into_owned())
+    let written = |rewritten| AgentFile {
+        path: path.to_string_lossy().into_owned(),
+        rewritten,
+    };
+    let fresh = || fresh_agent(exe_text, &log.to_string_lossy());
+    match read_agent(path)? {
+        OnDisk::Missing => {
+            log::info!("writing {} to run {exe_text}", path.display());
+            write_agent(path, &fresh())?;
+            Ok(written(true))
+        }
+        OnDisk::Unreadable(why) => {
+            log::warn!(
+                "{} could not be read ({why}); writing it again to run {exe_text}",
+                path.display()
+            );
+            write_agent(path, &fresh())?;
+            Ok(written(true))
+        }
+        OnDisk::Found(mut plist) => {
+            let wrong = repoint(&mut plist, exe, exe_text);
+            if wrong.is_empty() {
+                return Ok(written(false));
+            }
+            let wrong = wrong.join(", and ");
+            log::info!("{}: {wrong}; changing it to run {exe_text}", path.display());
+            write_agent(path, &plist).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("{} is out of date ({wrong}): {e}", path.display()),
+                )
+            })?;
+            Ok(written(true))
+        }
+    }
 }
 
 /// Start the daemon as a DETACHED background process (its own session, with
@@ -556,7 +886,7 @@ mod waiting_for_the_daemon {
     //! stop waiting as soon as the process has exited. These tests give the
     //! wait a scripted daemon and never start a real one.
 
-    use super::{DaemonStart, Watch, start_unless_running, what_became_of};
+    use super::{DaemonStart, StartReport, Watch, start_unless_running, what_became_of};
     use hops_ipc::DaemonEndpoint;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
@@ -786,6 +1116,44 @@ mod waiting_for_the_daemon {
         );
     }
 
+    /// What reaches the screen when the service did not come up (#189). It
+    /// used to be "connecting", indefinitely.
+    // LEDGER T63 | class B | 1 return value
+    #[test]
+    fn a_start_that_did_not_come_up_is_put_into_words_that_name_the_log() {
+        let report = |outcome, why: Option<&str>| StartReport {
+            outcome,
+            why: why.map(str::to_string),
+            log_file: Some(PathBuf::from("logs/daemon.log")),
+            within: Duration::from_secs(5),
+        };
+        let exited = report(DaemonStart::Exited(PID), None).problem();
+        let silent = report(DaemonStart::NoAnswer(PID), None).problem();
+        let failed = report(
+            DaemonStart::StartFailed,
+            Some("`launchctl kickstart -p gui/501/com.grabbr.hops` failed"),
+        )
+        .problem();
+        let unasked = report(DaemonStart::CannotProbe, Some("$HOME is not set")).problem();
+        for (got, says) in [
+            (&exited, "stopped again before it answered"),
+            (&exited, "logs/daemon.log"),
+            (&silent, "did not answer within 5 s"),
+            (&silent, "logs/daemon.log"),
+            (&failed, "could not be started: `launchctl kickstart"),
+            (&unasked, "$HOME is not set"),
+        ] {
+            assert!(
+                got.as_deref().is_some_and(|text| text.contains(says)),
+                "{got:?} does not say `{says}`. A service that did not come up must \
+                 be named on screen, with where to look."
+            );
+        }
+        for running in [DaemonStart::Started(PID), DaemonStart::AlreadyRunning] {
+            assert_eq!(report(running, None).problem(), None, "{running:?}");
+        }
+    }
+
     // LEDGER T39 | class B | 1 return value
     #[test]
     fn the_log_line_says_what_happened_and_where_to_look() {
@@ -842,9 +1210,10 @@ mod through_launchd {
     //! `kickstart -p` exit 37 while it prints the running process's id. These
     //! tests give the start a scripted `launchctl` and never run the real one.
 
-    use super::{LaunchctlRun, start_through_launchd};
+    use super::{AgentFile, LaunchctlRun, start_through_launchd};
     use std::cell::RefCell;
     use std::io;
+    use std::time::Duration;
 
     const UID: u32 = 501;
     const SERVICE: &str = "gui/501/com.grabbr.hops";
@@ -880,21 +1249,63 @@ mod through_launchd {
         }
     }
 
+    const PLIST: &str = "Library/LaunchAgents/com.grabbr.hops.plist";
+
+    /// What the plist step finds and does.
+    #[derive(Clone, Copy)]
+    enum Agent {
+        /// It already runs this binary as this build does: left alone.
+        Current,
+        /// Missing, or naming another binary or the old format: written.
+        Written,
+        /// Out of date and could not be written.
+        Unwritable,
+    }
+
     /// Run the start against `script`, which answers each `launchctl` call by
-    /// its subcommand. Returns the result, every call made in order, and
-    /// whether the plist was installed.
+    /// its subcommand, with a plist that is already current. Returns the
+    /// result, every call made in order, and whether the plist was written.
     fn start_with(script: impl Fn(&str) -> LaunchctlRun) -> (io::Result<u32>, Vec<String>, bool) {
+        let (got, calls, written, _) = start_with_agent(Agent::Current, script);
+        (got, calls, written)
+    }
+
+    /// [`start_with`] with the plist step finding `agent`; also returns the
+    /// pauses the start asked for.
+    fn start_with_agent(
+        agent: Agent,
+        script: impl Fn(&str) -> LaunchctlRun,
+    ) -> (io::Result<u32>, Vec<String>, bool, Vec<Duration>) {
         let calls = RefCell::new(Vec::new());
-        let installed = RefCell::new(false);
+        let written = RefCell::new(false);
+        let mut pauses = Vec::new();
         let mut launchctl = |args: &[&str]| {
             calls.borrow_mut().push(args.join(" "));
             Ok(script(args[0]))
         };
-        let got = start_through_launchd(UID, &mut launchctl, || {
-            *installed.borrow_mut() = true;
-            Ok("Library/LaunchAgents/com.grabbr.hops.plist".into())
-        });
-        (got, calls.into_inner(), installed.into_inner())
+        let got = start_through_launchd(
+            UID,
+            &mut launchctl,
+            || match agent {
+                Agent::Current => Ok(AgentFile {
+                    path: PLIST.into(),
+                    rewritten: false,
+                }),
+                Agent::Written => {
+                    *written.borrow_mut() = true;
+                    Ok(AgentFile {
+                        path: PLIST.into(),
+                        rewritten: true,
+                    })
+                }
+                Agent::Unwritable => Err(io::Error::other(format!(
+                    "{PLIST} is out of date (it ran `/Applications/old/hops daemon`): \
+                     permission denied"
+                ))),
+            },
+            &mut |wait| pauses.push(wait),
+        );
+        (got, calls.into_inner(), written.into_inner(), pauses)
     }
 
     fn never_restarts_or_stops(calls: &[String]) {
@@ -1008,7 +1419,7 @@ mod through_launchd {
     fn a_job_that_is_not_loaded_is_bootstrapped_then_must_have_a_process() {
         // `RunAtLoad` starts the daemon as the job is bootstrapped, so the
         // kickstart finds it running.
-        let (got, calls, installed) = start_with(|sub| match sub {
+        let (got, calls, installed, _) = start_with_agent(Agent::Written, |sub| match sub {
             "print" => failed(113, "Could not find service"),
             "bootstrap" => ok(""),
             "kickstart" => already_running(902),
@@ -1067,6 +1478,347 @@ mod through_launchd {
             message.contains("Bootstrap failed") && message.contains("kickstart"),
             "a job that could neither be loaded nor started must fail and say both: \
              {message}"
+        );
+    }
+
+    /// A job loaded from a plist that named a binary no longer there: the app
+    /// moved, launchd was left starting a path that does not exist, and the
+    /// front door used to kickstart that same definition forever (#170).
+    // LEDGER T67 | class B | 1 return value + calls recorded by the injected runner
+    #[test]
+    fn a_loaded_job_whose_plist_was_rewritten_is_reloaded_before_it_is_started() {
+        let (got, calls, written, _) = start_with_agent(Agent::Written, |sub| match sub {
+            "print" => loaded_idle(),
+            "bootout" | "bootstrap" => ok(""),
+            "kickstart" => already_running(5150),
+            other => failed(1, &format!("unexpected {other}")),
+        });
+        assert_eq!(
+            (got.as_ref().ok(), written),
+            (Some(&5150), true),
+            "{got:?} from {calls:?}"
+        );
+        assert_eq!(
+            calls,
+            [
+                format!("print {SERVICE}"),
+                format!("bootout {SERVICE}"),
+                format!("bootstrap gui/501 {PLIST}"),
+                format!("kickstart -p {SERVICE}"),
+            ],
+            "the plist now runs this binary, but a loaded job keeps the definition \
+             it was loaded with until it is booted out and bootstrapped again. \
+             Without that, launchd goes on starting the path the old plist named."
+        );
+        for call in &calls {
+            assert!(
+                !call.contains("-k") && !call.starts_with("kill"),
+                "`launchctl {call}` restarts or signals a daemon; reloading the job \
+                 needs neither"
+            );
+        }
+
+        // Not loaded: the new plist is simply bootstrapped.
+        let (got, calls, _, _) = start_with_agent(Agent::Written, |sub| match sub {
+            "print" => failed(113, "Could not find service"),
+            "bootstrap" => ok(""),
+            "kickstart" => already_running(5151),
+            other => failed(1, &format!("unexpected {other}")),
+        });
+        assert_eq!(got.as_ref().ok(), Some(&5151), "{got:?}");
+        assert!(
+            !calls.iter().any(|c| c.starts_with("bootout")),
+            "a job that is not loaded has nothing to boot out: {calls:?}"
+        );
+    }
+
+    /// launchd finishes tearing a booted-out job down after `bootout` returns,
+    /// and a bootstrap in that window fails with an I/O error.
+    // LEDGER T68 | class B | 1 return value + calls and pauses recorded
+    #[test]
+    fn a_bootstrap_right_after_a_bootout_is_tried_again() {
+        let bootstraps = std::cell::Cell::new(0);
+        let (got, calls, _, pauses) = start_with_agent(Agent::Written, |sub| match sub {
+            "print" => loaded_idle(),
+            "bootout" => ok(""),
+            "bootstrap" => {
+                bootstraps.set(bootstraps.get() + 1);
+                if bootstraps.get() < 3 {
+                    failed(5, "Bootstrap failed: 5: Input/output error")
+                } else {
+                    ok("")
+                }
+            }
+            "kickstart" => already_running(5152),
+            other => failed(1, &format!("unexpected {other}")),
+        });
+        assert_eq!(
+            (got.as_ref().ok(), bootstraps.get(), pauses.len()),
+            (Some(&5152), 3, 2),
+            "two bootstraps failed while launchd was still tearing the job down, \
+             and the start gave up with the job unloaded: {got:?} from {calls:?}"
+        );
+        assert!(
+            pauses.iter().sum::<Duration>() < Duration::from_secs(5),
+            "the app does not open until the start is over: {pauses:?}"
+        );
+
+        // One that never loads fails, and says so.
+        let (never, _, _, pauses) = start_with_agent(Agent::Written, |sub| match sub {
+            "print" => loaded_idle(),
+            "bootout" => ok(""),
+            "bootstrap" => failed(5, "Bootstrap failed: 5: Input/output error"),
+            _ => failed(113, "Could not find service"),
+        });
+        let message = never
+            .map(|p| p.to_string())
+            .unwrap_or_else(|e| e.to_string());
+        assert!(
+            message.contains("Bootstrap failed") && pauses.len() == super::REBOOTSTRAP_WAITS.len(),
+            "{message}, after {pauses:?}"
+        );
+    }
+
+    /// A plist that could not be brought up to date must not cost the job it
+    /// had: booting it out would leave nothing loaded at all.
+    // LEDGER T69 | class B | 1 return value / error + calls recorded
+    #[test]
+    fn a_plist_that_could_not_be_rewritten_unloads_nothing_and_names_itself() {
+        let (got, calls, _, _) = start_with_agent(Agent::Unwritable, |sub| match sub {
+            "print" => loaded_idle(),
+            _ => ok("4711\n"),
+        });
+        never_restarts_or_stops(&calls);
+        assert_eq!(calls, [format!("print {SERVICE}")], "{got:?}");
+        let message = got.map(|p| p.to_string()).unwrap_or_else(|e| e.to_string());
+        assert!(
+            message.contains(PLIST) && message.contains("/Applications/old/hops"),
+            "the failure must name the plist and the binary it still runs: {message}"
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod the_launch_agent_on_disk {
+    //! The plist is read and written with `plutil`, and judged by what it
+    //! means rather than how it is laid out, since several writers make it:
+    //! v0.12's front door, this one, the installer and the dev launcher.
+
+    use super::{LAUNCHD_LABEL, OnDisk, point_agent_at, read_agent};
+    use std::path::{Path, PathBuf};
+
+    /// The plist v0.12.0's front door wrote, verbatim but for the paths.
+    fn v0_12(exe: &Path, log: &Path) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.grabbr.hops</string>
+    <key>ProgramArguments</key>
+    <array><string>{}</string><string>daemon</string></array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><false/>
+    <key>ProcessType</key><string>Interactive</string>
+    <key>StandardOutPath</key><string>{}</string>
+    <key>StandardErrorPath</key><string>{}</string>
+</dict>
+</plist>
+"#,
+            exe.display(),
+            log.display(),
+            log.display()
+        )
+    }
+
+    /// A scratch directory holding a stand-in `hops` binary.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("hops-agent-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("new.app")).expect("a scratch directory");
+            std::fs::write(dir.join("new.app/hops"), b"").expect("a stand-in binary");
+            Self(dir)
+        }
+        fn exe(&self) -> PathBuf {
+            self.0.join("new.app/hops")
+        }
+        fn plist(&self) -> PathBuf {
+            self.0.join("com.grabbr.hops.plist")
+        }
+        fn log(&self) -> PathBuf {
+            self.0.join("daemon.log")
+        }
+        fn read(&self) -> serde_json::Map<String, serde_json::Value> {
+            match read_agent(&self.plist()).expect("readable") {
+                OnDisk::Found(plist) => plist,
+                other => panic!("the plist did not read back: {other:?}"),
+            }
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // LEDGER T65 | class B | 4 file on disk, read back with plutil
+    #[test]
+    fn a_plist_for_a_binary_that_moved_or_in_the_old_format_is_rewritten_and_a_current_one_is_not()
+    {
+        let dir = Scratch::new("judge");
+        let exe = dir.exe();
+
+        // Missing: written, and what is written is current.
+        let first = point_agent_at(&dir.plist(), &exe, &dir.log()).expect("written");
+        assert!(first.rewritten, "a missing plist was not written");
+        let again = point_agent_at(&dir.plist(), &exe, &dir.log()).expect("read");
+        assert!(
+            !again.rewritten,
+            "the plist this build writes reads as out of date: {:?}",
+            dir.read()
+        );
+
+        // v0.12's plist for this very binary: the path is right, but launchd
+        // never restarts a daemon that crashed.
+        std::fs::write(dir.plist(), v0_12(&exe, &dir.log())).expect("a v0.12 plist");
+        assert!(
+            point_agent_at(&dir.plist(), &exe, &dir.log())
+                .expect("rewritten")
+                .rewritten,
+            "a v0.12 plist, `KeepAlive` false, was left as it was"
+        );
+        assert_eq!(
+            dir.read().get("KeepAlive"),
+            Some(&serde_json::json!({ "SuccessfulExit": false })),
+            "{:?}",
+            dir.read()
+        );
+
+        // v0.12's plist for the app where it used to be.
+        let gone = dir.0.join("old.app/hops");
+        std::fs::write(dir.plist(), v0_12(&gone, &dir.log())).expect("a v0.12 plist");
+        assert!(
+            point_agent_at(&dir.plist(), &exe, &dir.log())
+                .expect("rewritten")
+                .rewritten,
+            "a plist naming a binary that is no longer there was left as it was, so \
+             launchd goes on starting a path that does not exist (#170)"
+        );
+        assert_eq!(
+            dir.read().get("ProgramArguments"),
+            Some(&serde_json::json!([exe.to_str().expect("utf-8"), "daemon"])),
+        );
+        assert_eq!(
+            dir.read().get("Label").and_then(|l| l.as_str()),
+            Some(LAUNCHD_LABEL)
+        );
+        assert!(
+            !point_agent_at(&dir.plist(), &exe, &dir.log())
+                .expect("read")
+                .rewritten,
+            "a repointed plist still reads as out of date"
+        );
+
+        // Another copy of hops that is still there: the old app was copied
+        // rather than moved, and this one was launched.
+        let other = dir.0.join("old.app/hops");
+        std::fs::create_dir_all(dir.0.join("old.app")).expect("another app");
+        std::fs::write(&other, b"").expect("another binary");
+        std::fs::write(dir.plist(), v0_12(&other, &dir.log())).expect("a v0.12 plist");
+        let mut plist = dir.read();
+        plist.insert(
+            "KeepAlive".into(),
+            serde_json::json!({ "SuccessfulExit": false }),
+        );
+        super::write_agent(&dir.plist(), &plist).expect("written");
+        assert!(
+            point_agent_at(&dir.plist(), &exe, &dir.log())
+                .expect("rewritten")
+                .rewritten,
+            "a plist naming another copy of hops was left as it was, so launchd \
+             starts that copy rather than the one the user opened"
+        );
+
+        // A link to this binary names it: left alone.
+        let link = dir.0.join("hops-link");
+        std::os::unix::fs::symlink(&exe, &link).expect("a link");
+        std::fs::write(dir.plist(), v0_12(&link, &dir.log())).expect("a plist");
+        let mut plist = dir.read();
+        plist.insert(
+            "KeepAlive".into(),
+            serde_json::json!({ "SuccessfulExit": false }),
+        );
+        super::write_agent(&dir.plist(), &plist).expect("written");
+        assert!(
+            !point_agent_at(&dir.plist(), &exe, &dir.log())
+                .expect("read")
+                .rewritten,
+            "a plist naming a link to this binary was rewritten"
+        );
+    }
+
+    /// The dev launcher and the installer write their own plists, with an
+    /// environment and log paths of their own. Repointing one changes only
+    /// what decides which binary runs and whether it comes back.
+    // LEDGER T66 | class B | 4 file on disk, read back with plutil
+    #[test]
+    fn repointing_keeps_what_another_writer_set() {
+        let dir = Scratch::new("keep");
+        let exe = dir.exe();
+        std::fs::write(
+            dir.plist(),
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>Label</key><string>com.grabbr.hops</string>
+    <key>ProgramArguments</key><array><string>{}</string><string>daemon</string></array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><false/>
+    <key>ProcessType</key><string>Interactive</string>
+    <key>EnvironmentVariables</key><dict><key>HOPS_LOG_LEVEL</key><string>info</string></dict>
+    <key>StandardOutPath</key><string>/elsewhere/daemon.log</string>
+    <key>StandardErrorPath</key><string>/elsewhere/daemon.log</string>
+</dict></plist>
+"#,
+                dir.0.join("gone/hops").display()
+            ),
+        )
+        .expect("a launcher's plist");
+        assert!(
+            point_agent_at(&dir.plist(), &exe, &dir.log())
+                .expect("rewritten")
+                .rewritten
+        );
+        let plist = dir.read();
+        assert_eq!(
+            (
+                plist.get("EnvironmentVariables"),
+                plist.get("StandardOutPath").and_then(|p| p.as_str()),
+                plist.get("RunAtLoad"),
+            ),
+            (
+                Some(&serde_json::json!({ "HOPS_LOG_LEVEL": "info" })),
+                Some("/elsewhere/daemon.log"),
+                Some(&serde_json::json!(true)),
+            ),
+            "repointing dropped what the plist's writer set: {plist:?}"
+        );
+
+        // And a file that is not a plist at all is replaced by a whole one.
+        std::fs::write(dir.plist(), b"not a plist {").expect("junk");
+        assert!(
+            point_agent_at(&dir.plist(), &exe, &dir.log())
+                .expect("rewritten")
+                .rewritten
+        );
+        assert_eq!(
+            dir.read().get("ProgramArguments"),
+            Some(&serde_json::json!([exe.to_str().expect("utf-8"), "daemon"]))
         );
     }
 }

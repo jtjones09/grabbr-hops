@@ -38,7 +38,7 @@ use std::{
 
 use hops_frontend_core::{
     AppModel, AttemptOrigin, ClientHandle, Device, DeviceSend, FrontendClient, FrontendRequest,
-    Position, Status, TrustState,
+    Launch, Position, Status, TrustState,
     prefs::Frontend,
     theme::{self, Rgb, Theme},
 };
@@ -201,8 +201,10 @@ fn parse_port(s: &str) -> Result<u16, &'static str> {
 }
 
 /// Run the TUI front-end. Must be called within a tokio `LocalSet`.
-pub async fn run() -> Result<(), TuiError> {
-    let client = FrontendClient::spawn();
+/// `launch` is what the binary knows as it opens: its own build, and why a
+/// service it tried to start did not come up.
+pub async fn run(launch: Launch) -> Result<(), TuiError> {
+    let client = FrontendClient::spawn(launch);
 
     // crossterm's event::read() blocks, so read keys on a dedicated OS thread.
     let (key_tx, mut key_rx) = mpsc::unbounded_channel::<KeyEvent>();
@@ -859,10 +861,22 @@ fn ui(
     // paint the whole window in the theme background first
     f.render_widget(Block::default().style(base), f.area());
 
+    // What is wrong with the service: a start that did not come up, or a
+    // daemon of another build. Wrapped under the status line, with the header
+    // grown to fit it.
+    let problem = model.service_problem();
+    let problem_rows = problem.as_deref().map_or(0, |p| {
+        let width = usize::from(f.area().width.saturating_sub(2)).max(1);
+        let rows: usize = p
+            .lines()
+            .map(|line| line.chars().count().div_ceil(width).max(1))
+            .sum();
+        rows.min(6) as u16
+    });
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(3 + problem_rows),
             Constraint::Min(0),
             Constraint::Length(6),
         ])
@@ -891,9 +905,19 @@ fn ui(
             muted,
         ),
     ]);
+    let mut header = vec![header];
+    if let Some(problem) = problem {
+        for line in problem.lines() {
+            header.push(Line::from(Span::styled(
+                line.to_string(),
+                Style::default().fg(col(theme.warn)),
+            )));
+        }
+    }
     let title = format!(" hops · {} ", theme.name);
     f.render_widget(
         Paragraph::new(header)
+            .wrap(Wrap { trim: false })
             .style(base)
             .block(panel(Span::styled(title, accent), false)),
         chunks[0],
@@ -1262,6 +1286,49 @@ mod tests {
             "the open pairing window is not shown with its time left:\n{out}"
         );
         assert!(out.contains("open add device on the other machine too"));
+    }
+
+    /// The service's trouble is on screen, not only in a log: a start that
+    /// did not come up (#189), or a daemon of another build.
+    // LEDGER T62 | class B | 3 widget tree rendered to a test terminal
+    #[test]
+    fn the_header_says_what_is_wrong_with_the_service() {
+        let mut model = AppModel::default();
+        model.start_problem = Some(
+            "The hops service started and stopped again before it answered. \
+             Its log says why:\n/tmp/hops/daemon.log"
+                .into(),
+        );
+        let out = screen(&model, 0);
+        assert!(
+            out.contains("stopped again") && out.contains("daemon.log"),
+            "a failed start is not on screen:\n{out}"
+        );
+
+        model.connected = true;
+        model.start_problem = None;
+        model.this_build = Some(hops_frontend_core::Build {
+            version: "0.13.0".into(),
+            commit: "abcd1234".into(),
+        });
+        model.apply(hops_frontend_core::FrontendEvent::Enumerate(vec![]));
+        let out = screen(&model, 0);
+        assert!(
+            out.contains("older build"),
+            "a daemon of an older build is not on screen:\n{out}"
+        );
+
+        model.apply(hops_frontend_core::FrontendEvent::DaemonBuild(
+            hops_frontend_core::Build {
+                version: "0.13.0".into(),
+                commit: "abcd1234".into(),
+            },
+        ));
+        let out = screen(&model, 0);
+        assert!(
+            !out.contains("older build") && !out.contains("This app is"),
+            "the same build is reported as a problem:\n{out}"
+        );
     }
 
     /// One machine we both cross to AND trust must be ONE row.
