@@ -2722,5 +2722,16 @@ mod replay_on_attach {
             Vec::<String>::new(),
             "a request was replayed after the pairing window closed"
         );
+        gate.open(t0 + 130 * S);
+        let pending = HashMap::from([
+            ("xx".to_string(), held(t0 + 100 * S)),
+            ("yy".to_string(), held(t0 + 131 * S)),
+        ]);
+        assert_eq!(
+            replayed(&pending, &gate, "dd", t0 + 135 * S),
+            vec!["yy".to_string()],
+            "add device reopened for one machine replayed another machine's \
+             request from the window before"
+        );
     }
 }

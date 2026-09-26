@@ -94,10 +94,13 @@ impl PromptGate {
     /// frontend that was not attached when it was raised (#114).
     ///
     /// Only while the window is open, as for any prompt, and only for a request
-    /// from the last two minutes: opening add device for one machine must not
+    /// admitted since it opened: opening add device for one machine must not
     /// bring back a request some other machine made in an earlier window.
+    /// Opening add device again while the window is open starts a new window,
+    /// so what was admitted before that is not shown again. A machine still
+    /// asking knocks again, and its next knock is admitted in the new window.
     pub(crate) fn replayable(&self, admitted: Instant, now: Instant) -> bool {
-        self.remaining(now).is_some() && now.saturating_duration_since(admitted) < Self::WINDOW
+        self.remaining(now).is_some() && self.opened.is_some_and(|opened| admitted >= opened)
     }
 }
 
@@ -334,7 +337,7 @@ mod tests {
     }
 
     /// A frontend that attaches while add device is open is shown what was
-    /// admitted in the last two minutes, and nothing else (#114, #195).
+    /// admitted since the window opened, and nothing else (#114, #195).
     // LEDGER T7 | class B | 1 return value: PromptGate::replayable
     #[test]
     fn a_prompt_is_shown_again_only_inside_the_window_it_was_raised_in() {
@@ -356,6 +359,45 @@ mod tests {
             "opening add device again brought back a request from an earlier window"
         );
         assert!(gate.replayable(now + 200 * S, now + 201 * S));
+    }
+
+    /// A request from an earlier window is not replayed into a later one, even
+    /// when it is under two minutes old. Someone who opens add device to pair
+    /// one machine must not be shown another machine's request from before.
+    // LEDGER T15 | class B | 1 return value: PromptGate::replayable
+    #[test]
+    fn a_request_from_an_earlier_window_is_not_replayed_in_a_new_one() {
+        let mut gate = PromptGate::new();
+        let now = Instant::now();
+        gate.open(now);
+        let from_x = now + 100 * S;
+        gate.open(now + 130 * S);
+        assert!(
+            !gate.replayable(from_x, now + 135 * S),
+            "X's request from the earlier window was replayed in the new one"
+        );
+        assert!(gate.replayable(now + 131 * S, now + 135 * S));
+    }
+
+    /// Opening add device again while the window is still open starts a new
+    /// window: what was admitted before the reopen is not replayed after it.
+    // LEDGER T16 | class B | 1 return value: PromptGate::replayable
+    #[test]
+    fn reopening_add_device_inside_the_window_starts_a_new_one_for_replay() {
+        let mut gate = PromptGate::new();
+        let now = Instant::now();
+        gate.open(now);
+        let from_x = now + 10 * S;
+        assert!(gate.replayable(from_x, now + 20 * S));
+        gate.open(now + 30 * S);
+        assert!(
+            !gate.replayable(from_x, now + 40 * S),
+            "a request admitted before add device was reopened was replayed after it"
+        );
+        assert!(
+            gate.replayable(now + 30 * S, now + 40 * S),
+            "a request admitted the instant the window reopened was not replayed"
+        );
     }
 
     /// Each admitted request is logged with its fingerprint, but a stranger
