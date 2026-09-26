@@ -534,7 +534,7 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                                     buf: model.port.map(|p| p.to_string()).unwrap_or_default(),
                                 });
                             }
-                            KeyCode::Char('g') => {
+                            KeyCode::Char('g') if hops_frontend_core::prefs::CAN_SWITCH => {
                                 ratatui::restore();
                                 let err = hops_frontend_core::prefs::switch_to(Frontend::Gui);
                                 log::warn!("could not switch to the graphical interface: {err}");
@@ -1212,6 +1212,10 @@ fn footer_line(
         ("g", " gui  "),
         ("q", " close"),
     ] {
+        // Offered only where the switch can happen (#173).
+        if k == "g" && !hops_frontend_core::prefs::CAN_SWITCH {
+            continue;
+        }
         spans.push(Span::styled(k, key));
         spans.push(Span::raw(label));
     }

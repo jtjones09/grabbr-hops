@@ -214,6 +214,10 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
         },
     ])));
 
+    // PREVIEW_NO_SWITCH=1 shows Settings as a Windows build has it, with no
+    // in-place switch to the terminal interface (#173).
+    ui.set_can_switch_interface(std::env::var_os("PREVIEW_NO_SWITCH").is_none());
+
     // PREVIEW_DISCONNECTED=1 shows what the app keeps once the daemon has gone:
     // the rows as last known, with every live fact cleared the way
     // hops_frontend_core clears it, and the notice a click then gets (#34).

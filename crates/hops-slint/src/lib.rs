@@ -826,6 +826,7 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
             }
         });
     }
+    ui.set_can_switch_interface(prefs::CAN_SWITCH);
     {
         ui.on_switch_interface(move || {
             let err = prefs::switch_to(prefs::Frontend::Tui);

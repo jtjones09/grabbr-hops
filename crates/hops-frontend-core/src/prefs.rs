@@ -5,7 +5,7 @@
 //! first-run onboarding has completed. The `hops` launcher reads these to decide
 //! what to show; the GUI/TUI write them (onboarding, Settings, switch-on-the-fly).
 
-use std::path::PathBuf;
+use std::{ffi::OsString, path::PathBuf};
 
 /// Which front-end the user prefers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,12 +31,46 @@ impl Frontend {
     }
 }
 
+/// Whether this platform can switch between the two front-ends in place.
+/// Only a Unix `exec` replaces the process; elsewhere [`switch_to`] saves the
+/// choice and fails, so no front-end offers the switch there (#173).
+pub const CAN_SWITCH: bool = cfg!(unix);
+
+/// The directory UI preferences live in, beside `config.toml`, or `None`
+/// when the environment names none.
+///
+/// On Windows it is under `LOCALAPPDATA`, else `USERPROFILE`, as the config
+/// is. Preferences were built from `HOME` alone, which a Start-menu launch
+/// does not set there, so nothing was saved: not the front-end, not the
+/// theme, not that onboarding was done (#173).
+pub fn ui_dir() -> Option<PathBuf> {
+    ui_dir_with(cfg!(windows), |name| std::env::var_os(name))
+}
+
+/// The directory the state directory sits in: `LOCALAPPDATA` (else
+/// `USERPROFILE/.config`) on Windows, `HOME/.config` elsewhere.
+pub fn config_base() -> Option<PathBuf> {
+    config_base_with(cfg!(windows), |name| std::env::var_os(name))
+}
+
+/// [`ui_dir`] for Windows or not, reading the environment through `var`.
+fn ui_dir_with(windows: bool, var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    Some(config_base_with(windows, var)?.join("lan-mouse"))
+}
+
+fn config_base_with(windows: bool, var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    let set = |name: &str| var(name).filter(|v| !v.is_empty());
+    if windows {
+        return match set("LOCALAPPDATA") {
+            Some(app_data) => Some(PathBuf::from(app_data)),
+            None => Some(PathBuf::from(set("USERPROFILE")?).join(".config")),
+        };
+    }
+    Some(PathBuf::from(set("HOME")?).join(".config"))
+}
+
 fn pref_path(name: &str) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let mut p = PathBuf::from(home);
-    p.push(".config/lan-mouse");
-    p.push(name);
-    Some(p)
+    Some(ui_dir()?.join(name))
 }
 
 fn write_pref(name: &str, value: &str) {
@@ -103,4 +137,56 @@ pub fn switch_to(target: Frontend) -> std::io::Error {
         std::io::ErrorKind::Unsupported,
         "switching interfaces on the fly isn't supported on this platform — restart manually",
     )
+}
+
+#[cfg(test)]
+mod where_preferences_live {
+    //! UI preferences resolve on Windows without `HOME` (#173).
+    use super::ui_dir_with;
+    use std::{ffi::OsString, path::PathBuf};
+
+    fn env<'a>(vars: &'a [(&str, &str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
+        move |name| {
+            vars.iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| OsString::from(v))
+        }
+    }
+
+    // LEDGER T528 | class B | 1 return value: prefs::ui_dir_with
+    #[test]
+    fn windows_preferences_sit_beside_the_config_without_home() {
+        assert_eq!(
+            ui_dir_with(true, env(&[("LOCALAPPDATA", "C:/Users/u/AppData/Local")])),
+            Some(PathBuf::from("C:/Users/u/AppData/Local").join("lan-mouse")),
+            "with HOME unset, as from the Start menu, preferences had nowhere to go"
+        );
+        assert_eq!(
+            ui_dir_with(true, env(&[("USERPROFILE", "C:/Users/u")])),
+            Some(
+                PathBuf::from("C:/Users/u")
+                    .join(".config")
+                    .join("lan-mouse")
+            ),
+        );
+        assert_eq!(
+            ui_dir_with(
+                true,
+                env(&[("HOME", "/h"), ("LOCALAPPDATA", "C:/Users/u/AppData/Local")])
+            ),
+            Some(PathBuf::from("C:/Users/u/AppData/Local").join("lan-mouse")),
+            "a HOME set by a Unix-style shell moved the preferences away from the config"
+        );
+        assert_eq!(ui_dir_with(true, env(&[("LOCALAPPDATA", "")])), None);
+    }
+
+    // LEDGER T529 | class B | 1 return value: prefs::ui_dir_with
+    #[test]
+    fn elsewhere_preferences_stay_under_home() {
+        assert_eq!(
+            ui_dir_with(false, env(&[("HOME", "/home/u")])),
+            Some(PathBuf::from("/home/u/.config/lan-mouse"))
+        );
+        assert_eq!(ui_dir_with(false, env(&[("LOCALAPPDATA", "C:/x")])), None);
+    }
 }

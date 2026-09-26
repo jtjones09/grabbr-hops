@@ -187,11 +187,10 @@ pub fn index_of(themes: &[Theme], name: &str) -> usize {
     themes.iter().position(|t| t.name == name).unwrap_or(0)
 }
 
+/// Beside `config.toml`, resolved as the other UI preferences are, so a
+/// Windows launch without `HOME` still has one (#173).
 fn config_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let mut p = PathBuf::from(home);
-    p.push(".config/lan-mouse");
-    Some(p)
+    Some(crate::prefs::config_base()?.join("lan-mouse"))
 }
 
 fn themes_dir() -> Option<PathBuf> {

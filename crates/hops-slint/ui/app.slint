@@ -181,6 +181,9 @@ export component AppWindow inherits Window {
     // port, edge. Discovery supplies the address, never the trust (#136).
     callback add-discovered(string /* label */, string /* ips */, string /* port */, string /* position */);
     callback switch-interface();
+    // Whether the other front-end can replace this one in place. Only a Unix
+    // exec can; elsewhere the button did nothing and said nothing (#173).
+    in property <bool> can-switch-interface: true;
     callback open-layout-canvas();
     callback update-device-geometry(string /* handle */, float /* x */, float /* y */);
 
@@ -1006,11 +1009,18 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                     SectionTitle { text: "interface"; color: Theme.c.accent; }
                     HorizontalLayout {
                         spacing: Space.sm;
+                        alignment: start;
                         PillButton { text: "graphical"; primary: true; enabled: false; }
-                        PillButton {
+                        if root.can-switch-interface: PillButton {
                             text: "terminal";
                             clicked => { root.switch-interface(); }
                         }
+                    }
+                    if !root.can-switch-interface: Text {
+                        text: "for the terminal interface, run hops tui in a terminal";
+                        color: Theme.c.muted;
+                        font-size: Type.caption;
+                        wrap: word-wrap;
                     }
                 }
                 Rectangle { vertical-stretch: 1; }
