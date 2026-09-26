@@ -295,6 +295,9 @@ impl Caps {
     /// Everything this build understands and enforces.
     pub const KNOWN: Caps = Caps(0x000f);
 
+    /// The clipboard, both ways: what the per-device switch turns off (#182).
+    pub const CLIPBOARD: Caps = Caps::CLIPBOARD_FROM.union(Caps::CLIPBOARD_TO);
+
     /// Everything the peer may do to us. The set a user is agreeing to when they
     /// answer an unsolicited knock at the door: it may drive this machine, and
     /// its clipboard follows it here ([`existing_pairing_clipboard`], #186).
@@ -342,6 +345,11 @@ impl Caps {
         Caps(self.0 | other.0)
     }
 
+    /// Only the bits of `self` that `other` also has.
+    pub const fn intersection(self, other: Caps) -> Caps {
+        Caps(self.0 & other.0)
+    }
+
     /// `self` with every bit of `other` cleared. Narrowing — always safe.
     pub const fn without(self, other: Caps) -> Caps {
         Caps(self.0 & !other.0)
@@ -365,8 +373,8 @@ impl Caps {
 /// These are exactly the bits [`Caps::INBOUND`] and [`Caps::OUTBOUND`] always
 /// carried, so no lease on disk changes. What changes is that the clipboard
 /// doors read them. Every existing pairing reaches this one function: the two
-/// constants, the migration from a v0.12 config, and through the constants
-/// the loader. The decision's guard,
+/// constants, the migration from a v0.12 config, and the loader, for a lease
+/// on which nobody chose a clipboard (#187). The decision's guard,
 /// `decision_guards::pairings_made_before_182_keep_the_clipboard_direction_their_lease_grants`,
 /// runs both machines' transports on each of those, so a change here fails
 /// there.
@@ -538,6 +546,14 @@ pub struct Lease {
     pub origin: Origin,
     pub issued_at: u64,
     pub expiry: Expiry,
+    /// Someone chose this pairing's clipboard: the off switch
+    /// ([`TrustStore::disable_clipboard`]), and from #182's pairing question
+    /// on, each pairing. The clipboard bits in `caps` are then that choice,
+    /// and a later approval adds only a direction to drive.
+    ///
+    /// False for a pairing made before #182, whose clipboard follows the
+    /// directions it drives ([`existing_pairing_clipboard`], #186).
+    pub clipboard_chosen: bool,
 }
 
 /// When a lease stops granting.
@@ -870,6 +886,7 @@ impl TrustStore {
             origin,
             issued_at: now,
             expiry: term.expiry_from(now),
+            clipboard_chosen: false,
         }
         .canonicalized()?;
 
@@ -912,7 +929,15 @@ impl TrustStore {
             .and_then(|e| e.lease.clone());
         let lease = match held {
             Some(held) => {
-                let caps = held.caps | lease.caps;
+                // A clipboard someone chose stays as chosen: approving a
+                // second direction to drive is not an answer about the
+                // clipboard, so it must not turn a switched-off one back on.
+                let granted = if held.clipboard_chosen {
+                    lease.caps.without(Caps::CLIPBOARD)
+                } else {
+                    lease.caps
+                };
+                let caps = held.caps | granted;
                 Lease {
                     caps,
                     // Two directions from two approvals are what `origin_of`
@@ -984,6 +1009,37 @@ impl TrustStore {
             }
         }
         Some(left)
+    }
+
+    /// Turn a pairing's clipboard off, both ways: the off arm of #182's
+    /// per-device switch. Drops [`Caps::CLIPBOARD`] and nothing else, and
+    /// records that the clipboard was chosen, so the choice is saved and a
+    /// later approval of the other direction keeps it off.
+    ///
+    /// Narrowing, like [`TrustStore::drop_capabilities`], so it needs no
+    /// authority. There is deliberately no verb that turns it back on here:
+    /// widening a pairing waits for #107.
+    ///
+    /// False when there is no lease to change.
+    pub fn disable_clipboard(&mut self, fingerprint: &str) -> bool {
+        let fp = key(fingerprint);
+        if self.drop_capabilities(&fp, Caps::CLIPBOARD).is_none() {
+            return false;
+        }
+        if let Some(lease) = self.entries.get_mut(&fp).and_then(|e| e.lease.as_mut()) {
+            lease.clipboard_chosen = true;
+        }
+        true
+    }
+
+    /// What each paired machine may do right now, for telling frontends.
+    /// A record that grants nothing is left out.
+    pub fn pairings(&self) -> Vec<(String, Caps)> {
+        let now = self.now();
+        self.entries()
+            .map(|(fp, e)| (fp.to_string(), effective_capabilities(e, &self.ours, now)))
+            .filter(|(_, caps)| !caps.is_empty())
+            .collect()
     }
 
     /// Rename a device we already hold a record for. Must never grant anything:
@@ -1404,6 +1460,7 @@ impl TrustStore {
                 origin: Origin::Migrated,
                 issued_at: now,
                 expiry: DEFAULT_TERM.expiry_from(now),
+                clipboard_chosen: false,
             };
             match self.admit(lease) {
                 Ok(()) if !report.leased.contains(&fp) => report.leased.push(fp),
@@ -1888,6 +1945,7 @@ mod tests {
                 origin: Origin::Inbound,
                 issued_at: T0,
                 expiry: Expiry::At(T0 + HOUR),
+                clipboard_chosen: false,
             }),
             denial: None,
         };
@@ -2021,6 +2079,7 @@ mod tests {
             origin: Origin::Inbound,
             issued_at: T0 - 2_000,
             expiry: Expiry::At(T0 - 500),
+            clipboard_chosen: false,
         };
         let entry = Entry {
             lease: Some(lease),
@@ -2158,6 +2217,7 @@ mod tests {
                 origin: Origin::Inbound,
                 issued_at: T0,
                 expiry: Expiry::Never,
+                clipboard_chosen: false,
             }),
             denial: None,
         };
@@ -2194,6 +2254,7 @@ mod tests {
                 origin: Origin::Inbound,
                 issued_at: T0,
                 expiry: Expiry::Never,
+                clipboard_chosen: false,
             })
             .expect_err("a lease naming another machine is not a lease here");
         assert!(matches!(err, TrustError::WrongMachine { .. }));
@@ -2365,6 +2426,7 @@ mod tests {
                 origin: Origin::Migrated,
                 issued_at: T0,
                 expiry: Expiry::At(T0 + MAX_TERM_SECS + 1),
+                clipboard_chosen: false,
             })
             .expect_err("a replayed record may not exceed it either");
         assert!(matches!(err, TrustError::TermTooLong { .. }));
@@ -2388,6 +2450,7 @@ mod tests {
             origin: Origin::Migrated,
             issued_at: T0,
             expiry: Expiry::Never,
+            clipboard_chosen: false,
         })
         .expect("a lease with no term must be admissible");
         assert!(s.may_drive_us(&peer));

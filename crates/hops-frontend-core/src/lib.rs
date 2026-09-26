@@ -18,7 +18,7 @@ use tokio::sync::{Notify, mpsc};
 
 pub use hops_ipc::{
     AttemptOrigin, Build, ClientConfig, ClientHandle, ClientState, DiscoveredDevice, FrontendEvent,
-    FrontendRequest, Position, RevokedEntry, Status, connect_async,
+    FrontendRequest, PeerTrust, Position, RevokedEntry, Status, connect_async,
 };
 
 pub mod prefs;
@@ -81,6 +81,10 @@ pub struct AppModel {
     /// shown as EXPELLED rather than as a stranger, and so re-trusting it is a
     /// distinct, user-initiated act.
     pub revoked: HashMap<String, RevokedEntry>,
+    /// What the trust store grants each paired machine, by fingerprint. Read
+    /// through [`AppModel::clipboard`]. Empty from a daemon older than
+    /// `FrontendEvent::TrustUpdated`.
+    pub trust: HashMap<String, PeerTrust>,
     /// The daemon's listen port.
     pub port: Option<u16>,
     /// Until when pairing prompts may appear on this machine, or `None` while
@@ -177,6 +181,7 @@ impl AppModel {
                 self.local_pairing_code = (!code.is_empty()).then_some(code);
             }
             FrontendEvent::RevokedUpdated(map) => self.revoked = map,
+            FrontendEvent::TrustUpdated(map) => self.trust = map,
             FrontendEvent::AuthorizedUpdated(map) => {
                 self.authorized = map;
                 let attempts = std::mem::take(&mut self.pairing_attempts);
@@ -511,6 +516,36 @@ impl PairingCard {
     }
 }
 
+/// This machine's clipboard with one paired device (#182).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Clipboard {
+    /// Neither way. There is no way to turn it on from a frontend yet.
+    Off,
+    /// That device's clipboard arrives here, and nothing goes back.
+    FromIt,
+    /// This machine's clipboard goes there, and nothing comes back.
+    ToIt,
+    /// Both ways.
+    BothWays,
+}
+
+impl Clipboard {
+    /// A direction is on, so the off switch has something to turn off.
+    pub fn is_on(self) -> bool {
+        self != Clipboard::Off
+    }
+
+    /// Short words for a device row, the same in every frontend.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Clipboard::Off => "clipboard off",
+            Clipboard::FromIt => "clipboard from it",
+            Clipboard::ToIt => "clipboard to it",
+            Clipboard::BothWays => "clipboard both ways",
+        }
+    }
+}
+
 /// The trust status of a [`Device`] in the unified view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrustState {
@@ -649,6 +684,20 @@ fn display_label(hostname: Option<&str>, description: Option<&str>, fp: &str) ->
 }
 
 impl AppModel {
+    /// The clipboard with the paired device whose fingerprint is `fp`, or
+    /// `None` when no pairing holds one, so there is nothing to show or to
+    /// switch off.
+    pub fn clipboard(&self, fp: &str) -> Option<Clipboard> {
+        self.trust
+            .get(fp)
+            .map(|t| match (t.clipboard_from, t.clipboard_to) {
+                (false, false) => Clipboard::Off,
+                (true, false) => Clipboard::FromIt,
+                (false, true) => Clipboard::ToIt,
+                (true, true) => Clipboard::BothWays,
+            })
+    }
+
     /// Project the two disjoint namespaces — outgoing `clients` and `authorized`
     /// fingerprints — into one [`Device`] per physical peer, joined by the peer
     /// fingerprint (stamped onto `ClientState` at handshake). An outgoing client

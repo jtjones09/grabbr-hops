@@ -322,6 +322,13 @@ pub enum FrontendEvent {
     EmulationStatus(Status),
     /// authorized public key fingerprints have been updated
     AuthorizedUpdated(HashMap<String, String>),
+    /// What the trust store grants each paired machine, by fingerprint: sent
+    /// with `AuthorizedUpdated` whenever trust changes, and on every sync. A
+    /// fingerprint absent here holds no pairing.
+    ///
+    /// Newer than `AuthorizedUpdated`, which older frontends still read; they
+    /// skip this event.
+    TrustUpdated(HashMap<String, PeerTrust>),
     /// public key fingerprint of this device
     PublicKeyFingerprint(String),
     /// this device's own pairing code (encoded, ready to share out-of-band), or
@@ -386,6 +393,16 @@ pub enum FrontendEvent {
     /// keeps the previous version's daemon running when the app is replaced
     /// in place, and it still serves.
     DaemonBuild(Build),
+}
+
+/// What this machine's trust store grants one paired machine, beyond the
+/// allowlist `FrontendEvent::AuthorizedUpdated` carries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerTrust {
+    /// This machine accepts that machine's clipboard.
+    pub clipboard_from: bool,
+    /// This machine sends that machine its clipboard.
+    pub clipboard_to: bool,
 }
 
 /// Which build a program is: its package version and the commit it was built
@@ -507,6 +524,14 @@ pub enum FrontendRequest {
     /// Grants nothing by itself: a prompt still has to be approved, and only
     /// `AuthorizeKey` does that.
     OpenPairing,
+    /// Turn the clipboard off, both ways, for the paired machine with this
+    /// fingerprint: the off arm of the per-device switch (#182). Saved, so it
+    /// stays off across restarts and when the other direction is approved.
+    ///
+    /// Only takes permission away, so, like removal, it is honoured while a
+    /// peer drives this machine. There is deliberately no request that turns
+    /// it back on: widening a pairing is not a frontend verb (#107).
+    DisableClipboard(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]

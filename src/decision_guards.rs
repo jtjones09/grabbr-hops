@@ -626,10 +626,11 @@ mod no_pairing_expires_until_renewal_exists {
     //! store schema together, and this guard with them, in the same commit.
     //!
     //! **A stored term needs a new schema, not only a changed `rebuild`.**
-    //! Every `expires_at` in a schema-v1 store is a placeholder and must never
-    //! be enforced. This build writes 400 days after pairing for a lease that
-    //! does not lapse, so a build from before #183 still starts, and nothing
-    //! tells that date apart from a real 400-day term. A build that enforced it
+    //! Every `expires_at` in a store, version 1 or 2, is a placeholder and
+    //! must never be enforced. This build writes 400 days after pairing for a
+    //! lease that does not lapse, the date version 1 stores carried for a
+    //! build from before #183, and nothing tells that date apart from a real
+    //! 400-day term. A build that enforced it
     //! would end every pairing made under this build at day 400, the outage
     //! #183 removes. Enforcing a stored term (#185) takes a `SCHEMA_VERSION`
     //! bump or a new field.
@@ -857,292 +858,403 @@ mod no_pairing_expires_until_renewal_exists {
     }
 }
 
-mod a_build_from_before_183_still_starts_on_a_store_this_build_saves {
-    //! A build from before #183 keeps starting on a trust store this build
-    //! writes. No release reads a trust store; the older builds are builds of
-    //! main from #158 up to #183, and one of those and this build can run
-    //! against one config directory, so a store this build saves must not stop
-    //! the older one.
+mod a_build_before_schema_2_refuses_this_store_and_leaves_it_unchanged {
+    //! **Decided 2026-09-17 (#187).** The trust file's schema moves once:
+    //! each lease records whether both machines confirmed it and, once chosen,
+    //! its clipboard. Builds of main from #158 up read only version 1, and
+    //! they refuse to start on the new store until they are updated. A copy of
+    //! the version 1 files is kept at migration for them, and deleted at the
+    //! first removal after it.
     //!
-    //! **What that build checks**, reproduced below from its
-    //! `trust_file::validate` and `trust_file::rebuild` (through
-    //! `Lease::canonicalized`). At startup every active lease carries an
-    //! `expires_at`, or the whole file is refused and the daemon does not
-    //! start. At rebuild `issued_at < expires_at <= issued_at + 400 days` and
-    //! the lease names a capability, or that lease is dropped and erased at
-    //! that build's next save.
+    //! **Why this guard replaces the one before it.** That guard held the
+    //! opposite rule, #183's: an older build must keep starting on a store
+    //! this build saves, which pushed toward a second signed file kept in step
+    //! with the first. The decision reversed it. What still has to hold is
+    //! that an older build fails safely and can be brought back:
     //!
-    //! **Not promised.** That build still enforces the date it is handed: it
-    //! stops admitting a pairing 400 days after the pairing was made, while
-    //! this build keeps admitting it. It also means running this build once
-    //! brings back, on that build, a pairing whose shorter term had lapsed
-    //! there: the next save dates it 400 days after pairing, so that build
-    //! admits it again until then. The load log names each such pairing.
+    //! * it refuses `trust.toml` as not a store it wrote, rather than reading
+    //!   part of it, and writes nothing while refusing, so the newer build
+    //!   still starts on the same files afterwards;
+    //! * it parses the floor, so moving `trust.toml` aside is enough for it to
+    //!   start again;
+    //! * it accepts the copies once they are put back in place, with the
+    //!   pairings they held.
     //!
-    //! The saved date is a placeholder no later build may enforce; see
-    //! `no_pairing_expires_until_renewal_exists`.
+    //! **The older build is frozen here**, reproduced from `trust_file::open`
+    //! as it was before version 2 and from the daemon's start, which refuses
+    //! on an error from `open` and writes only when no store is found. It must
+    //! not follow later changes to `trust_file`: the builds it stands for will
+    //! never change.
 
-    use std::collections::{HashMap, HashSet};
-    use std::path::PathBuf;
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    use hops_ipc::pairing::canonical_fingerprint;
+    use serde::{Deserialize, Serialize};
 
-    use crate::authority::{AUTHORITY_KEY_FILE_NAME, Authority, SoftwareAuthority};
-    use crate::trust::{Caps, Expiry, Lease, Origin, TrustStore};
+    use crate::authority::{AUTHORITY_KEY_FILE_NAME, Authority, SignatureAlg, SoftwareAuthority};
+    use crate::trust::TrustStore;
     use crate::trust_file::{
-        DiskCap, DiskOrigin, DiskState, LeaseRecord, Loaded, TrustFile, rebuild, records_of,
-        stored_terms,
+        FLOOR_FILE_NAME, FLOOR_V1_COPY_NAME, Loaded, TRUST_FILE_NAME, TRUST_V1_COPY_NAME,
+        TrustFile, records_of, start,
     };
 
     use super::fp32;
 
-    const DAY: u64 = 86_400;
-    /// `trust::MAX_TERM_SECS` in every build with a trust store (#158) and
-    /// from before #183. It never changed in that range.
-    const OLDER_BUILD_CEILING_SECS: u64 = 400 * DAY;
+    /// The older build: its on-disk shapes, byte for byte what it parses.
+    mod older {
+        use super::*;
 
-    /// That build's `validate`. An `Err` is a daemon that does not start.
-    fn older_build_starts_on(leases: &[LeaseRecord]) -> Result<(), String> {
-        let mut seen = HashSet::new();
-        for l in leases {
-            if !seen.insert(l.fingerprint.as_str()) {
-                return Err(format!("two leases name {}", l.fingerprint));
+        pub const TRUST_DOMAIN: &[u8] = b"hops.trust-store.v1\x00";
+        pub const FLOOR_DOMAIN: &[u8] = b"hops.trust-floor.v1\x00";
+        pub const SEPARATOR: &str = "\n[signature]\n";
+
+        #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+        #[serde(rename_all = "kebab-case")]
+        pub enum Cap {
+            Inbound,
+            Outbound,
+        }
+
+        #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+        #[serde(rename_all = "kebab-case")]
+        pub enum State {
+            Active,
+            Revoked,
+        }
+
+        #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+        #[serde(rename_all = "kebab-case")]
+        pub enum Origin {
+            Inbound,
+            OutboundDial,
+            Migrated,
+        }
+
+        #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+        #[serde(deny_unknown_fields)]
+        pub struct Lease {
+            pub fingerprint: String,
+            pub label: String,
+            pub state: State,
+            pub origin: Origin,
+            pub issued_at: u64,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub expires_at: Option<u64>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub revoked_at: Option<u64>,
+            pub caps: Vec<Cap>,
+        }
+
+        #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+        #[serde(deny_unknown_fields)]
+        pub struct AuthorityBlock {
+            pub alg: String,
+            pub public_key: String,
+        }
+
+        #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+        #[serde(deny_unknown_fields)]
+        pub struct TrustBody {
+            pub version: u32,
+            pub serial: u64,
+            pub written_at: u64,
+            pub authority: AuthorityBlock,
+            #[serde(default)]
+            pub leases: Vec<Lease>,
+        }
+
+        #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+        #[serde(deny_unknown_fields)]
+        pub struct FloorBody {
+            pub version: u32,
+            pub seconds: u64,
+            pub serial: u64,
+            pub authority: AuthorityBlock,
+        }
+
+        #[derive(Deserialize)]
+        struct SignatureBlock {
+            value: String,
+        }
+
+        #[derive(Deserialize)]
+        struct JustTheAuthority {
+            authority: AuthorityBlock,
+        }
+
+        fn hex(bytes: &[u8]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+
+        fn unhex(s: &str) -> Option<Vec<u8>> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+                .collect()
+        }
+
+        pub fn authority_block(auth: &dyn Authority) -> AuthorityBlock {
+            AuthorityBlock {
+                alg: auth.algorithm().as_str().to_owned(),
+                public_key: hex(auth.public_key()),
             }
-            match l.state {
-                DiskState::Active => {
-                    if canonical_fingerprint(&l.fingerprint).as_deref()
-                        != Some(l.fingerprint.as_str())
-                    {
-                        return Err(format!("{} is not a canonical fingerprint", l.fingerprint));
-                    }
-                    if l.expires_at.is_none() {
-                        return Err(format!("the lease for {} never expires", l.fingerprint));
-                    }
+        }
+
+        fn seal<T: Serialize>(body: &T, domain: &[u8], auth: &dyn Authority) -> String {
+            let text = toml_edit::ser::to_string_pretty(body).expect("serialise");
+            let text = text.trim_end_matches('\n').to_owned();
+            let mut msg = domain.to_vec();
+            msg.extend_from_slice(text.as_bytes());
+            let sig = auth.sign(&msg).expect("sign");
+            format!("{text}{SEPARATOR}value = \"{}\"\n", hex(&sig))
+        }
+
+        /// Its `read_sealed`: absent is `None`; another authority, a bad
+        /// signature or an unreadable body is an error naming the file.
+        fn read_sealed<T: serde::de::DeserializeOwned>(
+            path: &Path,
+            domain: &[u8],
+            expect: &AuthorityBlock,
+        ) -> Result<Option<T>, String> {
+            let text = match std::fs::read_to_string(path) {
+                Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(format!("{}: {e}", path.display())),
+            };
+            let untrusted = |why: String| format!("{} is untrusted: {why}", path.display());
+            let (body, tail) = text
+                .rsplit_once(SEPARATOR)
+                .ok_or_else(|| untrusted("no signature block".into()))?;
+            let declared: JustTheAuthority =
+                toml_edit::de::from_str(body).map_err(|e| untrusted(format!("{e}")))?;
+            if declared.authority != *expect {
+                return Err(untrusted("another authority".into()));
+            }
+            let block: SignatureBlock =
+                toml_edit::de::from_str(tail).map_err(|e| untrusted(format!("{e}")))?;
+            let sig = unhex(&block.value).ok_or_else(|| untrusted("signature not hex".into()))?;
+            let key = unhex(&expect.public_key).ok_or_else(|| untrusted("key not hex".into()))?;
+            let alg = SignatureAlg::parse(&expect.alg).map_err(|e| untrusted(format!("{e}")))?;
+            let mut msg = domain.to_vec();
+            msg.extend_from_slice(body.as_bytes());
+            crate::authority::verify(alg, &key, &msg, &sig)
+                .map_err(|_| untrusted("edited".into()))?;
+            toml_edit::de::from_str(body)
+                .map(Some)
+                .map_err(|e| untrusted(format!("unreadable body: {e}")))
+        }
+
+        /// Its `TrustFile::open`: the floor, then the store, its version, the
+        /// rollback check and the structural checks. `Ok(None)` is no store.
+        pub fn open(dir: &Path, auth: &dyn Authority) -> Result<Option<Vec<Lease>>, String> {
+            let expect = authority_block(auth);
+            let floor: Option<FloorBody> =
+                read_sealed(&dir.join(FLOOR_FILE_NAME), FLOOR_DOMAIN, &expect)?;
+            let floor_serial = floor.map_or(0, |f| f.serial);
+            let trust_path = dir.join(TRUST_FILE_NAME);
+            let Some(body) = read_sealed::<TrustBody>(&trust_path, TRUST_DOMAIN, &expect)? else {
+                return Ok(None);
+            };
+            if body.version != 1 {
+                return Err(format!(
+                    "{} is untrusted: schema version {}",
+                    trust_path.display(),
+                    body.version
+                ));
+            }
+            if body.serial < floor_serial {
+                return Err(format!("{} is untrusted: a rollback", trust_path.display()));
+            }
+            let mut seen = std::collections::HashSet::new();
+            for l in &body.leases {
+                if !seen.insert(l.fingerprint.clone()) {
+                    return Err(format!(
+                        "{} is untrusted: a duplicate",
+                        trust_path.display()
+                    ));
                 }
-                DiskState::Revoked => {
-                    if !l.caps.is_empty() {
-                        return Err(format!(
-                            "{} is revoked but still carries capabilities",
-                            l.fingerprint
-                        ));
-                    }
+                if l.state == State::Revoked && !l.caps.is_empty() {
+                    return Err(format!(
+                        "{} is untrusted: a revoked grant",
+                        trust_path.display()
+                    ));
+                }
+            }
+            Ok(Some(body.leases))
+        }
+
+        /// Its save: the store, then the floor, each sealed.
+        pub fn save(dir: &Path, auth: &dyn Authority, serial: u64, leases: Vec<Lease>) {
+            let body = TrustBody {
+                version: 1,
+                serial,
+                written_at: crate::trust::system_seconds(),
+                authority: authority_block(auth),
+                leases,
+            };
+            let floor = FloorBody {
+                version: 1,
+                seconds: body.written_at,
+                serial,
+                authority: authority_block(auth),
+            };
+            std::fs::write(dir.join(TRUST_FILE_NAME), seal(&body, TRUST_DOMAIN, auth))
+                .expect("write the store");
+            std::fs::write(dir.join(FLOOR_FILE_NAME), seal(&floor, FLOOR_DOMAIN, auth))
+                .expect("write the floor");
+        }
+
+        /// Its daemon's start: an error from `open` stops it before any
+        /// write; with no store it migrates and saves one.
+        pub fn start(dir: &Path, auth: &dyn Authority) -> Result<Vec<Lease>, String> {
+            match open(dir, auth)? {
+                Some(leases) => Ok(leases),
+                None => {
+                    save(dir, auth, 1, Vec::new());
+                    Ok(Vec::new())
                 }
             }
         }
-        Ok(())
     }
 
-    /// What that build's `rebuild` makes of the rows: each admitted lease's
-    /// window `[issued_at, expires_at)`, each removal, and each row it drops.
-    struct OlderBuildStore {
-        windows: HashMap<String, (u64, u64)>,
-        removed: HashSet<String>,
-        dropped: Vec<String>,
-    }
-
-    fn older_build_rebuild(leases: &[LeaseRecord]) -> OlderBuildStore {
-        let mut out = OlderBuildStore {
-            windows: HashMap::new(),
-            removed: HashSet::new(),
-            dropped: Vec::new(),
-        };
-        for l in leases {
-            match l.state {
-                DiskState::Revoked => {
-                    out.removed.insert(l.fingerprint.clone());
-                }
-                DiskState::Active => {
-                    let Some(not_after) = l.expires_at else {
-                        out.dropped.push(format!("{}: no expiry", l.fingerprint));
-                        continue;
-                    };
-                    if not_after <= l.issued_at {
-                        out.dropped
-                            .push(format!("{}: an empty term", l.fingerprint));
-                    } else if not_after - l.issued_at > OLDER_BUILD_CEILING_SECS {
-                        out.dropped.push(format!(
-                            "{}: a term of {}s, over the {OLDER_BUILD_CEILING_SECS}s ceiling",
-                            l.fingerprint,
-                            not_after - l.issued_at
-                        ));
-                    } else if l.caps.is_empty() {
-                        out.dropped
-                            .push(format!("{}: no capabilities", l.fingerprint));
-                    } else {
-                        out.windows
-                            .insert(l.fingerprint.clone(), (l.issued_at, not_after));
-                    }
-                }
-            }
-        }
-        out
-    }
-
-    fn scratch_dir() -> PathBuf {
+    fn scratch_dir(tag: &str) -> PathBuf {
         let mut d = std::env::temp_dir();
-        d.push(format!("hops-guard-older-build-{}", std::process::id()));
+        d.push(format!("hops-guard-schema-2-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).expect("mkdir");
         d
     }
 
-    /// Every kind of row this build saves goes through the real save and the
-    /// real open, then through the older build's checks.
-    // LEDGER T3 | class B | 4 file on disk: trust_file::records_of, TrustFile::save, TrustFile::open
-    #[test]
-    fn a_store_this_build_saves_passes_every_check_a_build_from_before_183_makes() {
-        let dir = scratch_dir();
-        let authority: Arc<dyn Authority> = Arc::new(
-            SoftwareAuthority::load_or_generate(&dir.join(AUTHORITY_KEY_FILE_NAME))
+    /// A scratch directory holding a machine's trust authority.
+    fn scratch(tag: &str) -> (PathBuf, Arc<dyn Authority>) {
+        let d = scratch_dir(tag);
+        let auth: Arc<dyn Authority> = Arc::new(
+            SoftwareAuthority::load_or_generate(&d.join(AUTHORITY_KEY_FILE_NAME))
                 .expect("authority"),
         );
-        let (mut file, _) = TrustFile::open(&dir, authority.clone()).expect("open");
-        let now = file.now();
+        (d, auth)
+    }
 
-        let ours = fp32(0x01);
-        let (sender, receiver, carried, removed, old) =
-            (fp32(0x11), fp32(0x12), fp32(0x13), fp32(0x14), fp32(0x15));
-        let mut store = TrustStore::new(&ours, now).expect("ours");
-        store
-            .issue(&sender, "approved inbound", Caps::INBOUND)
-            .expect("issue");
-        store
-            .issue(&receiver, "approved outbound", Caps::OUTBOUND)
-            .expect("issue");
-        store.migrate_from_config(
-            &HashMap::from([(carried.clone(), "carried forward".to_string())]),
-            &HashMap::new(),
-            &HashSet::new(),
-            now,
-        );
-        store
-            .issue(&removed, "removed", Caps::INBOUND)
-            .expect("issue");
-        store.revoke(&removed);
-        // Paired two years ago and still trusted here: the date saved for it
-        // is already behind, and that build must still start.
-        store
-            .admit(Lease {
-                peer: old.clone(),
-                issued_to: ours.clone(),
-                label: "paired two years ago".into(),
-                caps: Caps::INBOUND,
-                origin: Origin::Inbound,
-                issued_at: now - 2 * 365 * DAY,
-                expiry: Expiry::Never,
-            })
-            .expect("admit");
+    /// Every file either build reads or writes, by name, as bytes.
+    fn files(dir: &Path) -> BTreeMap<&'static str, Option<Vec<u8>>> {
+        [
+            TRUST_FILE_NAME,
+            FLOOR_FILE_NAME,
+            TRUST_V1_COPY_NAME,
+            FLOOR_V1_COPY_NAME,
+        ]
+        .into_iter()
+        .map(|name| (name, std::fs::read(dir.join(name)).ok()))
+        .collect()
+    }
+
+    fn lease(fp: &str, state: older::State, caps: &[older::Cap]) -> older::Lease {
+        older::Lease {
+            fingerprint: fp.to_owned(),
+            label: format!("device {}", &fp[..2]),
+            state,
+            origin: older::Origin::Migrated,
+            issued_at: 1_788_579_979,
+            expires_at: (state == older::State::Active).then_some(1_788_579_979 + 400 * 86_400),
+            revoked_at: (state == older::State::Revoked).then_some(1_788_579_979),
+            caps: caps.to_vec(),
+        }
+    }
+
+    // LEDGER E2A-8 | class B | 4 file on disk: TrustFile::open, trust_file::start, TrustFile::save, and a frozen older build's open, save and start
+    #[test]
+    fn a_build_before_schema_2_refuses_this_store_and_leaves_it_unchanged() {
+        use older::{Cap, State};
+
+        // A store holding no pairing is refused, by its version alone.
+        let (empty, auth) = scratch("empty");
+        let (mut file, _) = TrustFile::open(&empty, auth.clone()).expect("open");
+        file.save(&records_of(
+            &TrustStore::new(&fp32(0x01), file.now()).expect("ours"),
+        ))
+        .expect("save an empty store");
         assert!(
-            store.may_drive_us(&old),
-            "precondition: this build trusts the old pairing"
+            older::start(&empty, auth.as_ref()).is_err(),
+            "a build that reads only version 1 started on an empty store this build \
+             saved: the version must say it is not a store that build can read"
         );
 
-        file.save(&records_of(&store)).expect("save");
-        let (_, loaded) = TrustFile::open(&dir, authority).expect("reopen");
+        // A store an older build wrote, and this build's first start on it.
+        let (dir, auth) = scratch("migrated");
+        let held = vec![
+            lease(&fp32(0x11), State::Active, &[Cap::Inbound]),
+            lease(&fp32(0x12), State::Active, &[Cap::Outbound]),
+            lease(&fp32(0x13), State::Revoked, &[]),
+        ];
+        older::save(&dir, auth.as_ref(), 4, held.clone());
+        assert_eq!(
+            older::start(&dir, auth.as_ref()).as_ref(),
+            Ok(&held),
+            "precondition: the older build starts on its own store"
+        );
+        let (mut file, loaded) = TrustFile::open(&dir, auth.clone()).expect("this build opens it");
         let Loaded::Present { leases, .. } = loaded else {
             panic!("the store must be found");
         };
+        start(&mut file, &fp32(0x01), &leases).expect("this build starts");
 
-        if let Err(why) = older_build_starts_on(&leases) {
-            panic!(
-                "a build from before #183 refuses to start on a store this build \
-                 saved: {why}. Every active lease needs an expires_at that build \
-                 accepts, even though this build ignores it."
-            );
+        // The older build refuses the store this build saved, blames the
+        // store and not the floor, and writes nothing.
+        let before = files(&dir);
+        let refused = older::start(&dir, auth.as_ref());
+        let store_path = dir.join(TRUST_FILE_NAME).display().to_string();
+        match &refused {
+            Err(why) if why.starts_with(&format!("{store_path} is untrusted")) => {}
+            other => panic!(
+                "a build that reads only version 1 must refuse {TRUST_FILE_NAME} as a \
+                 store it did not write, and parse the floor on the way; it gave {other:?}"
+            ),
         }
-        let older = older_build_rebuild(&leases);
-        assert!(
-            older.dropped.is_empty(),
-            "a build from before #183 drops these pairings and erases them at its \
-             next save, taking them from this build too: {:?}",
-            older.dropped
+        assert_eq!(
+            files(&dir),
+            before,
+            "the older build changed a file while refusing, so this build may no longer \
+             start on them"
         );
-        for fp in [&sender, &receiver, &carried, &old] {
-            assert!(
-                older.windows.contains_key(fp.as_str()),
-                "{fp} is missing from what that build admits"
-            );
-        }
+        let (_, reopened) = TrustFile::open(&dir, auth.clone()).expect("this build reopens it");
         assert!(
-            older.removed.contains(&removed),
-            "a device removed here must stay removed there"
-        );
-        for fp in [&sender, &receiver, &carried] {
-            let (from, until) = older.windows[fp.as_str()];
-            assert!(from <= now + DAY, "precondition: {fp} was paired today");
-            let last_day = from + OLDER_BUILD_CEILING_SECS - 1;
-            assert!(
-                last_day < until,
-                "that build stops admitting {fp}, paired today, at {until}, before \
-                 {last_day}: it must get the whole 400 days that build allows"
-            );
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Pairings whose 30-day term had lapsed on that build. The load log names
-    /// each one and says what that build does with it once this build saves;
-    /// that build's own rebuild of the saved rows is the check on the claim.
-    // LEDGER T9 | class B | 1 return value: trust_file::rebuild, trust_file::stored_terms, StoredTerms::log_lines, trust_file::records_of
-    #[test]
-    fn the_load_log_says_what_that_build_does_with_a_lapsed_pairing_once_this_build_saves() {
-        let ours = fp32(0x01);
-        let now = crate::trust::system_seconds();
-        let (recent, old) = (fp32(0x21), fp32(0x22));
-        let written_by_that_build = |fp: &str, label: &str, issued_at: u64| LeaseRecord {
-            fingerprint: fp.to_owned(),
-            label: label.into(),
-            state: DiskState::Active,
-            origin: DiskOrigin::Inbound,
-            issued_at,
-            expires_at: Some(issued_at + 30 * DAY),
-            revoked_at: None,
-            caps: vec![DiskCap::Inbound],
-        };
-        let rows = vec![
-            written_by_that_build(&recent, "lapsed ten days ago", now - 40 * DAY),
-            written_by_that_build(&old, "paired two years ago", now - 2 * 365 * DAY),
-        ];
-        let admits_now = |older: &OlderBuildStore, fp: &str| {
-            older
-                .windows
-                .get(fp)
-                .is_some_and(|&(from, until)| from <= now && now < until)
-        };
-        let before = older_build_rebuild(&rows);
-        for fp in [&recent, &old] {
-            assert!(
-                !admits_now(&before, fp),
-                "precondition: that build had stopped admitting {fp}"
-            );
-        }
-
-        let (store, refused) = rebuild(&ours, now, &rows).expect("rebuild");
-        assert!(refused.is_empty(), "refused on load: {refused:?}");
-        let lines = stored_terms(&rows, &store).log_lines();
-        let after = older_build_rebuild(&records_of(&store));
-        assert!(
-            admits_now(&after, &recent) && !admits_now(&after, &old),
-            "precondition: once this build saves, that build admits the recent \
-             pairing again and goes on refusing the old one"
+            matches!(reopened, Loaded::Present { .. }),
+            "this build no longer finds its store after the older build refused it"
         );
 
-        for fp in [&recent, &old] {
-            let Some((_, warn)) = lines
-                .iter()
-                .find(|(level, line)| *level == log::Level::Warn && line.contains(fp.as_str()))
-            else {
-                panic!("{fp} works again here and is not named at warn: {lines:#?}");
-            };
-            let admits = admits_now(&after, fp);
-            assert!(
-                warn.contains("admits it again") == admits
-                    && warn.contains("goes on refusing") == !admits,
-                "the load log says of {fp}:\n  {warn}\nbut once this build saves, that \
-                 build {} it",
-                if admits { "admits" } else { "refuses" }
-            );
+        // The copies, put back in place, are a store the older build starts on.
+        let restored = scratch_dir("restored");
+        std::fs::copy(
+            dir.join(AUTHORITY_KEY_FILE_NAME),
+            restored.join(AUTHORITY_KEY_FILE_NAME),
+        )
+        .expect("the same machine");
+        for (copy, name) in [
+            (TRUST_V1_COPY_NAME, TRUST_FILE_NAME),
+            (FLOOR_V1_COPY_NAME, FLOOR_FILE_NAME),
+        ] {
+            std::fs::copy(dir.join(copy), restored.join(name)).expect("put the copy back");
+        }
+        assert_eq!(
+            older::start(&restored, auth.as_ref()).as_ref(),
+            Ok(&held),
+            "the version 1 copies, restored, are not the store the older build wrote"
+        );
+
+        // With trust.toml moved aside, the older build starts again on the
+        // floor this build wrote.
+        std::fs::rename(dir.join(TRUST_FILE_NAME), dir.join("trust.toml.aside"))
+            .expect("move the store aside");
+        assert_eq!(
+            older::open(&dir, auth.as_ref()),
+            Ok(None),
+            "with {TRUST_FILE_NAME} moved aside, a build that reads only version 1 must \
+             find no store and start fresh; it cannot read the floor this build wrote"
+        );
+
+        for d in [dir, restored, empty] {
+            let _ = std::fs::remove_dir_all(d);
         }
     }
 }
@@ -1247,6 +1359,7 @@ mod an_expelled_fingerprint_is_never_re_authorised {
                         origin: Origin::Inbound,
                         issued_at: 0,
                         expiry: Expiry::Never,
+                        clipboard_chosen: false,
                     });
                 }),
             ),
@@ -1508,7 +1621,8 @@ mod taking_trust_away_is_never_gated_the_way_giving_it_is {
     //! **Decided 2026-08-05, two rules.** (1) A trust grant is refused while a
     //! peer is injecting input into this machine. (2) Revoke and delete succeed
     //! while a peer is driving this machine — the quiet window gates grants
-    //! only.
+    //! only. Turning a pairing's clipboard off (#182) takes permission away
+    //! too, and is held to the same rule.
     //!
     //! **Why the asymmetry is deliberate.** On a KVM the pointer is not proof
     //! of local presence: a peer that still holds control can move the cursor
@@ -1615,7 +1729,7 @@ mod taking_trust_away_is_never_gated_the_way_giving_it_is {
             );
         }
 
-        for arm in ["RemoveAuthorizedKey", "Delete"] {
+        for arm in ["RemoveAuthorizedKey", "Delete", "DisableClipboard"] {
             let at = dispatch
                 .find(&format!("FrontendRequest::{arm}"))
                 .unwrap_or_else(|| panic!("{arm} must be dispatched; update this guard"));
@@ -1818,6 +1932,9 @@ mod every_trust_mutation_happens_at_a_named_door {
         // opens: it mints nothing, narrows only, and runs on a timer. Listed so
         // the addition is visible in the diff rather than discovered later.
         "fn sweep_lapsed_leases",
+        // Added with the clipboard off switch (#182, #187). It narrows only,
+        // dropping the clipboard bits of one lease, and needs no authority.
+        "fn disable_clipboard",
     ];
 
     /// The needle a scan must actually find. If the store is renamed again,

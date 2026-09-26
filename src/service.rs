@@ -434,18 +434,10 @@ impl Service {
         let (mut trust_file, loaded) = crate::trust_file::TrustFile::open(&config_dir, authority)?;
 
         let store = match loaded {
+            // A version 1 store moves to version 2 here, and a pairing never
+            // confirmed is dropped, each saved before anything else happens.
             crate::trust_file::Loaded::Present { leases, .. } => {
-                let (store, refused) =
-                    crate::trust_file::rebuild(&public_key_fingerprint, trust_file.now(), &leases)?;
-                for why in &refused {
-                    // Reported, never dropped silently: a device losing trust
-                    // with no explanation is the failure this rework removes.
-                    log::warn!("trust store: {why}");
-                }
-                for (level, line) in crate::trust_file::stored_terms(&leases, &store).log_lines() {
-                    log::log!(level, "{line}");
-                }
-                store
+                crate::trust_file::start(&mut trust_file, &public_key_fingerprint, &leases)?
             }
             crate::trust_file::Loaded::Absent => {
                 // First run under leases. This is the one-way door: after it,
@@ -819,6 +811,10 @@ impl Service {
                 );
                 self.publish_pairing_window();
             }
+            // Not behind `refuse_while_remotely_driven`: like removal, it only
+            // takes permission away, and a peer driving this machine gains
+            // nothing by clicking it.
+            FrontendRequest::DisableClipboard(fp) => self.disable_clipboard(fp),
         }
     }
 
@@ -1244,13 +1240,10 @@ impl Service {
             }
         };
         self.notify_frontend(FrontendEvent::PairingCode(pairing_code));
-        // Derived from LIVE inbound leases only. Anything looser makes the
-        // frontend claim a machine can drive you when its lease has lapsed.
-        let (keys, tombstones) = self.trust.read().expect("lock").config_cache();
-        self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
-        // a freshly-attached frontend must learn the denylist too, or it renders
-        // revoked devices as strangers until the next change
-        self.notify_frontend(FrontendEvent::RevokedUpdated(tombstones));
+        // A freshly-attached frontend must learn the denylist and each
+        // pairing's clipboard too, or it renders revoked devices as strangers
+        // and every switch as unknown until the next change.
+        self.publish_trust();
         // re-emit current incoming connections so a freshly-attached UI knows
         // which trusted peers are connected right now, not just from future events
         let connected: Vec<(SocketAddr, String)> = self
@@ -1384,8 +1377,7 @@ impl Service {
             .label(&fp)
             .unwrap_or_default();
         self.persist_trust(format!("trusting {}", named(&stored, &fp)));
-        let (keys, _) = self.trust.read().expect("lock").config_cache();
-        self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+        self.publish_trust();
     }
 
     /// Refuse a trust GRANT while a peer is driving this machine's input.
@@ -1635,8 +1627,7 @@ impl Service {
             .label(&fp)
             .unwrap_or_default();
         self.persist_trust(format!("renaming a device to {}", named(&stored, &fp)));
-        let (keys, _) = self.trust.read().expect("lock").config_cache();
-        self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+        self.publish_trust();
     }
 
     fn remove_authorized_key(&mut self, fp: String) {
@@ -1662,9 +1653,65 @@ impl Service {
         for h in self.client_manager.clear_pins_matching(&fp) {
             self.broadcast_client(h);
         }
-        let (keys, tombstones) = self.trust.read().expect("lock").config_cache();
+        self.publish_trust();
+    }
+
+    /// Turn a pairing's clipboard off, both ways (#182). The store keeps the
+    /// choice on the lease, so it is saved, survives a restart, and stays off
+    /// when the other direction is approved (#187). A transfer already under
+    /// way is checked again when it completes, so it is not applied either.
+    fn disable_clipboard(&mut self, fp: String) {
+        let Some(fp) = hops_ipc::pairing::canonical_fingerprint(&fp) else {
+            log::warn!("refusing to turn the clipboard off for {fp:?}: not a fingerprint");
+            return;
+        };
+        // The lock is taken on one line on purpose: the named-door guard scans
+        // for that call.
+        let changed = self.trust.write().expect("lock").disable_clipboard(&fp);
+        if !changed {
+            log::warn!("not turning the clipboard off for {fp}: it is not a paired device");
+            self.notify_frontend(FrontendEvent::Error(
+                "That device is not paired, so it has no clipboard to turn off.".to_string(),
+            ));
+            return;
+        }
+        let label = self
+            .trust
+            .read()
+            .expect("lock")
+            .label(&fp)
+            .unwrap_or_default();
+        log::info!("clipboard off for {}", named(&label, &fp));
+        self.persist_trust(format!(
+            "turning the clipboard off for {}",
+            named(&label, &fp)
+        ));
+        self.publish_trust();
+    }
+
+    /// Tell every frontend what the trust store now grants: who may drive
+    /// this machine (derived from live leases only, or a frontend would claim
+    /// a machine can drive you when its lease has lapsed), who was removed,
+    /// and each pairing's clipboard.
+    fn publish_trust(&mut self) {
+        let (keys, tombstones, pairings) = {
+            let trust = self.trust.read().expect("lock");
+            let (keys, tombstones) = trust.config_cache();
+            (keys, tombstones, trust.pairings())
+        };
+        let peers = pairings
+            .into_iter()
+            .map(|(fp, caps)| {
+                let t = hops_ipc::PeerTrust {
+                    clipboard_from: caps.contains(crate::trust::Caps::CLIPBOARD_FROM),
+                    clipboard_to: caps.contains(crate::trust::Caps::CLIPBOARD_TO),
+                };
+                (fp, t)
+            })
+            .collect();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
         self.notify_frontend(FrontendEvent::RevokedUpdated(tombstones));
+        self.notify_frontend(FrontendEvent::TrustUpdated(peers));
     }
 
     /// Drop what has lapsed, and cut the sessions it was holding open.
@@ -1704,9 +1751,7 @@ impl Service {
             .map(|l| format!("the end of the pairing with {}", named(&l.label, &l.peer)))
             .collect();
         self.persist_trust(ended.join(", "));
-        let (keys, tombstones) = self.trust.read().expect("lock").config_cache();
-        self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
-        self.notify_frontend(FrontendEvent::RevokedUpdated(tombstones));
+        self.publish_trust();
     }
 
     /// Write the sealed store.
@@ -2352,6 +2397,7 @@ mod one_trust_write_site {
         "fn set_label",             // rename, refuses unknown fingerprints
         "fn handle_config_change",  // reload: the config file is a door too
         "fn new",                   // startup load
+        "fn disable_clipboard",     // narrows one lease's clipboard, never widens
     ];
 
     #[test]

@@ -37,8 +37,9 @@ use std::{
 };
 
 use hops_frontend_core::{
-    AppModel, ApprovalRefused, AttemptOrigin, ClientHandle, Device, DeviceSend, FrontendClient,
-    FrontendRequest, Launch, PairingAttempt, PairingCard, Position, Status, TrustState,
+    AppModel, ApprovalRefused, AttemptOrigin, ClientHandle, Clipboard, Device, DeviceSend,
+    FrontendClient, FrontendRequest, Launch, PairingAttempt, PairingCard, Position, Status,
+    TrustState,
     prefs::Frontend,
     theme::{self, Rgb, Theme},
 };
@@ -129,6 +130,9 @@ enum Confirm {
         pin: Option<String>,
         destructive: bool,
     },
+    /// Turn a paired device's clipboard off. Asked first, because nothing
+    /// here turns it back on (#182, #107).
+    ClipboardOff { label: String, fp: String },
 }
 
 /// What the TUI says when it drops an armed action.
@@ -150,6 +154,12 @@ fn drop_stale(model: &AppModel, confirm: &mut Option<Confirm>, input: &mut Optio
     }) = confirm.as_ref()
     {
         if !model.still_names(*h, pin.as_deref()) {
+            *confirm = None;
+            dropped = true;
+        }
+    }
+    if let Some(Confirm::ClipboardOff { fp, .. }) = confirm.as_ref() {
+        if !model.clipboard(fp).is_some_and(Clipboard::is_on) {
             *confirm = None;
             dropped = true;
         }
@@ -448,22 +458,8 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                         // ---- confirmation mode ----
                         match k.code {
                             KeyCode::Char('y') => {
-                                if let Some(Confirm::Remove {
-                                    handle, fp, pin, ..
-                                }) = confirm.take()
-                                {
-                                    // Deleting the outgoing client is the whole
-                                    // removal: the daemon tombstones the pinned
-                                    // fingerprint with it. Only a peer we have no
-                                    // client for needs the allowlist request.
-                                    if let Some(h) = handle {
-                                        client.request(FrontendRequest::Delete {
-                                            handle: h,
-                                            fingerprint: pin,
-                                        });
-                                    } else if let Some(fp) = fp {
-                                        client.request(FrontendRequest::RemoveAuthorizedKey(fp));
-                                    }
+                                if let Some(request) = confirm.take().and_then(confirmed) {
+                                    client.request(request);
                                 }
                             }
                             KeyCode::Char('n') | KeyCode::Esc => confirm = None,
@@ -577,6 +573,10 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                                     notice = Some((NO_SEND_NOTE.to_string(), Instant::now()));
                                 }
                             },
+                            KeyCode::Char('c') => match clipboard_off(&model, selected) {
+                                Ok(ask) => confirm = Some(ask),
+                                Err(why) => notice = Some((why.to_string(), Instant::now())),
+                            },
                             KeyCode::Char('d') | KeyCode::Delete => match selected {
                                 // already expelled — there is nothing left to do
                                 // to it, and offering one would imply a way back
@@ -622,6 +622,49 @@ const REVOKED_NOTE: &str =
     "This device was removed. It must pair again with a new identity — there is no way back in.";
 const NO_SEND_NOTE: &str =
     "This device only connects in to you. Add it as a device to cross to it.";
+const CLIPBOARD_OFF_NOTE: &str =
+    "The clipboard is already off for this device. It cannot be turned back on from here yet.";
+const NO_CLIPBOARD_NOTE: &str = "This device is not paired, so it has no clipboard to turn off.";
+
+/// The request a confirmation answered `y` sends, if any.
+fn confirmed(confirm: Confirm) -> Option<FrontendRequest> {
+    match confirm {
+        // Deleting the outgoing client is the whole removal: the daemon
+        // tombstones the pinned fingerprint with it. Only a peer we have no
+        // client for needs the allowlist request.
+        Confirm::Remove {
+            handle: Some(h),
+            pin,
+            ..
+        } => Some(FrontendRequest::Delete {
+            handle: h,
+            fingerprint: pin,
+        }),
+        Confirm::Remove { fp, .. } => fp.map(FrontendRequest::RemoveAuthorizedKey),
+        Confirm::ClipboardOff { fp, .. } => Some(FrontendRequest::DisableClipboard(fp)),
+    }
+}
+
+/// The clipboard with a listed device, if a pairing holds one.
+fn clipboard_of(model: &AppModel, d: &Device) -> Option<Clipboard> {
+    d.fingerprint.as_deref().and_then(|fp| model.clipboard(fp))
+}
+
+/// What `c` does on the selected row: ask before turning its clipboard off,
+/// or say why there is nothing to turn off.
+fn clipboard_off(model: &AppModel, selected: Option<&Device>) -> Result<Confirm, &'static str> {
+    let Some(d) = selected else {
+        return Err(NO_CLIPBOARD_NOTE);
+    };
+    match (d.fingerprint.clone(), clipboard_of(model, d)) {
+        (Some(fp), Some(c)) if c.is_on() => Ok(Confirm::ClipboardOff {
+            label: d.label.clone(),
+            fp,
+        }),
+        (_, Some(_)) => Err(CLIPBOARD_OFF_NOTE),
+        _ => Err(NO_CLIPBOARD_NOTE),
+    }
+}
 
 /// Show the first-run "choose your interface" screen and block until the user
 /// picks one. A terminal can't show a graphical preview, so unlike the GUI's
@@ -784,7 +827,7 @@ fn peer_build(d: &Device) -> String {
 /// The two facets a device can have — we cross *to* it, it may connect *in* to
 /// us — are shown as one arrow badge rather than as membership of two different
 /// lists, which is the whole point of the projection.
-fn device_row(d: &Device, theme: &Theme) -> ListItem<'static> {
+fn device_row(d: &Device, clipboard: Option<Clipboard>, theme: &Theme) -> ListItem<'static> {
     let muted = Style::default().fg(col(theme.muted));
     let revoked = d.trust == TrustState::Revoked;
 
@@ -877,6 +920,18 @@ fn device_row(d: &Device, theme: &Theme) -> ListItem<'static> {
         ));
     } else {
         spans.push(Span::styled("connects in only", muted));
+    }
+    // Off is said as plainly as on: there is no way to turn it back on from
+    // here yet, so the row is the one place the user learns which it is.
+    if let Some(c) = clipboard {
+        spans.push(Span::styled(
+            format!("  {}", c.describe()),
+            if c.is_on() {
+                Style::default().fg(col(theme.foreground))
+            } else {
+                muted
+            },
+        ));
     }
 
     ListItem::new(Line::from(spans))
@@ -994,7 +1049,10 @@ fn ui(
             muted,
         )))]
     } else {
-        devices.iter().map(|d| device_row(d, theme)).collect()
+        devices
+            .iter()
+            .map(|d| device_row(d, clipboard_of(model, d), theme))
+            .collect()
     };
     f.render_stateful_widget(
         List::new(rows)
@@ -1006,11 +1064,13 @@ fn ui(
     );
 
     // footer: input / confirm / notice / keymap, plus our own fingerprint
+    let selected = devices.get(selected_index(list_state));
     let line1 = footer_line(
         input,
         confirm,
         notice,
-        devices.get(selected_index(list_state)),
+        selected,
+        selected.and_then(|d| clipboard_of(model, d)),
         theme,
     );
     let fp = model.fingerprint.as_deref().unwrap_or("—");
@@ -1069,6 +1129,7 @@ fn footer_line(
     confirm: Option<&Confirm>,
     notice: Option<&str>,
     selected: Option<&Device>,
+    clipboard: Option<Clipboard>,
     theme: &Theme,
 ) -> Line<'static> {
     let key = Style::default()
@@ -1115,6 +1176,20 @@ fn footer_line(
             Span::raw(" no"),
         ]);
     }
+    if let Some(Confirm::ClipboardOff { label, .. }) = confirm {
+        return Line::from(vec![
+            Span::styled(
+                format!(
+                    "turn the clipboard off for {label}? it cannot be turned back on here yet — "
+                ),
+                warn,
+            ),
+            Span::styled("y", key),
+            Span::raw(" yes  "),
+            Span::styled("n", key),
+            Span::raw(" no"),
+        ]);
+    }
     if let Some(msg) = notice {
         return Line::from(Span::styled(msg.to_string(), warn));
     }
@@ -1137,6 +1212,10 @@ fn footer_line(
                     spans.push(Span::styled(k, key));
                     spans.push(Span::raw(label));
                 }
+            }
+            if clipboard.is_some_and(Clipboard::is_on) {
+                spans.push(Span::styled("c", key));
+                spans.push(Span::raw(" clipboard off  "));
             }
             spans.push(Span::styled("d", key));
             spans.push(Span::raw(" remove  "));
@@ -1940,5 +2019,117 @@ mod tests {
         );
         let out = screen(&model, 0);
         assert!(out.contains("@?"), "unknown build must be explicit:\n{out}");
+    }
+    /// Each paired row says whether its clipboard is on, off included, and
+    /// `c` asks before sending the one request that turns it off. With it off,
+    /// `c` says so and asks nothing, and the keymap offers nothing: this
+    /// frontend cannot turn it back on (#182, #107).
+    // LEDGER E2A-10 | class B | 3 render + 1 return value: ui() into a TestBackend, clipboard_off, confirmed
+    #[test]
+    fn the_clipboard_switch_turns_it_off_and_shows_it_off() {
+        use hops_frontend_core::{FrontendEvent, PeerTrust};
+        const LAPTOP: &str = "2e:29:2b:3c:4d:5e:6f:70:81:92:a3:b4:c5:d6:e7:f8";
+        let mut model = AppModel::default();
+        model.apply(FrontendEvent::AuthorizedUpdated(
+            [
+                (FP.to_owned(), "desk mac".to_owned()),
+                (LAPTOP.to_owned(), "laptop".to_owned()),
+            ]
+            .into(),
+        ));
+        model.apply(FrontendEvent::TrustUpdated(
+            [
+                (
+                    FP.to_owned(),
+                    PeerTrust {
+                        clipboard_from: true,
+                        clipboard_to: false,
+                    },
+                ),
+                (LAPTOP.to_owned(), PeerTrust::default()),
+            ]
+            .into(),
+        ));
+        let devices = listable(&model);
+        let at = |label: &str| {
+            devices
+                .iter()
+                .position(|d| d.label == label)
+                .unwrap_or_else(|| panic!("{label} is not listed"))
+        };
+        let row = |out: &str, label: &str| {
+            out.lines()
+                .find(|l| l.contains(label))
+                .unwrap_or_else(|| panic!("no row for {label}:\n{out}"))
+                .to_owned()
+        };
+
+        let on = screen(&model, at("desk mac"));
+        assert!(
+            row(&on, "desk mac").contains("clipboard from it"),
+            "the row does not say its clipboard is on:\n{on}"
+        );
+        assert!(
+            row(&on, "laptop").contains("clipboard off"),
+            "the row does not say its clipboard is off:\n{on}"
+        );
+        assert!(
+            on.contains("c clipboard off"),
+            "the keymap does not offer to turn the clipboard off:\n{on}"
+        );
+        let ask = clipboard_off(&model, devices.get(at("desk mac")))
+            .unwrap_or_else(|why| panic!("c asked nothing: {why}"));
+        let theme = theme::default_theme();
+        let mut state = ListState::default();
+        state.select(Some(at("desk mac")));
+        let mut term = Terminal::new(TestBackend::new(120, 24)).expect("test terminal");
+        term.draw(|f| {
+            ui(
+                f,
+                &model,
+                &devices,
+                &mut state,
+                None,
+                Some(&ask),
+                None,
+                None,
+                false,
+                &theme,
+            )
+        })
+        .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let asking: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(
+            asking.contains(
+                "turn the clipboard off for desk mac? it cannot be turned back on here yet"
+            ),
+            "the question does not say what y does:\n{asking}"
+        );
+        assert_eq!(
+            confirmed(ask),
+            Some(FrontendRequest::DisableClipboard(FP.to_owned())),
+            "answering y does not turn this device's clipboard off"
+        );
+
+        let off = screen(&model, at("laptop"));
+        assert!(
+            !off.contains("c clipboard"),
+            "the keymap offers a clipboard key for a device whose clipboard is off:\n{off}"
+        );
+        assert!(
+            matches!(
+                clipboard_off(&model, devices.get(at("laptop"))),
+                Err(CLIPBOARD_OFF_NOTE)
+            ),
+            "c on a device whose clipboard is off must say so and ask nothing"
+        );
     }
 }

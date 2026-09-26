@@ -81,7 +81,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::trust::{Caps, Denial, Expiry, Lease, Origin, TrustError, TrustStore};
+use crate::trust::{
+    Caps, Denial, Expiry, Lease, Origin, TrustError, TrustStore, existing_pairing_clipboard,
+};
 
 use hops_ipc::pairing::canonical_fingerprint;
 
@@ -104,7 +106,28 @@ pub const FLOOR_FILE_NAME: &str = "trust-floor.toml";
 
 /// Bumped when the file layout changes incompatibly. A build that meets a
 /// version it does not know refuses the file rather than guessing.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// Version 2 (#187) records on each lease whether both machines confirmed the
+/// pairing and, once someone chose it, its clipboard. This build reads
+/// version 1 as well and writes version 2 at its first save, keeping a copy of
+/// the version 1 files beside it ([`TRUST_V1_COPY_NAME`]). Builds that read
+/// only version 1, from #158 up, refuse a version 2 store and do not start.
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// The version the floor file declares. Its layout did not change with the
+/// store's: a build that reads only version 1 parses it, which is what lets
+/// such a build start again once `trust.toml` is moved aside.
+const FLOOR_VERSION: u32 = 1;
+
+/// Where the save that moves a version 1 store to [`SCHEMA_VERSION`] keeps the
+/// store as it was, for a build that reads only version 1. Deleted, with
+/// [`FLOOR_V1_COPY_NAME`], by the first save that drops any record it holds,
+/// so no removed device survives in it (#184, #187).
+pub const TRUST_V1_COPY_NAME: &str = "trust.v1.toml";
+
+/// The floor as it was beside the version 1 store, copied with it: restoring
+/// the store alone over a newer floor would be refused as a rollback.
+pub const FLOOR_V1_COPY_NAME: &str = "trust-floor.v1.toml";
 
 /// The longest lease a build from before #183 admits: its `MAX_TERM_SECS`,
 /// unchanged from #158, which added the trust store, until #183.
@@ -117,9 +140,10 @@ const OLDER_BUILD_CEILING_SECS: u64 = 400 * 86_400;
 ///
 /// Such a build refuses to start on an active lease with no `expires_at`, and
 /// drops, then erases at its next save, a lease dated more than
-/// [`OLDER_BUILD_CEILING_SECS`] after `issued_at`. Builds on both sides of #183
-/// can share one config directory, so this build writes a date it never reads:
-/// [`rebuild`] makes every active lease [`Expiry::Never`].
+/// [`OLDER_BUILD_CEILING_SECS`] after `issued_at`. Version 1 stores carried it
+/// so builds on both sides of #183 could share one config directory. Version 2
+/// keeps writing the same date, which no build reads: [`rebuild`] makes every
+/// active lease [`Expiry::Never`].
 fn expiry_older_builds_accept(issued_at: u64) -> u64 {
     issued_at.saturating_add(OLDER_BUILD_CEILING_SECS)
 }
@@ -244,18 +268,16 @@ pub struct LeaseRecord {
     /// lease [`Expiry::Never`] (#183).
     ///
     /// Written for every active lease all the same, as 400 days after
-    /// `issued_at` ([`expiry_older_builds_accept`]), so a build from before
-    /// #183 still starts on a store this build saved. That build does enforce
-    /// the date: past it, that build stops admitting the pairing and this one
-    /// keeps admitting it. A date already on disk may instead be a term that
-    /// build chose (30 days for an approval); the next save replaces it.
+    /// `issued_at` ([`expiry_older_builds_accept`]): in version 1 so a build
+    /// from before #183 still started on a store a later build saved, and
+    /// unchanged in version 2. A date a version 1 store holds may instead be
+    /// a term a build from before #183 chose (30 days for an approval); the
+    /// next save replaces it.
     ///
-    /// **A placeholder, never to be enforced.** Nothing in a schema-v1 store
-    /// tells this date apart from a real 400-day term: [`SCHEMA_VERSION`] did
-    /// not change and `deny_unknown_fields` rules out a marker. A build that
-    /// enforced it would end every pairing this build made on day 400, the
-    /// outage #183 removes. A stored term (#185) needs a schema bump or a new
-    /// field.
+    /// **A placeholder, never to be enforced.** Nothing in either version
+    /// tells this date apart from a real 400-day term. A build that enforced
+    /// it would end every pairing on day 400, the outage #183 removes. A
+    /// stored term (#185) needs a schema bump or a new field.
     ///
     /// Absent on a revoked record, which does not lapse. Absent on an active
     /// lease also loads and grants, because no stored date decides anything.
@@ -265,6 +287,90 @@ pub struct LeaseRecord {
     pub revoked_at: Option<u64>,
     /// Empty for a revoked record.
     pub caps: Vec<DiskCap>,
+    /// Both machines confirmed this pairing (2026-09-10). A lease that is not
+    /// confirmed is a pairing interrupted before it finished: it is dropped
+    /// when the store loads, and the device is added again ([`start`]).
+    /// Every lease a version 1 store held predates the confirmation and is
+    /// confirmed.
+    ///
+    /// Required, and written for a revoked record too, so no build can read
+    /// a record without saying what it is.
+    pub confirmed: bool,
+    /// The clipboard directions someone chose for this pairing: the off
+    /// switch writes `[]`. Absent when nobody chose, for a pairing made
+    /// before #182: it then loads as the directions the pairing drives
+    /// ([`crate::trust::existing_pairing_clipboard`], #186).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clipboard: Option<Vec<DiskClipboard>>,
+}
+
+/// A direction the clipboard moves. Names, not bits, for the reason
+/// [`DiskCap`] gives.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiskClipboard {
+    /// Accept the peer's clipboard.
+    From,
+    /// Send the peer this machine's clipboard.
+    To,
+}
+
+/// The version 1 shapes, read and never written. A version 1 store is read
+/// once, by the start that moves it to [`SCHEMA_VERSION`], and its copy is
+/// read to learn what records it holds.
+mod v1 {
+    use super::{AuthorityBlock, DiskCap, DiskOrigin, DiskState, LeaseRecord};
+    use serde::Deserialize;
+
+    #[derive(Deserialize, Clone, PartialEq, Eq, Debug)]
+    #[cfg_attr(test, derive(serde::Serialize))]
+    #[serde(deny_unknown_fields)]
+    pub(super) struct LeaseRecordV1 {
+        pub(super) fingerprint: String,
+        pub(super) label: String,
+        pub(super) state: DiskState,
+        pub(super) origin: DiskOrigin,
+        pub(super) issued_at: u64,
+        #[serde(default)]
+        #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+        pub(super) expires_at: Option<u64>,
+        #[serde(default)]
+        #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+        pub(super) revoked_at: Option<u64>,
+        pub(super) caps: Vec<DiskCap>,
+    }
+
+    #[derive(Deserialize, Clone, PartialEq, Eq, Debug)]
+    #[cfg_attr(test, derive(serde::Serialize))]
+    #[serde(deny_unknown_fields)]
+    pub(super) struct TrustBodyV1 {
+        pub(super) version: u32,
+        pub(super) serial: u64,
+        pub(super) written_at: u64,
+        pub(super) authority: AuthorityBlock,
+        #[serde(default)]
+        pub(super) leases: Vec<LeaseRecordV1>,
+    }
+
+    impl From<LeaseRecordV1> for LeaseRecord {
+        /// Confirmed, because version 1 predates the confirmation and a
+        /// person cannot compare a number they were never shown (2026-09-10).
+        /// No clipboard, because nobody chose one (#186).
+        fn from(r: LeaseRecordV1) -> Self {
+            LeaseRecord {
+                fingerprint: r.fingerprint,
+                label: r.label,
+                state: r.state,
+                origin: r.origin,
+                issued_at: r.issued_at,
+                expires_at: r.expires_at,
+                revoked_at: r.revoked_at,
+                caps: r.caps,
+                confirmed: true,
+                clipboard: None,
+            }
+        }
+    }
 }
 
 // There is deliberately no decision function over a `LeaseRecord` here.
@@ -391,6 +497,16 @@ fn unseal<T: DeserializeOwned>(
     path: &Path,
     expect: &AuthorityBlock,
 ) -> Result<T, TrustFileError> {
+    parse_body(verified_body(text, domain, path, expect)?, path)
+}
+
+/// The signed body of `text`, once its signature is checked against `expect`.
+fn verified_body<'a>(
+    text: &'a str,
+    domain: &[u8],
+    path: &Path,
+    expect: &AuthorityBlock,
+) -> Result<&'a str, TrustFileError> {
     // Last occurrence: the real block is emitted last, and a TOML string value
     // can never contain a raw newline (the serialiser escapes it), so a lease
     // label cannot forge one. If one somehow appeared earlier, splitting last
@@ -419,7 +535,11 @@ fn unseal<T: DeserializeOwned>(
             "the signature does not match its contents — the file has been edited",
         )
     })?;
+    Ok(body)
+}
 
+/// Parse a body [`verified_body`] vouched for.
+fn parse_body<T: DeserializeOwned>(body: &str, path: &Path) -> Result<T, TrustFileError> {
     toml_edit::de::from_str(body)
         .map_err(|e| TrustFileError::untrusted(path, format!("unreadable body: {e}")))
 }
@@ -510,6 +630,19 @@ pub struct TrustFile {
     authority: Arc<dyn Authority>,
     serial: u64,
     floor_seconds: u64,
+    /// The store and floor files as [`TrustFile::open`] found them when the
+    /// store was version 1, until the save that writes version 2 has copied
+    /// them aside.
+    v1_found: Option<V1Files>,
+    /// What the version 1 copy holds while one is kept, read from the copy
+    /// itself: each record's fingerprint and state.
+    v1_copy: Option<Vec<(String, DiskState)>>,
+}
+
+/// A version 1 store's files, byte for byte.
+struct V1Files {
+    trust: String,
+    floor: Option<String>,
 }
 
 impl std::fmt::Debug for TrustFile {
@@ -518,6 +651,8 @@ impl std::fmt::Debug for TrustFile {
             .field("trust_path", &self.trust_path)
             .field("serial", &self.serial)
             .field("floor_seconds", &self.floor_seconds)
+            .field("v1_found", &self.v1_found.is_some())
+            .field("v1_copy", &self.v1_copy)
             .finish_non_exhaustive()
     }
 }
@@ -529,6 +664,10 @@ impl TrustFile {
     /// certificate, no socket, no backends, no runtime. That is issue #127 — the
     /// reason there is not one behavioural trust test in the daemon today is
     /// that reaching the trust code required standing up all five.
+    ///
+    /// Reads a version 1 store as well as a version 2 one, and refuses any
+    /// other. A version 1 store's leases come back confirmed and with no
+    /// clipboard chosen; the next [`TrustFile::save`] writes version 2.
     pub fn open(
         config_dir: &Path,
         authority: Arc<dyn Authority>,
@@ -540,10 +679,24 @@ impl TrustFile {
             public_key: hex_encode(authority.public_key()),
         };
 
-        let floor: Option<FloorBody> = read_sealed(&floor_path, FLOOR_DOMAIN, &expect)?;
+        let floor_text = read_text(&floor_path)?;
+        let floor: Option<FloorBody> = match &floor_text {
+            Some(text) => {
+                check_authority(text, &floor_path, &expect)?;
+                Some(unseal(text, FLOOR_DOMAIN, &floor_path, &expect)?)
+            }
+            None => None,
+        };
         let (floor_seconds, floor_serial) = floor.map_or((0, 0), |f| (f.seconds, f.serial));
 
-        let body: Option<TrustBody> = read_sealed(&trust_path, TRUST_DOMAIN, &expect)?;
+        let trust_text = read_text(&trust_path)?;
+        let body = match &trust_text {
+            Some(text) => {
+                check_authority(text, &trust_path, &expect)?;
+                Some(verified_body(text, TRUST_DOMAIN, &trust_path, &expect)?)
+            }
+            None => None,
+        };
 
         let mut store = Self {
             trust_path,
@@ -551,47 +704,65 @@ impl TrustFile {
             authority,
             serial: floor_serial,
             floor_seconds,
+            v1_found: None,
+            v1_copy: read_v1_copy(config_dir, &expect),
         };
 
         let Some(body) = body else {
             return Ok((store, Loaded::Absent));
         };
 
-        if body.version != SCHEMA_VERSION {
-            return Err(TrustFileError::untrusted(
-                &store.trust_path,
-                format!(
-                    "schema version {} — this build understands {SCHEMA_VERSION}. \
-                     A newer hops wrote this store; run that one, or move the file aside.",
-                    body.version
-                ),
-            ));
-        }
+        let (serial, written_at, leases) = match declared_version(body, &store.trust_path)? {
+            1 => {
+                let v1: v1::TrustBodyV1 = parse_body(body, &store.trust_path)?;
+                store.v1_found = trust_text.clone().map(|trust| V1Files {
+                    trust,
+                    floor: floor_text.clone(),
+                });
+                (
+                    v1.serial,
+                    v1.written_at,
+                    v1.leases.into_iter().map(LeaseRecord::from).collect(),
+                )
+            }
+            SCHEMA_VERSION => {
+                let v2: TrustBody = parse_body(body, &store.trust_path)?;
+                (v2.serial, v2.written_at, v2.leases)
+            }
+            other => {
+                return Err(TrustFileError::untrusted(
+                    &store.trust_path,
+                    format!(
+                        "schema version {other} — this build understands 1 and {SCHEMA_VERSION}. \
+                         A newer hops wrote this store; run that one, or move the file aside."
+                    ),
+                ));
+            }
+        };
 
         // Rollback. A signature proves who wrote a file, never when. Without
         // this, restoring yesterday's store re-grants a device expelled today
         // and every check above still passes.
-        if body.serial < floor_serial {
+        if serial < floor_serial {
             return Err(TrustFileError::untrusted(
                 &store.trust_path,
                 format!(
-                    "serial {} is older than the {floor_serial} this machine has already \
-                     written — it is a restored copy of an earlier trust store",
-                    body.serial
+                    "serial {serial} is older than the {floor_serial} this machine has already \
+                     written — it is a restored copy of an earlier trust store"
                 ),
             ));
         }
 
-        validate(&body.leases, &store.trust_path)?;
+        validate(&leases, &store.trust_path)?;
 
-        store.serial = store.serial.max(body.serial);
-        store.floor_seconds = store.floor_seconds.max(body.written_at);
+        store.serial = store.serial.max(serial);
+        store.floor_seconds = store.floor_seconds.max(written_at);
         Ok((
             store,
             Loaded::Present {
-                serial: body.serial,
-                written_at: body.written_at,
-                leases: body.leases,
+                serial,
+                written_at,
+                leases,
             },
         ))
     }
@@ -610,6 +781,12 @@ impl TrustFile {
         &self.trust_path
     }
 
+    /// The store [`TrustFile::open`] found is version 1, and no save has
+    /// written version 2 over it yet.
+    pub fn is_version_1(&self) -> bool {
+        self.v1_found.is_some()
+    }
+
     /// Replace the store with `leases`, then advance the floor.
     ///
     /// Order is load-bearing and is the opposite of the intuitive one. If the
@@ -619,8 +796,33 @@ impl TrustFile {
     /// unrecoverable without deleting a file by hand. Store first means the
     /// worst crash outcome is a floor one serial behind, which the next save
     /// corrects and which refuses nothing.
+    ///
+    /// Over a version 1 store, both files are first copied aside
+    /// ([`TRUST_V1_COPY_NAME`], [`FLOOR_V1_COPY_NAME`]), never over a copy
+    /// already there; a copy that cannot be made fails the save, so the store
+    /// never moves to version 2 without one. While a copy is kept, a save
+    /// that drops any record it holds, a removal or a forgotten denial,
+    /// deletes both copies before writing (#187).
     pub fn save(&mut self, leases: &[LeaseRecord]) -> Result<(), TrustFileError> {
         validate(leases, &self.trust_path)?;
+
+        let config_dir = self
+            .trust_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        if let Some(found) = &self.v1_found {
+            keep_copy(&config_dir.join(TRUST_V1_COPY_NAME), &found.trust)?;
+            if let Some(floor) = &found.floor {
+                keep_copy(&config_dir.join(FLOOR_V1_COPY_NAME), floor)?;
+            }
+            let expect = AuthorityBlock {
+                alg: self.authority.algorithm().as_str().to_owned(),
+                public_key: hex_encode(self.authority.public_key()),
+            };
+            self.v1_copy = read_v1_copy(&config_dir, &expect);
+        }
+        self.delete_v1_copy_if_dropped(&config_dir, leases);
 
         let now = self.now();
         self.serial += 1;
@@ -642,10 +844,11 @@ impl TrustFile {
         // whole old file or the whole new one.
         write_atomically(&self.trust_path, sealed.as_bytes())
             .map_err(|e| TrustFileError::io(&self.trust_path, e))?;
+        self.v1_found = None;
 
         self.floor_seconds = self.floor_seconds.max(now);
         let floor = FloorBody {
-            version: SCHEMA_VERSION,
+            version: FLOOR_VERSION,
             seconds: self.floor_seconds,
             serial: self.serial,
             authority,
@@ -655,6 +858,58 @@ impl TrustFile {
             .map_err(|e| TrustFileError::io(&self.floor_path, e))?;
         Ok(())
     }
+
+    /// Delete both version 1 copies when `leases` no longer hold, in the same
+    /// state, a record the copy holds. Before the save writes, so no crash
+    /// leaves a copy granting a device the store on disk has removed.
+    ///
+    /// A copy that cannot be deleted is logged and tried again at the next
+    /// save; the save itself goes ahead, since the store is the file this
+    /// build reads.
+    fn delete_v1_copy_if_dropped(&mut self, config_dir: &Path, leases: &[LeaseRecord]) {
+        let Some(held) = &self.v1_copy else {
+            return;
+        };
+        let dropped: Vec<&str> = held
+            .iter()
+            .filter(|(fp, state)| {
+                !leases
+                    .iter()
+                    .any(|r| r.state == *state && same_fingerprint(&r.fingerprint, fp))
+            })
+            .map(|(fp, _)| fp.as_str())
+            .collect();
+        if dropped.is_empty() {
+            return;
+        }
+        let mut failed = false;
+        for name in [TRUST_V1_COPY_NAME, FLOOR_V1_COPY_NAME] {
+            let path = config_dir.join(name);
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    failed = true;
+                    log::error!(
+                        "trust store: could not delete {}, which still holds {} a removal \
+                         dropped; trying again at the next save: {e}",
+                        path.display(),
+                        dropped.join(", ")
+                    );
+                }
+            }
+        }
+        if !failed {
+            log::warn!(
+                "trust store: deleted {TRUST_V1_COPY_NAME} and {FLOOR_V1_COPY_NAME}, the copy \
+                 kept for builds that read only version 1 stores, because it still held {}, \
+                 which this store no longer holds. Such a build no longer starts here until \
+                 it is updated, or {TRUST_FILE_NAME} is moved aside",
+                dropped.join(", ")
+            );
+            self.v1_copy = None;
+        }
+    }
 }
 
 fn read_sealed<T: DeserializeOwned>(
@@ -662,16 +917,27 @@ fn read_sealed<T: DeserializeOwned>(
     domain: &[u8],
     expect: &AuthorityBlock,
 ) -> Result<Option<T>, TrustFileError> {
-    let text = match fs::read_to_string(path) {
-        Ok(t) => t,
+    let Some(text) = read_text(path)? else {
+        return Ok(None);
+    };
+    check_authority(&text, path, expect)?;
+    unseal(&text, domain, path, expect).map(Some)
+}
+
+/// The file at `path`, or `None` when there is none.
+fn read_text(path: &Path) -> Result<Option<String>, TrustFileError> {
+    match fs::read_to_string(path) {
+        Ok(t) => Ok(Some(t)),
         // Absent legitimately means "nothing yet". Every other IO failure —
         // permissions, a directory in the way, a bad disk — is fatal, because
         // continuing would come up with no trust and then persist that.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(TrustFileError::io(path, e)),
-    };
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(TrustFileError::io(path, e)),
+    }
+}
 
-    let declared = declared_authority(&text, path)?;
+fn check_authority(text: &str, path: &Path, expect: &AuthorityBlock) -> Result<(), TrustFileError> {
+    let declared = declared_authority(text, path)?;
     if declared != *expect {
         return Err(TrustFileError::untrusted(
             path,
@@ -679,7 +945,60 @@ fn read_sealed<T: DeserializeOwned>(
              another hops installation, not this one",
         ));
     }
-    unseal(&text, domain, path, expect).map(Some)
+    Ok(())
+}
+
+/// The version a verified store body declares, read before the body is
+/// parsed as either version's shape.
+fn declared_version(body: &str, path: &Path) -> Result<u32, TrustFileError> {
+    #[derive(Deserialize)]
+    struct JustTheVersion {
+        version: u32,
+    }
+    parse_body::<JustTheVersion>(body, path).map(|v| v.version)
+}
+
+/// What the version 1 copy in `config_dir` holds: each record's fingerprint
+/// and state. `None` when there is no copy, or none this machine can read,
+/// which no build could restore either.
+fn read_v1_copy(config_dir: &Path, expect: &AuthorityBlock) -> Option<Vec<(String, DiskState)>> {
+    let path = config_dir.join(TRUST_V1_COPY_NAME);
+    match read_sealed::<v1::TrustBodyV1>(&path, TRUST_DOMAIN, expect) {
+        Ok(copy) => copy.map(|b| {
+            b.leases
+                .into_iter()
+                .map(|r| (r.fingerprint, r.state))
+                .collect()
+        }),
+        Err(e) => {
+            log::warn!(
+                "trust store: the copy of the version 1 store cannot be read, so no build \
+                 can restore it, and it is left as it is: {e}"
+            );
+            None
+        }
+    }
+}
+
+/// Put `contents` at `path` unless a file is already there. A copy is never
+/// written over: the first one is the store as it was before any build wrote
+/// version 2.
+fn keep_copy(path: &Path, contents: &str) -> Result<(), TrustFileError> {
+    match crate::new_file::create_whole(
+        path,
+        contents.as_bytes(),
+        crate::new_file::Access::OwnerReadWrite,
+    ) {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        other => other.map_err(|e| TrustFileError::io(path, e)),
+    }
+}
+
+/// The form a fingerprint is keyed by in the store, so a record written in
+/// another spelling is still the same record.
+fn same_fingerprint(a: &str, b: &str) -> bool {
+    let key = |fp: &str| canonical_fingerprint(fp).unwrap_or_else(|| fp.trim().to_lowercase());
+    key(a) == key(b)
 }
 
 /// Structural checks every record must pass before the store is believed.
@@ -795,15 +1114,41 @@ pub fn rebuild(
                     },
                 );
             }
+            // A pairing interrupted before both machines confirmed it. The
+            // number it was confirmed with died with that session, and a
+            // reconnect must not summon the comparison again, so it is dropped
+            // and the device added again (2026-09-10). `start` saves the store
+            // without it.
+            DiskState::Active if !r.confirmed => {
+                refused.push(format!(
+                    "{} ({:?}): its pairing was never confirmed on both machines, so it \
+                     is dropped; add the device again to pair it",
+                    r.fingerprint, r.label
+                ));
+            }
             DiskState::Active => {
-                let mut caps = Caps::NONE;
+                let mut drive = Caps::NONE;
                 for c in &r.caps {
-                    caps = caps
+                    drive = drive
                         | match c {
-                            DiskCap::Inbound => Caps::INBOUND,
-                            DiskCap::Outbound => Caps::OUTBOUND,
+                            DiskCap::Inbound => Caps::DRIVE_ME,
+                            DiskCap::Outbound => Caps::I_MAY_DRIVE,
                         };
                 }
+                // Nobody chose a clipboard for a pairing made before #182, and
+                // it keeps the one its lease always granted (#186). One that
+                // was chosen, the off switch included, is exactly what was
+                // chosen.
+                let clipboard = match &r.clipboard {
+                    None => existing_pairing_clipboard(drive),
+                    Some(chosen) => chosen.iter().fold(Caps::NONE, |acc, c| {
+                        acc | match c {
+                            DiskClipboard::From => Caps::CLIPBOARD_FROM,
+                            DiskClipboard::To => Caps::CLIPBOARD_TO,
+                        }
+                    }),
+                };
+                let caps = drive | clipboard;
                 let lease = Lease {
                     peer: r.fingerprint.clone(),
                     issued_to: ours.to_string(),
@@ -821,6 +1166,7 @@ pub fn rebuild(
                     // yet, so honouring any of them would take a working
                     // device away with no way back but pairing again (#183).
                     expiry: Expiry::Never,
+                    clipboard_chosen: r.clipboard.is_some(),
                 };
                 if let Err(e) = store.admit(lease) {
                     refused.push(format!("{}: {e}", r.fingerprint));
@@ -830,6 +1176,54 @@ pub fn rebuild(
     }
 
     Ok((store, refused))
+}
+
+/// The store the daemon starts with, from the records [`TrustFile::open`]
+/// found.
+///
+/// Rebuilds them and logs what a user may need to know. Then, when the file
+/// must change before anything else happens, saves at once: a version 1 store
+/// moves to [`SCHEMA_VERSION`], its copy kept for older builds, and a pairing
+/// never confirmed on both machines is dropped (#187). A save that fails is
+/// logged, not fatal: the store in memory is right, and the daemon's next
+/// save, at the latest its first minute sweep, writes it.
+pub fn start(
+    file: &mut TrustFile,
+    ours: &str,
+    records: &[LeaseRecord],
+) -> Result<TrustStore, TrustError> {
+    let (store, refused) = rebuild(ours, file.now(), records)?;
+    for why in &refused {
+        // Reported, never dropped silently: a device losing trust with no
+        // explanation is the failure this rework removes.
+        log::warn!("trust store: {why}");
+    }
+    for (level, line) in stored_terms(records, &store).log_lines() {
+        log::log!(level, "{line}");
+    }
+    let unconfirmed = records
+        .iter()
+        .any(|r| r.state == DiskState::Active && !r.confirmed);
+    let why = if file.is_version_1() {
+        Some(format!(
+            "moving it to version {SCHEMA_VERSION}, with a copy of version 1 kept as \
+             {TRUST_V1_COPY_NAME} and {FLOOR_V1_COPY_NAME}"
+        ))
+    } else if unconfirmed {
+        Some("dropping the pairings never confirmed".to_string())
+    } else {
+        None
+    };
+    if let Some(why) = why {
+        match file.save(&records_of(&store)) {
+            Ok(()) => log::info!("trust store: saved, {why}"),
+            Err(e) => log::error!(
+                "trust store: could not save it, {why}: {e}. It is in effect in memory, and \
+                 the next save tries again"
+            ),
+        }
+    }
+    Ok(store)
 }
 
 /// Stored expiry dates worth a line in the load log, sorted by what they mean.
@@ -853,9 +1247,9 @@ pub struct StoredTerms<'a> {
     pub replaced: Vec<&'a LeaseRecord>,
     /// Granting, with a date an older build chose that was at or before
     /// enforcement time at load. That build had stopped admitting this
-    /// pairing and this one admits it. Once this build saves, the date moves
-    /// to 400 days after pairing, and if that is still ahead, that build
-    /// admits it again until then.
+    /// pairing and this one admits it. That build reads only the version 1
+    /// copy kept at the save that moves the store to version 2, which keeps
+    /// the date it saved, so it goes on refusing this pairing.
     pub passed: Vec<&'a LeaseRecord>,
 }
 
@@ -866,38 +1260,25 @@ impl StoredTerms<'_> {
     /// it had stopped working on an older build and works on this one, which
     /// is a grant the user may not expect.
     pub fn log_lines(&self) -> Vec<(log::Level, String)> {
-        let ceiling_days = OLDER_BUILD_CEILING_SECS / 86_400;
         let mut lines = Vec::new();
         if !self.replaced.is_empty() {
             lines.push((
                 log::Level::Info,
                 format!(
                     "trust store: {} pairing(s) carry an expiry date an older build chose; \
-                     pairings no longer expire, so it is ignored, and the next save moves it \
-                     to {ceiling_days} days after pairing, the latest an older build accepts",
+                     pairings no longer expire, so it is ignored",
                     self.replaced.len(),
                 ),
             ));
         }
         for r in &self.passed {
-            let after_save = if expiry_older_builds_accept(r.issued_at) > self.now {
-                format!(
-                    "once this build saves the store, an older build admits it again until \
-                     {ceiling_days} days after pairing"
-                )
-            } else {
-                format!(
-                    "it was paired more than {ceiling_days} days ago, so an older build goes \
-                     on refusing it after this build saves the store"
-                )
-            };
             lines.push((
                 log::Level::Warn,
                 format!(
                     "trust store: {} ({:?}) had passed the expiry date an older hops build \
                      saved for it, so that build had stopped admitting it. Pairings no longer \
-                     expire, so this build admits it, and {after_save}. Remove it if that \
-                     machine should not have access",
+                     expire, so this build admits it. Remove it if that machine should not \
+                     have access",
                     r.fingerprint, r.label
                 ),
             ));
@@ -940,9 +1321,12 @@ pub fn stored_terms<'a>(records: &'a [LeaseRecord], store: &TrustStore) -> Store
 ///
 /// Every active lease is written with an `expires_at` and read back as
 /// [`Expiry::Never`] (#183). [`Expiry::Never`] is written as the latest date a
-/// build from before #183 accepts ([`expiry_older_builds_accept`]), so that
-/// build still starts on this store. [`Expiry::At`], which nothing in this
-/// build issues, is written with its own date.
+/// build from before #183 accepts ([`expiry_older_builds_accept`]), the date
+/// version 1 stores carried. [`Expiry::At`], which nothing in this build
+/// issues, is written with its own date.
+///
+/// A lease's `clipboard` is written when it was chosen, and when the lease
+/// holds other clipboard bits than an absent field loads as.
 pub fn records_of(store: &TrustStore) -> Vec<LeaseRecord> {
     let mut out: Vec<LeaseRecord> = Vec::new();
     for (fp, e) in store.entries() {
@@ -958,6 +1342,8 @@ pub fn records_of(store: &TrustStore) -> Vec<LeaseRecord> {
                 expires_at: None,
                 revoked_at: Some(d.at),
                 caps: Vec::new(),
+                confirmed: true,
+                clipboard: None,
             });
             continue;
         }
@@ -969,6 +1355,21 @@ pub fn records_of(store: &TrustStore) -> Vec<LeaseRecord> {
             if l.caps.contains(Caps::I_MAY_DRIVE) {
                 caps.push(DiskCap::Outbound);
             }
+            // Written when someone chose it, and also whenever the lease holds
+            // other clipboard bits than its absence loads as, so no narrowing
+            // is undone by a restart, whichever verb made it.
+            let held = l.caps.intersection(Caps::CLIPBOARD);
+            let clipboard = (l.clipboard_chosen || held != existing_pairing_clipboard(l.caps))
+                .then(|| {
+                    let mut chosen = Vec::new();
+                    if held.contains(Caps::CLIPBOARD_FROM) {
+                        chosen.push(DiskClipboard::From);
+                    }
+                    if held.contains(Caps::CLIPBOARD_TO) {
+                        chosen.push(DiskClipboard::To);
+                    }
+                    chosen
+                });
             out.push(LeaseRecord {
                 fingerprint: fp.to_string(),
                 label: l.label.clone(),
@@ -988,6 +1389,10 @@ pub fn records_of(store: &TrustStore) -> Vec<LeaseRecord> {
                 }),
                 revoked_at: None,
                 caps,
+                // Every lease this store holds is confirmed: one that was not
+                // is dropped when it loads, and nothing issues one yet.
+                confirmed: true,
+                clipboard,
             });
         }
     }
@@ -1239,6 +1644,8 @@ mod tests {
             expires_at: Some(issued + term_days * DAY),
             revoked_at: None,
             caps: vec![DiskCap::Inbound],
+            confirmed: true,
+            clipboard: None,
         };
         let rows = vec![
             written_before(A, DiskOrigin::Inbound, 30),
@@ -1602,6 +2009,8 @@ mod tests {
             expires_at: Some(NOW + DAY),
             revoked_at: None,
             caps: vec![DiskCap::Inbound],
+            confirmed: true,
+            clipboard: None,
         };
         let mut two = one.clone();
         two.caps = vec![DiskCap::Outbound];
@@ -1623,6 +2032,8 @@ mod tests {
             expires_at: None,
             revoked_at: None,
             caps: vec![DiskCap::Inbound],
+            confirmed: true,
+            clipboard: None,
         };
         validate(std::slice::from_ref(&unbounded), Path::new("trust.toml"))
             .expect("an active lease with no expiry is a valid record");
@@ -1650,6 +2061,8 @@ mod tests {
             expires_at: Some(issued + term_days * DAY),
             revoked_at: None,
             caps: vec![cap],
+            confirmed: true,
+            clipboard: None,
         };
         const C: &str = "c0:c1:c2:c3:c4:c5:c6:c7:c8:c9:ca:cb:cc:cd:ce:cf:\
 d0:d1:d2:d3:d4:d5:d6:d7:d8:d9:da:db:dc:dd:de:df";
@@ -1662,6 +2075,8 @@ d0:d1:d2:d3:d4:d5:d6:d7:d8:d9:da:db:dc:dd:de:df";
             expires_at: None,
             revoked_at: Some(issued),
             caps: vec![],
+            confirmed: true,
+            clipboard: None,
         };
         let rows = vec![
             active(A, DiskOrigin::Inbound, DiskCap::Inbound, 30),
@@ -1751,6 +2166,8 @@ d0:d1:d2:d3:d4:d5:d6:d7:d8:d9:da:db:dc:dd:de:df";
             expires_at: Some(issued_at + 30 * DAY),
             revoked_at: None,
             caps: vec![DiskCap::Inbound],
+            confirmed: true,
+            clipboard: None,
         };
         let rows = vec![
             row(A, "expired", now - 40 * DAY),
@@ -1827,6 +2244,8 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
             expires_at: Some(expires_at),
             revoked_at: None,
             caps: vec![DiskCap::Inbound],
+            confirmed: true,
+            clipboard: None,
         };
         let saved_by_this_build = FLOOR - 20 * DAY;
         let rows = vec![
@@ -1953,6 +2372,7 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
                     origin: Origin::Inbound,
                     issued_at: now - age,
                     expiry: Expiry::Never,
+                    clipboard_chosen: false,
                 })
                 .expect("admit");
         }
@@ -2053,6 +2473,420 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
             Some(Origin::Migrated),
             "a pairing that holds both directions was saved as coming from \
              one approval; two approvals add up to what `origin_of` names"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+    // -- schema 2 (#187) ----------------------------------------------------
+
+    fn authority_block(auth: &Arc<dyn Authority>) -> AuthorityBlock {
+        AuthorityBlock {
+            alg: auth.algorithm().as_str().to_owned(),
+            public_key: hex_encode(auth.public_key()),
+        }
+    }
+
+    fn v1_row(fp: &str, state: DiskState, caps: &[DiskCap]) -> v1::LeaseRecordV1 {
+        v1::LeaseRecordV1 {
+            fingerprint: fp.to_owned(),
+            label: format!("device {}", &fp[..2]),
+            state,
+            origin: DiskOrigin::Migrated,
+            issued_at: NOW,
+            expires_at: (state == DiskState::Active).then_some(NOW + 400 * DAY),
+            revoked_at: (state == DiskState::Revoked).then_some(NOW),
+            caps: caps.to_vec(),
+        }
+    }
+
+    /// Seal `rows` into `dir` as a version 1 build writes its store and its
+    /// floor, and return both files' text.
+    fn write_v1(
+        dir: &Path,
+        auth: &Arc<dyn Authority>,
+        serial: u64,
+        rows: Vec<v1::LeaseRecordV1>,
+    ) -> (String, String) {
+        let body = v1::TrustBodyV1 {
+            version: 1,
+            serial,
+            written_at: NOW,
+            authority: authority_block(auth),
+            leases: rows,
+        };
+        let trust = seal(&body, TRUST_DOMAIN, auth.as_ref()).expect("seal the store");
+        let floor = FloorBody {
+            version: 1,
+            seconds: NOW,
+            serial,
+            authority: authority_block(auth),
+        };
+        let floor = seal(&floor, FLOOR_DOMAIN, auth.as_ref()).expect("seal the floor");
+        fs::write(dir.join(TRUST_FILE_NAME), &trust).expect("write the store");
+        fs::write(dir.join(FLOOR_FILE_NAME), &floor).expect("write the floor");
+        (trust, floor)
+    }
+
+    /// The store body on disk, verified, as this build's shape.
+    fn body_on_disk(dir: &Path, auth: &Arc<dyn Authority>) -> TrustBody {
+        let path = dir.join(TRUST_FILE_NAME);
+        let text = fs::read_to_string(&path).expect("read the store");
+        let body =
+            verified_body(&text, TRUST_DOMAIN, &path, &authority_block(auth)).expect("verified");
+        parse_body(body, &path).expect("a version 2 body")
+    }
+
+    /// Open `dir` the way the daemon starts.
+    fn start_in(dir: &Path, auth: &Arc<dyn Authority>) -> (TrustFile, TrustStore) {
+        let (mut file, loaded) = TrustFile::open(dir, auth.clone()).expect("open");
+        let Loaded::Present { leases, .. } = loaded else {
+            panic!("the store must be found");
+        };
+        let store = start(&mut file, &ours(), &leases).expect("start");
+        (file, store)
+    }
+
+    fn copies_exist(dir: &Path) -> [bool; 2] {
+        [
+            dir.join(TRUST_V1_COPY_NAME).exists(),
+            dir.join(FLOOR_V1_COPY_NAME).exists(),
+        ]
+    }
+
+    /// The off switch is the lease's (#187). It used to reach disk as a lease
+    /// with no clipboard bits, which the loader reads back through
+    /// `Caps::INBOUND` / `Caps::OUTBOUND`, clipboard included, so a restart
+    /// turned it back on.
+    // LEDGER E2A-1 | class B | 4 file on disk: TrustStore::disable_clipboard, TrustFile::save, TrustFile::open, start
+    #[test]
+    fn turning_the_clipboard_off_survives_a_restart() {
+        let d = tmpdir("clipboard-off");
+        let auth = authority(&d);
+        let (mut file, _) = TrustFile::open(&d, auth.clone()).expect("open");
+        let mut store = TrustStore::new(&ours(), file.now()).expect("ours");
+        store
+            .issue(A, "drives this machine", Caps::INBOUND)
+            .expect("issue");
+        store
+            .issue(B, "driven from here", Caps::OUTBOUND)
+            .expect("issue");
+        for fp in [A, B] {
+            assert!(store.disable_clipboard(fp), "{fp} has a lease to change");
+            assert!(
+                !store.capabilities(fp).intersects(Caps::CLIPBOARD),
+                "precondition: {fp}'s clipboard is off in memory"
+            );
+        }
+        file.save(&records_of(&store)).expect("save");
+
+        let (_, store) = start_in(&d, &auth);
+        for fp in [A, B] {
+            assert!(
+                !store.capabilities(fp).intersects(Caps::CLIPBOARD),
+                "the clipboard of {fp} came back on after a restart: {}",
+                store.capabilities(fp)
+            );
+        }
+        assert!(
+            store.may_drive_us(A) && store.we_may_drive(B),
+            "turning the clipboard off took away a direction to drive"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A version 1 store loads with every lease confirmed and no clipboard
+    /// chosen, the first start writes version 2, and both version 1 files are
+    /// kept byte for byte for a build that reads only version 1.
+    // LEDGER E2A-2 | class B | 4 file on disk: TrustFile::open, start, TrustFile::save
+    #[test]
+    fn a_v1_store_migrates_confirmed_without_a_clipboard_field_and_keeps_both_copies() {
+        let d = tmpdir("v1-migrates");
+        let auth = authority(&d);
+        let (trust_v1, floor_v1) = write_v1(
+            &d,
+            &auth,
+            7,
+            vec![
+                v1_row(A, DiskState::Active, &[DiskCap::Inbound]),
+                v1_row(B, DiskState::Active, &[DiskCap::Outbound]),
+            ],
+        );
+
+        let (file, store) = start_in(&d, &auth);
+        assert!(
+            !file.is_version_1(),
+            "the first start did not write version 2"
+        );
+        let body = body_on_disk(&d, &auth);
+        assert_eq!(body.version, SCHEMA_VERSION, "the store on disk");
+        assert_eq!(body.leases.len(), 2, "every lease is carried: {body:?}");
+        for r in &body.leases {
+            assert!(
+                r.confirmed,
+                "{} was saved unconfirmed; a pairing made before the \
+                 confirmation is confirmed (2026-09-10)",
+                r.fingerprint
+            );
+            assert_eq!(
+                r.clipboard, None,
+                "{} was saved with a clipboard nobody chose",
+                r.fingerprint
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(d.join(TRUST_V1_COPY_NAME)).ok(),
+            Some(trust_v1),
+            "the version 1 store was not kept as it was"
+        );
+        assert_eq!(
+            fs::read_to_string(d.join(FLOOR_V1_COPY_NAME)).ok(),
+            Some(floor_v1),
+            "the version 1 floor was not kept as it was"
+        );
+
+        // What the pairings grant is unchanged, before and after a restart.
+        let (_, reloaded) = start_in(&d, &auth);
+        for s in [&store, &reloaded] {
+            assert_eq!(s.capabilities(A), Caps::INBOUND, "{A}");
+            assert_eq!(s.capabilities(B), Caps::OUTBOUND, "{B}");
+        }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Approving the other direction of a pairing adds that direction (#166)
+    /// and leaves a clipboard switched off, off, across a restart too.
+    // LEDGER E2A-3 | class B | 4 file on disk: service::grant_for_attempt, TrustStore::disable_clipboard, TrustFile::save, start
+    #[test]
+    fn approving_the_second_direction_keeps_the_clipboard_off() {
+        use crate::service::grant_for_attempt;
+        use hops_ipc::AttemptOrigin;
+
+        let d = tmpdir("second-direction-clipboard");
+        let auth = authority(&d);
+        let (mut file, _) = TrustFile::open(&d, auth.clone()).expect("open");
+        let mut store = TrustStore::new(&ours(), file.now()).expect("ours");
+        grant_for_attempt(&mut store, B, "desk mac", Some(AttemptOrigin::Inbound))
+            .expect("the first approval grants");
+        assert!(store.disable_clipboard(B), "a lease to switch off");
+        grant_for_attempt(&mut store, B, "desk mac", Some(AttemptOrigin::OutboundDial))
+            .expect("the second approval grants");
+        file.save(&records_of(&store)).expect("save");
+        let (_, reloaded) = start_in(&d, &auth);
+
+        for (when, s) in [
+            ("after the approval", &store),
+            ("after a restart", &reloaded),
+        ] {
+            assert!(
+                s.may_drive_us(B) && s.we_may_drive(B),
+                "{when}, the pairing does not drive both ways: {}",
+                s.capabilities(B)
+            );
+            assert!(
+                !s.capabilities(B).intersects(Caps::CLIPBOARD),
+                "{when}, approving the second direction turned the clipboard back \
+                 on: {}. It was switched off, and an approval to drive is not an \
+                 answer about the clipboard",
+                s.capabilities(B)
+            );
+        }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A pairing interrupted before both machines confirmed it does not load,
+    /// the load says so, and the start saves the store without it.
+    // LEDGER E2A-4 | class B | 4 file on disk + 1 return value: TrustFile::save, TrustFile::open, rebuild, start
+    #[test]
+    fn an_unconfirmed_lease_is_dropped_at_the_next_start() {
+        let d = tmpdir("unconfirmed");
+        let auth = authority(&d);
+        let (mut file, _) = TrustFile::open(&d, auth.clone()).expect("open");
+        let lease = |fp: &str, confirmed: bool| LeaseRecord {
+            fingerprint: fp.to_owned(),
+            label: "desk mac".into(),
+            state: DiskState::Active,
+            origin: DiskOrigin::Inbound,
+            issued_at: file.now(),
+            expires_at: None,
+            revoked_at: None,
+            caps: vec![DiskCap::Inbound],
+            confirmed,
+            clipboard: None,
+        };
+        let rows = vec![lease(A, true), lease(B, false)];
+        file.save(&rows).expect("save");
+
+        let (_, store) = start_in(&d, &auth);
+        assert!(store.may_drive_us(A), "the confirmed pairing did not load");
+        assert!(
+            !store.is_known(B),
+            "a pairing never confirmed on both machines loaded: {}",
+            store.capabilities(B)
+        );
+        let saved = body_on_disk(&d, &auth);
+        assert!(
+            saved.leases.iter().all(|r| r.fingerprint != B),
+            "the start did not save the store without it: {saved:?}"
+        );
+        let (_, refused) = rebuild(&ours(), file.now(), &rows).expect("rebuild");
+        assert!(
+            refused.iter().any(|why| why.contains(B)),
+            "the unconfirmed pairing is dropped without a word: {refused:?}"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// The version 1 copy goes at the first save that drops a record it
+    /// holds, so no removed device survives there (#184, #187): a removal, a
+    /// forgotten denial, and either one in a later run than the migration. A
+    /// save that drops nothing keeps it.
+    // LEDGER E2A-5 | class B | 4 file on disk: start, TrustStore::revoke, TrustStore::forget, TrustFile::save
+    #[test]
+    fn a_removal_after_migration_deletes_the_v1_copies() {
+        const Z: &str = "cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:\
+cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc";
+        let rows = || {
+            vec![
+                v1_row(A, DiskState::Active, &[DiskCap::Inbound]),
+                v1_row(B, DiskState::Active, &[DiskCap::Outbound]),
+                v1_row(Z, DiskState::Revoked, &[]),
+            ]
+        };
+        let migrated = |tag: &str| {
+            let d = tmpdir(tag);
+            let auth = authority(&d);
+            write_v1(&d, &auth, 3, rows());
+            let (file, store) = start_in(&d, &auth);
+            assert_eq!(
+                copies_exist(&d),
+                [true, true],
+                "precondition: both copies kept"
+            );
+            (d, auth, file, store)
+        };
+
+        // A save that drops nothing keeps the copies.
+        let (d, _, mut file, mut store) = migrated("copy-kept");
+        store.set_label(A, "renamed").expect("rename");
+        assert!(store.disable_clipboard(B), "a lease to switch off");
+        file.save(&records_of(&store)).expect("save");
+        assert_eq!(
+            copies_exist(&d),
+            [true, true],
+            "a save that dropped nothing deleted the copies"
+        );
+        let _ = fs::remove_dir_all(&d);
+
+        /// What the case is called, its scratch directory, whether it runs
+        /// in a later start than the migration, and what it drops.
+        type Case = (&'static str, &'static str, bool, fn(&mut TrustStore));
+        let cases: [Case; 4] = [
+            ("a removal", "copy-removal", false, |s| {
+                s.revoke(A);
+            }),
+            ("a forgotten denial", "copy-denial", false, |s| {
+                s.forget(Z);
+            }),
+            ("a removal in a later run", "copy-later", true, |s| {
+                s.revoke(B);
+            }),
+            (
+                "a forgotten denial in a later run",
+                "copy-later-denial",
+                true,
+                |s| {
+                    s.forget(Z);
+                },
+            ),
+        ];
+        for (what, tag, later, change) in cases {
+            let (d, auth, mut file, mut store) = migrated(tag);
+            if later {
+                // A later run: the migration's `TrustFile` is gone, and this
+                // build starts again on the files alone.
+                std::mem::drop(file);
+                (file, store) = start_in(&d, &auth);
+            }
+            change(&mut store);
+            file.save(&records_of(&store)).expect("save");
+            assert_eq!(
+                copies_exist(&d),
+                [false, false],
+                "{what} after the migration left the version 1 copy on disk, \
+                 where a build that reads it trusts what this machine dropped"
+            );
+            let _ = fs::remove_dir_all(&d);
+        }
+    }
+
+    /// A version 1 store found again, after the copies were restored for an
+    /// older build that then saved, migrates again without writing over the
+    /// first copy.
+    // LEDGER E2A-6 | class B | 4 file on disk: start, TrustFile::save
+    #[test]
+    fn a_second_migration_keeps_the_first_copy() {
+        let d = tmpdir("second-migration");
+        let auth = authority(&d);
+        let (first, first_floor) = write_v1(
+            &d,
+            &auth,
+            5,
+            vec![v1_row(A, DiskState::Active, &[DiskCap::Inbound])],
+        );
+        let _ = start_in(&d, &auth);
+
+        // An older build is given the copies back and saves a pairing.
+        fs::copy(d.join(TRUST_V1_COPY_NAME), d.join(TRUST_FILE_NAME)).expect("restore");
+        fs::copy(d.join(FLOOR_V1_COPY_NAME), d.join(FLOOR_FILE_NAME)).expect("restore");
+        write_v1(
+            &d,
+            &auth,
+            6,
+            vec![
+                v1_row(A, DiskState::Active, &[DiskCap::Inbound]),
+                v1_row(B, DiskState::Active, &[DiskCap::Inbound]),
+            ],
+        );
+
+        let (_, store) = start_in(&d, &auth);
+        assert!(
+            store.may_drive_us(A) && store.may_drive_us(B),
+            "the second migration lost a pairing"
+        );
+        assert_eq!(body_on_disk(&d, &auth).version, SCHEMA_VERSION);
+        assert_eq!(
+            fs::read_to_string(d.join(TRUST_V1_COPY_NAME)).ok(),
+            Some(first),
+            "the second migration wrote over the first copy of the store"
+        );
+        assert_eq!(
+            fs::read_to_string(d.join(FLOOR_V1_COPY_NAME)).ok(),
+            Some(first_floor),
+            "the second migration wrote over the first copy of the floor"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Only versions 1 and 2 are read. A store from a later schema is refused
+    /// by name rather than parsed as either.
+    // LEDGER E2A-7 | class B | 1 return value: TrustFile::open
+    #[test]
+    fn a_store_of_a_later_schema_is_refused() {
+        let d = tmpdir("later-schema");
+        let auth = authority(&d);
+        let body = TrustBody {
+            version: SCHEMA_VERSION + 1,
+            serial: 1,
+            written_at: NOW,
+            authority: authority_block(&auth),
+            leases: Vec::new(),
+        };
+        let sealed = seal(&body, TRUST_DOMAIN, auth.as_ref()).expect("seal");
+        fs::write(d.join(TRUST_FILE_NAME), sealed).expect("write");
+        let err = TrustFile::open(&d, auth).expect_err("a later schema must be refused");
+        assert!(
+            matches!(&err, TrustFileError::Untrusted { reason, .. }
+                if reason.contains(&format!("schema version {}", SCHEMA_VERSION + 1))),
+            "refused for another reason: {err}"
         );
         let _ = fs::remove_dir_all(&d);
     }
