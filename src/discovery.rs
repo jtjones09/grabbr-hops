@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
 use local_channel::mpsc::{Receiver, Sender, channel};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
@@ -34,6 +35,9 @@ use tokio_util::sync::CancellationToken;
 pub(crate) const SERVICE_TYPE: &str = "_hops._udp.local.";
 /// TXT key carrying the advertised certificate fingerprint (a claim).
 const TXT_FINGERPRINT: &str = "fp";
+/// How long discovery hears no other machine before it says so. Another
+/// machine running hops on the same network answers within seconds.
+const QUIET_AFTER: Duration = Duration::from_secs(30);
 /// TXT key carrying the wire-protocol version, so a future incompatible hops
 /// can be filtered out of the list instead of failing confusingly on dial.
 const TXT_VERSION: &str = "v";
@@ -58,6 +62,11 @@ pub enum DiscoveryEvent {
     Found(DiscoveredPeer),
     /// A peer stopped advertising. Carries the instance label it was listed by.
     Lost(String),
+    /// No other machine has been heard since discovery started, for
+    /// [`QUIET_AFTER`]. Said once, and never after one has been. On macOS
+    /// this is what a process without the Local Network permission sees: its
+    /// announcement goes out and nothing comes back, with no error (#149).
+    Quiet,
 }
 
 pub struct Discovery {
@@ -67,6 +76,8 @@ pub struct Discovery {
     /// Held so the responder keeps advertising for as long as we run; dropping
     /// the daemon withdraws the advertisement.
     daemon: Option<ServiceDaemon>,
+    /// When to say nothing has been heard, until something is.
+    quiet_at: Option<tokio::time::Instant>,
 }
 
 impl Discovery {
@@ -148,11 +159,45 @@ impl Discovery {
             task,
             event_rx,
             daemon: Some(daemon),
+            quiet_at: Some(tokio::time::Instant::now() + QUIET_AFTER),
         })
     }
 
+    /// Discovery fed by `event_rx` in place of the network, quiet after
+    /// `quiet_after`.
+    #[cfg(test)]
+    pub(crate) fn fed(event_rx: Receiver<DiscoveryEvent>, quiet_after: Duration) -> Self {
+        Self {
+            cancellation_token: CancellationToken::new(),
+            task: None,
+            event_rx,
+            daemon: None,
+            quiet_at: Some(tokio::time::Instant::now() + quiet_after),
+        }
+    }
+
+    /// The next thing discovery has to say. Safe to drop at any await: the
+    /// quiet deadline is kept, not restarted.
     pub async fn event(&mut self) -> Option<DiscoveryEvent> {
-        self.event_rx.recv().await
+        let quiet_at = self.quiet_at;
+        let quiet = async move {
+            match quiet_at {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            event = self.event_rx.recv() => {
+                if matches!(event, Some(DiscoveryEvent::Found(_))) {
+                    self.quiet_at = None;
+                }
+                event
+            }
+            _ = quiet => {
+                self.quiet_at = None;
+                Some(DiscoveryEvent::Quiet)
+            }
+        }
     }
 
     pub async fn terminate(&mut self) {
@@ -377,6 +422,72 @@ fn local_addresses() -> Vec<IpAddr> {
         seen.insert(i.ip(), ());
     }
     seen.into_keys().collect()
+}
+
+#[cfg(test)]
+mod heard_nobody {
+    //! Discovery says when it has heard no other machine, which on macOS is
+    //! how a missing Local Network permission looks (#149), and never once
+    //! it has heard one.
+
+    use super::{DiscoveredPeer, Discovery, DiscoveryEvent};
+    use crate::test_harness::run_local;
+    use local_channel::mpsc::channel;
+    use std::time::Duration;
+
+    /// What must happen is waited for this long at most.
+    const DEADLINE: Duration = Duration::from_secs(30);
+
+    fn peer() -> DiscoveredPeer {
+        DiscoveredPeer {
+            claimed_fingerprint: Some("11:22:33".into()),
+            label: "desk-pc".into(),
+            addrs: vec!["192.0.2.5:4242".parse().expect("addr")],
+        }
+    }
+
+    fn what(event: &Option<DiscoveryEvent>) -> &'static str {
+        match event {
+            Some(DiscoveryEvent::Found(_)) => "Found",
+            Some(DiscoveryEvent::Lost(_)) => "Lost",
+            Some(DiscoveryEvent::Quiet) => "Quiet",
+            None => "None",
+        }
+    }
+
+    // LEDGER T12 | class B | 1 return value: Discovery::event
+    #[test]
+    fn hearing_nobody_is_said_once_and_hearing_someone_is_never_quiet() {
+        run_local(async {
+            // Nobody answers.
+            let (_tx, rx) = channel();
+            let mut alone = Discovery::fed(rx, Duration::from_millis(50));
+            let first = tokio::time::timeout(DEADLINE, alone.event()).await;
+            let again = tokio::time::timeout(Duration::from_millis(300), alone.event()).await;
+
+            // A machine answers before the deadline, and leaves again.
+            let (tx, rx) = channel();
+            let mut heard = Discovery::fed(rx, Duration::from_millis(50));
+            tx.send(DiscoveryEvent::Found(peer())).expect("sent");
+            tx.send(DiscoveryEvent::Lost("desk-pc".into()))
+                .expect("sent");
+            let mut said = Vec::new();
+            for _ in 0..3 {
+                match tokio::time::timeout(Duration::from_millis(300), heard.event()).await {
+                    Ok(event) => said.push(what(&event)),
+                    Err(_) => said.push("nothing"),
+                }
+            }
+
+            assert_eq!(
+                (first.as_ref().map(what).ok(), again.is_err(), said),
+                (Some("Quiet"), true, vec!["Found", "Lost", "nothing"]),
+                "(first event with nobody heard, nothing more after it, events once \
+                 a machine was heard). Quiet must be said once nobody has answered, \
+                 and never once somebody has, even after it left."
+            );
+        });
+    }
 }
 
 #[cfg(test)]

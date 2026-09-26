@@ -71,6 +71,13 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
         ui.set_service_problem(problem.into());
     }
     ui.set_capture("enabled".into());
+    // PREVIEW_CAPTURE_PROBLEM=<text> shows a capture that failed, with the
+    // settings button a Mac offers for a missing permission.
+    if let Ok(problem) = std::env::var("PREVIEW_CAPTURE_PROBLEM") {
+        ui.set_capture("failed".into());
+        ui.set_capture_problem(problem.into());
+        ui.set_capture_settings(true);
+    }
     ui.set_emulation("enabled".into());
     ui.set_port("4242".into());
     ui.set_fingerprint("73:90:2a:3c:9d:e5:18:52:7c:aa:c3:de:de:04:cd:ec".into());
@@ -81,8 +88,16 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
     // inactive would exercise a state the product cannot produce.
     let nothing_found = matches!(
         std::env::var("PREVIEW_DISCOVERY").as_deref(),
-        Ok("empty") | Ok("off")
+        Ok("empty") | Ok("off") | Ok("quiet")
     );
+    // PREVIEW_DISCOVERY=quiet: looking, and nobody has answered for a while.
+    if std::env::var("PREVIEW_DISCOVERY").as_deref() == Ok("quiet") {
+        ui.set_discovery_empty(
+            "No other machine has answered. If one on this network runs hops, check that \
+             hops is on under System Settings → Privacy & Security → Local Network."
+                .into(),
+        );
+    }
     ui.set_discovered(ModelRc::new(VecModel::from(if nothing_found {
         vec![]
     } else {

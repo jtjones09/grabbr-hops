@@ -9,7 +9,8 @@ use std::{
 use futures::StreamExt;
 use hops_proto::{ProtoEvent, caps};
 use input_capture::{
-    CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
+    CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Permission,
+    Position,
 };
 use input_event::{Event, KeyboardEvent, PointerEvent, scancode};
 use local_channel::mpsc::{Receiver, Sender, channel};
@@ -32,6 +33,9 @@ pub(crate) enum ICaptureEvent {
     CaptureDisabled,
     /// capture disabled
     CaptureEnabled,
+    /// Capture could not start, or stopped, and why (#91). Sent after the
+    /// `CaptureDisabled` a session that stopped ends with.
+    CaptureFailed(hops_ipc::CaptureFault),
     /// A (new) client was entered.
     /// In contrast to [`ICaptureEvent::CaptureBegin`] this
     /// event is only triggered when the capture was
@@ -183,6 +187,23 @@ macro_rules! debounce {
     };
 }
 
+/// What to tell the user about a capture that ended with `e`: the settings
+/// to change when a permission is missing, and the error otherwise.
+fn fault_of(e: &InputCaptureError) -> hops_ipc::CaptureFault {
+    match e.missing_permissions() {
+        Some(missing) if !missing.is_empty() => hops_ipc::CaptureFault::Missing(
+            missing
+                .iter()
+                .map(|p| match p {
+                    Permission::Accessibility => hops_ipc::Permission::Accessibility,
+                    Permission::InputMonitoring => hops_ipc::Permission::InputMonitoring,
+                })
+                .collect(),
+        ),
+        _ => hops_ipc::CaptureFault::Backend(e.to_string()),
+    }
+}
+
 /// Caps / Num / Scroll Lock (evdev codes). These TOGGLE on each key-down, so an
 /// OS auto-repeat must never be forwarded — unlike an ordinary key, where repeat
 /// is the point.
@@ -297,6 +318,14 @@ impl CaptureTask {
         loop {
             if let Err(e) = self.do_capture().await {
                 log::warn!("input capture exited: {e}");
+                // Declining the portal's request switches capture off. Any
+                // other end is capture that should run and cannot, which
+                // the user is told apart from off, with what to change.
+                if !e.cancelled_by_user() {
+                    let _ = self
+                        .event_tx
+                        .send(ICaptureEvent::CaptureFailed(fault_of(&e)));
+                }
             }
             loop {
                 tokio::select! {

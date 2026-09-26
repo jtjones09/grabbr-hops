@@ -325,8 +325,8 @@ pub enum FrontendEvent {
     Enumerate(Vec<(ClientHandle, ClientConfig, ClientState)>),
     /// an error occured
     Error(String),
-    /// capture status
-    CaptureStatus(Status),
+    /// Whether input capture runs, and why not when it should (#91).
+    CaptureStatus(CaptureState),
     /// emulation status
     EmulationStatus(Status),
     /// authorized public key fingerprints have been updated
@@ -379,6 +379,13 @@ pub enum FrontendEvent {
         /// only sees `[]` renders the same silence for all three (#141).
         active: bool,
         peers: Vec<DiscoveredDevice>,
+        /// Discovery has run a while and heard no other machine at all,
+        /// paired or not. On macOS that is also how a daemon without the
+        /// Local Network permission looks (#149), so a frontend names the
+        /// setting rather than saying only that nothing is there. Absent
+        /// from an older daemon, which never says it.
+        #[serde(default)]
+        quiet: bool,
     },
     /// failed connection attempt (approval for fingerprint required)
     ConnectionAttempt {
@@ -569,6 +576,54 @@ impl From<Status> for bool {
             Status::Enabled => true,
             Status::Disabled => false,
         }
+    }
+}
+
+/// Whether input capture runs: [`Status`]'s two states, written on the wire
+/// exactly as `Status` writes them, and a third for a capture that should run
+/// and cannot (#91). Capture that failed is not capture switched off: the
+/// user is told why, and what to change.
+///
+/// A frontend older than this skips a `Failed` it cannot read.
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum CaptureState {
+    /// Not running, and nothing is wrong: not started yet, or ended.
+    #[default]
+    Disabled,
+    Enabled,
+    /// It could not start, or it stopped.
+    Failed(CaptureFault),
+}
+
+impl CaptureState {
+    pub fn is_enabled(&self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
+/// Why capture could not start, or stopped.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum CaptureFault {
+    /// macOS does not grant hops these permissions.
+    Missing(Vec<Permission>),
+    /// Any other failure, as the backend reported it.
+    Backend(String),
+}
+
+/// A macOS permission, named as System Settings → Privacy & Security lists
+/// it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+pub enum Permission {
+    Accessibility,
+    InputMonitoring,
+}
+
+impl Display for Permission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Accessibility => "Accessibility",
+            Self::InputMonitoring => "Input Monitoring",
+        })
     }
 }
 
@@ -1343,6 +1398,49 @@ mod a_full_accept_queue {
              the front door must not start a daemon beside it, and it takes the \
              token from no one, so it does not serve.",
             (answers, serves)
+        );
+    }
+}
+
+#[cfg(test)]
+mod capture_state_on_the_wire {
+    //! Capture's third state is new; its first two must read as they always
+    //! have, so a frontend and a daemon of different builds still agree on
+    //! them (#91).
+
+    use super::{CaptureFault, CaptureState, FrontendEvent, Permission, Status};
+
+    fn wire(event: &FrontendEvent) -> String {
+        serde_json::to_string(event).expect("serializes")
+    }
+
+    // LEDGER T7 | class B | 2 bytes: serde_json of FrontendEvent::CaptureStatus
+    #[test]
+    fn on_and_off_are_written_as_status_writes_them_and_failed_names_the_setting() {
+        let old = |s: Status| {
+            serde_json::to_string(&serde_json::json!({ "CaptureStatus": s })).expect("json")
+        };
+        assert_eq!(
+            (
+                wire(&FrontendEvent::CaptureStatus(CaptureState::Enabled)),
+                wire(&FrontendEvent::CaptureStatus(CaptureState::Disabled)),
+            ),
+            (old(Status::Enabled), old(Status::Disabled)),
+            "an older frontend reads capture's state as a Status"
+        );
+        let failed =
+            FrontendEvent::CaptureStatus(CaptureState::Failed(CaptureFault::Missing(vec![
+                Permission::InputMonitoring,
+            ])));
+        let read: FrontendEvent = serde_json::from_str(&wire(&failed)).expect("reads back");
+        assert!(
+            matches!(
+                read,
+                FrontendEvent::CaptureStatus(CaptureState::Failed(CaptureFault::Missing(ref m)))
+                    if m == &[Permission::InputMonitoring]
+            ),
+            "a failed capture must arrive naming what is missing: {}",
+            wire(&failed)
         );
     }
 }

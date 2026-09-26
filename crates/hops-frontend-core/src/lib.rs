@@ -19,8 +19,9 @@ use hops_ipc::{AsyncFrontendRequestWriter, ConnectionError, IpcError};
 use tokio::sync::{Notify, mpsc};
 
 pub use hops_ipc::{
-    AttemptOrigin, Build, ClientConfig, ClientHandle, ClientState, DiscoveredDevice, FrontendEvent,
-    FrontendRequest, PeerTrust, Position, RevokedEntry, Status, connect_async,
+    AttemptOrigin, Build, CaptureFault, CaptureState, ClientConfig, ClientHandle, ClientState,
+    DiscoveredDevice, FrontendEvent, FrontendRequest, PeerTrust, Permission, Position,
+    RevokedEntry, Status, connect_async,
 };
 
 pub mod prefs;
@@ -81,8 +82,8 @@ pub struct AppModel {
     pub left_running: Option<String>,
     /// Configured clients, keyed + ordered by handle.
     pub clients: BTreeMap<ClientHandle, (ClientConfig, ClientState)>,
-    /// Local input-capture status.
-    pub capture: Status,
+    /// Local input-capture status, and why it failed when it did.
+    pub capture: CaptureState,
     /// Local input-emulation status.
     pub emulation: Status,
     /// This device's public-key fingerprint.
@@ -142,6 +143,8 @@ pub struct AppModel {
     /// or genuinely nothing there. Rendering the same silence for all three is
     /// how a working feature looks broken (#141).
     pub discovery_active: bool,
+    /// Discovery has run a while and heard no other machine at all (#149).
+    pub discovery_quiet: bool,
     /// An untrusted peer's fingerprint awaiting the user's pairing approval. Set
     /// on `ConnectionAttempt`; cleared once it becomes authorized or the daemon
     /// link drops. The UI surfaces this as an approve/deny prompt.
@@ -279,8 +282,13 @@ impl AppModel {
                     self.pending_pairing_since = Some(now);
                 }
             }
-            FrontendEvent::Discovered { active, peers } => {
+            FrontendEvent::Discovered {
+                active,
+                peers,
+                quiet,
+            } => {
                 self.discovery_active = active;
+                self.discovery_quiet = quiet;
                 self.discovered = peers;
             }
             FrontendEvent::PairingOpen { seconds } => {
@@ -393,6 +401,34 @@ impl AppModel {
         ))
     }
 
+    /// Why capture, which should run, does not, for a frontend to show while
+    /// it is so (#91); `None` while capture runs or is simply off.
+    ///
+    /// A missing permission is named with where to grant it, and with what
+    /// it is for: a Mac that is only ever controlled never needs it.
+    pub fn capture_problem(&self) -> Option<String> {
+        let CaptureState::Failed(fault) = &self.capture else {
+            return None;
+        };
+        Some(match fault {
+            CaptureFault::Missing(missing) => {
+                let names: Vec<String> = missing.iter().map(ToString::to_string).collect();
+                let names = names.join(" and ");
+                let where_ = if missing.len() > 1 {
+                    format!(", in both {names}")
+                } else {
+                    format!(" → {names}")
+                };
+                format!(
+                    "Input capture cannot run: macOS does not grant hops {names}, which \
+                     this Mac needs to control other machines. Turn hops on under System \
+                     Settings → Privacy & Security{where_}."
+                )
+            }
+            CaptureFault::Backend(error) => format!("Input capture is not running: {error}"),
+        })
+    }
+
     /// The model a frontend opens with: this build, and what the front door
     /// found. A service it restarted is told as a notice.
     pub fn launched(launch: Launch) -> Self {
@@ -475,7 +511,8 @@ impl AppModel {
         self.pairing_open_until = None;
         self.discovered.clear();
         self.discovery_active = false;
-        self.capture = Status::Disabled;
+        self.discovery_quiet = false;
+        self.capture = CaptureState::Disabled;
         self.emulation = Status::Disabled;
         for (_, state) in self.clients.values_mut() {
             state.active_addr = None;
@@ -2243,7 +2280,7 @@ mod the_daemon_gone {
                         fingerprint: FP.into(),
                     },
                     FrontendEvent::PairingOpen { seconds: 120 },
-                    FrontendEvent::CaptureStatus(Status::Enabled),
+                    FrontendEvent::CaptureStatus(CaptureState::Enabled),
                     FrontendEvent::ConnectionAttempt {
                         fingerprint: "cc:dd".into(),
                         origin: AttemptOrigin::Inbound,
@@ -2256,6 +2293,7 @@ mod the_daemon_gone {
                             claimed_fingerprint: None,
                             addrs: vec!["192.0.2.7:4242".parse().expect("addr")],
                         }],
+                        quiet: false,
                     },
                 ] {
                     first.events.unbounded_send(Ok(event)).expect("open");
@@ -2322,7 +2360,7 @@ mod the_daemon_gone {
                 );
                 assert!(
                     gone.pairing_seconds_left(Instant::now()).is_none()
-                        && gone.capture == Status::Disabled,
+                        && gone.capture == CaptureState::Disabled,
                     "with no daemon the pairing window or capture still reads open"
                 );
                 assert!(
@@ -2355,5 +2393,56 @@ mod the_daemon_gone {
                 );
             })
             .await;
+    }
+}
+
+#[cfg(test)]
+mod capture_that_cannot_run {
+    //! What a frontend says about a capture that failed (#91).
+
+    use super::{AppModel, CaptureFault, CaptureState, FrontendEvent, Permission};
+
+    fn said(state: CaptureState) -> Option<String> {
+        let mut m = AppModel::default();
+        m.apply(FrontendEvent::CaptureStatus(state));
+        m.capture_problem()
+    }
+
+    // LEDGER T8 | class B | 1 return value: AppModel::apply then AppModel::capture_problem
+    #[test]
+    fn a_missing_permission_is_named_with_where_to_turn_it_on() {
+        let missing = |p: &[Permission]| CaptureState::Failed(CaptureFault::Missing(p.to_vec()));
+        assert_eq!(
+            [
+                said(missing(&[Permission::InputMonitoring])),
+                said(missing(&[
+                    Permission::Accessibility,
+                    Permission::InputMonitoring
+                ])),
+                said(CaptureState::Failed(CaptureFault::Backend(
+                    "no backend available".into()
+                ))),
+                said(CaptureState::Disabled),
+                said(CaptureState::Enabled),
+            ],
+            [
+                Some(
+                    "Input capture cannot run: macOS does not grant hops Input Monitoring, \
+                     which this Mac needs to control other machines. Turn hops on under \
+                     System Settings → Privacy & Security → Input Monitoring."
+                        .to_string()
+                ),
+                Some(
+                    "Input capture cannot run: macOS does not grant hops Accessibility and \
+                     Input Monitoring, which this Mac needs to control other machines. Turn \
+                     hops on under System Settings → Privacy & Security, in both \
+                     Accessibility and Input Monitoring."
+                        .to_string()
+                ),
+                Some("Input capture is not running: no backend available".to_string()),
+                None,
+                None,
+            ]
+        );
     }
 }

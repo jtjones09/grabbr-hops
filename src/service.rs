@@ -16,8 +16,9 @@ use crate::{
 };
 use futures::StreamExt;
 use hops_ipc::{
-    AsyncFrontendListener, AttemptOrigin, ClientHandle, DaemonEndpoint, DiscoveredDevice,
-    FrontendEvent, FrontendRequest, IpcError, IpcListenerCreationError, Position, Status,
+    AsyncFrontendListener, AttemptOrigin, CaptureState, ClientHandle, DaemonEndpoint,
+    DiscoveredDevice, FrontendEvent, FrontendRequest, IpcError, IpcListenerCreationError, Position,
+    Status,
 };
 use local_channel::mpsc::{Receiver, channel};
 use log;
@@ -156,6 +157,9 @@ pub struct Service {
     /// switched off in config or when mDNS could not start — discovery is a
     /// convenience, never a precondition for hops running (#136).
     discovery: Option<Discovery>,
+    /// Discovery has heard no other machine since it started, for long
+    /// enough to say so (#149).
+    discovery_quiet: bool,
     /// Peers seen on the network, keyed by advertised label. Not trusted: a
     /// claimed fingerprint here is an unauthenticated assertion by whatever is
     /// on the LAN, useful only for labelling and for spotting a mismatch when
@@ -204,7 +208,7 @@ pub struct Service {
     /// frontend events queued for sending
     pending_frontend_events: VecDeque<FrontendEvent>,
     /// status of input capture (enabled / disabled)
-    capture_status: Status,
+    capture_status: CaptureState,
     /// status of input emulation (enabled / disabled)
     emulation_status: Status,
     /// Watches for a macOS permission granted while capture or emulation
@@ -573,6 +577,7 @@ impl Service {
             frontend_listener,
             resolver,
             discovery,
+            discovery_quiet: false,
             discovered: HashMap::new(),
             trust,
             trust_saver: crate::trust_save::TrustSaver::new(trust_file),
@@ -1102,13 +1107,19 @@ impl Service {
             }
             ICaptureEvent::CaptureDisabled => {
                 self.permission_watch.stopped(Side::Capture);
-                self.capture_status = Status::Disabled;
-                self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
+                self.capture_status = CaptureState::Disabled;
+                self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status.clone()));
             }
             ICaptureEvent::CaptureEnabled => {
                 self.permission_watch.started(Side::Capture);
-                self.capture_status = Status::Enabled;
-                self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
+                self.capture_status = CaptureState::Enabled;
+                self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status.clone()));
+            }
+            ICaptureEvent::CaptureFailed(fault) => {
+                // A backend that was never created never said it stopped.
+                self.permission_watch.stopped(Side::Capture);
+                self.capture_status = CaptureState::Failed(fault);
+                self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status.clone()));
             }
             ICaptureEvent::ClientEntered(handle) => {
                 log::info!("entering client {handle} ...");
@@ -1127,7 +1138,20 @@ impl Service {
     fn handle_discovery_event(&mut self, event: Option<DiscoveryEvent>) {
         let Some(event) = event else { return };
         match event {
+            DiscoveryEvent::Quiet => {
+                let check = if cfg!(target_os = "macos") {
+                    "; if other machines here run hops, check System Settings → Privacy & \
+                     Security → Local Network, where hops must be on"
+                } else {
+                    ""
+                };
+                log::warn!("network discovery has heard no other machine since it started{check}");
+                self.discovery_quiet = true;
+            }
             DiscoveryEvent::Found(peer) => {
+                // Something answered: whatever the list shows, it is not
+                // silence.
+                let was_quiet = std::mem::take(&mut self.discovery_quiet);
                 let key = crate::discovery::peer_key(&peer);
                 let changed = match self.discovered.get_mut(&key) {
                     // mDNS re-announces constantly, per interface, with
@@ -1148,7 +1172,7 @@ impl Service {
                         true
                     }
                 };
-                if !changed {
+                if !changed && !was_quiet {
                     return;
                 }
             }
@@ -1215,6 +1239,7 @@ impl Service {
         self.notify_frontend(FrontendEvent::Discovered {
             active: self.discovery.is_some(),
             peers,
+            quiet: self.discovery_quiet,
         });
     }
 
@@ -1266,7 +1291,7 @@ impl Service {
         // publish was not.
         self.publish_discovered();
         self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
-        self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
+        self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status.clone()));
         self.notify_frontend(FrontendEvent::PortChanged(self.port, None));
         // A frontend that attaches while a trust change is still unsaved is
         // told, or the only notice went to no one.
@@ -2949,6 +2974,9 @@ mod a_second_daemon_leaves_the_running_daemons_files_alone {
 
 #[cfg(all(test, unix))]
 mod a_permission_granted_while_it_runs;
+
+#[cfg(all(test, unix))]
+mod a_mac_missing_a_permission;
 
 #[cfg(test)]
 mod replay_on_attach {

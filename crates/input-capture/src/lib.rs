@@ -11,7 +11,7 @@ use futures_core::Stream;
 
 use input_event::{Event, KeyboardEvent, scancode};
 
-pub use error::{CaptureCreationError, CaptureError, InputCaptureError};
+pub use error::{CaptureCreationError, CaptureError, InputCaptureError, Permission};
 
 pub mod error;
 
@@ -375,6 +375,7 @@ async fn create(
         return b;
     }
 
+    let mut failures = Vec::new();
     for backend in [
         #[cfg(libei)]
         Backend::InputCapturePortal,
@@ -393,10 +394,23 @@ async fn create(
                 return Ok(b);
             }
             Err(e) if e.cancelled_by_user() => return Err(e),
-            Err(e) => log::warn!("{backend} input capture backend unavailable: {e}"),
+            Err(e) => {
+                log::warn!("{backend} input capture backend unavailable: {e}");
+                failures.push(e);
+            }
         }
     }
-    Err(CaptureCreationError::NoAvailableBackend)
+    Err(when_none_started(failures))
+}
+
+/// What to report once every backend failed: the first failure that names a
+/// missing permission, since it says what the user can change (#91), and
+/// otherwise that no backend is available.
+fn when_none_started(failures: Vec<CaptureCreationError>) -> CaptureCreationError {
+    failures
+        .into_iter()
+        .find(|e| e.missing_permissions().is_some())
+        .unwrap_or(CaptureCreationError::NoAvailableBackend)
 }
 
 #[cfg(test)]
@@ -545,5 +559,42 @@ mod focus_removal {
     fn nothing_focused_is_not_a_removal() {
         let removed = Arc::new("edge-left");
         assert!(!removal_drops_focus(None, &removed));
+    }
+}
+
+#[cfg(all(test, feature = "scripted"))]
+mod a_backend_refused_for_a_permission {
+    //! When no backend starts, what capture reports must name a permission
+    //! one was refused for (#91): "no backend available" gives the user
+    //! nothing to change.
+
+    use super::{CaptureCreationError, Permission, scripted::ScriptedCaptureCreationError};
+
+    // LEDGER T4 | class B | 1 return value: when_none_started
+    #[test]
+    fn the_refusal_that_names_a_permission_is_what_is_reported() {
+        let failures = vec![
+            CaptureCreationError::Scripted(ScriptedCaptureCreationError::Unavailable),
+            CaptureCreationError::Scripted(ScriptedCaptureCreationError::MissingPermissions(vec![
+                Permission::InputMonitoring,
+            ])),
+            CaptureCreationError::Scripted(ScriptedCaptureCreationError::Unavailable),
+        ];
+        let reported = super::when_none_started(failures);
+        assert_eq!(
+            reported.missing_permissions(),
+            Some(&[Permission::InputMonitoring][..]),
+            "one backend was refused for want of Input Monitoring; the error \
+             reported must say so, but it was: {reported}"
+        );
+        assert!(
+            matches!(
+                super::when_none_started(vec![CaptureCreationError::Scripted(
+                    ScriptedCaptureCreationError::Unavailable
+                )]),
+                CaptureCreationError::NoAvailableBackend
+            ),
+            "with no permission named, no backend is available"
+        );
     }
 }
