@@ -811,6 +811,8 @@ impl Service {
                 self.save_config();
             }
             FrontendRequest::SaveConfiguration => self.save_config(),
+            // Queued behind everything the requests before it caused.
+            FrontendRequest::Barrier(n) => self.notify_frontend(FrontendEvent::Barrier(n)),
             FrontendRequest::OpenPairing => {
                 self.prompt_gate.open(Instant::now());
                 log::info!(
@@ -1380,6 +1382,15 @@ impl Service {
         };
         if let Err(e) = issued {
             log::warn!("refusing to authorize {fp}: {e}");
+            // Said to the frontend too: a refusal only the log knew about let
+            // `hops cli authorize-key` report success for a grant never made.
+            let why = match e {
+                GrantRefused::NoAttempt => "no pairing request from that device is waiting. \
+                     Open add device, connect from that device, then approve it."
+                    .to_string(),
+                GrantRefused::Store(e) => e.to_string(),
+            };
+            self.notify_frontend(FrontendEvent::Error(format!("Nothing was trusted: {why}")));
             return;
         }
         // Named by the label the store kept: it sanitises at the door.

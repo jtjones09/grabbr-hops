@@ -386,6 +386,10 @@ pub enum FrontendEvent {
     /// keeps the previous version's daemon running when the app is replaced
     /// in place, and it still serves.
     DaemonBuild(Build),
+    /// The answer to [`FrontendRequest::Barrier`] with the same number: every
+    /// request sent before it on that connection has been handled, and every
+    /// event those requests caused was sent before this one.
+    Barrier(u64),
 }
 
 /// Which build a program is: its package version and the commit it was built
@@ -507,6 +511,15 @@ pub enum FrontendRequest {
     /// Grants nothing by itself: a prompt still has to be approved, and only
     /// `AuthorizeKey` does that.
     OpenPairing,
+    /// Answered with [`FrontendEvent::Barrier`] carrying the same number once
+    /// every request sent before it on this connection has been handled.
+    ///
+    /// Events go to every frontend, so a frontend cannot tell which ones its
+    /// own requests caused. A number it chose itself can: a command that sends
+    /// its requests, then this, knows its requests were read and acted on when
+    /// the number comes back, and that the events before it include theirs.
+    /// Changes nothing.
+    Barrier(u64),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
