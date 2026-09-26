@@ -49,9 +49,18 @@ fn main() {
         run_build_check(repo, strict);
     }
 
-    if let Err(e) = run() {
-        log::error!("{e}");
-        process::exit(1);
+    match run() {
+        Ok(()) => {}
+        // A `hops cli` command answers whoever ran it, a script as much as a
+        // terminal, and the log reaches stderr only at a terminal.
+        Err(HopsError::Cli(e)) => {
+            eprintln!("{e}");
+            process::exit(1);
+        }
+        Err(e) => {
+            log::error!("{e}");
+            process::exit(1);
+        }
     }
 }
 

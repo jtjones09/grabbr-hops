@@ -115,6 +115,15 @@ pub enum IpcError {
 
 pub const DEFAULT_PORT: u16 = 4242;
 
+/// How the service's [`FrontendEvent::Error`] begins when it made a change and
+/// could not save the config, so the change is gone when it restarts. Shared
+/// with `hops cli`, which fails a command on it.
+pub const NOT_SAVED: &str = "The change was made but not saved";
+/// How the notice begins when a change to trusted devices could not be saved.
+pub const TRUST_NOT_SAVED: &str = "Could not save a change to trusted devices";
+/// How every refusal of a trust grant begins.
+pub const GRANT_REFUSED: &str = "Nothing was trusted";
+
 #[derive(Debug, Default, Eq, Hash, PartialEq, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Position {
@@ -393,6 +402,10 @@ pub enum FrontendEvent {
     /// keeps the previous version's daemon running when the app is replaced
     /// in place, and it still serves.
     DaemonBuild(Build),
+    /// The answer to [`FrontendRequest::Barrier`] with the same number: every
+    /// request sent before it on that connection has been handled, and every
+    /// event those requests caused was sent before this one.
+    Barrier(u64),
 }
 
 /// What this machine's trust store grants one paired machine, beyond the
@@ -532,6 +545,15 @@ pub enum FrontendRequest {
     /// peer drives this machine. There is deliberately no request that turns
     /// it back on: widening a pairing is not a frontend verb (#107).
     DisableClipboard(String),
+    /// Answered with [`FrontendEvent::Barrier`] carrying the same number once
+    /// every request sent before it on this connection has been handled.
+    ///
+    /// Events go to every frontend, so a frontend cannot tell which ones its
+    /// own requests caused. A number it chose itself can: a command that sends
+    /// its requests, then this, knows its requests were read and acted on when
+    /// the number comes back, and that the events before it include theirs.
+    /// Changes nothing.
+    Barrier(u64),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]

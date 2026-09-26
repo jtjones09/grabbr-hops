@@ -862,6 +862,8 @@ impl Service {
                 self.save_config();
             }
             FrontendRequest::SaveConfiguration => self.save_config(),
+            // Queued behind everything the requests before it caused.
+            FrontendRequest::Barrier(n) => self.notify_frontend(FrontendEvent::Barrier(n)),
             FrontendRequest::OpenPairing => {
                 self.prompt_gate.open(Instant::now());
                 log::info!(
@@ -901,6 +903,13 @@ impl Service {
         self.config.set_revoked_fingerprints(tombstones);
         if let Err(e) = self.config.write_back() {
             log::warn!("failed to write config: {e}");
+            // The change is in memory only, for one when the file does not
+            // parse and is left as it is: say so, or it looks saved until the
+            // next start.
+            self.notify_frontend(FrontendEvent::Error(format!(
+                "{}: {e}",
+                hops_ipc::NOT_SAVED
+            )));
         }
     }
 
@@ -1393,9 +1402,10 @@ impl Service {
         // expelled device (issue #67).
         let Some(fp) = hops_ipc::pairing::canonical_fingerprint(&fp) else {
             log::warn!("refusing to authorize {fp:?}: not a valid fingerprint");
-            self.notify_frontend(FrontendEvent::Error(
-                "That is not a valid device fingerprint.".to_string(),
-            ));
+            self.notify_frontend(FrontendEvent::Error(format!(
+                "{}: that is not a valid device fingerprint.",
+                hops_ipc::GRANT_REFUSED
+            )));
             return;
         };
         // An expelled fingerprint is DEAD. There is deliberately no path from
@@ -1412,9 +1422,10 @@ impl Service {
                 entry.label
             );
             self.notify_frontend(FrontendEvent::Error(format!(
-                "\"{}\" was removed, and that identity cannot be trusted again. \
+                "{}: \"{}\" was removed, and that identity cannot be trusted again. \
                  Re-install or reset hops on that machine so it generates a new \
                  identity, then pair it fresh.",
+                hops_ipc::GRANT_REFUSED,
                 entry.label
             )));
             return;
@@ -1430,6 +1441,20 @@ impl Service {
         };
         if let Err(e) = issued {
             log::warn!("refusing to authorize {fp}: {e}");
+            // Said to the frontend too: a refusal only the log knew about let
+            // `hops cli authorize-key` report success for a grant never made.
+            // Every refusal of a grant begins with GRANT_REFUSED, which is how
+            // the command tells one from any other notice.
+            let why = match e {
+                GrantRefused::NoAttempt => "no pairing request from that device is waiting. \
+                     Open add device, connect from that device, then approve it."
+                    .to_string(),
+                GrantRefused::Store(e) => e.to_string(),
+            };
+            self.notify_frontend(FrontendEvent::Error(format!(
+                "{}: {why}",
+                hops_ipc::GRANT_REFUSED
+            )));
             return;
         }
         // Named by the label the store kept: it sanitises at the door.
@@ -1462,8 +1487,9 @@ impl Service {
         }
         log::warn!("refusing to {what} — this machine is being driven by a peer right now");
         self.notify_frontend(FrontendEvent::Error(format!(
-            "Refused to {what}: this machine is being controlled remotely. \
-             Use its own keyboard and mouse, then try again."
+            "{}: this machine is being controlled remotely, so it refused to \
+             {what}. Use its own keyboard and mouse, then try again.",
+            hops_ipc::GRANT_REFUSED
         )));
         true
     }

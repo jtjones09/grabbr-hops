@@ -288,6 +288,8 @@ impl AppModel {
                     .then(|| Instant::now() + std::time::Duration::from_secs(seconds.into()));
             }
             FrontendEvent::NoSuchClient(_) => {}
+            // Sent to every frontend, and meant for the one that asked.
+            FrontendEvent::Barrier(_) => {}
         }
     }
 

@@ -115,9 +115,10 @@ impl TrustSaver {
 
 fn unsaved_notice(changes: &[String], error: &str) -> String {
     format!(
-        "Could not save a change to trusted devices: {} ({error}). It is in \
+        "{}: {} ({error}). It is in \
          effect now, but if hops restarts before it is saved, it is undone. hops \
          tries to save it again every minute.",
+        hops_ipc::TRUST_NOT_SAVED,
         changes.join(", ")
     )
 }
