@@ -61,7 +61,7 @@ codesign identity. After re-signing, `launchctl bootout` + `bootstrap` (not
 ### Windows
 
 ```powershell
-# from an elevated PowerShell (Run as administrator):
+# from a normal PowerShell; no administrator needed:
 cd windows
 .\install-hops-daemon.ps1 -HopsPath 'C:\path\to\hops.exe'
 ```
@@ -70,6 +70,11 @@ This registers a logon-triggered Scheduled Task rather than a Windows service on
 purpose: a service runs in the isolated session 0 and cannot inject input into
 your desktop. The task runs hops in your interactive session, which is what input
 emulation requires.
+
+hops runs as you and is never elevated: an administrator process started from a
+folder you can write hands administrator to anything that can replace the file.
+The cost is that hops cannot type or click into an elevated window. An enter
+hook set in `config.toml` does not run if hops is started elevated.
 
 ## 3. Configure over SSH
 

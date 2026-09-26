@@ -3088,3 +3088,71 @@ mod discovery_is_declared_to_the_operating_system {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// the daemon runs as the user
+// ---------------------------------------------------------------------------
+
+mod the_windows_daemon_is_never_installed_elevated {
+    //! **Decided 2026-09-15 (#109).** The Windows daemon runs as the user and
+    //! is never elevated. An administrator process started from a folder the
+    //! user can write hands administrator to anything that can replace the
+    //! file, and its enter hook comes from a config file the user can write.
+    //!
+    //! The runtime half is `crate::enter_hook`, which refuses the hook in an
+    //! elevated process and is tested by calling it. This half is about the
+    //! words that ship: the install script and the instructions for it. No CI
+    //! runner registers a Windows scheduled task, so the text is what can be
+    //! checked.
+
+    const SCRIPT: &str = include_str!("../service/windows/install-hops-daemon.ps1");
+    const README: &str = include_str!("../service/README.md");
+
+    /// PowerShell with `#` comments removed, lower-cased, since PowerShell
+    /// reads its parameter names without regard to case.
+    fn powershell_code(src: &str) -> String {
+        src.lines()
+            .map(|l| l.split('#').next().unwrap_or("").to_lowercase())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    // LEDGER T69 | class S | source text
+    #[test]
+    fn the_install_script_and_its_instructions_never_ask_for_elevation() {
+        let code = powershell_code(SCRIPT);
+        let run_levels: Vec<&str> = code
+            .split("-runlevel")
+            .skip(1)
+            .map(|after| after.split_whitespace().next().unwrap_or(""))
+            .collect();
+        assert!(
+            !run_levels.is_empty() && run_levels.iter().all(|level| *level == "limited"),
+            "install-hops-daemon.ps1 registers the daemon's task with run level \
+             {run_levels:?}; it must name `-RunLevel Limited` and nothing else. \
+             A task with the highest run level runs hops as an administrator from \
+             a folder the user can write, and runs its enter hook from a config \
+             file the user can write."
+        );
+
+        let mut asks = Vec::new();
+        for (file, text) in [
+            ("service/windows/install-hops-daemon.ps1", SCRIPT),
+            ("service/README.md", README),
+        ] {
+            let lower = text.to_lowercase();
+            for phrase in ["run as administrator", "elevated powershell"] {
+                if lower.contains(phrase) {
+                    asks.push(format!("{file}: \"{phrase}\""));
+                }
+            }
+        }
+        assert!(
+            asks.is_empty(),
+            "the Windows install instructions still ask for elevation: {asks:?}. \
+             The daemon runs as the user, so its install needs no administrator, \
+             and telling users to use one invites the elevated install that \
+             2026-09-15 took out."
+        );
+    }
+}
