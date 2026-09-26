@@ -196,6 +196,46 @@ fn free_edge(model: &AppModel) -> Position {
     .unwrap_or(Position::Left)
 }
 
+/// A device the user asked to add: its address, port and edge, waiting for
+/// the handle the daemon assigns.
+type NewDevice = (String, u16, Position);
+
+/// Ask the daemon to create a device, and stage `device` for its handle.
+///
+/// `request` returns the connection that took the request, the model's
+/// `link`, or `None` when no daemon did. Then nothing is staged: a staged add
+/// with none in flight would claim whichever handle appears next, another
+/// device's.
+fn stage_add(
+    request: impl FnOnce(FrontendRequest) -> Option<u64>,
+    device: NewDevice,
+) -> Option<(u64, NewDevice)> {
+    request(FrontendRequest::Create).map(|link| (link, device))
+}
+
+/// The staged add and its handle, once `arrived` is a handle this frontend
+/// had not seen; left staged until then.
+///
+/// `link` is the connection the model now describes. An add staged on
+/// another one is dropped: that connection was lost, and the `Create` or any
+/// word of its handle with it, so the next handle to appear is another
+/// device's, and would be given this one's address, edge and a switch-on
+/// (#34).
+fn claim_add(
+    staged: &mut Option<(u64, NewDevice)>,
+    link: u64,
+    arrived: Option<ClientHandle>,
+) -> Option<(ClientHandle, NewDevice)> {
+    match (staged.take()?, arrived) {
+        ((on, _), _) if on != link => None,
+        ((_, device), Some(handle)) => Some((handle, device)),
+        (kept, None) => {
+            *staged = Some(kept);
+            None
+        }
+    }
+}
+
 /// Split a typed `host` / `host:port` into its parts.
 ///
 /// A bare IPv6 literal is all host and no port, so it is recognised *before*
@@ -291,13 +331,15 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
     let mut card = PairingCard::default();
     let mut show_log = false;
     let mut notice: Option<(String, Instant)> = None;
+    // The model's error sequence last put in the footer.
+    let mut errors_seen: u64 = 0;
     // A device the user just asked to create, awaiting the handle the daemon
     // assigns: `Create` is fire-and-forget, and the handle only exists once the
     // resulting `Created` event lands in a snapshot. Applied below as soon as a
     // handle we have not seen before shows up. Without this, TUI "add" made a
     // blank unnamed card with no address, no port and no edge — a device that
     // could never connect and that the TUI had no way to finish configuring.
-    let mut pending_new: Option<(String, u16, Position)> = None;
+    let mut pending_new: Option<(u64, NewDevice)> = None;
     let mut known_handles: HashSet<ClientHandle> = HashSet::new();
 
     let result = loop {
@@ -305,27 +347,26 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
 
         // finish an add as soon as the daemon hands back a handle
         let current: HashSet<ClientHandle> = model.clients.keys().copied().collect();
-        if current != known_handles {
-            if let Some((host, port, pos)) = pending_new.take() {
-                match current.difference(&known_handles).copied().next() {
-                    Some(h) => {
-                        // Just created: never connected, so no pin.
-                        client.request(FrontendRequest::UpdateHostname {
-                            handle: h,
-                            hostname: Some(host),
-                            fingerprint: None,
-                        });
-                        client.request(FrontendRequest::UpdatePort(h, port));
-                        client.request(FrontendRequest::UpdatePosition(h, pos));
-                        // actually try the machine: an inert card that is never
-                        // dialed looks identical to a broken one.
-                        client.request(FrontendRequest::Activate(h, true));
-                    }
-                    // Created hasn't reached a snapshot yet — retry next tick
-                    None => pending_new = Some((host, port, pos)),
-                }
-            }
-            known_handles = current;
+        let arrived = current.difference(&known_handles).copied().next();
+        if let Some((h, (host, port, pos))) = claim_add(&mut pending_new, model.link, arrived) {
+            // Just created: never connected, so no pin.
+            client.request(FrontendRequest::UpdateHostname {
+                handle: h,
+                hostname: Some(host),
+                fingerprint: None,
+            });
+            client.request(FrontendRequest::UpdatePort(h, port));
+            client.request(FrontendRequest::UpdatePosition(h, pos));
+            // actually try the machine: an inert card that is never
+            // dialed looks identical to a broken one.
+            client.request(FrontendRequest::Activate(h, true));
+        }
+        known_handles = current;
+
+        // A request refused with no daemon, or one the daemon never took, is
+        // said here rather than only in the log (#34).
+        if let Some(error) = new_error(&model, &mut errors_seen) {
+            notice = Some((error, Instant::now()));
         }
 
         if drop_stale(&model, &mut confirm, &mut input) {
@@ -393,8 +434,10 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                             KeyCode::Enter => match input.take().expect("input set") {
                                 Input::Add { buf } => match parse_target(&buf) {
                                     Ok((host, port)) => {
-                                        pending_new = Some((host, port, free_edge(&model)));
-                                        client.request(FrontendRequest::Create);
+                                        pending_new = stage_add(
+                                            |r| client.request_on(r),
+                                            (host, port, free_edge(&model)),
+                                        );
                                     }
                                     Err(msg) => {
                                         notice = Some((msg.to_string(), Instant::now()));
@@ -508,7 +551,9 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                                 client.request(FrontendRequest::EnableCapture);
                                 client.request(FrontendRequest::EnableEmulation);
                             }
-                            KeyCode::Char('s') => client.request(FrontendRequest::SaveConfiguration),
+                            KeyCode::Char('s') => {
+                                client.request(FrontendRequest::SaveConfiguration);
+                            }
                             KeyCode::Char('t') => {
                                 theme_idx = (theme_idx + 1) % themes.len();
                                 theme::save_name(&themes[theme_idx].name);
@@ -519,7 +564,7 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                                     buf: model.port.map(|p| p.to_string()).unwrap_or_default(),
                                 });
                             }
-                            KeyCode::Char('g') => {
+                            KeyCode::Char('g') if hops_frontend_core::prefs::CAN_SWITCH => {
                                 ratatui::restore();
                                 let err = hops_frontend_core::prefs::switch_to(Frontend::Gui);
                                 log::warn!("could not switch to the graphical interface: {err}");
@@ -562,17 +607,23 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                                 _ => {}
                             },
                             KeyCode::Char('p') => match selected.and_then(|d| d.send.as_ref()) {
-                                Some(s) => client.request(FrontendRequest::UpdatePosition(
-                                    s.handle,
-                                    next_pos(&s.config.pos),
-                                )),
+                                Some(s) => {
+                                    client.request(FrontendRequest::UpdatePosition(
+                                        s.handle,
+                                        next_pos(&s.config.pos),
+                                    ));
+                                }
                                 None => {
                                     notice = Some((NO_SEND_NOTE.to_string(), Instant::now()));
                                 }
                             },
                             KeyCode::Char(' ') => match selected.and_then(|d| d.send.as_ref()) {
-                                Some(s) => client
-                                    .request(FrontendRequest::Activate(s.handle, !s.state.active)),
+                                Some(s) => {
+                                    client.request(FrontendRequest::Activate(
+                                        s.handle,
+                                        !s.state.active,
+                                    ));
+                                }
                                 None => {
                                     notice = Some((NO_SEND_NOTE.to_string(), Instant::now()));
                                 }
@@ -779,12 +830,23 @@ fn peer_build(d: &Device) -> String {
     }
 }
 
+/// The model's latest error, if it arrived since `seen`, which is advanced.
+fn new_error(model: &AppModel, seen: &mut u64) -> Option<String> {
+    if model.error_seq == *seen {
+        return None;
+    }
+    *seen = model.error_seq;
+    model.latest_error().map(str::to_owned)
+}
+
 /// One row of the unified device list.
 ///
 /// The two facets a device can have — we cross *to* it, it may connect *in* to
 /// us — are shown as one arrow badge rather than as membership of two different
 /// lists, which is the whole point of the projection.
-fn device_row(d: &Device, theme: &Theme) -> ListItem<'static> {
+/// `live` is false while no daemon is connected: the row is then what was
+/// last known, not what is, and is drawn muted with a hollow dot (#34).
+fn device_row(d: &Device, theme: &Theme, live: bool) -> ListItem<'static> {
     let muted = Style::default().fg(col(theme.muted));
     let revoked = d.trust == TrustState::Revoked;
 
@@ -839,7 +901,7 @@ fn device_row(d: &Device, theme: &Theme) -> ListItem<'static> {
             "pair again with a new identity to come back",
             muted,
         ));
-        return ListItem::new(Line::from(spans));
+        return row_item(spans, live, theme);
     }
 
     spans.push(Span::styled(
@@ -879,6 +941,24 @@ fn device_row(d: &Device, theme: &Theme) -> ListItem<'static> {
         spans.push(Span::styled("connects in only", muted));
     }
 
+    row_item(spans, live, theme)
+}
+
+/// A device row's spans as a list item: as built while a daemon is
+/// connected, and all muted, the dot hollow, while none is.
+fn row_item(spans: Vec<Span<'static>>, live: bool, theme: &Theme) -> ListItem<'static> {
+    if live {
+        return ListItem::new(Line::from(spans));
+    }
+    let muted = Style::default().fg(col(theme.muted));
+    let spans: Vec<Span<'static>> = spans
+        .into_iter()
+        .enumerate()
+        .map(|(i, span)| match i {
+            0 => Span::styled("○", muted),
+            _ => Span::styled(span.content, muted),
+        })
+        .collect();
     ListItem::new(Line::from(spans))
 }
 
@@ -994,11 +1074,21 @@ fn ui(
             muted,
         )))]
     } else {
-        devices.iter().map(|d| device_row(d, theme)).collect()
+        devices
+            .iter()
+            .map(|d| device_row(d, theme, model.connected))
+            .collect()
     };
     f.render_stateful_widget(
         List::new(rows)
-            .block(panel(Span::styled(" devices ", accent), true))
+            .block(panel(
+                if model.connected || devices.is_empty() {
+                    Span::styled(" devices ", accent)
+                } else {
+                    Span::styled(" devices · last known, not connected ", muted)
+                },
+                true,
+            ))
             .highlight_style(highlight)
             .highlight_symbol("▶ "),
         chunks[1],
@@ -1152,6 +1242,10 @@ fn footer_line(
         ("g", " gui  "),
         ("q", " close"),
     ] {
+        // Offered only where the switch can happen (#173).
+        if k == "g" && !hops_frontend_core::prefs::CAN_SWITCH {
+            continue;
+        }
         spans.push(Span::styled(k, key));
         spans.push(Span::raw(label));
     }
@@ -1310,6 +1404,71 @@ mod tests {
     const FP: &str = "1e:19:1b:2c:3d:4e:5f:60:71:82:93:a4:b5:c6:d7:e8";
     const OTHER_FP: &str = "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
 
+    // LEDGER T531 | class B | 1 return value + requests passed to stage_add's sender
+    /// An add no daemon took stages nothing: the first handles a daemon
+    /// reports later are the existing devices', and one of them would take
+    /// this address and edge.
+    #[test]
+    fn an_add_no_daemon_took_stages_nothing() {
+        let mut sent = Vec::new();
+        let staged = stage_add(
+            |r| {
+                sent.push(r);
+                None
+            },
+            ("desk-pc.local".into(), 4242, Position::Left),
+        );
+        assert!(
+            matches!(sent.as_slice(), [FrontendRequest::Create]),
+            "the add did not ask the daemon for a handle: {sent:?}"
+        );
+        assert_eq!(
+            staged, None,
+            "an add that never reached a daemon was left waiting for a handle"
+        );
+        assert_eq!(
+            stage_add(|_| Some(2), ("desk-pc.local".into(), 4242, Position::Left)),
+            Some((2, ("desk-pc.local".into(), 4242, Position::Left))),
+            "an add a daemon took must wait for its handle on that connection"
+        );
+    }
+
+    // LEDGER T532 | class B | 1 return value + 6 struct state: claim_add and its staged add
+    /// An add waits for its handle on the connection that took it, and is
+    /// dropped once that connection is lost (#34).
+    #[test]
+    fn an_add_is_claimed_once_and_only_on_its_connection() {
+        let add = || Some((0, ("desk-pc.local".to_string(), 4242, Position::Left)));
+
+        let mut staged = add();
+        assert_eq!(claim_add(&mut staged, 0, None), None);
+        assert_eq!(
+            staged,
+            add(),
+            "an add whose handle has not come yet was lost"
+        );
+        assert_eq!(
+            claim_add(&mut staged, 0, Some(7)),
+            Some((7, ("desk-pc.local".to_string(), 4242, Position::Left)))
+        );
+        assert_eq!(
+            staged, None,
+            "a claimed add would configure the next handle too"
+        );
+
+        let mut staged = add();
+        assert_eq!(
+            claim_add(&mut staged, 1, Some(7)),
+            None,
+            "an add staged before the daemon was lost gave its address, edge and \
+             a switch-on to the next handle to appear"
+        );
+        assert_eq!(
+            staged, None,
+            "an add from a lost connection stayed staged, to claim a later handle"
+        );
+    }
+
     // LEDGER T15 | class B | 6 struct state: the TUI's armed Confirm and Input after drop_stale
     /// An armed delete and an open rename go once their device changes, and
     /// stay while it does not (#94).
@@ -1402,6 +1561,73 @@ mod tests {
 
     fn screen(model: &AppModel, sel: usize) -> String {
         render(model, sel).join("\n")
+    }
+
+    /// With no daemon connected the rows are what was last known, and are
+    /// drawn that way rather than live (#34).
+    // LEDGER T521 | class B | 3 widget tree: ui() rendered to a test terminal
+    #[test]
+    fn with_no_daemon_the_rows_are_hollow_and_say_last_known() {
+        let mut model = AppModel::default();
+        model.connected = true;
+        let live = ClientState {
+            active: true,
+            alive: true,
+            active_addr: Some("192.0.2.5:4242".parse().expect("addr")),
+            peer_fingerprint: Some(FP.into()),
+            ..Default::default()
+        };
+        let config = ClientConfig {
+            hostname: Some("studio-pc".into()),
+            ..Default::default()
+        };
+        model.apply(FrontendEvent::Enumerate(vec![(0, config, live)]));
+        let row = |m: &AppModel| {
+            render(m, 0)
+                .into_iter()
+                .find(|l| l.contains("studio-pc"))
+                .expect("the device row is on screen")
+        };
+        assert!(
+            row(&model).contains('●'),
+            "precondition: a live row has a solid dot"
+        );
+
+        model.connected = false;
+        let out = screen(&model, 0);
+        assert!(
+            row(&model).contains('○') && !row(&model).contains('●'),
+            "with no daemon the row still has a live dot:\n{out}"
+        );
+        assert!(
+            out.contains("last known"),
+            "with no daemon nothing says the list is the last known one:\n{out}"
+        );
+    }
+
+    /// A refused request, and an error from the daemon, reach the footer
+    /// once each (#34).
+    // LEDGER T522 | class B | 1 return value: new_error over AppModel::apply
+    #[test]
+    fn each_new_error_reaches_the_footer_once() {
+        let mut model = AppModel::default();
+        let mut seen = 0;
+        assert_eq!(new_error(&model, &mut seen), None);
+        model.apply(FrontendEvent::Error("could not resolve studio-pc".into()));
+        assert_eq!(
+            new_error(&model, &mut seen).as_deref(),
+            Some("could not resolve studio-pc")
+        );
+        assert_eq!(
+            new_error(&model, &mut seen),
+            None,
+            "the same error was raised again"
+        );
+        model.apply(FrontendEvent::Error("could not resolve studio-pc".into()));
+        assert!(
+            new_error(&model, &mut seen).is_some(),
+            "a repeat of the failure was not raised"
+        );
     }
 
     /// A machine that may already drive this one answers this machine's dial.

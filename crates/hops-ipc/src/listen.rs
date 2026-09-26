@@ -57,7 +57,9 @@ struct ConnState {
     /// set once the token has been presented; until then the connection is
     /// written to by nobody
     authed: AtomicBool,
-    /// set when the read half hangs up, so the write half goes with it
+    /// set when either half ends the connection: the read half hanging up,
+    /// so the write half goes with it, or a write that did not finish, so
+    /// nothing more is read from it either
     closed: AtomicBool,
 }
 
@@ -191,6 +193,10 @@ impl<R: AsyncRead + Unpin> Stream for AuthedLines<R> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        // The write half closed the connection: nothing more is read from it.
+        if this.state.closed.load(Ordering::Acquire) {
+            return Poll::Ready(None);
+        }
         loop {
             let line = match this.lines.poll_next_line(cx) {
                 Poll::Pending => {
@@ -289,18 +295,32 @@ async fn write_one(entry: &mut TxStream, bytes: &[u8]) -> bool {
     // silently truncating the event mid-JSON. And bounded, or one client that
     // stops reading freezes the whole daemon.
     match tokio::time::timeout(WRITE_STALL_LIMIT, entry.tx.write_all(bytes)).await {
-        Ok(Ok(())) => true,
-        Ok(Err(e)) => {
-            log::debug!("frontend write failed ({e}) — dropping it");
-            false
-        }
-        Err(_) => {
-            log::warn!(
-                "a frontend stopped reading for {WRITE_STALL_LIMIT:?} — dropping it rather \
-                 than letting it stall the daemon"
-            );
-            false
-        }
+        Ok(Ok(())) => return true,
+        Ok(Err(e)) => log::debug!("frontend write failed ({e}) — closing it"),
+        Err(_) => log::warn!(
+            "a frontend stopped reading for {WRITE_STALL_LIMIT:?} — closing it rather \
+             than letting it stall the daemon"
+        ),
+    }
+    close(entry).await;
+    false
+}
+
+/// End a connection whose write did not finish (#95).
+///
+/// Part of an event may have been written, and the rest never will be.
+/// Letting go of the write half alone left the connection open, since the
+/// read half shares the socket: the frontend kept a cut-off line and waited
+/// for events that never came, showing a list that no longer changed. Shut
+/// down the sending side, so the frontend reads to the end, sees the
+/// connection close and connects again for a full state, and stop reading
+/// requests from it.
+async fn close(entry: &mut TxStream) {
+    entry.state.closed.store(true, Ordering::Release);
+    // A shutdown asks nothing of the peer; bounded anyway, since the daemon
+    // loop waits on it.
+    if let Ok(Err(e)) = tokio::time::timeout(WRITE_STALL_LIMIT, entry.tx.shutdown()).await {
+        log::debug!("frontend connection shutdown failed ({e})");
     }
 }
 
@@ -1950,6 +1970,117 @@ mod an_unauthenticated_client_cannot_grow_memory {
             admitted,
             "after the waiting connections timed out, a frontend with the token \
              was not admitted"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod a_write_that_did_not_finish_closes_the_connection {
+    //! A broadcast that cannot be written in full ends that frontend's
+    //! connection, rather than leaving it open with part of an event and
+    //! nothing after it (#95).
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// A real listener on a real socket, holding `TOKEN`, and a frontend on
+    /// it that has presented the token and been answered with `Sync`.
+    async fn attached(tag: &str) -> (AsyncFrontendListener, PathBuf, UnixStream) {
+        let path = PathBuf::from(format!("/tmp/h-short-{tag}-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let claim = Claim::take(&crate::DaemonEndpoint::Unix(path.clone()))
+            .await
+            .expect("a claim on a fresh socket path");
+        let mut listener = AsyncFrontendListener {
+            claim,
+            token: TOKEN.into(),
+            line_streams: SelectAll::new(),
+            tx_streams: vec![],
+            refusing: false,
+        };
+        let mut frontend = UnixStream::connect(&path).await.expect("connect");
+        frontend
+            .write_all(format!("{TOKEN}\n").as_bytes())
+            .await
+            .expect("the token");
+        let first = tokio::time::timeout(Duration::from_secs(10), listener.next())
+            .await
+            .expect("the listener answers the token within 10 s");
+        assert!(
+            matches!(first, Some(Ok(FrontendRequest::Sync))),
+            "precondition: an authenticated frontend is synced, got {first:?}"
+        );
+        (listener, path, frontend)
+    }
+
+    fn remove(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(lock_path(path));
+    }
+
+    /// An event far larger than any socket buffer, to a frontend that is
+    /// not reading: the write cannot finish within the stall limit.
+    fn too_big() -> (FrontendEvent, usize) {
+        let event = FrontendEvent::Error("x".repeat(8 * 1024 * 1024));
+        let len = serde_json::to_string(&event).expect("json").len() + 1;
+        (event, len)
+    }
+
+    // LEDGER T526 | class B | 2 bytes read from a real socket after AsyncFrontendListener::broadcast
+    #[tokio::test]
+    async fn a_frontend_sent_part_of_an_event_is_hung_up_on() {
+        let (mut listener, path, mut frontend) = attached("eof").await;
+        let (event, len) = too_big();
+        listener.broadcast(event).await;
+
+        // Everything written is still readable; after it must come the end.
+        let mut got = Vec::new();
+        let ended =
+            tokio::time::timeout(Duration::from_secs(10), frontend.read_to_end(&mut got)).await;
+        drop(listener);
+        remove(&path);
+
+        assert!(
+            got.len() < len,
+            "precondition: the write was cut short, and {} of {len} bytes arrived",
+            got.len()
+        );
+        assert!(
+            matches!(ended, Ok(Ok(_))),
+            "the frontend read {} bytes of a {len}-byte event and the connection \
+             stayed open: it holds a cut-off line and waits for events that never \
+             come ({ended:?})",
+            got.len()
+        );
+    }
+
+    // LEDGER T527 | class B | 2 bytes written to a real socket, requests read by AsyncFrontendListener
+    #[tokio::test]
+    async fn a_closed_connection_is_not_read_from() {
+        let (mut listener, path, mut frontend) = attached("read").await;
+        let (event, _) = too_big();
+        listener.broadcast(event).await;
+
+        // The frontend sends a request before it notices the end.
+        frontend
+            .write_all(b"{\"Activate\":[0,false]}\n")
+            .await
+            .expect("the daemon still holds the read half");
+        let mut honoured = vec![];
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(request) = listener.next().await {
+                honoured.push(request);
+            }
+        })
+        .await;
+        drop(listener);
+        remove(&path);
+
+        assert!(
+            honoured.is_empty(),
+            "a connection the daemon closed on a failed write still had its \
+             requests honoured: {honoured:?}"
         );
     }
 }

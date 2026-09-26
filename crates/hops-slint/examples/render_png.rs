@@ -14,7 +14,7 @@ use std::rc::Rc;
 
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
 use slint::platform::{Platform, WindowAdapter, WindowEvent};
-use slint::{ComponentHandle, ModelRc, PhysicalSize, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, PhysicalSize, VecModel};
 
 // Reuse the lib crate's Slint-generated types (AppWindow, DeviceRow, Theme,
 // theme_colors) instead of calling `include_modules!()` again here — a second
@@ -213,6 +213,31 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             revoked: true,
         },
     ])));
+
+    // PREVIEW_NO_SWITCH=1 shows Settings as a Windows build has it, with no
+    // in-place switch to the terminal interface (#173).
+    ui.set_can_switch_interface(std::env::var_os("PREVIEW_NO_SWITCH").is_none());
+
+    // PREVIEW_DISCONNECTED=1 shows what the app keeps once the daemon has gone:
+    // the rows as last known, with every live fact cleared the way
+    // hops_frontend_core clears it, and the notice a click then gets (#34).
+    if std::env::var_os("PREVIEW_DISCONNECTED").is_some() {
+        ui.set_capture("disabled".into());
+        ui.set_emulation("disabled".into());
+        ui.set_pairing_fp("".into());
+        ui.set_notice(hops_frontend_core::NOT_CONNECTED.into());
+        let rows: Vec<DeviceRow> = ui
+            .get_devices()
+            .iter()
+            .map(|d| DeviceRow {
+                online: false,
+                alive: false,
+                refuses_input: false,
+                ..d
+            })
+            .collect();
+        ui.set_devices(ModelRc::new(VecModel::from(rows)));
+    }
 
     // PREVIEW_FIRST_RUN=1 shows the case discovery exists FOR: a fresh install
     // with nothing configured, where "on your network" is the whole screen.

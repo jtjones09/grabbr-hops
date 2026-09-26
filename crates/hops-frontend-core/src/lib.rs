@@ -8,12 +8,14 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    future::Future,
     net::SocketAddr,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
+use hops_ipc::{AsyncFrontendRequestWriter, ConnectionError, IpcError};
 use tokio::sync::{Notify, mpsc};
 
 pub use hops_ipc::{
@@ -56,6 +58,11 @@ pub enum ServiceBuild {
 pub struct AppModel {
     /// True while the IPC socket is connected.
     pub connected: bool,
+    /// Which daemon connection this model describes, bumped each time one is
+    /// lost. What a frontend keeps against a request, such as the name for a
+    /// device it asked to create, belongs to the connection that took the
+    /// request, and is void once that connection is gone (#34).
+    pub link: u64,
     /// This binary's build, from [`Launch::build`].
     pub this_build: Option<Build>,
     /// The daemon's build, as it stated it on this connection.
@@ -86,12 +93,23 @@ pub struct AppModel {
     /// Until when pairing prompts may appear on this machine, or `None` while
     /// the window is closed (#195).
     pub pairing_open_until: Option<Instant>,
-    /// Recent transient events / errors (newest last), capped at [`MAX_MESSAGES`].
+    /// The activity log: recent events and errors alike (newest last), capped
+    /// at [`MAX_MESSAGES`].
     pub messages: VecDeque<String>,
-    /// Monotonic counter, bumped on every message. Lets a polling frontend tell a
-    /// NEW notice from the same one still on screen, so a dismissed banner stays
-    /// dismissed but a fresh failure re-raises it.
+    /// Monotonic counter, bumped on every activity-log line.
     pub message_seq: u64,
+    /// The latest thing that went wrong, or `None`.
+    ///
+    /// Kept apart from [`Self::messages`], which also records routine events
+    /// such as a cursor entering. The GUI's error banner rendered the log's
+    /// last line, so the most routine thing hops does appeared in red beside
+    /// a dismiss button, and an error surface that cries wolf stops being
+    /// read (#150).
+    pub latest_error: Option<String>,
+    /// Bumped on every error. Lets a polling frontend tell a NEW error from
+    /// the same one still on screen, so a dismissed banner stays dismissed
+    /// but a repeat of the same failure re-raises it.
+    pub error_seq: u64,
     /// Fingerprints of peers currently connected *in*, as known from live
     /// connect/disconnect events while this client is attached. CAVEAT: a peer
     /// that connected before we attached is not reflected until the daemon
@@ -196,10 +214,10 @@ impl AppModel {
             FrontendEvent::PortChanged(port, err) => {
                 self.port = Some(port);
                 if let Some(e) = err {
-                    self.push_message(format!("port change failed: {e}"));
+                    self.push_error(format!("port change failed: {e}"));
                 }
             }
-            FrontendEvent::Error(e) => self.push_message(format!("error: {e}")),
+            FrontendEvent::Error(e) => self.push_error(e),
             FrontendEvent::DeviceConnected { addr, fingerprint } => {
                 self.register_peer(addr, fingerprint);
                 self.push_message(format!("device connected: {addr}"));
@@ -392,12 +410,55 @@ impl AppModel {
         self.message_seq += 1;
     }
 
-    /// The most recent notice, if any. The daemon's only channel for telling the
+    /// Record an error: in the activity log, and as the latest error.
+    fn push_error(&mut self, error: String) {
+        self.push_message(format!("error: {error}"));
+        self.latest_error = Some(error);
+        self.error_seq += 1;
+    }
+
+    /// The daemon connection is gone: drop every fact only a running daemon
+    /// can vouch for, so nothing renders live while nothing is (#34). What
+    /// the user configured stays, to be shown as it was last known.
+    ///
+    /// The connection loop calls this on the shared model; public so a
+    /// frontend's tests can reach the state it leaves without a socket.
+    pub fn daemon_gone(&mut self) {
+        self.connected = false;
+        self.link = self.link.wrapping_add(1);
+        self.connected_peers.clear();
+        self.peer_addrs.clear();
+        self.pending_pairing = None;
+        self.pending_pairing_origin = None;
+        self.pending_pairing_addr = None;
+        self.pending_pairing_since = None;
+        self.pairing_attempts.clear();
+        self.pairing_open_until = None;
+        self.discovered.clear();
+        self.discovery_active = false;
+        self.capture = Status::Disabled;
+        self.emulation = Status::Disabled;
+        for (_, state) in self.clients.values_mut() {
+            state.active_addr = None;
+            state.alive = false;
+            state.peer_commit = None;
+            state.peer_caps = None;
+            state.resolving = false;
+            state.has_pressed_keys = false;
+        }
+    }
+
+    /// The activity log's latest line, if any: an event or an error.
+    pub fn latest_message(&self) -> Option<&str> {
+        self.messages.back().map(|s| s.as_str())
+    }
+
+    /// The latest error, if any. The daemon's only channel for telling the
     /// user something went wrong; before this was rendered, every failure —
     /// unresolvable name, refused trust change, failed config write, rejected
     /// IPC token — reached the user as silence.
-    pub fn latest_message(&self) -> Option<&str> {
-        self.messages.back().map(|s| s.as_str())
+    pub fn latest_error(&self) -> Option<&str> {
+        self.latest_error.as_deref()
     }
 }
 
@@ -801,6 +862,9 @@ pub struct FrontendClient {
     requests: mpsc::UnboundedSender<FrontendRequest>,
 }
 
+/// What a request made while no daemon is connected is answered with.
+pub const NOT_CONNECTED: &str = "Not done: no connection to the hops service, so nothing changed.";
+
 impl FrontendClient {
     /// Spawn the auto-reconnecting connection task and return a handle. Must be
     /// called within a tokio `LocalSet` (it uses `spawn_local`).
@@ -812,7 +876,12 @@ impl FrontendClient {
         }));
         let changed = Arc::new(Notify::new());
         let (requests, request_rx) = mpsc::unbounded_channel();
-        tokio::task::spawn_local(connection_loop(model.clone(), changed.clone(), request_rx));
+        tokio::task::spawn_local(connection_loop(
+            model.clone(),
+            changed.clone(),
+            request_rx,
+            || connect_async(None),
+        ));
         Self {
             model,
             changed,
@@ -831,20 +900,61 @@ impl FrontendClient {
         self.changed.notified().await;
     }
 
-    /// Send a request to the daemon (fire-and-forget).
-    pub fn request(&self, request: FrontendRequest) {
-        let _ = self.requests.send(request);
+    /// Send a request to the daemon. Returns whether it was handed to a
+    /// connected daemon.
+    ///
+    /// While no daemon is connected the request is dropped, and the model
+    /// records [`NOT_CONNECTED`] as an error. It used to wait in the queue
+    /// and replay into whichever daemon answered next, however much later
+    /// and against whatever the device list had become (#34).
+    pub fn request(&self, request: FrontendRequest) -> bool {
+        self.request_on(request).is_some()
+    }
+
+    /// [`Self::request`], saying which connection took it: the
+    /// [`AppModel::link`] it was queued on, or `None` when it was refused.
+    pub fn request_on(&self, request: FrontendRequest) -> Option<u64> {
+        // Under the model lock, which the connection loop also holds while it
+        // marks the daemon gone and empties the queue, so a request is either
+        // queued for a live connection or refused here, never left behind.
+        let mut model = self.model.lock().expect("model lock poisoned");
+        if model.connected && self.requests.send(request).is_ok() {
+            return Some(model.link);
+        }
+        model.push_error(NOT_CONNECTED.to_string());
+        drop(model);
+        self.changed.notify_one();
+        None
     }
 }
 
-/// Connect, sync, fold events into the model, forward requests; reconnect on drop.
-async fn connection_loop(
+/// Where the connection loop writes requests: the daemon's socket, or a test
+/// double.
+trait RequestSink {
+    async fn send(&mut self, request: FrontendRequest) -> Result<(), IpcError>;
+}
+
+impl RequestSink for AsyncFrontendRequestWriter {
+    async fn send(&mut self, request: FrontendRequest) -> Result<(), IpcError> {
+        self.request(request).await
+    }
+}
+
+/// Connect, sync, fold events into the model, forward requests; reconnect on
+/// drop. `connect` waits for a daemon and opens a connection to it.
+async fn connection_loop<C, F, E, W>(
     model: Arc<Mutex<AppModel>>,
     changed: Arc<Notify>,
     mut request_rx: mpsc::UnboundedReceiver<FrontendRequest>,
-) {
+    mut connect: C,
+) where
+    C: FnMut() -> F,
+    F: Future<Output = Result<(E, W), ConnectionError>>,
+    E: Stream<Item = Result<FrontendEvent, IpcError>> + Unpin,
+    W: RequestSink,
+{
     loop {
-        let (mut events, mut writer) = match connect_async(None).await {
+        let (mut events, mut writer) = match connect().await {
             Ok(conn) => conn,
             Err(e) => {
                 log::warn!("frontend: could not connect to daemon: {e}");
@@ -862,9 +972,10 @@ async fn connection_loop(
         }
         changed.notify_one();
         // pull full initial state
-        let _ = writer.request(FrontendRequest::Sync).await;
+        let _ = writer.send(FrontendRequest::Sync).await;
 
-        loop {
+        // Requests taken from the queue that did not reach the daemon.
+        let lost = loop {
             tokio::select! {
                 event = events.next() => match event {
                     Some(Ok(event)) => {
@@ -872,34 +983,51 @@ async fn connection_loop(
                         changed.notify_one();
                     }
                     // forward-compat: skip an event line we can't decode, keep the connection
-                    Some(Err(hops_ipc::IpcError::Json(e))) => {
+                    Some(Err(IpcError::Json(e))) => {
                         log::debug!("frontend: skipping undecodable event: {e}");
                     }
                     // EOF or io error -> reconnect
-                    _ => break,
+                    _ => break 0,
                 },
                 request = request_rx.recv() => match request {
                     Some(request) => {
-                        if let Err(e) = writer.request(request).await {
+                        if let Err(e) = writer.send(request).await {
                             log::warn!("frontend: request failed: {e}");
-                            break;
+                            break 1;
                         }
                     }
                     None => return, // the FrontendClient was dropped
                 },
             }
-        }
+        };
 
         {
             let mut m = model.lock().expect("model lock poisoned");
-            m.connected = false;
-            // we lose live connect/disconnect tracking when the daemon link
-            // drops; clear it so we don't show a stale "connected" peer.
-            m.connected_peers.clear();
-            m.peer_addrs.clear();
-            m.pending_pairing = None;
-            m.pending_pairing_since = None;
-            m.pairing_attempts.clear();
+            m.daemon_gone();
+            // What was queued for this daemon is not replayed into the next
+            // one: by then the user has seen the list go stale, and a delete
+            // or a trust change must not land minutes later unannounced.
+            let mut dropped = lost;
+            while request_rx.try_recv().is_ok() {
+                dropped += 1;
+            }
+            // Said as a lost connection, not a stopped service: the daemon
+            // also closes the connection of a frontend that stopped reading,
+            // and keeps running (#95).
+            if dropped > 0 {
+                log::warn!(
+                    "frontend: the daemon connection closed with {dropped} request(s) not sent"
+                );
+                m.push_error(format!(
+                    "The connection to the hops service was lost before {} reached it, so {} not made.",
+                    if dropped == 1 {
+                        "your last change".to_string()
+                    } else {
+                        format!("your last {dropped} changes")
+                    },
+                    if dropped == 1 { "it was" } else { "they were" },
+                ));
+            }
         }
         changed.notify_one();
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1527,5 +1655,587 @@ mod the_service_problem {
         model.start_problem = None;
         model.apply(FrontendEvent::DaemonBuild(build("0.13.0", "abcd1234")));
         assert_eq!(model.service_problem(), None);
+    }
+}
+
+#[cfg(test)]
+mod projection {
+    //! One card per physical peer, joined on the fingerprint across the
+    //! outgoing clients and the trust tables, which is the projection both
+    //! front-ends render.
+    use super::{AppModel, ClientConfig, ClientState, FrontendEvent, TrustState, fallback_label};
+
+    fn client(hostname: Option<&str>, peer_fp: Option<&str>) -> (ClientConfig, ClientState) {
+        let config = ClientConfig {
+            hostname: hostname.map(String::from),
+            ..Default::default()
+        };
+        let state = ClientState {
+            peer_fingerprint: peer_fp.map(String::from),
+            ..Default::default()
+        };
+        (config, state)
+    }
+
+    fn revoked(label: &str) -> super::RevokedEntry {
+        super::RevokedEntry {
+            label: label.to_string(),
+            revoked_at: 1_754_000_000,
+        }
+    }
+
+    // LEDGER T501 | class B | 6 struct state: AppModel::devices()
+    #[test]
+    fn merges_client_and_authorized_by_fingerprint() {
+        let mut m = AppModel::default();
+        let fp = "aa:bb:cc:dd";
+        m.clients.insert(0, client(Some("studio-mac"), Some(fp)));
+        m.authorized
+            .insert(fp.to_string(), "studio-mac".to_string());
+        let devices = m.devices();
+        assert_eq!(devices.len(), 1, "one machine must render as one card");
+        let d = &devices[0];
+        assert!(d.send.is_some(), "carries the outgoing facet");
+        assert!(d.receive, "may drive this machine");
+        assert_eq!(d.trust, TrustState::Trusted);
+        assert_eq!(d.fingerprint.as_deref(), Some(fp));
+    }
+
+    /// Two machines added by address: the name field holds an address. Once
+    /// the fingerprint is learned, each collapses into one card named by the
+    /// peer, not by its address.
+    // LEDGER T502 | class B | 6 struct state: AppModel::devices()
+    #[test]
+    fn ip_named_client_merges_and_takes_the_peer_description() {
+        let mut m = AppModel::default();
+        let desk = "73:90:2a:3c:9d:e5";
+        let laptop = "2d:65:8f:e6:f8:2b";
+        m.clients.insert(0, client(Some("192.0.2.10"), Some(desk)));
+        m.clients
+            .insert(1, client(Some("192.0.2.11"), Some(laptop)));
+        m.authorized
+            .insert(desk.to_string(), "desk mac".to_string());
+        m.authorized
+            .insert(laptop.to_string(), "laptop".to_string());
+
+        let devices = m.devices();
+        assert_eq!(devices.len(), 2, "two machines, not four cards");
+        let mut labels: Vec<&str> = devices.iter().map(|d| d.label.as_str()).collect();
+        labels.sort();
+        assert_eq!(labels, ["desk mac", "laptop"], "named by peer, not by IP");
+        for d in &devices {
+            assert!(d.send.is_some(), "{} keeps its outgoing facet", d.label);
+            assert!(d.receive, "{} may still drive this machine", d.label);
+        }
+    }
+
+    /// A denial the trust store still holds must never render like a device
+    /// never met.
+    // LEDGER T503 | class B | 6 struct state: AppModel::devices()
+    #[test]
+    fn a_revoked_device_is_shown_as_revoked_not_as_a_stranger() {
+        let mut m = AppModel::default();
+        let fp = "aa:bb:cc:dd";
+        m.revoked.insert(fp.to_string(), revoked("old laptop"));
+        let devices = m.devices();
+        assert_eq!(devices.len(), 1, "the removed device stays visible");
+        assert_eq!(devices[0].trust, TrustState::Revoked);
+        assert_eq!(
+            devices[0].label, "old laptop",
+            "it keeps the name it was known by"
+        );
+        assert!(!devices[0].receive, "revoked means it may not drive us");
+    }
+
+    /// A revoked peer reconnecting must not surface as a pairing request.
+    // LEDGER T504 | class B | 6 struct state: AppModel::devices()
+    #[test]
+    fn a_revoked_peer_cannot_appear_as_a_pending_approval() {
+        let mut m = AppModel::default();
+        let fp = "aa:bb:cc:dd";
+        m.revoked.insert(fp.to_string(), revoked("old laptop"));
+        m.pending_pairing = Some(fp.to_string());
+        let devices = m.devices();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(
+            devices[0].trust,
+            TrustState::Revoked,
+            "a reconnecting revoked peer must not be offered as a new pairing"
+        );
+    }
+
+    /// If both tables somehow name the same fingerprint, it must not render as
+    /// trusted.
+    // LEDGER T505 | class B | 6 struct state: AppModel::devices()
+    #[test]
+    fn authorized_wins_only_when_not_revoked() {
+        let mut m = AppModel::default();
+        let fp = "aa:bb:cc:dd";
+        m.authorized.insert(fp.to_string(), "old laptop".into());
+        let devices = m.devices();
+        assert_eq!(
+            devices[0].trust,
+            TrustState::Trusted,
+            "plain trusted device"
+        );
+
+        m.revoked.insert(fp.to_string(), revoked("old laptop"));
+        let devices = m.devices();
+        assert_eq!(devices.len(), 1, "still one card, not two");
+        assert_eq!(
+            devices[0].trust,
+            TrustState::Revoked,
+            "revoked outranks authorized: a denied identity cannot present as trusted"
+        );
+        assert!(!devices[0].receive, "and it may not drive us");
+    }
+
+    /// Filtering on `send.is_some() || receive` drops revoked devices, so the
+    /// removed state never rendered in the real app.
+    // LEDGER T506 | class B | 1 return value: Device::is_listable over AppModel::devices()
+    #[test]
+    fn a_revoked_device_survives_the_list_filter() {
+        let mut m = AppModel::default();
+        m.revoked
+            .insert("aa:bb:cc:dd".into(), revoked("old laptop"));
+        let devices = m.devices();
+        assert_eq!(devices.len(), 1);
+        assert!(
+            devices[0].is_listable(),
+            "a revoked device must reach the device list, or nothing says it was removed"
+        );
+        assert_eq!(
+            devices.iter().filter(|d| d.is_listable()).count(),
+            1,
+            "exactly one listable row"
+        );
+    }
+
+    /// The daemon's only channel for "that didn't work": each failure must
+    /// be something a UI can tell is new. The banner reads the latest error
+    /// and its sequence, not the activity log (#150).
+    // LEDGER T507 | class B | 6 struct state: AppModel::apply, latest_error/error_seq
+    #[test]
+    fn errors_become_a_notice_the_ui_can_tell_is_new() {
+        let mut m = AppModel::default();
+        assert_eq!(m.latest_error(), None, "nothing to show at rest");
+        assert_eq!(m.error_seq, 0);
+
+        m.apply(FrontendEvent::Error("could not resolve studio-pc".into()));
+        assert_eq!(m.latest_error(), Some("could not resolve studio-pc"));
+        let first = m.error_seq;
+        assert!(
+            first > 0,
+            "an error must bump the seq or the UI cannot raise it"
+        );
+
+        // A second, identical error must still be distinguishable, or a
+        // dismissed banner would stay hidden through a repeat of the failure.
+        m.apply(FrontendEvent::Error("could not resolve studio-pc".into()));
+        assert!(
+            m.error_seq > first,
+            "a repeated failure must re-raise the banner"
+        );
+    }
+
+    /// A peer that reconnects on a new source port must not be reported
+    /// offline by the old address's late disconnect.
+    // LEDGER T508 | class B | 6 struct state: AppModel::apply
+    #[test]
+    fn a_reconnect_on_a_new_port_stays_connected() {
+        use std::net::SocketAddr;
+        let fp = "aa:bb:cc:dd";
+        let old: SocketAddr = "192.0.2.5:50001".parse().unwrap();
+        let new: SocketAddr = "192.0.2.5:50002".parse().unwrap();
+
+        let mut m = AppModel::default();
+        m.apply(FrontendEvent::DeviceConnected {
+            addr: old,
+            fingerprint: fp.into(),
+        });
+        assert!(m.connected_peers.contains(fp));
+
+        // The reconnect lands first, then the old socket's disconnect.
+        m.apply(FrontendEvent::DeviceConnected {
+            addr: new,
+            fingerprint: fp.into(),
+        });
+        m.apply(FrontendEvent::IncomingDisconnected(old));
+        assert!(
+            m.connected_peers.contains(fp),
+            "the peer is still connected on the new port; a late disconnect \
+             for the old one must not mark it offline"
+        );
+
+        m.apply(FrontendEvent::IncomingDisconnected(new));
+        assert!(
+            !m.connected_peers.contains(fp),
+            "the last address leaving means offline"
+        );
+    }
+
+    // LEDGER T509 | class B | 6 struct state: AppModel::devices()
+    #[test]
+    fn offline_client_and_unrelated_trust_stay_two_cards() {
+        let mut m = AppModel::default();
+        // an outgoing client that has never connected (no fingerprint yet)
+        m.clients.insert(0, client(Some("studio-mac"), None));
+        // an unrelated peer that may drive us (receive-only)
+        m.authorized
+            .insert("cc:dd:ee:ff".to_string(), "windows-box".to_string());
+        let devices = m.devices();
+        assert_eq!(devices.len(), 2, "no fingerprint to join on => two cards");
+        assert!(
+            devices
+                .iter()
+                .any(|d| d.fingerprint.is_none() && d.send.is_some())
+        );
+        assert!(devices.iter().any(|d| d.receive && d.send.is_none()));
+    }
+
+    // LEDGER T510 | class B | 6 struct state: AppModel::devices()
+    #[test]
+    fn excludes_this_device() {
+        let mut m = AppModel::default();
+        let me = "de:ad:be:ef";
+        m.fingerprint = Some(me.to_string());
+        m.authorized.insert(me.to_string(), "myself".to_string());
+        m.revoked.insert(me.to_string(), revoked("myself"));
+        m.pending_pairing = Some(me.to_string());
+        assert!(m.devices().is_empty(), "never list ourselves");
+    }
+
+    // LEDGER T511 | class B | 6 struct state: AppModel::devices()
+    #[test]
+    fn bare_pairing_request_surfaces_as_pending() {
+        let mut m = AppModel::default();
+        let fp = "12:34:56:78";
+        m.pending_pairing = Some(fp.to_string());
+        let devices = m.devices();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].trust, TrustState::PendingApproval);
+        assert_eq!(devices[0].fingerprint.as_deref(), Some(fp));
+        assert!(
+            !devices[0].is_listable(),
+            "a bare request lives on the pairing card, not in the list"
+        );
+    }
+
+    // LEDGER T512 | class B | 6 struct state: AppModel::apply + AppModel::devices()
+    #[test]
+    fn online_reflects_connected_peers() {
+        let mut m = AppModel::default();
+        let fp = "aa:bb:cc:dd";
+        m.authorized
+            .insert(fp.to_string(), "studio-mac".to_string());
+        m.apply(FrontendEvent::DeviceConnected {
+            addr: "192.0.2.5:50001".parse().unwrap(),
+            fingerprint: fp.into(),
+        });
+        let devices = m.devices();
+        assert_eq!(devices.len(), 1);
+        assert!(devices[0].online);
+    }
+
+    /// Approving a peer without typing a name must produce the same label
+    /// the projection would have chosen, from either front-end.
+    // LEDGER T513 | class B | 1 return value: fallback_label, 6 struct state: AppModel::devices()
+    #[test]
+    fn a_blank_approval_is_named_the_same_way_everywhere() {
+        let fp = "1e:19:1b:2c:3d:4e:5f:60";
+        let label = fallback_label(fp);
+        assert_eq!(label, "1e:19:1b");
+
+        let mut m = AppModel::default();
+        m.authorized.insert(fp.to_string(), label.clone());
+        let d = m.devices();
+        assert_eq!(d.len(), 1);
+        assert_eq!(
+            d[0].label, label,
+            "the stored fallback must match what the projection displays"
+        );
+
+        // an empty fingerprint must still yield something sayable
+        assert_eq!(fallback_label(""), "unnamed device");
+    }
+}
+
+#[cfg(test)]
+mod errors_apart_from_activity {
+    //! Errors and the activity log are two things (#150): the log keeps
+    //! everything, and only what went wrong is an error.
+    use super::*;
+
+    // LEDGER T516 | class B | 6 struct state: AppModel::apply, latest_error/error_seq
+    #[test]
+    fn routine_events_reach_the_log_and_not_the_errors() {
+        let addr: SocketAddr = "192.0.2.5:50001".parse().expect("addr");
+        let mut m = AppModel::default();
+        m.apply(FrontendEvent::DeviceConnected {
+            addr,
+            fingerprint: "aa:bb".into(),
+        });
+        m.apply(FrontendEvent::DeviceEntered {
+            addr,
+            pos: Position::Right,
+            fingerprint: "aa:bb".into(),
+        });
+        m.apply(FrontendEvent::ConnectionAttempt {
+            fingerprint: "cc:dd".into(),
+            origin: AttemptOrigin::Inbound,
+            addr: Some(addr),
+        });
+        m.apply(FrontendEvent::IncomingDisconnected(addr));
+        m.apply(FrontendEvent::PortChanged(4242, None));
+        assert_eq!(m.messages.len(), 4, "the activity log keeps every event");
+        assert_eq!(
+            (m.latest_error(), m.error_seq),
+            (None, 0),
+            "a routine event became an error"
+        );
+
+        m.apply(FrontendEvent::Error("could not resolve studio-pc".into()));
+        m.apply(FrontendEvent::DeviceEntered {
+            addr,
+            pos: Position::Right,
+            fingerprint: "aa:bb".into(),
+        });
+        assert_eq!(
+            (m.latest_error(), m.error_seq),
+            (Some("could not resolve studio-pc"), 1),
+            "a cursor entering replaced or re-raised the error"
+        );
+        assert!(
+            m.latest_message()
+                .is_some_and(|l| l.starts_with("cursor entered")),
+            "the log's latest line is the latest event"
+        );
+
+        m.apply(FrontendEvent::PortChanged(
+            4243,
+            Some("address in use".into()),
+        ));
+        assert_eq!(
+            (m.latest_error(), m.error_seq),
+            (Some("port change failed: address in use"), 2)
+        );
+    }
+}
+
+#[cfg(test)]
+mod the_daemon_gone {
+    //! While no daemon is connected nothing reads live, and nothing asked of
+    //! the app is kept to replay into whichever daemon answers next (#34).
+    //!
+    //! Drives the real connection loop over in-memory connections.
+    use super::*;
+    use futures::channel::mpsc as fmpsc;
+    use std::rc::Rc;
+
+    type Events = fmpsc::UnboundedReceiver<Result<FrontendEvent, IpcError>>;
+
+    /// The app's end of one connection: what the daemon writes to it goes
+    /// through `Events`, what it writes to the daemon through this.
+    struct Sink(mpsc::UnboundedSender<FrontendRequest>);
+
+    impl RequestSink for Sink {
+        async fn send(&mut self, request: FrontendRequest) -> Result<(), IpcError> {
+            self.0
+                .send(request)
+                .map_err(|_| IpcError::Io(std::io::ErrorKind::BrokenPipe.into()))
+        }
+    }
+
+    /// The daemon's end of one connection.
+    struct Daemon {
+        events: fmpsc::UnboundedSender<Result<FrontendEvent, IpcError>>,
+        received: mpsc::UnboundedReceiver<FrontendRequest>,
+    }
+
+    fn connection() -> (Daemon, (Events, Sink)) {
+        let (events, app_events) = fmpsc::unbounded();
+        let (app_requests, received) = mpsc::unbounded_channel();
+        (
+            Daemon { events, received },
+            (app_events, Sink(app_requests)),
+        )
+    }
+
+    /// Wait until `cond` holds of the model, for at most 10 s.
+    async fn until(client: &FrontendClient, what: &str, cond: impl Fn(&AppModel) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !cond(&client.snapshot()) {
+            assert!(Instant::now() < deadline, "not within 10 s: {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The next request `daemon` receives, within 10 s.
+    async fn next(daemon: &mut Daemon) -> FrontendRequest {
+        tokio::time::timeout(Duration::from_secs(10), daemon.received.recv())
+            .await
+            .expect("a request within 10 s")
+            .expect("the connection is open")
+    }
+
+    const FP: &str = "aa:bb";
+
+    // LEDGER T520 | class B | 6 struct state + requests written by connection_loop across a daemon restart
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_lost_daemon_leaves_nothing_live_and_nothing_to_replay() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let model = Arc::new(Mutex::new(AppModel::default()));
+                let changed = Arc::new(Notify::new());
+                let (requests, request_rx) = mpsc::unbounded_channel();
+                let client = FrontendClient {
+                    model: model.clone(),
+                    changed: changed.clone(),
+                    requests,
+                };
+                let (dial, answers) = mpsc::unbounded_channel::<(Events, Sink)>();
+                let answers = Rc::new(tokio::sync::Mutex::new(answers));
+                tokio::task::spawn_local(connection_loop(model, changed, request_rx, move || {
+                    let answers = answers.clone();
+                    async move {
+                        answers
+                            .lock()
+                            .await
+                            .recv()
+                            .await
+                            .ok_or(ConnectionError::Timeout)
+                    }
+                }));
+
+                let (mut first, conn) = connection();
+                assert!(dial.send(conn).is_ok(), "the loop stopped");
+                until(&client, "the first daemon answers", |m| m.connected).await;
+                assert!(matches!(next(&mut first).await, FrontendRequest::Sync));
+                let live = ClientState {
+                    active: true,
+                    alive: true,
+                    active_addr: Some("192.0.2.5:4242".parse().expect("addr")),
+                    peer_fingerprint: Some(FP.into()),
+                    ..Default::default()
+                };
+                for event in [
+                    FrontendEvent::Enumerate(vec![(0, ClientConfig::default(), live)]),
+                    FrontendEvent::DeviceConnected {
+                        addr: "192.0.2.5:50001".parse().expect("addr"),
+                        fingerprint: FP.into(),
+                    },
+                    FrontendEvent::PairingOpen { seconds: 120 },
+                    FrontendEvent::CaptureStatus(Status::Enabled),
+                    FrontendEvent::ConnectionAttempt {
+                        fingerprint: "cc:dd".into(),
+                        origin: AttemptOrigin::Inbound,
+                        addr: Some("192.0.2.9:50002".parse().expect("addr")),
+                    },
+                    FrontendEvent::Discovered {
+                        active: true,
+                        peers: vec![DiscoveredDevice {
+                            label: "desk-laptop".into(),
+                            claimed_fingerprint: None,
+                            addrs: vec!["192.0.2.7:4242".parse().expect("addr")],
+                        }],
+                    },
+                ] {
+                    first.events.unbounded_send(Ok(event)).expect("open");
+                }
+                until(&client, "the device reads live", |m| {
+                    m.devices()
+                        .iter()
+                        .any(|d| d.online && d.send.as_ref().is_some_and(|s| s.state.alive))
+                        && m.pairing_open_until.is_some()
+                        && m.pending_pairing.is_some()
+                        && !m.pairing_attempts.is_empty()
+                        && !m.discovered.is_empty()
+                })
+                .await;
+
+                // The daemon stops taking requests with two queued: the first
+                // fails to write, the second, an add, is still waiting.
+                drop(first.received);
+                assert!(client.request(FrontendRequest::RemoveAuthorizedKey(FP.into())));
+                let add_on = client
+                    .request_on(FrontendRequest::Create)
+                    .expect("a daemon is connected");
+                until(&client, "the loss is noticed", |m| !m.connected).await;
+                let gone = client.snapshot();
+
+                // While none is connected, a request is refused, not queued.
+                let refused = !client.request(FrontendRequest::Delete {
+                    handle: 0,
+                    fingerprint: Some(FP.into()),
+                });
+                let said = client.snapshot().latest_error().map(str::to_owned);
+
+                let (mut second, conn) = connection();
+                assert!(dial.send(conn).is_ok(), "the loop stopped");
+                until(&client, "the second daemon answers", |m| m.connected).await;
+                assert!(client.request(FrontendRequest::SaveConfiguration));
+                let mut sent = vec![];
+                loop {
+                    let request = next(&mut second).await;
+                    let last = matches!(request, FrontendRequest::SaveConfiguration);
+                    sent.push(request);
+                    if last {
+                        break;
+                    }
+                }
+
+                assert!(
+                    matches!(
+                        sent.as_slice(),
+                        [FrontendRequest::Sync, FrontendRequest::SaveConfiguration]
+                    ),
+                    "the next daemon was sent {sent:?}: what was asked of the last \
+                     one, or while none was connected, was replayed into it"
+                );
+                let d = &gone.devices()[0];
+                let s = d.send.as_ref().expect("the device is still listed");
+                assert!(
+                    !d.online && !s.state.alive && s.state.active_addr.is_none(),
+                    "with no daemon the device still reads connected or up: \
+                     online {} alive {} link {:?}",
+                    d.online,
+                    s.state.alive,
+                    s.state.active_addr
+                );
+                assert!(
+                    gone.pairing_seconds_left(Instant::now()).is_none()
+                        && gone.capture == Status::Disabled,
+                    "with no daemon the pairing window or capture still reads open"
+                );
+                assert!(
+                    gone.pending_pairing.is_none() && gone.pairing_attempts.is_empty(),
+                    "with no daemon a pairing request still waits for an answer \
+                     nothing can deliver: {:?}",
+                    gone.pairing_attempts
+                );
+                assert!(
+                    gone.discovered.is_empty() && !gone.discovery_active,
+                    "with no daemon machines still read as found on the network: {:?}",
+                    gone.discovered
+                );
+                assert!(
+                    gone.latest_error()
+                        .is_some_and(|e| e.contains("your last 2 changes")),
+                    "two requests the daemon never took were dropped without a word: {:?}",
+                    gone.latest_error()
+                );
+                assert!(
+                    gone.link != add_on,
+                    "the add was dropped with its connection, but the link it was \
+                     queued on still reads current: a frontend keeping its name \
+                     and edge would give them to the next handle to appear"
+                );
+                assert!(
+                    refused && said.as_deref() == Some(NOT_CONNECTED),
+                    "a request with no daemon connected was accepted ({refused}) or \
+                     went unanswered ({said:?})"
+                );
+            })
+            .await;
     }
 }

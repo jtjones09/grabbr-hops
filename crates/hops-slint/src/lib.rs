@@ -10,7 +10,7 @@
 //! the UI thread. UI callbacks send [`FrontendRequest`]s back through the client.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     rc::Rc,
     sync::{
@@ -22,8 +22,8 @@ use std::{
 };
 
 use hops_frontend_core::{
-    ApprovalRefused, ClientHandle, FrontendClient, FrontendRequest, Launch, PairingCard, Position,
-    Status, TrustState, prefs, theme,
+    AppModel, ApprovalRefused, ClientHandle, FrontendClient, FrontendRequest, Launch,
+    PairingAttempt, PairingCard, Position, Status, TrustState, prefs, theme,
 };
 use hops_ipc::{DEFAULT_PORT, Geometry};
 use slint::{ComponentHandle, ModelRc, VecModel};
@@ -50,7 +50,8 @@ pub enum SlintError {
 /// Re-pushing an identical model every 250ms forces a repaint even when nothing
 /// changed — which makes variable-refresh-rate (G-Sync/FreeSync) displays flicker
 /// — so the poll only touches Slint when this differs from the previous tick.
-/// Primitive fields because Slint's generated row structs aren't `PartialEq`.
+/// Slint's generated row structs derive `PartialEq`, so the rows are kept as
+/// the window gets them rather than copied field by field.
 #[derive(PartialEq)]
 struct PolledUi {
     connected: bool,
@@ -78,25 +79,9 @@ struct PolledUi {
     /// What is wrong with the service, from `AppModel::service_problem`, or
     /// empty.
     service_problem: String,
-    // An 11-field positional tuple against a 13-field DeviceRow, which is why
-    // the repaint gate silently misses the two fields added most recently. The
-    // fix is a named struct, and it belongs with the device-model work rather
-    // than a lint silenced here — see the interface epic.
-    #[allow(clippy::type_complexity)]
-    devices: Vec<(
-        String,
-        String,
-        String,
-        String,
-        bool,
-        bool,
-        bool,
-        String,
-        String,
-        bool,
-        bool,
-        String,
-    )>,
+    /// The rows exactly as the window gets them, so the gate compares every
+    /// field a row shows and cannot drift from it (#172).
+    devices: Vec<DeviceRow>,
 }
 
 /// Whether an action armed on `handle` (as the UI holds it) with `pin` no
@@ -108,6 +93,217 @@ fn armed_is_stale(m: &hops_frontend_core::AppModel, handle: &str, pin: &str) -> 
         return false;
     };
     !m.still_names(handle, (!pin.is_empty()).then_some(pin))
+}
+
+/// Unified device view: one row per physical peer. AppModel::devices()
+/// joins the outgoing clients with the trusted-fingerprint set by
+/// identity (already sorted: send-facet devices by handle, then
+/// receive-only by label). Filter out a bare inbound pairing request
+/// (no send facet, not yet trusted) — it lives in the pairing banner
+/// above, not the list.
+fn device_rows(m: &AppModel) -> Vec<DeviceRow> {
+    m.devices()
+        .into_iter()
+        .filter(|d| d.is_listable())
+        .map(|d| {
+            let (handle, addr, pos, active, alive, has_send) = match &d.send {
+                Some(s) => {
+                    let addr = s
+                        .state
+                        .active_addr
+                        .map(|a| a.to_string())
+                        .or_else(|| {
+                            s.config
+                                .fix_ips
+                                .first()
+                                .map(|ip| format!("{ip}:{}", s.config.port))
+                        })
+                        .or_else(|| {
+                            s.state
+                                .ips
+                                .iter()
+                                .next()
+                                .map(|ip| format!("{ip}:{}", s.config.port))
+                        })
+                        .unwrap_or_else(|| "unresolved".into());
+                    (
+                        s.handle.to_string(),
+                        addr,
+                        s.config.pos.to_string(),
+                        s.state.active,
+                        s.state.alive,
+                        true,
+                    )
+                }
+                None => (
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    false,
+                    false,
+                    false,
+                ),
+            };
+            DeviceRow {
+                handle: handle.into(),
+                name: d.label.clone().into(),
+                addr: addr.into(),
+                pos: pos.into(),
+                active,
+                alive,
+                refuses_input: d.refuses_our_input(),
+                has_send,
+                fingerprint: d
+                    .fingerprint
+                    .as_deref()
+                    .map(short_fp)
+                    .unwrap_or_default()
+                    .into(),
+                fp_full: d.fingerprint.clone().unwrap_or_default().into(),
+                pin: d
+                    .send
+                    .as_ref()
+                    .and_then(|s| s.state.peer_fingerprint.clone())
+                    .unwrap_or_default()
+                    .into(),
+                online: d.online,
+                trusted: d.receive,
+                revoked: d.trust == TrustState::Revoked,
+            }
+        })
+        .collect()
+}
+
+/// What one poll tick puts in the window, from `m` and the request the
+/// pairing card picked, `shown`.
+fn polled_ui(m: &AppModel, shown: Option<&PairingAttempt>, now: Instant) -> PolledUi {
+    let pairing = shown.map(|a| a.fingerprint.clone()).unwrap_or_default();
+    let pairing_addr = shown
+        .and_then(|a| a.addr)
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+    let pairing_from_our_dial =
+        shown.is_some_and(|a| a.origin == hops_frontend_core::AttemptOrigin::OutboundDial);
+    let devices = device_rows(m);
+    PolledUi {
+        connected: m.connected,
+        capture: status_text(m.capture).to_string(),
+        emulation: status_text(m.emulation).to_string(),
+        port: m
+            .port
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "—".to_string()),
+        fingerprint: m.fingerprint.clone().unwrap_or_else(|| "—".to_string()),
+        pairing,
+        discovery_active: m.discovery_active,
+        discovered: m
+            .discovered
+            .iter()
+            .map(|d| {
+                let ips: Vec<String> = d.addrs.iter().map(|a| a.ip().to_string()).collect();
+                DiscoveredRow {
+                    label: d.label.as_str().into(),
+                    fingerprint: d
+                        .claimed_fingerprint
+                        .as_deref()
+                        .map(short_fp)
+                        .unwrap_or_default()
+                        .into(),
+                    addr_summary: match ips.len() {
+                        0 => String::new(),
+                        1 => ips[0].clone(),
+                        n => format!("{} +{} more", ips[0], n - 1),
+                    }
+                    .into(),
+                    ips: ips.join(",").into(),
+                    port: d
+                        .addrs
+                        .first()
+                        .map(|a| a.port().to_string())
+                        .unwrap_or_default()
+                        .into(),
+                }
+            })
+            .collect(),
+        pairing_from_our_dial,
+        pairing_addr,
+        // the first edge nothing active is already using, so adding a
+        // second device does not silently switch off the first
+        free_position: ["left", "right", "top", "bottom"]
+            .into_iter()
+            .find(|p| {
+                !devices
+                    .iter()
+                    .any(|d| d.has_send && d.active && d.pos.as_str() == *p)
+            })
+            .unwrap_or("left")
+            .to_string(),
+        pairing_seconds: m
+            .pairing_seconds_left(now)
+            .map_or(0, |s| s.min(i32::MAX as u64) as i32),
+        // Errors only: the activity log also records a cursor entering, and
+        // the banner is red (#150).
+        notice: m.latest_error().unwrap_or_default().to_string(),
+        // i32 is Slint's integer; the seq only needs to CHANGE, not be exact
+        notice_seq: (m.error_seq % (i32::MAX as u64)) as i32,
+        service_problem: m.service_problem().unwrap_or_default(),
+        devices,
+    }
+}
+
+/// What the poll last put in the window.
+#[derive(Default)]
+struct Repaint {
+    /// The state last pushed. A tick that builds the same leaves the window
+    /// alone.
+    last: Option<PolledUi>,
+    /// The daemon's notice sequence last shown. The banner has a second
+    /// source, local validation, so only a new daemon notice may replace what
+    /// it shows.
+    daemon_notice: i32,
+}
+
+impl Repaint {
+    /// Put `snap` in `ui`, unless it is what the last push put there. Returns
+    /// whether anything was written. `notice_seq` is the banner's sequence,
+    /// shared with local notices.
+    fn push(&mut self, ui: &AppWindow, snap: PolledUi, notice_seq: &Cell<i32>) -> bool {
+        // Unchanged since last tick → leave the window entirely alone (no
+        // property writes, no model swap → Slint has nothing to repaint).
+        if self.last.as_ref() == Some(&snap) {
+            return false;
+        }
+
+        ui.set_connected(snap.connected);
+        ui.set_service_problem(snap.service_problem.as_str().into());
+        ui.set_capture(snap.capture.as_str().into());
+        ui.set_emulation(snap.emulation.as_str().into());
+        ui.set_port(snap.port.as_str().into());
+        ui.set_fingerprint(snap.fingerprint.as_str().into());
+        show_pairing_card(ui, &snap.pairing);
+        ui.set_discovered(ModelRc::new(VecModel::from(snap.discovered.clone())));
+        ui.set_discovery_active(snap.discovery_active);
+        ui.set_pairing_from_our_dial(snap.pairing_from_our_dial);
+        ui.set_pairing_addr(snap.pairing_addr.as_str().into());
+        ui.set_pairing_seconds(snap.pairing_seconds);
+        // Every tick that changed, not only one with a new notice: the free
+        // edge follows the devices, and a new device placed on an edge in use
+        // switches the other one off (#32).
+        ui.set_free_position(snap.free_position.as_str().into());
+        // only when the DAEMON has something new — otherwise a local
+        // validation notice would be overwritten on the next poll
+        if snap.notice_seq != self.daemon_notice {
+            self.daemon_notice = snap.notice_seq;
+            if !snap.notice.is_empty() {
+                notice_seq.set(notice_seq.get().wrapping_add(1));
+                ui.set_notice(snap.notice.as_str().into());
+                ui.set_notice_seq(notice_seq.get());
+            }
+        }
+        ui.set_devices(ModelRc::new(VecModel::from(snap.devices.clone())));
+        self.last = Some(snap);
+        true
+    }
 }
 
 fn status_text(s: Status) -> &'static str {
@@ -315,16 +511,23 @@ type PendingCreate = (String, u16, Position, Vec<std::net::IpAddr>);
 ///
 /// Taking the request as an argument is what makes that testable: the omission
 /// was invisible precisely because nothing could observe it.
+///
+/// `request` returns the connection that took the request, the model's
+/// `link`, or `None` when no daemon did. Then nothing is staged: a staged
+/// create with none in flight would claim the next handle to appear, which
+/// is another device's once a daemon answers. What is staged is kept with
+/// its connection, so [`claim_pending`] can drop it once that one is lost.
 fn stage_create(
-    pending: &RefCell<Option<PendingCreate>>,
-    request: impl FnOnce(FrontendRequest),
+    pending: &RefCell<Option<(u64, PendingCreate)>>,
+    request: impl FnOnce(FrontendRequest) -> Option<u64>,
     name: String,
     port: u16,
     position: Position,
     fix_ips: Vec<std::net::IpAddr>,
 ) {
-    *pending.borrow_mut() = Some((name, port, position, fix_ips));
-    request(FrontendRequest::Create);
+    let staged =
+        request(FrontendRequest::Create).map(|link| (link, (name, port, position, fix_ips)));
+    *pending.borrow_mut() = staged;
 }
 
 /// Put `fingerprint`'s request on the pairing card.
@@ -379,14 +582,22 @@ fn approval(
 /// tick right after "add". The window died there with no message, because a
 /// panic under `panic = "abort"` was the last thing the process wrote and
 /// nothing was reading its output.
+///
+/// `link` is the connection the model now describes. A create staged on
+/// another one is dropped, never claimed: its connection was lost, and with
+/// it the `Create`, or at least any word of its handle. Kept, it would give
+/// its name, edge and a switch-on to the next handle to appear, another
+/// device's (#34).
 fn claim_pending<T>(
-    cell: &RefCell<Option<T>>,
+    cell: &RefCell<Option<(u64, T)>>,
+    link: u64,
     arrived: Option<ClientHandle>,
 ) -> Option<(ClientHandle, T)> {
     // Ends at the semicolon, before anything else can borrow.
     let taken = cell.borrow_mut().take();
     match (arrived, taken) {
-        (Some(handle), Some(value)) => Some((handle, value)),
+        (_, Some((on, _))) if on != link => None,
+        (Some(handle), Some((_, value))) => Some((handle, value)),
         // No handle yet — put it back and try again next tick.
         (None, Some(value)) => {
             *cell.borrow_mut() = Some(value);
@@ -445,7 +656,6 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
     // below only writes when the daemon's own seq changes, otherwise it would
     // overwrite a local validation message on the very next tick.
     let notice_seq: Rc<std::cell::Cell<i32>> = Rc::new(std::cell::Cell::new(0));
-    let last_daemon_notice: Rc<std::cell::Cell<i32>> = Rc::new(std::cell::Cell::new(0));
     let notice_sink = {
         let weak = ui.as_weak();
         let seq = notice_seq.clone();
@@ -625,6 +835,7 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
             }
         });
     }
+    ui.set_can_switch_interface(prefs::CAN_SWITCH);
     {
         ui.on_switch_interface(move || {
             let err = prefs::switch_to(prefs::Frontend::Tui);
@@ -641,7 +852,7 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
     // hand-typed device (resolve the name) and populated for one picked off the
     // network list, where we already know exactly where it is and should not
     // make DNS agree with mDNS before it will connect (#136).
-    let pending_new_device: Rc<RefCell<Option<PendingCreate>>> = Rc::new(RefCell::new(None));
+    let pending_new_device: Rc<RefCell<Option<(u64, PendingCreate)>>> = Rc::new(RefCell::new(None));
     let known_handles: Rc<RefCell<HashSet<ClientHandle>>> = Rc::new(RefCell::new(HashSet::new()));
     {
         // Add a machine picked off the network list. Same create sequence as a
@@ -662,8 +873,8 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
             }
             let port = port.trim().parse::<u16>().unwrap_or(DEFAULT_PORT);
             let position = Position::try_from(position.as_str()).unwrap_or_default();
-            // Store the mDNS hostname, not the bare label. `ScornMBP23` does not
-            // resolve; `ScornMBP23.local` does, through the OS name stack
+            // Store the mDNS hostname, not the bare label. `desk-mac` does not
+            // resolve; `desk-mac.local` does, through the OS name stack
             // (Bonjour on macOS, Avahi via nsswitch on Linux) -- see
             // resolve_hostname in src/dns.rs.
             //
@@ -673,12 +884,21 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
             // resolved ones on every reconnect, so a resolvable `.local` name
             // keeps working after every address it was added with has changed.
             let hostname = hops_frontend_core::discovered_hostname(&label);
-            stage_create(&pending, |r| c.request(r), hostname, port, position, addrs);
+            stage_create(
+                &pending,
+                |r| c.request_on(r),
+                hostname,
+                port,
+                position,
+                addrs,
+            );
         });
     }
     {
         let c = client.clone();
-        ui.on_open_pairing(move || c.request(FrontendRequest::OpenPairing));
+        ui.on_open_pairing(move || {
+            c.request(FrontendRequest::OpenPairing);
+        });
     }
     {
         let c = client.clone();
@@ -712,7 +932,14 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
                 }
             };
             let position = Position::try_from(position.as_str()).unwrap_or_default();
-            stage_create(&pending, |r| c.request(r), name, port, position, Vec::new());
+            stage_create(
+                &pending,
+                |r| c.request_on(r),
+                name,
+                port,
+                position,
+                Vec::new(),
+            );
         });
     }
     {
@@ -765,15 +992,14 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
 
     // poll the model ~4x/sec and push it into the window — but only when it
     // actually changed since last tick (see PolledUi: a constant repaint flickers
-    // VRR displays). `last_ui` holds the previous pushed state.
+    // VRR displays). `repaint` holds the previous pushed state.
     let weak = ui.as_weak();
     let show_requested_poll = show_requested.clone();
     let awaiting_paint_poll = awaiting_paint.clone();
-    let last_ui: RefCell<Option<PolledUi>> = RefCell::new(None);
+    let repaint: RefCell<Repaint> = RefCell::default();
     let timer = slint::Timer::default();
     let notice_seq_poll = notice_seq.clone();
     let notice_sink_poll = notice_sink.clone();
-    let last_daemon_notice = last_daemon_notice.clone();
     timer.start(
         slint::TimerMode::Repeated,
         Duration::from_millis(250),
@@ -799,7 +1025,7 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
                 let current: HashSet<ClientHandle> = m.clients.keys().copied().collect();
                 let arrived = current.difference(&known_handles.borrow()).next().copied();
                 if let Some((new_handle, (name, port, position, fix_ips))) =
-                    claim_pending(&pending_new_device, arrived)
+                    claim_pending(&pending_new_device, m.link, arrived)
                 {
                     if !name.is_empty() {
                         // Just created: never connected, so no pin.
@@ -852,7 +1078,7 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
                 );
             }
 
-            // --- Build the derived UI state, then push to Slint ONLY if it
+            // --- Build what the window would show, then push it ONLY if it
             // changed since last tick. Re-pushing an identical model every 250ms
             // repaints the window constantly (flickering VRR displays); when
             // nothing changed we touch nothing and the window stays static.
@@ -870,209 +1096,8 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
                         .is_some_and(|t| t.elapsed() < DISMISS_TTL)
                 })
                 .cloned();
-            let pairing = shown
-                .as_ref()
-                .map(|a| a.fingerprint.clone())
-                .unwrap_or_default();
-            let pairing_addr = shown
-                .as_ref()
-                .and_then(|a| a.addr)
-                .map(|a| a.to_string())
-                .unwrap_or_default();
-            let pairing_from_our_dial = shown
-                .as_ref()
-                .is_some_and(|a| a.origin == hops_frontend_core::AttemptOrigin::OutboundDial);
-
-            // unified device view: one row per physical peer. AppModel::devices()
-            // joins the outgoing clients with the trusted-fingerprint set by
-            // identity (already sorted: send-facet devices by handle, then
-            // receive-only by label). Filter out a bare inbound pairing request
-            // (no send facet, not yet trusted) — it lives in the pairing banner
-            // above, not the list.
-            let devices: Vec<DeviceRow> = m
-                .devices()
-                .into_iter()
-                .filter(|d| d.is_listable())
-                .map(|d| {
-                    let (handle, addr, pos, active, alive, has_send) = match &d.send {
-                        Some(s) => {
-                            let addr = s
-                                .state
-                                .active_addr
-                                .map(|a| a.to_string())
-                                .or_else(|| {
-                                    s.config
-                                        .fix_ips
-                                        .first()
-                                        .map(|ip| format!("{ip}:{}", s.config.port))
-                                })
-                                .or_else(|| {
-                                    s.state
-                                        .ips
-                                        .iter()
-                                        .next()
-                                        .map(|ip| format!("{ip}:{}", s.config.port))
-                                })
-                                .unwrap_or_else(|| "unresolved".into());
-                            (
-                                s.handle.to_string(),
-                                addr,
-                                s.config.pos.to_string(),
-                                s.state.active,
-                                s.state.alive,
-                                true,
-                            )
-                        }
-                        None => (
-                            String::new(),
-                            String::new(),
-                            String::new(),
-                            false,
-                            false,
-                            false,
-                        ),
-                    };
-                    DeviceRow {
-                        handle: handle.into(),
-                        name: d.label.clone().into(),
-                        addr: addr.into(),
-                        pos: pos.into(),
-                        active,
-                        alive,
-                        refuses_input: d.refuses_our_input(),
-                        has_send,
-                        fingerprint: d
-                            .fingerprint
-                            .as_deref()
-                            .map(short_fp)
-                            .unwrap_or_default()
-                            .into(),
-                        fp_full: d.fingerprint.clone().unwrap_or_default().into(),
-                        pin: d
-                            .send
-                            .as_ref()
-                            .and_then(|s| s.state.peer_fingerprint.clone())
-                            .unwrap_or_default()
-                            .into(),
-                        online: d.online,
-                        trusted: d.receive,
-                        revoked: d.trust == TrustState::Revoked,
-                    }
-                })
-                .collect();
-
-            let snap = PolledUi {
-                connected: m.connected,
-                capture: status_text(m.capture).to_string(),
-                emulation: status_text(m.emulation).to_string(),
-                port: m
-                    .port
-                    .map(|p| p.to_string())
-                    .unwrap_or_else(|| "—".to_string()),
-                fingerprint: m.fingerprint.clone().unwrap_or_else(|| "—".to_string()),
-                pairing,
-                discovery_active: m.discovery_active,
-                discovered: m
-                    .discovered
-                    .iter()
-                    .map(|d| {
-                        let ips: Vec<String> = d.addrs.iter().map(|a| a.ip().to_string()).collect();
-                        DiscoveredRow {
-                            label: d.label.as_str().into(),
-                            fingerprint: d
-                                .claimed_fingerprint
-                                .as_deref()
-                                .map(short_fp)
-                                .unwrap_or_default()
-                                .into(),
-                            addr_summary: match ips.len() {
-                                0 => String::new(),
-                                1 => ips[0].clone(),
-                                n => format!("{} +{} more", ips[0], n - 1),
-                            }
-                            .into(),
-                            ips: ips.join(",").into(),
-                            port: d
-                                .addrs
-                                .first()
-                                .map(|a| a.port().to_string())
-                                .unwrap_or_default()
-                                .into(),
-                        }
-                    })
-                    .collect(),
-                pairing_from_our_dial,
-                pairing_addr,
-                // the first edge nothing active is already using, so adding a
-                // second device does not silently switch off the first
-                free_position: ["left", "right", "top", "bottom"]
-                    .into_iter()
-                    .find(|p| {
-                        !devices
-                            .iter()
-                            .any(|d| d.has_send && d.active && d.pos.as_str() == *p)
-                    })
-                    .unwrap_or("left")
-                    .to_string(),
-                pairing_seconds: m
-                    .pairing_seconds_left(Instant::now())
-                    .map_or(0, |s| s.min(i32::MAX as u64) as i32),
-                notice: m.latest_message().unwrap_or_default().to_string(),
-                // i32 is Slint's integer; the seq only needs to CHANGE, not be exact
-                notice_seq: (m.message_seq % (i32::MAX as u64)) as i32,
-                service_problem: m.service_problem().unwrap_or_default(),
-                devices: devices
-                    .iter()
-                    .map(|d| {
-                        (
-                            d.handle.to_string(),
-                            d.name.to_string(),
-                            d.addr.to_string(),
-                            d.pos.to_string(),
-                            d.active,
-                            d.alive,
-                            d.has_send,
-                            d.fingerprint.to_string(),
-                            d.fp_full.to_string(),
-                            d.online,
-                            d.trusted,
-                            d.pin.to_string(),
-                        )
-                    })
-                    .collect(),
-            };
-
-            // Unchanged since last tick → leave the window entirely alone (no
-            // property writes, no model swap → Slint has nothing to repaint).
-            if last_ui.borrow().as_ref() == Some(&snap) {
-                return;
-            }
-
-            ui.set_connected(snap.connected);
-            ui.set_service_problem(snap.service_problem.as_str().into());
-            ui.set_capture(snap.capture.as_str().into());
-            ui.set_emulation(snap.emulation.as_str().into());
-            ui.set_port(snap.port.as_str().into());
-            ui.set_fingerprint(snap.fingerprint.as_str().into());
-            show_pairing_card(&ui, &snap.pairing);
-            ui.set_discovered(ModelRc::new(VecModel::from(snap.discovered.clone())));
-            ui.set_discovery_active(snap.discovery_active);
-            ui.set_pairing_from_our_dial(snap.pairing_from_our_dial);
-            ui.set_pairing_addr(snap.pairing_addr.as_str().into());
-            ui.set_pairing_seconds(snap.pairing_seconds);
-            // only when the DAEMON has something new — otherwise a local
-            // validation notice would be overwritten on the next poll
-            if snap.notice_seq != last_daemon_notice.get() {
-                last_daemon_notice.set(snap.notice_seq);
-                if !snap.notice.is_empty() {
-                    notice_seq_poll.set(notice_seq_poll.get().wrapping_add(1));
-                    ui.set_free_position(snap.free_position.as_str().into());
-                    ui.set_notice(snap.notice.as_str().into());
-                    ui.set_notice_seq(notice_seq_poll.get());
-                }
-            }
-            ui.set_devices(ModelRc::new(VecModel::from(devices)));
-            *last_ui.borrow_mut() = Some(snap);
+            let snap = polled_ui(&m, shown.as_ref(), Instant::now());
+            repaint.borrow_mut().push(&ui, snap, &notice_seq_poll);
         },
     );
 
@@ -1497,17 +1522,17 @@ mod pending_create {
 
     #[test]
     fn a_handle_that_has_not_arrived_yet_leaves_the_create_in_place() {
-        let cell = RefCell::new(Some(("mac", 4242u16)));
+        let cell = RefCell::new(Some((0, ("mac", 4242u16))));
 
         // This is the tick right after "add": the create was sent, no handle
         // has reached a snapshot. It must not panic, and must not lose the
         // create — losing it means the device is never configured or dialed.
-        let claimed = claim_pending(&cell, None);
+        let claimed = claim_pending(&cell, 0, None);
 
         assert!(claimed.is_none(), "nothing to claim without a handle");
         assert_eq!(
             *cell.borrow(),
-            Some(("mac", 4242)),
+            Some((0, ("mac", 4242))),
             "the pending create must survive for the next tick. Taking it and \
              failing to put it back loses the device silently; borrowing twice \
              to put it back panics with `RefCell already borrowed`, which is \
@@ -1517,8 +1542,8 @@ mod pending_create {
 
     #[test]
     fn an_arrived_handle_claims_the_create_exactly_once() {
-        let cell = RefCell::new(Some(("mac", 4242u16)));
-        let claimed = claim_pending(&cell, Some(7));
+        let cell = RefCell::new(Some((0, ("mac", 4242u16))));
+        let claimed = claim_pending(&cell, 0, Some(7));
         assert_eq!(claimed, Some((7, ("mac", 4242))));
         assert!(
             cell.borrow().is_none(),
@@ -1526,16 +1551,37 @@ mod pending_create {
              same device again"
         );
         assert!(
-            claim_pending(&cell, Some(8)).is_none(),
+            claim_pending(&cell, 0, Some(8)).is_none(),
             "and there must be nothing left to claim"
         );
     }
 
     #[test]
     fn no_pending_create_is_not_an_error() {
-        let cell: RefCell<Option<(&str, u16)>> = RefCell::new(None);
-        assert!(claim_pending(&cell, Some(7)).is_none());
-        assert!(claim_pending(&cell, None).is_none());
+        let cell: RefCell<Option<(u64, (&str, u16))>> = RefCell::new(None);
+        assert!(claim_pending(&cell, 0, Some(7)).is_none());
+        assert!(claim_pending(&cell, 0, None).is_none());
+    }
+
+    /// The daemon connection that took the `Create` was lost before its
+    /// handle came back. The request was dropped with it, or its handle will
+    /// never be reported on this connection, so the next handle to appear is
+    /// another device's: one renumbered by the next daemon, or added from the
+    /// other frontend or the command line (#34).
+    // LEDGER T530 | class B | 1 return value + 6 struct state: claim_pending and its cell
+    #[test]
+    fn a_create_staged_on_a_lost_connection_claims_nothing() {
+        let cell = RefCell::new(Some((0, ("mac", 4242u16))));
+        assert_eq!(
+            claim_pending(&cell, 1, Some(7)),
+            None,
+            "a create staged before the daemon was lost gave its name, edge \
+             and a switch-on to the next handle to appear"
+        );
+        assert!(
+            cell.borrow().is_none(),
+            "a create from a lost connection stayed staged, to claim a later handle"
+        );
     }
 }
 
@@ -1553,6 +1599,7 @@ mod staging_a_create {
     use super::{FrontendRequest, Position, stage_create};
     use std::cell::RefCell;
 
+    // LEDGER T524 | class B | 6 struct state + requests passed to stage_create's sender
     #[test]
     fn staging_also_asks_the_daemon_for_a_handle() {
         let pending = RefCell::new(None);
@@ -1560,11 +1607,14 @@ mod staging_a_create {
 
         stage_create(
             &pending,
-            |r| sent.borrow_mut().push(r),
-            "SCORNW20.local".into(),
+            |r| {
+                sent.borrow_mut().push(r);
+                Some(0)
+            },
+            "desk-pc.local".into(),
             4242,
             Position::Left,
-            vec!["10.0.0.5".parse().unwrap()],
+            vec!["192.0.2.5".parse().unwrap()],
         );
 
         assert!(
@@ -1582,14 +1632,18 @@ mod staging_a_create {
         );
     }
 
+    // LEDGER T525 | class B | 6 struct state: stage_create's pending cell
     #[test]
     fn what_was_staged_is_what_was_given() {
         let pending = RefCell::new(None);
         let sent: RefCell<Vec<FrontendRequest>> = RefCell::new(Vec::new());
-        let ips: Vec<std::net::IpAddr> = vec!["10.0.0.5".parse().unwrap()];
+        let ips: Vec<std::net::IpAddr> = vec!["192.0.2.5".parse().unwrap()];
         stage_create(
             &pending,
-            |r| sent.borrow_mut().push(r),
+            |r| {
+                sent.borrow_mut().push(r);
+                Some(3)
+            },
             "host".into(),
             9999,
             Position::Right,
@@ -1597,9 +1651,30 @@ mod staging_a_create {
         );
         assert_eq!(
             *pending.borrow(),
-            Some(("host".to_string(), 9999u16, Position::Right, ips)),
+            Some((3, ("host".to_string(), 9999u16, Position::Right, ips))),
             "a discovered machine's pinned addresses are why it connects \
              without DNS agreeing first — dropping them there would be silent"
+        );
+    }
+    /// With no daemon connected the create is refused, and nothing may wait
+    /// for a handle: the first handles a daemon reports later are the
+    /// existing devices', and one of them would take this name and edge.
+    // LEDGER T519 | class B | 6 struct state: stage_create's pending cell
+    #[test]
+    fn a_create_no_daemon_took_stages_nothing() {
+        let pending = RefCell::new(None);
+        stage_create(
+            &pending,
+            |_| None,
+            "host".into(),
+            4242,
+            Position::Left,
+            Vec::new(),
+        );
+        assert_eq!(
+            *pending.borrow(),
+            None,
+            "an add that never reached a daemon was left waiting for a handle"
         );
     }
 }
@@ -1763,6 +1838,353 @@ mod pairing_card_binds_the_approval {
             click(&ui, &card, t1 + Duration::from_millis(300)),
             Err(ApprovalRefused::JustChanged),
             "a click 300 ms after the card switched to cc:cc approved it"
+        );
+    }
+}
+
+#[cfg(test)]
+mod the_repaint_gate {
+    //! The poll repaints only when what it built differs from what it last
+    //! pushed, so the comparison has to see every field a row shows (#172).
+    //!
+    //! Drives a real `AppWindow` on Slint's headless testing backend through
+    //! the functions the poll calls.
+    use super::*;
+    use hops_frontend_core::{ClientConfig, ClientState, FrontendEvent, RevokedEntry};
+    use slint::Model;
+
+    const FP: &str = "1e:19:1b:2c:3d:4e:5f:60:71:82:93:a4:b5:c6:d7:e8";
+
+    /// One poll tick.
+    fn tick(ui: &AppWindow, repaint: &mut Repaint, m: &AppModel) {
+        repaint.push(ui, polled_ui(m, None, Instant::now()), &Cell::new(0));
+    }
+
+    fn row(ui: &AppWindow) -> DeviceRow {
+        ui.get_devices().row_data(0).expect("one row")
+    }
+
+    // LEDGER T514 | class B | 3 widget tree: AppWindow devices after polled_ui + Repaint::push
+    #[test]
+    fn a_row_change_no_other_field_shows_still_reaches_the_window() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = AppWindow::new().expect("window");
+        let mut repaint = Repaint::default();
+        let mut m = AppModel::default();
+
+        // Added by one fixed address, routed to, and dialled: no link yet.
+        let config = ClientConfig {
+            fix_ips: vec!["192.0.2.5".parse().expect("ip")],
+            port: 4242,
+            ..Default::default()
+        };
+        let dialling = ClientState {
+            active: true,
+            peer_fingerprint: Some(FP.into()),
+            ..Default::default()
+        };
+        m.apply(FrontendEvent::Enumerate(vec![(
+            0,
+            config.clone(),
+            dialling.clone(),
+        )]));
+        tick(&ui, &mut repaint, &m);
+        assert!(
+            !row(&ui).refuses_input,
+            "precondition: nothing is refused before a link is up"
+        );
+
+        // The dial is answered on that same address by a machine whose input
+        // emulation is off. The row's address reads the same before and after.
+        m.apply(FrontendEvent::State(
+            0,
+            config,
+            ClientState {
+                active_addr: Some("192.0.2.5:4242".parse().expect("addr")),
+                ..dialling
+            },
+        ));
+        tick(&ui, &mut repaint, &m);
+        assert!(
+            row(&ui).refuses_input,
+            "the window never said \"not accepting input\" for a machine that \
+             refuses everything sent to it"
+        );
+
+        // Then its identity is denied: of everything on the row, only
+        // `revoked` changes.
+        m.apply(FrontendEvent::RevokedUpdated(
+            [(
+                FP.to_owned(),
+                RevokedEntry {
+                    label: "desk mac".into(),
+                    revoked_at: 1,
+                },
+            )]
+            .into(),
+        ));
+        tick(&ui, &mut repaint, &m);
+        assert!(
+            row(&ui).revoked,
+            "the window never showed the row as removed"
+        );
+    }
+
+    // LEDGER T515 | class B | 1 return value: Repaint::push
+    #[test]
+    fn an_unchanged_tick_writes_nothing() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = AppWindow::new().expect("window");
+        let mut repaint = Repaint::default();
+        let mut m = AppModel::default();
+        m.apply(FrontendEvent::AuthorizedUpdated(
+            [(FP.to_owned(), "desk mac".to_owned())].into(),
+        ));
+        let now = Instant::now();
+        assert!(
+            repaint.push(&ui, polled_ui(&m, None, now), &Cell::new(0)),
+            "the first tick fills the window"
+        );
+        assert!(
+            !repaint.push(&ui, polled_ui(&m, None, now), &Cell::new(0)),
+            "an identical tick repainted the window, which flickers \
+             variable-refresh displays"
+        );
+    }
+}
+
+#[cfg(test)]
+mod the_window_without_a_daemon {
+    //! With the daemon gone the window says so, and nothing on it reads live:
+    //! the devices are what was last known (#34).
+    //!
+    //! Drives a real `AppWindow` on Slint's headless testing backend through
+    //! what the poll calls.
+    use super::*;
+    use hops_frontend_core::{ClientConfig, ClientState, DiscoveredDevice, FrontendEvent};
+    use slint::Model;
+
+    const FP: &str = "1e:19:1b:2c:3d:4e:5f:60:71:82:93:a4:b5:c6:d7:e8";
+    const OTHER_FP: &str = "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
+
+    /// One poll tick, the pairing card included.
+    fn tick(ui: &AppWindow, repaint: &mut Repaint, card: &mut PairingCard, m: &AppModel) {
+        let now = Instant::now();
+        let shown = card.show(m, now, |_| false).cloned();
+        repaint.push(ui, polled_ui(m, shown.as_ref(), now), &Cell::new(0));
+    }
+
+    fn device(name: &str, ip: &str, pos: Position) -> ClientConfig {
+        ClientConfig {
+            hostname: Some(name.into()),
+            fix_ips: vec![ip.parse().expect("ip")],
+            port: 4242,
+            pos,
+            ..Default::default()
+        }
+    }
+
+    fn rows(ui: &AppWindow) -> Vec<DeviceRow> {
+        ui.get_devices().iter().collect()
+    }
+
+    // LEDGER T533 | class B | 3 widget tree: AppWindow connected, devices, discovered, pairing-fp after daemon_gone + polled_ui + Repaint::push
+    #[test]
+    fn a_lost_daemon_leaves_nothing_in_the_window_reading_live() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = AppWindow::new().expect("window");
+        let mut repaint = Repaint::default();
+        let mut card = PairingCard::default();
+        let mut m = AppModel::default();
+        m.connected = true;
+        // One device up and connected, one dialled that refuses input, a
+        // machine asking to pair, and one found on the network.
+        m.apply(FrontendEvent::Enumerate(vec![
+            (
+                0,
+                device("studio-pc", "192.0.2.5", Position::Left),
+                ClientState {
+                    active: true,
+                    alive: true,
+                    active_addr: Some("192.0.2.5:4242".parse().expect("addr")),
+                    peer_fingerprint: Some(FP.into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                1,
+                device("desk-pc", "192.0.2.6", Position::Right),
+                ClientState {
+                    active: true,
+                    active_addr: Some("192.0.2.6:4242".parse().expect("addr")),
+                    peer_fingerprint: Some(OTHER_FP.into()),
+                    ..Default::default()
+                },
+            ),
+        ]));
+        m.apply(FrontendEvent::DeviceConnected {
+            addr: "192.0.2.5:50001".parse().expect("addr"),
+            fingerprint: FP.into(),
+        });
+        m.apply(FrontendEvent::ConnectionAttempt {
+            fingerprint: "cc:dd".into(),
+            origin: hops_frontend_core::AttemptOrigin::Inbound,
+            addr: Some("192.0.2.9:50002".parse().expect("addr")),
+        });
+        m.apply(FrontendEvent::Discovered {
+            active: true,
+            peers: vec![DiscoveredDevice {
+                label: "desk-laptop".into(),
+                claimed_fingerprint: None,
+                addrs: vec!["192.0.2.7:4242".parse().expect("addr")],
+            }],
+        });
+        tick(&ui, &mut repaint, &mut card, &m);
+        let live = rows(&ui);
+        assert!(
+            ui.get_connected()
+                && live[0].alive
+                && live[0].online
+                && live[1].refuses_input
+                && ui.get_discovered().row_count() == 1
+                && !ui.get_pairing_fp().is_empty(),
+            "precondition: the window shows the daemon's live state"
+        );
+
+        m.daemon_gone();
+        tick(&ui, &mut repaint, &mut card, &m);
+        assert!(
+            !ui.get_connected(),
+            "with no daemon the window still said it was connected"
+        );
+        let last_known = rows(&ui);
+        assert_eq!(
+            last_known.len(),
+            2,
+            "the devices must stay listed, as last known"
+        );
+        for row in &last_known {
+            assert!(
+                !row.alive && !row.online && !row.refuses_input,
+                "with no daemon {} still reads alive {}, connected {}, or \
+                 not accepting input {}",
+                row.name,
+                row.alive,
+                row.online,
+                row.refuses_input
+            );
+        }
+        assert_eq!(
+            (
+                ui.get_discovered().row_count(),
+                ui.get_pairing_fp().as_str()
+            ),
+            (0, ""),
+            "with no daemon the window still offers machines on the network or \
+             a pairing request to approve"
+        );
+    }
+}
+
+#[cfg(test)]
+mod the_banner_shows_errors {
+    //! The red banner with a dismiss button shows what went wrong, not the
+    //! activity log's latest line (#150).
+    use super::*;
+    use hops_frontend_core::{ClientConfig, ClientState, FrontendEvent};
+
+    fn entered(m: &mut AppModel) {
+        m.apply(FrontendEvent::DeviceEntered {
+            addr: "192.0.2.5:52808".parse().expect("addr"),
+            pos: Position::Right,
+            fingerprint: "aa:bb".into(),
+        });
+    }
+
+    // LEDGER T517 | class B | 3 widget tree: AppWindow notice after polled_ui + Repaint::push
+    #[test]
+    fn a_cursor_entering_is_not_an_error() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = AppWindow::new().expect("window");
+        let mut repaint = Repaint::default();
+        let seq = Cell::new(0);
+        let mut m = AppModel::default();
+
+        entered(&mut m);
+        repaint.push(&ui, polled_ui(&m, None, Instant::now()), &seq);
+        assert_eq!(
+            ui.get_notice().as_str(),
+            "",
+            "a cursor crossing an edge was shown in the error banner"
+        );
+
+        m.apply(FrontendEvent::Error("could not resolve studio-pc".into()));
+        repaint.push(&ui, polled_ui(&m, None, Instant::now()), &seq);
+        assert_eq!(ui.get_notice().as_str(), "could not resolve studio-pc");
+        let raised = ui.get_notice_seq();
+
+        // The cursor enters again on a tick that also changes a row, so the
+        // tick reaches the window: nothing new went wrong, so a banner the
+        // user dismissed must stay dismissed.
+        entered(&mut m);
+        m.apply(FrontendEvent::Created(
+            0,
+            ClientConfig {
+                hostname: Some("studio-pc".into()),
+                ..Default::default()
+            },
+            ClientState::default(),
+        ));
+        assert!(
+            repaint.push(&ui, polled_ui(&m, None, Instant::now()), &seq),
+            "precondition: a tick that adds a row reaches the window"
+        );
+        assert_eq!(
+            (ui.get_notice().as_str(), ui.get_notice_seq()),
+            ("could not resolve studio-pc", raised),
+            "a cursor entering replaced the error or raised a dismissed banner again"
+        );
+
+        // The same failure again is a new error, and raises the banner even
+        // if the user dismissed the first one.
+        m.apply(FrontendEvent::Error("could not resolve studio-pc".into()));
+        repaint.push(&ui, polled_ui(&m, None, Instant::now()), &seq);
+        assert!(
+            ui.get_notice_seq() != raised,
+            "a repeat of the same failure did not raise the banner again"
+        );
+    }
+
+    /// The add form opens on the first edge no active device uses. That edge
+    /// was written only alongside a new notice, which routine events no
+    /// longer are.
+    // LEDGER T518 | class B | 3 widget tree: AppWindow free-position after Repaint::push
+    #[test]
+    fn the_free_edge_follows_the_devices_without_a_notice() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = AppWindow::new().expect("window");
+        let mut repaint = Repaint::default();
+        let seq = Cell::new(0);
+        let mut m = AppModel::default();
+        repaint.push(&ui, polled_ui(&m, None, Instant::now()), &seq);
+        assert_eq!(ui.get_free_position().as_str(), "left");
+
+        let on_the_left = ClientConfig {
+            hostname: Some("studio-pc".into()),
+            pos: Position::Left,
+            ..Default::default()
+        };
+        let active = ClientState {
+            active: true,
+            ..Default::default()
+        };
+        m.apply(FrontendEvent::Created(0, on_the_left, active));
+        repaint.push(&ui, polled_ui(&m, None, Instant::now()), &seq);
+        assert_eq!(
+            ui.get_free_position().as_str(),
+            "right",
+            "the add form would open on the left edge an active device uses, \
+             and adding there switches that device off"
         );
     }
 }
