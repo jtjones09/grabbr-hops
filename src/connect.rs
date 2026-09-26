@@ -1057,8 +1057,8 @@ impl OutboundRevoker {
     /// to. Returns how many.
     ///
     /// Both, because renaming or re-addressing a device while its link is up
-    /// clears its pin and, until the next answer, its address, and leaves the
-    /// link open (#218).
+    /// clears its address until the next answer and leaves the link open
+    /// (#218), and a device whose machine was revoked has no pin.
     pub(crate) async fn close_device(&self, handle: ClientHandle, pin: Option<&str>) -> usize {
         let addrs: Vec<SocketAddr> = self
             .conns
@@ -1158,9 +1158,9 @@ async fn disconnect(
     client_manager.set_peer_caps(handle, None);
     // NB: peer_fingerprint is deliberately NOT cleared here — it's the client's
     // last-known identity (process-local), used to pin the reconnect dial + join
-    // the device view, not a per-connection value. It's cleared only when the
-    // target address config changes (set_hostname / set_fix_ips) or trust in it
-    // is revoked (remove_authorized_key).
+    // the device view, not a per-connection value. It's cleared only when trust
+    // in it is revoked (remove_authorized_key): a new address or hostname keeps
+    // it (#99).
     //
     // Clearing is not enough: the frontend shows the state it was last sent,
     // so a link that went down without a word kept its dot green (#34). Not

@@ -331,10 +331,9 @@ fn deleting_a_connected_device_closes_its_link() {
     });
 }
 
-// LEDGER T9 | class B | 2 connection closed at a real QUIC receiver, dialled by the hops binary
-/// The same after the device's address was edited while it was connected,
-/// which clears its pin: the delete then revokes nothing, and closing the
-/// link is left to the removal alone.
+// LEDGER T9 | class B | 2 connection closed at a real QUIC receiver, dialled by the hops binary; 1 device list returned over IPC
+/// The same after the device's address was edited while it was connected.
+/// The edit keeps the pin (#99), which the row shows and the delete carries.
 #[test]
 fn deleting_a_connected_device_after_an_address_edit_closes_its_link() {
     local(async {
@@ -345,12 +344,22 @@ fn deleting_a_connected_device_after_an_address_edit_closes_its_link() {
                 vec!["192.0.2.1".parse().expect("ip")],
             ))
             .await;
+        let shown = frontend
+            .devices()
+            .await
+            .get(&handle)
+            .and_then(|(_, s)| s.peer_fingerprint.clone());
+        assert_eq!(
+            shown.as_ref(),
+            Some(&receiver.fingerprint),
+            "a new address cleared the device's pin (#99); log:\n{}",
+            daemon.log()
+        );
 
-        // The edit cleared the pin, and the row shows none.
         frontend
             .send(FrontendRequest::Delete {
                 handle,
-                fingerprint: None,
+                fingerprint: shown,
             })
             .await;
 
@@ -542,19 +551,28 @@ fn a_delete_or_rename_for_a_pin_the_device_no_longer_has_is_refused() {
             daemon.log()
         );
 
-        // With the device's own pin, both are carried out. The rename clears
-        // the pin, as a new name may be another machine.
+        // With the device's own pin, both are carried out. The new name keeps
+        // the pin (#99): a machine answering to it has to be the same one.
         frontend
             .send(FrontendRequest::UpdateHostname {
                 handle,
                 hostname: Some("renamed.invalid".into()),
-                fingerprint: Some(pin),
+                fingerprint: Some(pin.clone()),
             })
             .await;
+        let renamed = frontend.devices().await;
+        assert_eq!(
+            renamed
+                .get(&handle)
+                .map(|(c, s)| (c.hostname.clone(), s.peer_fingerprint.clone())),
+            Some((Some("renamed.invalid".to_string()), Some(pin.clone()))),
+            "a new hostname for the device did not keep its pin (#99); log:\n{}",
+            daemon.log()
+        );
         frontend
             .send(FrontendRequest::Delete {
                 handle,
-                fingerprint: None,
+                fingerprint: Some(pin),
             })
             .await;
         assert!(

@@ -360,8 +360,8 @@ enum Against {
 /// Against memory, the one entry left on each side after that is the same
 /// device if they differ in a single field, which is what one change by the
 /// daemon does: a rename of a device known by nothing else. A pin on the
-/// left missing on the right is not counted: memory forgets a pin with every
-/// new name or address, until the next handshake learns it.
+/// left missing on the right is not counted: memory forgets a pin when trust
+/// in its machine is revoked. A new name or address keeps it (#99).
 ///
 /// Against the file, nothing left over is paired: an entry changed by hand
 /// past recognition cannot be told from a device removed and another added,

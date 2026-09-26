@@ -296,11 +296,11 @@ const MAX_PENDING_ATTEMPTS: usize = 32;
 /// allowlist.
 ///
 /// Such a pin can never let anyone in — the outbound dial is fail-closed against
-/// it — but it CAN silently brick a client: hand-editing `hostname` to retarget a
-/// device while leaving the old `fingerprint = ...` behind makes every dial fail
-/// identity verification with no visible cause. Dropping it lets the client
-/// re-learn the identity on its next successful handshake, which is exactly what
-/// a never-connected client does.
+/// it — but it CAN silently brick a client: no machine can satisfy it, so every
+/// dial fails identity verification with no visible cause. Dropping it lets the
+/// client re-learn the identity on its next successful handshake, which is
+/// exactly what a never-connected client does. A pin the trust store knows is
+/// kept through any edit to the device's hostname or address (#99).
 fn drop_untrusted_pins(
     client_manager: &ClientManager,
     trust: &crate::trust::TrustStore,
@@ -1906,9 +1906,9 @@ impl Service {
         // By the link's own record, never the address: a link outlives a
         // change of the device's address, and an address can be another
         // machine's by now. The links dialled for it, and every link to the
-        // machine it is pinned to; a rename or a new address clears the pin
-        // and leaves its link up. A dial still out when this runs is closed
-        // by the dialler when it lands.
+        // machine it is pinned to, which a rename or a new address keeps
+        // (#99). A dial still out when this runs is closed by the dialler
+        // when it lands.
         let pin = self.client_manager.peer_fingerprint(handle);
         let outbound = self.revoke_conn.clone();
         tokio::task::spawn_local(async move {
