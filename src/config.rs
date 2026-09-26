@@ -672,10 +672,9 @@ impl Config {
             .unwrap_or(default_path()?.join(CERT_FILE_NAME));
 
         let (tx, watch_rx) = tokio::sync::mpsc::channel(16);
+        let watched = config_path.clone();
         let watcher = RecommendedWatcher::new(
-            move |res| {
-                let _ = tx.blocking_send(res);
-            },
+            move |res| forward_watch_event(&tx, &watched, res),
             notify::Config::default(),
         )?;
         let mut config = Config {
@@ -706,15 +705,7 @@ impl Config {
         loop {
             let event = self.watch_rx.recv().await.expect("channel closed");
             let event = event.expect("filesystem event");
-            if event.paths.contains(&self.config_path)
-                && matches!(
-                    event.kind,
-                    EventKind::Create(_)
-                        | EventKind::Modify(ModifyKind::Data(_))
-                        | EventKind::Remove(_)
-                )
-                && self.read_from_disk()?
-            {
+            if changes_config(&event, &self.config_path) && self.read_from_disk()? {
                 return Ok(());
             }
         }
@@ -951,6 +942,38 @@ impl Config {
         // or the whole new one, never a truncated one.
         write_atomically(self.config_path(), new_config.as_bytes())
     }
+}
+
+/// Whether `event` can mean the config file at `config` was replaced, written
+/// or removed.
+fn changes_config(event: &notify::Event, config: &Path) -> bool {
+    event.paths.iter().any(|p| p == config)
+        && matches!(
+            event.kind,
+            EventKind::Create(_) | EventKind::Modify(ModifyKind::Data(_)) | EventKind::Remove(_)
+        )
+}
+
+/// Hand a watcher event to the daemon loop. Runs on the watcher's thread.
+///
+/// It must never wait for the loop: the loop calls `unwatch` around every
+/// config write, and on Linux `unwatch` waits for this thread, so a thread
+/// blocked on a full channel stopped the daemon for good (#227). Only events
+/// that can change the config take a slot, and when the channel is full the
+/// event is dropped: every event already queued re-reads the file when it is
+/// handled, so the latest content is still picked up. Errors are passed on
+/// the same way.
+fn forward_watch_event(
+    tx: &tokio::sync::mpsc::Sender<Result<notify::Event, notify::Error>>,
+    config: &Path,
+    res: Result<notify::Event, notify::Error>,
+) {
+    if let Ok(event) = &res {
+        if !changes_config(event, config) {
+            return;
+        }
+    }
+    let _ = tx.try_send(res);
 }
 
 #[cfg(all(test, unix))]
@@ -1430,5 +1453,95 @@ mod watcher_rearm_tests {
              stops the daemon noticing hand-edits for the rest of its life",
         );
         assert!(u < w, "the re-arm must come after the unwatch, not before");
+    }
+}
+
+#[cfg(test)]
+mod the_watcher_never_blocks {
+    //! The watcher thread hands events to the daemon loop, and `unwatch`, which
+    //! the loop calls around every config write, waits for that thread. So the
+    //! thread must never wait for the loop: a burst of other files written in
+    //! the config directory once filled the channel, blocked the thread, and
+    //! with it the daemon, for good (#227).
+    use super::*;
+    use notify::event::{AccessKind, CreateKind, DataChange, MetadataKind};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn event(kind: EventKind, path: &Path) -> notify::Result<notify::Event> {
+        Ok(notify::Event::new(kind).add_path(path.to_path_buf()))
+    }
+
+    // LEDGER T1 | class B | 1 return value: forward_watch_event on a bounded channel
+    #[test]
+    fn a_full_channel_does_not_block_the_watcher_thread() {
+        let dir = PathBuf::from("/nonexistent-hops-config");
+        let config = dir.join("config.toml");
+        let other = dir.join("trust.sealed.tmp");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            // many times the channel's size, as a trust save and a config
+            // write produce in one request, and nobody draining
+            for _ in 0..64 {
+                forward_watch_event(
+                    &tx,
+                    &config,
+                    event(EventKind::Create(CreateKind::File), &other),
+                );
+                forward_watch_event(
+                    &tx,
+                    &config,
+                    event(
+                        EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+                        &config,
+                    ),
+                );
+            }
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the watcher thread blocked on a full channel; unwatch would wait for it forever"
+        );
+
+        let mut kept = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            kept.push(e.expect("event"));
+        }
+        assert!(
+            !kept.is_empty() && kept.iter().all(|e| e.paths == [dir.join("config.toml")]),
+            "the channel must still hold a change to the config file, and nothing \
+             else: {kept:?}"
+        );
+    }
+
+    // LEDGER T2 | class B | 1 return value: forward_watch_event filtering
+    #[test]
+    fn only_a_change_to_the_config_file_takes_a_slot() {
+        let dir = PathBuf::from("/nonexistent-hops-config");
+        let config = dir.join("config.toml");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        for e in [
+            event(EventKind::Create(CreateKind::File), &dir.join("other")),
+            event(EventKind::Access(AccessKind::Any), &config),
+            event(
+                EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+                &config,
+            ),
+        ] {
+            forward_watch_event(&tx, &config, e);
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "an event that cannot change the config took a slot"
+        );
+        forward_watch_event(
+            &tx,
+            &config,
+            event(EventKind::Create(CreateKind::File), &config),
+        );
+        assert!(rx.try_recv().is_ok(), "a new config file was not passed on");
     }
 }
