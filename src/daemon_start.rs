@@ -337,6 +337,14 @@ fn start_platform_daemon() -> io::Result<u32> {
 )]
 const LAUNCHD_LABEL: &str = "com.grabbr.hops";
 
+/// The app bundle's identifier, named in the plist so System Settings lists
+/// the job under hops (`man launchd.plist`, AssociatedBundleIdentifiers).
+#[cfg_attr(
+    not(all(target_os = "macos", any(feature = "tui", feature = "slint"))),
+    allow(dead_code)
+)]
+const APP_BUNDLE_ID: &str = "com.grabbr.hops";
+
 /// The status `launchctl kickstart` exits with for a job that is already
 /// running (`EALREADY`). It prints that process's id as it does for a process
 /// it started.
@@ -583,6 +591,7 @@ fn fresh_agent(exe: &str, log: &str) -> Plist {
         "KeepAlive": { "SuccessfulExit": false },
         "ThrottleInterval": 10,
         "ProcessType": "Interactive",
+        "AssociatedBundleIdentifiers": [APP_BUNDLE_ID],
         "StandardOutPath": log,
         "StandardErrorPath": log,
     }) else {
@@ -639,6 +648,18 @@ fn repoint(agent: &mut Plist, exe: &Path, exe_text: &str) -> Vec<String> {
         agent.insert("KeepAlive".into(), json!({ "SuccessfulExit": false }));
         agent.entry("ThrottleInterval").or_insert_with(|| json!(10));
     }
+
+    // A string or an array of strings; identifiers of other apps stay.
+    let mut apps: Vec<Value> = match agent.remove("AssociatedBundleIdentifiers") {
+        Some(Value::Array(apps)) => apps,
+        Some(Value::String(app)) => vec![Value::String(app)],
+        _ => Vec::new(),
+    };
+    if !apps.iter().any(|app| app.as_str() == Some(APP_BUNDLE_ID)) {
+        wrong.push("it named no app".into());
+        apps.push(json!(APP_BUNDLE_ID));
+    }
+    agent.insert("AssociatedBundleIdentifiers".into(), Value::Array(apps));
     wrong
 }
 
@@ -1752,12 +1773,74 @@ mod the_launch_agent_on_disk {
             "KeepAlive".into(),
             serde_json::json!({ "SuccessfulExit": false }),
         );
+        plist.insert(
+            "AssociatedBundleIdentifiers".into(),
+            serde_json::json!(["com.grabbr.hops"]),
+        );
         super::write_agent(&dir.plist(), &plist).expect("written");
         assert!(
             !point_agent_at(&dir.plist(), &exe, &dir.log())
                 .expect("read")
                 .rewritten,
             "a plist naming a link to this binary was rewritten"
+        );
+    }
+
+    /// System Settings lists a legacy LaunchAgent under the app whose bundle
+    /// identifier the plist names (`man launchd.plist`,
+    /// AssociatedBundleIdentifiers). A plist without it is out of date, and
+    /// an identifier another writer added stays.
+    // LEDGER T71 | class B | 4 file on disk, read back with plutil
+    #[test]
+    fn the_plist_names_the_app_it_belongs_to() {
+        use serde_json::json;
+        let dir = Scratch::new("bundle");
+        let exe = dir.exe();
+
+        point_agent_at(&dir.plist(), &exe, &dir.log()).expect("written");
+        assert_eq!(
+            dir.read().get("AssociatedBundleIdentifiers"),
+            Some(&json!(["com.grabbr.hops"])),
+            "a new plist does not name the app it belongs to: {:?}",
+            dir.read()
+        );
+
+        // Current in every other respect, but written before the key.
+        let mut plist = dir.read();
+        plist.remove("AssociatedBundleIdentifiers");
+        super::write_agent(&dir.plist(), &plist).expect("written");
+        assert!(
+            point_agent_at(&dir.plist(), &exe, &dir.log())
+                .expect("rewritten")
+                .rewritten,
+            "a plist that names no app was left as it was"
+        );
+        assert_eq!(
+            dir.read().get("AssociatedBundleIdentifiers"),
+            Some(&json!(["com.grabbr.hops"]))
+        );
+
+        // A single string naming another app: kept, and ours added.
+        let mut plist = dir.read();
+        plist.insert(
+            "AssociatedBundleIdentifiers".into(),
+            json!("org.example.other"),
+        );
+        super::write_agent(&dir.plist(), &plist).expect("written");
+        assert!(
+            point_agent_at(&dir.plist(), &exe, &dir.log())
+                .expect("rewritten")
+                .rewritten
+        );
+        assert_eq!(
+            dir.read().get("AssociatedBundleIdentifiers"),
+            Some(&json!(["org.example.other", "com.grabbr.hops"]))
+        );
+        assert!(
+            !point_agent_at(&dir.plist(), &exe, &dir.log())
+                .expect("read")
+                .rewritten,
+            "a plist naming hops among other apps reads as out of date"
         );
     }
 
