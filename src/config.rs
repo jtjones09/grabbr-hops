@@ -2166,4 +2166,43 @@ aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
         );
         assert_eq!(text(entry(&doc, 0), "hostname"), "\"desk-mac\"");
     }
+
+    // LEDGER T25 | class B | 4 file on disk written by Config::write_back
+    #[test]
+    fn an_entry_that_replaced_a_device_by_hand_is_never_changed_or_removed() {
+        let pinned = format!(
+            "[[clients]]\nhostname = \"desk-mac\"\nfingerprint = \"{DESK}\"\n\
+             position = \"left\"\n"
+        );
+        let unpinned = "[[clients]]\nhostname = \"desk-mac\"\nposition = \"left\"\n";
+        // Each file loses the desk mac to another device by hand, and is not
+        // read back; the daemon then changes the desk mac from memory.
+        type Change = fn(&mut Vec<ConfigClient>);
+        let cases: [(&str, &str, Change); 3] = [
+            ("moved", &pinned, |c| c[0].pos = Position::Top),
+            ("pinned", unpinned, |c| {
+                c[0].fingerprint = Some(DESK.to_string())
+            }),
+            ("removed", unpinned, |c| c.clear()),
+        ];
+        let other = "[[clients]]\nhostname = \"den\"\nposition = \"left\"\n";
+        let mut changed = vec![];
+        for (tag, before, change) in cases {
+            let (s, mut config) = scratch(&format!("replaced{tag}"), before);
+            fs::write(&s.path, other).expect("the hand edit");
+            let mut clients = config.clients();
+            change(&mut clients);
+            config.set_clients(clients);
+            config.write_back().expect("the save");
+            let saved = fs::read_to_string(&s.path).expect("the config");
+            if saved != other {
+                changed.push(format!("{tag}:\n{saved}"));
+            }
+        }
+        assert!(
+            changed.is_empty(),
+            "a save for the desk mac changed den, the device that replaced it \
+             by hand: {changed:#?}"
+        );
+    }
 }

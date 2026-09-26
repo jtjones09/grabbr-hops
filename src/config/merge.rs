@@ -111,8 +111,8 @@ fn merge_clients(
     theirs: &[ConfigClient],
     fresh: &[Table],
 ) -> Result<(), MergeError> {
-    let kept = pair(base, ours);
-    let on_disk = pair(base, theirs);
+    let kept = pair(base, ours, Against::Memory);
+    let on_disk = pair(base, theirs, Against::File);
     let mut claimed = vec![false; ours.len()];
     let mut edits = vec![];
     let mut removed = vec![];
@@ -295,20 +295,32 @@ fn place(table: &mut Table, at: usize) {
     }
 }
 
+/// Whose list [`pair`] matches the daemon's last read or write against.
+#[derive(Clone, Copy, PartialEq)]
+enum Against {
+    Memory,
+    File,
+}
+
 /// For each entry of `left`, the entry of `right` that is the same device.
 ///
 /// The file carries no id per entry, so a device is recognised by what it
 /// holds: an unchanged entry by being equal, a changed one by its pin, its
 /// hostname or its addresses, in that order. Two entries pinned to different
-/// machines are never the same device. After that, the one entry left on
-/// each side is the same device if they differ in a single field, which is
-/// what one edit changes: a rename of a device known by nothing else. A pin
-/// on the left missing on the right is not counted: memory forgets a pin
-/// with every new name or address, until the next handshake learns it.
-/// Anything else left over is a device removed on one side and another added
-/// on the other, never one device edited, so no field of one lands on the
-/// other.
-fn pair(left: &[ConfigClient], right: &[ConfigClient]) -> Vec<Option<usize>> {
+/// machines are never the same device.
+///
+/// Against memory, the one entry left on each side after that is the same
+/// device if they differ in a single field, which is what one change by the
+/// daemon does: a rename of a device known by nothing else. A pin on the
+/// left missing on the right is not counted: memory forgets a pin with every
+/// new name or address, until the next handshake learns it.
+///
+/// Against the file, nothing left over is paired: an entry changed by hand
+/// past recognition cannot be told from a device removed and another added,
+/// and a change to one device, its pin above all, must never land on
+/// another's entry. Anything left over is a device removed on one side and
+/// another added on the other, so no field of one lands on the other.
+fn pair(left: &[ConfigClient], right: &[ConfigClient], against: Against) -> Vec<Option<usize>> {
     fn apart(a: &ConfigClient, b: &ConfigClient) -> bool {
         matches!((&a.fingerprint, &b.fingerprint), (Some(x), Some(y)) if x != y)
     }
@@ -354,6 +366,9 @@ fn pair(left: &[ConfigClient], right: &[ConfigClient]) -> Vec<Option<usize>> {
                 taken[r] = true;
             }
         }
+    }
+    if against == Against::File {
+        return out;
     }
     let left_over: Vec<usize> = (0..left.len()).filter(|&l| out[l].is_none()).collect();
     let right_over: Vec<usize> = (0..right.len()).filter(|&r| !taken[r]).collect();
