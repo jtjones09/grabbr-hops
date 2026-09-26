@@ -31,6 +31,8 @@ use std::path::PathBuf;
 
 const TOKEN_FILE: &str = "ipc-token";
 const TOKEN_BYTES: usize = 32;
+/// The token's length as frontends send it: two hex digits per byte.
+pub(crate) const TOKEN_CHARS: usize = TOKEN_BYTES * 2;
 
 /// The token lives with `config.toml`, in the user-scoped config directory —
 /// deliberately NOT beside the socket. On macOS the socket is under
@@ -79,7 +81,7 @@ pub fn load_or_create_at(path: &std::path::Path) -> io::Result<String> {
         let existing = existing.trim().to_string();
         // a truncated or hand-mangled token would lock every frontend out with a
         // confusing failure, so replace anything that isn't well-formed
-        if existing.len() == TOKEN_BYTES * 2 && existing.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if existing.len() == TOKEN_CHARS && existing.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Ok(existing);
         }
         log::warn!("{path:?}: malformed IPC token — minting a new one");

@@ -28,7 +28,7 @@ pub use connect::{FrontendEventReader, FrontendRequestWriter, connect, connect_t
 pub use connect_async::{
     AsyncFrontendEventReader, AsyncFrontendRequestWriter, connect_async, connect_async_to,
 };
-pub use listen::AsyncFrontendListener;
+pub use listen::{AsyncFrontendListener, PREAUTH_CONNECTIONS_MAX, PREAUTH_DEADLINE};
 pub use pairing::{PairingCode, PairingError};
 
 #[derive(Debug, Error)]
@@ -470,7 +470,7 @@ pub enum FrontendRequest {
     /// not inserted (#117-adjacent, Layer 1 of CONSENT-ARCHITECTURE.md).
     SetLabel(String, String),
     // NOTE: there is deliberately NO verb here for the enter hook. It is
-    // executed with `sh -c` (src/service.rs), so exposing it on this channel
+    // run as a command (src/enter_hook.rs), so exposing it on this channel
     // made reaching the frontend socket equivalent to arbitrary command
     // execution. `enter_hook` is a CONFIG-FILE-ONLY field; setting it requires
     // write access to the config directory. See issue #56, and the guard test

@@ -21,6 +21,12 @@ hostname = "iridium"
 activate_on_startup = true
 # optional list of (known) ip addresses
 ips = ["192.168.178.156"]
+# optional: a program to run, with its arguments, each time the pointer
+# crosses to this device. It is run directly, not through a shell, so `;`,
+# pipes, globs and variables are passed to it as they are; name a shell to
+# use them, as in "sh -c 'date >> ~/crossings.log'". It runs as you, and not
+# at all when hops itself runs as an administrator or root.
+# enter_hook = "notify-send hops 'entered iridium'"
 
 # define a client on the left side with IP address 192.168.178.189
 [[clients]]

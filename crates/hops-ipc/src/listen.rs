@@ -2,6 +2,7 @@ use futures::{Stream, StreamExt, stream::SelectAll};
 #[cfg(unix)]
 use std::path::PathBuf;
 use std::{
+    future::Future,
     io::ErrorKind,
     pin::Pin,
     sync::{
@@ -12,8 +13,7 @@ use std::{
     time::Duration,
 };
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
-use tokio_stream::wrappers::LinesStream;
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 
 #[cfg(unix)]
 use tokio::net::UnixListener;
@@ -61,29 +61,166 @@ struct ConnState {
     closed: AtomicBool,
 }
 
+/// The longest line a connection may send before it has presented the token.
+///
+/// The only line accepted before then is the token, which every frontend sends
+/// as its hex digits and a newline. Twice its length leaves room for the
+/// whitespace the comparison trims, and for nothing else. There was no cap: a
+/// client that never sent a newline was read into memory until the daemon was
+/// killed, and on Windows any signed-in user can reach the port (#175).
+const PREAUTH_LINE_MAX: usize = 2 * token::TOKEN_CHARS;
+
+/// How long a connection may stay open without presenting the token.
+///
+/// Every frontend sends the token as its first line, the moment it connects.
+/// Before this there was no deadline, so a connection that sent a few bytes
+/// and then nothing was held, with its read buffer, until the client closed
+/// it (#175).
+pub const PREAUTH_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How many connections may wait to present the token at once. A connection
+/// accepted beyond this is closed at once.
+///
+/// Each costs a read buffer and its bookkeeping, about 9 KiB. There was no
+/// limit: thousands of idle connections grew the daemon by tens of MiB, and
+/// on Windows the listener is a loopback port any signed-in user can reach,
+/// from any address in 127.0.0.0/8 (#175). Frontends that have presented
+/// the token do not count.
+pub const PREAUTH_CONNECTIONS_MAX: usize = 32;
+
+/// Why a line could not be read.
+#[derive(Debug)]
+enum LineError {
+    /// More than this many bytes arrived without a newline.
+    TooLong(usize),
+    Io(std::io::Error),
+}
+
+/// Newline-terminated lines, refusing any longer than a maximum.
+///
+/// `tokio`'s own `lines()` extends its buffer until a newline arrives, with no
+/// maximum. This reads the same lines: a trailing `\r` is dropped, and a last
+/// line with no newline before the end of the stream is still returned.
+struct Lines<R> {
+    reader: BufReader<R>,
+    /// The line read so far. Never longer than `max`.
+    line: Vec<u8>,
+    /// The longest line accepted; `None` for no limit.
+    max: Option<usize>,
+}
+
+impl<R: AsyncRead + Unpin> Lines<R> {
+    fn new(reader: R, max: Option<usize>) -> Self {
+        Self {
+            reader: BufReader::new(reader),
+            line: Vec::new(),
+            max,
+        }
+    }
+
+    fn poll_next_line(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<String, LineError>>> {
+        loop {
+            let available = match Pin::new(&mut self.reader).poll_fill_buf(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(LineError::Io(e)))),
+                Poll::Ready(Ok(available)) => available,
+            };
+            if available.is_empty() {
+                if self.line.is_empty() {
+                    return Poll::Ready(None);
+                }
+                return Poll::Ready(Some(self.take_line()));
+            }
+            let newline = available.iter().position(|&b| b == b'\n');
+            let kept = newline.unwrap_or(available.len());
+            // Checked before anything is kept, so the line never outgrows it.
+            if let Some(max) = self.max {
+                if self.line.len() + kept > max {
+                    return Poll::Ready(Some(Err(LineError::TooLong(max))));
+                }
+            }
+            self.line.extend_from_slice(&available[..kept]);
+            let used = newline.map_or(kept, |at| at + 1);
+            Pin::new(&mut self.reader).consume(used);
+            if newline.is_some() {
+                return Poll::Ready(Some(self.take_line()));
+            }
+        }
+    }
+
+    fn take_line(&mut self) -> Result<String, LineError> {
+        let mut line = std::mem::take(&mut self.line);
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        String::from_utf8(line)
+            .map_err(|e| LineError::Io(std::io::Error::new(ErrorKind::InvalidData, e)))
+    }
+}
+
 /// A frontend connection that must present the IPC token before anything it says
 /// is honoured — or anything is said TO it — and that is HUNG UP on rather than
 /// tolerated when it sends something unparseable.
 struct AuthedLines<R> {
-    lines: LinesStream<BufReader<R>>,
+    lines: Lines<R>,
     token: std::sync::Arc<str>,
     authed: bool,
     state: Arc<ConnState>,
+    /// When the connection is closed if the token has not arrived; `None`
+    /// once it has.
+    deadline: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
-impl<R: tokio::io::AsyncRead + Unpin> Stream for AuthedLines<R> {
+impl<R: AsyncRead + Unpin> AuthedLines<R> {
+    /// A connection that has not yet presented the token, whose lines are
+    /// therefore capped at [`PREAUTH_LINE_MAX`] and closed after
+    /// [`PREAUTH_DEADLINE`].
+    fn new(reader: R, token: std::sync::Arc<str>, state: Arc<ConnState>) -> Self {
+        Self {
+            lines: Lines::new(reader, Some(PREAUTH_LINE_MAX)),
+            token,
+            authed: false,
+            state,
+            deadline: Some(Box::pin(tokio::time::sleep(PREAUTH_DEADLINE))),
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> Stream for AuthedLines<R> {
     type Item = Result<FrontendRequest, IpcError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         loop {
-            let line = match this.lines.poll_next_unpin(cx) {
-                Poll::Pending => return Poll::Pending,
+            let line = match this.lines.poll_next_line(cx) {
+                Poll::Pending => {
+                    let late = this
+                        .deadline
+                        .as_mut()
+                        .is_some_and(|d| d.as_mut().poll(cx).is_ready());
+                    if late {
+                        log::warn!(
+                            "a frontend connection did not present the IPC token within \
+                             {PREAUTH_DEADLINE:?} — closing it"
+                        );
+                        this.state.closed.store(true, Ordering::Release);
+                        return Poll::Ready(None);
+                    }
+                    return Poll::Pending;
+                }
                 Poll::Ready(None) => {
                     this.state.closed.store(true, Ordering::Release);
                     return Poll::Ready(None);
                 }
-                Poll::Ready(Some(Err(e))) => {
+                Poll::Ready(Some(Err(LineError::TooLong(max)))) => {
+                    log::warn!(
+                        "a frontend connection sent more than {max} bytes without a \
+                         newline before presenting the IPC token — closing it"
+                    );
+                    this.state.closed.store(true, Ordering::Release);
+                    return Poll::Ready(None);
+                }
+                Poll::Ready(Some(Err(LineError::Io(e)))) => {
                     log::debug!("frontend connection read error: {e}");
                     this.state.closed.store(true, Ordering::Release);
                     return Poll::Ready(None);
@@ -101,7 +238,10 @@ impl<R: tokio::io::AsyncRead + Unpin> Stream for AuthedLines<R> {
                     return Poll::Ready(None);
                 }
                 this.authed = true;
+                this.deadline = None;
                 this.state.authed.store(true, Ordering::Release);
+                // A frontend that holds the token may send requests of any length.
+                this.lines.max = None;
                 continue;
             }
             match serde_json::from_str(line.as_str()) {
@@ -551,6 +691,9 @@ pub struct AsyncFrontendListener {
     tx_streams: Vec<TxStream>,
     /// the secret every frontend must present as its first line
     token: std::sync::Arc<str>,
+    /// set while connections are being closed on accept because
+    /// [`PREAUTH_CONNECTIONS_MAX`] wait for the token, so that is logged once
+    refusing: bool,
 }
 
 impl AsyncFrontendListener {
@@ -571,6 +714,7 @@ impl AsyncFrontendListener {
             token: load_token()?.into(),
             line_streams: SelectAll::new(),
             tx_streams: vec![],
+            refusing: false,
         })
     }
 
@@ -603,16 +747,31 @@ impl Stream for AsyncFrontendListener {
         // arrives; accepted after the read, a new frontend waited unheard
         // until something else woke the daemon.
         while let Poll::Ready(Ok((stream, _))) = self.claim.listener.poll_accept(cx) {
+            let waiting = self
+                .tx_streams
+                .iter()
+                .filter(|e| {
+                    !e.state.authed.load(Ordering::Acquire)
+                        && !e.state.closed.load(Ordering::Acquire)
+                })
+                .count();
+            if waiting >= PREAUTH_CONNECTIONS_MAX {
+                if !self.refusing {
+                    log::warn!(
+                        "{waiting} frontend connections are waiting to present the IPC \
+                         token — closing new ones until they do or time out"
+                    );
+                    self.refusing = true;
+                }
+                drop(stream);
+                continue;
+            }
+            self.refusing = false;
             let (rx, tx) = tokio::io::split(stream);
-            let lines = LinesStream::new(BufReader::new(rx).lines());
             let token = self.token.clone();
             let state = Arc::new(ConnState::default());
-            self.line_streams.push(AuthedLines {
-                lines,
-                token,
-                authed: false,
-                state: state.clone(),
-            });
+            self.line_streams
+                .push(AuthedLines::new(rx, token, state.clone()));
             // Registered, but not yet spoken to. Accepting is not authenticating.
             self.tx_streams.push(TxStream {
                 tx,
@@ -649,8 +808,7 @@ mod tests {
     use super::AuthedLines;
     use crate::FrontendRequest;
     use futures::StreamExt;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio_stream::wrappers::LinesStream;
+    use tokio::io::AsyncWriteExt;
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -659,12 +817,11 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(4096);
         client.write_all(script.as_bytes()).await.expect("write");
         client.shutdown().await.expect("shutdown");
-        let mut stream = AuthedLines {
-            lines: LinesStream::new(BufReader::new(server).lines()),
-            token: TOKEN.into(),
-            authed: false,
-            state: std::sync::Arc::new(super::ConnState::default()),
-        };
+        let mut stream = AuthedLines::new(
+            server,
+            TOKEN.into(),
+            std::sync::Arc::new(super::ConnState::default()),
+        );
         let mut out = vec![];
         while let Some(Ok(req)) = stream.next().await {
             out.push(req);
@@ -706,6 +863,26 @@ mod tests {
         assert!(
             got.is_empty(),
             "a browser-shaped POST must never reach the daemon — it got: {got:?}"
+        );
+    }
+
+    /// The cap on what a client may send before the token must not reach the
+    /// requests that follow it: a real request is routinely longer than a token.
+    // LEDGER T63 | class B | 1 return value / error
+    #[tokio::test]
+    async fn after_the_token_a_request_longer_than_the_token_line_is_honoured() {
+        let request = format!(
+            "{{\"UpdateHostname\":{{\"handle\":0,\"hostname\":\"{}\",\"fingerprint\":null}}}}",
+            "h".repeat(1024)
+        );
+        let got = drive(&format!("{TOKEN}\n{request}\n")).await;
+        assert!(
+            matches!(got.as_slice(), [FrontendRequest::UpdateHostname { handle: 0, hostname: Some(name), .. }]
+                if name.len() == 1024),
+            "an authenticated request of {} bytes was refused ({} requests honoured). \
+             The pre-authentication cap must lift once the token is presented.",
+            request.len(),
+            got.len()
         );
     }
 
@@ -1598,6 +1775,181 @@ mod the_token_error_names_the_file {
             matches!(&mine, Err(IpcListenerCreationError::Token { hint, .. })
                 if hint.contains("Check that this user can read and write it")),
             "a token this user owns must get the ordinary hint: {mine:?}"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod an_unauthenticated_client_cannot_grow_memory {
+    //! Before the token arrives, the only line the daemon accepts is the token.
+    //! A client that sends anything longer is hung up on, rather than read into
+    //! memory until it chooses to send a newline (#175). On Windows the listener
+    //! is a loopback TCP port any signed-in user can reach.
+
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// A real listener on a real socket, holding `TOKEN`.
+    async fn listener(tag: &str) -> (AsyncFrontendListener, PathBuf) {
+        let path = PathBuf::from(format!("/tmp/h-cap-{tag}-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let claim = Claim::take(&crate::DaemonEndpoint::Unix(path.clone()))
+            .await
+            .expect("a claim on a fresh socket path");
+        let listener = AsyncFrontendListener {
+            claim,
+            token: TOKEN.into(),
+            line_streams: SelectAll::new(),
+            tx_streams: vec![],
+            refusing: false,
+        };
+        (listener, path)
+    }
+
+    /// Write `total` bytes with no newline, and return how many were accepted
+    /// before the daemon hung up, or `None` if all of them were.
+    async fn stream_one_line(client: &mut UnixStream, total: usize) -> Option<usize> {
+        let chunk = vec![b'x'; 64 * 1024];
+        let mut sent = 0;
+        while sent < total {
+            match client.write(&chunk).await {
+                Ok(0) | Err(_) => return Some(sent),
+                Ok(n) => sent += n,
+            }
+        }
+        None
+    }
+
+    // LEDGER T61 | class B | 2 bytes written to a socket
+    #[tokio::test]
+    async fn a_client_without_the_token_is_hung_up_on_before_it_can_fill_memory() {
+        const TOTAL: usize = 64 * 1024 * 1024;
+        let (mut listener, path) = listener("line").await;
+        let mut client = UnixStream::connect(&path).await.expect("connect");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::select! {
+                _ = async { while listener.next().await.is_some() {} } => {
+                    unreachable!("the listener stream never ends")
+                }
+                refused = stream_one_line(&mut client, TOTAL) => refused,
+            }
+        })
+        .await;
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(lock_path(&path));
+
+        let refused = outcome.expect("the daemon neither read nor refused the line in 30 s");
+        assert!(
+            refused.is_some_and(|sent| sent < 4 * 1024 * 1024),
+            "a client that never presented the token wrote {} bytes of one \
+             unterminated line and was not hung up on. Without the cap the daemon \
+             keeps every byte of such a line until a newline arrives, so any local \
+             process that can reach the socket can grow it until it is killed.",
+            refused.map_or(format!("all {TOTAL}"), |sent| sent.to_string())
+        );
+    }
+
+    /// Whether the daemon has closed `client`, without waiting.
+    fn hung_up(client: &UnixStream) -> bool {
+        let mut buf = [0u8; 64];
+        match client.try_read(&mut buf) {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(e) => e.kind() != ErrorKind::WouldBlock,
+        }
+    }
+
+    /// Serve `listener` for `how_long`.
+    async fn serve_for(listener: &mut AsyncFrontendListener, how_long: Duration) {
+        let _ = tokio::time::timeout(how_long, async { while listener.next().await.is_some() {} })
+            .await;
+    }
+
+    fn remove(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(lock_path(path));
+    }
+
+    // LEDGER T70 | class B | 2 connections on a socket, virtual clock
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_that_never_presents_the_token_is_closed_at_the_deadline() {
+        let (mut listener, path) = listener("late").await;
+        let idle = UnixStream::connect(&path).await.expect("connect");
+        idle.try_write(&[b'x'; 100])
+            .expect("100 bytes, under the cap");
+        let mut frontend = UnixStream::connect(&path).await.expect("connect");
+        frontend
+            .write_all(format!("{TOKEN}\n").as_bytes())
+            .await
+            .expect("the token");
+
+        serve_for(&mut listener, PREAUTH_DEADLINE / 2).await;
+        let early = hung_up(&idle);
+        serve_for(&mut listener, PREAUTH_DEADLINE * 2).await;
+        let late = hung_up(&idle);
+        let frontend_closed = hung_up(&frontend);
+        drop(listener);
+        remove(&path);
+
+        assert!(!early, "an idle connection was closed before the deadline");
+        assert!(
+            late,
+            "a connection that sent 100 bytes and never the token was still open \
+             {:?} later. Without a deadline the daemon holds such a connection, and \
+             its read buffer, for as long as the client likes.",
+            PREAUTH_DEADLINE * 5 / 2
+        );
+        assert!(
+            !frontend_closed,
+            "a frontend that presented the token was closed at the deadline"
+        );
+    }
+
+    // LEDGER T71 | class B | 2 connections on a socket, virtual clock
+    #[tokio::test(start_paused = true)]
+    async fn connections_waiting_for_the_token_are_capped() {
+        const EXTRA: usize = 8;
+        let (mut listener, path) = listener("many").await;
+        let mut idle = vec![];
+        for _ in 0..PREAUTH_CONNECTIONS_MAX + EXTRA {
+            idle.push(UnixStream::connect(&path).await.expect("connect"));
+        }
+
+        serve_for(&mut listener, Duration::from_millis(100)).await;
+        let closed = idle.iter().filter(|c| hung_up(c)).count();
+
+        // Once those time out, a frontend is admitted again.
+        serve_for(&mut listener, PREAUTH_DEADLINE * 2).await;
+        let mut frontend = UnixStream::connect(&path).await.expect("connect");
+        frontend
+            .write_all(format!("{TOKEN}\n").as_bytes())
+            .await
+            .expect("the token");
+        serve_for(&mut listener, Duration::from_millis(100)).await;
+        let admitted = listener
+            .tx_streams
+            .iter()
+            .any(|e| e.state.authed.load(Ordering::Acquire));
+        drop(listener);
+        remove(&path);
+
+        assert_eq!(
+            closed,
+            EXTRA,
+            "of {} idle connections without the token, {closed} were closed at \
+             once; at most {PREAUTH_CONNECTIONS_MAX} may wait. Without a cap every \
+             one is held with its read buffer, and any local process can open \
+             thousands.",
+            PREAUTH_CONNECTIONS_MAX + EXTRA
+        );
+        assert!(
+            admitted,
+            "after the waiting connections timed out, a frontend with the token \
+             was not admitted"
         );
     }
 }

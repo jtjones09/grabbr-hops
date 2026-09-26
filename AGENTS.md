@@ -85,7 +85,8 @@ and there is **no restore path**. Do not add one.
   keylogging for a capability hops does not have. Enforced by the `no /dev/input access` CI
   job. If a privileged backend is ever wanted, update the guard and the security model **in
   the same PR**.
-- **The frontend IPC channel must never reach a shell.** `spawn_hook_command` runs `sh -c`;
+- **The frontend IPC channel must never reach a shell.** `spawn_hook_command` runs a
+  config-supplied command (as a program, never through a shell, never elevated);
   `enter_hook` is therefore **config-file-only**, and no `FrontendRequest` variant may set it or
   otherwise reach command execution. Enforced by the `ipc_shell_guard` tests in `src/service.rs`,
   both mutation-tested. If a privileged verb is ever genuinely needed, update the security model

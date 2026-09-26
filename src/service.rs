@@ -8,6 +8,7 @@ use crate::{
     discovery::{DiscoveredPeer, Discovery, DiscoveryEvent},
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
+    enter_hook,
     hop_log::Lifecycle,
     listen::{ClipboardSenderListen, LanMouseListener, ListenerCreationError},
     prompt_gate::{Admit, PromptGate},
@@ -1855,28 +1856,54 @@ impl Service {
         self.notify_frontend(event);
     }
 
+    /// Run the enter hook of the device at `handle`, if it has one: as a
+    /// program with arguments, never through a shell, and never while this
+    /// process is elevated. See [`crate::enter_hook`].
     fn spawn_hook_command(&self, handle: ClientHandle) {
         let Some(cmd) = self.client_manager.get_enter_cmd(handle) else {
             return;
         };
+        let hook = match enter_hook::invocation(&cmd) {
+            Ok(hook) => hook,
+            Err(refused) => {
+                log::warn!("not running the enter hook: {refused}");
+                log::debug!("the refused enter hook: {cmd}");
+                return;
+            }
+        };
+        let mut command = Command::new(&hook.program);
+        #[cfg(unix)]
+        {
+            command.args(&hook.args);
+        }
+        #[cfg(windows)]
+        {
+            if !hook.rest.is_empty() {
+                command.raw_arg(&hook.rest);
+            }
+        }
+        // The program is named at info; the arguments may hold secrets, so the
+        // whole command is logged only at debug.
+        let program = hook.program.clone();
         tokio::task::spawn_local(async move {
-            log::info!("spawning command!");
-            let mut child = match Command::new("sh").arg("-c").arg(cmd.as_str()).spawn() {
+            log::info!("running the enter hook `{program}`");
+            log::debug!("the enter hook: {cmd}");
+            let mut child = match command.spawn() {
                 Ok(c) => c,
                 Err(e) => {
-                    log::warn!("could not execute cmd: {e}");
+                    log::warn!("could not run the enter hook `{program}`: {e}");
                     return;
                 }
             };
             match child.wait().await {
                 Ok(s) => {
                     if s.success() {
-                        log::info!("{cmd} exited successfully");
+                        log::info!("the enter hook `{program}` exited successfully");
                     } else {
-                        log::warn!("{cmd} exited with {s}");
+                        log::warn!("the enter hook `{program}` exited with {s}");
                     }
                 }
-                Err(e) => log::warn!("{cmd}: {e}"),
+                Err(e) => log::warn!("the enter hook `{program}`: {e}"),
             }
         });
     }
@@ -1886,7 +1913,7 @@ impl Service {
 mod ipc_shell_guard {
     //! Guard for #56: **the frontend IPC channel must never reach a shell.**
     //!
-    //! `spawn_hook_command` runs `sh -c` with a config-supplied string. While a
+    //! `spawn_hook_command` runs a config-supplied command. While a
     //! `FrontendRequest` variant could set that string, reaching the frontend
     //! socket was equivalent to arbitrary command execution — the boundary was
     //! protecting a shell, not a settings pane. `enter_hook` is now config-file
@@ -1939,8 +1966,8 @@ mod ipc_shell_guard {
             let code = line.split("//").next().unwrap_or("");
             assert!(
                 !code.contains("EnterHook"),
-                "FrontendRequest gained an enter-hook verb: `{}`. That string is executed \
-                 with `sh -c`, so this reopens the RCE path closed in #56.",
+                "FrontendRequest gained an enter-hook verb: `{}`. That string is run \
+                 as a command, so this reopens the RCE path closed in #56.",
                 line.trim()
             );
         }
