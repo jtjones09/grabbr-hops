@@ -23,9 +23,10 @@
 # is a failed run, never a release without its dmg.
 #
 # Every action is pinned to a commit, with the tag it stands for in a comment.
-# A tag can be moved to other code after review; a commit cannot. The one
-# exception is dtolnay/rust-toolchain, whose ref is also the compiler version
-# that `chore::toolchain_pin` in src/lib.rs checks against rust-toolchain.toml.
+# A tag can be moved to other code after review; a commit cannot. That includes
+# dtolnay/rust-toolchain, whose version refs are branches: the compiler is its
+# `toolchain` input, which `toolchain_pin` in src/lib.rs checks against
+# rust-toolchain.toml.
 # Windows signing is still a TODO (see the marker below).
 name: release
 
@@ -113,7 +114,9 @@ jobs:
           fetch-depth: 0   # so build.rs can read the git commit
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master 2026-09-03, base of branch 1.98.0
+        with:
+          toolchain: 1.98.0
 
       # --- build ---
       - name: Build (macOS universal)
