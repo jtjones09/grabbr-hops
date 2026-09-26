@@ -111,6 +111,10 @@ mdns-sd = { version = "0.21.2", features = ["unstable-fuzz-api"] }
 # feature of this crate forwards to either.
 input-emulation = { path = "crates/input-emulation", version = "0.4.0", default-features = false, features = ["recording"] }
 input-capture = { path = "crates/input-capture", version = "0.4.0", default-features = false, features = ["scripted"] }
+# The release workflows are YAML that only GitHub runs; the release pipeline
+# tests parse them to run each gate's shell and to read which job holds a
+# secret or may write.
+yaml-rust2 = { version = "0.13", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.148"
