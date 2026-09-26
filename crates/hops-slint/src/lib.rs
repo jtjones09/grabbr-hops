@@ -1954,6 +1954,139 @@ mod the_repaint_gate {
 }
 
 #[cfg(test)]
+mod the_window_without_a_daemon {
+    //! With the daemon gone the window says so, and nothing on it reads live:
+    //! the devices are what was last known (#34).
+    //!
+    //! Drives a real `AppWindow` on Slint's headless testing backend through
+    //! what the poll calls.
+    use super::*;
+    use hops_frontend_core::{ClientConfig, ClientState, DiscoveredDevice, FrontendEvent};
+    use slint::Model;
+
+    const FP: &str = "1e:19:1b:2c:3d:4e:5f:60:71:82:93:a4:b5:c6:d7:e8";
+    const OTHER_FP: &str = "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
+
+    /// One poll tick, the pairing card included.
+    fn tick(ui: &AppWindow, repaint: &mut Repaint, card: &mut PairingCard, m: &AppModel) {
+        let now = Instant::now();
+        let shown = card.show(m, now, |_| false).cloned();
+        repaint.push(ui, polled_ui(m, shown.as_ref(), now), &Cell::new(0));
+    }
+
+    fn device(name: &str, ip: &str, pos: Position) -> ClientConfig {
+        ClientConfig {
+            hostname: Some(name.into()),
+            fix_ips: vec![ip.parse().expect("ip")],
+            port: 4242,
+            pos,
+            ..Default::default()
+        }
+    }
+
+    fn rows(ui: &AppWindow) -> Vec<DeviceRow> {
+        ui.get_devices().iter().collect()
+    }
+
+    // LEDGER T533 | class B | 3 widget tree: AppWindow connected, devices, discovered, pairing-fp after daemon_gone + polled_ui + Repaint::push
+    #[test]
+    fn a_lost_daemon_leaves_nothing_in_the_window_reading_live() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = AppWindow::new().expect("window");
+        let mut repaint = Repaint::default();
+        let mut card = PairingCard::default();
+        let mut m = AppModel::default();
+        m.connected = true;
+        // One device up and connected, one dialled that refuses input, a
+        // machine asking to pair, and one found on the network.
+        m.apply(FrontendEvent::Enumerate(vec![
+            (
+                0,
+                device("studio-pc", "192.0.2.5", Position::Left),
+                ClientState {
+                    active: true,
+                    alive: true,
+                    active_addr: Some("192.0.2.5:4242".parse().expect("addr")),
+                    peer_fingerprint: Some(FP.into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                1,
+                device("desk-pc", "192.0.2.6", Position::Right),
+                ClientState {
+                    active: true,
+                    active_addr: Some("192.0.2.6:4242".parse().expect("addr")),
+                    peer_fingerprint: Some(OTHER_FP.into()),
+                    ..Default::default()
+                },
+            ),
+        ]));
+        m.apply(FrontendEvent::DeviceConnected {
+            addr: "192.0.2.5:50001".parse().expect("addr"),
+            fingerprint: FP.into(),
+        });
+        m.apply(FrontendEvent::ConnectionAttempt {
+            fingerprint: "cc:dd".into(),
+            origin: hops_frontend_core::AttemptOrigin::Inbound,
+            addr: Some("192.0.2.9:50002".parse().expect("addr")),
+        });
+        m.apply(FrontendEvent::Discovered {
+            active: true,
+            peers: vec![DiscoveredDevice {
+                label: "desk-laptop".into(),
+                claimed_fingerprint: None,
+                addrs: vec!["192.0.2.7:4242".parse().expect("addr")],
+            }],
+        });
+        tick(&ui, &mut repaint, &mut card, &m);
+        let live = rows(&ui);
+        assert!(
+            ui.get_connected()
+                && live[0].alive
+                && live[0].online
+                && live[1].refuses_input
+                && ui.get_discovered().row_count() == 1
+                && !ui.get_pairing_fp().is_empty(),
+            "precondition: the window shows the daemon's live state"
+        );
+
+        m.daemon_gone();
+        tick(&ui, &mut repaint, &mut card, &m);
+        assert!(
+            !ui.get_connected(),
+            "with no daemon the window still said it was connected"
+        );
+        let last_known = rows(&ui);
+        assert_eq!(
+            last_known.len(),
+            2,
+            "the devices must stay listed, as last known"
+        );
+        for row in &last_known {
+            assert!(
+                !row.alive && !row.online && !row.refuses_input,
+                "with no daemon {} still reads alive {}, connected {}, or \
+                 not accepting input {}",
+                row.name,
+                row.alive,
+                row.online,
+                row.refuses_input
+            );
+        }
+        assert_eq!(
+            (
+                ui.get_discovered().row_count(),
+                ui.get_pairing_fp().as_str()
+            ),
+            (0, ""),
+            "with no daemon the window still offers machines on the network or \
+             a pairing request to approve"
+        );
+    }
+}
+
+#[cfg(test)]
 mod the_banner_shows_errors {
     //! The red banner with a dismiss button shows what went wrong, not the
     //! activity log's latest line (#150).

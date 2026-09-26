@@ -420,7 +420,10 @@ impl AppModel {
     /// The daemon connection is gone: drop every fact only a running daemon
     /// can vouch for, so nothing renders live while nothing is (#34). What
     /// the user configured stays, to be shown as it was last known.
-    fn daemon_gone(&mut self) {
+    ///
+    /// The connection loop calls this on the shared model; public so a
+    /// frontend's tests can reach the state it leaves without a socket.
+    pub fn daemon_gone(&mut self) {
         self.connected = false;
         self.link = self.link.wrapping_add(1);
         self.connected_peers.clear();
@@ -2118,6 +2121,19 @@ mod the_daemon_gone {
                     },
                     FrontendEvent::PairingOpen { seconds: 120 },
                     FrontendEvent::CaptureStatus(Status::Enabled),
+                    FrontendEvent::ConnectionAttempt {
+                        fingerprint: "cc:dd".into(),
+                        origin: AttemptOrigin::Inbound,
+                        addr: Some("192.0.2.9:50002".parse().expect("addr")),
+                    },
+                    FrontendEvent::Discovered {
+                        active: true,
+                        peers: vec![DiscoveredDevice {
+                            label: "desk-laptop".into(),
+                            claimed_fingerprint: None,
+                            addrs: vec!["192.0.2.7:4242".parse().expect("addr")],
+                        }],
+                    },
                 ] {
                     first.events.unbounded_send(Ok(event)).expect("open");
                 }
@@ -2126,6 +2142,9 @@ mod the_daemon_gone {
                         .iter()
                         .any(|d| d.online && d.send.as_ref().is_some_and(|s| s.state.alive))
                         && m.pairing_open_until.is_some()
+                        && m.pending_pairing.is_some()
+                        && !m.pairing_attempts.is_empty()
+                        && !m.discovered.is_empty()
                 })
                 .await;
 
@@ -2182,6 +2201,17 @@ mod the_daemon_gone {
                     gone.pairing_seconds_left(Instant::now()).is_none()
                         && gone.capture == Status::Disabled,
                     "with no daemon the pairing window or capture still reads open"
+                );
+                assert!(
+                    gone.pending_pairing.is_none() && gone.pairing_attempts.is_empty(),
+                    "with no daemon a pairing request still waits for an answer \
+                     nothing can deliver: {:?}",
+                    gone.pairing_attempts
+                );
+                assert!(
+                    gone.discovered.is_empty() && !gone.discovery_active,
+                    "with no daemon machines still read as found on the network: {:?}",
+                    gone.discovered
                 );
                 assert!(
                     gone.latest_error()
