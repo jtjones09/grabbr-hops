@@ -1398,6 +1398,50 @@ mod held_input_is_released {
         });
     }
 
+    // LEDGER T117-1 | class B | 5 log line: InputEmulation::release_held via a Leave over loopback
+    /// Releasing a held key is logged at warn, the level a default install
+    /// writes and macOS copies into the system log. The line says a key was
+    /// released, never which one (#117).
+    #[test]
+    fn a_key_released_at_teardown_is_not_named_in_the_log() {
+        const HELD: scancode::Linux = scancode::Linux::KeyA;
+        run_local(async {
+            let logs = crate::test_harness::logs::capture();
+            let s = session().await;
+            let handle = s.inject(key(HELD as u32, 1)).await;
+
+            s.dialer().send(ProtoEvent::Leave(0)).await;
+            assert!(
+                s.released_before_destroy(handle, key(HELD as u32, 0)).await,
+                "the held key must still be released: {:?}",
+                s.recording.calls()
+            );
+
+            let lines = logs.lines();
+            assert!(
+                lines.iter().any(|l| l.level == log::Level::Trace
+                    && l.target == "hops::emulation"
+                    && l.text.contains("<-<-<-<-<-")
+                    && l.text.contains("key(")),
+                "the receiver's trace line for the key never reached the capture, \
+                 so an empty result below would prove nothing: {lines:#?}"
+            );
+            assert!(
+                lines.iter().any(|l| l.level == log::Level::Warn
+                    && l.target.starts_with("input_emulation")
+                    && l.text.contains("stuck key")),
+                "the warn line for the released key never reached the capture: {lines:#?}"
+            );
+            let naming = logs.naming(HELD);
+            assert!(
+                naming.is_empty(),
+                "the log names the key the peer typed. Raising the log level, or \
+                 none at all for a warn line, must not record what someone types: \
+                 {naming:#?}"
+            );
+        });
+    }
+
     // LEDGER T3 | class B | 6 struct state: Recording::calls() after Emulation::terminate
     #[test]
     fn shutting_down_releases_a_held_button() {

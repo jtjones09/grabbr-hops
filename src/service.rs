@@ -165,8 +165,9 @@ pub struct Service {
     /// with one set there is no second table to outrank the first: a hand-edit
     /// is caught by the seal over the file, not by a precedence rule.
     trust: crate::transport::Trust,
-    /// Sealed persistence for the store above.
-    trust_file: crate::trust_file::TrustFile,
+    /// Sealed persistence for the store above, and whether a change is still
+    /// waiting to reach it.
+    trust_saver: crate::trust_save::TrustSaver,
     /// The provenance of the prompt each fingerprint is currently waiting on.
     ///
     /// A grant has to be shaped by HOW the peer arrived: an unsolicited knock
@@ -184,9 +185,6 @@ pub struct Service {
     /// paired, dialled every second until they connect, with when that began.
     /// Without it a new device is only dialled when the pointer crosses to it.
     adding: HashMap<ClientHandle, Instant>,
-    /// The clock floor last written to disk, so a quiet daemon does not rewrite
-    /// a sealed file every sweep for nothing.
-    last_persisted_floor: u64,
     /// (outgoing) client information
     client_manager: ClientManager,
     /// current port
@@ -324,6 +322,17 @@ pub(crate) fn grant_for_attempt(
     };
     trust.issue(fingerprint, label, caps)?;
     Ok(caps)
+}
+
+/// A device as a notice names it: its label, or the start of its fingerprint
+/// when it has none.
+fn named(label: &str, fp: &str) -> String {
+    let label = label.trim();
+    if label.is_empty() {
+        format!("the device {}", fp.get(..11).unwrap_or(fp))
+    } else {
+        format!("\"{label}\"")
+    }
 }
 
 /// Hold the claim before the config is read, and read it only then.
@@ -516,11 +525,10 @@ impl Service {
             discovery,
             discovered: HashMap::new(),
             trust,
-            trust_file,
+            trust_saver: crate::trust_save::TrustSaver::new(trust_file),
             pending_origin: HashMap::new(),
             prompt_gate: crate::prompt_gate::PromptGate::new(),
             adding: HashMap::new(),
-            last_persisted_floor: 0,
             public_key_fingerprint,
             client_manager,
             frontend_event_pending: Default::default(),
@@ -1134,6 +1142,10 @@ impl Service {
         self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
         self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
         self.notify_frontend(FrontendEvent::PortChanged(self.port, None));
+        // A frontend that attaches while a trust change is still unsaved is
+        // told, or the only notice went to no one.
+        let unsaved = self.trust_saver.pending_notice();
+        self.tell_trust_saved(unsaved);
         self.notify_frontend(FrontendEvent::PublicKeyFingerprint(
             self.public_key_fingerprint.clone(),
         ));
@@ -1303,7 +1315,14 @@ impl Service {
             log::warn!("refusing to authorize {fp}: {e}");
             return;
         }
-        self.persist_trust();
+        // Named by the label the store kept: it sanitises at the door.
+        let stored = self
+            .trust
+            .read()
+            .expect("lock")
+            .label(&fp)
+            .unwrap_or_default();
+        self.persist_trust(format!("trusting {}", named(&stored, &fp)));
         let (keys, _) = self.trust.read().expect("lock").config_cache();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
     }
@@ -1494,7 +1513,13 @@ impl Service {
             log::warn!("refusing to relabel {fp}: {e}");
             return;
         }
-        self.persist_trust();
+        let stored = self
+            .trust
+            .read()
+            .expect("lock")
+            .label(&fp)
+            .unwrap_or_default();
+        self.persist_trust(format!("renaming a device to {}", named(&stored, &fp)));
         let (keys, _) = self.trust.read().expect("lock").config_cache();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
     }
@@ -1513,7 +1538,7 @@ impl Service {
         // backdated system clock cannot write a tombstone into the past.
         let label = self.trust.write().expect("lock").revoke(&fp);
         log::warn!("removed {label:?} ({fp}) — that identity is permanently dead");
-        self.persist_trust();
+        self.persist_trust(format!("removing {}", named(&label, &fp)));
         self.cut_sessions(&fp);
         // Revoking trust in a fingerprint releases any outbound pin on it, so a
         // client whose receiver re-keyed (e.g. reinstall) can re-learn + re-pin
@@ -1545,8 +1570,10 @@ impl Service {
         if lapsed.is_empty() {
             // Still persist occasionally: the clock floor only advances while
             // the daemon runs, and a floor that never reaches disk is a floor
-            // that resets on every restart.
-            self.persist_trust_if_floor_moved();
+            // that resets on every restart. A change that failed to save is
+            // retried here too, whether or not the floor moved.
+            let notice = self.trust_saver.sweep(&self.trust.read().expect("lock"));
+            self.tell_trust_saved(notice);
             return;
         }
         for lease in &lapsed {
@@ -1557,20 +1584,14 @@ impl Service {
             );
             self.cut_sessions_dir(&lease.peer, lease.caps);
         }
-        self.persist_trust();
+        let ended: Vec<String> = lapsed
+            .iter()
+            .map(|l| format!("the end of the pairing with {}", named(&l.label, &l.peer)))
+            .collect();
+        self.persist_trust(ended.join(", "));
         let (keys, tombstones) = self.trust.read().expect("lock").config_cache();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
         self.notify_frontend(FrontendEvent::RevokedUpdated(tombstones));
-    }
-
-    /// Persist only when the clock floor actually moved, so a quiet daemon does
-    /// not rewrite a sealed file every minute for nothing.
-    fn persist_trust_if_floor_moved(&mut self) {
-        let floor = self.trust.read().expect("lock").clock().floor();
-        if floor > self.last_persisted_floor {
-            self.last_persisted_floor = floor;
-            self.persist_trust();
-        }
     }
 
     /// Write the sealed store.
@@ -1578,10 +1599,19 @@ impl Service {
     /// Deliberately separate from `save_config`: trust must not ride on the
     /// eleven callers of that, which fire for a window move or a position
     /// change. This is called only where trust actually changed.
-    fn persist_trust(&mut self) {
-        let records = crate::trust_file::records_of(&self.trust.read().expect("lock"));
-        if let Err(e) = self.trust_file.save(&records) {
-            log::error!("failed to write the trust store: {e}");
+    ///
+    /// A change that does not reach disk is not only logged: it is undone by
+    /// the next restart, so the user is told, and the sweep retries it.
+    fn persist_trust(&mut self, what: String) {
+        let notice = self
+            .trust_saver
+            .save_change(&self.trust.read().expect("lock"), what);
+        self.tell_trust_saved(notice);
+    }
+
+    fn tell_trust_saved(&mut self, notice: Option<String>) {
+        if let Some(notice) = notice {
+            self.notify_frontend(FrontendEvent::Error(notice));
         }
     }
 

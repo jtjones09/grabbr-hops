@@ -404,6 +404,12 @@ impl InputEmulation {
             .get_mut(&handle)
             .map(|k| k.drain().collect::<Vec<_>>())
             .unwrap_or_default();
+        // How many, never which: this is a warn line, written at the default
+        // level and copied into the macOS system log, and the keys are what
+        // the peer was typing (#117).
+        if !keys.is_empty() {
+            log::warn!("releasing {} stuck key(s)", keys.len());
+        }
         for key in keys {
             let event = Event::Keyboard(KeyboardEvent::Key {
                 time: 0,
@@ -412,9 +418,6 @@ impl InputEmulation {
             });
             if let Err(e) = self.emulation.consume(event, handle).await {
                 first_error.get_or_insert(e);
-            }
-            if let Ok(key) = input_event::scancode::Linux::try_from(key) {
-                log::warn!("releasing stuck key: {key:?}");
             }
         }
 

@@ -474,23 +474,21 @@ fn to_key_event(wparam: WPARAM, lparam: LPARAM) -> Option<KeyboardEvent> {
         evdev
     } else {
         let mut scan_code = kybrdllhookstruct.scanCode;
-        log::trace!("scan_code: {scan_code}");
         if kybrdllhookstruct.flags.contains(LLKHF_EXTENDED) {
             scan_code |= 0xE000;
         }
+        // Which key goes to the keylog, never to the general log: a warn line
+        // is written at the default level (#117).
         let Ok(win_scan_code) = scancode::Windows::try_from(scan_code) else {
-            log::warn!(
-                "failed to translate to windows scancode: {scan_code} (vk={:#04x})",
-                kybrdllhookstruct.vkCode
-            );
+            input_event::keylog::key(scan_code, 0, "windows:unknown");
+            log::warn!("dropped a key with no Windows scancode");
             return None;
         };
-        log::trace!("windows_scan: {win_scan_code:?}");
         let Ok(linux_scan_code): Result<Linux, ()> = win_scan_code.try_into() else {
-            log::warn!("failed to translate into linux scancode: {win_scan_code:?}");
+            input_event::keylog::key(scan_code, 0, &format!("windows:{win_scan_code:?}"));
+            log::warn!("dropped a key with no Linux scancode");
             return None;
         };
-        log::trace!("linux_scan: {linux_scan_code:?}");
         linux_scan_code as u32
     };
     match wparam {

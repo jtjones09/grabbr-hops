@@ -808,7 +808,7 @@ fn post_hid_media_key(connect: u32, nx_keytype: u8, down: bool) -> bool {
         )
     };
     if kr != 0 {
-        log::warn!("IOHIDPostEvent(media key {nx_keytype}) failed: kr=0x{kr:x}");
+        log::warn!("IOHIDPostEvent(media key) failed: kr=0x{kr:x}");
     }
     kr == 0
 }
@@ -2209,7 +2209,7 @@ impl Emulation for MacOSEmulation {
                                 post_hid_media_key(connect, nx_keytype, state == 1);
                             }
                             None => {
-                                log::debug!("media key {key} dropped: no IOHIDSystem connection")
+                                log::debug!("media key dropped: no IOHIDSystem connection")
                             }
                         }
                         return Ok(());

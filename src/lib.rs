@@ -24,6 +24,7 @@ pub mod service;
 mod transport;
 pub mod trust;
 pub mod trust_file;
+mod trust_save;
 
 /// Guards for decisions already made — and, three times now, rebuilt anyway.
 /// See the module docs for the bar each guard is held to.
