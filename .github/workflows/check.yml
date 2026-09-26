@@ -40,7 +40,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master 2026-09-03, base of branch 1.98.0
+        with:
+          toolchain: 1.98.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: system deps
         run: |
@@ -66,7 +68,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master 2026-09-03, base of branch 1.98.0
+        with:
+          toolchain: 1.98.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: system deps (linux)
         if: runner.os == 'Linux'
@@ -78,24 +82,38 @@ jobs:
         run: cargo check --locked --no-default-features --features "${{ matrix.features }}" --all-targets
       - name: test
         run: cargo test --locked --no-default-features --features "${{ matrix.features }}"
-      # The workspace tests run on macOS. The IPC crate has Linux-only code
-      # and tests: the sticky bit on the daemon's lock and socket, and a
-      # listener whose queue of connections not yet accepted is full.
-      - name: test hops-ipc (linux)
-        if: runner.os == 'Linux'
-        run: cargo test --locked -p hops-ipc
 
   # The trust tests are the ones that must never silently stop running: each was
   # written to fail without its fix, and several guard a shipped vulnerability.
+  #
+  # Linux as well as macOS: with macOS alone, a Linux-only deadlock failed only
+  # the Ubuntu release job, twice, while this job was green, and the tests of
+  # every crate but the root one never ran on Linux at all. The runner is not
+  # root, and tests of refusals that root would bypass rely on that. The IPC
+  # crate's Linux-only tests (the sticky bit on the daemon's lock and socket,
+  # a full accept queue) run here too. `the_workspace_tests_run_on_linux_and_on_macos`
+  # in tests/release_pipeline.rs fails if either runner is dropped.
   workspace-tests:
-    name: workspace tests
-    runs-on: macos-latest
+    name: workspace tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master 2026-09-03, base of branch 1.98.0
+        with:
+          toolchain: 1.98.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: system deps (linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev \
+            libxtst-dev pkg-config libfontconfig1-dev
       # Was `-p hops-ipc -p hops-frontend-core`, which ran 121 of 166 tests. The
       # hops-slint guards — the sole evidence for four merged PRs — had never
       # executed in CI. A guard that does not run is a comment.
@@ -103,13 +121,18 @@ jobs:
 
   # hops commits to NOT reading raw input devices on Linux. Capture is
   # portal-mediated (xdg-desktop-portal InputCapture / libei), which is
-  # consent-gated and revocable; /dev/input is neither.
+  # consent-gated and revocable; a raw device is neither.
   #
-  # This exists because the installer used to tell every Linux user to run
-  # `sudo usermod -aG input $USER` — granting system-wide keylogging, on a
+  # This exists because the installer used to tell every Linux user to add
+  # themselves to the input group, granting system-wide keylogging, on a
   # machine running a KVM, for a capability no hops code ever used. A
   # commitment about what software does NOT do is worth nothing unless
   # something fails when it stops being true.
+  #
+  # It was two greps here: one over the installer, later a list of extensions
+  # without `.rs`, and one over two of the crates. Each was scoped to where a
+  # defect had been found, not to the property. The test reads every tracked
+  # file outside a `tests` directory; the workspace tests run it as well.
   no-raw-input-devices:
     name: no /dev/input access
     runs-on: ubuntu-latest
@@ -117,32 +140,17 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - name: the input path must stay portal-mediated
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master 2026-09-03, base of branch 1.98.0
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: system deps
         run: |
-          if grep -rnE '/dev/(input|uinput)|EVIOCGRAB|\bevdev::' \
-               crates/input-capture/src crates/input-emulation/src src \
-               --include='*.rs' ; then
-            echo "::error::hops must not open raw input devices — see SECURITY-MODEL.md."
-            echo "If this is a deliberate, privileged, opt-in backend, update this"
-            echo "job and the security model in the same PR, not afterwards."
-            exit 1
-          fi
-          echo "OK: no raw input-device access."
-      # This checked install.sh alone and passed for months while the same
-      # instruction sat in service/README.md and service/hops-headless.service.
-      # A guard scoped to one file cannot prove a claim about the project.
-      - name: nothing shipped may tell users to grant one
-        run: |
-          if grep -rnE 'usermod .*-aG .*input|gpasswd .*input' \
-               --include='*.sh' --include='*.md' --include='*.service' \
-               --include='*.ps1' --include='*.plist' --include='*.yml' \
-               . --exclude-dir=target --exclude-dir=.git --exclude-dir=.github ; then
-            echo "::error::nothing shipped may instruct users into the input group."
-            echo "hops has no uinput backend; that grant is system-wide keystroke"
-            echo "read access in exchange for a capability this code does not have."
-            exit 1
-          fi
-          echo "OK: nothing instructs input-group membership."
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev \
+            libxtst-dev pkg-config libfontconfig1-dev
+      - name: nothing shipped opens a raw input device or tells anyone to
+        run: cargo test --locked --no-default-features --test no_raw_input_devices
 
   # A build script runs on the HOST. `cfg!(unix)` / `cfg!(target_os = ...)` inside
   # one therefore describes the build machine, not the target — which silently
@@ -191,7 +199,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master 2026-09-03, base of branch 1.98.0
         with:
+          toolchain: 1.98.0
           components: rustfmt
       - run: cargo fmt --all --check

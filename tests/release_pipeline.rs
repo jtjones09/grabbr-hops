@@ -761,22 +761,6 @@ fn is_commit(r: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
-/// The one reference still allowed to name a branch: the toolchain action at
-/// exactly the compiler rust-toolchain.toml pins. `chore::toolchain_pin` in
-/// src/lib.rs reads the version from this ref, so pinning it to a commit
-/// changes that guard, and that is a separate decision. Nothing else is exempt.
-fn toolchain_branch(uses: &str) -> bool {
-    let channel = read("rust-toolchain.toml")
-        .lines()
-        .map(|l| l.split('#').next().unwrap_or(""))
-        .find_map(|l| {
-            let v = l.trim().strip_prefix("channel")?.trim().strip_prefix('=')?;
-            Some(v.trim().trim_matches('"').to_owned())
-        })
-        .expect("rust-toolchain.toml sets channel");
-    uses == format!("dtolnay/rust-toolchain@{channel}")
-}
-
 // LEDGER T8 | class S | raw workflow text + parsed workflow YAML
 #[test]
 fn every_action_is_pinned_to_a_commit() {
@@ -793,7 +777,7 @@ fn every_action_is_pinned_to_a_commit() {
             }
         }
         for (id, u) in &parsed {
-            if u.starts_with("./") || toolchain_branch(u) {
+            if u.starts_with("./") {
                 continue;
             }
             let (_, r) = u
@@ -818,7 +802,7 @@ fn every_action_is_pinned_to_a_commit() {
             lines += 1;
             let (value, comment) = v.split_once('#').unwrap_or((v, ""));
             let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
-            if value.starts_with("./") || toolchain_branch(value) {
+            if value.starts_with("./") {
                 continue;
             }
             assert!(
@@ -932,5 +916,116 @@ fn the_signing_job_uploads_only_a_verified_dmg() {
         sign[uploaded]["with"]["if-no-files-found"].as_str(),
         Some("error"),
         "a missing dmg must fail the upload, not warn"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// check.yml: the workspace tests run on Linux as well as macOS (#228). A
+// Linux-only deadlock failed only the Ubuntu release job, twice, while the
+// workspace tests, which ran on macOS alone, were green.
+// ---------------------------------------------------------------------------
+
+const CHECK: &str = ".github/workflows/check.yml";
+const WORKSPACE_TESTS: &str = "workspace-tests";
+
+/// The runner labels a job runs on: its `runs-on`, or, when that is
+/// `${{ matrix.os }}`, every `os` the matrix lists or includes.
+fn runners(job_id: &str, job: &Yaml) -> BTreeSet<String> {
+    let runs_on = job["runs-on"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{job_id}: runs-on is not a single label"));
+    if !runs_on.contains("${{") {
+        return BTreeSet::from([runs_on.to_owned()]);
+    }
+    let expr: String = runs_on.chars().filter(|c| !c.is_whitespace()).collect();
+    assert_eq!(
+        expr, "${{matrix.os}}",
+        "{job_id}: runs-on is an expression this test cannot resolve"
+    );
+    let matrix = &job["strategy"]["matrix"];
+    assert!(
+        matrix["exclude"].is_badvalue(),
+        "{job_id}: a matrix `exclude` can drop a runner without the list showing it; \
+         list the runners instead"
+    );
+    let listed = matrix["os"].as_vec().map(Vec::as_slice).unwrap_or(&[]);
+    let included = matrix["include"].as_vec().map(Vec::as_slice).unwrap_or(&[]);
+    listed
+        .iter()
+        .chain(included.iter().map(|entry| &entry["os"]))
+        .filter_map(|os| os.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Whether a job or step is marked so that its failure fails nothing.
+fn may_fail(y: &Yaml) -> bool {
+    !matches!(
+        y["continue-on-error"],
+        Yaml::BadValue | Yaml::Boolean(false)
+    )
+}
+
+// LEDGER T12 | class S | parsed workflow YAML | pair NONE (CI configuration)
+#[test]
+fn the_workspace_tests_run_on_linux_and_on_macos() {
+    let wf = parse(CHECK);
+    let job = &wf["jobs"][WORKSPACE_TESTS];
+    assert!(!job.is_badvalue(), "check.yml has no {WORKSPACE_TESTS} job");
+    let on = runners(WORKSPACE_TESTS, job);
+    for os in ["ubuntu-latest", "macos-latest"] {
+        assert!(
+            on.contains(os),
+            "{WORKSPACE_TESTS} runs on {on:?}, not {os}. Every crate's tests must run on \
+             Linux and macOS; a platform with no workspace run lets a defect that only \
+             exists there merge green"
+        );
+    }
+    assert!(
+        job["if"].is_badvalue() && !may_fail(job),
+        "{WORKSPACE_TESTS} is conditional or allowed to fail"
+    );
+
+    let wanted = ["--locked", "--workspace", "--all-targets"];
+    let mut found = 0;
+    for step in steps(job) {
+        let name = step["name"].as_str().unwrap_or("cargo test");
+        // One command a line, and a line ending in `\` goes on to the next.
+        let run = step["run"].as_str().unwrap_or("").replace("\\\n", " ");
+        for command in run.lines() {
+            let tokens: Vec<&str> = command.split_whitespace().collect();
+            let Some(at) = tokens.windows(2).position(|w| w == ["cargo", "test"]) else {
+                continue;
+            };
+            let args = &tokens[at + 2..];
+            if !wanted.iter().all(|w| args.contains(w)) {
+                continue;
+            }
+            assert!(
+                step["if"].is_badvalue() && !may_fail(step),
+                "{WORKSPACE_TESTS}/{name:?} is conditional or allowed to fail, so some runner \
+                 can skip the workspace tests"
+            );
+            // Exactly these: anything more is a package, a target, a test name
+            // filter or `-- --skip`, which runs fewer tests, or shell that
+            // hides a failure.
+            let mut sorted = args.to_vec();
+            sorted.sort_unstable();
+            let mut want = wanted.to_vec();
+            want.sort_unstable();
+            assert!(
+                sorted == want,
+                "{WORKSPACE_TESTS}/{name:?} runs `cargo test {}`; it must pass exactly `{}`, \
+                 since anything more runs fewer tests than the workspace or hides a failure",
+                args.join(" "),
+                wanted.join(" ")
+            );
+            found += 1;
+        }
+    }
+    assert_eq!(
+        found,
+        1,
+        "{WORKSPACE_TESTS} must run `cargo test {}` once, in one step",
+        wanted.join(" ")
     );
 }

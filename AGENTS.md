@@ -147,7 +147,7 @@ silently drops every Unix backend and reports success — build Linux natively (
 
 ## CI
 
-`check.yml` runs on every push to `main` and every PR: default features, the three release feature sets, workspace tests, rustfmt, and the
+`check.yml` runs on every push to `main` and every PR: default features, the three release feature sets, workspace tests on macOS and Ubuntu, rustfmt, and the
 `no /dev/input access` guard. `release.yml` runs on `v*` tags and by hand (a run by hand
 publishes nothing), asserts the built Linux binary actually contains real input backends,
 signs the dmg in `sign-macos` (the only job that sees a secret; it runs no cargo), and

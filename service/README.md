@@ -7,7 +7,7 @@ remotely. This directory holds the autostart units for each OS.
 | File | Platform | Use |
 | ---- | -------- | --- |
 | `hops.service` | Linux (desktop) | user service bound to your graphical session |
-| `hops-headless.service` | Linux (server) | user service, **no display required** |
+| `hops-headless.service` | Linux (server) | user service with no monitor or login; **still needs a display server** to inject input |
 | `com.grabbr.hops.plist` | macOS | launchd daemon (LaunchAgent) |
 | `windows/install-hops-daemon.ps1` | Windows | logon Scheduled Task (interactive session) |
 
@@ -42,6 +42,10 @@ systemctl --user enable --now hops-headless.service
 sudo loginctl enable-linger "$USER"
 
 ```
+
+"Headless" here means no monitor and no login, not no display server. Every
+Linux emulation backend injects through Wayland, X11 or the desktop portal, so
+without one hops cannot inject input. See the header of `hops-headless.service`.
 
 ### macOS
 

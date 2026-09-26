@@ -14,8 +14,9 @@
 # code is built today; it only stops the version drifting on its own. Bumping is
 # now a deliberate one-line PR that CI proves before it lands.
 #
-# `.github/workflows/*.yml` name the same version. `chore::toolchain_pin` in
-# src/lib.rs fails if they disagree.
+# `.github/workflows/*.yml` name the same version as the `toolchain` input of
+# dtolnay/rust-toolchain, pinned to a commit. `toolchain_pin` in src/lib.rs
+# fails if they disagree or the action is not pinned.
 [toolchain]
 channel = "1.98.0"
 components = ["rustfmt"]
