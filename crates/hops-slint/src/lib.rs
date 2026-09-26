@@ -241,9 +241,11 @@ fn polled_ui(m: &AppModel, shown: Option<&PairingAttempt>, now: Instant) -> Poll
         pairing_seconds: m
             .pairing_seconds_left(now)
             .map_or(0, |s| s.min(i32::MAX as u64) as i32),
-        notice: m.latest_message().unwrap_or_default().to_string(),
+        // Errors only: the activity log also records a cursor entering, and
+        // the banner is red (#150).
+        notice: m.latest_error().unwrap_or_default().to_string(),
         // i32 is Slint's integer; the seq only needs to CHANGE, not be exact
-        notice_seq: (m.message_seq % (i32::MAX as u64)) as i32,
+        notice_seq: (m.error_seq % (i32::MAX as u64)) as i32,
         service_problem: m.service_problem().unwrap_or_default(),
         devices,
     }
@@ -284,13 +286,16 @@ impl Repaint {
         ui.set_pairing_from_our_dial(snap.pairing_from_our_dial);
         ui.set_pairing_addr(snap.pairing_addr.as_str().into());
         ui.set_pairing_seconds(snap.pairing_seconds);
+        // Every tick that changed, not only one with a new notice: the free
+        // edge follows the devices, and a new device placed on an edge in use
+        // switches the other one off (#32).
+        ui.set_free_position(snap.free_position.as_str().into());
         // only when the DAEMON has something new — otherwise a local
         // validation notice would be overwritten on the next poll
         if snap.notice_seq != self.daemon_notice {
             self.daemon_notice = snap.notice_seq;
             if !snap.notice.is_empty() {
                 notice_seq.set(notice_seq.get().wrapping_add(1));
-                ui.set_free_position(snap.free_position.as_str().into());
                 ui.set_notice(snap.notice.as_str().into());
                 ui.set_notice_seq(notice_seq.get());
             }
@@ -1862,6 +1867,86 @@ mod the_repaint_gate {
             !repaint.push(&ui, polled_ui(&m, None, now), &Cell::new(0)),
             "an identical tick repainted the window, which flickers \
              variable-refresh displays"
+        );
+    }
+}
+
+#[cfg(test)]
+mod the_banner_shows_errors {
+    //! The red banner with a dismiss button shows what went wrong, not the
+    //! activity log's latest line (#150).
+    use super::*;
+    use hops_frontend_core::{ClientConfig, ClientState, FrontendEvent};
+
+    fn entered(m: &mut AppModel) {
+        m.apply(FrontendEvent::DeviceEntered {
+            addr: "192.0.2.5:52808".parse().expect("addr"),
+            pos: Position::Right,
+            fingerprint: "aa:bb".into(),
+        });
+    }
+
+    // LEDGER T517 | class B | 3 widget tree: AppWindow notice after polled_ui + Repaint::push
+    #[test]
+    fn a_cursor_entering_is_not_an_error() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = AppWindow::new().expect("window");
+        let mut repaint = Repaint::default();
+        let seq = Cell::new(0);
+        let mut m = AppModel::default();
+
+        entered(&mut m);
+        repaint.push(&ui, polled_ui(&m, None, Instant::now()), &seq);
+        assert_eq!(
+            ui.get_notice().as_str(),
+            "",
+            "a cursor crossing an edge was shown in the error banner"
+        );
+
+        m.apply(FrontendEvent::Error("could not resolve studio-pc".into()));
+        repaint.push(&ui, polled_ui(&m, None, Instant::now()), &seq);
+        assert_eq!(ui.get_notice().as_str(), "could not resolve studio-pc");
+        let raised = ui.get_notice_seq();
+
+        entered(&mut m);
+        repaint.push(&ui, polled_ui(&m, None, Instant::now()), &seq);
+        assert_eq!(
+            (ui.get_notice().as_str(), ui.get_notice_seq()),
+            ("could not resolve studio-pc", raised),
+            "a cursor entering replaced the error or raised a dismissed banner again"
+        );
+    }
+
+    /// The add form opens on the first edge no active device uses. That edge
+    /// was written only alongside a new notice, which routine events no
+    /// longer are.
+    // LEDGER T518 | class B | 3 widget tree: AppWindow free-position after Repaint::push
+    #[test]
+    fn the_free_edge_follows_the_devices_without_a_notice() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = AppWindow::new().expect("window");
+        let mut repaint = Repaint::default();
+        let seq = Cell::new(0);
+        let mut m = AppModel::default();
+        repaint.push(&ui, polled_ui(&m, None, Instant::now()), &seq);
+        assert_eq!(ui.get_free_position().as_str(), "left");
+
+        let on_the_left = ClientConfig {
+            hostname: Some("studio-pc".into()),
+            pos: Position::Left,
+            ..Default::default()
+        };
+        let active = ClientState {
+            active: true,
+            ..Default::default()
+        };
+        m.apply(FrontendEvent::Created(0, on_the_left, active));
+        repaint.push(&ui, polled_ui(&m, None, Instant::now()), &seq);
+        assert_eq!(
+            ui.get_free_position().as_str(),
+            "right",
+            "the add form would open on the left edge an active device uses, \
+             and adding there switches that device off"
         );
     }
 }

@@ -86,12 +86,23 @@ pub struct AppModel {
     /// Until when pairing prompts may appear on this machine, or `None` while
     /// the window is closed (#195).
     pub pairing_open_until: Option<Instant>,
-    /// Recent transient events / errors (newest last), capped at [`MAX_MESSAGES`].
+    /// The activity log: recent events and errors alike (newest last), capped
+    /// at [`MAX_MESSAGES`].
     pub messages: VecDeque<String>,
-    /// Monotonic counter, bumped on every message. Lets a polling frontend tell a
-    /// NEW notice from the same one still on screen, so a dismissed banner stays
-    /// dismissed but a fresh failure re-raises it.
+    /// Monotonic counter, bumped on every activity-log line.
     pub message_seq: u64,
+    /// The latest thing that went wrong, or `None`.
+    ///
+    /// Kept apart from [`Self::messages`], which also records routine events
+    /// such as a cursor entering. The GUI's error banner rendered the log's
+    /// last line, so the most routine thing hops does appeared in red beside
+    /// a dismiss button, and an error surface that cries wolf stops being
+    /// read (#150).
+    pub latest_error: Option<String>,
+    /// Bumped on every error. Lets a polling frontend tell a NEW error from
+    /// the same one still on screen, so a dismissed banner stays dismissed
+    /// but a repeat of the same failure re-raises it.
+    pub error_seq: u64,
     /// Fingerprints of peers currently connected *in*, as known from live
     /// connect/disconnect events while this client is attached. CAVEAT: a peer
     /// that connected before we attached is not reflected until the daemon
@@ -196,10 +207,10 @@ impl AppModel {
             FrontendEvent::PortChanged(port, err) => {
                 self.port = Some(port);
                 if let Some(e) = err {
-                    self.push_message(format!("port change failed: {e}"));
+                    self.push_error(format!("port change failed: {e}"));
                 }
             }
-            FrontendEvent::Error(e) => self.push_message(format!("error: {e}")),
+            FrontendEvent::Error(e) => self.push_error(e),
             FrontendEvent::DeviceConnected { addr, fingerprint } => {
                 self.register_peer(addr, fingerprint);
                 self.push_message(format!("device connected: {addr}"));
@@ -392,12 +403,24 @@ impl AppModel {
         self.message_seq += 1;
     }
 
-    /// The most recent notice, if any. The daemon's only channel for telling the
+    /// Record an error: in the activity log, and as the latest error.
+    fn push_error(&mut self, error: String) {
+        self.push_message(format!("error: {error}"));
+        self.latest_error = Some(error);
+        self.error_seq += 1;
+    }
+
+    /// The activity log's latest line, if any: an event or an error.
+    pub fn latest_message(&self) -> Option<&str> {
+        self.messages.back().map(|s| s.as_str())
+    }
+
+    /// The latest error, if any. The daemon's only channel for telling the
     /// user something went wrong; before this was rendered, every failure —
     /// unresolvable name, refused trust change, failed config write, rejected
     /// IPC token — reached the user as silence.
-    pub fn latest_message(&self) -> Option<&str> {
-        self.messages.back().map(|s| s.as_str())
+    pub fn latest_error(&self) -> Option<&str> {
+        self.latest_error.as_deref()
     }
 }
 
@@ -1831,5 +1854,67 @@ mod projection {
 
         // an empty fingerprint must still yield something sayable
         assert_eq!(fallback_label(""), "unnamed device");
+    }
+}
+
+#[cfg(test)]
+mod errors_apart_from_activity {
+    //! Errors and the activity log are two things (#150): the log keeps
+    //! everything, and only what went wrong is an error.
+    use super::*;
+
+    // LEDGER T516 | class B | 6 struct state: AppModel::apply, latest_error/error_seq
+    #[test]
+    fn routine_events_reach_the_log_and_not_the_errors() {
+        let addr: SocketAddr = "192.0.2.5:50001".parse().expect("addr");
+        let mut m = AppModel::default();
+        m.apply(FrontendEvent::DeviceConnected {
+            addr,
+            fingerprint: "aa:bb".into(),
+        });
+        m.apply(FrontendEvent::DeviceEntered {
+            addr,
+            pos: Position::Right,
+            fingerprint: "aa:bb".into(),
+        });
+        m.apply(FrontendEvent::ConnectionAttempt {
+            fingerprint: "cc:dd".into(),
+            origin: AttemptOrigin::Inbound,
+            addr: Some(addr),
+        });
+        m.apply(FrontendEvent::IncomingDisconnected(addr));
+        m.apply(FrontendEvent::PortChanged(4242, None));
+        assert_eq!(m.messages.len(), 4, "the activity log keeps every event");
+        assert_eq!(
+            (m.latest_error(), m.error_seq),
+            (None, 0),
+            "a routine event became an error"
+        );
+
+        m.apply(FrontendEvent::Error("could not resolve studio-pc".into()));
+        m.apply(FrontendEvent::DeviceEntered {
+            addr,
+            pos: Position::Right,
+            fingerprint: "aa:bb".into(),
+        });
+        assert_eq!(
+            (m.latest_error(), m.error_seq),
+            (Some("could not resolve studio-pc"), 1),
+            "a cursor entering replaced or re-raised the error"
+        );
+        assert!(
+            m.latest_message()
+                .is_some_and(|l| l.starts_with("cursor entered")),
+            "the log's latest line is the latest event"
+        );
+
+        m.apply(FrontendEvent::PortChanged(
+            4243,
+            Some("address in use".into()),
+        ));
+        assert_eq!(
+            (m.latest_error(), m.error_seq),
+            (Some("port change failed: address in use"), 2)
+        );
     }
 }
