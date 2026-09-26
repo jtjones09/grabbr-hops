@@ -100,7 +100,10 @@ fn walk_secret_refs(y: &Yaml, refs: &mut BTreeSet<String>) {
     match y {
         Yaml::String(s) => {
             for e in expressions(s) {
-                for (i, _) in e.match_indices("secrets") {
+                // Context names are case-insensitive: `Secrets.X` reads the
+                // same secret as `secrets.X`. ASCII lowercasing keeps offsets.
+                let lower = e.to_ascii_lowercase();
+                for (i, _) in lower.match_indices("secrets") {
                     let after = &e[i + "secrets".len()..];
                     if e[..i].chars().next_back().is_some_and(is_ident)
                         || after.chars().next().is_some_and(is_ident)
@@ -343,9 +346,15 @@ mod gates {
         let empty_dmg = stage(&ASSETS[1..], &[DMG], &[]);
         assert!(!empty_dmg.ok, "an empty dmg passed:\n{}", empty_dmg.text);
 
-        // The unsigned dmg, and names that are part of a listed name: matching
-        // a whole line, not a substring, is what refuses the last two.
-        for name in ["hops-macos-unsigned.dmg", "hops", "hops-macos-universal"] {
+        // The unsigned dmg, names that are part of a listed name (matching a
+        // whole line, not a substring, refuses those), and a dotfile, which
+        // `artifacts/*` alone does not list.
+        for name in [
+            "hops-macos-unsigned.dmg",
+            "hops",
+            "hops-macos-universal",
+            ".hidden-asset",
+        ] {
             let extra = stage(&ASSETS, &[], &[name]);
             assert!(
                 !extra.ok,
@@ -637,6 +646,30 @@ fn only_the_environment_scoped_signing_job_can_read_a_secret() {
         checked,
         "every secret {SIGN} uses is checked for presence before it is used"
     );
+}
+
+// LEDGER T5a | class S | the scan T5 relies on, over inline YAML
+#[test]
+fn the_secret_scan_reads_the_context_name_in_any_case() {
+    let scan = |expr: &str| {
+        let doc = format!("env:\n  P: \"${{{{ {expr} }}}}\"\n");
+        secret_refs(&YamlLoader::load_from_str(&doc).unwrap()[0])
+    };
+    let one = |n: &str| BTreeSet::from([n.to_owned()]);
+    for expr in [
+        "secrets.MACOS_CERT_P12",
+        "Secrets.MACOS_CERT_P12",
+        "SECRETS.macos_cert_p12",
+        "sEcReTs['MACOS_CERT_P12']",
+    ] {
+        assert_eq!(scan(expr), one("MACOS_CERT_P12"), "{expr} was not seen");
+    }
+    assert_eq!(
+        scan("toJSON(Secrets)"),
+        one("*"),
+        "toJSON(Secrets) was not seen"
+    );
+    assert!(scan("github.MySecrets").is_empty(), "a longer name matched");
 }
 
 // LEDGER T6 | class S | parsed workflow YAML
