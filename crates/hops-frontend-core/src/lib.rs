@@ -8,12 +8,14 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    future::Future,
     net::SocketAddr,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
+use hops_ipc::{AsyncFrontendRequestWriter, ConnectionError, IpcError};
 use tokio::sync::{Notify, mpsc};
 
 pub use hops_ipc::{
@@ -408,6 +410,33 @@ impl AppModel {
         self.push_message(format!("error: {error}"));
         self.latest_error = Some(error);
         self.error_seq += 1;
+    }
+
+    /// The daemon connection is gone: drop every fact only a running daemon
+    /// can vouch for, so nothing renders live while nothing is (#34). What
+    /// the user configured stays, to be shown as it was last known.
+    fn daemon_gone(&mut self) {
+        self.connected = false;
+        self.connected_peers.clear();
+        self.peer_addrs.clear();
+        self.pending_pairing = None;
+        self.pending_pairing_origin = None;
+        self.pending_pairing_addr = None;
+        self.pending_pairing_since = None;
+        self.pairing_attempts.clear();
+        self.pairing_open_until = None;
+        self.discovered.clear();
+        self.discovery_active = false;
+        self.capture = Status::Disabled;
+        self.emulation = Status::Disabled;
+        for (_, state) in self.clients.values_mut() {
+            state.active_addr = None;
+            state.alive = false;
+            state.peer_commit = None;
+            state.peer_caps = None;
+            state.resolving = false;
+            state.has_pressed_keys = false;
+        }
     }
 
     /// The activity log's latest line, if any: an event or an error.
@@ -824,6 +853,9 @@ pub struct FrontendClient {
     requests: mpsc::UnboundedSender<FrontendRequest>,
 }
 
+/// What a request made while no daemon is connected is answered with.
+pub const NOT_CONNECTED: &str = "Not done: no connection to the hops service, so nothing changed.";
+
 impl FrontendClient {
     /// Spawn the auto-reconnecting connection task and return a handle. Must be
     /// called within a tokio `LocalSet` (it uses `spawn_local`).
@@ -835,7 +867,12 @@ impl FrontendClient {
         }));
         let changed = Arc::new(Notify::new());
         let (requests, request_rx) = mpsc::unbounded_channel();
-        tokio::task::spawn_local(connection_loop(model.clone(), changed.clone(), request_rx));
+        tokio::task::spawn_local(connection_loop(
+            model.clone(),
+            changed.clone(),
+            request_rx,
+            || connect_async(None),
+        ));
         Self {
             model,
             changed,
@@ -854,20 +891,55 @@ impl FrontendClient {
         self.changed.notified().await;
     }
 
-    /// Send a request to the daemon (fire-and-forget).
-    pub fn request(&self, request: FrontendRequest) {
-        let _ = self.requests.send(request);
+    /// Send a request to the daemon. Returns whether it was handed to a
+    /// connected daemon.
+    ///
+    /// While no daemon is connected the request is dropped, and the model
+    /// records [`NOT_CONNECTED`] as an error. It used to wait in the queue
+    /// and replay into whichever daemon answered next, however much later
+    /// and against whatever the device list had become (#34).
+    pub fn request(&self, request: FrontendRequest) -> bool {
+        // Under the model lock, which the connection loop also holds while it
+        // marks the daemon gone and empties the queue, so a request is either
+        // queued for a live connection or refused here, never left behind.
+        let mut model = self.model.lock().expect("model lock poisoned");
+        if model.connected && self.requests.send(request).is_ok() {
+            return true;
+        }
+        model.push_error(NOT_CONNECTED.to_string());
+        drop(model);
+        self.changed.notify_one();
+        false
     }
 }
 
-/// Connect, sync, fold events into the model, forward requests; reconnect on drop.
-async fn connection_loop(
+/// Where the connection loop writes requests: the daemon's socket, or a test
+/// double.
+trait RequestSink {
+    async fn send(&mut self, request: FrontendRequest) -> Result<(), IpcError>;
+}
+
+impl RequestSink for AsyncFrontendRequestWriter {
+    async fn send(&mut self, request: FrontendRequest) -> Result<(), IpcError> {
+        self.request(request).await
+    }
+}
+
+/// Connect, sync, fold events into the model, forward requests; reconnect on
+/// drop. `connect` waits for a daemon and opens a connection to it.
+async fn connection_loop<C, F, E, W>(
     model: Arc<Mutex<AppModel>>,
     changed: Arc<Notify>,
     mut request_rx: mpsc::UnboundedReceiver<FrontendRequest>,
-) {
+    mut connect: C,
+) where
+    C: FnMut() -> F,
+    F: Future<Output = Result<(E, W), ConnectionError>>,
+    E: Stream<Item = Result<FrontendEvent, IpcError>> + Unpin,
+    W: RequestSink,
+{
     loop {
-        let (mut events, mut writer) = match connect_async(None).await {
+        let (mut events, mut writer) = match connect().await {
             Ok(conn) => conn,
             Err(e) => {
                 log::warn!("frontend: could not connect to daemon: {e}");
@@ -885,9 +957,10 @@ async fn connection_loop(
         }
         changed.notify_one();
         // pull full initial state
-        let _ = writer.request(FrontendRequest::Sync).await;
+        let _ = writer.send(FrontendRequest::Sync).await;
 
-        loop {
+        // Requests taken from the queue that did not reach the daemon.
+        let lost = loop {
             tokio::select! {
                 event = events.next() => match event {
                     Some(Ok(event)) => {
@@ -895,34 +968,46 @@ async fn connection_loop(
                         changed.notify_one();
                     }
                     // forward-compat: skip an event line we can't decode, keep the connection
-                    Some(Err(hops_ipc::IpcError::Json(e))) => {
+                    Some(Err(IpcError::Json(e))) => {
                         log::debug!("frontend: skipping undecodable event: {e}");
                     }
                     // EOF or io error -> reconnect
-                    _ => break,
+                    _ => break 0,
                 },
                 request = request_rx.recv() => match request {
                     Some(request) => {
-                        if let Err(e) = writer.request(request).await {
+                        if let Err(e) = writer.send(request).await {
                             log::warn!("frontend: request failed: {e}");
-                            break;
+                            break 1;
                         }
                     }
                     None => return, // the FrontendClient was dropped
                 },
             }
-        }
+        };
 
         {
             let mut m = model.lock().expect("model lock poisoned");
-            m.connected = false;
-            // we lose live connect/disconnect tracking when the daemon link
-            // drops; clear it so we don't show a stale "connected" peer.
-            m.connected_peers.clear();
-            m.peer_addrs.clear();
-            m.pending_pairing = None;
-            m.pending_pairing_since = None;
-            m.pairing_attempts.clear();
+            m.daemon_gone();
+            // What was queued for this daemon is not replayed into the next
+            // one: by then the user has seen the list go stale, and a delete
+            // or a trust change must not land minutes later unannounced.
+            let mut dropped = lost;
+            while request_rx.try_recv().is_ok() {
+                dropped += 1;
+            }
+            if dropped > 0 {
+                log::warn!("frontend: the daemon went away with {dropped} request(s) not sent");
+                m.push_error(format!(
+                    "The hops service went away before {} reached it, so {} not made.",
+                    if dropped == 1 {
+                        "your last change".to_string()
+                    } else {
+                        format!("your last {dropped} changes")
+                    },
+                    if dropped == 1 { "it was" } else { "they were" },
+                ));
+            }
         }
         changed.notify_one();
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1916,5 +2001,188 @@ mod errors_apart_from_activity {
             (m.latest_error(), m.error_seq),
             (Some("port change failed: address in use"), 2)
         );
+    }
+}
+
+#[cfg(test)]
+mod the_daemon_gone {
+    //! While no daemon is connected nothing reads live, and nothing asked of
+    //! the app is kept to replay into whichever daemon answers next (#34).
+    //!
+    //! Drives the real connection loop over in-memory connections.
+    use super::*;
+    use futures::channel::mpsc as fmpsc;
+    use std::rc::Rc;
+
+    type Events = fmpsc::UnboundedReceiver<Result<FrontendEvent, IpcError>>;
+
+    /// The app's end of one connection: what the daemon writes to it goes
+    /// through `Events`, what it writes to the daemon through this.
+    struct Sink(mpsc::UnboundedSender<FrontendRequest>);
+
+    impl RequestSink for Sink {
+        async fn send(&mut self, request: FrontendRequest) -> Result<(), IpcError> {
+            self.0
+                .send(request)
+                .map_err(|_| IpcError::Io(std::io::ErrorKind::BrokenPipe.into()))
+        }
+    }
+
+    /// The daemon's end of one connection.
+    struct Daemon {
+        events: fmpsc::UnboundedSender<Result<FrontendEvent, IpcError>>,
+        received: mpsc::UnboundedReceiver<FrontendRequest>,
+    }
+
+    fn connection() -> (Daemon, (Events, Sink)) {
+        let (events, app_events) = fmpsc::unbounded();
+        let (app_requests, received) = mpsc::unbounded_channel();
+        (
+            Daemon { events, received },
+            (app_events, Sink(app_requests)),
+        )
+    }
+
+    /// Wait until `cond` holds of the model, for at most 10 s.
+    async fn until(client: &FrontendClient, what: &str, cond: impl Fn(&AppModel) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !cond(&client.snapshot()) {
+            assert!(Instant::now() < deadline, "not within 10 s: {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The next request `daemon` receives, within 10 s.
+    async fn next(daemon: &mut Daemon) -> FrontendRequest {
+        tokio::time::timeout(Duration::from_secs(10), daemon.received.recv())
+            .await
+            .expect("a request within 10 s")
+            .expect("the connection is open")
+    }
+
+    const FP: &str = "aa:bb";
+
+    // LEDGER T520 | class B | 6 struct state + requests written by connection_loop across a daemon restart
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_lost_daemon_leaves_nothing_live_and_nothing_to_replay() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let model = Arc::new(Mutex::new(AppModel::default()));
+                let changed = Arc::new(Notify::new());
+                let (requests, request_rx) = mpsc::unbounded_channel();
+                let client = FrontendClient {
+                    model: model.clone(),
+                    changed: changed.clone(),
+                    requests,
+                };
+                let (dial, answers) = mpsc::unbounded_channel::<(Events, Sink)>();
+                let answers = Rc::new(tokio::sync::Mutex::new(answers));
+                tokio::task::spawn_local(connection_loop(model, changed, request_rx, move || {
+                    let answers = answers.clone();
+                    async move {
+                        answers
+                            .lock()
+                            .await
+                            .recv()
+                            .await
+                            .ok_or(ConnectionError::Timeout)
+                    }
+                }));
+
+                let (mut first, conn) = connection();
+                assert!(dial.send(conn).is_ok(), "the loop stopped");
+                until(&client, "the first daemon answers", |m| m.connected).await;
+                assert!(matches!(next(&mut first).await, FrontendRequest::Sync));
+                let live = ClientState {
+                    active: true,
+                    alive: true,
+                    active_addr: Some("192.0.2.5:4242".parse().expect("addr")),
+                    peer_fingerprint: Some(FP.into()),
+                    ..Default::default()
+                };
+                for event in [
+                    FrontendEvent::Enumerate(vec![(0, ClientConfig::default(), live)]),
+                    FrontendEvent::DeviceConnected {
+                        addr: "192.0.2.5:50001".parse().expect("addr"),
+                        fingerprint: FP.into(),
+                    },
+                    FrontendEvent::PairingOpen { seconds: 120 },
+                    FrontendEvent::CaptureStatus(Status::Enabled),
+                ] {
+                    first.events.unbounded_send(Ok(event)).expect("open");
+                }
+                until(&client, "the device reads live", |m| {
+                    m.devices()
+                        .iter()
+                        .any(|d| d.online && d.send.as_ref().is_some_and(|s| s.state.alive))
+                        && m.pairing_open_until.is_some()
+                })
+                .await;
+
+                // The daemon stops taking requests with two queued: the first
+                // fails to write, the second is still waiting.
+                drop(first.received);
+                assert!(client.request(FrontendRequest::RemoveAuthorizedKey(FP.into())));
+                assert!(client.request(FrontendRequest::Activate(0, false)));
+                until(&client, "the loss is noticed", |m| !m.connected).await;
+                let gone = client.snapshot();
+
+                // While none is connected, a request is refused, not queued.
+                let refused = !client.request(FrontendRequest::Delete {
+                    handle: 0,
+                    fingerprint: Some(FP.into()),
+                });
+                let said = client.snapshot().latest_error().map(str::to_owned);
+
+                let (mut second, conn) = connection();
+                assert!(dial.send(conn).is_ok(), "the loop stopped");
+                until(&client, "the second daemon answers", |m| m.connected).await;
+                assert!(client.request(FrontendRequest::SaveConfiguration));
+                let mut sent = vec![];
+                loop {
+                    let request = next(&mut second).await;
+                    let last = matches!(request, FrontendRequest::SaveConfiguration);
+                    sent.push(request);
+                    if last {
+                        break;
+                    }
+                }
+
+                assert!(
+                    matches!(
+                        sent.as_slice(),
+                        [FrontendRequest::Sync, FrontendRequest::SaveConfiguration]
+                    ),
+                    "the next daemon was sent {sent:?}: what was asked of the last \
+                     one, or while none was connected, was replayed into it"
+                );
+                let d = &gone.devices()[0];
+                let s = d.send.as_ref().expect("the device is still listed");
+                assert!(
+                    !d.online && !s.state.alive && s.state.active_addr.is_none(),
+                    "with no daemon the device still reads connected or up: \
+                     online {} alive {} link {:?}",
+                    d.online,
+                    s.state.alive,
+                    s.state.active_addr
+                );
+                assert!(
+                    gone.pairing_seconds_left(Instant::now()).is_none()
+                        && gone.capture == Status::Disabled,
+                    "with no daemon the pairing window or capture still reads open"
+                );
+                assert!(
+                    gone.latest_error()
+                        .is_some_and(|e| e.contains("your last 2 changes")),
+                    "two requests the daemon never took were dropped without a word: {:?}",
+                    gone.latest_error()
+                );
+                assert!(
+                    refused && said.as_deref() == Some(NOT_CONNECTED),
+                    "a request with no daemon connected was accepted ({refused}) or \
+                     went unanswered ({said:?})"
+                );
+            })
+            .await;
     }
 }

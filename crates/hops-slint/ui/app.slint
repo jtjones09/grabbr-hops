@@ -257,7 +257,9 @@ export component AppWindow inherits Window {
                     letter-spacing: Type.mono-tracking;
                 }
             }
-            if root.capture != "enabled" || root.emulation != "enabled": PillButton {
+            // Only with a daemon to ask: without one input is off because
+            // nothing is running, and the button could only be refused (#34).
+            if root.connected && (root.capture != "enabled" || root.emulation != "enabled"): PillButton {
                 text: "enable input";
                 primary: true;
                 clicked => { root.enable-input(); }
@@ -605,6 +607,18 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                     VerticalLayout {
                         padding: Space.sm;
                         spacing: 2px;
+                        // No daemon: the rows below are what it last said,
+                        // not what is, so they are dimmed, inert, and say so
+                        // (#34).
+                        if !root.connected && root.devices.length > 0: HorizontalLayout {
+                            padding: Space.sm;
+                            Text {
+                                text: "not connected to the hops service — last known devices";
+                                color: Theme.c.warn;
+                                font-size: Type.small;
+                                overflow: elide;
+                            }
+                        }
                         if root.devices.length == 0: HorizontalLayout {
                             padding: Space.sm;
                             Text {
@@ -632,6 +646,7 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                             property <bool> confirming: revoking || deleting;
                             height: 56px;
                             border-radius: Radius.md;
+                            opacity: root.connected ? 1.0 : 0.45;
                             drow := TouchArea {}
                             background: drow.has-hover ? Theme.c.surface-raised : transparent;
                             animate background { duration: Motion.fast; }
@@ -647,7 +662,9 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                         // to OR this away, so a machine silently
                                         // rejecting everything we sent showed
                                         // green (#92).
-                                        tint: d.refuses-input
+                                        tint: !root.connected
+                                            ? Theme.c.muted
+                                            : d.refuses-input
                                             ? Theme.c.error
                                             : (d.online || d.alive)
                                             ? Theme.c.success
@@ -681,7 +698,7 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                     // One line, elided, NEVER wrapped: the row is
                                     // a fixed 56px and a wrapped block overflows
                                     // into the row below it.
-                                    if d.refuses-input: Text {
+                                    if d.refuses-input && root.connected: Text {
                                         text: "not accepting input";
                                         color: Theme.c.error;
                                         font-size: Type.caption;
@@ -791,8 +808,8 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                 if !d.has-send && !d.revoked && !revoking: VerticalLayout {
                                     alignment: center;
                                     Text {
-                                        text: d.online ? "connected" : "offline";
-                                        color: d.online ? Theme.c.success : Theme.c.muted;
+                                        text: d.online && root.connected ? "connected" : "offline";
+                                        color: d.online && root.connected ? Theme.c.success : Theme.c.muted;
                                         font-size: Type.small;
                                         font-weight: Type.medium;
                                     }
@@ -863,6 +880,9 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                     }
                                 }
                             }
+                            // Inert while no daemon is connected: a click would only be refused,
+                            // and the row no longer says what is (#34). Last, so it is on top.
+                            if !root.connected: TouchArea {}
                         }
                         if root.editing-device != "": Rectangle {
                             background: Theme.c.surface-raised;

@@ -291,6 +291,8 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
     let mut card = PairingCard::default();
     let mut show_log = false;
     let mut notice: Option<(String, Instant)> = None;
+    // The model's error sequence last put in the footer.
+    let mut errors_seen: u64 = 0;
     // A device the user just asked to create, awaiting the handle the daemon
     // assigns: `Create` is fire-and-forget, and the handle only exists once the
     // resulting `Created` event lands in a snapshot. Applied below as soon as a
@@ -326,6 +328,12 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                 }
             }
             known_handles = current;
+        }
+
+        // A request refused with no daemon, or one the daemon never took, is
+        // said here rather than only in the log (#34).
+        if let Some(error) = new_error(&model, &mut errors_seen) {
+            notice = Some((error, Instant::now()));
         }
 
         if drop_stale(&model, &mut confirm, &mut input) {
@@ -392,9 +400,14 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                         match k.code {
                             KeyCode::Enter => match input.take().expect("input set") {
                                 Input::Add { buf } => match parse_target(&buf) {
+                                    // Staged only if the Create reached a
+                                    // daemon: a staged add with none in
+                                    // flight would claim whichever handle
+                                    // appears next, another device's.
                                     Ok((host, port)) => {
-                                        pending_new = Some((host, port, free_edge(&model)));
-                                        client.request(FrontendRequest::Create);
+                                        if client.request(FrontendRequest::Create) {
+                                            pending_new = Some((host, port, free_edge(&model)));
+                                        }
                                     }
                                     Err(msg) => {
                                         notice = Some((msg.to_string(), Instant::now()));
@@ -508,7 +521,9 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                                 client.request(FrontendRequest::EnableCapture);
                                 client.request(FrontendRequest::EnableEmulation);
                             }
-                            KeyCode::Char('s') => client.request(FrontendRequest::SaveConfiguration),
+                            KeyCode::Char('s') => {
+                                client.request(FrontendRequest::SaveConfiguration);
+                            }
                             KeyCode::Char('t') => {
                                 theme_idx = (theme_idx + 1) % themes.len();
                                 theme::save_name(&themes[theme_idx].name);
@@ -562,17 +577,23 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                                 _ => {}
                             },
                             KeyCode::Char('p') => match selected.and_then(|d| d.send.as_ref()) {
-                                Some(s) => client.request(FrontendRequest::UpdatePosition(
-                                    s.handle,
-                                    next_pos(&s.config.pos),
-                                )),
+                                Some(s) => {
+                                    client.request(FrontendRequest::UpdatePosition(
+                                        s.handle,
+                                        next_pos(&s.config.pos),
+                                    ));
+                                }
                                 None => {
                                     notice = Some((NO_SEND_NOTE.to_string(), Instant::now()));
                                 }
                             },
                             KeyCode::Char(' ') => match selected.and_then(|d| d.send.as_ref()) {
-                                Some(s) => client
-                                    .request(FrontendRequest::Activate(s.handle, !s.state.active)),
+                                Some(s) => {
+                                    client.request(FrontendRequest::Activate(
+                                        s.handle,
+                                        !s.state.active,
+                                    ));
+                                }
                                 None => {
                                     notice = Some((NO_SEND_NOTE.to_string(), Instant::now()));
                                 }
@@ -779,12 +800,23 @@ fn peer_build(d: &Device) -> String {
     }
 }
 
+/// The model's latest error, if it arrived since `seen`, which is advanced.
+fn new_error(model: &AppModel, seen: &mut u64) -> Option<String> {
+    if model.error_seq == *seen {
+        return None;
+    }
+    *seen = model.error_seq;
+    model.latest_error().map(str::to_owned)
+}
+
 /// One row of the unified device list.
 ///
 /// The two facets a device can have — we cross *to* it, it may connect *in* to
 /// us — are shown as one arrow badge rather than as membership of two different
 /// lists, which is the whole point of the projection.
-fn device_row(d: &Device, theme: &Theme) -> ListItem<'static> {
+/// `live` is false while no daemon is connected: the row is then what was
+/// last known, not what is, and is drawn muted with a hollow dot (#34).
+fn device_row(d: &Device, theme: &Theme, live: bool) -> ListItem<'static> {
     let muted = Style::default().fg(col(theme.muted));
     let revoked = d.trust == TrustState::Revoked;
 
@@ -839,7 +871,7 @@ fn device_row(d: &Device, theme: &Theme) -> ListItem<'static> {
             "pair again with a new identity to come back",
             muted,
         ));
-        return ListItem::new(Line::from(spans));
+        return row_item(spans, live, theme);
     }
 
     spans.push(Span::styled(
@@ -879,6 +911,24 @@ fn device_row(d: &Device, theme: &Theme) -> ListItem<'static> {
         spans.push(Span::styled("connects in only", muted));
     }
 
+    row_item(spans, live, theme)
+}
+
+/// A device row's spans as a list item: as built while a daemon is
+/// connected, and all muted, the dot hollow, while none is.
+fn row_item(spans: Vec<Span<'static>>, live: bool, theme: &Theme) -> ListItem<'static> {
+    if live {
+        return ListItem::new(Line::from(spans));
+    }
+    let muted = Style::default().fg(col(theme.muted));
+    let spans: Vec<Span<'static>> = spans
+        .into_iter()
+        .enumerate()
+        .map(|(i, span)| match i {
+            0 => Span::styled("○", muted),
+            _ => Span::styled(span.content, muted),
+        })
+        .collect();
     ListItem::new(Line::from(spans))
 }
 
@@ -994,11 +1044,21 @@ fn ui(
             muted,
         )))]
     } else {
-        devices.iter().map(|d| device_row(d, theme)).collect()
+        devices
+            .iter()
+            .map(|d| device_row(d, theme, model.connected))
+            .collect()
     };
     f.render_stateful_widget(
         List::new(rows)
-            .block(panel(Span::styled(" devices ", accent), true))
+            .block(panel(
+                if model.connected || devices.is_empty() {
+                    Span::styled(" devices ", accent)
+                } else {
+                    Span::styled(" devices · last known, not connected ", muted)
+                },
+                true,
+            ))
             .highlight_style(highlight)
             .highlight_symbol("▶ "),
         chunks[1],
@@ -1402,6 +1462,73 @@ mod tests {
 
     fn screen(model: &AppModel, sel: usize) -> String {
         render(model, sel).join("\n")
+    }
+
+    /// With no daemon connected the rows are what was last known, and are
+    /// drawn that way rather than live (#34).
+    // LEDGER T521 | class B | 3 widget tree: ui() rendered to a test terminal
+    #[test]
+    fn with_no_daemon_the_rows_are_hollow_and_say_last_known() {
+        let mut model = AppModel::default();
+        model.connected = true;
+        let live = ClientState {
+            active: true,
+            alive: true,
+            active_addr: Some("192.0.2.5:4242".parse().expect("addr")),
+            peer_fingerprint: Some(FP.into()),
+            ..Default::default()
+        };
+        let config = ClientConfig {
+            hostname: Some("studio-pc".into()),
+            ..Default::default()
+        };
+        model.apply(FrontendEvent::Enumerate(vec![(0, config, live)]));
+        let row = |m: &AppModel| {
+            render(m, 0)
+                .into_iter()
+                .find(|l| l.contains("studio-pc"))
+                .expect("the device row is on screen")
+        };
+        assert!(
+            row(&model).contains('●'),
+            "precondition: a live row has a solid dot"
+        );
+
+        model.connected = false;
+        let out = screen(&model, 0);
+        assert!(
+            row(&model).contains('○') && !row(&model).contains('●'),
+            "with no daemon the row still has a live dot:\n{out}"
+        );
+        assert!(
+            out.contains("last known"),
+            "with no daemon nothing says the list is the last known one:\n{out}"
+        );
+    }
+
+    /// A refused request, and an error from the daemon, reach the footer
+    /// once each (#34).
+    // LEDGER T522 | class B | 1 return value: new_error over AppModel::apply
+    #[test]
+    fn each_new_error_reaches_the_footer_once() {
+        let mut model = AppModel::default();
+        let mut seen = 0;
+        assert_eq!(new_error(&model, &mut seen), None);
+        model.apply(FrontendEvent::Error("could not resolve studio-pc".into()));
+        assert_eq!(
+            new_error(&model, &mut seen).as_deref(),
+            Some("could not resolve studio-pc")
+        );
+        assert_eq!(
+            new_error(&model, &mut seen),
+            None,
+            "the same error was raised again"
+        );
+        model.apply(FrontendEvent::Error("could not resolve studio-pc".into()));
+        assert!(
+            new_error(&model, &mut seen).is_some(),
+            "a repeat of the failure was not raised"
+        );
     }
 
     /// A machine that may already drive this one answers this machine's dial.

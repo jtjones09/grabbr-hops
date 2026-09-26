@@ -511,16 +511,22 @@ type PendingCreate = (String, u16, Position, Vec<std::net::IpAddr>);
 ///
 /// Taking the request as an argument is what makes that testable: the omission
 /// was invisible precisely because nothing could observe it.
+///
+/// `request` returns whether the request reached a daemon. When it did not,
+/// nothing is staged: a staged create with none in flight would claim the
+/// next handle to appear, which is another device's once a daemon answers.
 fn stage_create(
     pending: &RefCell<Option<PendingCreate>>,
-    request: impl FnOnce(FrontendRequest),
+    request: impl FnOnce(FrontendRequest) -> bool,
     name: String,
     port: u16,
     position: Position,
     fix_ips: Vec<std::net::IpAddr>,
 ) {
     *pending.borrow_mut() = Some((name, port, position, fix_ips));
-    request(FrontendRequest::Create);
+    if !request(FrontendRequest::Create) {
+        *pending.borrow_mut() = None;
+    }
 }
 
 /// Put `fingerprint`'s request on the pairing card.
@@ -873,7 +879,9 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
     }
     {
         let c = client.clone();
-        ui.on_open_pairing(move || c.request(FrontendRequest::OpenPairing));
+        ui.on_open_pairing(move || {
+            c.request(FrontendRequest::OpenPairing);
+        });
     }
     {
         let c = client.clone();
@@ -1546,6 +1554,7 @@ mod staging_a_create {
     use super::{FrontendRequest, Position, stage_create};
     use std::cell::RefCell;
 
+    // LEDGER T524 | class B | 6 struct state + requests passed to stage_create's sender
     #[test]
     fn staging_also_asks_the_daemon_for_a_handle() {
         let pending = RefCell::new(None);
@@ -1553,7 +1562,10 @@ mod staging_a_create {
 
         stage_create(
             &pending,
-            |r| sent.borrow_mut().push(r),
+            |r| {
+                sent.borrow_mut().push(r);
+                true
+            },
             "SCORNW20.local".into(),
             4242,
             Position::Left,
@@ -1575,6 +1587,7 @@ mod staging_a_create {
         );
     }
 
+    // LEDGER T525 | class B | 6 struct state: stage_create's pending cell
     #[test]
     fn what_was_staged_is_what_was_given() {
         let pending = RefCell::new(None);
@@ -1582,7 +1595,10 @@ mod staging_a_create {
         let ips: Vec<std::net::IpAddr> = vec!["10.0.0.5".parse().unwrap()];
         stage_create(
             &pending,
-            |r| sent.borrow_mut().push(r),
+            |r| {
+                sent.borrow_mut().push(r);
+                true
+            },
             "host".into(),
             9999,
             Position::Right,
@@ -1593,6 +1609,27 @@ mod staging_a_create {
             Some(("host".to_string(), 9999u16, Position::Right, ips)),
             "a discovered machine's pinned addresses are why it connects \
              without DNS agreeing first — dropping them there would be silent"
+        );
+    }
+    /// With no daemon connected the create is refused, and nothing may wait
+    /// for a handle: the first handles a daemon reports later are the
+    /// existing devices', and one of them would take this name and edge.
+    // LEDGER T519 | class B | 6 struct state: stage_create's pending cell
+    #[test]
+    fn a_create_no_daemon_took_stages_nothing() {
+        let pending = RefCell::new(None);
+        stage_create(
+            &pending,
+            |_| false,
+            "host".into(),
+            4242,
+            Position::Left,
+            Vec::new(),
+        );
+        assert_eq!(
+            *pending.borrow(),
+            None,
+            "an add that never reached a daemon was left waiting for a handle"
         );
     }
 }
