@@ -136,7 +136,7 @@ fn merge_clients(
         return Ok(());
     }
     // Every index below is one into `theirs`, read from this array.
-    let file = clients_of(doc)?;
+    let (file, above) = clients_of(doc)?;
     for (t, o, b) in edits {
         if let (Some(entry), Some(new)) = (file.get_mut(t), fresh.get(o)) {
             change_fields(entry, &base[b], &ours[o], new);
@@ -172,19 +172,33 @@ fn merge_clients(
             file.push(new);
         }
     }
+    // A list written inline had the comment above it on its key, which is
+    // gone: it goes above the first entry. With none left, it goes with them.
+    if let (Some(above), Some(first)) = (above, file.get_mut(0)) {
+        let own = first
+            .decor()
+            .prefix()
+            .and_then(|p| p.as_str())
+            .unwrap_or("");
+        let prefix = format!("{above}{own}");
+        first.decor_mut().set_prefix(prefix);
+    }
     Ok(())
 }
 
-/// The file's `[[clients]]`, made one if it is missing or written inline.
+/// The file's `[[clients]]`, made one if it is missing or written inline,
+/// and the comment above a list that was written inline.
 ///
 /// Refused when that would lose entries: a device can also be written as an
 /// array of its fields in order, which has no table to edit.
-fn clients_of(doc: &mut DocumentMut) -> Result<&mut ArrayOfTables, MergeError> {
+fn clients_of(doc: &mut DocumentMut) -> Result<(&mut ArrayOfTables, Option<String>), MergeError> {
     let table = doc.as_table_mut();
     let inline = table
         .get("clients")
         .is_some_and(|item| !item.is_array_of_tables());
+    let mut above = None;
     if inline {
+        above = comment_above(table, "clients");
         // `clients = [ { .. } ]`, or `clients = []`
         let item = table.remove("clients").unwrap_or_default();
         let entries = match item.into_array_of_tables() {
@@ -194,11 +208,19 @@ fn clients_of(doc: &mut DocumentMut) -> Result<&mut ArrayOfTables, MergeError> {
         };
         table.insert("clients", Item::ArrayOfTables(entries));
     }
-    table
+    let file = table
         .entry("clients")
         .or_insert(Item::ArrayOfTables(ArrayOfTables::new()))
         .as_array_of_tables_mut()
-        .ok_or(MergeError::Shape)
+        .ok_or(MergeError::Shape)?;
+    Ok((file, above))
+}
+
+/// The comment on the lines above `key` in `table`, which toml_edit keeps
+/// on the key and drops with it.
+fn comment_above(table: &Table, key: &str) -> Option<String> {
+    let prefix = table.key(key)?.leaf_decor().prefix()?.as_str()?;
+    prefix.contains('#').then(|| prefix.to_string())
 }
 
 /// Write into `entry` the fields the daemon changed between `base` and
@@ -258,12 +280,23 @@ fn replace(doc: &mut DocumentMut, fresh: &DocumentMut, key: &str) {
         return;
     };
     let mut new = detached(new);
-    if let (Some(Item::Table(old)), Item::Table(table)) = (doc.get(key), &mut new) {
-        // where the old table was, with the comment above it
-        if let Some(at) = old.position() {
-            place(table, at);
+    if let Item::Table(table) = &mut new {
+        match doc.get(key) {
+            // where the old table was, with the comment above it
+            Some(Item::Table(old)) => {
+                if let Some(at) = old.position() {
+                    place(table, at);
+                }
+                *table.decor_mut() = old.decor().clone();
+            }
+            // written inline, with the comment above it on its key
+            Some(_) => {
+                if let Some(above) = comment_above(doc.as_table(), key) {
+                    table.decor_mut().set_prefix(above);
+                }
+            }
+            None => {}
         }
-        *table.decor_mut() = old.decor().clone();
     }
     doc.insert(key, new);
 }

@@ -2265,4 +2265,72 @@ aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
             "a save dropped a comment of an entry it changed, or moved it: {wrong:#?}"
         );
     }
+
+    // LEDGER T29 | class B | 4 file on disk written by Config::write_back
+    #[test]
+    fn a_comment_above_a_table_written_inline_stays_when_a_save_rewrites_it() {
+        const TRUST: &str = "# who may drive this machine\n";
+        const DEVICES: &str = "# the machines beside this one\n";
+        type Change = fn(&mut Config);
+        let cases: [(&str, String, Change, String); 3] = [
+            (
+                "trust",
+                format!(
+                    "port = 4343\n{TRUST}authorized_fingerprints = {{ \"{DESK}\" = \"desk\" }}\n"
+                ),
+                |c| {
+                    c.set_authorized_keys(HashMap::from([
+                        (DESK.to_string(), "desk".to_string()),
+                        (OTHER.to_string(), "den".to_string()),
+                    ]))
+                },
+                format!("{TRUST}[authorized_fingerprints]\n"),
+            ),
+            (
+                "devices",
+                format!(
+                    "{DEVICES}clients = [ {{ hostname = \"desk-mac\", position = \"left\" }} ]\n"
+                ),
+                |c| {
+                    let mut clients = c.clients();
+                    clients[0].pos = Position::Top;
+                    c.set_clients(clients);
+                },
+                format!("{DEVICES}[[clients]]\n"),
+            ),
+            (
+                "none",
+                format!("{DEVICES}clients = []\n"),
+                |c| {
+                    let mut clients = c.clients();
+                    clients.push(ConfigClient {
+                        ips: HashSet::new(),
+                        hostname: Some("desk-mac".to_string()),
+                        port: DEFAULT_PORT,
+                        pos: Position::Left,
+                        active: false,
+                        enter_hook: None,
+                        fingerprint: None,
+                    });
+                    c.set_clients(clients);
+                },
+                format!("{DEVICES}[[clients]]\n"),
+            ),
+        ];
+        let mut wrong = vec![];
+        for (tag, before, change, above) in cases {
+            let (s, mut config) = scratch(&format!("inline{tag}"), &before);
+            change(&mut config);
+            config.write_back().expect("the save");
+            let saved = fs::read_to_string(&s.path).expect("the config");
+            if !saved.contains(&above) {
+                wrong.push(format!("{tag}:\n{saved}"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "a save that rewrote a table written inline dropped the comment \
+             above it: {wrong:#?}"
+        );
+    }
 }
