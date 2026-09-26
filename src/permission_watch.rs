@@ -163,6 +163,7 @@ impl PermissionWatch {
     /// watched until each says it runs. A backend that cannot be created
     /// never says it stopped, so a daemon started without a permission is
     /// watched only because of this.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn at_daemon_start(probe: Probe, restarts: Restarts, every: Duration) -> Self {
         let mut watch = Self::new(probe, restarts, every);
         watch.stopped(Side::Capture);
