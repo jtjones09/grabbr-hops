@@ -193,10 +193,10 @@ fn config_dir() -> Option<PathBuf> {
     Some(crate::prefs::config_base()?.join("lan-mouse"))
 }
 
+/// The user's themes: beside `config.toml`, or where an earlier build kept
+/// them if that is the only place that has any (#173).
 fn themes_dir() -> Option<PathBuf> {
-    let mut p = config_dir()?;
-    p.push("themes");
-    Some(p)
+    crate::prefs::readable("themes")
 }
 
 /// On-disk theme schema — every field is a `"#rrggbb"` hex string. A user theme
@@ -344,7 +344,7 @@ fn pref_path() -> Option<PathBuf> {
 
 /// The persisted theme name, if any (UI-local; lives next to config.toml).
 pub fn load_name() -> Option<String> {
-    let s = std::fs::read_to_string(pref_path()?).ok()?;
+    let s = std::fs::read_to_string(crate::prefs::readable("tui-theme")?).ok()?;
     let s = s.trim().to_string();
     (!s.is_empty()).then_some(s)
 }
