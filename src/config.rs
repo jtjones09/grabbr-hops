@@ -349,6 +349,7 @@ pub struct Config {
     watch_rx: tokio::sync::mpsc::Receiver<Result<notify::Event, notify::Error>>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub struct ConfigClient {
     pub ips: HashSet<IpAddr>,
     pub hostname: Option<String>,

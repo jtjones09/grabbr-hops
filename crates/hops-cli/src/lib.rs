@@ -73,6 +73,32 @@ enum CliSubcommand {
     SaveConfig,
 }
 
+/// The pin of device `id` as the daemon has it now: `None` (after saying so)
+/// if there is no such device.
+///
+/// The daemon refuses a delete or rename that names a different pin than the
+/// device has, so the one the CLI acts on is the one it just read.
+async fn pin_of(
+    rx: &mut hops_ipc::AsyncFrontendEventReader,
+    tx: &mut hops_ipc::AsyncFrontendRequestWriter,
+    id: ClientHandle,
+) -> Result<Option<Option<String>>, CliError> {
+    tx.request(FrontendRequest::Enumerate()).await?;
+    while let Some(e) = rx.next().await {
+        if let FrontendEvent::Enumerate(clients) = e? {
+            let pin = clients
+                .into_iter()
+                .find(|(h, _, _)| *h == id)
+                .map(|(_, _, s)| s.peer_fingerprint);
+            if pin.is_none() {
+                eprintln!("no device with id {id}");
+            }
+            return Ok(pin);
+        }
+    }
+    Ok(None)
+}
+
 pub async fn run(args: CliArgs) -> Result<(), CliError> {
     execute(args.command).await?;
     Ok(())
@@ -93,8 +119,13 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
             while let Some(e) = rx.next().await {
                 if let FrontendEvent::Created(handle, _, _) = e? {
                     if let Some(hostname) = hostname {
-                        tx.request(FrontendRequest::UpdateHostname(handle, Some(hostname)))
-                            .await?;
+                        // Just created: never connected, so no pin.
+                        tx.request(FrontendRequest::UpdateHostname {
+                            handle,
+                            hostname: Some(hostname),
+                            fingerprint: None,
+                        })
+                        .await?;
                     }
                     if let Some(port) = port {
                         tx.request(FrontendRequest::UpdatePort(handle, port))
@@ -108,7 +139,15 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                 }
             }
         }
-        CliSubcommand::RemoveClient { id } => tx.request(FrontendRequest::Delete(id)).await?,
+        CliSubcommand::RemoveClient { id } => {
+            if let Some(fingerprint) = pin_of(&mut rx, &mut tx, id).await? {
+                tx.request(FrontendRequest::Delete {
+                    handle: id,
+                    fingerprint,
+                })
+                .await?
+            }
+        }
         CliSubcommand::Activate { id } => tx.request(FrontendRequest::Activate(id, true)).await?,
         CliSubcommand::Deactivate { id } => {
             tx.request(FrontendRequest::Activate(id, false)).await?
@@ -123,8 +162,10 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                         let pos = config.pos;
                         let active = state.active;
                         let ips = state.ips;
+                        let pin = state.peer_fingerprint.unwrap_or("none".to_owned());
                         println!(
-                            "id {handle}: {host}:{port} ({pos}) active: {active}, ips: {ips:?}"
+                            "id {handle}: {host}:{port} ({pos}) active: {active}, ips: {ips:?}, \
+                             fingerprint: {pin}"
                         );
                     }
                     break;
@@ -132,8 +173,14 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
             }
         }
         CliSubcommand::SetHost { id, host } => {
-            tx.request(FrontendRequest::UpdateHostname(id, host))
+            if let Some(fingerprint) = pin_of(&mut rx, &mut tx, id).await? {
+                tx.request(FrontendRequest::UpdateHostname {
+                    handle: id,
+                    hostname: host,
+                    fingerprint,
+                })
                 .await?
+            }
         }
         CliSubcommand::SetPort { id, port } => {
             tx.request(FrontendRequest::UpdatePort(id, port)).await?

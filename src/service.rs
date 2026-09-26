@@ -2,7 +2,7 @@ use crate::{
     capture::{Capture, CaptureType, ICaptureEvent},
     client::ClientManager,
     clipboard::{Clipboard, ClipboardEvent, ClipboardInbox},
-    config::{Config, ConfigClient, ConfigError},
+    config::{Config, ConfigError},
     connect::{ClipboardSender, LanMouseConnection},
     crypto,
     discovery::{DiscoveredPeer, Discovery, DiscoveryEvent},
@@ -708,7 +708,17 @@ impl Service {
                 self.add_client();
                 self.save_config();
             }
-            FrontendRequest::Delete(handle) => {
+            FrontendRequest::Delete {
+                handle,
+                fingerprint,
+            } => {
+                // Only the device the frontend showed. Handles are never
+                // reused, but the device behind one can learn or lose its pin
+                // between the frontend drawing it and the user confirming, and
+                // the pin is what gets revoked below.
+                if !self.still_as_shown(handle, fingerprint.as_deref(), "deleted") {
+                    return;
+                }
                 // Deleting a device REVOKES it. hops can read every keystroke on
                 // the machine, so "remove this device" has to mean removed —
                 // previously delete forgot the dial address but left the peer's
@@ -716,9 +726,8 @@ impl Service {
                 // could still take their keyboard and mouse.
                 //
                 // Deliberately here and NOT in remove_client(): that is also
-                // called by handle_config_change, which removes every client
-                // before rebuilding them, so revoking there would wipe the entire
-                // trust store on any config reload.
+                // called by handle_config_change, which removes clients it
+                // replaces, so revoking there would drop trust on a reload.
                 if let Some(fp) = self.client_manager.peer_fingerprint(handle) {
                     if self.trust.read().expect("lock").is_known(&fp) {
                         log::warn!("deleting client {handle}: also revoking its trust ({fp})");
@@ -735,8 +744,15 @@ impl Service {
                 self.update_fix_ips(handle, fix_ips);
                 self.save_config();
             }
-            FrontendRequest::UpdateHostname(handle, host) => {
-                self.update_hostname(handle, host);
+            FrontendRequest::UpdateHostname {
+                handle,
+                hostname,
+                fingerprint,
+            } => {
+                if !self.still_as_shown(handle, fingerprint.as_deref(), "renamed") {
+                    return;
+                }
+                self.update_hostname(handle, hostname);
                 self.save_config();
             }
             FrontendRequest::UpdatePort(handle, port) => {
@@ -785,16 +801,8 @@ impl Service {
     fn save_config(&mut self) {
         let clients = self.client_manager.clients();
         let clients = clients
-            .into_iter()
-            .map(|(c, s)| ConfigClient {
-                ips: HashSet::from_iter(c.fix_ips),
-                hostname: c.hostname,
-                port: c.port,
-                pos: c.pos,
-                active: s.active,
-                enter_hook: c.cmd,
-                fingerprint: s.peer_fingerprint,
-            })
+            .iter()
+            .map(|(c, s)| crate::client::config_entry(c, s))
             .collect();
         self.config.set_clients(clients);
         // A CACHE, written and never read back as authority. It exists so an
@@ -809,13 +817,21 @@ impl Service {
     }
 
     fn handle_config_change(&mut self) {
-        for h in self.client_manager.registered_clients() {
+        // Only what the edit changed. A device whose entry reads the same keeps
+        // its handle, connection and capture; one whose entry changed or went
+        // is removed, and its replacement gets a handle never used before. So
+        // no handle a frontend or a dial holds can come to name another
+        // device (#94, #97).
+        let plan = self.client_manager.plan_reload(self.config.clients());
+        log::info!(
+            "config reloaded: {} device(s) replaced or removed, {} added",
+            plan.stale.len(),
+            plan.fresh.len()
+        );
+        for h in plan.stale {
             self.remove_client(h);
         }
-        // Every client is gone; hand out 0,1,2… again rather than letting the
-        // slab's LIFO free list reverse the numbering (#94).
-        self.client_manager.reset_handle_allocation();
-        for c in self.config.clients() {
+        for c in plan.fresh {
             let handle = self.client_manager.add_with_config(c);
             log::info!("added client {handle}");
             let (c, s) = self.client_manager.get_state(handle).unwrap();
@@ -1435,11 +1451,7 @@ impl Service {
     /// verb, used by removal, where everything goes.
     fn cut_sessions_dir(&mut self, fp: &str, lost: crate::trust::Caps) {
         use crate::trust::Caps;
-        let handles = if lost.contains(Caps::I_MAY_DRIVE) {
-            self.client_manager.handles_with_fingerprint(fp)
-        } else {
-            Vec::new()
-        };
+        let cut_outbound = lost.contains(Caps::I_MAY_DRIVE);
         let cut_inbound = lost.contains(Caps::DRIVE_ME);
         let (inbound, outbound, peer) = (
             self.revoke_listen.clone(),
@@ -1452,7 +1464,11 @@ impl Service {
             } else {
                 0
             };
-            let cut_out = outbound.close_handles(&handles).await;
+            let cut_out = if cut_outbound {
+                outbound.close_fingerprint(&peer).await
+            } else {
+                0
+            };
             if cut_in + cut_out > 0 {
                 log::warn!(
                     "{peer}: lease lapsed, cut {cut_in} incoming + {cut_out} outgoing session(s)"
@@ -1462,9 +1478,11 @@ impl Service {
     }
 
     fn cut_sessions(&mut self, fp: &str) {
-        // Resolve the handles first: clear_pins_matching erases the fingerprint
-        // that the outbound match is made on.
-        let handles = self.client_manager.handles_with_fingerprint(fp);
+        // Outbound links are found by the certificate each one proved, not by
+        // which device points at it: by the time this runs the device may be
+        // deleted, re-addressed, or replaced by a reload, and a lookup by
+        // device then closed nothing while the revoked machine kept its link
+        // and its clipboard.
         let (inbound, outbound, revoked) = (
             self.revoke_listen.clone(),
             self.revoke_conn.clone(),
@@ -1472,7 +1490,7 @@ impl Service {
         );
         tokio::task::spawn_local(async move {
             let cut_in = inbound.close_fingerprint(&revoked).await;
-            let cut_out = outbound.close_handles(&handles).await;
+            let cut_out = outbound.close_fingerprint(&revoked).await;
             if cut_in + cut_out > 0 {
                 log::warn!(
                     "revoked {revoked}: cut {cut_in} incoming + {cut_out} outgoing session(s)"
@@ -1747,15 +1765,53 @@ impl Service {
 
     fn remove_client(&mut self, handle: ClientHandle) {
         self.adding.remove(&handle);
-        if self
-            .client_manager
-            .remove_client(handle)
-            .map(|(_, s)| s.active)
-            .unwrap_or(false)
-        {
+        let removed = self.client_manager.remove_client(handle);
+        if removed.as_ref().is_some_and(|(_, s)| s.active) {
             self.capture.destroy(handle);
         }
+        // Close the device's connection. Nothing can address it once the
+        // device is gone, since handles are never reused, but it stays open
+        // and still carries clipboard text until something closes it.
+        if let Some(addr) = removed.and_then(|(_, s)| s.active_addr) {
+            let outbound = self.revoke_conn.clone();
+            tokio::task::spawn_local(async move {
+                if outbound.close_addr(addr).await {
+                    log::info!("client {handle} removed: closed its connection to {addr}");
+                }
+            });
+        }
         self.notify_frontend(FrontendEvent::Deleted(handle));
+    }
+
+    /// Whether `handle` is still the device a frontend showed as pinned to
+    /// `shown`, before acting on it as `what` (past tense).
+    ///
+    /// A frontend acts on what it drew some time ago. Refusing a device whose
+    /// pin changed since is what keeps a delete, which revokes the pin, from
+    /// reaching a machine that was never on that row.
+    fn still_as_shown(&mut self, handle: ClientHandle, shown: Option<&str>, what: &str) -> bool {
+        let Some((_, state)) = self.client_manager.get_state(handle) else {
+            log::warn!("client {handle} was not {what}: no such device");
+            self.notify_frontend(FrontendEvent::NoSuchClient(handle));
+            return false;
+        };
+        let canonical = |fp: &str| {
+            hops_ipc::pairing::canonical_fingerprint(fp).unwrap_or_else(|| fp.trim().to_lowercase())
+        };
+        if state.peer_fingerprint.as_deref().map(canonical) == shown.map(canonical) {
+            return true;
+        }
+        log::warn!(
+            "client {handle} was not {what}: it is pinned to {:?}, and the request \
+             was made for {shown:?}",
+            state.peer_fingerprint
+        );
+        self.notify_frontend(FrontendEvent::Error(format!(
+            "Nothing was {what}: that device changed since it was shown. Check it and \
+             try again."
+        )));
+        self.broadcast_client(handle);
+        false
     }
 
     fn update_fix_ips(&mut self, handle: ClientHandle, fix_ips: Vec<IpAddr>) {
@@ -2343,81 +2399,6 @@ mod attempt_origin_guard {
             "the raise sites pass {passed:?}. Both provenances must still be raised: \
              if they all pass the same one, a prompt our own dial summoned is \
              indistinguishable from a peer knocking — the #61 defect."
-        );
-    }
-}
-
-#[cfg(test)]
-mod reload_resets_handles {
-    //! The reload path itself must reset handle allocation.
-    //!
-    //! `client::reload_permutation` proves `ClientManager` behaves once the
-    //! reset is called. It cannot prove `handle_config_change` calls it — that
-    //! test drives the manager directly, so dropping the call here would leave
-    //! it green while the real reload renumbered every device again (#94).
-    //!
-    //! That is the false-pass shape this project keeps producing, so it gets its
-    //! own guard.
-
-    /// Non-test source only. Split on the marker WITHOUT a trailing newline:
-    /// `include_str!` keeps CRLF on a Windows checkout, and a trailing `\n`
-    /// there matches a `\r` and never fires.
-    fn production() -> &'static str {
-        const FULL: &str = include_str!("service.rs");
-        FULL.split("\n#[cfg(test)]").next().unwrap_or(FULL)
-    }
-
-    #[test]
-    fn handle_config_change_resets_handle_allocation() {
-        let src = production();
-        let body = src
-            .split("fn handle_config_change(")
-            .nth(1)
-            .expect("handle_config_change must exist; if renamed, update this guard");
-        let body = &body[..body.find("\n    fn ").unwrap_or(body.len())];
-        // Strip comments: the prose here explains the reset and would otherwise
-        // satisfy the search on its own.
-        let code: String = body
-            .lines()
-            .map(|l| l.split("//").next().unwrap_or(""))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            code.contains("reset_handle_allocation()"),
-            "handle_config_change removes every client and re-adds them, and Slab \
-             reuses freed keys from a LIFO free list — so without resetting, a \
-             reload REVERSES the device numbering and reverses it back on the \
-             next one. Delete is keyed by handle and tombstones irreversibly, so \
-             this silently aims an irreversible verb at the wrong machine (#94)."
-        );
-    }
-
-    /// And the reset must come after the removals, never before — resetting
-    /// first would drop live clients without tearing down their capture.
-    #[test]
-    fn the_reset_comes_after_the_removals() {
-        let src = production();
-        let body = src
-            .split("fn handle_config_change(")
-            .nth(1)
-            .expect("exists");
-        let body = &body[..body.find("\n    fn ").unwrap_or(body.len())];
-        let code: String = body
-            .lines()
-            .map(|l| l.split("//").next().unwrap_or(""))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let remove = code
-            .find("self.remove_client(")
-            .expect("the reload must still tear clients down");
-        let reset = code
-            .find("reset_handle_allocation()")
-            .expect("the reload must still reset handle allocation");
-        assert!(
-            remove < reset,
-            "reset_handle_allocation clears the slab outright; running it before \
-             the removals would drop live clients without destroying their \
-             capture."
         );
     }
 }

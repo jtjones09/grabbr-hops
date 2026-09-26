@@ -1203,9 +1203,9 @@ mod release_mid_drag {
     }
 
     // LEDGER T20 | class B | 2 frames received by listen::LanMouseListener
-    /// A config reload removes every client and adds them back, numbered from
-    /// 0 again, before capture hears of either. The client the cursor was on
-    /// comes back under the same handle, not yet connected.
+    /// A config reload that edits the entry of the client the cursor is on
+    /// removes that client and adds its replacement, under a new handle,
+    /// before capture hears of either.
     #[test]
     fn reloading_the_config_mid_drag_sends_the_button_up() {
         run_local(async {
@@ -1215,7 +1215,6 @@ mod release_mid_drag {
             // Service::handle_config_change, for the one client.
             let (config, state) = v.clients.remove_client(v.handle).expect("precondition");
             v.capture.destroy(v.handle);
-            v.clients.reset_handle_allocation();
             let handle = v.clients.add_with_config(crate::config::ConfigClient {
                 ips: config.fix_ips.iter().copied().collect(),
                 hostname: config.hostname,
@@ -1225,7 +1224,6 @@ mod release_mid_drag {
                 enter_hook: config.cmd,
                 fingerprint: state.peer_fingerprint,
             });
-            assert_eq!(handle, v.handle, "precondition: the handle is reused");
             v.clients.deactivate_client(handle);
             assert!(v.clients.activate_client(handle), "precondition");
             v.capture

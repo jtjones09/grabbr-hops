@@ -421,14 +421,27 @@ pub enum FrontendRequest {
     Create,
     /// change the listen port (recreate udp listener)
     ChangePort(u16),
-    /// remove a client
-    Delete(ClientHandle),
+    /// Remove a device, and revoke the machine it is pinned to.
+    ///
+    /// `fingerprint` is the device's pin as the frontend showed it (`None` for
+    /// one never connected). The daemon refuses the request if the device's
+    /// pin is no longer that, so a delete aimed at what the user saw cannot
+    /// revoke a machine the user never saw on that row (#94).
+    Delete {
+        handle: ClientHandle,
+        fingerprint: Option<String>,
+    },
     /// request an enumeration of all clients
     Enumerate(),
     /// resolve dns
     ResolveDns(ClientHandle),
-    /// update hostname
-    UpdateHostname(ClientHandle, Option<String>),
+    /// Rename a device: set the hostname it dials. `fingerprint` is its pin as
+    /// the frontend showed it, and a mismatch is refused, as for `Delete`.
+    UpdateHostname {
+        handle: ClientHandle,
+        hostname: Option<String>,
+        fingerprint: Option<String>,
+    },
     /// update port
     UpdatePort(ClientHandle, u16),
     /// update position

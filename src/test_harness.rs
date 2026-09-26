@@ -501,3 +501,95 @@ pub(crate) mod logs {
         }
     }
 }
+
+/// A receiver that answers dials only when told to, then records what
+/// happens to each connection: how many streams the dialler opened on it and
+/// whether it was closed.
+///
+/// Holding the handshake is what puts a dial "in flight" for as long as a
+/// test needs: the dialler has read the device's address and is waiting, and
+/// the test can change the device before letting the dial land.
+pub(crate) struct Door {
+    pub(crate) port: u16,
+    knocks: std::rc::Rc<std::cell::Cell<u32>>,
+    open: std::rc::Rc<std::cell::Cell<bool>>,
+    streams: std::rc::Rc<std::cell::Cell<u32>>,
+    closed: std::rc::Rc<std::cell::Cell<u32>>,
+}
+
+impl Door {
+    /// Dials that have reached the door, answered or not.
+    pub(crate) fn knocks(&self) -> u32 {
+        self.knocks.get()
+    }
+
+    /// Let every dial in, now and from here on.
+    pub(crate) fn open(&self) {
+        self.open.set(true);
+    }
+
+    /// Streams the dialler has opened across every connection. The first on
+    /// each connection carries input; any after it carries clipboard text.
+    pub(crate) fn streams(&self) -> u32 {
+        self.streams.get()
+    }
+
+    /// Connections that have been closed, by either end.
+    pub(crate) fn closed(&self) -> u32 {
+        self.closed.get()
+    }
+}
+
+/// `me` behind a [`Door`] on 127.0.0.1, shut until [`Door::open`].
+pub(crate) fn door(me: &Machine) -> Door {
+    use std::{cell::Cell, rc::Rc};
+    let mut crypto = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![me.identity.cert.clone()], me.identity.key.clone_key())
+        .expect("server cert");
+    crypto.alpn_protocols = vec![transport::ALPN.to_vec()];
+    let config = quinn::ServerConfig::with_crypto(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(crypto).expect("quic server"),
+    ));
+    let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().expect("addr"))
+        .expect("server endpoint");
+    let port = endpoint.local_addr().expect("local addr").port();
+    let door = Door {
+        port,
+        knocks: Rc::new(Cell::new(0)),
+        open: Rc::new(Cell::new(false)),
+        streams: Rc::new(Cell::new(0)),
+        closed: Rc::new(Cell::new(0)),
+    };
+    let (knocks, open, streams, closed) = (
+        door.knocks.clone(),
+        door.open.clone(),
+        door.streams.clone(),
+        door.closed.clone(),
+    );
+    tokio::task::spawn_local(async move {
+        while let Some(incoming) = endpoint.accept().await {
+            knocks.set(knocks.get() + 1);
+            let (open, streams, closed) = (open.clone(), streams.clone(), closed.clone());
+            tokio::task::spawn_local(async move {
+                while !open.get() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                let Ok(conn) = incoming.await else { return };
+                let counted = streams.clone();
+                let accepting = conn.clone();
+                tokio::task::spawn_local(async move {
+                    while let Ok(mut recv) = accepting.accept_uni().await {
+                        counted.set(counted.get() + 1);
+                        tokio::task::spawn_local(async move {
+                            let _ = recv.read_to_end(usize::MAX).await;
+                        });
+                    }
+                });
+                conn.closed().await;
+                closed.set(closed.get() + 1);
+            });
+        }
+    });
+    door
+}
