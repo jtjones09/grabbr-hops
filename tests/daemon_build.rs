@@ -137,7 +137,7 @@ async fn attached(client: &FrontendClient, within: Duration) -> hops_frontend_co
     }
 }
 
-// LEDGER T58+T59 | class B | 2 events over real IPC from 5 the built daemon; 6 FrontendClient state
+// LEDGER T58+T59+T2222 | class B | 2 events over real IPC from 5 the built daemon; 6 FrontendClient state; 1 the listener's pid from the kernel
 #[tokio::test(flavor = "current_thread")]
 async fn the_daemon_states_its_build_first_and_the_app_names_another() {
     let daemon = start();
@@ -205,6 +205,34 @@ async fn the_daemon_states_its_build_first_and_the_app_names_another() {
     assert_eq!(syncs, 2, "two syncs were asked for: {names:?}");
     drop((events, requests));
 
+    // T2220 end to end: what the front door asks before it decides whether
+    // to restart the service (#222) reads this daemon as its own build.
+    let endpoint = hops_ipc::DaemonEndpoint::of_this_platform().expect("the scratch endpoint");
+    let token = hops_ipc::token::read().ok();
+    let asked = tokio::task::spawn_blocking(move || {
+        endpoint.build(token.as_deref(), Duration::from_secs(10))
+    })
+    .await
+    .expect("the ask ran");
+    assert_eq!(
+        asked,
+        Some(hops_ipc::StatedBuild::Is(ours.clone())),
+        "the front door read the daemon of its own build as another, and would \
+         restart it"
+    );
+
+    // T2222 across processes: the process the front door would stop is the
+    // daemon listening, not the one asking, as the kernel names it.
+    let endpoint = hops_ipc::DaemonEndpoint::of_this_platform().expect("the scratch endpoint");
+    let listener = endpoint.listener().map_err(|e| e.to_string());
+    assert_eq!(
+        listener.map(|l| l.pid),
+        Ok(daemon.child.id()),
+        "the endpoint named another process than the daemon listening on it \
+         (this test is {}); a restart would stop the wrong program",
+        std::process::id()
+    );
+
     // T59: the app's own client, as this build and as another.
     let local = tokio::task::LocalSet::new();
     local
@@ -212,6 +240,7 @@ async fn the_daemon_states_its_build_first_and_the_app_names_another() {
             let same = FrontendClient::spawn(Launch {
                 build: Some(ours.clone()),
                 start_problem: Some("stale: a start that did not come up".into()),
+                ..Launch::default()
             });
             let model = attached(&same, Duration::from_secs(10)).await;
             assert_eq!(
@@ -232,7 +261,7 @@ async fn the_daemon_states_its_build_first_and_the_app_names_another() {
             };
             let newer = FrontendClient::spawn(Launch {
                 build: Some(other.clone()),
-                start_problem: None,
+                ..Launch::default()
             });
             let model = attached(&newer, Duration::from_secs(10)).await;
             let said = model.service_problem().unwrap_or_default();

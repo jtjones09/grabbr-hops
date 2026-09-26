@@ -11,6 +11,7 @@ use crate::{
     enter_hook,
     hop_log::Lifecycle,
     listen::{ClipboardSenderListen, LanMouseListener, ListenerCreationError},
+    permission_watch::{AfterGrant, PermissionWatch, Side},
     prompt_gate::{Admit, PromptGate},
 };
 use futures::StreamExt;
@@ -52,6 +53,10 @@ pub enum ServiceError {
     Authority(#[from] crate::authority::AuthorityError),
     #[error("could not listen for stop requests: {0}")]
     Signal(io::Error),
+    /// A macOS permission was granted while the daemon ran, and launchd
+    /// starts it again after an unsuccessful exit, which this is (#221).
+    #[error("macOS now grants hops {0}; exiting so that launchd starts it again with the grant")]
+    PermissionGranted(String),
 }
 
 /// What asks the daemon to stop and leave through its shutdown, which lets go
@@ -202,6 +207,9 @@ pub struct Service {
     capture_status: Status,
     /// status of input emulation (enabled / disabled)
     emulation_status: Status,
+    /// Watches for a macOS permission granted while capture or emulation
+    /// cannot start (#221).
+    permission_watch: PermissionWatch,
     /// keep track of registered connections to avoid duplicate barriers
     incoming_conns: HashSet<SocketAddr>,
     /// addrs whose cursor is currently ON this device (crossing-level state) —
@@ -406,6 +414,25 @@ impl Service {
         config: Config,
         frontend_listener: AsyncFrontendListener,
     ) -> Result<Self, ServiceError> {
+        let capture_backend = config.capture_backend().map(|b| b.into());
+        let emulation_backend = config.emulation_backend().map(|b| b.into());
+        Self::with_backends(
+            config,
+            frontend_listener,
+            capture_backend,
+            emulation_backend,
+        )
+        .await
+    }
+
+    /// [`Self::new`] with the capture and emulation backends chosen by the
+    /// caller, which a config file cannot name for every backend.
+    async fn with_backends(
+        config: Config,
+        frontend_listener: AsyncFrontendListener,
+        capture_backend: Option<input_capture::Backend>,
+        emulation_backend: Option<input_emulation::Backend>,
+    ) -> Result<Self, ServiceError> {
         let client_manager = ClientManager::default();
         for client in config.clients() {
             client_manager.add_with_config(client);
@@ -519,9 +546,7 @@ impl Service {
         let revoke_listen = listener.revoker();
 
         // input capture + emulation
-        let capture_backend = config.capture_backend().map(|b| b.into());
         let capture = Capture::new(capture_backend, conn, config.release_bind());
-        let emulation_backend = config.emulation_backend().map(|b| b.into());
         let emulation = Emulation::new(emulation_backend, listener, trust.clone());
 
         // create dns resolver
@@ -561,6 +586,7 @@ impl Service {
             pending_frontend_events: Default::default(),
             capture_status: Default::default(),
             emulation_status: Default::default(),
+            permission_watch: PermissionWatch::of_this_machine(),
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             currently_controlling: Default::default(),
@@ -609,6 +635,7 @@ impl Service {
         // handler the default action (exit) no longer applies.
         let mut stop = StopRequests::new().map_err(ServiceError::Signal)?;
         log::info!("service running; stops on {}", StopRequests::DESCRIPTION);
+        let mut restart_for = None;
 
         loop {
             tokio::select! {
@@ -661,6 +688,12 @@ impl Service {
                     }
                 }
                 _ = self.config.changed() => self.handle_config_change(),
+                after = self.permission_watch.granted() => {
+                    if let Some(granted) = self.after_permission_granted(after) {
+                        restart_for = Some(granted);
+                        break;
+                    }
+                }
                 why = stop.next() => {
                     log::info!("{why} received");
                     break;
@@ -680,7 +713,33 @@ impl Service {
         log::debug!("terminating dns resolver ...");
         self.resolver.terminate().await;
 
-        Ok(())
+        match restart_for {
+            Some(granted) => Err(ServiceError::PermissionGranted(granted)),
+            None => Ok(()),
+        }
+    }
+
+    /// A macOS permission capture or emulation was missing is now granted
+    /// (#221). Returns what was granted when the daemon should exit so that
+    /// launchd starts it again with the grant; otherwise tells the user it
+    /// takes effect once hops restarts.
+    fn after_permission_granted(&mut self, after: AfterGrant) -> Option<String> {
+        let granted = after.granted();
+        match after {
+            AfterGrant::Exit(_) => Some(granted),
+            AfterGrant::Tell(_) => {
+                log::warn!(
+                    "macOS now grants hops {granted}, which takes effect once the hops \
+                     service restarts; launchd did not start this daemon, so it cannot \
+                     restart itself"
+                );
+                self.notify_frontend(FrontendEvent::Error(format!(
+                    "macOS now grants hops {granted}. It takes effect once the hops \
+                     service restarts: stop it and start it again."
+                )));
+                None
+            }
+        }
     }
 
     /// A *local* clipboard change → broadcast it to every connected peer the
@@ -960,10 +1019,12 @@ impl Service {
                     .notify_frontend(FrontendEvent::PortChanged(self.port, Some(format!("{e}")))),
             },
             EmulationEvent::EmulationDisabled => {
+                self.permission_watch.stopped(Side::Emulation);
                 self.emulation_status = Status::Disabled;
                 self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
             }
             EmulationEvent::EmulationEnabled => {
+                self.permission_watch.started(Side::Emulation);
                 self.emulation_status = Status::Enabled;
                 self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
             }
@@ -1031,10 +1092,12 @@ impl Service {
                 }
             }
             ICaptureEvent::CaptureDisabled => {
+                self.permission_watch.stopped(Side::Capture);
                 self.capture_status = Status::Disabled;
                 self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
             }
             ICaptureEvent::CaptureEnabled => {
+                self.permission_watch.started(Side::Capture);
                 self.capture_status = Status::Enabled;
                 self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
             }
@@ -2857,6 +2920,9 @@ mod a_second_daemon_leaves_the_running_daemons_files_alone {
         );
     }
 }
+
+#[cfg(all(test, unix))]
+mod a_permission_granted_while_it_runs;
 
 #[cfg(test)]
 mod replay_on_attach {

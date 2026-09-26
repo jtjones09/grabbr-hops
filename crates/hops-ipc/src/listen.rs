@@ -728,10 +728,30 @@ impl AsyncFrontendListener {
     /// holds the endpoint or is part-way through claiming it. Nothing but the
     /// claim's own lock file is read or written until the claim is held.
     pub async fn at(endpoint: &crate::DaemonEndpoint) -> Result<Self, IpcListenerCreationError> {
+        Self::claim_then_token(endpoint, load_token).await
+    }
+
+    /// [`Self::at`], with the token kept in `token_file` rather than beside
+    /// the user's config: for a daemon a test runs whole in its own process,
+    /// which must neither read nor mint the user's token.
+    pub async fn at_with_token_file(
+        endpoint: &crate::DaemonEndpoint,
+        token_file: &std::path::Path,
+    ) -> Result<Self, IpcListenerCreationError> {
+        Self::claim_then_token(endpoint, || {
+            load_token_with(token_file, ownership::foreign_owner)
+        })
+        .await
+    }
+
+    async fn claim_then_token(
+        endpoint: &crate::DaemonEndpoint,
+        token: impl FnOnce() -> Result<String, IpcListenerCreationError>,
+    ) -> Result<Self, IpcListenerCreationError> {
         let claim = Claim::take(endpoint).await?;
         Ok(Self {
             claim,
-            token: load_token()?.into(),
+            token: token()?.into(),
             line_streams: SelectAll::new(),
             tx_streams: vec![],
             refusing: false,

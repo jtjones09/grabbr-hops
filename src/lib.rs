@@ -19,6 +19,7 @@ mod listen;
 pub mod logging;
 pub mod match_code;
 mod new_file;
+mod permission_watch;
 mod pid;
 mod prompt_gate;
 pub mod service;

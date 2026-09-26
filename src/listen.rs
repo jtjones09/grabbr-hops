@@ -265,7 +265,12 @@ impl LanMouseListener {
         trust: Trust,
         clipboard_in: Sender<PeerClipboard>,
     ) -> Result<Self, ListenerCreationError> {
-        let listen_addr = SocketAddr::new("0.0.0.0".parse().expect("invalid ip"), port);
+        // A daemon a test runs in-process never listens on the network.
+        #[cfg(not(test))]
+        let ip = std::net::Ipv4Addr::UNSPECIFIED;
+        #[cfg(test)]
+        let ip = std::net::Ipv4Addr::LOCALHOST;
+        let listen_addr = SocketAddr::new(ip.into(), port);
         Self::bind(listen_addr, identity, trust, clipboard_in).await
     }
 

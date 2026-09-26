@@ -1,6 +1,7 @@
 use hops::{
     capture_test,
     config::{self, Command, Config, ConfigError},
+    daemon_start::StartReport,
     emulation_test,
     service::{Service, ServiceError},
 };
@@ -114,7 +115,16 @@ fn runs_the_daemon(command: Option<Command>) -> bool {
 
 /// Run the daemon (the receiver service). A redundant instance self-exits.
 fn run_daemon() -> Result<(), HopsError> {
-    match run_async(run_service()) {
+    daemon_ended(run_async(run_service()))
+}
+
+/// What the daemon's end means for how the process exits. One that found
+/// another daemon running leaves quietly. Any other error exits 1: that
+/// includes a macOS permission granted while it ran (#221), whose exit is
+/// what makes launchd, which restarts it only after a failure, start a fresh
+/// process with the grant.
+fn daemon_ended(ended: Result<(), HopsError>) -> Result<(), HopsError> {
+    match ended {
         Err(HopsError::Service(ServiceError::IpcListen(
             IpcListenerCreationError::AlreadyRunning,
         ))) => {
@@ -126,27 +136,32 @@ fn run_daemon() -> Result<(), HopsError> {
 }
 
 /// What a frontend is told as it opens: this build, to compare with the
-/// daemon's, and why the service the front door started did not come up.
+/// daemon's, and what the front door did about the service, if it ran: why
+/// the service did not come up, or that it restarted or left running one of
+/// another build.
 #[cfg(any(feature = "tui", feature = "slint"))]
-fn launch(start_problem: Option<String>) -> hops_frontend_core::Launch {
+fn launch(started: Option<StartReport>) -> hops_frontend_core::Launch {
+    let started = started.as_ref();
     hops_frontend_core::Launch {
         build: Some(hops::config::this_build()),
-        start_problem,
+        start_problem: started.and_then(StartReport::problem),
+        restarted: started.and_then(StartReport::note),
+        left_running: started.and_then(|started| started.left.clone()),
     }
 }
 
 /// Open the Slint GUI (attach-only). No-op with a hint if this build lacks it.
 /// `hidden` starts the app in the menu bar / tray only, no window shown.
-/// `start_problem` is why the service the front door started did not come up.
-fn run_gui(hidden: bool, start_problem: Option<String>) -> Result<(), HopsError> {
+/// `started` is what the front door did about the service, if it ran.
+fn run_gui(hidden: bool, started: Option<StartReport>) -> Result<(), HopsError> {
     #[cfg(feature = "slint")]
     {
-        hops_slint::run(hidden, launch(start_problem))?;
+        hops_slint::run(hidden, launch(started))?;
         Ok(())
     }
     #[cfg(not(feature = "slint"))]
     {
-        let _ = (hidden, start_problem);
+        let _ = (hidden, started);
         log::error!("this build has no GUI — rebuild with `--features slint`");
         Ok(())
     }
@@ -186,16 +201,16 @@ fn install_panic_logger() {
 }
 
 /// Open the Ratatui TUI (attach-only). No-op with a hint if this build lacks it.
-/// `start_problem` is why the service the front door started did not come up.
-fn run_tui(start_problem: Option<String>) -> Result<(), HopsError> {
+/// `started` is what the front door did about the service, if it ran.
+fn run_tui(started: Option<StartReport>) -> Result<(), HopsError> {
     #[cfg(feature = "tui")]
     {
-        run_async(hops_tui::run(launch(start_problem)))?;
+        run_async(hops_tui::run(launch(started)))?;
         Ok(())
     }
     #[cfg(not(feature = "tui"))]
     {
-        let _ = start_problem;
+        let _ = started;
         log::error!("this build has no TUI — rebuild with `--features tui`");
         Ok(())
     }
@@ -211,8 +226,9 @@ fn front_door() -> Result<(), HopsError> {
         Frontend, load_frontend, onboarding_done, save_frontend, set_onboarding_done,
     };
     // What became of the start goes to the screen: a service that did not
-    // come up used to leave the app at "connecting" with nothing said (#189).
-    let start_problem = hops::daemon_start::ensure_running().problem();
+    // come up used to leave the app at "connecting" with nothing said (#189),
+    // and one of another build went on serving without a word (#222).
+    let started = hops::daemon_start::ensure_running();
 
     let frontend = if onboarding_done() {
         load_frontend().unwrap_or_else(default_frontend)
@@ -227,9 +243,9 @@ fn front_door() -> Result<(), HopsError> {
     };
 
     match frontend {
-        Frontend::Tui => run_tui(start_problem),
+        Frontend::Tui => run_tui(Some(started)),
         // front door = the user actively opening the app, so show the window
-        Frontend::Gui => run_gui(false, start_problem),
+        Frontend::Gui => run_gui(false, Some(started)),
     }
 }
 
@@ -360,6 +376,33 @@ mod keylog_is_never_shipped {
     }
 }
 
+#[cfg(test)]
+mod a_daemon_ended_for_a_grant_exits_unsuccessfully {
+    //! launchd restarts the daemon only after it fails (#221), so the error a
+    //! grant ends it with must reach `main`, which exits 1 on any error.
+    use super::{HopsError, IpcListenerCreationError, ServiceError, daemon_ended};
+
+    // LEDGER T2251 | class B | 1 return value of daemon_ended
+    #[test]
+    fn only_a_daemon_that_found_another_running_leaves_quietly() {
+        let granted = daemon_ended(Err(HopsError::Service(ServiceError::PermissionGranted(
+            "Accessibility".into(),
+        ))));
+        let beside = daemon_ended(Err(HopsError::Service(ServiceError::IpcListen(
+            IpcListenerCreationError::AlreadyRunning,
+        ))));
+        assert!(
+            matches!(
+                granted,
+                Err(HopsError::Service(ServiceError::PermissionGranted(_)))
+            ),
+            "a daemon that ended for a grant must exit 1, or launchd leaves it down \
+             until the next login: {granted:?}"
+        );
+        assert!(beside.is_ok(), "{beside:?}");
+    }
+}
+
 #[cfg(all(test, any(feature = "tui", feature = "slint")))]
 mod the_front_door_shows_what_became_of_its_start {
     //! A start that did not come up left the app at "connecting", with the
@@ -367,12 +410,42 @@ mod the_front_door_shows_what_became_of_its_start {
     //!
     //! The text is tested where it is made (`StartReport::problem` against a
     //! real daemon that exits, in tests/failed_start.rs) and where it is shown
-    //! (`AppModel::service_problem`, and the TUI's rendered header). What no
+    //! (`AppModel::service_problem`, and the TUI's rendered header); what the
+    //! front door did about a service of another build likewise
+    //! (`StartReport::note` and `left`, `AppModel::launched`). What no
     //! behavioural test can reach is `front_door` itself, which opens a
     //! window or a terminal UI: that it hands the report to the frontend it
     //! opens is checked here, on its source with comments stripped.
 
-    // LEDGER T70 | class S | source text | pair T64 (report text), T61 (model), T62 (render)
+    /// A daemon of another build that the front door left running is named
+    /// before the app connects. One from before the token cannot be
+    /// connected to at all, and the app sat at "connecting" with nothing
+    /// said: the very thing #222 is about.
+    // LEDGER T2250 | class B | 1 AppModel::service_problem over main's launch()
+    #[test]
+    fn a_service_left_running_is_named_before_the_app_connects() {
+        use hops::daemon_start::{DaemonStart, StartReport};
+        let why = "On Windows hops does not restart its service. Sign out and back in \
+                   to run this version.";
+        let report = StartReport {
+            outcome: DaemonStart::AlreadyRunning,
+            why: None,
+            log_file: None,
+            within: std::time::Duration::from_secs(5),
+            replaced: None,
+            left: Some(why.into()),
+            left_build: Some("hops 0.12.0 (1111111)".into()),
+        };
+        let model = hops_frontend_core::AppModel::launched(super::launch(Some(report)));
+        let said = model.service_problem().unwrap_or_default();
+        assert!(
+            !model.connected && said.contains("hops 0.12.0 (1111111)") && said.ends_with(why),
+            "the app has not connected, and must already say which build still runs \
+             and why: {said:?}"
+        );
+    }
+
+    // LEDGER T70 | class S | source text | pair T64 (report text), T61 (model), T62 (render), T2224 (restart report), T2230 (model)
     #[test]
     fn front_door_hands_its_start_report_to_the_frontend_it_opens() {
         let src = include_str!("main.rs");
@@ -390,9 +463,9 @@ mod the_front_door_shows_what_became_of_its_start {
         let body = &code[at..];
         let body = &body[..body.find("\n}").unwrap_or(body.len())];
         for needed in [
-            "let start_problem = hops::daemon_start::ensure_running().problem();",
-            "Frontend::Tui => run_tui(start_problem)",
-            "Frontend::Gui => run_gui(false, start_problem)",
+            "let started = hops::daemon_start::ensure_running();",
+            "Frontend::Tui => run_tui(Some(started))",
+            "Frontend::Gui => run_gui(false, Some(started))",
         ] {
             assert!(
                 body.contains(needed),

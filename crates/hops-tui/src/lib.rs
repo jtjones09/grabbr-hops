@@ -303,6 +303,7 @@ fn parse_port(s: &str) -> Result<u16, &'static str> {
 /// `launch` is what the binary knows as it opens: its own build, and why a
 /// service it tried to start did not come up.
 pub async fn run(launch: Launch) -> Result<(), TuiError> {
+    let opening = opening_notice(&launch, Instant::now());
     let client = FrontendClient::spawn(launch);
 
     // crossterm's event::read() blocks, so read keys on a dedicated OS thread.
@@ -340,7 +341,7 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
     // between reading it and pressing `y` (#168).
     let mut card = PairingCard::default();
     let mut show_log = false;
-    let mut notice: Option<(String, Instant)> = None;
+    let mut notice: Option<(String, Instant)> = opening;
     // The model's error sequence last put in the footer.
     let mut errors_seen: u64 = 0;
     // A device the user just asked to create, awaiting the handle the daemon
@@ -1214,6 +1215,12 @@ fn selected_index(state: &ListState) -> usize {
     state.selected().unwrap_or(0)
 }
 
+/// The notice the TUI opens with: that the front door restarted a service of
+/// another build (#222). It is also in the log.
+fn opening_notice(launch: &Launch, now: Instant) -> Option<(String, Instant)> {
+    launch.restarted.clone().map(|note| (note, now))
+}
+
 /// Build the footer's first line: an active text-input, a confirmation, a
 /// transient notice, or the keymap for the selected row.
 fn footer_line(
@@ -1906,6 +1913,13 @@ mod tests {
             commit: "abcd1234".into(),
         });
         mismatch.apply(hops_frontend_core::FrontendEvent::Enumerate(vec![]));
+        // Another build the app left running, with the reason (#222).
+        let mut left = mismatch.clone();
+        left.left_running = Some(
+            "hops did not restart it, because it was started from a terminal. Stop it, \
+             then open hops again."
+                .into(),
+        );
 
         // The words inside the header box, in order, with the wrapping undone.
         let header_words = |model: &AppModel, width: u16| -> String {
@@ -1917,9 +1931,21 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(" ")
         };
-        let clipped: Vec<(u16, Vec<u16>)> = [&failed, &mismatch]
+        // The same, before the app connects: a daemon from before the token
+        // cannot be connected to at all.
+        let mut left_unreached = AppModel::default();
+        left_unreached.start_problem = Some(
+            "The hops service is running hops 0.12.0 (1111111), not this version. hops \
+             did not restart it, because the hops service runs another copy of hops, \
+             /Applications/hops.app/Contents/MacOS/hops. Stop it, then open hops again."
+                .into(),
+        );
+        if let Some(out) = std::env::var_os("HOPS_TUI_RENDER") {
+            let _ = std::fs::write(out, render_at(&left_unreached, 0, 80, 24).join("\n"));
+        }
+        let clipped: Vec<(u16, Vec<u16>)> = [&failed, &mismatch, &left, &left_unreached]
             .into_iter()
-            .zip([0, 1])
+            .zip([0, 1, 2, 3])
             .map(|(model, case)| {
                 let problem = model.service_problem().expect("a problem to show");
                 let problem = problem.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1933,6 +1959,61 @@ mod tests {
             clipped.iter().all(|(_, widths)| widths.is_empty()),
             "the header ends before the problem's last line, (case, widths): {clipped:?}\n{}",
             render_at(&failed, 0, 66, 30).join("\n")
+        );
+    }
+
+    /// A service the front door restarted is said in the footer as the TUI
+    /// opens (#222), whole, at the width of a default terminal.
+    // LEDGER T2231 | class B | 3 widget tree: opening_notice, ui() into a TestBackend
+    #[test]
+    fn a_restarted_service_is_said_in_the_footer_as_the_tui_opens() {
+        let note = "hops restarted its service because it was running hops 0.12.0 \
+                    (1111111), not this version.";
+        let launch = Launch {
+            restarted: Some(note.into()),
+            ..Launch::default()
+        };
+        let (notice, _) = opening_notice(&launch, Instant::now()).expect("a notice");
+        let model = AppModel::launched(launch);
+        let theme = theme::default_theme();
+        let mut state = ListState::default();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        term.draw(|f| {
+            ui(
+                f,
+                &model,
+                &[],
+                &mut state,
+                None,
+                None,
+                None,
+                Some(&notice),
+                false,
+                &theme,
+            )
+        })
+        .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let words = rows
+            .iter()
+            .flat_map(|row| row.trim_matches('│').split_whitespace().map(str::to_owned))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let said = note.split_whitespace().collect::<Vec<_>>().join(" ");
+        if let Some(out) = std::env::var_os("HOPS_TUI_RENDER") {
+            let _ = std::fs::write(out, rows.join("\n"));
+        }
+        assert!(
+            words.contains(&said),
+            "the restart is not on screen whole:\n{}",
+            rows.join("\n")
         );
     }
 

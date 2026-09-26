@@ -57,6 +57,13 @@ impl Clipboard {
         let (event_tx, event_rx) = channel::<ClipboardEvent>();
 
         let task = spawn_local(async move {
+            // A daemon a test runs in-process leaves the user's clipboard
+            // alone, as one on a system without a clipboard does. AppKit's
+            // cannot be read from tests running side by side either.
+            if cfg!(test) {
+                log::info!("clipboard sync disabled (a test's daemon)");
+                return;
+            }
             let mut clipboard = match arboard::Clipboard::new() {
                 Ok(c) => c,
                 Err(e) => {
