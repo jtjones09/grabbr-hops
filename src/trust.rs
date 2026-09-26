@@ -43,9 +43,8 @@
 //! permission and identity are different fields.
 //!
 //! Every bit here is enforced at a real door. The two input bits are checked
-//! in the TLS verifiers and again per event. The two clipboard bits were
-//! stored with nothing reading them, while this paragraph said otherwise;
-//! they are now checked where text leaves and where it lands:
+//! in the TLS verifiers and again per event. The two clipboard bits are
+//! checked where text leaves and where it lands:
 //! [`Caps::CLIPBOARD_TO`] per peer in both clipboard broadcasts,
 //! [`Caps::CLIPBOARD_FROM`] in the one clipboard accept loop, when a transfer
 //! starts and again when it completes, and once more before the service

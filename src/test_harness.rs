@@ -221,8 +221,6 @@ pub(crate) struct ClipboardPair {
     pub(crate) driven: Machine,
     pub(crate) driven_trust: Trust,
     pub(crate) driven_sends: crate::listen::ClipboardSenderListen,
-    /// The driven machine's devices, which its broadcast asks about the switch.
-    pub(crate) driven_clients: ClientManager,
     /// What the driven machine's transport queued for its service.
     pub(crate) driven_heard: Receiver<crate::transport::PeerClipboard>,
     _listener: crate::listen::LanMouseListener,
@@ -250,8 +248,7 @@ pub(crate) async fn clipboard_pair(
     )
     .await
     .expect("listener");
-    let driven_clients = ClientManager::default();
-    let driven_sends = listener.clipboard_sender(driven_clients.clone());
+    let driven_sends = listener.clipboard_sender();
     let dialer = dialer(&driver, driver_trust.clone(), port, Position::Left);
     dialer.conn.dial(dialer.handle).await;
     let accepted = tokio::time::timeout(Duration::from_secs(10), async {
@@ -278,7 +275,6 @@ pub(crate) async fn clipboard_pair(
         driven,
         driven_trust,
         driven_sends,
-        driven_clients,
         driven_heard,
         _listener: listener,
         driver,

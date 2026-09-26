@@ -431,7 +431,7 @@ impl ClipboardInlet {
 }
 
 /// The stop code a peer sees when this machine refuses its clipboard.
-pub const CLIPBOARD_REFUSED: u32 = 1;
+pub(crate) const CLIPBOARD_REFUSED: u32 = 1;
 
 const CLIP_REFUSED_LOG_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(60);
 thread_local! {
@@ -456,8 +456,7 @@ fn clipboard_refused(addr: SocketAddr) {
 /// one) and hands each payload on, with the peer's fingerprint, if the
 /// pairing takes clipboard from that peer.
 ///
-/// One loop for both ends of a link. The listener and the dialler each had
-/// their own copy, and neither asked the store anything.
+/// One loop for both ends of a link: the listener's and the dialler's.
 ///
 /// Asked twice. When a stream arrives, so a peer the pairing takes nothing
 /// from is stopped before it sends the rest; and when the transfer completes,

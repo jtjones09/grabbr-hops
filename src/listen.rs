@@ -19,7 +19,6 @@ use tokio::{
     task::{JoinHandle, spawn_local},
 };
 
-use crate::client::ClientManager;
 use crate::crypto::Identity;
 use crate::transport::{self, ClipboardInlet, FpClientVerifier, PeerClipboard, Trust};
 
@@ -479,13 +478,11 @@ impl LanMouseListener {
 
     /// A handle for broadcasting local clipboard changes to the connected
     /// peers the pairing shares it with. Grabbed before this listener is moved
-    /// into `Emulation` so the service can drive it directly. `clients` says
-    /// which devices are switched off.
-    pub(crate) fn clipboard_sender(&self, clients: ClientManager) -> ClipboardSenderListen {
+    /// into `Emulation` so the service can drive it directly.
+    pub(crate) fn clipboard_sender(&self) -> ClipboardSenderListen {
         ClipboardSenderListen {
             conns: self.conns.clone(),
             trust: self.trust.clone(),
-            clients,
         }
     }
 }
@@ -529,7 +526,6 @@ impl ConnRevoker {
 pub(crate) struct ClipboardSenderListen {
     conns: Rc<AsyncMutex<Vec<ConnEntry>>>,
     trust: Trust,
-    clients: ClientManager,
 }
 
 /// One clipboard-failure line a minute is enough to tell you it is dropping,
@@ -545,14 +541,12 @@ impl ClipboardSenderListen {
         let conns: Vec<Connection> = {
             let conns = self.conns.lock().await;
             let trust = self.trust.read().expect("lock");
-            // Every open link used to get it. A peer that connected in is one
-            // that drives this machine, and the pairing sends it this
-            // machine's clipboard only if its lease says so (#186), and not
-            // while its card here is switched off.
+            // A peer that connected in is one that drives this machine, and
+            // the pairing sends it this machine's clipboard only if its lease
+            // says so (#186).
             conns
                 .iter()
                 .filter(|e| trust.clipboard_to(&e.fingerprint))
-                .filter(|e| !self.clients.switched_off(&e.fingerprint))
                 .map(|e| e.conn.clone())
                 .collect()
         };

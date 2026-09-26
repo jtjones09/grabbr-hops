@@ -283,62 +283,6 @@ mod clipboard_follows_the_pairing {
         });
     }
 
-    // LEDGER T1863 | class B | 6 struct state: peer's inbound queue; ClipboardSender::broadcast, ClipboardSenderListen::broadcast, ClientManager::deactivate_client
-    #[test]
-    fn a_switched_off_device_is_not_sent_the_clipboard() {
-        run_local(async {
-            // Switched off on the driver, the link to it still up.
-            let (driven, driver) = (machine(), machine());
-            let (on_driven, on_driver) = (
-                store(&driven, &driver, Caps::INBOUND),
-                store(&driver, &driven, Caps::OUTBOUND),
-            );
-            let mut pair = clipboard_pair(driven, on_driven, driver, on_driver).await;
-            pair.driver_sends.broadcast("on".into()).await;
-            assert_eq!(
-                text(heard_within(&mut pair.driven_heard, ARRIVES_WITHIN).await).as_deref(),
-                Some("on"),
-                "a switched-on device never got text its pairing grants"
-            );
-            pair.dialer.clients.deactivate_client(pair.dialer.handle);
-            pair.driver_sends.broadcast("off".into()).await;
-            assert_eq!(
-                text(heard_within(&mut pair.driven_heard, NEVER_WITHIN).await),
-                None,
-                "a device switched off on its card was still sent this machine's \
-                 clipboard over the link this machine dialled"
-            );
-
-            // A pairing both ways, and the driver's card switched off on the
-            // machine it drives: that machine's link to it is the one the
-            // driver dialled in on.
-            let (driven, driver) = (machine(), machine());
-            let both = Caps::INBOUND | Caps::OUTBOUND;
-            let (on_driven, on_driver) =
-                (store(&driven, &driver, both), store(&driver, &driven, both));
-            let mut pair = clipboard_pair(driven, on_driven, driver, on_driver).await;
-            let card = pair.driven_clients.add_client();
-            pair.driven_clients
-                .set_peer_fingerprint(card, Some(pair.driver.fingerprint.clone()));
-            pair.driven_clients.activate_client(card);
-            pair.driven_sends.broadcast("on".into()).await;
-            assert_eq!(
-                text(heard_within(&mut pair.dialer.notices.clipboard, ARRIVES_WITHIN).await)
-                    .as_deref(),
-                Some("on"),
-                "a switched-on device never got text a both-ways pairing grants"
-            );
-            pair.driven_clients.deactivate_client(card);
-            pair.driven_sends.broadcast("off".into()).await;
-            assert_eq!(
-                text(heard_within(&mut pair.dialer.notices.clipboard, NEVER_WITHIN).await),
-                None,
-                "a device switched off on its card was still sent this machine's \
-                 clipboard over the link it dialled in on"
-            );
-        });
-    }
-
     // LEDGER T1866 | class B | 6 struct state: inbound queue; transport::clipboard_accept_loop via LanMouseListener and LanMouseConnection
     #[test]
     fn a_machine_refuses_clipboard_its_pairing_does_not_take_from_that_peer() {

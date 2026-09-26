@@ -479,7 +479,7 @@ impl Service {
         // clipboard broadcast handles — grabbed before the transports are moved
         // into capture/emulation below.
         let clipboard_out_conn = conn.clipboard_sender();
-        let clipboard_out_listen = listener.clipboard_sender(client_manager.clone());
+        let clipboard_out_listen = listener.clipboard_sender();
         // revocation handles, grabbed before both are moved into capture/emulation
         let revoke_conn = conn.revoker();
         let revoke_listen = listener.revoker();

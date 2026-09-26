@@ -59,9 +59,6 @@ struct PeerLink {
     /// this on every send, not only at the handshake: trust can be withdrawn
     /// while the link stays open (#156).
     fingerprint: String,
-    /// The client this link was dialled for, so a device switched off on its
-    /// card is not sent this machine's clipboard over a link still open.
-    handle: ClientHandle,
 }
 
 fn client_config(
@@ -109,7 +106,6 @@ async fn connect(
     addr: SocketAddr,
     expected_fp: Option<String>,
     trust: Trust,
-    handle: ClientHandle,
 ) -> Result<(PeerLink, SocketAddr), (SocketAddr, LanMouseConnectionError)> {
     log::info!("connecting to {addr} ...");
     // server_name is the SNI label; trust is by fingerprint, so it is not
@@ -156,7 +152,6 @@ async fn connect(
             conn,
             send: Arc::new(Mutex::new(send)),
             fingerprint,
-            handle,
         },
         addr,
     ))
@@ -235,7 +230,6 @@ async fn connect_any(
     dials: &[Dial],
     expected_fp: Option<String>,
     trust: &Trust,
-    handle: ClientHandle,
 ) -> Result<(PeerLink, SocketAddr), LanMouseConnectionError> {
     let addrs: Vec<SocketAddr> = dials.iter().map(|d| d.addr).collect();
     let mut joinset = JoinSet::new();
@@ -244,14 +238,7 @@ async fn connect_any(
         let cfg = d.cfg.clone();
         let addr = d.addr;
         let expected = expected_fp.clone();
-        joinset.spawn_local(connect(
-            endpoint,
-            cfg,
-            addr,
-            expected,
-            trust.clone(),
-            handle,
-        ));
+        joinset.spawn_local(connect(endpoint, cfg, addr, expected, trust.clone()));
     }
     // if every candidate failed the identity pin (not a transport error), surface
     // that distinctly so the caller logs the right recovery guidance.
@@ -375,7 +362,6 @@ impl LanMouseConnection {
         ClipboardSender {
             conns: self.conns.clone(),
             trust: self.trust.clone(),
-            clients: self.client_manager.clone(),
         }
     }
 
@@ -532,7 +518,6 @@ impl LanMouseConnection {
 pub(crate) struct ClipboardSender {
     conns: Rc<Mutex<HashMap<SocketAddr, PeerLink>>>,
     trust: Trust,
-    clients: ClientManager,
 }
 
 /// One clipboard-failure line a minute is enough to tell you it is dropping,
@@ -548,13 +533,11 @@ impl ClipboardSender {
         let conns: Vec<Connection> = {
             let conns = self.conns.lock().await;
             let trust = self.trust.read().expect("lock");
-            // Every open link used to get it, including one to a device that
-            // was removed or switched off while the link stayed up. Sent only
-            // where the lease says so (#186) and the device is switched on.
+            // Sent only where the lease says so (#186), so a device that was
+            // removed while its link stayed up is not sent it either.
             conns
                 .values()
                 .filter(|l| trust.clipboard_to(&l.fingerprint))
-                .filter(|l| self.clients.is_active(l.handle))
                 .map(|l| l.conn.clone())
                 .collect()
         };
@@ -673,7 +656,7 @@ async fn connect_to_handle(
                 }
             })
             .collect();
-        let (link, addr) = match connect_any(&endpoint, &dials, expected_fp, &trust, handle).await {
+        let (link, addr) = match connect_any(&endpoint, &dials, expected_fp, &trust).await {
             Ok(c) => c,
             Err(e) => {
                 connecting.lock().await.remove(&handle);
@@ -1095,16 +1078,14 @@ mod tests {
                     cfgs[0].clone(),
                     addrs[0],
                     None,
-                    empty.clone(),
-                    0
+                    empty.clone()
                 ),
                 connect(
                     client_ep.clone(),
                     cfgs[1].clone(),
                     addrs[1],
                     None,
-                    empty.clone(),
-                    1
+                    empty.clone()
                 ),
             );
 
@@ -1354,18 +1335,11 @@ mod tests {
         )
         .expect("connection");
         let cfg = client_config(&client, trust.clone(), Arc::new(StdMutex::new(None)));
-        let handle = conn.client_manager.add_client();
-        let (link, addr) = connect(
-            conn.endpoint.clone(),
-            cfg,
-            addr,
-            None,
-            trust.clone(),
-            handle,
-        )
-        .await
-        .expect("a permitted receiver is dialled");
+        let (link, addr) = connect(conn.endpoint.clone(), cfg, addr, None, trust.clone())
+            .await
+            .expect("a permitted receiver is dialled");
         conn.conns.lock().await.insert(addr, link);
+        let handle = conn.client_manager.add_client();
         conn.client_manager.set_active_addr(handle, Some(addr));
         conn.client_manager.set_alive(handle, true);
         Recorded {
@@ -1492,7 +1466,7 @@ mod tests {
 
             let ep = Endpoint::client("127.0.0.1:0".parse().expect("addr")).expect("endpoint");
             let cfg = client_config(&client, then, Arc::new(StdMutex::new(None)));
-            let dialled = connect(ep, cfg, addr, None, now, 0).await;
+            let dialled = connect(ep, cfg, addr, None, now).await;
             assert!(
                 matches!(dialled, Err((_, LanMouseConnectionError::NotPermitted))),
                 "a dial whose permission was withdrawn after the handshake was kept: {:?}",
@@ -1631,7 +1605,7 @@ mod tests {
                 })
                 .collect();
 
-            let _ = connect_any(&client_ep, &dials, None, &empty, 0).await;
+            let _ = connect_any(&client_ep, &dials, None, &empty).await;
 
             for (i, d) in dials.iter().enumerate() {
                 assert_eq!(

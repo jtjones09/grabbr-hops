@@ -301,24 +301,6 @@ impl ClientManager {
             .collect()
     }
 
-    /// Whether `handle` is a client that is switched on. False for one that
-    /// was removed.
-    pub(crate) fn is_active(&self, handle: ClientHandle) -> bool {
-        self.clients
-            .borrow()
-            .get(handle as usize)
-            .is_some_and(|(_, s)| s.active)
-    }
-
-    /// Whether the device card for `fingerprint` is switched off: some client
-    /// pinned to that identity is inactive.
-    pub(crate) fn switched_off(&self, fingerprint: &str) -> bool {
-        self.clients
-            .borrow()
-            .iter()
-            .any(|(_, (_, s))| !s.active && s.peer_fingerprint.as_deref() == Some(fingerprint))
-    }
-
     /// returns all clients that are currently active
     pub(crate) fn active_clients(&self) -> Vec<ClientHandle> {
         self.clients
