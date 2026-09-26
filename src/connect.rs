@@ -406,6 +406,7 @@ impl LanMouseConnection {
                         &self.client_manager,
                         handle,
                         addr,
+                        Some(&link.conn),
                         &self.conns,
                         &self.state_tx,
                     )
@@ -425,7 +426,7 @@ impl LanMouseConnection {
                     transport::write_frame(&mut send, event).await
                 })
                 .await;
-                self.settle(result, event, handle, addr).await;
+                self.settle(result, event, handle, addr, &link).await;
                 return Ok(());
             }
         }
@@ -495,7 +496,7 @@ impl LanMouseConnection {
             transport::write_frame(&mut send, event).await
         })
         .await;
-        self.settle(result, event, handle, addr).await;
+        self.settle(result, event, handle, addr, &link).await;
         Ok(())
     }
 
@@ -514,6 +515,7 @@ impl LanMouseConnection {
         event: ProtoEvent,
         handle: ClientHandle,
         addr: SocketAddr,
+        link: &PeerLink,
     ) {
         match result {
             Ok(Ok(())) => log::trace!("{event} >->->->->- {addr}"),
@@ -523,6 +525,7 @@ impl LanMouseConnection {
                     &self.client_manager,
                     handle,
                     addr,
+                    Some(&link.conn),
                     &self.conns,
                     &self.state_tx,
                 )
@@ -538,6 +541,7 @@ impl LanMouseConnection {
                     &self.client_manager,
                     handle,
                     addr,
+                    Some(&link.conn),
                     &self.conns,
                     &self.state_tx,
                 )
@@ -893,7 +897,15 @@ async fn ping_pong(
             };
             if let Err(e) = result {
                 log::warn!("{addr}: send error `{e}`, closing connection");
-                disconnect(&client_manager, handle, addr, &conns, &state_tx).await;
+                disconnect(
+                    &client_manager,
+                    handle,
+                    addr,
+                    Some(&link.conn),
+                    &conns,
+                    &state_tx,
+                )
+                .await;
                 return;
             }
             log::trace!("PING >->->->->- {addr}");
@@ -931,7 +943,15 @@ async fn receive_loop(
         Ok(recv) => recv,
         Err(e) => {
             log::warn!("{addr}: no inbound stream: {e}");
-            disconnect(&client_manager, handle, addr, &conns, &state_tx).await;
+            disconnect(
+                &client_manager,
+                handle,
+                addr,
+                Some(&link.conn),
+                &conns,
+                &state_tx,
+            )
+            .await;
             return;
         }
     };
@@ -984,7 +1004,15 @@ async fn receive_loop(
             }
         }
     }
-    disconnect(&client_manager, handle, addr, &conns, &state_tx).await;
+    disconnect(
+        &client_manager,
+        handle,
+        addr,
+        Some(&link.conn),
+        &conns,
+        &state_tx,
+    )
+    .await;
 }
 
 /// Force-closes outgoing sessions when we revoke trust in the receiver.
@@ -1064,6 +1092,7 @@ impl OutboundRevoker {
                 &self.client_manager,
                 handle,
                 addr,
+                None,
                 &self.conns,
                 &self.state_tx,
             )
@@ -1075,21 +1104,49 @@ impl OutboundRevoker {
 
 /// End `handle`'s link at `addr`, clear what it said about the peer, and tell
 /// the service the client's state changed, so the frontend shows it down.
+///
+/// `ended` is the link whose end this is, when the caller holds one. Its
+/// ping and receive tasks find it ended some time after it closed, and by
+/// then the device can hold a newer link to the same address, dialled when
+/// it was switched back on: that one is not theirs to end. `None` ends
+/// whatever link is open at `addr`.
 async fn disconnect(
     client_manager: &ClientManager,
     handle: ClientHandle,
     addr: SocketAddr,
+    ended: Option<&Connection>,
     conns: &Mutex<HashMap<SocketAddr, PeerLink>>,
     state_tx: &Sender<ClientHandle>,
 ) {
-    log::warn!("client ({handle}) @ {addr} connection closed");
-    let removed = match conns.lock().await.remove(&addr) {
-        Some(link) => {
-            link.conn.close(0u32.into(), b"bye");
-            true
+    let removed = {
+        let mut open = conns.lock().await;
+        let newer = match (open.get(&addr), ended) {
+            (Some(open), Some(ended)) if open.conn.stable_id() != ended.stable_id() => {
+                Some(open.handle)
+            }
+            _ => None,
+        };
+        match newer {
+            Some(newer) => {
+                if let Some(ended) = ended {
+                    ended.close(0u32.into(), b"bye");
+                }
+                if newer == handle {
+                    log::debug!("client ({handle}) @ {addr}: an ended link, and a newer one is up");
+                    return;
+                }
+                false
+            }
+            None => match open.remove(&addr) {
+                Some(link) => {
+                    link.conn.close(0u32.into(), b"bye");
+                    true
+                }
+                None => false,
+            },
         }
-        None => false,
     };
+    log::warn!("client ({handle}) @ {addr} connection closed");
     let was_up = client_manager.active_addr(handle).is_some();
     client_manager.set_active_addr(handle, None);
     // `alive` is only ever SET from the pong path, so without clearing it here
@@ -2011,6 +2068,54 @@ mod a_device_edit_touches_only_that_device {
                 d.clients.active_addr(d.handle).is_some()
             })
             .await;
+        });
+    }
+
+    // LEDGER T2186 | class B | 6 struct state: ClientManager::active_addr after LanMouseConnection::send's second dial; 2 connections closed at the receiver
+    #[test]
+    fn a_link_dialled_again_to_the_same_address_outlives_the_old_links_tasks() {
+        run_local(async {
+            let (receiver, sender) = (machine(), machine());
+            let door = door(&receiver);
+            door.open();
+            let d = dialer(
+                &sender,
+                trust(&sender, &[&receiver], Caps::OUTBOUND),
+                door.port,
+                Position::Left,
+            );
+            let _ = d.conn.send(ProtoEvent::Ping, d.handle).await;
+            wait_until("the first dial to hold the link", PATIENCE, || {
+                d.clients.active_addr(d.handle).is_some()
+            })
+            .await;
+
+            // Switched off and straight back on: the link closes, and the
+            // next crossing dials the same address again.
+            let pin = d.clients.peer_fingerprint(d.handle);
+            assert_eq!(
+                d.conn
+                    .revoker()
+                    .close_device(d.handle, pin.as_deref())
+                    .await,
+                1,
+                "precondition: the link was up"
+            );
+            let _ = d.conn.send(ProtoEvent::Ping, d.handle).await;
+            wait_until("the second dial to hold the link", PATIENCE, || {
+                door.knocks() == 2 && d.clients.active_addr(d.handle).is_some()
+            })
+            .await;
+
+            // The old link's ping task finds it ended within one ping
+            // interval, 500 ms. Three of them later, the new link is up.
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            assert_eq!(
+                (door.closed(), d.clients.active_addr(d.handle).is_some()),
+                (1, true),
+                "(links closed at the receiver, device shown connected): the old \
+                 link's tasks ended the new link to the same address"
+            );
         });
     }
 
