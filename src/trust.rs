@@ -1694,6 +1694,27 @@ mod tests {
         );
     }
 
+    /// An approval that grants everything the pairing already holds is a
+    /// renewal, not an addition, so the lease records the act the approval
+    /// names. Only a lease that adds up two approvals takes the origin
+    /// `origin_of` derives from the union (#166).
+    // LEDGER T10 | class B | 1 struct state: TrustStore::issue_with_origin, TrustStore::lease
+    #[test]
+    fn an_approval_covering_the_pairing_keeps_its_own_origin() {
+        let mut s = store();
+        let peer = fp(0x26);
+        s.issue(&peer, "attic", Caps::INBOUND).expect("issue");
+        assert_eq!(s.lease(&peer).map(|l| l.origin), Some(Origin::Inbound));
+
+        s.issue_with_origin(&peer, "attic", Caps::INBOUND, Origin::Migrated)
+            .expect("issue");
+        assert_eq!(
+            s.lease(&peer).map(|l| (l.caps, l.origin)),
+            Some((Caps::INBOUND, Origin::Migrated)),
+            "an approval that adds nothing lost the origin it was given"
+        );
+    }
+
     #[test]
     fn asking_for_no_capability_is_not_a_grant() {
         let s = store();

@@ -2048,6 +2048,12 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
             "the second approval renamed the device; it adds a direction and \
              must keep the name the device already has"
         );
+        assert_eq!(
+            store.lease(B).map(|l| l.origin),
+            Some(Origin::Migrated),
+            "a pairing that holds both directions was saved as coming from \
+             one approval; two approvals add up to what `origin_of` names"
+        );
         let _ = fs::remove_dir_all(&d);
     }
 }

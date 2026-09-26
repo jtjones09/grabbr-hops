@@ -1252,7 +1252,7 @@ mod tests {
         use hops_frontend_core::{AttemptOrigin, FrontendEvent};
         let mut model = AppModel::default();
         model.apply(FrontendEvent::AuthorizedUpdated(
-            [(FP.to_owned(), "ScornW20".to_owned())].into(),
+            [(FP.to_owned(), "desk mac".to_owned())].into(),
         ));
         model.apply(FrontendEvent::ConnectionAttempt {
             fingerprint: FP.into(),
