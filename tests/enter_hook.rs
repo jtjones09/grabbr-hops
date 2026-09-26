@@ -143,4 +143,15 @@ fn the_enter_hook_runs_as_a_program_and_never_through_a_shell() {
          group `quoted name` into one argument; log:\n{}",
         daemon.log()
     );
+    // The arguments may hold secrets: only the program is logged by default.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !daemon.log().contains("exited successfully") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        daemon.log().contains("the enter hook `touch`") && !daemon.log().contains("quoted name"),
+        "the daemon's log names the enter hook's arguments, or not its program; \
+         log:\n{}",
+        daemon.log()
+    );
 }

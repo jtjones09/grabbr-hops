@@ -1777,7 +1777,8 @@ impl Service {
         let hook = match enter_hook::invocation(&cmd) {
             Ok(hook) => hook,
             Err(refused) => {
-                log::warn!("not running the enter hook `{cmd}`: {refused}");
+                log::warn!("not running the enter hook: {refused}");
+                log::debug!("the refused enter hook: {cmd}");
                 return;
             }
         };
@@ -1792,24 +1793,28 @@ impl Service {
                 command.raw_arg(&hook.rest);
             }
         }
+        // The program is named at info; the arguments may hold secrets, so the
+        // whole command is logged only at debug.
+        let program = hook.program.clone();
         tokio::task::spawn_local(async move {
-            log::info!("running the enter hook: {cmd}");
+            log::info!("running the enter hook `{program}`");
+            log::debug!("the enter hook: {cmd}");
             let mut child = match command.spawn() {
                 Ok(c) => c,
                 Err(e) => {
-                    log::warn!("could not run the enter hook `{cmd}`: {e}");
+                    log::warn!("could not run the enter hook `{program}`: {e}");
                     return;
                 }
             };
             match child.wait().await {
                 Ok(s) => {
                     if s.success() {
-                        log::info!("{cmd} exited successfully");
+                        log::info!("the enter hook `{program}` exited successfully");
                     } else {
-                        log::warn!("{cmd} exited with {s}");
+                        log::warn!("the enter hook `{program}` exited with {s}");
                     }
                 }
-                Err(e) => log::warn!("{cmd}: {e}"),
+                Err(e) => log::warn!("the enter hook `{program}`: {e}"),
             }
         });
     }

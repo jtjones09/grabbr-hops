@@ -28,7 +28,7 @@ pub use connect::{FrontendEventReader, FrontendRequestWriter, connect, connect_t
 pub use connect_async::{
     AsyncFrontendEventReader, AsyncFrontendRequestWriter, connect_async, connect_async_to,
 };
-pub use listen::AsyncFrontendListener;
+pub use listen::{AsyncFrontendListener, PREAUTH_CONNECTIONS_MAX, PREAUTH_DEADLINE};
 pub use pairing::{PairingCode, PairingError};
 
 #[derive(Debug, Error)]
