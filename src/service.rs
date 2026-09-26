@@ -883,8 +883,14 @@ impl Service {
             }
             EmulationEvent::Disconnected { addr } => {
                 self.currently_controlling.remove(&addr);
-                self.connected_peers.remove(&addr);
-                if let Some(addr) = self.remove_incoming(addr) {
+                // The frontend was told about the connection when it was made,
+                // whether or not the peer ever crossed, so it is told about
+                // its end either way. Otherwise a peer that connected and
+                // never crossed shows as connected until the app restarts
+                // (#34).
+                let connected = self.connected_peers.remove(&addr).is_some();
+                let entered = self.remove_incoming(addr).is_some();
+                if connected || entered {
                     Lifecycle::Disconnected { addr }.log();
                     self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
                 }

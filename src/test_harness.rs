@@ -148,7 +148,9 @@ pub(crate) struct Notices {
     _clipboard: Receiver<String>,
     _untrusted: Receiver<(String, std::net::SocketAddr)>,
     _persist: Receiver<ClientHandle>,
-    _state: Receiver<ClientHandle>,
+    /// Which client's live state changed: what the service republishes to
+    /// the frontend.
+    pub(crate) state: Receiver<ClientHandle>,
 }
 
 pub(crate) fn dialer(me: &Machine, trust: Trust, port: u16, pos: Position) -> Dialer {
@@ -180,7 +182,7 @@ pub(crate) fn dialer(me: &Machine, trust: Trust, port: u16, pos: Position) -> Di
             _clipboard: clipboard,
             _untrusted: untrusted,
             _persist: persist,
-            _state: state,
+            state,
         },
     }
 }

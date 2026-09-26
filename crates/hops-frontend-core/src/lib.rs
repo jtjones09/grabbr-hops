@@ -865,3 +865,70 @@ mod pairing_window {
         );
     }
 }
+
+#[cfg(test)]
+mod a_closed_link_shows_down {
+    //! What the daemon sends when a link closes has to take the device out of
+    //! "connected" and "refusing" in the model the frontends render (#34).
+    use super::*;
+
+    const FP: &str = "aa:bb";
+
+    fn device(m: &AppModel) -> Device {
+        m.devices()
+            .into_iter()
+            .find(|d| d.fingerprint.as_deref() == Some(FP))
+            .expect("the device is listed")
+    }
+
+    // LEDGER T68 | class B | 6 struct state: AppModel::apply + AppModel::devices()
+    #[test]
+    fn a_closed_link_takes_the_device_out_of_connected_and_refusing() {
+        let addr: std::net::SocketAddr = "10.0.0.5:51000".parse().unwrap();
+        let mut m = AppModel::default();
+        m.apply(FrontendEvent::AuthorizedUpdated(HashMap::from([(
+            FP.to_string(),
+            "peer".to_string(),
+        )])));
+        m.apply(FrontendEvent::DeviceConnected {
+            addr,
+            fingerprint: FP.into(),
+        });
+        let refusing = ClientState {
+            active: true,
+            alive: false,
+            active_addr: Some("10.0.0.5:4242".parse().unwrap()),
+            peer_fingerprint: Some(FP.into()),
+            ..Default::default()
+        };
+        m.apply(FrontendEvent::State(
+            0,
+            ClientConfig::default(),
+            refusing.clone(),
+        ));
+        assert!(
+            device(&m).online && device(&m).refuses_our_input(),
+            "precondition: connected in, and refusing our input"
+        );
+
+        m.apply(FrontendEvent::IncomingDisconnected(addr));
+        m.apply(FrontendEvent::State(
+            0,
+            ClientConfig::default(),
+            ClientState {
+                active_addr: None,
+                ..refusing
+            },
+        ));
+
+        let d = device(&m);
+        assert!(
+            !d.online,
+            "the inbound link closed and the device still shows connected"
+        );
+        assert!(
+            !d.refuses_our_input(),
+            "the outbound link closed and the device still shows as up and refusing"
+        );
+    }
+}

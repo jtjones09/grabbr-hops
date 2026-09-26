@@ -352,6 +352,7 @@ impl LanMouseConnection {
         OutboundRevoker {
             conns: self.conns.clone(),
             client_manager: self.client_manager.clone(),
+            state_tx: self.state_tx.clone(),
         }
     }
 
@@ -385,8 +386,14 @@ impl LanMouseConnection {
                         "client {handle}: this machine may no longer drive {}; closing the link",
                         link.fingerprint
                     );
-                    disconnect(&self.client_manager, handle, addr, &self.conns).await;
-                    let _ = self.state_tx.send(handle);
+                    disconnect(
+                        &self.client_manager,
+                        handle,
+                        addr,
+                        &self.conns,
+                        &self.state_tx,
+                    )
+                    .await;
                     return Err(LanMouseConnectionError::NotPermitted);
                 }
                 if !self.client_manager.alive(handle) {
@@ -496,7 +503,14 @@ impl LanMouseConnection {
             Ok(Ok(())) => log::trace!("{event} >->->->->- {addr}"),
             Ok(Err(e)) => {
                 log::warn!("client {handle} failed to send: {e}");
-                disconnect(&self.client_manager, handle, addr, &self.conns).await;
+                disconnect(
+                    &self.client_manager,
+                    handle,
+                    addr,
+                    &self.conns,
+                    &self.state_tx,
+                )
+                .await;
             }
             Err(_) => {
                 log::warn!(
@@ -504,7 +518,14 @@ impl LanMouseConnection {
                      dropping it rather than letting it freeze capture on this machine",
                     transport::INPUT_SEND_TIMEOUT
                 );
-                disconnect(&self.client_manager, handle, addr, &self.conns).await;
+                disconnect(
+                    &self.client_manager,
+                    handle,
+                    addr,
+                    &self.conns,
+                    &self.state_tx,
+                )
+                .await;
             }
         }
     }
@@ -766,6 +787,7 @@ async fn connect_to_handle(
             link.clone(),
             conns.clone(),
             ping_response.clone(),
+            state_tx.clone(),
         ));
         spawn_local(receive_loop(
             client_manager,
@@ -791,6 +813,7 @@ async fn ping_pong(
     link: PeerLink,
     conns: Rc<Mutex<HashMap<SocketAddr, PeerLink>>>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    state_tx: Sender<ClientHandle>,
 ) {
     loop {
         // send 4 pings, at least one must be answered
@@ -801,7 +824,7 @@ async fn ping_pong(
             };
             if let Err(e) = result {
                 log::warn!("{addr}: send error `{e}`, closing connection");
-                disconnect(&client_manager, handle, addr, &conns).await;
+                disconnect(&client_manager, handle, addr, &conns, &state_tx).await;
                 return;
             }
             log::trace!("PING >->->->->- {addr}");
@@ -839,7 +862,7 @@ async fn receive_loop(
         Ok(recv) => recv,
         Err(e) => {
             log::warn!("{addr}: no inbound stream: {e}");
-            disconnect(&client_manager, handle, addr, &conns).await;
+            disconnect(&client_manager, handle, addr, &conns, &state_tx).await;
             return;
         }
     };
@@ -888,7 +911,7 @@ async fn receive_loop(
             }
         }
     }
-    disconnect(&client_manager, handle, addr, &conns).await;
+    disconnect(&client_manager, handle, addr, &conns, &state_tx).await;
 }
 
 /// Force-closes outgoing sessions when we revoke trust in the receiver.
@@ -901,6 +924,7 @@ async fn receive_loop(
 pub(crate) struct OutboundRevoker {
     conns: Rc<Mutex<HashMap<SocketAddr, PeerLink>>>,
     client_manager: ClientManager,
+    state_tx: Sender<ClientHandle>,
 }
 
 impl OutboundRevoker {
@@ -911,7 +935,14 @@ impl OutboundRevoker {
         let mut closed = 0;
         for &handle in handles {
             if let Some(addr) = self.client_manager.active_addr(handle) {
-                disconnect(&self.client_manager, handle, addr, &self.conns).await;
+                disconnect(
+                    &self.client_manager,
+                    handle,
+                    addr,
+                    &self.conns,
+                    &self.state_tx,
+                )
+                .await;
                 closed += 1;
             }
         }
@@ -919,22 +950,30 @@ impl OutboundRevoker {
     }
 }
 
+/// End `handle`'s link at `addr`, clear what it said about the peer, and tell
+/// the service the client's state changed, so the frontend shows it down.
 async fn disconnect(
     client_manager: &ClientManager,
     handle: ClientHandle,
     addr: SocketAddr,
     conns: &Mutex<HashMap<SocketAddr, PeerLink>>,
+    state_tx: &Sender<ClientHandle>,
 ) {
     log::warn!("client ({handle}) @ {addr} connection closed");
-    if let Some(link) = conns.lock().await.remove(&addr) {
-        link.conn.close(0u32.into(), b"bye");
-    }
+    let removed = match conns.lock().await.remove(&addr) {
+        Some(link) => {
+            link.conn.close(0u32.into(), b"bye");
+            true
+        }
+        None => false,
+    };
+    let was_up = client_manager.active_addr(handle).is_some();
     client_manager.set_active_addr(handle, None);
     // `alive` is only ever SET from the pong path, so without clearing it here
     // the dot stays green after a real disconnect — the device list telling the
     // user a dead peer is up. Every other per-connection value is cleared below;
     // this one was simply missed.
-    client_manager.set_alive(handle, false);
+    let alive_changed = client_manager.set_alive(handle, false);
     client_manager.set_peer_commit(handle, None);
     client_manager.set_peer_caps(handle, None);
     // NB: peer_fingerprint is deliberately NOT cleared here — it's the client's
@@ -942,6 +981,16 @@ async fn disconnect(
     // the device view, not a per-connection value. It's cleared only when the
     // target address config changes (set_hostname / set_fix_ips) or trust in it
     // is revoked (remove_authorized_key).
+    //
+    // Clearing is not enough: the frontend shows the state it was last sent,
+    // so a link that went down without a word kept its dot green (#34). Not
+    // on `alive` alone either, which a peer refusing input already had
+    // false: that device would keep showing as up and refusing. The link's
+    // receive loop and ping task both end up here, and the second finds
+    // nothing left to change.
+    if removed || was_up || alive_changed {
+        let _ = state_tx.send(handle);
+    }
     let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
     log::info!("active connections: {active:?}");
 }
@@ -1690,6 +1739,185 @@ mod tests {
                 !dials_ok(&client_ep, addr).await,
                 "REGRESSION: kept driving a REVOKED receiver — the outbound handshake \
                  resumed and skipped FpServerVerifier"
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod a_closed_link_is_shown_down {
+    //! When a link to a receiver closes, the app is told at once, so the
+    //! device stops showing as up (#156, #34).
+    //!
+    //! These dial a real listener, whose emulation injects into a recording,
+    //! with the production dialler, and watch the notices the service turns
+    //! into what the frontend is sent.
+
+    use super::*;
+    use crate::emulation::Emulation;
+    use crate::listen::{ConnRevoker, LanMouseListener};
+    use crate::test_harness::{Dialer, Machine, dialer, machine, run_local, trust, wait_until};
+    use crate::trust::Caps;
+    use futures::FutureExt;
+    use input_emulation::recording::Recording;
+    use input_event::{Event, PointerEvent};
+
+    /// Loopback delivers a close in about a millisecond.
+    const AT_ONCE: Duration = Duration::from_secs(1);
+
+    struct Link {
+        sender: Machine,
+        dialer: Dialer,
+        /// Closes the receiver's side of the link.
+        revoker: ConnRevoker,
+        recording: Recording,
+        _emulation: Emulation,
+    }
+
+    /// A dialler with a live link to a receiver that injects into a
+    /// recording, once the receiver has answered everything it answers when
+    /// a link comes up.
+    async fn link() -> Link {
+        let receiver = machine();
+        let sender = machine();
+        let receiver_trust = trust(&receiver, &[&sender], Caps::INBOUND);
+        let (clipboard_tx, _) = channel();
+        let (listener, port) = LanMouseListener::bind_loopback(
+            receiver.identity.clone(),
+            receiver_trust.clone(),
+            clipboard_tx,
+        )
+        .await
+        .expect("listener");
+        let revoker = listener.revoker();
+        let recording = Recording::new();
+        let emulation = Emulation::new(Some(recording.backend()), listener, receiver_trust);
+        let dialer = dialer(
+            &sender,
+            trust(&sender, &[&receiver], Caps::OUTBOUND),
+            port,
+            hops_ipc::Position::Left,
+        );
+        dialer.until_alive().await;
+        // The receiver's Hello and Capability each raise a notice of their
+        // own. Once both are in, nothing more is due while the link is up.
+        wait_until(
+            "the receiver's Hello and Capability",
+            Duration::from_secs(10),
+            || {
+                dialer
+                    .clients
+                    .get_state(dialer.handle)
+                    .is_some_and(|(_, s)| s.peer_commit.is_some() && s.peer_caps.is_some())
+            },
+        )
+        .await;
+        Link {
+            sender,
+            dialer,
+            revoker,
+            recording,
+            _emulation: emulation,
+        }
+    }
+
+    impl Link {
+        /// Forget every notice so far.
+        fn drain(&mut self) {
+            while let Some(Some(_)) = self.dialer.notices.state.recv().now_or_never() {}
+        }
+
+        /// Close the link from the receiver's end, and wait at most
+        /// [`AT_ONCE`] for the dialler to say its state changed.
+        async fn close_and_hear(&mut self) -> Option<ClientHandle> {
+            self.revoker
+                .close_fingerprint(&self.sender.fingerprint)
+                .await;
+            tokio::time::timeout(AT_ONCE, self.dialer.notices.state.recv())
+                .await
+                .ok()
+                .flatten()
+        }
+
+        fn state(&self) -> hops_ipc::ClientState {
+            self.dialer
+                .clients
+                .get_state(self.dialer.handle)
+                .expect("the client")
+                .1
+        }
+    }
+
+    // LEDGER T64 | class B | 6 struct state: LanMouseConnection state notice + ClientManager after the receiver closes the link
+    /// The case in #34: the other end closes, and the device must stop
+    /// showing as up. `disconnect` cleared the state but told nobody, so the
+    /// frontend kept a green dot for a peer that was gone.
+    #[test]
+    fn a_link_the_receiver_closes_is_shown_down_within_a_second() {
+        run_local(async {
+            let mut l = link().await;
+            l.drain();
+
+            let heard = l.close_and_hear().await;
+
+            assert_eq!(
+                heard,
+                Some(l.dialer.handle),
+                "the receiver closed the link and the app was not told within {AT_ONCE:?}"
+            );
+            let state = l.state();
+            assert!(
+                !state.alive && state.active_addr.is_none(),
+                "told, but the state it would show is still up: {state:?}"
+            );
+        });
+    }
+
+    // LEDGER T65 | class B | 6 struct state: LanMouseConnection state notice + ClientManager after a refusing receiver closes the link
+    /// A receiver that said it takes no input shows as up and refusing. When
+    /// its link closes that is no longer true either, although `alive` was
+    /// already false and does not change.
+    #[test]
+    fn a_link_that_was_refusing_input_is_shown_down_when_it_closes() {
+        run_local(async {
+            let mut l = link().await;
+            // The receiver's input emulation fails, so from its next Pong it
+            // answers that it takes no input.
+            l.dialer
+                .send(ProtoEvent::Enter(hops_proto::Position::Right))
+                .await;
+            let motion = Event::Pointer(PointerEvent::Motion {
+                time: 0,
+                dx: 1.0,
+                dy: 0.0,
+            });
+            l.recording.fail_when(move |e| *e == motion);
+            l.dialer.send(ProtoEvent::Input(motion)).await;
+            wait_until(
+                "the receiver to say it takes no input",
+                Duration::from_secs(10),
+                || !l.dialer.clients.alive(l.dialer.handle),
+            )
+            .await;
+            assert!(
+                l.state().active_addr.is_some(),
+                "precondition: the link is still up and refusing: {:?}",
+                l.state()
+            );
+            l.drain();
+
+            let heard = l.close_and_hear().await;
+
+            assert_eq!(
+                heard,
+                Some(l.dialer.handle),
+                "a refusing receiver closed the link and the app was not told \
+                 within {AT_ONCE:?}, so it keeps showing the device as up"
+            );
+            assert!(
+                l.state().active_addr.is_none(),
+                "told, but the state it would show still has the link: {:?}",
+                l.state()
             );
         });
     }
