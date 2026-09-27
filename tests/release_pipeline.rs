@@ -1214,7 +1214,10 @@ cp -R "$src" "$out"
     /// every exception removed (no ignores; `unmaintained` and `unsound` both
     /// "all"): the three advisories deny.toml ignores, and four that its
     /// scopes let through without naming them.
-    const REPORTED: [Advisory; 7] = [
+    /// Unsound advisories cargo-deny reported against the lockfile before
+    /// lru and event-listener were updated. deny.toml's `unsound = "all"`
+    /// must fail the gate on either, wherever the crate sits in the tree.
+    const UNSOUND: [Advisory; 2] = [
         (
             "RUSTSEC-2026-0221",
             "unsound",
@@ -1229,6 +1232,9 @@ cp -R "$src" "$out"
             "0.18.0",
             "Potential use-after-free due to lack of panic safety in `LruCache::pop()`",
         ),
+    ];
+
+    const REPORTED: [Advisory; 5] = [
         (
             "RUSTSEC-2024-0436",
             "unmaintained",
@@ -1545,10 +1551,25 @@ exit "$(cat "$STUB/exit")"
             "a vulnerability deny.toml does not ignore was written into the notes:\n{}",
             unexplained.ran.text
         );
+        // Refused: an unsound advisory, which the real deny.toml lets through
+        // nowhere in the tree.
+        for unsound in UNSOUND {
+            let mut more = REPORTED.to_vec();
+            more.push(unsound);
+            let n = notes(&deny, &deny_report(&more), 1);
+            assert!(
+                !n.ran.ok && n.ran.text.contains(unsound.0),
+                "the release notes explained away the unsound {} in {}, so deny.toml \
+                 no longer fails the gate on it:\n{}",
+                unsound.0,
+                unsound.2,
+                n.ran.text
+            );
+        }
         let all = "[advisories]\nunmaintained = \"all\"\n";
-        let in_scope = notes(all, &deny_report(&[REPORTED[5]]), 1);
+        let in_scope = notes(all, &deny_report(&[REPORTED[3]]), 1);
         assert!(
-            !in_scope.ran.ok && in_scope.ran.text.contains(REPORTED[5].0),
+            !in_scope.ran.ok && in_scope.ran.text.contains(REPORTED[3].0),
             "an unmaintained crate inside `unmaintained = \"all\"` was explained away:\n{}",
             in_scope.ran.text
         );

@@ -1,9 +1,10 @@
 # cargo-deny configuration. CI and the release workflow run
 # `cargo deny --all-features --workspace check advisories` with this file.
 # An advisory against any crate in Cargo.lock fails the build, unless it is
-# ignored below, or is an unmaintained or unsound one against a crate no hops
-# crate depends on directly (`unmaintained` below, and cargo-deny's default
-# for `unsound`). The release notes list every advisory let through, and why.
+# ignored below, or is an unmaintained one against a crate no hops crate
+# depends on directly (`unmaintained` below). Unsound advisories fail wherever
+# the crate sits in the tree (`unsound` below). The release notes list every
+# advisory let through, and why.
 #
 # Only the advisories check is enabled. The licenses, bans and sources checks
 # are not run, so they are not configured here.
@@ -17,6 +18,10 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # Unmaintained crates fail only when hops depends on them directly; the rest
 # belong to the crates that use them, and the release notes name them.
 unmaintained = "workspace"
+# Unsound code is a memory-safety defect in what ships, whoever depends on it:
+# cargo-deny's default ("workspace") let two through, in lru and
+# event-listener, until they were updated.
+unsound = "all"
 yanked = "deny"
 ignore = [
     # quick-xml 0.39 is reached only by wayland-scanner, a proc-macro that runs
