@@ -3049,10 +3049,24 @@ mod every_state_on_a_row {
                 revoked_at: 1,
             },
         )])));
+        // The two facts about this direction that the other machine's link
+        // in must not hide: the terminal has no switch widget, so the row is
+        // the only place "off" is read.
+        let in_too = |mut m: AppModel| {
+            m.apply(FrontendEvent::DeviceConnected {
+                addr: "192.0.2.5:50001".parse().expect("addr"),
+                fingerprint: FP.into(),
+            });
+            m
+        };
+        let off_in = in_too(off.clone());
+        let unreachable_in = in_too(unreachable.clone());
         let mut gone = connected.clone();
         gone.daemon_gone();
         vec![
             ("connected", connected, "●", Tone::Good),
+            ("off, connected in", off_in, "○", Tone::Quiet),
+            ("unreachable, connected in", unreachable_in, "●", Tone::Warn),
             ("refusing", refusing, "●", Tone::Bad),
             ("off", off, "○", Tone::Quiet),
             ("idle", idle, "○", Tone::Quiet),
@@ -3069,9 +3083,9 @@ mod every_state_on_a_row {
         match scenario {
             "connected" => "connected",
             "refusing" => "not accepting input",
-            "off" => "off",
+            "off" | "off, connected in" => "off",
             "idle" => "not connected",
-            "unreachable" => "unreachable",
+            "unreachable" | "unreachable, connected in" => "unreachable",
             "not paired" => "not paired",
             "waiting" => "waiting for its approval",
             "comparing" => "compare the number",
@@ -3156,6 +3170,53 @@ mod every_state_on_a_row {
                 "{c:?} is drawn from something else:\n{line}"
             );
         }
+    }
+
+    /// With no service the whole row is what was last known, so none of it
+    /// keeps a live colour: not the trust word, not the direction, not the
+    /// clipboard (#34).
+    // LEDGER T148-15 | class B | 3 widget tree: ui() rendered to a test terminal, every cell's colour
+    #[test]
+    fn with_no_service_nothing_on_the_row_keeps_a_live_colour() {
+        let colours = |m: &AppModel| {
+            let devices = listable(m);
+            let mut state = ListState::default();
+            let theme = theme::default_theme();
+            let mut term = Terminal::new(TestBackend::new(160, 24)).expect("test terminal");
+            term.draw(|f| {
+                ui(
+                    f, m, &devices, &mut state, None, None, None, None, false, &theme,
+                )
+            })
+            .expect("draw");
+            let buf = term.backend().buffer().clone();
+            (0..buf.area.height)
+                .find_map(|y| {
+                    let line: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+                    // from the dot to the pane's right border, which are the
+                    // row's own cells
+                    line.find(NAME).map(|at| {
+                        let dot = line[..at].chars().count() as u16 - 2;
+                        (dot..buf.area.width - 1)
+                            .filter(|&x| !buf[(x, y)].symbol().trim().is_empty())
+                            .map(|x| buf[(x, y)].fg)
+                            .collect::<std::collections::HashSet<Color>>()
+                    })
+                })
+                .expect("the device row is on screen")
+        };
+        let connected = dialled(pinned(true, true, true), true);
+        assert!(
+            colours(&connected).len() > 1,
+            "precondition: a live row is drawn in more than one colour"
+        );
+        let mut gone = connected;
+        gone.daemon_gone();
+        assert_eq!(
+            colours(&gone),
+            std::collections::HashSet::from([colour(Tone::Quiet)]),
+            "with no service part of the row still reads live"
+        );
     }
 
     // LEDGER T148-3 | class B | 3 widget tree: ui() rendered to a test terminal from AppModel::apply

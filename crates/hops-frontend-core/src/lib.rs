@@ -1645,14 +1645,14 @@ mod refusal_is_not_maskable {
             ClientState {
                 active,
                 alive,
-                active_addr: linked.then(|| "10.0.0.5:4242".parse().unwrap()),
+                active_addr: linked.then(|| "192.0.2.5:4242".parse().unwrap()),
                 peer_fingerprint: Some(FP.into()),
                 ..Default::default()
             },
         )]));
         if online {
             m.apply(FrontendEvent::DeviceConnected {
-                addr: "10.0.0.5:51000".parse().unwrap(),
+                addr: "192.0.2.5:51000".parse().unwrap(),
                 fingerprint: FP.into(),
             });
         }
@@ -1686,9 +1686,9 @@ mod refusal_is_not_maskable {
     fn an_inactive_device_is_not_flagged() {
         assert_eq!(
             dev(true, false, false),
-            Connection::Connected,
-            "switched off here and connected in: the inbound link is live, and \
-             nothing this machine sends is refused"
+            Connection::Off,
+            "switched off here and connected in: nothing this machine sends is \
+             refused, and the switch is what the row must say"
         );
     }
 
@@ -1729,7 +1729,7 @@ mod refusal_is_not_maskable {
             "peer".to_string(),
         )])));
         m.apply(FrontendEvent::DeviceConnected {
-            addr: "10.0.0.5:51000".parse().unwrap(),
+            addr: "192.0.2.5:51000".parse().unwrap(),
             fingerprint: FP.into(),
         });
         assert_eq!(m.devices()[0].connection, Connection::Connected);
@@ -1964,7 +1964,7 @@ mod a_closed_link_shows_down {
     // LEDGER T148-5 | class B | 6 struct state: AppModel::apply + AppModel::devices()
     #[test]
     fn a_peer_that_never_crossed_reads_down_once_its_link_closes() {
-        let addr: std::net::SocketAddr = "10.0.0.5:51000".parse().unwrap();
+        let addr: std::net::SocketAddr = "192.0.2.5:51000".parse().unwrap();
         let mut m = AppModel {
             connected: true,
             ..AppModel::default()
@@ -2685,9 +2685,10 @@ mod the_daemon_gone {
                     first.events.unbounded_send(Ok(event)).expect("open");
                 }
                 until(&client, "the device reads live", |m| {
-                    m.devices()
-                        .iter()
-                        .any(|d| d.connection == Connection::Connected)
+                    m.connected_peers.contains(FP)
+                        && m.devices()
+                            .iter()
+                            .any(|d| d.send.as_ref().is_some_and(|s| s.state.alive))
                         && m.pairing_open_until.is_some()
                         && m.pending_pairing.is_some()
                         && !m.pairing_attempts.is_empty()
@@ -2715,6 +2716,19 @@ mod the_daemon_gone {
                 let (mut second, conn) = connection();
                 assert!(dial.send(conn).is_ok(), "the loop stopped");
                 until(&client, "the second daemon answers", |m| m.connected).await;
+                // Nothing reported yet by the daemon now answering: a device
+                // the last one saw connected in is not connected in to this
+                // one until it says so.
+                let fresh = client.snapshot();
+                assert!(
+                    fresh
+                        .devices()
+                        .iter()
+                        .all(|d| d.connection != Connection::Connected),
+                    "the next daemon has reported no peer, and a device still \
+                     reads connected: {:?}",
+                    fresh.devices()
+                );
                 assert!(client.request(FrontendRequest::SaveConfiguration));
                 let mut sent = vec![];
                 loop {
@@ -3112,12 +3126,144 @@ mod the_state_follows_the_events {
             "survived switching off"
         );
 
-        // As does a lost service, and a fresh list from the next one.
+        // As does a lost service.
         refused(&mut m);
         m.daemon_gone();
         assert_eq!(state(&m), Connection::ServiceGone);
         m.connected = true;
         assert_eq!(state(&m), Connection::NotConnected, "survived the service");
+    }
+
+    fn connected_in(m: &mut AppModel) {
+        m.apply(FrontendEvent::DeviceConnected {
+            addr: "192.0.2.5:51000".parse().expect("addr"),
+            fingerprint: FP.into(),
+        });
+    }
+
+    /// The other machine's link in is a fact about its direction. It does
+    /// not hide the switch here, a dial from here that failed, or a
+    /// pairing in progress, which the terminal row is the only place to
+    /// read.
+    // LEDGER T148-12 | class B | 6 struct state: AppModel::apply + AppModel::devices()
+    #[test]
+    fn the_link_in_hides_neither_the_switch_nor_a_failed_dial() {
+        let mut m = paired();
+        connected_in(&mut m);
+        assert_eq!(state(&m), Connection::Connected, "precondition");
+
+        refused(&mut m);
+        assert_eq!(
+            state(&m),
+            Connection::Unreachable,
+            "a dial from here failed while the device was connected in"
+        );
+
+        set(&mut m, linked(false, false));
+        assert_eq!(
+            state(&m),
+            Connection::Off,
+            "switched off here while the device is connected in"
+        );
+        set(&mut m, linked(true, false));
+        assert_eq!(state(&m), Connection::Connected, "on again, still in");
+
+        m.apply(FrontendEvent::TrustUpdated(HashMap::from([(
+            FP.to_string(),
+            PeerTrust {
+                pending: true,
+                ..Default::default()
+            },
+        )])));
+        m.apply(FrontendEvent::PairingCheck {
+            fingerprint: FP.into(),
+            addr: None,
+            check: PairingCheck::Show("042917".into()),
+            answered: false,
+        });
+        assert_eq!(
+            state(&m),
+            Connection::ComparingNumber,
+            "a number to compare, with the device connected in"
+        );
+    }
+
+    /// Only a crossing refused for want of a link says the device could not
+    /// be reached. One refused because this machine may not drive it says
+    /// nothing about the network.
+    // LEDGER T148-13 | class B | 6 struct state: AppModel::apply + AppModel::devices()
+    #[test]
+    fn a_crossing_refused_for_another_reason_is_not_unreachable() {
+        let mut m = paired();
+        m.apply(FrontendEvent::CrossingRefused {
+            handle: HANDLE,
+            reason: CrossingRefusal::NotPermitted,
+        });
+        assert_eq!(
+            state(&m),
+            Connection::NotConnected,
+            "a crossing this machine may not make reads as a network failure"
+        );
+    }
+
+    /// The mark belongs to the device on its handle. A list that still has
+    /// it down keeps it; one with its link up, or without it, drops it, and
+    /// so does its removal, so a device that later gets the same handle
+    /// starts clean.
+    // LEDGER T148-14 | class B | 6 struct state: AppModel::apply + AppModel::devices()
+    #[test]
+    fn a_fresh_list_or_a_removal_settles_the_mark() {
+        let list = |m: &mut AppModel, devices: Vec<ClientState>| {
+            m.apply(FrontendEvent::Enumerate(
+                devices
+                    .into_iter()
+                    .map(|s| (HANDLE, ClientConfig::default(), s))
+                    .collect(),
+            ));
+        };
+        let mut m = paired();
+        refused(&mut m);
+        list(&mut m, vec![linked(true, false)]);
+        assert_eq!(
+            state(&m),
+            Connection::Unreachable,
+            "still down, still failed"
+        );
+
+        list(&mut m, vec![linked(true, true)]);
+        assert_eq!(state(&m), Connection::Connected, "precondition");
+        list(&mut m, vec![linked(true, false)]);
+        assert_eq!(
+            state(&m),
+            Connection::NotConnected,
+            "a list with the link up did not clear the mark"
+        );
+
+        refused(&mut m);
+        list(&mut m, vec![]);
+        m.apply(FrontendEvent::Created(
+            HANDLE,
+            ClientConfig::default(),
+            linked(true, false),
+        ));
+        assert_eq!(
+            state(&m),
+            Connection::NotConnected,
+            "a list without the device did not clear the mark"
+        );
+
+        refused(&mut m);
+        m.apply(FrontendEvent::Deleted(HANDLE));
+        m.apply(FrontendEvent::Created(
+            HANDLE,
+            ClientConfig::default(),
+            linked(true, false),
+        ));
+        assert_eq!(
+            state(&m),
+            Connection::NotConnected,
+            "a new device on a removed one's handle inherited its mark"
+        );
     }
 
     // LEDGER T148-7 | class B | 6 struct state: AppModel::apply + AppModel::devices()

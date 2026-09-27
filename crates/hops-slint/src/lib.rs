@@ -1602,10 +1602,21 @@ mod the_window_draws_the_state {
             )]
             .into(),
         ));
+        let in_too = |mut m: AppModel| {
+            m.apply(FrontendEvent::DeviceConnected {
+                addr: "192.0.2.5:50001".parse().expect("addr"),
+                fingerprint: FP.into(),
+            });
+            m
+        };
+        let off_in = in_too(dialled(pinned(false, false, false), true));
+        let unreachable_in = in_too(unreachable.clone());
         let mut gone = connected.clone();
         gone.daemon_gone();
         vec![
             (connected, "connected", DotTone::Good),
+            (off_in, "off", DotTone::Quiet),
+            (unreachable_in, "unreachable", DotTone::Warn),
             (refusing, "not accepting input", DotTone::Bad),
             (
                 dialled(pinned(false, false, false), true),
@@ -1665,11 +1676,12 @@ mod the_window_draws_the_state {
             .join(" ")
     }
 
-    /// The one thing a render cannot be asked from a headless window is a
-    /// colour, so the tone's colour is checked in the source: each tone gets
-    /// its own theme colour, and the device dot and its words are coloured
-    /// by the tone alone.
-    // LEDGER T148-11 | class S | source text: ui/app.slint tone-color and the device-row Dot
+    /// A headless window can be asked neither a colour nor, without the
+    /// compiler's debug info, which text an element draws. So these are
+    /// checked in the source: each tone gets its own theme colour, the
+    /// device dot is coloured by the tone alone, and the row draws the
+    /// status words in that colour.
+    // LEDGER T148-11 | class S | source text: ui/app.slint tone-color, the device-row Dot and status Text
     #[test]
     fn each_tone_has_its_own_colour_and_the_row_uses_it() {
         let code = slint_code();
@@ -1687,6 +1699,14 @@ mod the_window_draws_the_state {
                 .starts_with("tint: root.tone-color(d.tone); }"),
             "the device dot is coloured from something other than its tone: {}",
             &dot[..dot.len().min(120)]
+        );
+        // the row's own markup: up to the next item of the list, if any
+        let row = rows.split("for ").next().unwrap_or(rows);
+        let status = "Text { text: d.status; color: root.tone-color(d.tone);";
+        assert!(
+            row.contains(status),
+            "the device row no longer draws its status words in its tone: \
+             `{status}` is gone"
         );
     }
 }
