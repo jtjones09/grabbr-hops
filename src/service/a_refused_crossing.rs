@@ -162,8 +162,8 @@ fn crossing_to_a_device_that_never_connected_says_why_and_keeps_the_pointer() {
             ended = service.run() => panic!("the daemon ended: {ended:?}"),
             told = told => told,
             _ = tokio::time::sleep(DEADLINE) => panic!(
-                "the pointer crossed to a device that never connected, and the \
-                 frontend was never told why nothing happened (held: {})",
+                "no CrossingRefused reached the frontend within {DEADLINE:?} of \
+                 crossing to a device that never connected (pointer held: {})",
                 script.held()
             ),
         };

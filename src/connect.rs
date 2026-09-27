@@ -391,6 +391,30 @@ impl LanMouseConnection {
         self.client_manager.alive(handle)
     }
 
+    /// Whether `handle`'s peer has answered a ping on its current link, and
+    /// so whether [`Self::peer_alive`] is its answer or only its silence.
+    pub(crate) fn peer_answered(&self, handle: ClientHandle) -> bool {
+        self.client_manager.answered(handle)
+    }
+
+    /// Whether this machine's trust store refuses to let it drive `handle`'s
+    /// peer: the machine its link proved, else the one the device is pinned
+    /// to. A device with neither is not known to be refused.
+    pub(crate) async fn may_not_drive(&self, handle: ClientHandle) -> bool {
+        let proved = match self.client_manager.active_addr(handle) {
+            Some(addr) => self
+                .conns
+                .lock()
+                .await
+                .get(&addr)
+                .map(|link| link.fingerprint.clone()),
+            None => None,
+        };
+        proved
+            .or_else(|| self.client_manager.peer_fingerprint(handle))
+            .is_some_and(|fingerprint| !self.trust.read().expect("lock").we_may_drive(&fingerprint))
+    }
+
     pub(crate) async fn send(
         &self,
         event: ProtoEvent,
@@ -977,7 +1001,7 @@ async fn receive_loop(
                         // Only on a change: pongs are about 2/s per client, and
                         // the frontend needs to hear when the answer differs,
                         // not that it was asked again.
-                        if client_manager.set_alive(handle, b) {
+                        if client_manager.answered_ping(handle, b) {
                             let _ = state_tx.send(handle);
                         }
                         ping_response.borrow_mut().insert(addr);
