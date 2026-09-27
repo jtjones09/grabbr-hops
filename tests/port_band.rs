@@ -64,8 +64,13 @@ fn picked_ports_are_in_the_pool_distinct_and_free() {
 #[test]
 fn a_port_another_socket_holds_on_any_local_address_is_passed_over() {
     // 127.0.0.2 can be bound on Linux, where all of 127/8 is loopback; the
-    // daemon listens on every address, so a holder there takes its port too.
+    // daemon listens on every address, so on Unix a holder there takes its
+    // port too. Windows lets the two share it, and a holder there never
+    // receives what the tests send to 127.0.0.1, so there it is no conflict.
+    #[cfg(unix)]
     let holders = [Ipv4Addr::LOCALHOST, Ipv4Addr::new(127, 0, 0, 2)];
+    #[cfg(not(unix))]
+    let holders = [Ipv4Addr::LOCALHOST];
     let mut checked = Vec::new();
     for address in holders {
         let held = ports::pick();

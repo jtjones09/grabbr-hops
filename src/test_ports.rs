@@ -117,7 +117,14 @@ pub fn pick() -> u16 {
 pub fn first_free(candidates: impl IntoIterator<Item = u16>) -> Option<u16> {
     candidates
         .into_iter()
-        .find(|&port| UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)).is_ok())
+        // Both binds, one after the other: Windows lets a socket on every
+        // address share a port another holds on 127.0.0.1, and the tests
+        // reach their daemons on 127.0.0.1.
+        .find(|&port| {
+            [Ipv4Addr::UNSPECIFIED, Ipv4Addr::LOCALHOST]
+                .iter()
+                .all(|&address| UdpSocket::bind((address, port)).is_ok())
+        })
 }
 
 /// The offset after the last one handed out, below `len`, from a start drawn
