@@ -473,12 +473,11 @@ fn default_canvas_pos(pos: Position) -> (f32, f32) {
 }
 
 /// Single-instance coordination result. A second `hops gui` launch signals the
-/// first (any connection to the rendezvous = "show your window") and exits, so
-/// re-launching focuses the resident menu-bar app instead of stacking duplicate
-/// tray icons. The rendezvous is a Unix-domain socket on unix (per-user, scoped
-/// by `~/.config` permissions) and a loopback `TcpListener` on Windows (no
-/// per-user filesystem socket there; a `127.0.0.1` listener is the std-only
-/// equivalent).
+/// first ("show your window") and exits, so re-launching focuses the resident
+/// menu-bar app instead of stacking duplicate tray icons. The rendezvous is a
+/// Unix-domain socket on unix (per-user, scoped by `~/.config` permissions)
+/// and, on Windows, a named event in the session's `Local\` namespace that
+/// grants this user alone ([`hops_ipc::instance`]).
 #[cfg(any(unix, windows))]
 enum Instance {
     /// We're the first instance; the guard cleans up the rendezvous on exit.
@@ -488,14 +487,15 @@ enum Instance {
 }
 
 /// Cleans up the single-instance rendezvous on drop (normal GUI exit). Only Unix
-/// leaves a filesystem artifact (the socket file); on Windows the `TcpListener`
-/// closes itself, so `path` is left empty.
+/// leaves a filesystem artifact (the socket file). On Windows the event lasts
+/// until the process exits: the thread that waits on it holds a handle of its
+/// own, blocked for as long as the GUI runs.
 #[cfg(any(unix, windows))]
 struct SingleInstanceGuard {
-    // only Drop (unix-only) reads this; on Windows there's no socket file to
-    // clean up, so the field is written-but-unread there.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg(unix)]
     path: std::path::PathBuf,
+    #[cfg(windows)]
+    _event: hops_ipc::instance::First,
 }
 
 #[cfg(any(unix, windows))]
@@ -567,41 +567,20 @@ fn acquire_single_instance(show_requested: Arc<AtomicBool>) -> Instance {
     }
 }
 
-/// Windows single-instance via a loopback `TcpListener`. Bound to `127.0.0.1`
-/// only (never `0.0.0.0`), so it's a local rendezvous — not a reachable service —
-/// and a loopback bind doesn't trip the Windows Firewall prompt. Any successful
-/// connect from a second launch flips `show_requested`; the second launch then
-/// exits. Degrades gracefully (runs without single-instance) on any bind error.
+/// Windows single-instance through [`hops_ipc::instance::claim_gui`]: only a
+/// running hops window of this user, found and asked to show, keeps this
+/// launch closed. Anything else holding the name opens the window anyway,
+/// so no other program can stop the GUI appearing (#176).
 #[cfg(windows)]
 fn acquire_single_instance(show_requested: Arc<AtomicBool>) -> Instance {
-    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-    // fixed high port below the ephemeral range (49152+) to avoid churn collisions
-    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 47842));
-    match TcpListener::bind(addr) {
-        Ok(listener) => {
-            std::thread::spawn(move || {
-                for _stream in listener.incoming() {
-                    show_requested.store(true, Ordering::SeqCst);
-                }
-            });
-            Instance::Primary(SingleInstanceGuard {
-                path: std::path::PathBuf::new(),
-            })
+    match hops_ipc::instance::claim_gui(move || show_requested.store(true, Ordering::SeqCst)) {
+        hops_ipc::instance::Found::First(first) => {
+            Instance::Primary(SingleInstanceGuard { _event: first })
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            // a live primary already owns the port; poke it to surface, then exit
-            if TcpStream::connect(addr).is_ok() {
-                Instance::Secondary
-            } else {
-                Instance::Primary(SingleInstanceGuard {
-                    path: std::path::PathBuf::new(),
-                })
-            }
+        hops_ipc::instance::Found::Running => {
+            log::info!("a hops window is already open for this user; it was asked to show");
+            Instance::Secondary
         }
-        // any other bind error → run anyway without single-instance
-        Err(_) => Instance::Primary(SingleInstanceGuard {
-            path: std::path::PathBuf::new(),
-        }),
     }
 }
 

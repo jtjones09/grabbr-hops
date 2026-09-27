@@ -178,12 +178,12 @@ async fn next_event(
 ///
 /// A request that has reached the socket has not been acted on. A command
 /// that exits there reports success for requests the service refused or has
-/// not read yet, and on Windows, where the endpoint is loopback TCP, closing
-/// the socket with the service's replies unread resets the connection, which
-/// can discard a request the service has not read (#6). So the requests are
-/// followed by a listing and a barrier, and everything the service sends is
-/// read until the barrier comes back. The listing just before it is the
-/// state the requests left.
+/// not read yet, and closing a connection with the service's replies unread
+/// could reset it, discarding a request the service had not read, as it did
+/// over the loopback TCP endpoint Windows used before its pipe (#6). So the
+/// requests are followed by a listing and a barrier, and everything the
+/// service sends is read until the barrier comes back. The listing just
+/// before it is the state the requests left.
 async fn send(
     rx: &mut Events,
     tx: &mut AsyncFrontendRequestWriter,

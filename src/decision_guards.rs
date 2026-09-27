@@ -3520,8 +3520,9 @@ mod the_front_door_starts_a_daemon_only_when_none_answers {
         }
     }
 
-    /// The Windows transport, checked on every platform: there the daemon's
-    /// IPC listener is a loopback TCP port.
+    /// A daemon answering on loopback TCP, the transport Windows used before
+    /// its pipe, is left alone rather than a second started. Checked on every
+    /// platform.
     // LEDGER T1 | class B | 1 return value
     #[test]
     fn a_daemon_answering_on_loopback_tcp_is_left_alone() {

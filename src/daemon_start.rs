@@ -154,8 +154,8 @@ impl Running for ThisMachine {
 }
 
 /// What the app says about a daemon of another build on Windows, where it
-/// does not restart one: its endpoint is a loopback port, which does not say
-/// which process holds it.
+/// does not restart one: nothing there tells whether the service started the
+/// daemon that holds the pipe.
 #[cfg_attr(not(windows), allow(dead_code))]
 const ON_WINDOWS: &str =
     "On Windows hops does not restart its service. Sign out and back in to run this version.";
@@ -1785,9 +1785,9 @@ mod waiting_for_the_daemon {
         );
     }
 
-    /// A daemon on a loopback port that takes each connection's token, then
-    /// starts a line of JSON and adds a space to it every 50 ms, never ending
-    /// it, for up to 5 s or until the asker hangs up. Asked through the real
+    /// A daemon on a loopback port that reads what each connection sends
+    /// first, then starts a line and adds a space to it every 50 ms, never
+    /// ending it, for up to 5 s or until the asker hangs up. Asked through the real
     /// [`DaemonEndpoint::serves`]; its process never ends.
     struct Trickling {
         addr: std::net::SocketAddr,

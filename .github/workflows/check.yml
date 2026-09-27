@@ -119,6 +119,25 @@ jobs:
       # executed in CI. A guard that does not run is a comment.
       - run: cargo test --locked --workspace --all-targets
 
+  # The IPC crate's tests on Windows: the daemon's named pipe, who it admits,
+  # the two-way proof over it, and the GUI's single-instance event. The
+  # workspace tests above run on Linux and macOS only, and the release job
+  # tests only the root crate, so the Windows transport was type-checked
+  # and never run. `the_ipc_tests_run_on_windows` in
+  # tests/release_pipeline.rs fails if this job is dropped or narrowed.
+  ipc-tests-windows:
+    name: IPC tests (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master 2026-09-03, base of branch 1.98.0
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo test --locked -p hops-ipc --all-targets
+
   # hops commits to NOT reading raw input devices on Linux. Capture is
   # portal-mediated (xdg-desktop-portal InputCapture / libei), which is
   # consent-gated and revocable; a raw device is neither.

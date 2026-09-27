@@ -7,11 +7,10 @@
 //! used to start a second daemon. This test uses the listener the daemon binds
 //! and the connector a frontend uses.
 //!
-//! On macOS and Linux it uses the endpoint all three work out for themselves:
-//! a socket under `HOME` or `XDG_RUNTIME_DIR`, pointed at a scratch directory.
-//! On Windows that endpoint is a fixed loopback port, which a hops daemon on
-//! the machine may hold. There the test hands the same code a port of its own,
-//! and never binds the production one.
+//! It uses the endpoint all three work out for themselves: on macOS and Linux
+//! a socket under `HOME` or `XDG_RUNTIME_DIR`, on Windows a pipe named after
+//! the token under `LOCALAPPDATA`, each pointed at a scratch directory, so the
+//! endpoint is never the one a hops daemon on the machine holds.
 //!
 //! Runs in its own test binary so pointing `HOME`, `XDG_RUNTIME_DIR`,
 //! `XDG_CONFIG_HOME` and `LOCALAPPDATA` at a scratch directory cannot disturb
@@ -65,26 +64,17 @@ impl Watch for ServesAtOnce {
     }
 }
 
-/// Run the front door's decision, counting starts.
-///
-/// On macOS and Linux this is what `hops` runs, `ensure_running_with`, on the
-/// endpoint it works out itself, with a stand-in start and wait.
-fn front_door(_endpoint: &DaemonEndpoint) -> (DaemonStart, u32) {
+/// Run the front door's decision, counting starts: what `hops` runs,
+/// `ensure_running_with`, on the endpoint it works out itself, with a
+/// stand-in start and wait.
+fn front_door() -> (DaemonStart, u32) {
     let starts = Cell::new(0);
     let start = || {
         starts.set(starts.get() + 1);
         Ok(4242)
     };
     let within = Duration::from_secs(1);
-    #[cfg(unix)]
     let outcome = hops::daemon_start::ensure_running_with(start, &mut ServesAtOnce, within);
-    #[cfg(windows)]
-    let outcome = hops::daemon_start::start_unless_running(
-        Ok(_endpoint.clone()),
-        start,
-        &mut ServesAtOnce,
-        within,
-    );
     (outcome, starts.get())
 }
 
@@ -112,43 +102,36 @@ async fn front_door_sees_it_serve(
 }
 
 /// Claim the daemon's endpoint the way `hops daemon` does.
-async fn claim(
-    _endpoint: &DaemonEndpoint,
-) -> Result<AsyncFrontendListener, IpcListenerCreationError> {
-    #[cfg(unix)]
-    {
-        AsyncFrontendListener::new().await
-    }
-    #[cfg(windows)]
-    {
-        AsyncFrontendListener::at(_endpoint).await
-    }
+async fn claim() -> Result<AsyncFrontendListener, IpcListenerCreationError> {
+    AsyncFrontendListener::new().await
 }
 
-/// Connect the way a frontend does, and say whether it got through.
-async fn frontend_reaches(_endpoint: &DaemonEndpoint) -> bool {
-    let timeout = Some(Duration::from_secs(5));
-    #[cfg(unix)]
-    let connecting = hops_ipc::connect_async(timeout);
-    #[cfg(windows)]
-    let connecting = hops_ipc::connect_async_to(_endpoint, timeout);
-    tokio::time::timeout(Duration::from_secs(5), connecting)
-        .await
-        .map(|connected| connected.is_ok())
-        .unwrap_or(false)
+/// Connect the way a frontend does, while `daemon` runs the way the service
+/// loop does, and say whether it got through. The daemon answers the
+/// frontend's challenge only while its loop runs.
+async fn frontend_reaches(daemon: &mut AsyncFrontendListener) -> bool {
+    let connecting = tokio::time::timeout(
+        Duration::from_secs(10),
+        hops_ipc::connect_async(Some(Duration::from_secs(5))),
+    );
+    tokio::pin!(connecting);
+    loop {
+        tokio::select! {
+            connected = &mut connecting => {
+                break connected.map(|c| c.is_ok()).unwrap_or(false)
+            }
+            _ = daemon.next() => {}
+        }
+    }
 }
 
 // LEDGER T6 | class B | 1 return value
 #[tokio::test(flavor = "current_thread")]
 async fn the_front_door_asks_the_endpoint_the_daemon_listens_on() {
     let dir = isolate();
-    #[cfg(unix)]
     let endpoint = DaemonEndpoint::of_this_platform().expect("the scratch HOME");
-    // A port of the test's own, picked by the system when the daemon binds.
-    #[cfg(windows)]
-    let endpoint = DaemonEndpoint::Tcp("127.0.0.1:0".parse().expect("a loopback address"));
 
-    let mut daemon = match claim(&endpoint).await {
+    let mut daemon = match claim().await {
         Ok(daemon) => daemon,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&dir);
@@ -156,19 +139,18 @@ async fn the_front_door_asks_the_endpoint_the_daemon_listens_on() {
         }
     };
     let bound = daemon.endpoint().clone();
-    let beside_it = front_door(&bound);
-    let frontend = frontend_reaches(&bound).await;
+    let beside_it = front_door();
+    let frontend = frontend_reaches(&mut daemon).await;
     let serving_seen = front_door_sees_it_serve(&mut daemon, &bound).await;
-    let second = match claim(&bound).await {
+    let second = match claim().await {
         Ok(_) => "claimed".to_string(),
         Err(IpcListenerCreationError::AlreadyRunning) => "AlreadyRunning".to_string(),
         Err(e) => format!("{e:?}"),
     };
     drop(daemon);
-    let after = front_door(&bound);
+    let after = front_door();
     let _ = std::fs::remove_dir_all(&dir);
 
-    #[cfg(unix)]
     assert_eq!(
         bound, endpoint,
         "the daemon bound a different endpoint from the one the front door works out"

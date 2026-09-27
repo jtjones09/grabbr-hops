@@ -587,8 +587,10 @@ impl Service {
     /// The claim is the single-instance check. A daemon started beside a
     /// running one, or racing another through startup, stops at it with
     /// `AlreadyRunning`, having opened only its own log and the claim's lock
-    /// file. It never reads or writes the config, the token, the identity key
-    /// or the trust store that the running daemon holds.
+    /// file. It never reads or writes the config, the identity key or the
+    /// trust store that the running daemon holds, nor on unix the token. On
+    /// Windows the token names the pipe, so `endpoint` was worked out from it
+    /// before this is called.
     pub async fn start(
         endpoint: &DaemonEndpoint,
         load_config: impl FnOnce() -> Result<Config, ConfigError>,
@@ -3700,11 +3702,16 @@ mod a_second_daemon_leaves_the_running_daemons_files_alone {
             let running = std::os::unix::net::UnixListener::bind(&path).expect("a unix listener");
             (running, DaemonEndpoint::Unix(path))
         };
+        // On Windows the daemon listens only on a pipe, and a pipe held by a
+        // process of this user, as this one is, is a daemon already running.
         #[cfg(windows)]
         let (running, endpoint) = {
-            let running = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
-            let addr = running.local_addr().expect("its address");
-            (running, DaemonEndpoint::Tcp(addr))
+            let name = format!(r"\\.\pipe\hops-test-taken-{}", std::process::id());
+            let running = tokio::net::windows::named_pipe::ServerOptions::new()
+                .first_pipe_instance(true)
+                .create(&name)
+                .expect("a pipe of this user");
+            (running, DaemonEndpoint::Pipe(name))
         };
 
         let read_config = Cell::new(false);
