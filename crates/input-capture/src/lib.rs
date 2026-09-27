@@ -27,6 +27,11 @@ mod layer_shell;
 #[cfg(windows)]
 mod windows;
 
+// Built for tests on every OS, so the policy the Windows backend relies on is
+// tested where there is no Windows to run it.
+#[cfg(any(windows, test))]
+mod event_queue;
+
 #[cfg(x11)]
 mod x11;
 
@@ -598,3 +603,8 @@ mod a_backend_refused_for_a_permission {
         );
     }
 }
+
+// Kept at the end: source guards elsewhere read this file up to its first
+// test module.
+#[cfg(test)]
+mod windows_guards;

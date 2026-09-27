@@ -4137,6 +4137,10 @@ mod no_log_line_in_the_input_path_names_a_key {
             include_str!("../crates/input-capture/src/windows/event_thread.rs"),
         ),
         (
+            "crates/input-capture/src/event_queue.rs",
+            include_str!("../crates/input-capture/src/event_queue.rs"),
+        ),
+        (
             "crates/input-emulation/src/lib.rs",
             include_str!("../crates/input-emulation/src/lib.rs"),
         ),
