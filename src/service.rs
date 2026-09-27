@@ -3,9 +3,9 @@ use crate::{
     client::ClientManager,
     clipboard::{Clipboard, ClipboardEvent, ClipboardInbox},
     config::{Config, ConfigError},
-    connect::{ClipboardSender, LanMouseConnection},
+    connect::{ClipboardSender, DialRefusal, LanMouseConnection},
     crypto,
-    discovery::{DiscoveredPeer, Discovery, DiscoveryEvent},
+    discovery::{Discovery, DiscoveryEvent},
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
     enter_hook,
@@ -160,11 +160,11 @@ pub struct Service {
     /// Discovery has heard no other machine since it started, for long
     /// enough to say so (#149).
     discovery_quiet: bool,
-    /// Peers seen on the network, keyed by advertised label. Not trusted: a
-    /// claimed fingerprint here is an unauthenticated assertion by whatever is
-    /// on the LAN, useful only for labelling and for spotting a mismatch when
-    /// the TLS certificate actually arrives.
-    discovered: HashMap<String, DiscoveredPeer>,
+    /// Peers seen on the network, bounded. Not trusted: a claimed
+    /// fingerprint here is an unauthenticated assertion by whatever is on the
+    /// LAN, useful only for labelling and for spotting a mismatch when the TLS
+    /// certificate actually arrives.
+    discovered: crate::discovery::DiscoveredPeers,
     /// frontend listener
     frontend_listener: AsyncFrontendListener,
     /// The lease store. Shared with both TLS verifiers, which ask it the
@@ -235,10 +235,15 @@ pub struct Service {
     /// inbound clipboard text received from peers, applied to the local
     /// clipboard if the pairing still takes it from its sender
     clipboard_in: ClipboardInbox,
-    /// fingerprints of RECEIVERS we tried to dial but don't trust (from the
-    /// connect side). Turned into `ConnectionAttempt` below so the UI can offer
-    /// to authorize them — the outbound counterpart of the inbound pairing prompt.
-    untrusted_receivers: Receiver<(String, SocketAddr)>,
+    /// Dials that ended in a way the user may need telling about (from the
+    /// connect side). An untrusted receiver becomes a `ConnectionAttempt` so
+    /// the UI can offer to authorize it — the outbound counterpart of the
+    /// inbound pairing prompt. A refusal becomes a notice (#171).
+    dial_refusals: Receiver<DialRefusal>,
+    /// When each device last had a refusal notice of each kind, so a device
+    /// refused on every crossing, or every second while it is being added,
+    /// says so once a minute rather than each time.
+    refusal_notices: RecentNotices,
     /// a client's peer_fingerprint was just learned — persist it and republish
     persist_requests: Receiver<ClientHandle>,
     /// a client's LIVE state changed — republish it, without touching the config
@@ -295,6 +300,38 @@ fn attempts_to_replay(
 /// recognise while add device is open. Well past any real fleet, small enough
 /// that a flood costs nothing.
 const MAX_PENDING_ATTEMPTS: usize = 32;
+
+/// When each device last had a refusal notice of each kind.
+///
+/// A crossing into a device that refuses this machine is retried on every
+/// crossing, and a device being added is dialled every second, so without
+/// this the same notice would repeat as fast as the dials do.
+#[derive(Default)]
+struct RecentNotices {
+    shown: HashMap<(ClientHandle, &'static str), Instant>,
+}
+
+impl RecentNotices {
+    /// How long a notice stays quiet after it is shown.
+    const QUIET: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Whether a notice of `kind` about `handle` may be shown at `now`, and
+    /// if so, record that it was.
+    fn due(&mut self, handle: ClientHandle, kind: &'static str, now: Instant) -> bool {
+        // Handles are never reused, so a removed device's entries would stay.
+        if self.shown.len() >= 64 {
+            self.shown
+                .retain(|_, at| now.saturating_duration_since(*at) < Self::QUIET);
+        }
+        match self.shown.get(&(handle, kind)) {
+            Some(at) if now.saturating_duration_since(*at) < Self::QUIET => false,
+            _ => {
+                self.shown.insert((handle, kind), now);
+                true
+            }
+        }
+    }
+}
 
 /// Drop any persisted client pin naming a fingerprint that is not in the
 /// allowlist.
@@ -515,7 +552,7 @@ impl Service {
         // such a peer flooding valid payloads is not yet back-pressured; a
         // bounded/coalescing channel is the future hardening.
         let (clipboard_in_tx, clipboard_in) = channel();
-        let (untrusted_tx, untrusted_receivers) = channel();
+        let (refusals_tx, dial_refusals) = channel();
         let (persist_tx, persist_requests) = channel();
         let (state_tx, state_changes) = channel();
         let clipboard = Clipboard::new();
@@ -535,7 +572,7 @@ impl Service {
             client_manager.clone(),
             trust.clone(),
             clipboard_in_tx,
-            untrusted_tx,
+            refusals_tx,
             persist_tx,
             state_tx,
         )
@@ -578,7 +615,7 @@ impl Service {
             resolver,
             discovery,
             discovery_quiet: false,
-            discovered: HashMap::new(),
+            discovered: Default::default(),
             trust,
             trust_saver: crate::trust_save::TrustSaver::new(trust_file),
             pending_attempts: HashMap::new(),
@@ -600,7 +637,8 @@ impl Service {
             clipboard,
             clipboard_alive: true,
             clipboard_in,
-            untrusted_receivers,
+            dial_refusals,
+            refusal_notices: RecentNotices::default(),
             persist_requests,
             state_changes,
             clipboard_out_conn,
@@ -676,15 +714,9 @@ impl Service {
                         self.broadcast_client(handle);
                     }
                 }
-                fp = self.untrusted_receivers.recv() => {
-                    if let Some((fp, addr)) = fp {
-                        // only prompt if it really is untrusted — a racing dial can
-                        // report a fingerprint that was authorized in the meantime
-                        let known = self.trust.read().expect("lock").we_may_drive(&fp);
-                        if !known {
-                            log::info!("untrusted receiver {fp} — raising an approval prompt");
-                            self.raise_connection_attempt(fp, AttemptOrigin::OutboundDial, Some(addr));
-                        }
+                refusal = self.dial_refusals.recv() => {
+                    if let Some(refusal) = refusal {
+                        self.handle_dial_refusal(refusal);
                     }
                 }
                 text = self.clipboard_in.next() => {
@@ -1068,22 +1100,23 @@ impl Service {
                 self.connected_peers.insert(addr, fingerprint.clone());
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
             }
-            EmulationEvent::PeerHello { addr, commit } => {
-                // Map the peer's source addr back to its client handle
-                // and stamp the commit. Skip if we don't have an
-                // outgoing client configured for this peer (incoming-
-                // only setup) — there's nowhere to display the version
-                // in that case anyway.
-                if let Some(handle) = self.client_manager.get_client(addr) {
+            EmulationEvent::PeerHello {
+                fingerprint,
+                commit,
+            } => {
+                // Stamp the commit on the device pinned to the certificate
+                // this connection presented. None for an incoming-only
+                // setup: there is nowhere to display the version then.
+                for handle in self.client_manager.pinned_to(&fingerprint) {
                     self.client_manager.set_peer_commit(handle, Some(commit));
                     self.broadcast_client(handle);
                 }
             }
-            EmulationEvent::PeerCaps { addr, flags } => {
-                // Mirror PeerHello: map the peer's addr to its client
-                // handle and record the advertised capability bits. Skip
-                // if there's no outgoing client for this peer.
-                if let Some(handle) = self.client_manager.get_client(addr) {
+            EmulationEvent::PeerCaps { fingerprint, flags } => {
+                // Mirror PeerHello. These bits decide what this machine
+                // sends the device, so a machine that only shares its
+                // address must not set them.
+                for handle in self.client_manager.pinned_to(&fingerprint) {
                     self.client_manager.set_peer_caps(handle, Some(flags));
                     self.broadcast_client(handle);
                 }
@@ -1157,52 +1190,22 @@ impl Service {
                 // Something answered: whatever the list shows, it is not
                 // silence.
                 let was_quiet = std::mem::take(&mut self.discovery_quiet);
-                let key = crate::discovery::peer_key(&peer);
-                let changed = match self.discovered.get_mut(&key) {
-                    // mDNS re-announces constantly, per interface, with
-                    // different address subsets each time. Only a real change
-                    // is worth telling the frontend about.
-                    Some(known) => crate::discovery::merge(known, peer),
-                    None => {
-                        log::info!(
-                            "found {:?} on the local network at {:?}{}",
-                            peer.label,
-                            peer.addrs,
-                            match &peer.claimed_fingerprint {
-                                Some(fp) => format!(" claiming {fp}"),
-                                None => String::new(),
-                            }
-                        );
-                        self.discovered.insert(key, peer);
-                        true
-                    }
-                };
-                if !changed && !was_quiet {
+                // mDNS re-announces constantly, per interface, with different
+                // address subsets each time. Only a real change is worth
+                // telling the frontend about.
+                if !self.discovered.found(peer, Instant::now()) && !was_quiet {
                     return;
                 }
             }
-            DiscoveryEvent::Lost(label) => {
-                // Filed by fingerprint, but withdrawn by name — so find the
-                // entry whose label matches rather than assuming the key.
-                // Compare BASE labels: mDNS can announce a peer as `name` and
-                // withdraw it as `name (2)`, and a raw comparison then never
-                // matches, leaving the row on screen forever.
-                let want = crate::discovery::base_label(&label);
-                let key = self
-                    .discovered
-                    .iter()
-                    .find(|(_, p)| crate::discovery::base_label(&p.label) == want)
-                    .map(|(k, _)| k.clone());
-                match key.and_then(|k| self.discovered.remove(&k)) {
-                    Some(p) => {
-                        log::info!(
-                            "{:?} stopped announcing itself on the local network",
-                            p.label
-                        )
-                    }
-                    None => return,
+            DiscoveryEvent::Lost(label) => match self.discovered.lost(&label) {
+                Some(p) => {
+                    log::info!(
+                        "{:?} stopped announcing itself on the local network",
+                        p.label
+                    )
                 }
-            }
+                None => return,
+            },
         }
         self.publish_discovered();
     }
@@ -1221,7 +1224,7 @@ impl Service {
         let trust = self.trust.read().expect("lock");
         let peers: Vec<DiscoveredDevice> = self
             .discovered
-            .values()
+            .iter()
             .filter(|p| match &p.claimed_fingerprint {
                 // `has_live_lease`, so a device whose lease lapsed reappears
                 // as discoverable and can be re-added. An expelled one does
@@ -1498,6 +1501,110 @@ impl Service {
         self.publish_trust();
     }
 
+    /// A dial that ended in a way the person here may need telling about.
+    ///
+    /// Each refusal was caused by someone at this machine, crossing to the
+    /// device or adding it, so each is an error they can act on (#150, #171),
+    /// once a minute per device at most. The exception is a device being
+    /// added: the machine it names may simply not have approved this one yet,
+    /// which is the expected state of a pairing in progress, so that is
+    /// activity until adding ends, and adding says so if it runs out of time.
+    fn handle_dial_refusal(&mut self, refusal: DialRefusal) {
+        let now = Instant::now();
+        match refusal {
+            DialRefusal::Untrusted {
+                fingerprint: fp,
+                addr,
+            } => {
+                // only prompt if it really is untrusted — a racing dial can
+                // report a fingerprint that was authorized in the meantime
+                let known = self.trust.read().expect("lock").we_may_drive(&fp);
+                if !known {
+                    log::info!("untrusted receiver {fp} — raising an approval prompt");
+                    // On one line: the provenance guard reads the call's line.
+                    self.raise_connection_attempt(fp, AttemptOrigin::OutboundDial, Some(addr));
+                }
+            }
+            DialRefusal::RefusedByPeer {
+                handle,
+                fingerprint,
+                addr,
+            } => {
+                // The name it was paired under here: a refusal can arrive
+                // before the device is pinned to the machine that answered.
+                let label = self.trust.read().expect("lock").label(&fingerprint);
+                let name = label
+                    .filter(|l| !l.is_empty())
+                    .unwrap_or_else(|| self.device_name(handle));
+                if self.adding.contains_key(&handle) {
+                    if self.refusal_notices.due(handle, "waiting", now) {
+                        self.notify_frontend(FrontendEvent::Activity(format!(
+                            "Waiting for {name} to approve this machine: open add device on \
+                             {name} to see its request."
+                        )));
+                    }
+                } else if self.refusal_notices.due(handle, "refused", now) {
+                    log::warn!("{name} at {addr} refused this machine");
+                    self.notify_frontend(FrontendEvent::Error(format!(
+                        "{name} refused the connection: it does not let this machine control \
+                         it. To pair again, open add device on {name}, then move the pointer \
+                         across again."
+                    )));
+                }
+            }
+            DialRefusal::NotThePinnedMachine { handle, seen } => {
+                if !self.refusal_notices.due(handle, "not-pinned", now) {
+                    return;
+                }
+                let name = self.device_name(handle);
+                let answered = seen.first().map(|(addr, fp)| {
+                    let label = self.trust.read().expect("lock").label(fp);
+                    (
+                        addr.ip().to_string(),
+                        label
+                            .filter(|l| !l.is_empty())
+                            .unwrap_or_else(|| "another paired machine".to_owned()),
+                    )
+                });
+                let (addr, other) = answered.unwrap_or_else(|| {
+                    (
+                        "Its address".to_owned(),
+                        "another paired machine".to_owned(),
+                    )
+                });
+                self.notify_frontend(FrontendEvent::Error(format!(
+                    "{addr} answered for {name} as {other}, so hops did not connect to it. \
+                     Check {name}'s address or hostname."
+                )));
+            }
+            DialRefusal::Conflict { handle, .. } => {
+                if !self.refusal_notices.due(handle, "conflict", now) {
+                    return;
+                }
+                let name = self.device_name(handle);
+                self.notify_frontend(FrontendEvent::Error(format!(
+                    "{name}'s addresses answered as different machines, so hops connected to \
+                     none of them. Check that its address or hostname reaches {name} only."
+                )));
+            }
+        }
+    }
+
+    /// What to call device `handle` in a notice: the name it was paired
+    /// under, else its hostname, else its first address.
+    fn device_name(&self, handle: ClientHandle) -> String {
+        let Some((config, state)) = self.client_manager.get_state(handle) else {
+            return format!("device {handle}");
+        };
+        state
+            .peer_fingerprint
+            .and_then(|fp| self.trust.read().expect("lock").label(&fp))
+            .filter(|l| !l.is_empty())
+            .or(config.hostname)
+            .or_else(|| config.fix_ips.first().map(|ip| ip.to_string()))
+            .unwrap_or_else(|| format!("device {handle}"))
+    }
+
     /// Refuse a trust GRANT while a peer is driving this machine's input.
     ///
     /// On a KVM the pointer is not proof of local presence: a peer that still
@@ -1552,14 +1659,26 @@ impl Service {
             return;
         }
         let now = Instant::now();
-        match self.prompt_gate.admit(&fingerprint, now) {
+        // Only a knock is counted against its address: this machine's own dial
+        // is timed by the person here, not by whoever answers it.
+        let from = addr
+            .filter(|_| origin == AttemptOrigin::Inbound)
+            .map(|a| a.ip());
+        match self.prompt_gate.admit(&fingerprint, from, now) {
             Admit::Prompt => {}
             Admit::Repeat => return,
-            Admit::Closed => {
-                if let Some(line) = self.prompt_gate.note_refusal(&fingerprint, now) {
+            Admit::Throttled => {
+                if let Some(line) = self.prompt_gate.note_throttled(addr, now) {
                     log::info!("{line}");
                 }
-                if origin == AttemptOrigin::OutboundDial {
+                return;
+            }
+            Admit::Closed => match origin {
+                AttemptOrigin::OutboundDial => {
+                    log::info!(
+                        "our dial reached {fingerprint} at {addr:?}, which is not paired with \
+                         this machine, and add device is not open"
+                    );
                     // Our own dial reached a machine we are not paired with, so the
                     // person at this one can act on it; a stranger knocking cannot.
                     self.notify_frontend(FrontendEvent::Error(format!(
@@ -1567,9 +1686,19 @@ impl Service {
                          machines, then move the pointer across again.",
                         addr.map_or_else(|| "That device".to_owned(), |a| a.to_string())
                     )));
+                    return;
                 }
-                return;
-            }
+                AttemptOrigin::Inbound => {
+                    // Nobody here asked for this, and a stranger can cause it at
+                    // will: a summarised line in the activity log, never the
+                    // error banner (#150, #171).
+                    if let Some(refused) = self.prompt_gate.note_refusal(&fingerprint, addr, now) {
+                        log::info!("{}", refused.log_line());
+                        self.notify_frontend(FrontendEvent::Activity(refused.notice()));
+                    }
+                    return;
+                }
+            },
         }
         match origin {
             AttemptOrigin::OutboundDial => {
@@ -1972,8 +2101,9 @@ impl Service {
         self.capture.dial(handle);
     }
 
-    /// Dial again every device still being added. Stops for one that connected,
-    /// was switched off or removed, or ran out of time; the last says why.
+    /// Dial again every device still being added whose link is down. Stops
+    /// for one switched off or removed, or out of time; out of time with no
+    /// link, it says why.
     fn retry_adding(&mut self) {
         let now = Instant::now();
         let window_open = self.prompt_gate.remaining(now).is_some();
@@ -1982,14 +2112,24 @@ impl Service {
             let Some((_, state)) = self.client_manager.get_state(handle) else {
                 return false;
             };
-            if !state.active || self.client_manager.active_addr(handle).is_some() {
+            if !state.active {
                 return false;
             }
+            // A link that looks open may not be: a machine that has not
+            // approved this one completes this machine's half of the
+            // handshake and refuses it after. So a device stays being added,
+            // undialled while its link is up, until the time runs out; its
+            // refusal meanwhile is the expected one (#171).
+            let linked = self.client_manager.active_addr(handle).is_some();
             if !window_open || now.saturating_duration_since(started) >= PromptGate::WINDOW {
-                gave_up.push(handle);
+                if !linked {
+                    gave_up.push(handle);
+                }
                 return false;
             }
-            self.capture.dial(handle);
+            if !linked {
+                self.capture.dial(handle);
+            }
             true
         });
         for handle in gave_up {
@@ -2985,6 +3125,9 @@ mod a_mac_missing_a_permission;
 
 #[cfg(all(test, unix))]
 mod a_refused_crossing;
+
+#[cfg(all(test, unix))]
+mod refusals_and_bounds;
 
 #[cfg(test)]
 mod replay_on_attach {

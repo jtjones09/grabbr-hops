@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use local_channel::mpsc::{Receiver, Sender, channel};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
@@ -351,6 +351,91 @@ pub fn peer_key(p: &DiscoveredPeer) -> String {
         .unwrap_or_else(|| p.label.clone())
 }
 
+/// The most addresses kept for one machine. A machine has a handful, one or
+/// two per interface; anything announcing more is not worth the memory.
+const MAX_ADDRS: usize = 16;
+
+/// The machines seen on the network, bounded.
+///
+/// Anything on the network can announce, under any name and fingerprint, as
+/// often as it likes, and an entry left only when its announcement was
+/// withdrawn. So a stranger announcing fresh fingerprints grew this for the
+/// life of the daemon, and one announcing fresh addresses grew an entry
+/// (#101). Past [`Self::MAX`] machines, the one heard from longest ago makes
+/// room: a real machine announces again, and is back once a flood stops.
+#[derive(Default)]
+pub(crate) struct DiscoveredPeers {
+    peers: HashMap<String, (DiscoveredPeer, Instant)>,
+}
+
+impl DiscoveredPeers {
+    /// More machines than a network running hops has.
+    pub(crate) const MAX: usize = 64;
+
+    /// Record an announcement heard at `now`. Whether the list changed: a
+    /// machine not listed before, or something new about one that was.
+    pub(crate) fn found(&mut self, mut peer: DiscoveredPeer, now: Instant) -> bool {
+        peer.addrs.truncate(MAX_ADDRS);
+        let key = peer_key(&peer);
+        if let Some((known, heard)) = self.peers.get_mut(&key) {
+            *heard = now;
+            return merge(known, peer);
+        }
+        if self.peers.len() >= Self::MAX {
+            let stalest = self
+                .peers
+                .iter()
+                .min_by_key(|(_, (_, heard))| *heard)
+                .map(|(k, _)| k.clone());
+            if let Some((gone, _)) = stalest.and_then(|k| self.peers.remove(&k)) {
+                log::debug!(
+                    "discovery: {} machines listed; dropping {:?}, heard from longest ago",
+                    Self::MAX,
+                    gone.label
+                );
+            }
+        }
+        log::info!(
+            "found {:?} on the local network at {:?}{}",
+            peer.label,
+            peer.addrs,
+            match &peer.claimed_fingerprint {
+                Some(fp) => format!(" claiming {fp}"),
+                None => String::new(),
+            }
+        );
+        self.peers.insert(key, (peer, now));
+        true
+    }
+
+    /// Forget the machine announced as `label`, which stopped announcing.
+    ///
+    /// Filed by fingerprint, but withdrawn by name — so find the entry whose
+    /// label matches rather than assuming the key. Compare BASE labels: mDNS
+    /// can announce a peer as `name` and withdraw it as `name (2)`, and a raw
+    /// comparison then never matches, leaving the row on screen forever.
+    pub(crate) fn lost(&mut self, label: &str) -> Option<DiscoveredPeer> {
+        let want = base_label(label);
+        let key = self
+            .peers
+            .iter()
+            .find(|(_, (p, _))| base_label(&p.label) == want)
+            .map(|(k, _)| k.clone())?;
+        self.peers.remove(&key).map(|(p, _)| p)
+    }
+
+    /// Every machine listed.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &DiscoveredPeer> {
+        self.peers.values().map(|(p, _)| p)
+    }
+
+    /// How many machines are listed.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.peers.len()
+    }
+}
+
 /// Fold a new announcement into what we already knew.
 ///
 /// Announcements arrive **per interface and piecemeal**: on this rig one peer
@@ -362,9 +447,15 @@ pub fn peer_key(p: &DiscoveredPeer) -> String {
 ///
 /// Returns `true` if anything actually changed, so a re-announcement that
 /// tells us nothing new does not wake the frontend.
+///
+/// At most [`MAX_ADDRS`] addresses are kept, the first ones heard: an
+/// announcement can carry any addresses at all.
 pub fn merge(into: &mut DiscoveredPeer, new: DiscoveredPeer) -> bool {
     let before = into.clone();
     for a in new.addrs {
+        if into.addrs.len() >= MAX_ADDRS {
+            break;
+        }
         if !into.addrs.contains(&a) {
             into.addrs.push(a);
         }
@@ -606,6 +697,58 @@ mod tests {
             "every route seen must be kept: {:?}",
             known.addrs
         );
+    }
+
+    /// An announcement can carry any addresses, and anyone can announce as
+    /// often as it likes: the addresses kept for one machine are bounded, and
+    /// the first ones heard stay (#101).
+    // LEDGER T2374 | class B | 1 return value: merge
+    #[test]
+    fn announced_addresses_cannot_grow_an_entry_without_bound() {
+        let mut known = peer("p", Some("aa:aa"), &["192.0.2.1:4242"]);
+        for i in 0..10_000u32 {
+            let ip = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i as u16);
+            let addr = SocketAddr::new(IpAddr::V6(ip), 4242).to_string();
+            merge(&mut known, peer("p", Some("aa:aa"), &[addr.as_str()]));
+        }
+        assert!(
+            known.addrs.len() <= MAX_ADDRS,
+            "10,000 announced addresses left {} on one row",
+            known.addrs.len()
+        );
+        assert!(
+            known.addrs.contains(&"192.0.2.1:4242".parse().unwrap()),
+            "the first address heard was pushed out: {:?}",
+            known.addrs
+        );
+    }
+
+    /// A stranger announcing fresh fingerprints adds a row each time; past
+    /// the cap the machine heard from longest ago makes room, and a real
+    /// machine that keeps announcing stays listed.
+    // LEDGER T2381 | class B | 6 struct state: DiscoveredPeers after found/lost
+    #[test]
+    fn a_flood_of_announcements_keeps_the_list_bounded_and_a_live_machine_on_it() {
+        let mut list = DiscoveredPeers::default();
+        let start = Instant::now();
+        let at = |ms: u64| start + std::time::Duration::from_millis(ms);
+        assert!(list.found(peer("desk", Some("de:5k"), &["192.0.2.1:4242"]), at(0)));
+        for i in 0..5_000u64 {
+            let fp = format!("f1:{i:04x}");
+            list.found(peer("flood", Some(&fp), &["192.0.2.66:4242"]), at(i + 1));
+            // The real machine announces again now and then, as mDNS does.
+            if i % 20 == 0 {
+                list.found(peer("desk", Some("de:5k"), &["192.0.2.1:4242"]), at(i + 1));
+            }
+        }
+        assert!(list.len() <= DiscoveredPeers::MAX, "{} rows", list.len());
+        assert!(
+            list.iter()
+                .any(|p| p.claimed_fingerprint.as_deref() == Some("de:5k")),
+            "a machine announcing all along was pushed off the list"
+        );
+        assert!(list.lost("desk").is_some());
+        assert!(list.iter().all(|p| p.label != "desk"));
     }
 
     /// The same set in a different order is not news. Without this the daemon

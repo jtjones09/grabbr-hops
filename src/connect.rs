@@ -43,6 +43,57 @@ pub(crate) enum LanMouseConnectionError {
     Timeout,
     #[error("receiver fingerprint did not match the expected identity")]
     FingerprintMismatch,
+    #[error("the receiver refused this machine")]
+    RefusedByPeer,
+}
+
+/// A dial that ended in a way the person at this machine may need telling
+/// about, sent to the service, which decides what to say (#171).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DialRefusal {
+    /// A receiver this machine holds no lease to drive answered: the service
+    /// may offer to pair it.
+    Untrusted {
+        fingerprint: String,
+        addr: SocketAddr,
+    },
+    /// A receiver this machine may drive refused this machine: it holds no
+    /// pairing that lets this machine control it.
+    RefusedByPeer {
+        handle: ClientHandle,
+        fingerprint: String,
+        addr: SocketAddr,
+    },
+    /// The device's addresses answered, but as another paired machine than
+    /// the one the device is pinned to.
+    NotThePinnedMachine {
+        handle: ClientHandle,
+        seen: Vec<(SocketAddr, String)>,
+    },
+    /// The device's addresses answered as different machines.
+    Conflict {
+        handle: ClientHandle,
+        seen: Vec<(SocketAddr, String)>,
+    },
+}
+
+/// Whether the receiver ended this connection because it will not take this
+/// machine: its TLS layer refused our certificate, which arrives as a TLS
+/// alert in a QUIC crypto error, or its accept path closed the connection as
+/// `unauthorized`.
+///
+/// Our certificate is checked after our side of the handshake completes, so
+/// the refusal usually lands on a connection this machine took to be open.
+fn refused_by_peer(e: &quinn::ConnectionError) -> bool {
+    match e {
+        quinn::ConnectionError::ConnectionClosed(close) => {
+            (0x100..=0x1ff).contains(&u64::from(close.error_code))
+        }
+        quinn::ConnectionError::ApplicationClosed(close) => {
+            close.reason.as_ref() == b"unauthorized"
+        }
+        _ => false,
+    }
 }
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -151,7 +202,14 @@ async fn connect(
         conn.close(0u32.into(), b"not permitted");
         return Err((addr, LanMouseConnectionError::NotPermitted));
     }
-    let send = conn.open_uni().await.map_err(|e| (addr, e.into()))?;
+    let send = conn.open_uni().await.map_err(|e| {
+        let e = if refused_by_peer(&e) {
+            LanMouseConnectionError::RefusedByPeer
+        } else {
+            e.into()
+        };
+        (addr, e)
+    })?;
     Ok((
         PeerLink {
             conn,
@@ -257,11 +315,14 @@ async fn connect_any(
     // if every candidate failed the identity pin (not a transport error), surface
     // that distinctly so the caller logs the right recovery guidance.
     let mut only_mismatch = !addrs.is_empty();
+    let mut refused = false;
     loop {
         match joinset.join_next().await {
             None => {
                 return Err(if only_mismatch {
                     LanMouseConnectionError::FingerprintMismatch
+                } else if refused {
+                    LanMouseConnectionError::RefusedByPeer
                 } else {
                     LanMouseConnectionError::NotConnected
                 });
@@ -272,6 +333,7 @@ async fn connect_any(
                     if !matches!(e, LanMouseConnectionError::FingerprintMismatch) {
                         only_mismatch = false;
                     }
+                    refused |= matches!(e, LanMouseConnectionError::RefusedByPeer);
                     log::warn!("failed to connect to {a}: `{e}`");
                 }
             },
@@ -301,12 +363,13 @@ pub(crate) struct LanMouseConnection {
     /// the join key is in-memory only and never reaches the UI, so every device
     /// renders as two cards -- one client row, one trusted row.
     persist_tx: Sender<ClientHandle>,
-    /// fingerprint of a receiver we tried to dial but do not trust. The service
-    /// turns this into a `ConnectionAttempt` so the UI can offer to authorize it
-    /// — without this, an untrusted RECEIVER is only ever a log line and the user
-    /// has no in-app way to trust it (the inbound path has had a prompt all
-    /// along; the outbound path never did).
-    untrusted_tx: Sender<(String, SocketAddr)>,
+    /// Dials that ended in a way the user may need telling about. An untrusted
+    /// receiver becomes a `ConnectionAttempt` so the UI can offer to authorize
+    /// it — without this, an untrusted RECEIVER is only ever a log line and the
+    /// user has no in-app way to trust it (the inbound path has had a prompt
+    /// all along; the outbound path never did). A receiver that refuses this
+    /// machine, or answers as another machine, becomes a notice (#171).
+    refusals: Sender<DialRefusal>,
     /// signals the service that a client's LIVE state changed — the peer came
     /// up, went away, or answered with different capabilities — so the frontend
     /// can be told. `persist_tx` cannot serve: it also writes the config file,
@@ -322,7 +385,7 @@ impl LanMouseConnection {
         client_manager: ClientManager,
         trust: Trust,
         clipboard_in: Sender<PeerClipboard>,
-        untrusted_tx: Sender<(String, SocketAddr)>,
+        refusals: Sender<DialRefusal>,
         persist_tx: Sender<ClientHandle>,
         state_tx: Sender<ClientHandle>,
     ) -> Result<Self, LanMouseConnectionError> {
@@ -342,7 +405,7 @@ impl LanMouseConnection {
             identity,
             trust,
             clipboard_in,
-            untrusted_tx,
+            refusals,
             persist_tx,
             state_tx,
         })
@@ -489,7 +552,7 @@ impl LanMouseConnection {
                 self.identity.clone(),
                 self.trust.clone(),
                 self.clipboard_in.clone(),
-                self.untrusted_tx.clone(),
+                self.refusals.clone(),
                 self.persist_tx.clone(),
                 self.state_tx.clone(),
             ));
@@ -696,7 +759,7 @@ async fn connect_to_handle(
     identity: Arc<Identity>,
     trust: Trust,
     clipboard_in: Sender<PeerClipboard>,
-    untrusted_tx: Sender<(String, SocketAddr)>,
+    refusals: Sender<DialRefusal>,
     persist_tx: Sender<ClientHandle>,
     state_tx: Sender<ClientHandle>,
 ) -> Result<(), LanMouseConnectionError> {
@@ -737,57 +800,76 @@ async fn connect_to_handle(
             Ok(c) => c,
             Err(e) => {
                 connecting.lock().await.remove(&handle);
+                // What each address answered as, whatever went wrong after.
+                let seen: Vec<(SocketAddr, String)> = dials
+                    .iter()
+                    .filter_map(|d| {
+                        d.observed
+                            .lock()
+                            .expect("lock")
+                            .take()
+                            .map(|fp| (d.addr, fp))
+                    })
+                    .collect();
                 match e {
-                    // handshake succeeded but the identity didn't match the pin —
-                    // NOT an authorization failure (the presented fp IS allowlisted).
-                    LanMouseConnectionError::FingerprintMismatch => log::warn!(
-                        "client {handle}: the receiver answered but its fingerprint did \
-                         not match the pinned identity — the target address may point at \
-                         a different machine, or the receiver re-keyed (reinstall). If it \
-                         re-keyed, remove the old fingerprint from authorized_fingerprints \
-                         and authorize the new one."
-                    ),
-                    _ => {
-                        let seen: Vec<(SocketAddr, String)> = dials
-                            .iter()
-                            .filter_map(|d| {
-                                d.observed
-                                    .lock()
-                                    .expect("lock")
-                                    .take()
-                                    .map(|fp| (d.addr, fp))
-                            })
-                            .collect();
-                        match decide_trust_prompt(&seen) {
-                            TrustPrompt::Nothing => {}
-                            TrustPrompt::Offer { addr, fp } => {
-                                log::warn!(
-                                    "client {handle}: {addr} answered with fingerprint {fp}, \
-                                     which is not trust — prompting to trust it"
-                                );
-                                // Hand it to the service, which checks it against
-                                // the allowlist and raises a ConnectionAttempt if it
-                                // really is untrusted. Filtering lives there because
-                                // that is where the allowlist lives.
-                                // keep the addr: the user typed an address and
-                                // needs to see WHICH one answered (#93)
-                                let _ = untrusted_tx.send((fp, addr));
-                            }
-                            TrustPrompt::Conflict => {
-                                log::error!(
-                                    "client {handle}: the addresses for this device answered \
-                                     with DIFFERENT identities, so hops will not offer to \
-                                     trust any of them. This is what a spoofed record, a \
-                                     stale DHCP lease, or two machines sharing a name looks \
-                                     like. Seen: {}",
-                                    seen.iter()
-                                        .map(|(a, f)| format!("{a} -> {f}"))
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                );
-                            }
-                        }
+                    // The handshake succeeded, so the machine that answered is
+                    // one this machine may drive, but it is not the one this
+                    // device is pinned to: the address now reaches another
+                    // paired machine.
+                    LanMouseConnectionError::FingerprintMismatch => {
+                        log::warn!(
+                            "client {handle}: its address answered as another paired machine \
+                             than the one it is pinned to, so it was not connected. Seen: {}",
+                            seen.iter()
+                                .map(|(a, f)| format!("{a} -> {f}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                        let _ = refusals.send(DialRefusal::NotThePinnedMachine { handle, seen });
                     }
+                    _ => match decide_trust_prompt(&seen) {
+                        TrustPrompt::Nothing => {}
+                        TrustPrompt::Offer { addr, fp }
+                            if matches!(e, LanMouseConnectionError::RefusedByPeer) =>
+                        {
+                            log::warn!("client {handle}: {addr} ({fp}) refused this machine");
+                            let _ = refusals.send(DialRefusal::RefusedByPeer {
+                                handle,
+                                fingerprint: fp,
+                                addr,
+                            });
+                        }
+                        TrustPrompt::Offer { addr, fp } => {
+                            log::warn!(
+                                "client {handle}: {addr} answered with fingerprint {fp}, \
+                                 which is not trust — prompting to trust it"
+                            );
+                            // Hand it to the service, which checks it against
+                            // the allowlist and raises a ConnectionAttempt if it
+                            // really is untrusted. Filtering lives there because
+                            // that is where the allowlist lives.
+                            // keep the addr: the user typed an address and
+                            // needs to see WHICH one answered (#93)
+                            let _ = refusals.send(DialRefusal::Untrusted {
+                                fingerprint: fp,
+                                addr,
+                            });
+                        }
+                        TrustPrompt::Conflict => {
+                            log::error!(
+                                "client {handle}: the addresses for this device answered \
+                                 with DIFFERENT identities, so hops will not offer to \
+                                 trust any of them. This is what a spoofed record, a \
+                                 stale DHCP lease, or two machines sharing a name looks \
+                                 like. Seen: {}",
+                                seen.iter()
+                                    .map(|(a, f)| format!("{a} -> {f}"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            );
+                            let _ = refusals.send(DialRefusal::Conflict { handle, seen });
+                        }
+                    },
                 }
                 return Err(e);
             }
@@ -901,6 +983,7 @@ async fn connect_to_handle(
             ping_response.clone(),
             clipboard,
             state_tx,
+            refusals,
         ));
         return Ok(());
     }
@@ -966,12 +1049,23 @@ async fn receive_loop(
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
     clipboard: ClipboardInlet,
     state_tx: Sender<ClientHandle>,
+    refusals: Sender<DialRefusal>,
 ) {
     // the peer's reliable inbound stream (their uni stream to us)
     let mut recv = match link.conn.accept_uni().await {
         Ok(recv) => recv,
         Err(e) => {
             log::warn!("{addr}: no inbound stream: {e}");
+            // The receiver checks our certificate after our half of the
+            // handshake, so its refusal ends a link that looked open. It
+            // opens its stream only for a machine it admitted.
+            if refused_by_peer(&e) {
+                let _ = refusals.send(DialRefusal::RefusedByPeer {
+                    handle,
+                    fingerprint: link.fingerprint.clone(),
+                    addr,
+                });
+            }
             disconnect(
                 &client_manager,
                 handle,
@@ -1571,7 +1665,7 @@ mod tests {
             st
         }));
         let (clip_tx, _) = channel();
-        let (untrusted_tx, _) = channel();
+        let (refusals, _) = channel();
         let (persist_tx, _) = channel();
         let (state_tx, _) = channel();
         let conn = LanMouseConnection::new(
@@ -1579,7 +1673,7 @@ mod tests {
             ClientManager::default(),
             trust.clone(),
             clip_tx,
-            untrusted_tx,
+            refusals,
             persist_tx,
             state_tx,
         )
@@ -2353,6 +2447,53 @@ mod a_closed_link_is_shown_down {
                 l.state().active_addr.is_none(),
                 "told, but the state it would show still has the link: {:?}",
                 l.state()
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod a_refusing_receiver_is_reported {
+    //! A receiver checks this machine's certificate after this machine's half
+    //! of the handshake, so its refusal ends a link that looked open, and the
+    //! dial reported nothing: the device showed no change and only the log
+    //! said why (#171).
+    use super::*;
+    use crate::listen::LanMouseListener;
+    use crate::test_harness::{dialer, machine, next_within, run_local, trust};
+    use crate::trust::Caps;
+
+    // LEDGER T2380 | class B | 3 message on the dialler's refusal channel, real listener over loopback
+    #[test]
+    fn a_receiver_that_refuses_this_machine_is_reported_by_name() {
+        run_local(async {
+            let sender = machine();
+            let receiver = machine();
+            let (clip_tx, _clip_rx) = channel();
+            // It holds no pairing with the sender, as after it removed it.
+            let (_listener, port) = LanMouseListener::bind_loopback(
+                receiver.identity.clone(),
+                trust(&receiver, &[], Caps::INBOUND),
+                clip_tx,
+            )
+            .await
+            .expect("listener");
+            let mut d = dialer(
+                &sender,
+                trust(&sender, &[&receiver], Caps::OUTBOUND),
+                port,
+                hops_ipc::Position::Left,
+            );
+            let _ = d.conn.send(ProtoEvent::Ping, d.handle).await;
+            let reported = next_within(&mut d.notices.refusals, Duration::from_secs(10)).await;
+            assert_eq!(
+                reported,
+                Some(DialRefusal::RefusedByPeer {
+                    handle: d.handle,
+                    fingerprint: receiver.fingerprint.clone(),
+                    addr: SocketAddr::new("127.0.0.1".parse().expect("ip"), port),
+                }),
+                "a receiver that refused this machine was not reported as such"
             );
         });
     }

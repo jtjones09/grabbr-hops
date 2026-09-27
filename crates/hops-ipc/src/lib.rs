@@ -325,6 +325,14 @@ pub enum FrontendEvent {
     Enumerate(Vec<(ClientHandle, ClientConfig, ClientState)>),
     /// an error occured
     Error(String),
+    /// Something the daemon did that nobody at this machine asked for and
+    /// nobody here need act on, such as refusing a machine that is not
+    /// paired: a line for the activity log, never the error banner. Anyone on
+    /// the network can cause some of these, and an error surface that cries
+    /// wolf stops being read (#150).
+    ///
+    /// Newer than `Error`; older frontends skip it.
+    Activity(String),
     /// Whether input capture runs, and why not when it should (#91).
     CaptureStatus(CaptureState),
     /// emulation status

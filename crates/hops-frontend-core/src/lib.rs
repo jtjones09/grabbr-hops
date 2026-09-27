@@ -235,6 +235,7 @@ impl AppModel {
                 }
             }
             FrontendEvent::Error(e) => self.push_error(e),
+            FrontendEvent::Activity(line) => self.push_message(line),
             FrontendEvent::DeviceConnected { addr, fingerprint } => {
                 self.register_peer(addr, fingerprint);
                 self.push_message(format!("device connected: {addr}"));
@@ -2165,6 +2166,27 @@ mod errors_apart_from_activity {
     //! Errors and the activity log are two things (#150): the log keeps
     //! everything, and only what went wrong is an error.
     use super::*;
+
+    /// A machine refused in the background is a line in the log. Anyone on
+    /// the network can cause one, so it must never raise the error banner.
+    // LEDGER T2372 | class B | 6 struct state: AppModel::apply, messages and latest_error
+    #[test]
+    fn a_background_refusal_is_activity_and_never_an_error() {
+        let mut m = AppModel::default();
+        let line = "Refused a connection from 192.0.2.7: it is not paired to control this \
+                    machine, and add device is not open here.";
+        m.apply(FrontendEvent::Activity(line.into()));
+        assert_eq!(
+            m.latest_message(),
+            Some(line),
+            "a background refusal must be the log's latest line, as it was sent"
+        );
+        assert_eq!(
+            (m.latest_error(), m.error_seq),
+            (None, 0),
+            "a background refusal raised the error banner"
+        );
+    }
 
     // LEDGER T516 | class B | 6 struct state: AppModel::apply, latest_error/error_seq
     #[test]

@@ -152,14 +152,19 @@ impl ClientManager {
         }
     }
 
-    /// find a client by its address
-    pub fn get_client(&self, addr: SocketAddr) -> Option<ClientHandle> {
-        // since there shouldn't be more than a handful of clients at any given
-        // time this is likely faster than using a HashMap
+    /// The devices switched on and pinned to `fingerprint`: the ones a
+    /// connection that proved it speaks for.
+    ///
+    /// Not found by address. Two machines can dial from one address, two
+    /// virtual machines behind one host's NAT for instance, and one machine
+    /// from several, so the address a connection came from names no device.
+    pub(crate) fn pinned_to(&self, fingerprint: &str) -> Vec<ClientHandle> {
         self.clients
             .borrow()
             .iter()
-            .find_map(|(k, (_, s))| (s.active && s.ips.contains(&addr.ip())).then_some(k))
+            .filter(|(_, (_, s))| s.active && s.peer_fingerprint.as_deref() == Some(fingerprint))
+            .map(|(h, _)| h)
+            .collect()
     }
 
     /// get the client at the given position
