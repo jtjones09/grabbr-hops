@@ -15,7 +15,6 @@
 
 mod common;
 
-use std::net::UdpSocket;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
