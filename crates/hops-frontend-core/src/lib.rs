@@ -763,6 +763,11 @@ pub fn fallback_label(fp: &str) -> String {
     short_fingerprint(fp)
 }
 
+/// The name the user gave a device we dial, apart from its address (#13).
+fn given_name(config: &ClientConfig) -> Option<&str> {
+    config.label.as_deref().filter(|l| !l.trim().is_empty())
+}
+
 /// Pick a display label, preferring the user-typed send-side hostname, then the
 /// trusted description, then a short fingerprint, then a placeholder.
 fn display_label(hostname: Option<&str>, description: Option<&str>, fp: &str) -> String {
@@ -853,11 +858,14 @@ impl AppModel {
                     if device.send.is_some() {
                         continue;
                     }
-                    // A user-typed send-side hostname is the preferred label --
-                    // EXCEPT when it is a bare IP literal. Adding a device by
-                    // address puts the IP in the name field, and an address is a
-                    // worse name than the peer's own advertised description.
-                    if let Some(host) = config
+                    // The name the user gave the device comes first (#13). Then
+                    // a user-typed send-side hostname -- EXCEPT when it is a
+                    // bare IP literal. Adding a device by address puts the IP
+                    // in the name field, and an address is a worse name than
+                    // the peer's own advertised description.
+                    if let Some(name) = given_name(config) {
+                        device.label = name.to_string();
+                    } else if let Some(host) = config
                         .hostname
                         .as_deref()
                         .filter(|h| !h.is_empty())
@@ -870,7 +878,10 @@ impl AppModel {
                 // never connected (or our own fp somehow) -> own provisional card
                 _ => provisional.push(Device {
                     fingerprint: None,
-                    label: display_label(config.hostname.as_deref(), None, ""),
+                    label: given_name(config).map_or_else(
+                        || display_label(config.hostname.as_deref(), None, ""),
+                        str::to_string,
+                    ),
                     trust: TrustState::Provisional,
                     online: false,
                     send: Some(send),
@@ -1897,6 +1908,36 @@ mod projection {
                  first entry's, name and buttons both"
             );
         }
+    }
+
+    /// A device the user named is shown by that name, whatever it is dialled
+    /// at and whatever its pairing called it, connected or not (#13). The
+    /// name used to be the hostname, so naming it changed where it dialled.
+    // LEDGER T9906 | class B | 6 struct state: AppModel::devices()
+    #[test]
+    fn a_named_device_is_shown_by_its_name_and_not_its_address() {
+        let desk = "73:90:2a:3c:9d:e5";
+        let named = |host: &str, pin: Option<&str>| {
+            let (mut config, state) = client(Some(host), pin);
+            config.label = Some("den".to_string());
+            (config, state)
+        };
+        let mut m = AppModel::default();
+        m.clients.insert(0, named("desk-mac.local", Some(desk)));
+        m.clients.insert(1, named("192.0.2.11", None));
+        m.authorized
+            .insert(desk.to_string(), "desk mac".to_string());
+        let labels: Vec<(Option<u64>, String)> = m
+            .devices()
+            .into_iter()
+            .map(|d| (d.send.map(|s| s.handle), d.label))
+            .collect();
+        assert_eq!(
+            labels,
+            [(Some(0), "den".to_string()), (Some(1), "den".to_string())],
+            "a paired device and a device never connected, both named den, were \
+             not shown as den"
+        );
     }
 
     /// A denial the trust store still holds must never render like a device

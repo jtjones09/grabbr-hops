@@ -143,6 +143,12 @@ export component AppWindow inherits Window {
     in-out property <string> editing-device: "";
     // The row's pin when its rename opened, carried like confirm-delete-pin.
     in-out property <string> editing-pin: "";
+    // The device being edited is one this machine dials, so it has an
+    // address to change as well as a name (#13).
+    in-out property <bool> editing-send: false;
+    // What is typed into its address field, on `root` so cancel can clear a
+    // field that exists only while `editing-send` holds.
+    in-out property <string> editing-address: "";
     // The edit panel is asking whether to turn the device's clipboard off.
     // Asked, because nothing here turns it back on (#182, #107).
     in-out property <bool> confirm-clipboard-off: false;
@@ -180,6 +186,9 @@ export component AppWindow inherits Window {
     callback activate-device(string /* handle */, bool /* active */);
     callback reposition-device(string /* handle */, string /* new position */);
     callback rename-device(string /* handle */, string /* pin */, string /* new name */);
+    // A device this machine dials, at a new hostname or address. Its pin
+    // stays: only the same machine is accepted there (#99).
+    callback readdress-device(string /* handle */, string /* pin */, string /* address */);
     callback delete-device(string /* handle */, string /* pin */);
     callback revoke(string /* full fingerprint */);
     callback disable-clipboard(string /* full fingerprint */);
@@ -791,6 +800,8 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                         clicked => {
                                             root.confirm-clipboard-off = false;
                                             root.editing-pin = d.pin;
+                                            root.editing-send = d.has-send;
+                                            root.editing-address = "";
                                             root.editing-device = root.editing-device == (d.has-send ? d.handle : d.fp-full)
                                                 ? ""
                                                 : (d.has-send ? d.handle : d.fp-full);
@@ -937,10 +948,25 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                             VerticalLayout {
                                 padding: Space.md;
                                 spacing: Space.sm;
-                                Text {
-                                    text: "rename device";
-                                    color: Theme.c.muted;
-                                    font-size: Type.caption;
+                                // Cancel sits up here, for the whole panel, so
+                                // the name and address rows line up (#13).
+                                HorizontalLayout {
+                                    Text {
+                                        text: root.editing-send ? "name" : "rename device";
+                                        color: Theme.c.muted;
+                                        font-size: Type.caption;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                    }
+                                    PillButton {
+                                        text: "cancel";
+                                        ghost: true;
+                                        clicked => {
+                                            rename-field.text = "";
+                                            root.editing-address = "";
+                                            root.editing-device = "";
+                                        }
+                                    }
                                 }
                                 HorizontalLayout {
                                     spacing: Space.sm;
@@ -962,11 +988,34 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                             root.editing-device = "";
                                         }
                                     }
+                                }
+                                // Where it is dialled, apart from its name (#13).
+                                // Outside the `for` below, like the name field,
+                                // so the poll tick cannot wipe what is typed.
+                                if root.editing-send: Text {
+                                    text: root.editing-pin != ""
+                                        ? "address — the same machine has to answer there"
+                                        : "address";
+                                    color: Theme.c.muted;
+                                    font-size: Type.caption;
+                                }
+                                if root.editing-send: HorizontalLayout {
+                                    spacing: Space.sm;
+                                    TextField {
+                                        text <=> root.editing-address;
+                                        placeholder: "hostname or IP address";
+                                        horizontal-stretch: 1;
+                                        accepted => {
+                                            root.readdress-device(root.editing-device, root.editing-pin, root.editing-address);
+                                            root.editing-address = "";
+                                            root.editing-device = "";
+                                        }
+                                    }
                                     PillButton {
-                                        text: "cancel";
-                                        ghost: true;
+                                        text: "save";
                                         clicked => {
-                                            rename-field.text = "";
+                                            root.readdress-device(root.editing-device, root.editing-pin, root.editing-address);
+                                            root.editing-address = "";
                                             root.editing-device = "";
                                         }
                                     }

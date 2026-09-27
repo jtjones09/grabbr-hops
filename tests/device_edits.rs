@@ -685,3 +685,55 @@ fn deleting_a_machine_saved_as_two_devices_removes_both() {
         );
     });
 }
+
+// LEDGER T9910 | class B | 1 device list returned over IPC by the hops binary; 2 connection at a real QUIC receiver; 4 config file written by the hops binary
+/// Naming a connected device names it, and nothing else: it is dialled
+/// where it was, stays pinned to its machine and keeps its link, and the
+/// name is saved beside its address (#13). The name used to be the
+/// hostname, so naming a device changed where it dialled.
+#[test]
+fn naming_a_connected_device_changes_only_its_name() {
+    local(async {
+        let (daemon, receiver, mut frontend, handle) = connected("n").await;
+
+        frontend
+            .send(FrontendRequest::UpdateLabel(handle, Some("den".into())))
+            .await;
+
+        let shown = frontend.devices().await;
+        assert_eq!(
+            shown.get(&handle).map(|(c, s)| (
+                c.label.as_deref(),
+                c.hostname.as_deref(),
+                s.peer_fingerprint.as_deref()
+            )),
+            Some((
+                Some("den"),
+                Some("127.0.0.1"),
+                Some(receiver.fingerprint.as_str())
+            )),
+            "(name, where it is dialled, pin) after naming the device den; log:\n{}",
+            daemon.log()
+        );
+        let saved = until("the name to be saved", Duration::from_secs(20), || {
+            std::fs::read_to_string(&daemon.config).is_ok_and(|t| t.contains("label = \"den\""))
+        })
+        .await;
+        let file = std::fs::read_to_string(&daemon.config).unwrap_or_default();
+        assert!(
+            saved
+                && file.contains("hostname = \"127.0.0.1\"")
+                && file.contains(&format!("fingerprint = \"{}\"", receiver.fingerprint)),
+            "the name was not saved beside the device's address and pin:\n{file}"
+        );
+        // after the daemon has read its own save back
+        let _ = frontend.devices().await;
+        assert_eq!(
+            (receiver.accepted.get(), receiver.closed.get()),
+            (1, 0),
+            "(links opened, links closed): naming the device touched its link; \
+             log:\n{}",
+            daemon.log()
+        );
+    });
+}

@@ -207,6 +207,11 @@ pub struct Geometry {
 
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
+    /// What the user calls the device, kept apart from the address it is
+    /// dialled at so a rename never changes where it dials (#13). `None`: it
+    /// goes by its hostname, or by the name its pairing gave it.
+    #[serde(default)]
+    pub label: Option<String>,
     /// hostname of this client
     pub hostname: Option<String>,
     /// fix ips, determined by the user
@@ -228,6 +233,7 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             port: DEFAULT_PORT,
+            label: None,
             hostname: Default::default(),
             fix_ips: Default::default(),
             pos: Default::default(),
@@ -489,8 +495,12 @@ pub enum FrontendRequest {
     Enumerate(),
     /// resolve dns
     ResolveDns(ClientHandle),
-    /// Rename a device: set the hostname it dials. `fingerprint` is its pin as
-    /// the frontend showed it, and a mismatch is refused, as for `Delete`.
+    /// Name a device: set its label, or clear it with `None`. Changes nothing
+    /// it dials and nothing it is trusted with (#13).
+    UpdateLabel(ClientHandle, Option<String>),
+    /// Set the hostname a device is dialled at. Its pin stays, so only the
+    /// same machine is reached there (#99). `fingerprint` is its pin as the
+    /// frontend showed it, and a mismatch is refused, as for `Delete`.
     UpdateHostname {
         handle: ClientHandle,
         hostname: Option<String>,

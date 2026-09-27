@@ -229,6 +229,7 @@ fn change_fields(entry: &mut Table, base: &ConfigClient, ours: &ConfigClient, fr
     // Every field named, so a field added to `ConfigClient` does not compile
     // until it is placed here.
     let ConfigClient {
+        label,
         ips,
         hostname,
         port,
@@ -239,6 +240,7 @@ fn change_fields(entry: &mut Table, base: &ConfigClient, ours: &ConfigClient, fr
         fingerprint,
     } = base;
     let changed = [
+        ("label", *label != ours.label),
         ("hostname", *hostname != ours.hostname),
         ("ips", *ips != ours.ips),
         ("port", *port != ours.port),
@@ -375,6 +377,7 @@ fn pair(left: &[ConfigClient], right: &[ConfigClient], against: Against) -> Vec<
     fn differences(a: &ConfigClient, b: &ConfigClient) -> usize {
         // Every field named, as in `change_fields`.
         let ConfigClient {
+            label,
             ips,
             hostname,
             port,
@@ -384,6 +387,7 @@ fn pair(left: &[ConfigClient], right: &[ConfigClient], against: Against) -> Vec<
             fingerprint,
         } = a;
         [
+            *label != b.label,
             *hostname != b.hostname,
             *ips != b.ips,
             *port != b.port,

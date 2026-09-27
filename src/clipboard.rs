@@ -811,6 +811,7 @@ mod clipboard_follows_the_switch {
         /// Another entry here pinned to `peer`, switched on.
         fn entry_for(&self, peer: &Machine) -> ClientHandle {
             self.clients.add_with_config(ConfigClient {
+                label: None,
                 ips: HashSet::new(),
                 hostname: None,
                 port: hops_ipc::DEFAULT_PORT,

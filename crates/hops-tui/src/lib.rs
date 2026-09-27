@@ -83,8 +83,12 @@ fn approve_prompt(card: &PairingCard, fp: String, now: Instant) -> Result<Input,
 enum Input {
     /// Adding a device: `host` or `host:port`.
     Add { buf: String },
-    /// Editing an outgoing client's hostname. `pin` is the client's pin when
-    /// the edit opened, which the request carries (#94).
+    /// Naming a device this machine dials. Only its name: where it is
+    /// dialled and its pin stay (#13).
+    Name { handle: ClientHandle, buf: String },
+    /// Editing where a device this machine dials is dialled: its hostname or
+    /// address. `pin` is the client's pin when the edit opened, which the
+    /// request carries (#94), and which the new address keeps (#99).
     Hostname {
         handle: ClientHandle,
         pin: Option<String>,
@@ -107,6 +111,7 @@ impl Input {
     fn buf_mut(&mut self) -> &mut String {
         match self {
             Input::Add { buf } => buf,
+            Input::Name { buf, .. } => buf,
             Input::Hostname { buf, .. } => buf,
             Input::TrustedName { buf, .. } => buf,
             Input::Port { buf } => buf,
@@ -137,6 +142,33 @@ enum Confirm {
 
 /// What the TUI says when it drops an armed action.
 const CHANGED_NOTE: &str = "That device changed, so nothing was done. Check it and try again.";
+
+/// What saving the name typed for the device `handle` sends: that name, or
+/// none for a blank one, so it goes by its hostname or pairing again (#13).
+fn name_request(handle: ClientHandle, buf: &str) -> FrontendRequest {
+    let name = buf.trim();
+    FrontendRequest::UpdateLabel(handle, (!name.is_empty()).then(|| name.to_string()))
+}
+
+/// What `n` opens on the row `d`, which is not revoked.
+fn name_input(d: &Device) -> Option<Input> {
+    match (&d.send, &d.fingerprint) {
+        // a device this machine dials has a name of its own, apart from the
+        // address it dials (#13)
+        (Some(s), _) => Some(Input::Name {
+            handle: s.handle,
+            buf: d.label.clone(),
+        }),
+        // receive-only: re-authorizing the same fingerprint with a new
+        // description IS the rename
+        (None, Some(fp)) if d.receive => Some(Input::TrustedName {
+            fp: fp.clone(),
+            buf: d.label.clone(),
+            granting: false,
+        }),
+        _ => None,
+    }
+}
 
 /// Drop an armed delete or an open rename whose device is gone or now pinned
 /// to another machine. Returns whether anything was dropped.
@@ -454,6 +486,9 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                                         notice = Some((msg.to_string(), Instant::now()));
                                     }
                                 },
+                                Input::Name { handle, buf } => {
+                                    client.request(name_request(handle, &buf));
+                                }
                                 Input::Hostname { handle, pin, buf } => {
                                     let val = (!buf.trim().is_empty()).then_some(buf);
                                     client.request(FrontendRequest::UpdateHostname {
@@ -580,28 +615,28 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                                 Some(d) if d.trust == TrustState::Revoked => {
                                     notice = Some((REVOKED_NOTE.to_string(), Instant::now()));
                                 }
-                                // an outgoing client is named by its hostname —
-                                // that is also the address it dials
-                                Some(d) if d.send.is_some() => {
-                                    let s = d.send.as_ref().expect("send facet");
+                                Some(d) => {
+                                    if let Some(open) = name_input(d) {
+                                        input = Some(open);
+                                    }
+                                }
+                                None => {}
+                            },
+                            // where a device this machine dials is dialled
+                            KeyCode::Char('h') => match selected {
+                                Some(d) if d.trust == TrustState::Revoked => {
+                                    notice = Some((REVOKED_NOTE.to_string(), Instant::now()));
+                                }
+                                Some(Device { send: Some(s), .. }) => {
                                     input = Some(Input::Hostname {
                                         handle: s.handle,
                                         pin: s.state.peer_fingerprint.clone(),
                                         buf: s.config.hostname.clone().unwrap_or_default(),
                                     });
                                 }
-                                // receive-only: re-authorizing the same
-                                // fingerprint with a new description IS the rename
-                                Some(d) if d.receive => {
-                                    if let Some(fp) = d.fingerprint.clone() {
-                                        input = Some(Input::TrustedName {
-                                            fp,
-                                            buf: d.label.clone(),
-                                            granting: false,
-                                        });
-                                    }
+                                _ => {
+                                    notice = Some((NO_SEND_NOTE.to_string(), Instant::now()));
                                 }
-                                _ => {}
                             },
                             KeyCode::Char('p') => match selected.and_then(|d| d.send.as_ref()) {
                                 Some(s) => {
@@ -1244,7 +1279,8 @@ fn footer_line(
     if let Some(inp) = input {
         let (label, buf) = match inp {
             Input::Add { buf } => ("add device — host or host:port: ".to_string(), buf.clone()),
-            Input::Hostname { handle, buf, .. } => (format!("name [{handle}]: "), buf.clone()),
+            Input::Name { handle, buf } => (format!("name [{handle}]: "), buf.clone()),
+            Input::Hostname { handle, buf, .. } => (format!("address [{handle}]: "), buf.clone()),
             Input::TrustedName { buf, .. } => ("trust as: ".to_string(), buf.clone()),
             Input::Port { buf } => ("listen port: ".to_string(), buf.clone()),
         };
@@ -1307,7 +1343,7 @@ fn footer_line(
                 " rename  "
             }));
             if d.send.is_some() {
-                for (k, label) in [("p", " pos  "), ("spc", " on/off  ")] {
+                for (k, label) in [("h", " address  "), ("p", " pos  "), ("spc", " on/off  ")] {
                     spans.push(Span::styled(k, key));
                     spans.push(Span::raw(label));
                 }
@@ -2176,6 +2212,49 @@ mod tests {
         assert!(
             send.contains("on/off") && send.contains("pos"),
             "a device we cross to must offer edge + toggle:\n{send}"
+        );
+    }
+
+    // LEDGER T9911 | class B | 1 return value: name_input and name_request, what `n` opens and what saving it sends; 3 render: footer_line in ui() on a TestBackend
+    /// `n` on a device this machine dials names it, and saving sends that
+    /// name only; its address has a key of its own (#13). `n` used to edit
+    /// the hostname, which is where the device dials.
+    #[test]
+    fn naming_a_device_this_machine_dials_changes_its_name_and_not_its_address() {
+        let mut model = AppModel::default();
+        model.clients.insert(
+            4,
+            (
+                ClientConfig {
+                    hostname: Some("desk-mac.local".into()),
+                    ..Default::default()
+                },
+                ClientState {
+                    peer_fingerprint: Some(FP.into()),
+                    ..Default::default()
+                },
+            ),
+        );
+        model.authorized.insert(FP.into(), "desk mac".into());
+        let devices = listable(&model);
+        let opened = devices.first().and_then(name_input);
+        assert!(
+            matches!(&opened, Some(Input::Name { handle: 4, buf }) if buf == "desk-mac.local"),
+            "n on a device this machine dials has to open its name, not its \
+             address"
+        );
+        assert_eq!(
+            (name_request(4, "  den "), name_request(4, " ")),
+            (
+                FrontendRequest::UpdateLabel(4, Some("den".into())),
+                FrontendRequest::UpdateLabel(4, None)
+            ),
+            "saving a name has to send the name, or clear it when blank"
+        );
+        let shown = screen(&model, 0);
+        assert!(
+            shown.contains("h address") && shown.contains("n name"),
+            "the keymap has to offer the name and the address apart:\n{shown}"
         );
     }
 

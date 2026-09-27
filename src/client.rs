@@ -84,6 +84,7 @@ impl ClientManager {
 
     pub fn add_with_config(&self, config_client: ConfigClient) -> ClientHandle {
         let config = ClientConfig {
+            label: config_client.label,
             hostname: config_client.hostname,
             fix_ips: config_client.ips.into_iter().collect(),
             port: config_client.port,
@@ -265,6 +266,30 @@ impl ClientManager {
         } else {
             false
         }
+    }
+
+    /// Name the device, or clear its name with `None` or a blank one. Only
+    /// the name: where it is dialled and which machine it is pinned to stay
+    /// as they are (#13). Returns whether the name changed.
+    pub(crate) fn set_label(&self, handle: ClientHandle, label: Option<String>) -> bool {
+        let label = label
+            .map(|l| hops_ipc::pairing::sanitize_label(l.trim()))
+            .filter(|l| !l.trim().is_empty());
+        match self.clients.borrow_mut().get_mut(handle) {
+            Some((c, _)) if c.label != label => {
+                c.label = label;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The device's name, if it was given one.
+    pub(crate) fn get_label(&self, handle: ClientHandle) -> Option<String> {
+        self.clients
+            .borrow()
+            .get(handle)
+            .and_then(|(c, _)| c.label.clone())
     }
 
     /// update the port of the client
@@ -587,6 +612,7 @@ impl ClientManager {
 /// what a reload compares the file against.
 pub(crate) fn config_entry(config: &ClientConfig, state: &ClientState) -> ConfigClient {
     ConfigClient {
+        label: config.label.clone(),
         ips: HashSet::from_iter(config.fix_ips.iter().copied()),
         hostname: config.hostname.clone(),
         port: config.port,
@@ -620,6 +646,7 @@ mod reload_permutation {
 
     fn entry(name: &str) -> ConfigClient {
         ConfigClient {
+            label: None,
             ips: HashSet::new(),
             hostname: Some(name.to_string()),
             port: hops_ipc::DEFAULT_PORT,
@@ -830,6 +857,7 @@ mod the_switch_gates_clipboard_by_fingerprint {
 
     fn device(m: &ClientManager, pin: Option<&str>, on: bool) -> ClientHandle {
         m.add_with_config(ConfigClient {
+            label: None,
             ips: HashSet::new(),
             hostname: None,
             port: hops_ipc::DEFAULT_PORT,
@@ -934,6 +962,7 @@ mod one_device_dials_each_machine {
     /// Another device at the address the dialer's device dials.
     fn another_entry(d: &Dialer, door: &Door, pin: Option<String>) -> ClientHandle {
         let handle = d.clients.add_with_config(ConfigClient {
+            label: None,
             ips: HashSet::from([IpAddr::V4(Ipv4Addr::LOCALHOST)]),
             hostname: Some("desk mac".into()),
             port: door.port,

@@ -572,6 +572,41 @@ fn approval(
     Ok(FrontendRequest::AuthorizeKey(desc, fingerprint.to_string()))
 }
 
+/// What "save" on the rename field sends for the row keyed `id`: a handle for
+/// a device this machine dials, else the fingerprint of a paired machine.
+///
+/// A device this machine dials is given a name of its own. Its hostname is
+/// where it is dialled, and a rename used to replace it (#13).
+fn rename_request(id: &str, name: &str) -> FrontendRequest {
+    let name = name.trim();
+    if let Ok(h) = id.parse::<u64>() {
+        return FrontendRequest::UpdateLabel(h, (!name.is_empty()).then(|| name.to_string()));
+    }
+    // A rename is a rename. This used to re-send AuthorizeKey, so the
+    // wire could not tell relabelling from granting trust; SetLabel
+    // refuses a fingerprint that is not already authorized.
+    let desc = if name.is_empty() {
+        hops_frontend_core::fallback_label(id)
+    } else {
+        name.to_string()
+    };
+    FrontendRequest::SetLabel(id.to_string(), desc)
+}
+
+/// What "save" on the address field sends for the device `handle`: the
+/// hostname or address to dial it at, carrying the pin the row showed. Its
+/// pin stays, so only the same machine is reached there (#99). Nothing for a
+/// blank field or a row that is not a device this machine dials.
+fn readdress_request(handle: &str, pin: &str, address: &str) -> Option<FrontendRequest> {
+    let address = address.trim();
+    let handle = handle.parse::<u64>().ok()?;
+    (!address.is_empty()).then(|| FrontendRequest::UpdateHostname {
+        handle,
+        hostname: Some(address.to_string()),
+        fingerprint: (!pin.is_empty()).then(|| pin.to_string()),
+    })
+}
+
 /// Claim a pending "create device" once its handle appears, or leave it for the
 /// next tick.
 ///
@@ -785,26 +820,18 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
         // handle, so keying this on the handle alone meant the parse failed and
         // the rename silently did nothing — which is why the GUI could not name
         // an inbound peer at all while the TUI could.
-        ui.on_rename_device(move |id, pin, name| {
-            let name = name.trim();
-            if let Ok(h) = id.as_str().parse::<u64>() {
-                let name = (!name.is_empty()).then(|| name.to_string());
-                c.request(FrontendRequest::UpdateHostname {
-                    handle: h,
-                    hostname: name,
-                    fingerprint: (!pin.is_empty()).then(|| pin.to_string()),
-                });
-                return;
+        ui.on_rename_device(move |id, _pin, name| {
+            c.request(rename_request(id.as_str(), name.as_str()));
+        });
+    }
+    {
+        let c = client.clone();
+        ui.on_readdress_device(move |handle, pin, address| {
+            if let Some(request) =
+                readdress_request(handle.as_str(), pin.as_str(), address.as_str())
+            {
+                c.request(request);
             }
-            // A rename is a rename. This used to re-send AuthorizeKey, so the
-            // wire could not tell relabelling from granting trust; SetLabel
-            // refuses a fingerprint that is not already authorized.
-            let desc = if name.is_empty() {
-                hops_frontend_core::fallback_label(id.as_str())
-            } else {
-                name.to_string()
-            };
-            c.request(FrontendRequest::SetLabel(id.to_string(), desc));
         });
     }
     {
@@ -2245,6 +2272,63 @@ mod the_restart_note_is_news_not_an_error {
             ui.get_notice().as_str(),
             "",
             "a restart that worked was shown as an error"
+        );
+    }
+}
+
+#[cfg(test)]
+mod a_rename_names_and_changes_nothing_else {
+    //! Renaming a device from its card names it. The name used to be the
+    //! hostname it is dialled at, so a rename sent a new address: the device
+    //! then dialled its new name, and until #99 lost its pin (#13).
+    use super::*;
+
+    const PIN: &str = "1e:19:1b:2c:3d:4e:5f:60:71:82:93:a4:b5:c6:d7:e8";
+
+    // LEDGER T9907 | class B | 1 return value: rename_request, the request the rename field's save sends
+    #[test]
+    fn renaming_a_device_this_machine_dials_sends_its_name_only() {
+        assert_eq!(
+            rename_request("4", "  den "),
+            FrontendRequest::UpdateLabel(4, Some("den".into())),
+            "renaming a device this machine dials has to send its name, and \
+             not a hostname: that is where it dials"
+        );
+        assert_eq!(
+            rename_request("4", ""),
+            FrontendRequest::UpdateLabel(4, None),
+            "clearing the name of a device never connected has to clear its \
+             name, and not its address"
+        );
+        assert_eq!(
+            rename_request(PIN, "laptop"),
+            FrontendRequest::SetLabel(PIN.into(), "laptop".into()),
+            "a paired machine this one does not dial is renamed by its \
+             fingerprint, as before"
+        );
+    }
+
+    // LEDGER T9908 | class B | 1 return value: readdress_request, the request the address field's save sends
+    #[test]
+    fn a_new_address_is_sent_as_the_hostname_with_the_pin_shown() {
+        assert_eq!(
+            readdress_request("4", PIN, " 192.0.2.20 "),
+            Some(FrontendRequest::UpdateHostname {
+                handle: 4,
+                hostname: Some("192.0.2.20".into()),
+                fingerprint: Some(PIN.into()),
+            }),
+            "a new address has to be sent as where the device is dialled, with \
+             the pin the row showed"
+        );
+        assert_eq!(
+            (
+                readdress_request("4", PIN, "  "),
+                readdress_request(PIN, PIN, "192.0.2.20")
+            ),
+            (None, None),
+            "(a blank address, a row this machine does not dial): neither may \
+             change where anything is dialled"
         );
     }
 }

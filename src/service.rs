@@ -842,6 +842,12 @@ impl Service {
                 self.update_fix_ips(handle, fix_ips);
                 self.save_config();
             }
+            FrontendRequest::UpdateLabel(handle, label) => {
+                if self.client_manager.set_label(handle, label) {
+                    self.broadcast_client(handle);
+                    self.save_config();
+                }
+            }
             FrontendRequest::UpdateHostname {
                 handle,
                 hostname,
@@ -2003,7 +2009,8 @@ impl Service {
     /// What the user calls the device at `handle`.
     fn device_name(&self, handle: ClientHandle) -> String {
         self.client_manager
-            .get_hostname(handle)
+            .get_label(handle)
+            .or_else(|| self.client_manager.get_hostname(handle))
             .unwrap_or_else(|| format!("device {handle}"))
     }
 
