@@ -43,7 +43,9 @@ it is the previous context window's state. See `.claude/skills/handoff/`.
 
 **Pipeline:** `input-capture` → `hops-proto` over **QUIC** → `input-emulation`
 
-- **Transport is QUIC** (`quinn`), ALPN `grabbr-hop/1`, default port 4242. It is *not* UDP
+- **Transport is QUIC** (`quinn`), default port 4722 (4242 before v0.13), and two ALPNs:
+  `grabbr-hop/1` when the dialler drives, `grabbr-hop/1-driven` when it is driven (a
+  controlled machine dialling out, #15; `listen = false` binds no port). It is *not* UDP
   events plus a TCP control channel — that was the pre-fork design.
 - **`crates/`** holds all workspace members (moved there in `5345953`).
 - **`input-capture`** reads OS events as a `Stream<CaptureEvent>`. Selection order:

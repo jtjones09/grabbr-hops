@@ -197,7 +197,15 @@ fn device_rows(m: &AppModel) -> Vec<DeviceRow> {
                                 .next()
                                 .map(|ip| format!("{ip}:{}", s.config.port))
                         })
-                        .unwrap_or_else(|| "unresolved".into());
+                        // A device with no address that dials this machine (#15).
+                        .unwrap_or_else(|| {
+                            if s.state.dials_us {
+                                "dials in"
+                            } else {
+                                "unresolved"
+                            }
+                            .into()
+                        });
                     (
                         s.handle.to_string(),
                         addr,

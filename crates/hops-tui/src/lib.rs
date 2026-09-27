@@ -959,7 +959,15 @@ fn send_addr(s: &DeviceSend) -> String {
                 .next()
                 .map(|ip| format!("{ip}:{}", s.config.port))
         })
-        .unwrap_or_else(|| "unresolved".into())
+        // A device with no address that dials this machine (#15).
+        .unwrap_or_else(|| {
+            if s.state.dials_us {
+                "dials in"
+            } else {
+                "unresolved"
+            }
+            .into()
+        })
 }
 
 /// The peer's build id, from the `Hello` proto event.
@@ -3329,6 +3337,41 @@ mod every_state_on_a_row {
                 "{c:?} is drawn from something else:\n{line}"
             );
         }
+    }
+
+    /// A device whose machine dials this one to be controlled (#15), with no
+    /// address and its link down, says where it is reached and that this
+    /// machine waits for it, whole, in a 100-column terminal, as the other
+    /// states do.
+    // LEDGER T15 | class B | 3 widget tree: device_row rendered through List to a test terminal
+    #[test]
+    fn a_device_that_dials_in_reads_as_waited_for() {
+        let theme = theme::default_theme();
+        let d = Device {
+            fingerprint: Some(FP.into()),
+            label: NAME.into(),
+            trust: TrustState::Trusted,
+            connection: Connection::AwaitingItsDial,
+            send: Some(DeviceSend {
+                handle: 0,
+                config: ClientConfig::default(),
+                state: ClientState {
+                    dials_us: true,
+                    ..pinned(true, false, false)
+                },
+            }),
+            receive: true,
+        };
+        let mut term = Terminal::new(TestBackend::new(100, 3)).expect("test terminal");
+        term.draw(|f| f.render_widget(List::new(vec![device_row(&d, None, &theme)]), f.area()))
+            .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let line: String = (0..buf.area.width).map(|x| buf[(x, 0)].symbol()).collect();
+        eprintln!("{line}");
+        assert!(
+            line.contains("dials in") && line.contains("waiting for it to dial"),
+            "the row does not say the device dials in and is waited for:\n{line}"
+        );
     }
 
     /// With no service the whole row is what was last known, so none of it

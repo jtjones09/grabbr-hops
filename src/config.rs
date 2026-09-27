@@ -125,6 +125,13 @@ struct ConfigToml {
     /// `discovery = false` — hops still works, you just type addresses.
     #[serde(default)]
     discovery: Option<bool>,
+    /// Listen for peers on `port`. Default ON. `false` makes this a machine
+    /// that only dials out (#15): it binds no port, announces nothing, and is
+    /// driven only over the links it dials to the machines that control it,
+    /// which is how a machine behind a client that drops unsolicited inbound
+    /// connections is controlled at all.
+    #[serde(default)]
+    listen: Option<bool>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -873,6 +880,15 @@ impl Config {
         self.config_toml
             .as_ref()
             .and_then(|c| c.discovery)
+            .unwrap_or(true)
+    }
+
+    /// Whether this machine listens for peers. `false`: it only dials out
+    /// (#15), and binds no port.
+    pub fn listen(&self) -> bool {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.listen)
             .unwrap_or(true)
     }
 

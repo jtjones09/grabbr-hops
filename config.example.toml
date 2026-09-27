@@ -3,8 +3,15 @@
 # configure release bind
 release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
 
-# optional port (defaults to 4242)
-port = 4242
+# optional port (defaults to 4722; hops before v0.13 used 4242, and a
+# machine still set to 4242 is not reached by one that dials 4722)
+# port = 4722
+
+# optional: set to false on a machine that should only dial out, such as
+# one behind a VPN or security client that drops incoming connections. It
+# then listens on no port and is controlled over the connection it opens to
+# each machine that controls it.
+# listen = false
 
 # list of authorized tls certificate fingerprints that
 # are accepted for incoming traffic
@@ -38,5 +45,5 @@ position = "left"
 hostname = "thorium"
 # ips for ethernet and wifi
 ips = ["192.168.178.189", "192.168.178.172"]
-# optional port
-port = 4242
+# optional port (defaults to 4722)
+# port = 4722

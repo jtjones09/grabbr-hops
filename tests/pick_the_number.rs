@@ -1027,7 +1027,8 @@ fn adding_back_while_the_number_is_on_screen_still_pairs() {
 /// and the machine in control adds it back while the number is on screen.
 /// One number pairs them. The machine in control takes up its link; the
 /// connection the controlled machine dialled carries nothing and closes, its
-/// device for the other never connects, and it says why.
+/// device for the other never takes up a link to drive it, and it says that
+/// it connects to the other to be controlled instead (#15).
 #[test]
 fn opposite_answers_link_only_the_way_control_goes() {
     machines("opposite", |mut m| async move {
@@ -1146,7 +1147,9 @@ fn opposite_answers_link_only_the_way_control_goes() {
                 Ok(FrontendEvent::State(h, _, s)) if h == on_a && s.active_addr.is_some() => {
                     a_linked = true;
                 }
-                Ok(FrontendEvent::Activity(text)) if !told && text.contains("does not control") => {
+                Ok(FrontendEvent::Activity(text))
+                    if !told && text.contains("which controls this machine") =>
+                {
                     told = true;
                     deadline = tokio::time::Instant::now() + QUIET;
                 }
@@ -1168,8 +1171,8 @@ fn opposite_answers_link_only_the_way_control_goes() {
         }
         if !told {
             failures.push(
-                "the machine controlled never said why its device for the other does not \
-                 connect"
+                "the machine controlled never said that it connects to the machine in \
+                 control, to be controlled by it"
                     .into(),
             );
         }

@@ -141,6 +141,11 @@ const PAIRING_NOT_FINISHED: &str = "The pairing is not finished";
 /// How often a device being added is dialled again until it answers (#195).
 const ADD_DIAL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How often the links this machine dials to be driven are matched to what
+/// its devices and leases say (#15): a new pairing, a device switched on or
+/// re-addressed, or a lease withdrawn, is acted on within this long.
+const DIAL_BACK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// How often the daemon looks for leases that have lapsed while nothing was
 /// being sent.
 ///
@@ -276,6 +281,15 @@ pub struct Service {
     revoke_listen: crate::listen::ConnRevoker,
     /// broadcast local clipboard changes to incoming-connection peers
     clipboard_out_listen: ClipboardSenderListen,
+    /// Whether this machine listens for peers; `false` when it only dials
+    /// out (#15).
+    listening: bool,
+    /// The links this machine dials to the machines that control it (#15).
+    dial_back: crate::dial_back::DialBack,
+    /// Links machines dialled to be driven by this one, from the listener.
+    dialled_in: Option<Receiver<crate::listen::DialledIn>>,
+    /// Takes such a link as its device's link.
+    adopter: crate::connect::Adopter,
 }
 
 #[derive(Debug)]
@@ -711,13 +725,30 @@ impl Service {
         // listener + connection. Both hold the same store and ask it different
         // questions: the listener whether a peer may drive us, the connection
         // whether we may drive a peer.
-        let mut listener = LanMouseListener::new(
-            config.port(),
+        // A machine that only dials out binds no port (#15): the links it
+        // dials to be driven are read by a listener that listens on none.
+        let listening = config.listen();
+        let mut listener = if listening {
+            LanMouseListener::new(
+                config.port(),
+                identity.clone(),
+                trust.clone(),
+                clipboard_in_tx.clone(),
+            )
+            .await?
+        } else {
+            LanMouseListener::dial_only(identity.clone(), trust.clone(), clipboard_in_tx.clone())
+                .await?
+        };
+        let dial_back = crate::dial_back::DialBack::new(
             identity.clone(),
             trust.clone(),
-            clipboard_in_tx.clone(),
-        )
-        .await?;
+            client_manager.clone(),
+            listener.admitter(),
+            refusals_tx.clone(),
+            state_tx.clone(),
+        );
+        let dialled_in = listener.take_dialled_in();
         let mut conn = LanMouseConnection::new(
             identity.clone(),
             client_manager.clone(),
@@ -728,6 +759,7 @@ impl Service {
             state_tx,
         )
         .map_err(|e| ServiceError::Connect(e.to_string()))?;
+        let adopter = conn.adopter();
 
         // clipboard broadcast handles — grabbed before the transports are moved
         // into capture/emulation below.
@@ -757,8 +789,9 @@ impl Service {
             .ok()
             .and_then(|h| h.into_string().ok())
             .unwrap_or_else(|| "hops".to_string());
+        // Nothing to announce on a machine that listens on no port.
         let discovery = Discovery::new(
-            config.discovery(),
+            config.discovery() && listening,
             config.port(),
             &public_key_fingerprint,
             &instance,
@@ -812,6 +845,10 @@ impl Service {
             clipboard_out_listen,
             revoke_conn,
             revoke_listen,
+            listening,
+            dial_back,
+            dialled_in,
+            adopter,
         };
         Ok(service)
     }
@@ -839,6 +876,8 @@ impl Service {
         lease_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut add_dials = tokio::time::interval(ADD_DIAL_INTERVAL);
         add_dials.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut dial_back = tokio::time::interval(DIAL_BACK_INTERVAL);
+        dial_back.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         // Before the loop and once: a stream made per iteration would miss a
         // signal that lands between two of them, and once tokio installs its
@@ -850,6 +889,8 @@ impl Service {
         loop {
             tokio::select! {
                 _ = lease_sweep.tick() => self.sweep_lapsed_leases(),
+                _ = dial_back.tick() => self.dial_back.reconcile(self.listening),
+                dialled = next_or_never(&mut self.dialled_in) => self.handle_dialled_in(dialled),
                 _ = add_dials.tick(), if !self.adding.is_empty() || !self.approved.is_empty() => {
                     self.retry_adding();
                     self.forget_unstarted_pairings();
@@ -911,6 +952,7 @@ impl Service {
         }
 
         log::info!("terminating service ...");
+        self.dial_back.stop_all();
         log::debug!("terminating capture ...");
         self.capture.terminate().await;
         log::debug!("terminating emulation ...");
@@ -1835,6 +1877,49 @@ impl Service {
                      Check {name}'s address or hostname."
                 )));
             }
+            DialRefusal::WontDrive {
+                handle,
+                fingerprint,
+                addr,
+            } => {
+                if !self.refusal_notices.due(handle, "wont-drive", now) {
+                    return;
+                }
+                let name = self.device_name(handle);
+                log::warn!("{name} at {addr} ({fingerprint}) refused to control this machine");
+                self.notify_frontend(FrontendEvent::Error(format!(
+                    "{name} refused this machine's connection: it holds no pairing that lets \
+                     it control this machine. To pair again, open add device on {name}."
+                )));
+            }
+            DialRefusal::OlderVersion { handle, addr } => {
+                if !self.refusal_notices.due(handle, "older-version", now) {
+                    return;
+                }
+                let name = self.device_name(handle);
+                log::warn!("{name} at {addr} runs hops v0.12 or earlier");
+                self.notify_frontend(FrontendEvent::Error(format!(
+                    "{name} runs hops v0.12 or earlier, which this version cannot connect to: \
+                     v0.13 listens on port {} and lets a controlled machine dial out. Update \
+                     hops on {name}.",
+                    hops_ipc::DEFAULT_PORT
+                )));
+            }
+            DialRefusal::OldPort { handle, addr } => {
+                if !self.refusal_notices.due(handle, "old-port", now) {
+                    return;
+                }
+                let name = self.device_name(handle);
+                log::warn!("{name} answers only at {addr}, the port hops used before v0.13");
+                self.notify_frontend(FrontendEvent::Error(format!(
+                    "{name} listens on port {}, the port hops used before v0.13, and this \
+                     machine dials it on {}. Remove the port line from {name}'s config.toml, \
+                     or set this device's port to {}.",
+                    addr.port(),
+                    hops_ipc::DEFAULT_PORT,
+                    addr.port()
+                )));
+            }
             DialRefusal::Conflict { handle, .. } => {
                 if !self.refusal_notices.due(handle, "conflict", now) {
                     return;
@@ -1846,6 +1931,74 @@ impl Service {
                 )));
             }
         }
+    }
+
+    /// A machine this one may drive dialled it to be driven (#15). Its link
+    /// goes to the device pinned to that machine, found by the fingerprint it
+    /// proved and never by the address it came from. A machine with no
+    /// device here gets one, pinned to it and with no address: only its own
+    /// dial reaches it.
+    fn handle_dialled_in(&mut self, dialled: crate::listen::DialledIn) {
+        let fp = dialled.fingerprint.clone();
+        let handle = match self.client_manager.every_pinned_to(&fp).first() {
+            Some(&handle) => handle,
+            None => self.add_device_that_dials_us(&fp),
+        };
+        if self.client_manager.set_dials_us(handle, true) {
+            self.broadcast_client(handle);
+        }
+        let adopter = self.adopter.clone();
+        tokio::task::spawn_local(async move {
+            adopter.adopt(handle, dialled).await;
+        });
+    }
+
+    /// A device for the machine `fp`, which dials this one to be driven by
+    /// it and has no device here: named as its pairing is, at the first
+    /// free edge, and switched on. With every edge taken it is added
+    /// switched off, and the person told, rather than taking another
+    /// device's edge.
+    fn add_device_that_dials_us(&mut self, fp: &str) -> ClientHandle {
+        let label = self
+            .trust
+            .read()
+            .expect("lock")
+            .label(fp)
+            .filter(|l| !l.is_empty());
+        let handle = self.client_manager.add_client();
+        if let Err(other) = self.client_manager.pin(handle, fp.to_string()) {
+            log::warn!("client {handle}: {fp} is already client {other}'s machine");
+        }
+        self.client_manager.set_label(handle, label);
+        self.client_manager.set_dials_us(handle, true);
+        let free = [
+            Position::Right,
+            Position::Left,
+            Position::Top,
+            Position::Bottom,
+        ]
+        .into_iter()
+        .find(|&pos| self.client_manager.client_at(pos).is_none());
+        if let Some(pos) = free {
+            self.client_manager.set_pos(handle, pos);
+        }
+        log::info!("added client {handle} for {fp}, which dials this machine to be driven");
+        if let Some((c, s)) = self.client_manager.get_state(handle) {
+            self.notify_frontend(FrontendEvent::Created(handle, c, s));
+        }
+        match free {
+            Some(_) => self.activate_client(handle),
+            None => {
+                let name = self.device_name(handle);
+                self.notify_frontend(FrontendEvent::Error(format!(
+                    "{name} connected to be controlled from this machine, and every edge is \
+                     in use, so it was added switched off. Move a device to free an edge, \
+                     then switch {name} on."
+                )));
+            }
+        }
+        self.save_config();
+        handle
     }
 
     /// What to call device `handle` in a notice: the name it was paired
@@ -2474,17 +2627,26 @@ impl Service {
             paired: true,
         });
         // This machine may control that one, and has no device to dial it
-        // at: only the machine in control dials, so say what is missing.
-        if unreachable {
+        // at. The machine that dialled here to pair connects back to be
+        // controlled (#15), and appears as a device when it does; one this
+        // machine dialled has to be added at its address.
+        if unreachable && !dialled_here {
+            self.notify_frontend(FrontendEvent::Activity(format!(
+                "Paired with {name}. It connects to this machine to be controlled from here, \
+                 and appears as a device once it does."
+            )));
+        } else if unreachable {
             self.notify_frontend(FrontendEvent::Activity(format!(
                 "Paired with {name}. To control it from this machine, add it here as a \
                  device at its address."
             )));
         }
+        // That machine controls this one: the device here for it dials it
+        // to be controlled (#15), rather than it dialling in.
         if !we_drive && (dialled_here || !undriven.is_empty()) {
             self.notify_frontend(FrontendEvent::Activity(format!(
-                "Paired with {name}, which controls this machine. This machine does not \
-                 control {name}, so the device added here for it does not connect."
+                "Paired with {name}, which controls this machine. This machine connects to \
+                 {name} so that it can."
             )));
         }
     }
@@ -3870,6 +4032,9 @@ mod refusals_and_bounds;
 
 #[cfg(all(test, unix))]
 mod removal_reaches_the_other_machine;
+
+#[cfg(all(test, unix))]
+mod dialled_by_the_controlled_machine;
 
 /// The whole daemon in this process, for a test that drives it the way a
 /// frontend and a peer do.

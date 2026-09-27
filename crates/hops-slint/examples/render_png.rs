@@ -80,7 +80,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
         ui.set_capture_settings(true);
     }
     ui.set_emulation("enabled".into());
-    ui.set_port("4242".into());
+    ui.set_port("4722".into());
     ui.set_fingerprint("73:90:2a:3c:9d:e5:18:52:7c:aa:c3:de:de:04:cd:ec".into());
     let first_run = std::env::var_os("PREVIEW_FIRST_RUN").is_some();
     ui.set_discovery_active(std::env::var("PREVIEW_DISCOVERY").as_deref() != Ok("off"));
@@ -108,14 +108,14 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
                 fingerprint: "9c:2e:11".into(),
                 addr_summary: "192.0.2.51 +2 more".into(),
                 ips: "192.0.2.51,198.51.100.51,203.0.113.9".into(),
-                port: "4242".into(),
+                port: "4722".into(),
             },
             DiscoveredRow {
                 label: "lab-mbp-m4-max".into(),
                 fingerprint: "".into(),
                 addr_summary: "192.0.2.99".into(),
                 ips: "192.0.2.99".into(),
-                port: "4242".into(),
+                port: "4722".into(),
             },
         ]
     })));
@@ -123,7 +123,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
     // flip to true to review the "we dialled this device" wording (#61)
     ui.set_pairing_from_our_dial(std::env::var_os("PREVIEW_OUR_DIAL").is_some());
     if std::env::var_os("PREVIEW_OUR_DIAL").is_some() {
-        ui.set_pairing_addr("10.0.0.5:4242".into());
+        ui.set_pairing_addr("10.0.0.5:4722".into());
     }
     // PREVIEW_KNOCK_ADDR=1: an inbound request with the address it came from
     // (#83), and a name typed into the card (#168).
@@ -165,7 +165,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
         DeviceRow {
             handle: "1".into(),
             name: "studio-pc".into(),
-            addr: "192.0.2.42:4242".into(),
+            addr: "192.0.2.42:4722".into(),
             pos: "left".into(),
             active: true,
             tone: DotTone::Bad,
@@ -229,12 +229,30 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             clipboard: "off".into(),
             clipboard_on: false,
         },
+        // a machine this one controls that dials in to be controlled (#15),
+        // with its link down: this machine waits for it
+        DeviceRow {
+            handle: "5".into(),
+            name: "work-laptop".into(),
+            addr: "dials in".into(),
+            pos: "bottom".into(),
+            active: true,
+            tone: DotTone::Quiet,
+            status: Connection::AwaitingItsDial.words().into(),
+            has_send: true,
+            fingerprint: "5d:81:e2".into(),
+            fp_full: "5d:81:e2:07:bb:19".into(),
+            pin: "5d:81:e2:07:bb:19".into(),
+            trusted: true,
+            clipboard: "goes from here to this device".into(),
+            clipboard_on: true,
+        },
         // the machine this one dials removed this one (#184): the card says
         // so and keeps its delete button, rather than vanishing
         DeviceRow {
             handle: "4".into(),
             name: "old-thinkpad".into(),
-            addr: "192.0.2.61:4242".into(),
+            addr: "192.0.2.61:4722".into(),
             pos: "top".into(),
             active: true,
             tone: DotTone::Bad,
@@ -320,7 +338,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
         ui.set_pairing_fp("".into());
         ui.set_notice("".into());
         ui.set_check_fp("a4:f0:9c:2e:11:bd:77:0c:35:9a".into());
-        ui.set_check_from("a4:f0:9c at 192.0.2.7:4242".into());
+        ui.set_check_from("a4:f0:9c at 192.0.2.7:4722".into());
         ui.set_check_show(check.starts_with("show"));
         ui.set_check_number("042 917".into());
         ui.set_check_choices(ModelRc::new(VecModel::from(vec![

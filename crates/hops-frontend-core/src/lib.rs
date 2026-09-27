@@ -1224,6 +1224,9 @@ impl AppModel {
                 .send
                 .as_ref()
                 .is_some_and(|s| s.state.removed_by_peer),
+            // The daemon says so for a device whose machine dials in to be
+            // driven from here (#15).
+            dials_us: device.send.as_ref().is_some_and(|s| s.state.dials_us),
         }
     }
 }
@@ -3118,6 +3121,35 @@ mod the_state_follows_the_events {
         assert_eq!(state(&m), Connection::ServiceGone);
         m.connected = true;
         assert_eq!(state(&m), Connection::NotConnected, "survived the service");
+    }
+
+    // LEDGER T13 | class B | 6 struct state: AppModel::apply + AppModel::devices()
+    /// A device whose machine dials this one to be controlled from here
+    /// (#15) reads "waiting for it to dial" while its link is down, and
+    /// connected once the link it dialled is up. A crossing that finds it
+    /// down does not call it unreachable: this machine never dials it.
+    #[test]
+    fn a_device_that_dials_in_is_waited_for_until_its_link_is_up() {
+        let dials_us = |link: bool| ClientState {
+            dials_us: true,
+            ..linked(true, link)
+        };
+        let mut m = paired();
+        set(&mut m, dials_us(false));
+        assert_eq!(state(&m), Connection::AwaitingItsDial);
+        assert_eq!(m.devices()[0].connection.words(), "waiting for it to dial");
+
+        refused(&mut m);
+        assert_eq!(
+            state(&m),
+            Connection::AwaitingItsDial,
+            "a crossing called a device this machine never dials unreachable"
+        );
+
+        set(&mut m, dials_us(true));
+        assert_eq!(state(&m), Connection::Connected);
+        set(&mut m, dials_us(false));
+        assert_eq!(state(&m), Connection::AwaitingItsDial);
     }
 
     fn connected_in(m: &mut AppModel) {

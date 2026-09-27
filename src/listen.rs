@@ -34,6 +34,18 @@ pub enum ListenerCreationError {
     Rustls(#[from] rustls::Error),
     #[error(transparent)]
     NoInitialCipherSuite(#[from] quinn::crypto::rustls::NoInitialCipherSuite),
+    #[error("this machine only dials out, so it listens on no port")]
+    NotListening,
+}
+
+/// A connection a machine opened to this one to be driven by it (#15),
+/// admitted by this machine's TLS door because this machine may drive it.
+/// The service gives it to the device pinned to `fingerprint`, which drives
+/// it as though this machine had dialled it.
+pub(crate) struct DialledIn {
+    pub(crate) conn: Connection,
+    pub(crate) fingerprint: String,
+    pub(crate) addr: SocketAddr,
 }
 
 /// How much unsent reply and clipboard data this machine will hold for one
@@ -250,9 +262,15 @@ pub(crate) struct LanMouseListener {
     pairings: crate::pairing::Pairings,
     /// What those attempts tell the service, until it takes it.
     pairing_events: Option<Receiver<crate::pairing::PairingEvent>>,
-    /// Where the first endpoint bound, so a test that asked for port 0 can dial it.
+    /// Links machines opened to be driven by this one, until the service
+    /// takes them.
+    dialled_in: Option<Receiver<DialledIn>>,
+    /// Where each accepted connection's clipboard transfers are queued.
+    clipboard_in: Sender<PeerClipboard>,
+    /// Where the first endpoint bound, so a test that asked for port 0 can
+    /// dial it. `None` for a listener that only takes links it dialled.
     #[cfg(test)]
-    local_addr: SocketAddr,
+    local_addr: Option<SocketAddr>,
 }
 
 /// `refused` is where the verifier puts a certificate it turns away. Every
@@ -263,11 +281,18 @@ pub(crate) fn server_config(
     trust: Trust,
     refused: Arc<StdMutex<Option<String>>>,
 ) -> Result<quinn::ServerConfig, ListenerCreationError> {
-    let verifier = Arc::new(FpClientVerifier::new(trust, refused));
+    // The resolver notes which role the client asked for; the verifier, which
+    // shares the slot, asks the lease the question for that role (#15).
+    let offered: transport::Offered = Default::default();
+    let verifier = Arc::new(FpClientVerifier::for_roles(trust, refused, offered.clone()));
+    let resolver = Arc::new(transport::RoleResolver::new(
+        transport::certified_key(identity)?,
+        offered,
+    ));
     let mut crypto = rustls::ServerConfig::builder()
         .with_client_cert_verifier(verifier)
-        .with_single_cert(vec![identity.cert.clone()], identity.key.clone_key())?;
-    crypto.alpn_protocols = vec![transport::ALPN.to_vec()];
+        .with_cert_resolver(resolver);
+    crypto.alpn_protocols = transport::served_alpns();
     // REFUSE TLS 1.3 resumption. rustls only calls `verify_client_cert` from the
     // ExpectCertificate state, which a resumed handshake never enters: it restores
     // the peer's cert chain from the ticket and sets doing_client_auth = false. So
@@ -317,13 +342,25 @@ impl LanMouseListener {
         #[cfg(test)]
         let ip = std::net::Ipv4Addr::LOCALHOST;
         let listen_addr = SocketAddr::new(ip.into(), port);
-        Self::bind(listen_addr, identity, trust, clipboard_in).await
+        Self::bind(Some(listen_addr), identity, trust, clipboard_in).await
     }
 
-    /// [`Self::new`] on a chosen address. Tests bind 127.0.0.1 port 0, so they
-    /// neither listen on the network nor collide with a running daemon.
+    /// A listener that binds nothing: for a machine that only dials out
+    /// (#15). The links it dials to be driven are admitted into it through
+    /// [`Self::admitter`], and read exactly as a link dialled in would be.
+    pub(crate) async fn dial_only(
+        identity: Arc<Identity>,
+        trust: Trust,
+        clipboard_in: Sender<PeerClipboard>,
+    ) -> Result<Self, ListenerCreationError> {
+        Self::bind(None, identity, trust, clipboard_in).await
+    }
+
+    /// [`Self::new`] on a chosen address, or on none. Tests bind 127.0.0.1
+    /// port 0, so they neither listen on the network nor collide with a
+    /// running daemon.
     async fn bind(
-        listen_addr: SocketAddr,
+        listen_addr: Option<SocketAddr>,
         identity: Arc<Identity>,
         trust: Trust,
         clipboard_in: Sender<PeerClipboard>,
@@ -334,10 +371,23 @@ impl LanMouseListener {
         let (port_changed_tx, port_changed) = channel();
         // The endpoint needs a default config, but no connection is accepted
         // with it: each gets its own below, so its slot is never read.
-        let cfg = server_config(&identity, trust.clone(), Default::default())?;
-        let mut endpoint = Endpoint::server(cfg, listen_addr)?;
+        let mut endpoint = match listen_addr {
+            Some(listen_addr) => {
+                let cfg = server_config(&identity, trust.clone(), Default::default())?;
+                Some(Endpoint::server(cfg, listen_addr)?)
+            }
+            None => {
+                log::info!("this machine only dials out: no port is listened on");
+                None
+            }
+        };
         #[cfg(test)]
-        let local_addr = endpoint.local_addr()?;
+        let local_addr = match &endpoint {
+            Some(e) => Some(e.local_addr()?),
+            None => None,
+        };
+        let (dialled_in_tx, dialled_in) = channel();
+        let clipboard_in_kept = clipboard_in.clone();
 
         let conns: Rc<AsyncMutex<Vec<ConnEntry>>> = Rc::new(AsyncMutex::new(Vec::new()));
         let conns_clone = conns.clone();
@@ -357,7 +407,12 @@ impl LanMouseListener {
             spawn_local(async move {
                 loop {
                     tokio::select! {
-                        incoming = endpoint.accept() => {
+                        incoming = async {
+                            match &endpoint {
+                                Some(endpoint) => endpoint.accept().await,
+                                None => std::future::pending().await,
+                            }
+                        } => {
                             let Some(incoming) = incoming else { break };
                             let remote = incoming.remote_address();
                             // This connection's own verifier, and the slot it
@@ -393,6 +448,7 @@ impl LanMouseListener {
                             let pairings = pairings.clone();
                             let ours = ours.clone();
                             let failures = failures.clone();
+                            let dialled_in_tx = dialled_in_tx.clone();
                             spawn_local(async move {
                                 match connecting.await {
                                     Ok(conn) => {
@@ -412,6 +468,32 @@ impl LanMouseListener {
                                             conn.close(0u32.into(), b"unauthorized");
                                             return;
                                         };
+                                        match transport::negotiated_role(&conn) {
+                                            Some(transport::Dialler::Drives) => {}
+                                            // It dialled to be driven by this
+                                            // machine (#15): asked again, and
+                                            // handed to the device that drives
+                                            // it. Nothing it sends is read here.
+                                            Some(transport::Dialler::IsDriven) => {
+                                                if !trust.read().expect("lock").we_may_drive(&fingerprint) {
+                                                    log::warn!(
+                                                        "{addr}: rejecting {fingerprint}, dialling to be driven — no live lease lets this machine drive it"
+                                                    );
+                                                    conn.close(0u32.into(), b"unauthorized");
+                                                    return;
+                                                }
+                                                log::info!("{addr}: {fingerprint} dialled this machine to be driven by it");
+                                                if let Err(e) = dialled_in_tx.send(DialledIn { conn, fingerprint, addr }) {
+                                                    e.into_inner().conn.close(0u32.into(), b"not taken");
+                                                }
+                                                return;
+                                            }
+                                            None => {
+                                                log::warn!("{addr}: rejecting {fingerprint} — no role of ours was negotiated");
+                                                conn.close(0u32.into(), b"unauthorized");
+                                                return;
+                                            }
+                                        }
                                         // The receiver's question. A lease that
                                         // lapsed between the TLS check and here
                                         // is refused, which is why the check is
@@ -496,14 +578,21 @@ impl LanMouseListener {
                         port = request_port_change_rx.recv() => {
                             // None => the listener handle was dropped (shutdown); end the task.
                             let Some(port) = port else { break };
+                            // A machine that only dials out listens on no
+                            // port, and a port change does not start one.
+                            if endpoint.is_none() {
+                                let _ = port_changed_tx.send(Err(ListenerCreationError::NotListening));
+                                continue;
+                            }
                             let listen_addr = SocketAddr::new("0.0.0.0".parse().expect("invalid ip"), port);
                             // A dropped port_changed receiver (requester gone) must NOT panic
                             // this long-running accept loop — ignore the send result instead.
                             match server_config(&identity, trust.clone(), Default::default()) {
                                 Ok(cfg) => match Endpoint::server(cfg, listen_addr) {
                                     Ok(new_endpoint) => {
-                                        endpoint.close(0u32.into(), b"port change");
-                                        endpoint = new_endpoint;
+                                        if let Some(old) = endpoint.replace(new_endpoint) {
+                                            old.close(0u32.into(), b"port change");
+                                        }
                                         let _ = port_changed_tx.send(Ok(port));
                                     }
                                     Err(e) => {
@@ -533,6 +622,8 @@ impl LanMouseListener {
             trust: clipboard_trust,
             pairings,
             pairing_events: Some(pairing_events),
+            dialled_in: Some(dialled_in),
+            clipboard_in: clipboard_in_kept,
             #[cfg(test)]
             local_addr,
         })
@@ -549,6 +640,25 @@ impl LanMouseListener {
         self.pairing_events.take()
     }
 
+    /// The links machines open to be driven by this one (#15). Once: `None`
+    /// after the first. Grabbed before the listener moves into `Emulation`.
+    pub(crate) fn take_dialled_in(&mut self) -> Option<Receiver<DialledIn>> {
+        self.dialled_in.take()
+    }
+
+    /// A handle that admits a link this machine dialled to be driven (#15),
+    /// as though it had been dialled in: the same door, the same read loop,
+    /// the same checks on every event.
+    pub(crate) fn admitter(&self) -> Admitter {
+        Admitter {
+            conns: self.conns.clone(),
+            listen_tx: self.listen_tx.clone(),
+            clipboard_in: self.clipboard_in.clone(),
+            trust: self.trust.clone(),
+            pressure: self.pressure.clone(),
+        }
+    }
+
     /// A listener on 127.0.0.1 at a port the OS picks, and that port.
     #[cfg(test)]
     pub(crate) async fn bind_loopback(
@@ -557,8 +667,8 @@ impl LanMouseListener {
         clipboard_in: Sender<PeerClipboard>,
     ) -> Result<(Self, u16), ListenerCreationError> {
         let addr = SocketAddr::new("127.0.0.1".parse().expect("loopback"), 0);
-        let listener = Self::bind(addr, identity, trust, clipboard_in).await?;
-        let port = listener.local_addr.port();
+        let listener = Self::bind(Some(addr), identity, trust, clipboard_in).await?;
+        let port = listener.local_addr.map_or(0, |a| a.port());
         Ok((listener, port))
     }
 
@@ -625,6 +735,55 @@ impl LanMouseListener {
             trust: self.trust.clone(),
             clients,
         }
+    }
+}
+
+/// Admits links this machine dialled to be driven into the listener (#15).
+#[derive(Clone)]
+pub(crate) struct Admitter {
+    conns: Rc<AsyncMutex<Vec<ConnEntry>>>,
+    listen_tx: Sender<ListenEvent>,
+    clipboard_in: Sender<PeerClipboard>,
+    trust: Trust,
+    pressure: Rc<InputPressure>,
+}
+
+impl Admitter {
+    /// Read `conn`, whose peer proved `fingerprint`, as a link in from a
+    /// machine that drives this one: its input reaches emulation through the
+    /// same checks as any other, each event asked again whether that machine
+    /// may drive this one and whether it crossed onto it (#211, #212).
+    ///
+    /// Asked here once more, too: a lease withdrawn since the handshake
+    /// admits nothing. Returns whether it was admitted.
+    /// `first` is the input stream and the first frame read from it, when
+    /// the dialler already read it to learn the link was taken.
+    pub(crate) async fn admit(
+        &self,
+        conn: Connection,
+        fingerprint: String,
+        first: Option<(RecvStream, ProtoEvent)>,
+    ) -> bool {
+        if !self.trust.read().expect("lock").may_drive_us(&fingerprint) {
+            log::warn!(
+                "{fingerprint} may no longer drive this machine; closing the link dialled to it"
+            );
+            conn.close(0u32.into(), b"not permitted");
+            return false;
+        }
+        admit(Admitted {
+            conns: self.conns.clone(),
+            addr: conn.remote_address(),
+            conn,
+            fingerprint,
+            listen_tx: self.listen_tx.clone(),
+            clipboard_in: self.clipboard_in.clone(),
+            trust: self.trust.clone(),
+            pressure: self.pressure.clone(),
+            first,
+        })
+        .await;
+        true
     }
 }
 
