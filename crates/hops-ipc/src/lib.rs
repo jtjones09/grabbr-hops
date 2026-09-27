@@ -348,6 +348,12 @@ pub struct ClientState {
     /// `authorized_fingerprints` entry (byte-identical to the allowlist key).
     #[serde(default)]
     pub peer_fingerprint: Option<String>,
+    /// The machine this device is pinned to refused this machine's dial as
+    /// one it holds no pairing with: it removed this machine (#184). This
+    /// machine still holds its side, so the device's card says so and offers
+    /// to remove it. Cleared once a link to it is up again.
+    #[serde(default)]
+    pub removed_by_peer: bool,
 }
 
 /// Who caused a connection attempt to be raised.
@@ -410,8 +416,6 @@ pub enum FrontendEvent {
     TrustUpdated(HashMap<String, PeerTrust>),
     /// public key fingerprint of this device
     PublicKeyFingerprint(String),
-    /// the set of deliberately-revoked fingerprints changed
-    RevokedUpdated(HashMap<String, RevokedEntry>),
     /// new device connected
     DeviceConnected {
         addr: SocketAddr,
@@ -586,17 +590,12 @@ pub struct DiscoveredDevice {
     pub addrs: Vec<SocketAddr>,
 }
 
-/// A fingerprint the user deliberately expelled.
+/// One row of the `[revoked_fingerprints]` table a build before #184 wrote to
+/// `config.toml`: a device it removed.
 ///
-/// Kept so a revoked peer is DISTINGUISHABLE from a stranger. Without it,
-/// re-approving a machine you just kicked out is indistinguishable from
-/// approving a brand-new one — the exact state whose absence has a CVE in
-/// matrix-sdk-crypto (RUSTSEC-2024-0434).
-///
-/// It is NOT an exclusion mechanism and must never be sold as one: a revoked
-/// peer can mint a fresh keypair and return as a stranger for free. What it buys
-/// is that the SAME key can no longer summon an approval dialog — the peer loses
-/// the ability to schedule a security decision.
+/// Read once, when the daemon first makes its trust store, so that device is
+/// not carried forward, and never written again: removing a device now
+/// forgets it, and no record of the removal is kept (#184).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RevokedEntry {
     /// what the device was called when trust was withdrawn

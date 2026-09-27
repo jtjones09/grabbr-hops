@@ -838,8 +838,8 @@ mod no_pairing_expires_until_renewal_exists {
             DOORS,
             "precondition: a live pairing gets through every door"
         );
-        receiving.write().expect("lock").revoke(&peer_fp);
-        sending.write().expect("lock").revoke(&peer_fp);
+        receiving.write().expect("lock").forget(&peer_fp);
+        sending.write().expect("lock").forget(&peer_fp);
         let admitted = doors_that_admit(&peer, &receiving, &sending);
         assert!(
             admitted.is_empty(),
@@ -1197,11 +1197,14 @@ mod a_build_before_schema_2_refuses_this_store_and_leaves_it_unchanged {
         );
 
         // A store an older build wrote, and this build's first start on it.
+        // It holds no removal: one is dropped at that start, and the copy
+        // holding it goes with it, so no removed device survives there
+        // (#184; `trust_file`'s
+        // `a_removal_an_earlier_build_kept_is_dropped_and_that_device_pairs_again`).
         let (dir, auth) = scratch("migrated");
         let held = vec![
             lease(&fp32(0x11), State::Active, &[Cap::Inbound]),
             lease(&fp32(0x12), State::Active, &[Cap::Outbound]),
-            lease(&fp32(0x13), State::Revoked, &[]),
         ];
         older::save(&dir, auth.as_ref(), 4, held.clone());
         assert_eq!(
@@ -1276,356 +1279,190 @@ mod a_build_before_schema_2_refuses_this_store_and_leaves_it_unchanged {
 }
 
 // ---------------------------------------------------------------------------
-// expulsion is permanent — the rule this project has now rebuilt three times
+// removing a device forgets it
 // ---------------------------------------------------------------------------
 
-mod an_expelled_fingerprint_is_never_re_authorised {
-    //! **Decided 2026-08-19.** No code path re-authorises a fingerprint that
-    //! carries a denial. No restore verb exists in the IPC enum, the CLI, or
-    //! any frontend. Recovery is the other machine generating a NEW identity
-    //! and pairing from scratch.
+mod removing_a_device_forgets_it {
+    //! **Decided 2026-09-16 (#184), correcting how 2026-08-19 was built.**
+    //! Removing a device drops its lease, its address and any record of its
+    //! identity. There is no tombstone, no restore verb and no reset: the
+    //! machine is unknown again, and adding it back is an ordinary pairing.
     //!
-    //! **This reverses an earlier decision, and the direction matters.** On
-    //! 2026-08-05 re-trust was a distinct verb with a confirm step. On
-    //! 2026-08-19 that clause — and only that clause — was overturned. Anyone
-    //! citing the August 5th entry to justify a restore path, a suspend state,
-    //! or a `Restored` origin is citing a decision that was reversed two weeks
-    //! later. The rest of the August 5th entry still stands.
+    //! **What stands in for the tombstone.** A removed machine returns only
+    //! through the full pairing: a prompt, which appears only after someone
+    //! opened add device on this machine (#195); an approval here, which
+    //! grants nothing on its own; and the same number confirmed on both
+    //! machines (#11, #167).
     //!
-    //! **Why the rule is worth a test.** A stored one-request path from
-    //! expelled back to full keyboard control is a capability sitting in the
-    //! daemon for a convenience worth almost nothing, since re-pairing is a
-    //! single approval. The reason to remove it was never that it was
-    //! reachable — it was that it existed at all.
+    //! **Superseded, and it is not a tidy-up to bring back.** The rule these
+    //! guards replace recorded the removed identity for good, so that machine
+    //! could only come back under a new one, and the app told people to
+    //! reinstall to get one. Recording removals again reverses the 2026-09-16
+    //! decision: take it to the decision record first.
 
-    use crate::trust::{Caps, Denial, Expiry, Lease, Origin, TrustStore};
+    use crate::service::{GrantRefused, grant_for_attempt};
+    use crate::trust::{Caps, TrustStore};
+    use hops_ipc::AttemptOrigin;
 
     use super::fp32;
 
-    fn expelled_store() -> (TrustStore, String, String) {
-        let ours = fp32(0x01);
-        let peer = fp32(0x77);
-        let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
+    fn paired_with(peer: &str, kept: &str) -> TrustStore {
+        let mut store = TrustStore::new(&fp32(0x01), 0).expect("our own fingerprint");
         store
-            .issue_confirmed(&peer, "a machine", Caps::INBOUND)
+            .issue_confirmed(peer, "the sold laptop", Caps::KNOWN)
             .expect("issue");
-        store.revoke(&peer);
-        (store, ours, peer)
+        store
+            .issue_confirmed(kept, "the desk mac", Caps::INBOUND)
+            .expect("issue");
+        store
     }
 
-    /// The whole public surface of the store, tried one verb at a time against
-    /// a removed device.
-    ///
-    /// Written as an enumeration rather than as one test per verb on purpose:
-    /// the failure mode is a NEW verb, added next month, that happens to clear
-    /// a denial. A test per existing verb passes happily on the day that lands.
-    /// This one at least fails the moment an existing verb starts laundering,
-    /// and its name tells whoever adds the new verb what the rule is.
+    /// Nothing about a removed device is left anywhere the store answers
+    /// from or writes to: not a lease, not its name, not a row on disk, not
+    /// the allowlist cache an older build reads.
+    // LEDGER R184-2 | class B | 1 return value + 6 struct state: TrustStore::forget, records_of, config_cache
     #[test]
-    fn no_verb_in_the_trust_store_can_lift_a_removal() {
-        let (mut store, ours, peer) = expelled_store();
+    fn removal_leaves_no_record_of_the_device() {
+        let (peer, kept) = (fp32(0x77), fp32(0x78));
+        let mut store = paired_with(&peer, &kept);
 
-        /// One attempt to lift a removal: the verb's name, and the call.
-        type Attempt = (&'static str, Box<dyn FnOnce(&mut TrustStore)>);
+        assert!(store.forget(&peer), "the removal found nothing to remove");
 
-        let attempts: Vec<Attempt> = vec![
-            (
-                "issue",
-                Box::new(|s: &mut TrustStore| {
-                    let _ = s.issue_confirmed(&fp32(0x77), "back please", Caps::KNOWN);
-                }),
-            ),
-            (
-                "issue_with_origin",
-                Box::new(|s: &mut TrustStore| {
-                    let _ = s.issue_with_origin(
-                        &fp32(0x77),
-                        "back please",
-                        Caps::KNOWN,
-                        Origin::Inbound,
-                    );
-                }),
-            ),
-            (
-                "renew",
-                Box::new(|s: &mut TrustStore| {
-                    let _ = s.renew(&fp32(0x77));
-                }),
-            ),
-            (
-                "set_label",
-                Box::new(|s: &mut TrustStore| {
-                    let _ = s.set_label(&fp32(0x77), "renamed");
-                }),
-            ),
-            (
-                "drop_capabilities",
-                Box::new(|s: &mut TrustStore| {
-                    let _ = s.drop_capabilities(&fp32(0x77), Caps::NONE);
-                }),
-            ),
-            (
-                "admit (the disk-replay door)",
-                Box::new(move |s: &mut TrustStore| {
-                    let _ = s.admit(Lease {
-                        peer: fp32(0x77),
-                        issued_to: fp32(0x01),
-                        label: "replayed off disk".to_string(),
-                        caps: Caps::KNOWN,
-                        origin: Origin::Inbound,
-                        issued_at: 0,
-                        expiry: Expiry::Never,
-                        clipboard_chosen: false,
-                        confirmed: true,
-                    });
-                }),
-            ),
-            (
-                "admit_denial (a second removal)",
-                Box::new(|s: &mut TrustStore| {
-                    s.admit_denial(
-                        &fp32(0x77),
-                        Denial {
-                            label: "again".to_string(),
-                            at: 1,
-                        },
-                    );
-                }),
-            ),
+        assert!(
+            !store.is_known(&peer),
+            "the store still holds a record of a removed device. Removing a \
+             device forgets it (decided 2026-09-16, #184): no tombstone, no \
+             name, nothing a reset would have to undo."
+        );
+        assert_eq!(store.label(&peer), None, "its name was kept");
+        assert!(
+            store.entries().all(|(fp, _)| fp != peer),
+            "a record of it is still listed"
+        );
+        assert!(
+            crate::trust_file::records_of(&store)
+                .iter()
+                .all(|r| r.fingerprint != peer),
+            "the store would write a record of it to disk"
+        );
+        assert!(
+            !store.config_cache().contains_key(&peer),
+            "the config file would still list it"
+        );
+        assert!(
+            store.may_drive_us(&kept),
+            "removing one device took another's pairing with it"
+        );
+    }
+
+    /// A removed device comes back through the full pairing and no other
+    /// way. Every verb short of it leaves the device with nothing; the grant
+    /// door refuses without a prompt a pairing window admitted; an approval
+    /// grants nothing until both machines confirm the number.
+    ///
+    /// Written as an enumeration so a verb added next month that hands a
+    /// removed device something short of the pairing fails here by name.
+    // LEDGER R184-3 | class B | 1 return value: TrustStore verbs, service::grant_for_attempt
+    #[test]
+    fn a_removed_device_returns_only_through_the_full_pairing() {
+        let (peer, kept) = (fp32(0x77), fp32(0x78));
+
+        type Verb = (&'static str, fn(&mut TrustStore, &str));
+        let verbs: [Verb; 7] = [
+            ("renew", |s, fp| {
+                let _ = s.renew(fp);
+            }),
+            ("set_label", |s, fp| {
+                let _ = s.set_label(fp, "back please");
+            }),
+            ("drop_capabilities", |s, fp| {
+                let _ = s.drop_capabilities(fp, Caps::NONE);
+            }),
+            ("disable_clipboard", |s, fp| {
+                let _ = s.disable_clipboard(fp);
+            }),
+            ("enable_clipboard", |s, fp| {
+                let _ = s.enable_clipboard(fp);
+            }),
+            ("confirm", |s, fp| {
+                let _ = s.confirm(fp);
+            }),
+            ("forget_unconfirmed", |s, fp| {
+                let _ = s.forget_unconfirmed(fp);
+            }),
         ];
-
-        for (verb, apply) in attempts {
-            apply(&mut store);
-            assert_eq!(
-                store.capabilities(&peer),
-                Caps::NONE,
-                "`{verb}` re-authorised a removed device. Removal is permanent \
-                 (decided 2026-08-19, reversing the 2026-08-05 restore verb). \
-                 The recovery path is the other machine generating a NEW \
-                 identity and pairing from scratch — a single approval. A \
-                 one-request route from expelled back to full keyboard control \
-                 is a capability sitting in the daemon for nothing. This has \
-                 been rebuilt twice already after the objection was answered; \
-                 if you are here because a restore feature was requested, the \
-                 answer is a new identity, not a new verb."
-            );
+        for (verb, apply) in verbs {
+            let mut store = paired_with(&peer, &kept);
+            store.forget(&peer);
+            apply(&mut store, &peer);
             assert!(
-                store.is_denied(&peer),
-                "`{verb}` erased the removal record for {peer}. The tombstone is \
-                 what keeps an expelled machine distinguishable from a stranger \
-                 on its next dial; without it the peer is simply unknown again \
-                 and one click from readmitted."
-            );
-            assert!(
-                !store.may_drive_us(&peer) && !store.we_may_drive(&peer),
-                "`{verb}` left {peer} able to drive a machine in some direction \
-                 after removal, on a store owned by {ours}."
+                !store.is_known(&peer) && store.capabilities(&peer) == Caps::NONE,
+                "`{verb}` gave a removed device a record or a capability without \
+                 the full pairing (#184, #195, #167)"
             );
         }
-    }
 
-    /// The grant door's *return value*, not just its effect. A door that
-    /// silently no-ops looks identical to a door that worked, and the UI would
-    /// then show a device the daemon does not trust.
-    #[test]
-    fn granting_to_a_removed_device_fails_loudly_rather_than_quietly() {
-        use crate::trust::TrustError;
-        let (mut store, _, peer) = expelled_store();
-        match store.issue_confirmed(&peer, "back please", Caps::INBOUND) {
-            Err(TrustError::Expelled { fingerprint }) => assert_eq!(fingerprint, peer),
-            other => panic!(
-                "granting to a removed device returned {other:?}. It must return \
-                 TrustError::Expelled so the caller can tell the user that \
-                 identity is dead and the machine needs a new one. A silent \
-                 no-op leaves the frontend showing a grant that did not happen."
-            ),
-        }
-    }
-
-    /// **Decided 2026-08-30.** No commit adds a restore or suspend path while
-    /// the written tombstone rationale is still present in the source.
-    ///
-    /// **This one is a text invariant, deliberately.** The rule IS about a
-    /// comment: the mechanism is that an author who wants the restore path back
-    /// must consciously delete a paragraph explaining why it is gone, which
-    /// turns a silent regression into a deliberate act someone has to justify
-    /// in a diff. There is nothing to call. The scan runs over `trust.rs` and
-    /// `trust_file.rs`, never over this file.
-    #[test]
-    fn the_negative_space_comment_that_makes_a_rebuild_deliberate_is_still_there() {
-        for (file, src) in [
-            ("src/trust.rs", include_str!("trust.rs")),
-            ("src/trust_file.rs", include_str!("trust_file.rs")),
-        ] {
-            assert!(
-                src.contains("No `Restored`"),
-                "{file} no longer carries the `No \\`Restored\\`` note beside its \
-                 origin enum. That note is not decoration: it is the thing an \
-                 author has to delete on purpose before adding the variant back, \
-                 which is what converts a silent regression into a reviewable \
-                 act. If you removed it because you are adding a restore path, \
-                 the 2026-08-19 decision says the path may not exist — take it \
-                 to the decision record first."
-            );
-        }
-        let door = include_str!("trust.rs");
+        let mut store = paired_with(&peer, &kept);
+        store.forget(&peer);
         assert!(
-            door.contains("There is deliberately no restore verb anywhere"),
-            "src/trust.rs no longer states, at the admit door, that no restore \
-             verb exists above it. The door is the only place a reader learns \
-             that the refusal is intentional rather than an oversight — and an \
-             oversight is what somebody tidies up."
+            matches!(
+                grant_for_attempt(&mut store, &peer, "back please", None),
+                Err(GrantRefused::NoAttempt)
+            ),
+            "the grant door approved a removed device with no prompt a pairing \
+             window admitted (#195)"
         );
-    }
+        assert!(!store.is_known(&peer), "a refused grant left a record");
 
-    /// **RED TODAY.** A text invariant, and the right instrument for it: the
-    /// defect is prose, not behaviour.
-    ///
-    /// The executable code obeys the 2026-08-19 decision. The documentation
-    /// around it teaches the 2026-08-05 rule that was overturned — including
-    /// two rustdoc intra-doc links to `TrustStore::restore`, a method that does
-    /// not exist, in the module header, which is the first thing any reader
-    /// sees. That prose is the reseeding mechanism this whole exercise exists
-    /// to stop: the assistant that rebuilt `restore()` was working from a
-    /// framing it had constructed in between reading the record and writing the
-    /// code, and the framing is sitting in the file, naming the verb.
-    ///
-    /// A guard cannot outrank documentation that tells the next reader the
-    /// guard is wrong.
-    #[test]
-    fn no_shipped_prose_teaches_the_superseded_rule_that_removal_is_reversible() {
-        // Precise phrases, not the bare word: legitimate uses exist nearby —
-        // "no restore verb", "a dotfiles restore could launder", "irreversible",
-        // and the TUI's own `the_footer_advertises_no_restore` guard. Each
-        // needle below was checked to match only sites that assert the
-        // SUPERSEDED position as current design.
-        const FORBIDDEN: &[(&str, &str)] = &[
-            (
-                "`TrustStore::restore`",
-                "a rustdoc link to a method that does not exist, offered as the verb that undoes a removal",
-            ),
-            (
-                "makes removal reversible",
-                "states the overturned 2026-08-05 position as current design",
-            ),
-            (
-                "removal is reversible",
-                "states the overturned 2026-08-05 position as current design",
-            ),
-            (
-                "restore it before granting",
-                "a user-facing error string pointing at an affordance that does not exist",
-            ),
-            (
-                "so `restore`",
-                "a guard's own failure message arguing that the forbidden verb is legitimate",
-            ),
-            (
-                "what makes it reversible",
-                "states the overturned 2026-08-05 position as current design",
-            ),
-            (
-                "user can now restore",
-                "the migration doc comment asserting the reversed rule",
-            ),
-        ];
-
-        // Whole-file, including test modules, ON PURPOSE: one of the offenders
-        // is a guard's own failure message, and a failure message read by
-        // somebody about to delete the guard is exactly where this rule matters
-        // most.
-        let mut offenders = Vec::new();
-        for (file, src) in [
-            ("src/trust.rs", include_str!("trust.rs")),
-            ("src/trust_file.rs", include_str!("trust_file.rs")),
-            ("src/service.rs", include_str!("service.rs")),
-        ] {
-            for (needle, why) in FORBIDDEN {
-                for (line, text) in super::scan::hits(src, needle) {
-                    offenders.push(format!("{file}:{line} — {why}\n      {text}"));
-                }
-            }
-        }
-
-        assert!(
-            offenders.is_empty(),
-            "shipped prose still teaches that a removed device can be restored, \
-             in {} place(s):\n\n    {}\n\n\
-             Removal is permanent — decided 2026-08-19, REVERSING the 2026-08-05 \
-             entry that made re-trust a distinct verb. The code already obeys \
-             this; only the words disagree, and the words are what the next \
-             author reads. The restore path has been built twice against an \
-             objection that had already been answered, both times by someone \
-             working from a framing built between reading the record and writing \
-             the code. Two of these are broken rustdoc intra-doc links, so \
-             `cargo doc` will not resolve them either. Rewrite the prose to say \
-             what the code does: a denial outranks the lease it sits beside, and \
-             the machine returns by generating a new identity.",
-            offenders.len(),
-            offenders.join("\n    ")
-        );
-    }
-
-    /// **Decided 2026-08-05, still standing.** A revoked fingerprint produces
-    /// no approval prompt, inbound or outbound.
-    ///
-    /// **Why.** Revocation cut the session, the peer reconnected, and its
-    /// failed handshake raised the approval prompt — one click restored full
-    /// control, at a moment the peer chose, repeatable until a misclick.
-    /// Revocation cannot keep an attacker out (it can re-key); what it can do
-    /// is stop the attacker choosing the moment you are asked.
-    ///
-    /// This calls both predicates because the production path
-    /// (`raise_connection_attempt`) gates on `denial()` while the store exposes
-    /// `may_prompt()` — two answers to one question, and the audit found
-    /// `may_prompt` has no production caller. If they ever disagree, one of
-    /// them is a prompt gate that is not gating.
-    #[test]
-    fn a_removed_device_can_never_put_a_prompt_on_the_screen_and_a_lapsed_one_still_can() {
-        use crate::trust::{MAX_TERM_SECS, Term};
-
-        let ours = fp32(0x01);
-        let expelled = fp32(0x88);
-        let lapsed = fp32(0x99);
-        let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
-
-        store
-            .issue_confirmed(&expelled, "removed", Caps::INBOUND)
-            .expect("issue");
-        store.revoke(&expelled);
-
-        store
-            .issue_with_term(&lapsed, "lapsed", Caps::INBOUND, Term::Secs(10))
-            .expect("issue");
-
-        assert!(
-            !store.may_prompt(&expelled),
-            "a removed device may raise an approval prompt. That is the whole \
-             readmission loop: revoke cuts the session, the peer redials, its \
-             failed handshake raises a dialog, and one click hands back full \
-             keyboard control — at a moment the peer picked, repeatable until a \
-             misclick."
-        );
+        grant_for_attempt(
+            &mut store,
+            &peer,
+            "back please",
+            Some(AttemptOrigin::Inbound),
+        )
+        .expect("a prompt a window admitted is approved like any first contact");
         assert_eq!(
-            store.denial(&expelled).is_some(),
-            !store.may_prompt(&expelled),
-            "the store's `may_prompt` and the `denial()` lookup that \
-             `Service::raise_connection_attempt` actually uses disagree about \
-             {expelled}. Two predicates, one question, and only one of them is \
-             wired to the screen — so the tested one can be right while the \
-             running one is wrong."
+            store.capabilities(&peer),
+            Caps::NONE,
+            "an approval alone gave a removed device back its pairing: the \
+             number was never confirmed (#11, #167)"
         );
-
-        // Roll the clock past the lease. `Clock` is max(reading, floor), so
-        // observe() is how time moves for the store.
-        store.clock().observe(MAX_TERM_SECS);
         assert!(
-            store.may_prompt(&lapsed),
-            "a device whose lease merely LAPSED was refused a prompt. A lapse is \
-             not an expulsion: a lapsed machine may knock again and be renewed, \
-             an expelled one may not even ask. Collapsing the two makes expiry \
-             indistinguishable from removal, and then nobody dares let a lease \
-             expire."
+            store.awaits(&peer, Caps::DRIVE_ME),
+            "the approval does not let the number be compared"
+        );
+        store
+            .confirm(&peer)
+            .expect("both machines confirmed the number");
+        assert!(
+            store.may_drive_us(&peer),
+            "the full pairing did not pair a removed device again (#161)"
+        );
+    }
+
+    /// A removal an earlier build kept on file is not carried into the store
+    /// this build answers from (#184, #161).
+    // LEDGER R184-4 | class B | 1 return value: trust_file::rebuild
+    #[test]
+    fn a_removal_an_earlier_build_kept_is_not_carried_forward() {
+        use crate::trust_file::{DiskOrigin, DiskState, LeaseRecord, rebuild};
+        let peer = fp32(0x77);
+        let kept = LeaseRecord {
+            fingerprint: peer.clone(),
+            label: "the sold laptop".into(),
+            state: DiskState::Revoked,
+            origin: DiskOrigin::Migrated,
+            issued_at: 1,
+            expires_at: None,
+            revoked_at: Some(1),
+            caps: Vec::new(),
+            confirmed: true,
+            clipboard: None,
+        };
+        let (store, _) = rebuild(&fp32(0x01), 2, &[kept]).expect("rebuild");
+        assert!(
+            !store.is_known(&peer),
+            "a removal an earlier build recorded is still in force here"
         );
     }
 }
@@ -1656,7 +1493,7 @@ mod taking_trust_away_is_never_gated_the_way_giving_it_is {
 
     use super::fp32;
 
-    /// The structural half, checked by calling the store: revocation takes no
+    /// The structural half, checked by calling the store: removal takes no
     /// authority and cannot fail, so there is nothing for a future gate to hook
     /// into without changing the signature — which a reviewer would see.
     #[test]
@@ -1668,24 +1505,25 @@ mod taking_trust_away_is_never_gated_the_way_giving_it_is {
             .issue_confirmed(&peer, "driving me right now", Caps::KNOWN)
             .expect("issue");
 
-        // No Result, no authority argument, no clock argument: `revoke` returns
-        // the label it removed and nothing else can be threaded into it.
-        let label: String = store.revoke(&peer);
+        // No Result, no authority argument, no clock argument: `forget`
+        // returns whether there was a record and nothing else can be threaded
+        // into it.
+        let removed: bool = store.forget(&peer);
 
-        assert_eq!(label, "driving me right now");
+        assert!(removed, "the removal found nothing");
         assert_eq!(
             store.capabilities(&peer),
             Caps::NONE,
-            "revoke left capabilities behind. Revocation must be reachable and \
+            "removal left capabilities behind. Removal must be reachable and \
              total from a machine that is CURRENTLY being driven by the peer \
-             being revoked — that is the moment it exists for."
+             being removed — that is the moment it exists for."
         );
 
-        // Revoking something already revoked, and something never known, must
+        // Removing something already removed, and something never known, must
         // also not fail: a user hammering the button while a peer drives them
         // must not hit an error path.
-        let _ = store.revoke(&peer);
-        let _ = store.revoke(&fp32(0xbb));
+        let _ = store.forget(&peer);
+        let _ = store.forget(&fp32(0xbb));
     }
 
     /// **Text invariant, and it is about placement rather than behaviour.**
@@ -1808,7 +1646,7 @@ mod removing_a_device_takes_its_key_and_not_merely_its_address {
             .expect("issue");
         assert!(store.may_drive_us(&peer), "precondition: it was trusted");
 
-        store.revoke(&peer);
+        store.forget(&peer);
 
         assert_eq!(
             store.capabilities(&peer),
@@ -1820,10 +1658,8 @@ mod removing_a_device_takes_its_key_and_not_merely_its_address {
              their keyboard and mouse."
         );
         assert!(
-            store.is_denied(&peer),
-            "a removed device left no expulsion record, so on its next dial it \
-             is a stranger rather than a machine you already threw out — and a \
-             stranger is one click from readmitted."
+            !store.is_known(&peer),
+            "a removed device left a record behind; removing it forgets it (#184)"
         );
     }
 
@@ -1844,7 +1680,7 @@ mod removing_a_device_takes_its_key_and_not_merely_its_address {
             .unwrap_or(rest.len());
         let body = &rest[..end];
 
-        for forbidden in ["remove_authorized_key", "revoke("] {
+        for forbidden in ["remove_authorized_key", ".forget("] {
             assert!(
                 !body.contains(forbidden),
                 "remove_client() calls `{forbidden}`. remove_client is ALSO called \
@@ -2488,7 +2324,7 @@ mod every_trust_mutation_happens_at_a_named_door {
 
     const DOORS: &[&str] = &[
         "fn add_authorized_key",    // grant
-        "fn remove_authorized_key", // revoke + tombstone
+        "fn remove_authorized_key", // removal: forgets the device (#184)
         "fn set_label",             // rename; refuses unknown fingerprints
         "fn handle_config_change",  // reload: the config file is a door too
         "fn new",                   // startup load
@@ -2511,6 +2347,10 @@ mod every_trust_mutation_happens_at_a_named_door {
         // to what its drive bits allow, and its caller refuses it while a peer
         // drives this machine.
         "fn enable_clipboard",
+        // Added with #184. A paired machine removed this one and said so on a
+        // live link that proved its identity, so this one forgets it too. It
+        // narrows only, and only the pairing with the machine that said so.
+        "fn forget_machine_that_removed_this_one",
     ];
 
     /// The needle a scan must actually find. If the store is renamed again,

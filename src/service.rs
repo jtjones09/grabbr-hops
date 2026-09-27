@@ -683,9 +683,8 @@ impl Service {
                     trust_file.now(),
                 );
                 log::info!(
-                    "migrated the trust store: {} leases, {} removals, {} refused, {} dropped",
+                    "migrated the trust store: {} leases, {} removed before, {} dropped",
                     report.leased.len(),
-                    report.denied.len(),
                     report.refused.len(),
                     report.dropped.len(),
                 );
@@ -1164,9 +1163,11 @@ impl Service {
         // A CACHE, written and never read back as authority. It exists so an
         // older build, or a human reading the file, still sees who is trusted —
         // but the daemon answers every trust question from the sealed store.
-        let (cache, tombstones) = self.trust.read().expect("lock").config_cache();
+        let cache = self.trust.read().expect("lock").config_cache();
         self.config.set_authorized_keys(cache);
-        self.config.set_revoked_fingerprints(tombstones);
+        // Removing a device forgets it: the table an earlier build kept its
+        // removals in goes at the first save (#184).
+        self.config.clear_revoked_fingerprints();
         if let Err(e) = self.config.write_back() {
             log::warn!("failed to write config: {e}");
             // The change is in memory only, for one when the file does not
@@ -1270,6 +1271,9 @@ impl Service {
                 } else {
                     self.update_incoming(addr, pos, fingerprint);
                 }
+            }
+            EmulationEvent::RemovedBy { fingerprint } => {
+                self.forget_machine_that_removed_this_one(fingerprint);
             }
             EmulationEvent::Disconnected { addr } => {
                 self.currently_controlling.remove(&addr);
@@ -1455,15 +1459,9 @@ impl Service {
             .discovered
             .iter()
             .filter(|p| match &p.claimed_fingerprint {
-                // `has_live_lease`, so a device whose lease lapsed reappears
-                // as discoverable and can be re-added. An expelled one does
-                // not: `is_known` would hide it forever, and it must stay
-                // visible so the user can see it is gone.
-                Some(fp) => {
-                    !configured.contains(fp)
-                        && !trust.has_live_lease(fp)
-                        && trust.denial(fp).is_none()
-                }
+                // `has_live_lease`, so a device whose lease lapsed, or that
+                // was removed, reappears as discoverable and can be re-added.
+                Some(fp) => !configured.contains(fp) && !trust.has_live_lease(fp),
                 None => true,
             })
             .map(|p| DiscoveredDevice {
@@ -1634,11 +1632,8 @@ impl Service {
     }
 
     fn add_authorized_key(&mut self, desc: String, fp: String) {
-        // Canonicalise BEFORE the tombstone lookup. The check below is an exact
-        // map lookup, so an uppercased spelling of an expelled fingerprint used
-        // to miss it — and `Config::authorized_fingerprints` then folded that
-        // spelling back to canonical form on the next read, resurrecting the
-        // expelled device (issue #67).
+        // Canonicalise first, so the grant lands on the one record the TLS
+        // doors look up (issue #67).
         let Some(fp) = hops_ipc::identity::canonical_fingerprint(&fp) else {
             log::warn!("refusing to authorize {fp:?}: not a valid fingerprint");
             self.notify_frontend(FrontendEvent::Error(format!(
@@ -1647,28 +1642,9 @@ impl Service {
             )));
             return;
         };
-        // An expelled fingerprint is DEAD. There is deliberately no path from
-        // revoked back to authorized: the record is a tombstone, not a pause.
-        // Re-establishing a deleted device means that machine presenting a NEW
-        // identity and pairing from scratch — "the whole point of issuing new
-        // keys". Refusing here closes the last laundering route, since
-        // raise_connection_attempt already prevents a revoked peer prompting.
-        let expelled = self.trust.read().expect("lock").denial(&fp).cloned();
-        if let Some(entry) = expelled {
-            log::warn!(
-                "refusing to authorize {fp}: it was expelled as {:?}. That identity \
-                 is permanently dead — the device must present a new one.",
-                entry.label
-            );
-            self.notify_frontend(FrontendEvent::Error(format!(
-                "{}: \"{}\" was removed, and that identity cannot be trusted again. \
-                 Re-install or reset hops on that machine so it generates a new \
-                 identity, then pair it fresh.",
-                hops_ipc::GRANT_REFUSED,
-                entry.label
-            )));
-            return;
-        }
+        // A device removed here is a stranger again, and is approved like
+        // one: only from a prompt its pairing window admitted, and granting
+        // nothing until both machines confirm the number (#184, #195, #167).
         // Shaped by how the peer arrived; see `grant_for_attempt`. A prompt
         // whose pairing window has closed grants nothing.
         let now = self.pairing_now();
@@ -1807,6 +1783,47 @@ impl Service {
                     )));
                 }
             }
+            DialRefusal::Forgotten {
+                handle,
+                fingerprint,
+                addr,
+            } => {
+                // Refused as a machine it holds no pairing with, by a machine
+                // this one holds a pairing with: it removed this machine
+                // (#184). Not while adding it, when it may simply not have
+                // approved this one yet, and not for a machine this one never
+                // paired with, whose refusal says nothing new.
+                let paired = {
+                    let trust = self.trust.read().expect("lock");
+                    trust.is_known(&fingerprint) && !trust.is_pairing(&fingerprint)
+                };
+                if self.adding.contains_key(&handle) || !paired {
+                    self.handle_dial_refusal(DialRefusal::RefusedByPeer {
+                        handle,
+                        fingerprint,
+                        addr,
+                    });
+                    return;
+                }
+                // The card says so and offers to remove it, rather than this
+                // machine deleting its own pairing unasked: that is harder to
+                // make sense of than a card that asks.
+                if self.client_manager.set_removed_by_peer(handle, true) {
+                    self.broadcast_client(handle);
+                }
+                if self.refusal_notices.due(handle, "removed", now) {
+                    let name = self.device_name(handle);
+                    log::warn!("{name} at {addr} ({fingerprint}) no longer trusts this machine");
+                    self.notify_frontend(FrontendEvent::Error(format!(
+                        "{name} no longer trusts this machine: it removed this machine. Remove \
+                         {name} here; to use it again, pair the two machines again."
+                    )));
+                }
+            }
+            DialRefusal::RemovedBy {
+                handle: _,
+                fingerprint,
+            } => self.forget_machine_that_removed_this_one(fingerprint),
             DialRefusal::NotThePinnedMachine { handle, seen } => {
                 if !self.refusal_notices.due(handle, "not-pinned", now) {
                     return;
@@ -1903,31 +1920,15 @@ impl Service {
 
     /// The ONLY path from an approval prompt to the allowlist.
     ///
-    /// A revoked fingerprint is dropped here with a log line and no UI event, so
-    /// a peer that reconnects after being expelled cannot put a dialog on the
-    /// user's screen. That is the whole mechanism: revocation cannot keep an
-    /// attacker out (it can re-key), but it can stop it choosing the moment you
-    /// are asked to let it back in.
+    /// A machine removed here knocks as a stranger, and like any stranger it
+    /// raises a prompt only while someone here has add device open (#195):
+    /// it cannot choose the moment the person here is asked (#184).
     fn raise_connection_attempt(
         &mut self,
         fingerprint: String,
         origin: AttemptOrigin,
         addr: Option<SocketAddr>,
     ) {
-        if let Some(entry) = self
-            .trust
-            .read()
-            .expect("lock")
-            .denial(&fingerprint)
-            .cloned()
-        {
-            log::warn!(
-                "ignoring a connection attempt from removed device {:?} ({fingerprint}) — \
-                 that identity is permanently dead; the machine must present a new one",
-                entry.label
-            );
-            return;
-        }
         // Approved here already, and waiting for its number: the request was
         // answered, and a second prompt for it would only confuse. Covers the
         // machine being added dialling the one adding it, too, which the TLS
@@ -2030,11 +2031,7 @@ impl Service {
     /// on screen now are shown again.
     fn replay_pending_attempts(&mut self) {
         let now = self.pairing_now();
-        let replay = {
-            let trust = self.trust.read().expect("lock");
-            self.pending_attempts
-                .replay(&self.prompt_gate, |fp| trust.denial(fp).is_some(), now)
-        };
+        let replay = self.pending_attempts.replay(&self.prompt_gate, now);
         for (fingerprint, attempt) in replay {
             self.notify_frontend(FrontendEvent::ConnectionAttempt {
                 fingerprint,
@@ -2152,20 +2149,26 @@ impl Service {
     }
 
     fn remove_authorized_key(&mut self, fp: String) {
-        // Canonicalise here too, or a tombstone can be written under a spelling
-        // that `add_authorized_key` will never match (issue #67). An invalid
-        // fingerprint is still tombstoned under its lowercased form rather than
-        // dropped: refusing to revoke is the more dangerous failure.
+        // Canonicalise here too, so the removal finds the record the grant
+        // door wrote under any spelling (issue #67).
         let fp = hops_ipc::identity::canonical_fingerprint(&fp)
             .unwrap_or_else(|| fp.trim().to_lowercase());
-        // One verb, and it is permanent for this key. The store keeps the
-        // expulsion so the peer is not a stranger again on its next dial — that
-        // is how a removal ended up one click from undone — and stamps it from
-        // the floored clock rather than a raw `SystemTime::now()`, so a
-        // backdated system clock cannot write a tombstone into the past.
-        let label = self.trust.write().expect("lock").revoke(&fp);
-        log::warn!("removed {label:?} ({fp}) — that identity is permanently dead");
+        // Removing a device forgets it: its lease, its name and every other
+        // record of it go, and nothing is kept to undo (#184). It returns only
+        // by pairing again in full. A prompt it raised and nobody answered
+        // goes too.
+        let label = self
+            .trust
+            .read()
+            .expect("lock")
+            .label(&fp)
+            .unwrap_or_default();
+        self.trust.write().expect("lock").forget(&fp);
+        self.pending_attempts.forget(&fp);
+        log::warn!("removed {label:?} ({fp}): this machine keeps no record of it");
         self.persist_trust(format!("removing {}", named(&label, &fp)));
+        // Its links close as they are cut, and the machine at the other end
+        // is told it was removed as they do (`transport::REMOVED`).
         self.cut_sessions(&fp);
         // Revoking trust in a fingerprint releases any outbound pin on it, so a
         // client whose receiver re-keyed (e.g. reinstall) can re-learn + re-pin
@@ -2175,6 +2178,46 @@ impl Service {
             self.broadcast_client(h);
         }
         self.publish_trust();
+    }
+
+    /// The machine that proved `fp` on a live link closed it because it
+    /// removed this machine (#184), so this machine forgets it too: its
+    /// pairing, and every device card pinned to it.
+    ///
+    /// Safe to accept from a peer because it can only take trust away, and
+    /// only its own: the link it came on proved `fp`, and a machine this one
+    /// holds no pairing with changes nothing.
+    fn forget_machine_that_removed_this_one(&mut self, fp: String) {
+        let (known, label) = {
+            let trust = self.trust.read().expect("lock");
+            (trust.is_known(&fp), trust.label(&fp).unwrap_or_default())
+        };
+        if !known {
+            log::debug!("{fp} said it removed this machine, which holds no pairing with it");
+            return;
+        }
+        let gone = self.client_manager.every_pinned_to(&fp);
+        let name = gone
+            .first()
+            .map(|&h| self.device_name(h))
+            .unwrap_or_else(|| named(&label, &fp));
+        log::warn!("{name} ({fp}) removed this machine: removing it here too");
+        self.trust.write().expect("lock").forget(&fp);
+        self.pending_attempts.forget(&fp);
+        self.persist_trust(format!(
+            "removing {}, which removed this machine",
+            named(&label, &fp)
+        ));
+        self.cut_sessions(&fp);
+        for handle in gone {
+            self.remove_client(handle);
+        }
+        self.save_config();
+        self.publish_trust();
+        self.notify_frontend(FrontendEvent::Error(format!(
+            "{name} removed this machine, so it was removed here too. To use it again, \
+             pair the two machines again."
+        )));
     }
 
     /// Turn a pairing's clipboard off, both ways (#182). The store keeps the
@@ -2573,13 +2616,12 @@ impl Service {
 
     /// Tell every frontend what the trust store now grants: who may drive
     /// this machine (derived from live leases only, or a frontend would claim
-    /// a machine can drive you when its lease has lapsed), who was removed,
-    /// and each pairing's clipboard.
+    /// a machine can drive you when its lease has lapsed), and each pairing's
+    /// clipboard.
     fn publish_trust(&mut self) {
-        let (keys, tombstones, pairings, unconfirmed) = {
+        let (keys, pairings, unconfirmed) = {
             let trust = self.trust.read().expect("lock");
-            let (keys, tombstones) = trust.config_cache();
-            (keys, tombstones, trust.pairings(), trust.unconfirmed())
+            (trust.config_cache(), trust.pairings(), trust.unconfirmed())
         };
         let mut peers: HashMap<String, hops_ipc::PeerTrust> = pairings
             .into_iter()
@@ -2604,7 +2646,6 @@ impl Service {
             );
         }
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
-        self.notify_frontend(FrontendEvent::RevokedUpdated(tombstones));
         self.notify_frontend(FrontendEvent::TrustUpdated(peers));
     }
 
@@ -3123,7 +3164,7 @@ mod trust_door_guard {
     /// boundary where the two tables become one.
     ///
     /// The guarantee the scan was protecting still holds and is now checked by
-    /// calling the code: a fingerprint in BOTH tables migrates to a removal, not
+    /// calling the code: a fingerprint in BOTH tables migrates to nothing, not
     /// a grant. That is issue #66, tested rather than grepped.
     /// A well-formed 32-byte fingerprint made of one repeated byte.
     fn fp32(b: u8) -> String {
@@ -3134,7 +3175,7 @@ mod trust_door_guard {
     }
 
     #[test]
-    fn a_fingerprint_in_both_config_tables_migrates_to_a_removal_not_a_grant() {
+    fn a_fingerprint_in_both_config_tables_migrates_to_nothing_not_a_grant() {
         use crate::trust::Caps;
         use std::collections::HashMap;
 
@@ -3145,7 +3186,7 @@ mod trust_door_guard {
             &HashMap::from([(
                 fp.clone(),
                 hops_ipc::RevokedEntry {
-                    label: "expelled".to_string(),
+                    label: "removed".to_string(),
                     revoked_at: 1_000,
                 },
             )]),
@@ -3160,7 +3201,10 @@ mod trust_door_guard {
              capability — copy-pasting a key back into the allowlist is how a \
              removed device came back after a reboot"
         );
-        assert!(store.denial(&fp).is_some(), "and the removal must survive");
+        assert!(
+            !store.is_known(&fp),
+            "and nothing is recorded for it: removal forgets (#184)"
+        );
     }
 
     #[test]
@@ -3194,9 +3238,9 @@ mod trust_door_guard {
         ] {
             assert!(
                 body_of(&src, reader).contains("to_lowercase()"),
-                "{reader} must lowercase its keys. When only the authorized table did, an \
-                 expelled fingerprint re-added in uppercase missed the tombstone and was \
-                 then folded back to canonical form on the next read — issue #67."
+                "{reader} must lowercase its keys. When only the authorized table did, a \
+                 removed fingerprint re-added in uppercase was missed by the migration \
+                 and then folded back to canonical form on the next read — issue #67."
             );
         }
     }
@@ -3207,7 +3251,7 @@ mod trust_door_guard {
             assert!(
                 body_of(&production_source(SERVICE_RS_ALL), door).contains("canonical_fingerprint"),
                 "{door} must canonicalise before touching the trust maps. An uppercased \
-                 spelling of an expelled fingerprint missed the tombstone and was folded \
+                 spelling of a fingerprint was written as a second record, and folded \
                  back to canonical form on the next config read — issue #67."
             );
         }
@@ -3312,7 +3356,7 @@ mod set_label_cannot_grant {
 
 #[cfg(test)]
 mod one_trust_write_site {
-    //! Only the named trust doors may write the allowlist or the denylist.
+    //! Only the named trust doors may write the allowlist.
     //!
     //! Layer 1 of `CONSENT-ARCHITECTURE.md` asks for exactly one place that
     //! mutates trust. This guards the property before the refactor that makes it
@@ -3354,7 +3398,7 @@ mod one_trust_write_site {
     /// deliberate act; arriving here by accident is what the guard prevents.
     const DOORS: &[&str] = &[
         "fn add_authorized_key",    // grant
-        "fn remove_authorized_key", // revoke + tombstone
+        "fn remove_authorized_key", // removal: forgets the device
         "fn set_label",             // rename, refuses unknown fingerprints
         "fn handle_config_change",  // reload: the config file is a door too
         "fn new",                   // startup load
@@ -3383,30 +3427,6 @@ mod one_trust_write_site {
     }
 
     #[test]
-    fn nothing_outside_the_named_doors_writes_the_denylist() {
-        let src = production();
-        let mut offenders = vec![];
-        for pat in [
-            "self.revoked.insert",
-            "self.revoked.remove",
-            "self.revoked =",
-        ] {
-            for (at, _) in src.match_indices(pat) {
-                let f = enclosing_fn(&src, at);
-                if !DOORS.iter().any(|d| f.starts_with(d)) {
-                    offenders.push(format!("{f} ({pat})"));
-                }
-            }
-        }
-        assert!(
-            offenders.is_empty(),
-            "these write the denylist and are not a named trust door: {offenders:?}. \
-             A revocation tombstone is irreversible; it must not be written from \
-             somewhere nobody is looking."
-        );
-    }
-
-    #[test]
     fn the_door_list_still_matches_reality() {
         // A door that no longer exists means the guard has quietly stopped
         // covering something, which is worse than not having it.
@@ -3423,9 +3443,9 @@ mod one_trust_write_site {
 
 #[cfg(test)]
 mod trust_reaches_every_app_whole {
-    //! What the trust store grants reaches the apps as three events that
-    //! `publish_trust` sends together: who may drive this machine, who was
-    //! removed, and each pairing's clipboard (#187). A site that sends the
+    //! What the trust store grants reaches the apps as two events that
+    //! `publish_trust` sends together: who may drive this machine, and each
+    //! pairing's clipboard (#187). A site that sends the
     //! first alone leaves every app showing the clipboard from before the
     //! change, and offering a switch for a clipboard that is already off.
     //!
@@ -3464,7 +3484,7 @@ mod trust_reaches_every_app_whole {
     #[test]
     fn only_publish_trust_sends_the_trust_events() {
         let src = production();
-        for event in ["AuthorizedUpdated(", "RevokedUpdated(", "TrustUpdated("] {
+        for event in ["AuthorizedUpdated(", "TrustUpdated("] {
             let senders: Vec<String> = src
                 .match_indices(event)
                 .map(|(at, _)| enclosing_fn(&src, at))
@@ -3803,6 +3823,9 @@ mod a_refused_crossing;
 
 #[cfg(all(test, unix))]
 mod refusals_and_bounds;
+
+#[cfg(all(test, unix))]
+mod removal_reaches_the_other_machine;
 
 /// The whole daemon in this process, for a test that drives it the way a
 /// frontend and a peer do.

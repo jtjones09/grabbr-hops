@@ -78,16 +78,20 @@ impl PendingAttempts {
         self.held.remove(fingerprint)
     }
 
-    /// The held prompts a frontend attaching at `now` is shown, less any
-    /// from a device `removed` names.
+    /// The held prompts a frontend attaching at `now` is shown.
     pub(super) fn replay(
         &mut self,
         gate: &PromptGate,
-        removed: impl Fn(&str) -> bool,
         now: Instant,
     ) -> Vec<(String, PendingAttempt)> {
         self.expire(gate, now);
-        attempts_to_replay(&self.held, gate, removed, now)
+        attempts_to_replay(&self.held, gate, now)
+    }
+
+    /// Forget the prompt from `fingerprint`, which was removed here: nothing
+    /// of a removed device is kept (#184).
+    pub(super) fn forget(&mut self, fingerprint: &str) {
+        self.held.remove(fingerprint);
     }
 
     /// Forget every prompt whose pairing window has closed since it was
@@ -99,16 +103,15 @@ impl PendingAttempts {
 }
 
 /// The held prompts a frontend attaching at `now` is shown (#114): those the
-/// gate would still allow on screen, less any from a removed device.
+/// gate would still allow on screen.
 fn attempts_to_replay(
     pending: &HashMap<String, PendingAttempt>,
     gate: &PromptGate,
-    removed: impl Fn(&str) -> bool,
     now: Instant,
 ) -> Vec<(String, PendingAttempt)> {
     pending
         .iter()
-        .filter(|(fp, a)| gate.replayable(a.admitted, now) && !removed(fp))
+        .filter(|(_, a)| gate.replayable(a.admitted, now))
         .map(|(fp, a)| (fp.clone(), *a))
         .collect()
 }
@@ -117,7 +120,7 @@ fn attempts_to_replay(
 mod replay_on_attach {
     //! A frontend that attaches late is shown the prompts it missed, but only
     //! those the pairing window still allows (#114, #195).
-    use super::{PendingAttempt, attempts_to_replay};
+    use super::{PendingAttempt, PendingAttempts, attempts_to_replay};
     use crate::prompt_gate::PromptGate;
     use hops_ipc::AttemptOrigin;
     use std::collections::HashMap;
@@ -136,10 +139,9 @@ mod replay_on_attach {
     fn replayed(
         pending: &HashMap<String, PendingAttempt>,
         gate: &PromptGate,
-        removed: &str,
         now: Instant,
     ) -> Vec<String> {
-        let mut fps: Vec<String> = attempts_to_replay(pending, gate, |fp| fp == removed, now)
+        let mut fps: Vec<String> = attempts_to_replay(pending, gate, now)
             .into_iter()
             .map(|(fp, _)| fp)
             .collect();
@@ -153,18 +155,14 @@ mod replay_on_attach {
         let t0 = Instant::now();
         let mut gate = PromptGate::new();
         gate.open(t0);
-        let pending = HashMap::from([
-            ("aa".to_string(), held(t0 + S)),
-            ("dd".to_string(), held(t0 + S)),
-        ]);
+        let pending = HashMap::from([("aa".to_string(), held(t0 + S))]);
         assert_eq!(
-            replayed(&pending, &gate, "dd", t0 + 30 * S),
+            replayed(&pending, &gate, t0 + 30 * S),
             vec!["aa".to_string()],
-            "half a minute into the window, the live request must be replayed and \
-             the removed device's must not"
+            "half a minute into the window, the live request must be replayed"
         );
         assert_eq!(
-            replayed(&pending, &gate, "dd", t0 + PromptGate::WINDOW + 5 * S),
+            replayed(&pending, &gate, t0 + PromptGate::WINDOW + 5 * S),
             Vec::<String>::new(),
             "a request was replayed after the pairing window closed"
         );
@@ -174,10 +172,38 @@ mod replay_on_attach {
             ("yy".to_string(), held(t0 + 131 * S)),
         ]);
         assert_eq!(
-            replayed(&pending, &gate, "dd", t0 + 135 * S),
+            replayed(&pending, &gate, t0 + 135 * S),
             vec!["yy".to_string()],
             "add device reopened for one machine replayed another machine's \
              request from the window before"
+        );
+    }
+
+    /// A prompt from a device removed here is forgotten with it, and is
+    /// neither replayed nor approvable (#184).
+    #[test]
+    fn a_removed_devices_prompt_is_forgotten_with_it() {
+        let t0 = Instant::now();
+        let mut gate = PromptGate::new();
+        gate.open(t0);
+        let mut pending = PendingAttempts::default();
+        for fp in ["aa", "dd"] {
+            pending.hold(&gate, fp.to_string(), AttemptOrigin::Inbound, None, t0 + S);
+        }
+        pending.forget("dd");
+        let replayed: Vec<String> = pending
+            .replay(&gate, t0 + 30 * S)
+            .into_iter()
+            .map(|(fp, _)| fp)
+            .collect();
+        assert_eq!(
+            replayed,
+            vec!["aa".to_string()],
+            "the removed device's was kept"
+        );
+        assert!(
+            pending.take(&gate, "dd", t0 + 31 * S).is_none(),
+            "the removed device's prompt can still be approved"
         );
     }
 }

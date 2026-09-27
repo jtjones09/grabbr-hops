@@ -105,6 +105,12 @@ pub(crate) enum ListenEvent {
     Closed {
         addr: SocketAddr,
     },
+    /// The machine that proved `fingerprint` on a link it opened closed that
+    /// link as [`transport::REMOVED`]: it removed this machine (#184). Sent
+    /// before that link's [`ListenEvent::Closed`].
+    RemovedBy {
+        fingerprint: String,
+    },
 }
 
 /// Failed handshakes, summarised in the log rather than one line each.
@@ -589,6 +595,7 @@ impl LanMouseListener {
     pub(crate) fn revoker(&self) -> ConnRevoker {
         ConnRevoker {
             conns: self.conns.clone(),
+            trust: self.trust.clone(),
         }
     }
 
@@ -616,19 +623,24 @@ impl LanMouseListener {
 #[derive(Clone)]
 pub(crate) struct ConnRevoker {
     conns: Rc<AsyncMutex<Vec<ConnEntry>>>,
+    trust: Trust,
 }
 
 impl ConnRevoker {
     /// Close every live inbound session whose peer presented `fp`. Returns how
     /// many were cut. The read loop's own cleanup is idempotent, so removing the
     /// entries here does not race it.
+    ///
+    /// A peer this machine no longer holds any pairing with is told so as the
+    /// link closes ([`transport::REMOVED`], #184).
     pub(crate) async fn close_fingerprint(&self, fp: &str) -> usize {
+        let reason = transport::close_reason(&self.trust, fp, b"trust revoked");
         let mut conns = self.conns.lock().await;
         let mut closed = 0;
         conns.retain(|e| {
             if e.fingerprint == fp {
                 log::warn!("closing session with {} — trust revoked", e.addr);
-                e.conn.close(0u32.into(), b"trust revoked");
+                e.conn.close(0u32.into(), reason);
                 closed += 1;
                 false
             } else {
@@ -804,10 +816,14 @@ async fn admit(a: Admitted) {
         trust: trust.clone(),
         tx: clipboard_in,
     };
-    let _ = listen_tx.send(ListenEvent::Accept { addr, fingerprint });
+    let _ = listen_tx.send(ListenEvent::Accept {
+        addr,
+        fingerprint: fingerprint.clone(),
+    });
     spawn_local(read_loop(
         conns.clone(),
         addr,
+        fingerprint,
         conn,
         listen_tx.clone(),
         clipboard,
@@ -821,6 +837,7 @@ async fn admit(a: Admitted) {
 async fn read_loop(
     conns: Rc<AsyncMutex<Vec<ConnEntry>>>,
     addr: SocketAddr,
+    fingerprint: String,
     conn: Connection,
     listen_tx: Sender<ListenEvent>,
     clipboard: ClipboardInlet,
@@ -840,6 +857,7 @@ async fn read_loop(
             Ok(recv) => recv,
             Err(e) => {
                 log::info!("{addr}: no inbound stream: {e}");
+                told_removed(&conn, fingerprint, &listen_tx);
                 remove_conn(&conns, addr, &listen_tx).await;
                 return;
             }
@@ -872,6 +890,7 @@ async fn read_loop(
         }
     }
     log::info!("client disconnected {addr:?}");
+    told_removed(&conn, fingerprint, &listen_tx);
     // Close the connection so the spawned clipboard_accept_loop's accept_uni
     // errors and the loop (and this connection's remaining clones) are
     // released. Mirrors connect.rs::disconnect; without it a half-closed-but-
@@ -879,6 +898,19 @@ async fn read_loop(
     // holds the connection up) would leak the clipboard task and the connection.
     conn.close(0u32.into(), b"bye");
     remove_conn(&conns, addr, &listen_tx).await;
+}
+
+/// Say so when the machine at the other end of `conn`, which proved
+/// `fingerprint`, closed it because it removed this machine (#184). Read
+/// before this side closes it, which would otherwise be the reason recorded.
+fn told_removed(conn: &Connection, fingerprint: String, listen_tx: &Sender<ListenEvent>) {
+    if conn
+        .close_reason()
+        .is_some_and(|e| transport::closed_as_removed(&e))
+    {
+        log::info!("{fingerprint} closed its link: it removed this machine");
+        let _ = listen_tx.send(ListenEvent::RemovedBy { fingerprint });
+    }
 }
 
 #[cfg(test)]
@@ -1099,8 +1131,8 @@ mod tests {
                 "an trust peer must be admitted"
             );
 
-            // revoke — exactly what remove_authorized_key does to the shared map
-            trust.write().expect("lock").revoke(&client_fp);
+            // revoke — exactly what remove_authorized_key does to the shared store
+            trust.write().expect("lock").forget(&client_fp);
 
             assert!(
                 !dials_ok(&client_ep, addr).await,
@@ -1450,6 +1482,214 @@ mod failed_handshakes_are_summarised {
                 warned.len() <= 2,
                 "{DIALS} refused dials in a few seconds wrote {} warnings: {warned:#?}",
                 warned.len()
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod a_removed_machine_is_told {
+    //! Removing a device tells the machine at the other end (#184, #161).
+    //!
+    //! Connected, the link closes as `removed`, which only a machine that
+    //! holds no pairing with the other end sends. Not connected, the other
+    //! machine learns on its next dial: it is refused during the handshake as
+    //! `access_denied`, which a receiver sends only to a machine it holds no
+    //! record of, and every other refusal stays `handshake_failure`.
+    //!
+    //! The production listener and the production dialler, on loopback.
+    use super::*;
+    use crate::connect::DialRefusal;
+    use crate::test_harness::{Dialer, Machine, dialer, machine, run_local};
+    use crate::trust::{Caps, TrustStore};
+    use hops_ipc::Position;
+    use std::sync::RwLock;
+
+    const DEADLINE: Duration = Duration::from_secs(30);
+
+    fn store(me: &Machine, peers: &[(&Machine, Caps)]) -> Trust {
+        let mut store = TrustStore::new(&me.fingerprint, 0).expect("our fingerprint");
+        for (peer, caps) in peers {
+            store
+                .issue_confirmed(&peer.fingerprint, "peer", *caps)
+                .expect("issue");
+        }
+        Arc::new(RwLock::new(store))
+    }
+
+    async fn receiver(me: &Machine, trust: Trust) -> (LanMouseListener, u16) {
+        let (clipboard_tx, _clipboard) = local_channel::mpsc::channel();
+        // The clipboard queue is not what these tests watch; keeping its
+        // receiver would only hold the channel open.
+        std::mem::forget(_clipboard);
+        LanMouseListener::bind_loopback(me.identity.clone(), trust, clipboard_tx)
+            .await
+            .expect("a loopback listener")
+    }
+
+    /// Dial until the dialler reports a refusal, and return it.
+    async fn refusal_on_dial(d: &mut Dialer) -> DialRefusal {
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        loop {
+            let _ = d.conn.send(hops_proto::ProtoEvent::Ping, d.handle).await;
+            if let Ok(Some(r)) =
+                tokio::time::timeout(Duration::from_millis(200), d.notices.refusals.recv()).await
+            {
+                return r;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the dial was never refused"
+            );
+        }
+    }
+
+    /// Dial, and wait until the receiver has admitted the link.
+    async fn linked(d: &Dialer, listener: &mut LanMouseListener) {
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        loop {
+            let _ = d.conn.send(hops_proto::ProtoEvent::Ping, d.handle).await;
+            if let Ok(Some(ListenEvent::Accept { .. })) =
+                tokio::time::timeout(Duration::from_millis(200), listener.next()).await
+            {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the receiver never admitted the link"
+            );
+        }
+    }
+
+    // LEDGER R184-9 | class B | 1 return value: DialRefusal from the production dialler against the production listener
+    /// A dialler the receiver holds no record of, as after a removal there,
+    /// is refused as `access_denied`, and the dialler says so; a dialler the
+    /// receiver knows but does not let drive it is refused as before.
+    #[test]
+    fn a_dialler_the_receiver_forgot_is_told_it_was_removed() {
+        run_local(async {
+            let (rx, removed, one_way) = (machine(), machine(), machine());
+            let trust = store(&rx, &[(&one_way, Caps::OUTBOUND)]);
+            let (_listener, port) = receiver(&rx, trust).await;
+
+            let mut d = dialer(
+                &removed,
+                store(&removed, &[(&rx, Caps::OUTBOUND)]),
+                port,
+                Position::Left,
+            );
+            let refused = refusal_on_dial(&mut d).await;
+            assert!(
+                matches!(&refused, DialRefusal::Forgotten { fingerprint, .. }
+                    if *fingerprint == rx.fingerprint),
+                "a dialler the receiver holds no record of was not told it was \
+                 removed: {refused:?}"
+            );
+
+            let mut d = dialer(
+                &one_way,
+                store(&one_way, &[(&rx, Caps::OUTBOUND)]),
+                port,
+                Position::Left,
+            );
+            let refused = refusal_on_dial(&mut d).await;
+            assert!(
+                matches!(&refused, DialRefusal::RefusedByPeer { fingerprint, .. }
+                    if *fingerprint == rx.fingerprint),
+                "a dialler the receiver knows, paired the other way, was told it \
+                 was removed: {refused:?}"
+            );
+        });
+    }
+
+    // LEDGER R184-10 | class B | 1 return value: DialRefusal after ConnRevoker::close_fingerprint
+    /// The receiver removes a dialler whose link is up: the dialler is told,
+    /// by the link's close, which machine removed it.
+    #[test]
+    fn a_receiver_that_removes_a_connected_dialler_tells_it() {
+        run_local(async {
+            let (rx, tx) = (machine(), machine());
+            let trust = store(&rx, &[(&tx, Caps::INBOUND)]);
+            let (mut listener, port) = receiver(&rx, trust.clone()).await;
+            let mut d = dialer(
+                &tx,
+                store(&tx, &[(&rx, Caps::OUTBOUND)]),
+                port,
+                Position::Left,
+            );
+            linked(&d, &mut listener).await;
+
+            trust.write().expect("lock").forget(&tx.fingerprint);
+            assert_eq!(
+                listener.revoker().close_fingerprint(&tx.fingerprint).await,
+                1
+            );
+
+            let told = tokio::time::timeout(DEADLINE, d.notices.refusals.recv())
+                .await
+                .ok()
+                .flatten()
+                .expect("the dialler never heard why its link closed");
+            assert_eq!(
+                told,
+                DialRefusal::RemovedBy {
+                    handle: d.handle,
+                    fingerprint: rx.fingerprint.clone(),
+                },
+                "the dialler was not told the receiver removed it"
+            );
+        });
+    }
+
+    // LEDGER R184-11 | class B | 1 return value: ListenEvent after OutboundRevoker::close_fingerprint
+    /// The dialler removes a receiver whose link is up: the receiver is told,
+    /// by the link's close, which machine removed it. Closed for any other
+    /// reason, it is told nothing of the kind.
+    #[test]
+    fn a_dialler_that_removes_a_connected_receiver_tells_it() {
+        run_local(async {
+            let (rx, tx) = (machine(), machine());
+            let (mut listener, port) = receiver(&rx, store(&rx, &[(&tx, Caps::INBOUND)])).await;
+            let tx_trust = store(&tx, &[(&rx, Caps::OUTBOUND)]);
+
+            // Closed while still paired: the link ends, and says nothing of a
+            // removal.
+            let d = dialer(&tx, tx_trust.clone(), port, Position::Left);
+            linked(&d, &mut listener).await;
+            assert_eq!(d.conn.revoker().close_fingerprint(&rx.fingerprint).await, 1);
+            let mut heard = Vec::new();
+            loop {
+                match tokio::time::timeout(DEADLINE, listener.next()).await {
+                    Ok(Some(ListenEvent::Closed { .. })) => break,
+                    Ok(Some(ListenEvent::RemovedBy { fingerprint })) => heard.push(fingerprint),
+                    Ok(Some(_)) => {}
+                    _ => panic!("the receiver never saw the link close"),
+                }
+            }
+            assert!(
+                heard.is_empty(),
+                "a link closed while still paired was taken as a removal: {heard:?}"
+            );
+
+            // Removed: the receiver hears it, named by the link's proven
+            // identity, before the link's end.
+            let d = dialer(&tx, tx_trust.clone(), port, Position::Left);
+            linked(&d, &mut listener).await;
+            tx_trust.write().expect("lock").forget(&rx.fingerprint);
+            assert_eq!(d.conn.revoker().close_fingerprint(&rx.fingerprint).await, 1);
+            let mut told = None;
+            loop {
+                match tokio::time::timeout(DEADLINE, listener.next()).await {
+                    Ok(Some(ListenEvent::Closed { .. })) => break,
+                    Ok(Some(ListenEvent::RemovedBy { fingerprint })) => told = Some(fingerprint),
+                    Ok(Some(_)) => {}
+                    _ => panic!("the receiver never saw the link close"),
+                }
+            }
+            assert_eq!(
+                told.as_deref(),
+                Some(tx.fingerprint.as_str()),
+                "the receiver was not told the dialler removed it"
             );
         });
     }

@@ -48,6 +48,33 @@ impl Daemon {
         tables: &str,
         emulation: input_emulation::Backend,
     ) -> Self {
+        Self::build(tag, tables, input_capture::Backend::Dummy, emulation).await
+    }
+
+    /// [`Daemon::start`], capturing from `capture`, such as a scripted
+    /// backend a test crosses with. This machine's own permissions are not
+    /// consulted.
+    pub(crate) async fn start_capturing(
+        tag: &str,
+        tables: &str,
+        capture: input_capture::Backend,
+        emulation: input_emulation::Backend,
+    ) -> Self {
+        let mut daemon = Self::build(tag, tables, capture, emulation).await;
+        daemon.service.permission_watch = crate::permission_watch::PermissionWatch::at_daemon_start(
+            Arc::new(|_| false),
+            Arc::new(|| false),
+            Duration::from_secs(3600),
+        );
+        daemon
+    }
+
+    async fn build(
+        tag: &str,
+        tables: &str,
+        capture: input_capture::Backend,
+        emulation: input_emulation::Backend,
+    ) -> Self {
         // Short, for a socket path in it (`sun_path`).
         let dir = PathBuf::from(format!("/tmp/h-ip-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -72,14 +99,9 @@ impl Daemon {
                 .expect("the scratch endpoint");
         let config = crate::config::Config::in_scratch(&config, &dir.join("hops.pem"))
             .expect("the scratch config");
-        let service = Service::with_backends(
-            config,
-            frontends,
-            Some(input_capture::Backend::Dummy),
-            Some(emulation),
-        )
-        .await
-        .expect("a daemon in the scratch directory");
+        let service = Service::with_backends(config, frontends, Some(capture), Some(emulation))
+            .await
+            .expect("a daemon in the scratch directory");
         Self {
             service,
             scratch: Scratch { dir },

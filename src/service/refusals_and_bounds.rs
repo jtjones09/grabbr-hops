@@ -156,52 +156,127 @@ impl Frontend {
     }
 }
 
-/// A crossing to a paired machine that refuses this one used to change
-/// nothing in the app: the link opened, closed, and only the log said why.
-/// The app is told, as an error, since the person here moved the pointer.
+/// Cross into the desk mac, whose store `fill` is given along with this
+/// machine's fingerprint, from a daemon holding a pairing with it, and
+/// return what the app was told: the first error
+/// naming it that `want` accepts, every error and activity line seen, the
+/// last state the device was shown in, and whether the daemon still holds
+/// its pairing.
+async fn cross_into(
+    tag: &str,
+    fill: impl FnOnce(&mut crate::trust::TrustStore, &str),
+    want: impl Fn(&str) -> bool,
+) -> (Option<String>, Vec<String>, serde_json::Value, bool) {
+    let desk = machine();
+    let (clip_tx, _clip_rx) = local_channel::mpsc::channel();
+    let script = Script::new();
+    // The desk mac's store is filled once this machine's fingerprint is
+    // known, which is once its daemon exists; the listener reads it live.
+    let shared = trust(&desk, &[], Caps::INBOUND);
+    let (_desk_listener, desk_port) =
+        LanMouseListener::bind_loopback(desk.identity.clone(), shared.clone(), clip_tx)
+            .await
+            .expect("the desk mac listens");
+    let (mut service, scratch) = daemon(
+        tag,
+        &format!(
+            "[authorized_fingerprints]\n\"{fp}\" = \"desk mac\"\n\n\
+             [[clients]]\nposition = \"left\"\nips = [\"127.0.0.1\"]\nport = {desk_port}\n\
+             activate_on_startup = true\nfingerprint = \"{fp}\"\n",
+            fp = desk.fingerprint
+        ),
+        &script,
+    )
+    .await;
+    fill(
+        &mut shared.write().expect("lock"),
+        &service.public_key_fingerprint,
+    );
+    let mut app = attached(&mut service, &scratch).await;
+
+    let crossing = async {
+        loop {
+            script.push(Position::Left, CaptureEvent::Begin);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    };
+    let mut seen = Vec::new();
+    let told = tokio::select! {
+        told = app.next_text("Error", &mut seen, |t| t.contains("desk mac") && want(t)) => told,
+        ended = service.run() => panic!("the daemon ended: {:?}", ended.err()),
+        _ = crossing => unreachable!(),
+        _ = tokio::time::sleep(DEADLINE) => None,
+    };
+    let shown = service
+        .client_manager
+        .get_client_states()
+        .first()
+        .map(|(_, _, state)| serde_json::to_value(state).expect("json"))
+        .unwrap_or_default();
+    let still_paired = service
+        .trust
+        .read()
+        .expect("lock")
+        .we_may_drive(&desk.fingerprint);
+    service.capture.terminate().await;
+    service.emulation.terminate().await;
+    service.resolver.terminate().await;
+    (told, seen, shown, still_paired)
+}
+
+/// A crossing into a paired machine that removed this one (#184): the desk
+/// mac holds no pairing with this machine, so it refuses the dial as
+/// `access_denied`. The app is told the desk mac no longer trusts this
+/// machine and to remove it, the device's card is marked so, and this
+/// machine keeps its side until someone removes it here.
 // LEDGER T2375 | class B | 2 bytes (IPC events) from the whole daemon in-process, crossing driven by scripted capture
 #[test]
-fn a_crossing_into_a_machine_that_refuses_this_one_says_so() {
+fn a_crossing_into_a_machine_that_removed_this_one_marks_its_card() {
     run_local(async {
-        // The desk mac holds no pairing with this machine, as after it
-        // removed this one.
-        let desk = machine();
-        let (clip_tx, _clip_rx) = local_channel::mpsc::channel();
-        let (_desk_listener, desk_port) = LanMouseListener::bind_loopback(
-            desk.identity.clone(),
-            trust(&desk, &[], Caps::INBOUND),
-            clip_tx,
-        )
-        .await
-        .expect("the desk mac listens");
-
-        let script = Script::new();
-        let (mut service, scratch) = daemon(
-            "cross",
-            &format!(
-                "[authorized_fingerprints]\n\"{fp}\" = \"desk mac\"\n\n\
-                 [[clients]]\nposition = \"left\"\nips = [\"127.0.0.1\"]\nport = {desk_port}\n\
-                 activate_on_startup = true\nfingerprint = \"{fp}\"\n",
-                fp = desk.fingerprint
-            ),
-            &script,
+        let (told, seen, shown, still_paired) = cross_into(
+            "removed",
+            |_, _| {},
+            |t| t.contains("no longer trusts this machine"),
         )
         .await;
-        let mut app = attached(&mut service, &scratch).await;
+        let told = told.unwrap_or_else(|| {
+            panic!(
+                "crossing into a machine that removed this one did not say it no longer \
+                 trusts this machine within {DEADLINE:?}; it was told: {seen:?}"
+            )
+        });
+        assert!(
+            told.contains("Remove desk mac here"),
+            "the notice does not say to remove it here: {told:?}"
+        );
+        assert_eq!(
+            shown.get("removed_by_peer"),
+            Some(&serde_json::json!(true)),
+            "the device's card is not marked: {shown}"
+        );
+        assert!(
+            still_paired,
+            "this machine removed its own pairing unasked; the card should ask"
+        );
+    });
+}
 
-        let crossing = async {
-            loop {
-                script.push(Position::Left, CaptureEvent::Begin);
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        };
-        let mut seen = Vec::new();
-        let told = tokio::select! {
-            told = app.next_text("Error", &mut seen, |t| t.contains("desk mac")) => told,
-            ended = service.run() => panic!("the daemon ended: {:?}", ended.err()),
-            _ = crossing => unreachable!(),
-            _ = tokio::time::sleep(DEADLINE) => None,
-        };
+/// A crossing into a paired machine that knows this one but does not let it
+/// drive, paired the other way only, is refused as it always was: that
+/// machine did not remove this one, and the card is not marked (#171).
+// LEDGER R184-12 | class B | 2 bytes (IPC events) from the whole daemon in-process, crossing driven by scripted capture
+#[test]
+fn a_crossing_into_a_machine_paired_the_other_way_says_it_refused() {
+    run_local(async {
+        let (told, seen, shown, _) = cross_into(
+            "oneway",
+            |desk, ours| {
+                desk.issue_confirmed(ours, "this machine", Caps::OUTBOUND)
+                    .expect("issue");
+            },
+            |t| t.contains("refused the connection"),
+        )
+        .await;
         let told = told.unwrap_or_else(|| {
             panic!(
                 "crossing into a machine that refuses this one told the app nothing \
@@ -209,13 +284,14 @@ fn a_crossing_into_a_machine_that_refuses_this_one_says_so() {
             )
         });
         assert!(
-            told.contains("refused the connection") && told.contains("open add device on desk mac"),
-            "the notice must say the desk mac refused the connection and how to pair \
-             again: {told:?}"
+            told.contains("open add device on desk mac"),
+            "the notice must say how to pair again: {told:?}"
         );
-        service.capture.terminate().await;
-        service.emulation.terminate().await;
-        service.resolver.terminate().await;
+        assert_ne!(
+            shown.get("removed_by_peer"),
+            Some(&serde_json::json!(true)),
+            "a machine that did not remove this one was shown as having removed it"
+        );
     });
 }
 
@@ -371,6 +447,114 @@ fn a_refusal_is_told_once_a_minute_and_as_activity_while_adding() {
         assert!(
             matches!(events.as_slice(), [FrontendEvent::Activity(t)] if t.starts_with("Waiting for")),
             "a refusal while adding must be one activity line and no error: {events:?}"
+        );
+
+        service.capture.terminate().await;
+        service.emulation.terminate().await;
+        service.resolver.terminate().await;
+    });
+}
+
+/// A refusal as a machine the receiver holds no pairing with marks the
+/// device's card only when this machine holds a pairing with that receiver
+/// and is not adding it (#184). While adding it, that machine may simply not
+/// have approved this one yet; a machine never paired with is refused as
+/// any other.
+// LEDGER R184-13 | class B | 6 struct state: the daemon's queue of events for the app, and the device's state
+#[test]
+fn only_a_paired_machine_refusing_this_one_outside_adding_marks_its_card() {
+    use crate::connect::DialRefusal;
+    use hops_ipc::FrontendEvent;
+    run_local(async {
+        let script = Script::new();
+        let (mut service, _scratch) = daemon("mark", "", &script).await;
+        let paired = machine().fingerprint;
+        service
+            .trust
+            .write()
+            .expect("lock")
+            .issue_confirmed(&paired, "desk mac", Caps::OUTBOUND)
+            .expect("issue");
+        let addr: std::net::SocketAddr = "192.0.2.7:4242".parse().expect("addr");
+        let told = |service: &mut Service| -> Vec<FrontendEvent> {
+            service.pending_frontend_events.drain(..).collect()
+        };
+        let marked = |service: &Service, handle| {
+            service
+                .client_manager
+                .get_state(handle)
+                .is_some_and(|(_, s)| s.removed_by_peer)
+        };
+        let _ = told(&mut service);
+
+        // Being added: an activity line, and no mark.
+        let adding = service.client_manager.add_client();
+        service.adding.insert(adding, std::time::Instant::now());
+        service.handle_dial_refusal(DialRefusal::Forgotten {
+            handle: adding,
+            fingerprint: paired.clone(),
+            addr,
+        });
+        let events = told(&mut service);
+        assert!(
+            matches!(events.as_slice(), [FrontendEvent::Activity(t)] if t.starts_with("Waiting for")),
+            "a refusal while adding must be one activity line and no error: {events:?}"
+        );
+        assert!(
+            !marked(&service, adding),
+            "a device being added was marked as removed by its machine"
+        );
+
+        // Never paired: refused as before, no mark.
+        let stranger = service.client_manager.add_client();
+        service.handle_dial_refusal(DialRefusal::Forgotten {
+            handle: stranger,
+            fingerprint: machine().fingerprint,
+            addr,
+        });
+        let events = told(&mut service);
+        assert!(
+            events.iter().any(
+                |e| matches!(e, FrontendEvent::Error(t) if t.contains("refused the connection"))
+            ),
+            "a machine never paired with was not refused as before: {events:?}"
+        );
+        assert!(
+            !marked(&service, stranger),
+            "a device never paired was marked as removed by its machine"
+        );
+
+        // Paired, and not being added: marked, said once, and still paired.
+        let desk = service.client_manager.add_client();
+        for _ in 0..3 {
+            service.handle_dial_refusal(DialRefusal::Forgotten {
+                handle: desk,
+                fingerprint: paired.clone(),
+                addr,
+            });
+        }
+        let events = told(&mut service);
+        let errors: Vec<&String> = events
+            .iter()
+            .filter_map(|e| match e {
+                FrontendEvent::Error(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            matches!(errors.as_slice(), [t] if t.contains("no longer trusts this machine")),
+            "three refusals by a machine that removed this one must say so once: {errors:?}"
+        );
+        assert!(marked(&service, desk), "the device's card is not marked");
+        assert!(
+            events.iter().any(
+                |e| matches!(e, FrontendEvent::State(h, _, s) if *h == desk && s.removed_by_peer)
+            ),
+            "the app was not shown the marked card: {events:?}"
+        );
+        assert!(
+            service.trust.read().expect("lock").we_may_drive(&paired),
+            "this machine removed its own pairing unasked"
         );
 
         service.capture.terminate().await;
