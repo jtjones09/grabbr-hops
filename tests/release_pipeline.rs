@@ -26,16 +26,19 @@ const BUILD: &str = "build";
 const ATTEST: &str = "attest";
 /// The artifact attest uploads and publish releases: every asset, attested.
 const RELEASE_ARTIFACT: &str = "release";
+#[cfg(unix)] // used only by the Unix-only `gates` module
 const SUMS: &str = "SHA256SUMS";
 const LICENSE: &str = "LICENSE";
 const NOTICES: &str = "THIRD-PARTY-NOTICES.txt";
 /// The section `cargo auditable` embeds a binary's dependency list in. Its
 /// name is in the binary on every platform hops ships: ELF, Mach-O and PE.
+#[cfg(unix)] // used only by the Unix-only `gates` module
 const AUDIT_SECTION: &str = ".dep-v0";
 
 /// Each archive, the binary in it, and every target that binary is compiled
 /// for. Each target has its own SBOM: the two macOS slices resolve different
 /// dependencies.
+#[cfg(unix)] // used only by the Unix-only `gates` module
 const ARCHIVES: [(&str, &str, &[&str]); 3] = [
     (
         "hops-linux-x86_64.tar.gz",
@@ -53,6 +56,7 @@ const ARCHIVES: [(&str, &str, &[&str]); 3] = [
         &["x86_64-pc-windows-msvc"],
     ),
 ];
+#[cfg(unix)] // used only by the Unix-only `gates` module
 const APPLE_TARGETS: [&str; 2] = ["aarch64-apple-darwin", "x86_64-apple-darwin"];
 
 // Step names, as the workflow spells them.
@@ -60,19 +64,23 @@ const TOOLS_STEP: &str = "Install the release tools";
 const NOTICES_STEP: &str = "Licence notices and SBOMs";
 const PACKAGE_UNIX: &str = "Package (Linux, macOS)";
 const PACKAGE_WINDOWS: &str = "Package (Windows)";
+#[cfg(unix)] // used only by the Unix-only `gates` module
 const UNPACK_STEP: &str = "Unpack the unsigned build";
 const ARCHIVE_GATE: &str = "every archive carries its licence, notices, SBOMs and audit data";
 const SUMS_STEP: &str = "SHA256SUMS";
 const PUBLISH_GATE: &str = "the release is exactly its assets, each as SHA256SUMS describes it";
 const NOTES_STEP: &str = "the release notes name every advisory the gate lets through";
+#[cfg(unix)] // used only by the Unix-only `gates` module
 const NOTES_CHECK: &str = "the release notes are present";
 
 /// The SBOM of one target, as the release names it.
+#[cfg(unix)] // used only by the Unix-only `gates` module
 fn sbom(target: &str) -> String {
     format!("hops-{target}.cdx.json")
 }
 
 /// Every asset a release publishes besides SHA256SUMS.
+#[cfg(unix)] // used only by the Unix-only `gates` module
 fn assets() -> Vec<String> {
     let mut out = vec![DMG.to_owned()];
     for (archive, _, targets) in ARCHIVES {
