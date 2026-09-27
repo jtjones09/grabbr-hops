@@ -228,6 +228,13 @@ mod a_grant_carries_only_the_direction_that_was_approved {
         let mut store = fresh();
         grant_for_attempt(&mut store, &peer, "knocked", Some(AttemptOrigin::Inbound))
             .expect("grant");
+        assert_eq!(
+            store.capabilities(&peer),
+            Caps::NONE,
+            "an approval alone grants nothing until both machines confirm the \
+             number (#167)"
+        );
+        store.confirm(&peer).expect("confirm");
         assert!(
             store.may_drive_us(&peer) && !store.we_may_drive(&peer),
             "an approved inbound knock must grant inbound and only inbound (#130)"
@@ -241,6 +248,7 @@ mod a_grant_carries_only_the_direction_that_was_approved {
             Some(AttemptOrigin::OutboundDial),
         )
         .expect("grant");
+        store.confirm(&peer).expect("confirm");
         assert!(
             store.we_may_drive(&peer) && !store.may_drive_us(&peer),
             "an approved outbound dial must grant outbound and only outbound (#130)"
@@ -272,7 +280,7 @@ mod a_grant_carries_only_the_direction_that_was_approved {
         // A receiver we confirmed our own dial reached: outbound only.
         let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
         store
-            .issue(&peer_fp, "a receiver", Caps::OUTBOUND)
+            .issue_confirmed(&peer_fp, "a receiver", Caps::OUTBOUND)
             .expect("issue an outbound-only lease");
         let trust = Arc::new(RwLock::new(store));
 
@@ -498,7 +506,8 @@ mod pairings_made_before_182_keep_the_clipboard_direction_their_lease_grants {
     }
 
     /// Paired on a build with the trust store: each machine approved the
-    /// other's prompt once, in the direction it was asked.
+    /// other's prompt once, in the direction it was asked, and both confirmed
+    /// the number.
     fn approved(driven: &Machine, driver: &Machine) -> (TrustStore, TrustStore) {
         let mut on_driven = TrustStore::new(&driven.fingerprint, 0).expect("ours");
         grant_for_attempt(
@@ -508,6 +517,7 @@ mod pairings_made_before_182_keep_the_clipboard_direction_their_lease_grants {
             Some(AttemptOrigin::Inbound),
         )
         .expect("grant");
+        on_driven.confirm(&driver.fingerprint).expect("confirm");
         let mut on_driver = TrustStore::new(&driver.fingerprint, 0).expect("ours");
         grant_for_attempt(
             &mut on_driver,
@@ -516,6 +526,7 @@ mod pairings_made_before_182_keep_the_clipboard_direction_their_lease_grants {
             Some(AttemptOrigin::OutboundDial),
         )
         .expect("grant");
+        on_driver.confirm(&driven.fingerprint).expect("confirm");
         (on_driven, on_driver)
     }
 
@@ -731,6 +742,9 @@ mod no_pairing_expires_until_renewal_exists {
             Some(AttemptOrigin::OutboundDial),
         )
         .expect("the grant door grants an approved outbound dial");
+        // and both machines confirmed the number (#167)
+        receiving.confirm(&peer_fp).expect("confirm");
+        sending.confirm(&peer_fp).expect("confirm");
 
         let mut refused = Vec::new();
 
@@ -800,6 +814,8 @@ mod no_pairing_expires_until_renewal_exists {
                         Some(AttemptOrigin::OutboundDial),
                     )
                     .expect("grant");
+                    receiving.confirm(&peer_fp).expect("confirm");
+                    sending.confirm(&peer_fp).expect("confirm");
                 }
                 Some(term) => {
                     receiving
@@ -1291,7 +1307,7 @@ mod an_expelled_fingerprint_is_never_re_authorised {
         let peer = fp32(0x77);
         let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
         store
-            .issue(&peer, "a machine", Caps::INBOUND)
+            .issue_confirmed(&peer, "a machine", Caps::INBOUND)
             .expect("issue");
         store.revoke(&peer);
         (store, ours, peer)
@@ -1316,7 +1332,7 @@ mod an_expelled_fingerprint_is_never_re_authorised {
             (
                 "issue",
                 Box::new(|s: &mut TrustStore| {
-                    let _ = s.issue(&fp32(0x77), "back please", Caps::KNOWN);
+                    let _ = s.issue_confirmed(&fp32(0x77), "back please", Caps::KNOWN);
                 }),
             ),
             (
@@ -1360,6 +1376,7 @@ mod an_expelled_fingerprint_is_never_re_authorised {
                         issued_at: 0,
                         expiry: Expiry::Never,
                         clipboard_chosen: false,
+                        confirmed: true,
                     });
                 }),
             ),
@@ -1414,7 +1431,7 @@ mod an_expelled_fingerprint_is_never_re_authorised {
     fn granting_to_a_removed_device_fails_loudly_rather_than_quietly() {
         use crate::trust::TrustError;
         let (mut store, _, peer) = expelled_store();
-        match store.issue(&peer, "back please", Caps::INBOUND) {
+        match store.issue_confirmed(&peer, "back please", Caps::INBOUND) {
             Err(TrustError::Expelled { fingerprint }) => assert_eq!(fingerprint, peer),
             other => panic!(
                 "granting to a removed device returned {other:?}. It must return \
@@ -1573,7 +1590,7 @@ mod an_expelled_fingerprint_is_never_re_authorised {
         let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
 
         store
-            .issue(&expelled, "removed", Caps::INBOUND)
+            .issue_confirmed(&expelled, "removed", Caps::INBOUND)
             .expect("issue");
         store.revoke(&expelled);
 
@@ -1647,7 +1664,7 @@ mod taking_trust_away_is_never_gated_the_way_giving_it_is {
         let peer = fp32(0xaa);
         let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
         store
-            .issue(&peer, "driving me right now", Caps::KNOWN)
+            .issue_confirmed(&peer, "driving me right now", Caps::KNOWN)
             .expect("issue");
 
         // No Result, no authority argument, no clock argument: `revoke` returns
@@ -1707,12 +1724,15 @@ mod taking_trust_away_is_never_gated_the_way_giving_it_is {
              against state only it holds."
         );
 
-        // The one arm that MUST consult the gate.
-        {
-            const GRANT: &str = "FrontendRequest::AuthorizeKey";
+        // The arms that MUST consult the gate: the grant, and the answer to a
+        // pairing's number, which is what makes an approval grant (#167).
+        for grant in [
+            "FrontendRequest::AuthorizeKey",
+            "FrontendRequest::ConfirmPairing",
+        ] {
             let at = dispatch
-                .find(GRANT)
-                .unwrap_or_else(|| panic!("{GRANT} must be dispatched; update this guard"));
+                .find(grant)
+                .unwrap_or_else(|| panic!("{grant} must be dispatched; update this guard"));
             let after = &dispatch[at..];
             let arm_end = after[1..]
                 .find("FrontendRequest::")
@@ -1720,16 +1740,22 @@ mod taking_trust_away_is_never_gated_the_way_giving_it_is {
                 .unwrap_or(after.len());
             assert!(
                 after[..arm_end].contains(gate),
-                "the AuthorizeKey arm no longer refuses while a peer is driving \
+                "the {grant} arm no longer refuses while a peer is driving \
                  this machine. On a KVM the pointer is not proof of local \
                  presence: the peer holding your keyboard can move the cursor \
                  onto the approval button and click it, manufacturing its own \
-                 consent. Granting trust is the one verb a remote peer can \
-                 usefully click for itself."
+                 consent. Granting trust, and confirming the number that makes \
+                 a grant take effect, are what a remote peer can usefully click \
+                 for itself."
             );
         }
 
-        for arm in ["RemoveAuthorizedKey", "Delete", "DisableClipboard"] {
+        for arm in [
+            "RemoveAuthorizedKey",
+            "Delete",
+            "DisableClipboard",
+            "CancelPairing",
+        ] {
             let at = dispatch
                 .find(&format!("FrontendRequest::{arm}"))
                 .unwrap_or_else(|| panic!("{arm} must be dispatched; update this guard"));
@@ -1779,7 +1805,7 @@ mod removing_a_device_takes_its_key_and_not_merely_its_address {
         let peer = fp32(0xcc);
         let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
         store
-            .issue(&peer, "the sold laptop", Caps::KNOWN)
+            .issue_confirmed(&peer, "the sold laptop", Caps::KNOWN)
             .expect("issue");
         assert!(store.may_drive_us(&peer), "precondition: it was trusted");
 
@@ -1935,6 +1961,13 @@ mod every_trust_mutation_happens_at_a_named_door {
         // Added with the clipboard off switch (#182, #187). It narrows only,
         // dropping the clipboard bits of one lease, and needs no authority.
         "fn disable_clipboard",
+        // Added with pick-the-number pairing (#11, #167). The one door that
+        // makes an approval grant: both machines confirmed the number. It
+        // cannot create a lease, only confirm one an approval here issued.
+        "fn settle_pairing",
+        // Drops a lease an approval here issued that was never confirmed:
+        // a wrong pick, a cancel, a close, or no number in time. Narrows only.
+        "fn forget_pairing",
     ];
 
     /// The needle a scan must actually find. If the store is renamed again,
@@ -2104,20 +2137,21 @@ mod discovery_can_fail_without_taking_anything_with_it {
 
 mod typing_an_address_still_pairs_a_device {
     //! **Decided 2026-09-01.** Typing a peer's address remains a working way to
-    //! pair a device, and no discovery or pairing-code work removes it or puts
-    //! a precondition in front of it.
+    //! pair a device, and no discovery work removes it or puts a precondition
+    //! in front of it.
     //!
     //! **Why, with the measurement.** The "easy" path measured harder than the
-    //! fallback: the pairing code is 228-415 characters and needs a text
-    //! channel between two machines that do not yet share a keyboard — which is
-    //! the thing being set up. Typing an address is 15 characters. User flows
-    //! are a fallback ladder, and the bottom rung is the one that always works.
+    //! fallback: the pairing code, since retired (#14), was 228-415 characters
+    //! and needed a text channel between two machines that do not yet share a
+    //! keyboard — which is the thing being set up. Typing an address is 15
+    //! characters. User flows are a fallback ladder, and the bottom rung is the
+    //! one that always works.
 
     use crate::client::ClientManager;
     use hops_ipc::Position;
 
     /// Calls the client model with nothing but a typed address — no discovery
-    /// result, no pairing code, no fingerprint known in advance — and checks a
+    /// result, no fingerprint known in advance — and checks a
     /// dialable client comes out the far side.
     #[test]
     fn a_client_can_be_created_from_a_typed_address_alone() {
@@ -2342,13 +2376,13 @@ mod the_wire_contract_is_frozen {
             // refuse the handshake is the protocol name.
             let server_trust = {
                 let mut s = crate::trust::TrustStore::new(&server_fp, 0).expect("ours");
-                s.issue(&client_fp, "peer", crate::trust::Caps::KNOWN)
+                s.issue_confirmed(&client_fp, "peer", crate::trust::Caps::KNOWN)
                     .expect("issue");
                 Arc::new(RwLock::new(s))
             };
             let client_trust = {
                 let mut s = crate::trust::TrustStore::new(&client_fp, 0).expect("ours");
-                s.issue(&server_fp, "peer", crate::trust::Caps::KNOWN)
+                s.issue_confirmed(&server_fp, "peer", crate::trust::Caps::KNOWN)
                     .expect("issue");
                 Arc::new(RwLock::new(s))
             };

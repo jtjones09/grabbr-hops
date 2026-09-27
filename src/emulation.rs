@@ -1382,7 +1382,7 @@ mod held_input_is_released {
             s.trust
                 .write()
                 .expect("trust lock")
-                .issue(&peer.fingerprint, "raw peer", Caps::INBOUND)
+                .issue_confirmed(&peer.fingerprint, "raw peer", Caps::INBOUND)
                 .expect("grant");
             let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().expect("loopback"))
                 .expect("endpoint");
@@ -2500,7 +2500,7 @@ mod held_input_is_released {
             s.trust
                 .write()
                 .expect("trust lock")
-                .issue(fingerprint, "peer", Caps::INBOUND)
+                .issue_confirmed(fingerprint, "peer", Caps::INBOUND)
                 .expect("grant again");
             let second = s.inject(button(BTN_RIGHT, 1)).await;
             assert_ne!(first, second, "precondition: a new handle");
@@ -2715,15 +2715,22 @@ mod a_pairing_approved_both_ways {
         }
     }
 
-    /// What the approval prompt does when the user says yes to `peer`.
+    /// What the approval prompt does when the user says yes to `peer`, and
+    /// the number is then confirmed on both machines if the pairing is new.
     fn approve(on: &Side, peer: &Side, origin: AttemptOrigin) {
+        let mut trust = on.trust.write().expect("trust lock");
         grant_for_attempt(
-            &mut on.trust.write().expect("trust lock"),
+            &mut trust,
             &peer.machine.fingerprint,
             "the other machine",
             Some(origin),
         )
         .expect("the approval grants");
+        if trust.is_pairing(&peer.machine.fingerprint) {
+            trust
+                .confirm(&peer.machine.fingerprint)
+                .expect("both machines confirmed the number");
+        }
     }
 
     /// `from` dials `to` and crosses onto it.

@@ -20,7 +20,7 @@ use tokio::sync::{Notify, mpsc};
 
 pub use hops_ipc::{
     AttemptOrigin, Build, ClientConfig, ClientHandle, ClientState, DiscoveredDevice, FrontendEvent,
-    FrontendRequest, PeerTrust, Position, RevokedEntry, Status, connect_async,
+    FrontendRequest, PairingCheck, PeerTrust, Position, RevokedEntry, Status, connect_async,
 };
 
 pub mod prefs;
@@ -87,10 +87,6 @@ pub struct AppModel {
     pub emulation: Status,
     /// This device's public-key fingerprint.
     pub fingerprint: Option<String>,
-    /// This device's own shareable pairing code (encoded), or `None` if it has no
-    /// shareable LAN address. Sent by the daemon on sync; the UI reveals it so the
-    /// user can hand it to another machine to pair across a subnet.
-    pub local_pairing_code: Option<String>,
     /// Trusted peer fingerprints -> description.
     pub authorized: HashMap<String, String>,
     /// Fingerprints the user deliberately revoked. Kept so a returning peer is
@@ -163,9 +159,49 @@ pub struct AppModel {
     /// [`PairingCard`], so another machine's request cannot replace the one on
     /// screen (#168).
     pub pairing_attempts: Vec<PairingAttempt>,
+    /// Pairings whose number a person here must now compare, oldest first
+    /// (#11, #167). Set on `PairingCheck`, cleared on `PairingEnded` or when
+    /// the daemon link drops.
+    pub pairing_checks: Vec<PairingCheckCard>,
     /// Maps a connected peer's socket address -> fingerprint, so the addr-only
     /// `IncomingDisconnected` event can be correlated back to a fingerprint.
     peer_addrs: HashMap<SocketAddr, String>,
+}
+
+/// A pairing whose number a person here must compare.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingCheckCard {
+    pub fingerprint: String,
+    /// Where the other machine is, when known.
+    pub addr: Option<SocketAddr>,
+    /// Show the number and confirm, or pick it from three.
+    pub check: PairingCheck,
+    /// The person here answered; waiting for the other machine.
+    pub answered: bool,
+}
+
+impl PairingCheckCard {
+    /// The request answering this card with `number` sends: the digits, as
+    /// shown with or without the space [`spaced_number`] puts in.
+    pub fn answer(&self, number: &str) -> FrontendRequest {
+        FrontendRequest::ConfirmPairing {
+            fingerprint: self.fingerprint.clone(),
+            number: number.chars().filter(|c| !c.is_whitespace()).collect(),
+        }
+    }
+
+    /// The request ending this card without pairing sends.
+    pub fn cancel(&self) -> FrontendRequest {
+        FrontendRequest::CancelPairing(self.fingerprint.clone())
+    }
+
+    /// Where the other machine is, in words, for the card's first line.
+    pub fn from(&self) -> String {
+        match self.addr {
+            Some(a) => format!("{} at {a}", short_fingerprint(&self.fingerprint)),
+            None => short_fingerprint(&self.fingerprint),
+        }
+    }
 }
 
 impl Device {
@@ -204,11 +240,52 @@ impl AppModel {
             FrontendEvent::CaptureStatus(s) => self.capture = s,
             FrontendEvent::EmulationStatus(s) => self.emulation = s,
             FrontendEvent::PublicKeyFingerprint(fp) => self.fingerprint = Some(fp),
-            FrontendEvent::PairingCode(code) => {
-                self.local_pairing_code = (!code.is_empty()).then_some(code);
-            }
             FrontendEvent::RevokedUpdated(map) => self.revoked = map,
-            FrontendEvent::TrustUpdated(map) => self.trust = map,
+            FrontendEvent::TrustUpdated(map) => {
+                self.trust = map;
+                // An approval here answers its request: the machine is now
+                // mid-pairing, and its number card takes over (#167).
+                let attempts = std::mem::take(&mut self.pairing_attempts);
+                self.pairing_attempts = attempts
+                    .into_iter()
+                    .filter(|a| !self.arrival_permitted(&a.fingerprint, Some(a.origin)))
+                    .collect();
+            }
+            FrontendEvent::PairingCheck {
+                fingerprint,
+                addr,
+                check,
+                answered,
+            } => {
+                let card = PairingCheckCard {
+                    fingerprint,
+                    addr,
+                    check,
+                    answered,
+                };
+                match self
+                    .pairing_checks
+                    .iter_mut()
+                    .find(|c| c.fingerprint == card.fingerprint)
+                {
+                    Some(held) => *held = card,
+                    None => {
+                        if self.pairing_checks.len() >= MAX_PAIRING_ATTEMPTS {
+                            self.pairing_checks.remove(0);
+                        }
+                        self.pairing_checks.push(card);
+                    }
+                }
+            }
+            FrontendEvent::PairingEnded {
+                fingerprint,
+                paired,
+            } => {
+                self.pairing_checks.retain(|c| c.fingerprint != fingerprint);
+                if paired {
+                    self.push_message(format!("paired with {}", short_fingerprint(&fingerprint)));
+                }
+            }
             FrontendEvent::AuthorizedUpdated(map) => {
                 self.authorized = map;
                 let attempts = std::mem::take(&mut self.pairing_attempts);
@@ -311,10 +388,27 @@ impl AppModel {
     /// peer, and the daemon raises an attempt from its own dial only after its
     /// trust store said it may not, so that attempt is never already answered.
     fn arrival_permitted(&self, fp: &str, origin: Option<AttemptOrigin>) -> bool {
+        // Approved here and mid-pairing, either way: the request was answered,
+        // and what is left is the number (#167).
+        if self.is_pairing(fp) {
+            return true;
+        }
         match origin {
             Some(AttemptOrigin::OutboundDial) => false,
             Some(AttemptOrigin::Inbound) | None => self.authorized.contains_key(fp),
         }
+    }
+
+    /// Whether `fp` was approved here and waits for the number to be
+    /// confirmed on both machines (#167).
+    pub fn is_pairing(&self, fp: &str) -> bool {
+        self.trust.get(fp).is_some_and(|t| t.pending)
+            || self.pairing_checks.iter().any(|c| c.fingerprint == fp)
+    }
+
+    /// The number card to put in front of the user: the oldest open check.
+    pub fn pairing_check(&self) -> Option<&PairingCheckCard> {
+        self.pairing_checks.first()
     }
 
     /// The pin of device `handle` as this model has it: the fingerprint a
@@ -472,6 +566,7 @@ impl AppModel {
         self.pending_pairing_addr = None;
         self.pending_pairing_since = None;
         self.pairing_attempts.clear();
+        self.pairing_checks.clear();
         self.pairing_open_until = None;
         self.discovered.clear();
         self.discovery_active = false;
@@ -742,6 +837,16 @@ impl Device {
     }
 }
 
+/// A pairing number as a person reads it: six digits in two groups of three,
+/// so "042917" is compared as "042 917", the same in every frontend.
+pub fn spaced_number(n: &str) -> String {
+    if n.len() == 6 && n.is_ascii() {
+        format!("{} {}", &n[..3], &n[3..])
+    } else {
+        n.to_string()
+    }
+}
+
 /// A compact, human-comparable rendering of a colon-separated fingerprint
 /// (first three groups, e.g. `1e:19:1b`) for use as a fallback label.
 fn short_fingerprint(fp: &str) -> String {
@@ -785,6 +890,8 @@ impl AppModel {
     pub fn clipboard(&self, fp: &str) -> Option<Clipboard> {
         self.trust
             .get(fp)
+            // mid-pairing: nothing is shared yet, and there is nothing to switch
+            .filter(|t| !t.pending)
             .map(|t| match (t.clipboard_from, t.clipboard_to) {
                 (false, false) => Clipboard::Off,
                 (true, false) => Clipboard::FromIt,
@@ -2355,5 +2462,99 @@ mod the_daemon_gone {
                 );
             })
             .await;
+    }
+}
+
+#[cfg(test)]
+mod pick_the_number {
+    //! The pairing cards across an approval (#11, #167): the approve card
+    //! gives way once the pairing waits for its number, and the number card
+    //! lives from the daemon's check until it says the check is over.
+
+    use super::*;
+
+    const FP: &str = "cd:cd:cd";
+
+    fn pending() -> FrontendEvent {
+        FrontendEvent::TrustUpdated(HashMap::from([(
+            FP.to_string(),
+            PeerTrust {
+                pending: true,
+                ..Default::default()
+            },
+        )]))
+    }
+
+    // LEDGER G-18 | class B | 1 return value: PairingCard::show after AppModel::apply
+    /// Approving a machine answers its request, in either direction: the
+    /// approve card goes once the pairing waits for its number, rather than
+    /// staying on screen until the request goes stale.
+    #[test]
+    fn an_approval_retires_its_card_once_the_pairing_waits_for_the_number() {
+        for origin in [AttemptOrigin::Inbound, AttemptOrigin::OutboundDial] {
+            let mut m = AppModel::default();
+            m.apply(FrontendEvent::ConnectionAttempt {
+                fingerprint: FP.into(),
+                origin,
+                addr: None,
+            });
+            let mut card = PairingCard::default();
+            let now = Instant::now();
+            assert!(card.show(&m, now, |_| false).is_some(), "precondition");
+            m.apply(pending());
+            assert!(
+                card.show(&m, now, |_| false).is_none(),
+                "the {origin:?} request is still asking to be approved after its \
+                 approval"
+            );
+            assert_eq!(
+                m.clipboard(FP),
+                None,
+                "a pairing that grants nothing offers a clipboard switch"
+            );
+        }
+    }
+
+    // LEDGER G-19 | class B | 6 struct state: AppModel::pairing_check after AppModel::apply
+    /// The number card shows the check the daemon sent, follows the answer
+    /// given here, and goes when the daemon says the check is over or the
+    /// daemon is gone.
+    #[test]
+    fn the_number_card_lives_from_its_check_to_its_end() {
+        let mut m = AppModel::default();
+        let check = |answered| FrontendEvent::PairingCheck {
+            fingerprint: FP.into(),
+            addr: None,
+            check: PairingCheck::Pick(vec!["1".into(), "2".into(), "3".into()]),
+            answered,
+        };
+        m.apply(check(false));
+        let card = m.pairing_check().expect("a number card");
+        assert_eq!(
+            card.check,
+            PairingCheck::Pick(vec!["1".into(), "2".into(), "3".into()])
+        );
+        assert_eq!(
+            card.answer("2"),
+            FrontendRequest::ConfirmPairing {
+                fingerprint: FP.into(),
+                number: "2".into()
+            }
+        );
+        m.apply(check(true));
+        assert_eq!(m.pairing_checks.len(), 1, "the answer made a second card");
+        assert!(m.pairing_check().is_some_and(|c| c.answered));
+        m.apply(FrontendEvent::PairingEnded {
+            fingerprint: FP.into(),
+            paired: true,
+        });
+        assert!(m.pairing_check().is_none(), "the card outlived its check");
+
+        m.apply(check(false));
+        m.daemon_gone();
+        assert!(
+            m.pairing_check().is_none(),
+            "a number card outlived the daemon that asked"
+        );
     }
 }

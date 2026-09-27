@@ -85,7 +85,7 @@ use crate::trust::{
     Caps, Denial, Expiry, Lease, Origin, TrustError, TrustStore, existing_pairing_clipboard,
 };
 
-use hops_ipc::pairing::canonical_fingerprint;
+use hops_ipc::identity::canonical_fingerprint;
 
 use crate::authority::{Authority, AuthorityError, SignatureAlg, verify};
 use crate::config::write_atomically;
@@ -258,7 +258,7 @@ pub struct LeaseRecord {
     /// verifiers compute, so this is the join key with everything else.
     pub fingerprint: String,
     /// Display name. Sanitised on every write; see
-    /// [`hops_ipc::pairing::sanitize_label`].
+    /// [`hops_ipc::identity::sanitize_label`].
     pub label: String,
     pub state: DiskState,
     pub origin: DiskOrigin,
@@ -425,8 +425,7 @@ struct SignatureBlock {
 // ---------------------------------------------------------------------------
 // hex
 //
-// Not base64: the root crate has no base64 dependency (only `hops-ipc` does),
-// and hex is already this project's on-disk encoding for key material — it is
+// Not base64: no crate here depends on base64, and hex is already this project's on-disk encoding for key material — it is
 // how `generate_fingerprint` renders a SHA-256. One convention, no new crate.
 // ---------------------------------------------------------------------------
 
@@ -1167,6 +1166,9 @@ pub fn rebuild(
                     // device away with no way back but pairing again (#183).
                     expiry: Expiry::Never,
                     clipboard_chosen: r.clipboard.is_some(),
+                    // Only a confirmed record reaches here: one that was not
+                    // is dropped above.
+                    confirmed: true,
                 };
                 if let Err(e) = store.admit(lease) {
                     refused.push(format!("{}: {e}", r.fingerprint));
@@ -1389,9 +1391,10 @@ pub fn records_of(store: &TrustStore) -> Vec<LeaseRecord> {
                 }),
                 revoked_at: None,
                 caps,
-                // Every lease this store holds is confirmed: one that was not
-                // is dropped when it loads, and nothing issues one yet.
-                confirmed: true,
+                // As it is. One not yet confirmed on both machines is written
+                // so, and dropped when the store next loads: the number it
+                // waits on dies with the connection it was compared on.
+                confirmed: l.confirmed,
                 clipboard,
             });
         }
@@ -2356,7 +2359,7 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
 
         let mut store = TrustStore::new(&ours(), now).expect("ours");
         store
-            .issue(A, "paired today", Caps::INBOUND)
+            .issue_confirmed(A, "paired today", Caps::INBOUND)
             .expect("issue");
         for (fp, label, age) in [
             (B, "400 days ago", 400 * DAY),
@@ -2373,6 +2376,7 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
                     issued_at: now - age,
                     expiry: Expiry::Never,
                     clipboard_chosen: false,
+                    confirmed: true,
                 })
                 .expect("admit");
         }
@@ -2434,6 +2438,9 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
 
         grant_for_attempt(&mut store, B, "desk mac", Some(AttemptOrigin::Inbound))
             .expect("the first approval grants");
+        store
+            .confirm(B)
+            .expect("both machines confirmed the number");
         grant_for_attempt(
             &mut store,
             B,
@@ -2564,10 +2571,10 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
         let (mut file, _) = TrustFile::open(&d, auth.clone()).expect("open");
         let mut store = TrustStore::new(&ours(), file.now()).expect("ours");
         store
-            .issue(A, "drives this machine", Caps::INBOUND)
+            .issue_confirmed(A, "drives this machine", Caps::INBOUND)
             .expect("issue");
         store
-            .issue(B, "driven from here", Caps::OUTBOUND)
+            .issue_confirmed(B, "driven from here", Caps::OUTBOUND)
             .expect("issue");
         for fp in [A, B] {
             assert_eq!(
@@ -2677,6 +2684,9 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
             let mut store = TrustStore::new(&ours(), file.now()).expect("ours");
             grant_for_attempt(&mut store, B, "desk mac", Some(AttemptOrigin::Inbound))
                 .expect("the first approval grants");
+            store
+                .confirm(B)
+                .expect("both machines confirmed the number");
             assert_eq!(
                 store.disable_clipboard(B),
                 Some(true),
@@ -2712,6 +2722,67 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
             }
             let _ = fs::remove_dir_all(&d);
         }
+    }
+
+    // LEDGER G-5 | class B | 4 file on disk + 1 return value: records_of, TrustFile::save, start
+    /// Approving the second direction of a confirmed pairing does not ask
+    /// for the number again, and the pairing is still confirmed after a
+    /// restart: it loads, both ways (#11, #166).
+    #[test]
+    fn a_grant_to_a_confirmed_pairing_stays_confirmed_across_a_restart() {
+        use crate::service::grant_for_attempt;
+        use hops_ipc::AttemptOrigin;
+
+        let d = tmpdir("confirmed-second-grant");
+        let auth = authority(&d);
+        let (mut file, _) = TrustFile::open(&d, auth.clone()).expect("open");
+        let mut store = TrustStore::new(&ours(), file.now()).expect("ours");
+        grant_for_attempt(&mut store, B, "desk mac", Some(AttemptOrigin::Inbound))
+            .expect("the first approval");
+        store
+            .confirm(B)
+            .expect("both machines confirmed the number");
+        grant_for_attempt(&mut store, B, "desk mac", Some(AttemptOrigin::OutboundDial))
+            .expect("the second approval");
+        assert!(
+            !store.is_pairing(B),
+            "a second direction asked for the number again"
+        );
+        file.save(&records_of(&store)).expect("save");
+        std::mem::drop(file);
+
+        let (_, reloaded) = start_in(&d, &auth);
+        assert!(
+            reloaded.may_drive_us(B) && reloaded.we_may_drive(B),
+            "after a restart the pairing holds {}; it was saved unconfirmed and \
+             dropped",
+            reloaded.capabilities(B)
+        );
+    }
+
+    // LEDGER G-5b | class B | 4 file on disk: records_of, TrustFile::save, start
+    /// An approval saved while its pairing waits for the number is written as
+    /// unconfirmed, so a restart drops it rather than loading it as trust: the
+    /// number it waited on died with the connection (#167, 2026-09-07).
+    #[test]
+    fn an_approval_saved_before_the_number_is_dropped_at_the_next_start() {
+        let d = tmpdir("approved-then-restart");
+        let auth = authority(&d);
+        let (mut file, _) = TrustFile::open(&d, auth.clone()).expect("open");
+        let mut store = TrustStore::new(&ours(), file.now()).expect("ours");
+        store
+            .issue(A, "desk mac", Caps::INBOUND)
+            .expect("the approval");
+        assert!(store.is_pairing(A), "precondition: waiting for the number");
+        file.save(&records_of(&store)).expect("save");
+        std::mem::drop(file);
+
+        let (_, reloaded) = start_in(&d, &auth);
+        assert!(
+            !reloaded.is_known(A),
+            "an approval nobody confirmed loaded after a restart as {}",
+            reloaded.capabilities(A)
+        );
     }
 
     /// A pairing interrupted before both machines confirmed it does not load,

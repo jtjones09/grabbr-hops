@@ -285,9 +285,9 @@ async fn write_one(entry: &mut TxStream, bytes: &[u8]) -> bool {
         return false;
     }
     // Never write to a connection that has not presented the token. `Sync`
-    // carries the entire trust store, this machine's own fingerprint and its
-    // pairing code; before this gate existed, a bare connect was enough to
-    // receive all of it.
+    // carries the entire trust store and this machine's own fingerprint;
+    // before this gate existed, a bare connect was enough to receive all of
+    // it.
     if !entry.state.authed.load(Ordering::Acquire) {
         return true;
     }

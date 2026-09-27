@@ -20,7 +20,9 @@ part of the **grabbr** suite · repo: **grabbr-hops** · a fork of
   (quinn + rustls). Peers are pinned by public-key fingerprint, so only machines
   you've explicitly paired can connect (see [Security](#security)).
 - **Explicit pairing** — a new machine shows up as a pairing request with its
-  fingerprint; you name it and approve it once, and the trust persists.
+  fingerprint; you approve it on both machines, then compare a six-digit number
+  (the machine you added from shows it, the other picks it from three), and the
+  trust persists.
 - **Three ways to drive it** — a native **GUI**, a **terminal UI** for SSH /
   keyboard-driven use, and a **system-tray** icon; all attach to the same
   background daemon.
@@ -85,11 +87,14 @@ cargo build --release --no-default-features --features "tui slint"
 ## Connect two machines
 
 1. Both machines are running hops now.
-2. On one, open the window (click the tray icon) → **+ add** the other machine:
-   its IP address and which screen edge it sits on (left/right/top/bottom).
-3. The first connection shows a **pairing request** with a fingerprint — name it
-   and hit **trust & name**. Just once per pair.
-4. Move your cursor off that edge — it hops over. Keyboard, scroll, and modifier
+2. On both, open **+ add**. On one, add the other machine: its IP address and
+   which screen edge it sits on (left/right/top/bottom).
+3. Each machine shows a **pairing request** with a fingerprint — name it and hit
+   **trust & name** on both.
+4. The machine you added from shows a six-digit number; the other asks which of
+   three numbers it sees. Pick it there and **confirm** here. A wrong pick ends
+   the attempt and nothing is trusted. Just once per pair.
+5. Move your cursor off that edge — it hops over. Keyboard, scroll, and modifier
    keys follow.
 
 ## Other ways to run it
@@ -141,7 +146,10 @@ usual.
 - **Identity:** each machine holds a self-signed keypair; peers are verified by
   the **fingerprint of the public key**, not by a CA. rustls' certificate check
   is delegated to fingerprint pinning, so a machine is trusted only after you
-  approve its fingerprint (trust on first use, with explicit consent).
+  approve its fingerprint on both machines and confirm the number both arrive
+  at, which is bound to that connection's TLS session (trust on first use,
+  with explicit consent). The number shows no machine in the middle; it does
+  not vouch for the machine you chose to add.
 - **No cloud, no accounts:** machines connect directly over your LAN. There is no
   relay and no telemetry.
 

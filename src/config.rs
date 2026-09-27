@@ -386,7 +386,7 @@ impl From<TomlClient> for ConfigClient {
         // reject a malformed value rather than letting it reach the pin
         let fingerprint = toml
             .fingerprint
-            .filter(|fp| hops_ipc::pairing::valid_fingerprint(fp));
+            .filter(|fp| hops_ipc::identity::valid_fingerprint(fp));
         Self {
             ips,
             hostname,

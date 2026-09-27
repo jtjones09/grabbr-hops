@@ -275,6 +275,24 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
         ui.set_pairing_seconds(seconds);
     }
 
+    // PREVIEW_CHECK=show|show-answered|pick|pick-answered shows the number
+    // card (#11, #167): the adding machine's number and confirm, or the three
+    // numbers the machine being added picks from, before and after answering.
+    if let Ok(check) = std::env::var("PREVIEW_CHECK") {
+        ui.set_pairing_fp("".into());
+        ui.set_notice("".into());
+        ui.set_check_fp("a4:f0:9c:2e:11:bd:77:0c:35:9a".into());
+        ui.set_check_from("a4:f0:9c at 192.0.2.7:4242".into());
+        ui.set_check_show(check.starts_with("show"));
+        ui.set_check_number("042 917".into());
+        ui.set_check_choices(ModelRc::new(VecModel::from(vec![
+            slint::SharedString::from("318 204"),
+            "042 917".into(),
+            "775 061".into(),
+        ])));
+        ui.set_check_answered(check.ends_with("answered"));
+    }
+
     match std::env::args().nth(5).as_deref() {
         Some("settings") => ui.set_show_settings(true),
         Some("add-device") => ui.set_show_add_device(true),

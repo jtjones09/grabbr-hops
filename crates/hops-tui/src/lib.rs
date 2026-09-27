@@ -38,9 +38,10 @@ use std::{
 
 use hops_frontend_core::{
     AppModel, ApprovalRefused, AttemptOrigin, ClientHandle, Clipboard, Device, DeviceSend,
-    FrontendClient, FrontendRequest, Launch, PairingAttempt, PairingCard, Position, Status,
-    TrustState,
+    FrontendClient, FrontendRequest, Launch, PairingAttempt, PairingCard, PairingCheck,
+    PairingCheckCard, Position, Status, TrustState,
     prefs::Frontend,
+    spaced_number,
     theme::{self, Rgb, Theme},
 };
 use hops_ipc::DEFAULT_PORT;
@@ -48,7 +49,7 @@ use ratatui::{
     Frame,
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
@@ -77,6 +78,27 @@ fn approve_prompt(card: &PairingCard, fp: String, now: Instant) -> Result<Input,
         buf: String::new(),
         granting: true,
     })
+}
+
+/// A key on the number card, as the request it sends (#11, #167): `y`
+/// confirms the number this machine shows, `1` to `3` pick one of the three
+/// the machine being added offers, and `n` or Esc ends the pairing ("none of
+/// these"). Once this machine answered only ending it is left. Any other key
+/// does nothing.
+fn check_key(card: &PairingCheckCard, code: KeyCode) -> Option<FrontendRequest> {
+    if matches!(code, KeyCode::Char('n') | KeyCode::Esc) {
+        return Some(card.cancel());
+    }
+    if card.answered {
+        return None;
+    }
+    match (&card.check, code) {
+        (PairingCheck::Show(number), KeyCode::Char('y')) => Some(card.answer(number)),
+        (PairingCheck::Pick(choices), KeyCode::Char(d @ '1'..='3')) => choices
+            .get(d as usize - '1' as usize)
+            .map(|number| card.answer(number)),
+        _ => None,
+    }
 }
 
 /// Active text-input edit, if any.
@@ -508,6 +530,11 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                             }
                             KeyCode::Char('n') | KeyCode::Esc => confirm = None,
                             _ => {}
+                        }
+                    } else if let Some(check) = model.pairing_check() {
+                        // ---- the number card: before any approval card ----
+                        if let Some(request) = check_key(check, k.code) {
+                            client.request(request);
                         }
                     } else if let Some(fp) = pairing.as_ref().map(|a| a.fingerprint.clone()) {
                         // ---- pairing-approval prompt ----
@@ -1193,8 +1220,13 @@ fn ui(
         chunks[2],
     );
 
-    // overlays (only when nothing else is capturing input): pairing takes priority
-    if let Some(attempt) = pairing {
+    // overlays (only when nothing else is capturing input): the number card
+    // first, then a pairing request
+    if let Some(check) = model.pairing_check() {
+        if input.is_none() && confirm.is_none() {
+            check_popup(f, check, theme);
+        }
+    } else if let Some(attempt) = pairing {
         if input.is_none() && confirm.is_none() {
             // The shown machine's own origin and address, not the latest
             // request's: they are different machines when two are waiting.
@@ -1408,6 +1440,103 @@ fn pairing_popup(
         };
         body.insert(1, Line::from(Span::styled(line, key)));
     }
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(body)
+            .wrap(Wrap { trim: false })
+            .style(base)
+            .block(block),
+        area,
+    );
+}
+
+/// Render the number card (#11, #167): on the machine adding the other, the
+/// number and a confirm; on the machine being added, three numbers to pick
+/// from. Nothing moves until both machines answered.
+fn check_popup(f: &mut Frame, card: &PairingCheckCard, theme: &Theme) {
+    let base = Style::default()
+        .bg(col(theme.background))
+        .fg(col(theme.foreground));
+    let accent = Style::default()
+        .fg(col(theme.accent))
+        .bg(col(theme.background));
+    let muted = Style::default()
+        .fg(col(theme.muted))
+        .bg(col(theme.background));
+    let number = base.add_modifier(Modifier::BOLD);
+    let show = matches!(card.check, PairingCheck::Show(_));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(accent)
+        .style(base)
+        .title(Span::styled(
+            if show {
+                " pairing · confirm the number "
+            } else {
+                " pairing · pick the number "
+            },
+            accent,
+        ));
+    let numbers = match &card.check {
+        PairingCheck::Show(n) => Line::from(Span::styled(spaced_number(n), number)),
+        PairingCheck::Pick(choices) => Line::from(
+            choices
+                .iter()
+                .enumerate()
+                .flat_map(|(i, n)| {
+                    [
+                        Span::styled(if i == 0 { "" } else { "    " }, base),
+                        Span::styled(format!("{}", i + 1), accent),
+                        Span::styled(format!(" {}", spaced_number(n)), number),
+                    ]
+                })
+                .collect::<Vec<_>>(),
+        ),
+    }
+    .centered();
+    let say = match (show, card.answered) {
+        (true, false) => {
+            "The other machine asks which of three numbers it sees. Once this one is picked \
+             there, confirm here."
+        }
+        (true, true) => "Confirmed here. Waiting for the other machine to pick it.",
+        (false, false) => {
+            "Which number does the other machine show? A wrong pick ends the pairing."
+        }
+        (false, true) => "Picked. Waiting for the other machine to confirm.",
+    };
+    let keys = match (show, card.answered) {
+        (_, true) => vec![Span::styled("n", accent), Span::styled(" cancel", muted)],
+        (true, false) => vec![
+            Span::styled("y", accent),
+            Span::styled(" confirm      ", muted),
+            Span::styled("n", accent),
+            Span::styled(" cancel", muted),
+        ],
+        (false, false) => vec![
+            Span::styled("1-3", accent),
+            Span::styled(" pick      ", muted),
+            Span::styled("n", accent),
+            Span::styled(" none of these", muted),
+        ],
+    };
+    let mut body = vec![Line::from(Span::styled(card.from(), muted)), Line::from("")];
+    // Once picked, the three are gone: there is nothing left to choose.
+    if show || !card.answered {
+        body.extend([numbers, Line::from("")]);
+    }
+    body.extend([
+        Line::from(Span::styled(say, base)),
+        Line::from(""),
+        Line::from(keys),
+    ]);
+    // As tall as what it says: the explanation wraps on a narrow terminal.
+    let inner = centered_rect(70, 0, f.area())
+        .width
+        .saturating_sub(2)
+        .max(1) as usize;
+    let wrapped = say.chars().count().div_ceil(inner).saturating_sub(1);
+    let area = centered_rect(70, (body.len() + wrapped + 2) as u16, f.area());
     f.render_widget(Clear, area);
     f.render_widget(
         Paragraph::new(body)
@@ -2353,6 +2482,7 @@ mod tests {
                     PeerTrust {
                         clipboard_from: true,
                         clipboard_to: false,
+                        pending: false,
                     },
                 ),
                 (LAPTOP.to_owned(), PeerTrust::default()),
@@ -2440,5 +2570,158 @@ mod tests {
             ),
             "c on a device whose clipboard is off must say so and ask nothing"
         );
+    }
+
+    /// A model with the number card for FP open in `check`, answered or not.
+    fn checking(check: PairingCheck, answered: bool) -> AppModel {
+        let mut model = AppModel::default();
+        model.connected = true;
+        model.apply(FrontendEvent::PairingCheck {
+            fingerprint: FP.into(),
+            addr: Some("192.0.2.7:4242".parse().expect("addr")),
+            check,
+            answered,
+        });
+        model
+    }
+
+    fn picking() -> PairingCheck {
+        PairingCheck::Pick(vec!["318204".into(), "042917".into(), "775061".into()])
+    }
+
+    /// The number card is drawn in each of its four states: the adding
+    /// machine's number with its confirm, the three numbers the machine being
+    /// added picks from, and each once answered here (#11, #167). It is drawn
+    /// over an approval card, which the number replaces.
+    // LEDGER G-20 | class B | 3 widget tree: ui() into a TestBackend
+    #[test]
+    fn the_number_card_shows_the_number_or_three_to_pick() {
+        let cases = [
+            ("show", PairingCheck::Show("042917".into()), false),
+            ("show-answered", PairingCheck::Show("042917".into()), true),
+            ("pick", picking(), false),
+            ("pick-answered", picking(), true),
+        ];
+        for (name, check, answered) in cases {
+            let mut model = checking(check, answered);
+            model.apply(FrontendEvent::ConnectionAttempt {
+                fingerprint: "ab:ab:ab".into(),
+                origin: AttemptOrigin::Inbound,
+                addr: None,
+            });
+            // Another machine's request is live too, so its approval card
+            // would be drawn if the number card did not come first.
+            let approval = PairingCard::default()
+                .show(&model, Instant::now(), |_| false)
+                .cloned();
+            assert!(approval.is_some(), "{name}: precondition: an approval card");
+            // at the width of a default terminal, where the card is narrowest
+            let devices = listable(&model);
+            let mut state = ListState::default();
+            let theme = theme::default_theme();
+            let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+            term.draw(|f| {
+                ui(
+                    f,
+                    &model,
+                    &devices,
+                    &mut state,
+                    None,
+                    None,
+                    approval.as_ref(),
+                    None,
+                    false,
+                    &theme,
+                )
+            })
+            .expect("draw");
+            let buf = term.backend().buffer().clone();
+            let out = (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if let Some(dir) = std::env::var_os("HOPS_TUI_RENDER_DIR") {
+                let path = std::path::Path::new(&dir).join(format!("tui-check-{name}.txt"));
+                let _ = std::fs::write(path, &out);
+            }
+            let show = name.starts_with("show");
+            let title = if show {
+                "pairing · confirm the number"
+            } else {
+                "pairing · pick the number"
+            };
+            assert!(out.contains(title), "{name}: no number card:\n{out}");
+            assert!(
+                !out.contains("pairing request"),
+                "{name}: the approval card is drawn over the number:\n{out}"
+            );
+            assert!(
+                out.contains("192.0.2.7:4242"),
+                "{name}: not said where from:\n{out}"
+            );
+            match (show, answered) {
+                (true, false) => assert!(
+                    out.contains("042 917") && out.contains("y confirm"),
+                    "{name}: the number or its confirm is missing:\n{out}"
+                ),
+                (false, false) => assert!(
+                    out.contains("1 318 204")
+                        && out.contains("2 042 917")
+                        && out.contains("3 775 061")
+                        && out.contains("none of these"),
+                    "{name}: the three numbers are not offered by key:\n{out}"
+                ),
+                (_, true) => assert!(
+                    out.contains("Waiting for the other machine")
+                        && !out.contains("y confirm")
+                        && !out.contains("1-3 pick"),
+                    "{name}: an answered card still asks:\n{out}"
+                ),
+            }
+        }
+    }
+
+    /// The keys on the number card send the answer the daemon compares: the
+    /// number shown for `y`, the picked one for `1` to `3`, a cancel for `n`
+    /// or Esc; nothing but a cancel once answered (#11).
+    // LEDGER G-21 | class B | 1 return value: check_key
+    #[test]
+    fn the_number_card_keys_answer_it() {
+        let answer = |n: &str| FrontendRequest::ConfirmPairing {
+            fingerprint: FP.into(),
+            number: n.into(),
+        };
+        let cancel = FrontendRequest::CancelPairing(FP.into());
+        let show = checking(PairingCheck::Show("042917".into()), false);
+        let card = show.pairing_check().expect("a card");
+        assert_eq!(check_key(card, KeyCode::Char('y')), Some(answer("042917")));
+        assert_eq!(check_key(card, KeyCode::Char('2')), None);
+        assert_eq!(check_key(card, KeyCode::Esc), Some(cancel.clone()));
+
+        let pick = checking(picking(), false);
+        let card = pick.pairing_check().expect("a card");
+        for (key, n) in [('1', "318204"), ('2', "042917"), ('3', "775061")] {
+            assert_eq!(
+                check_key(card, KeyCode::Char(key)),
+                Some(answer(n)),
+                "key {key}"
+            );
+        }
+        assert_eq!(check_key(card, KeyCode::Char('4')), None);
+        assert_eq!(
+            check_key(card, KeyCode::Char('y')),
+            None,
+            "y picked a number"
+        );
+        assert_eq!(check_key(card, KeyCode::Char('n')), Some(cancel.clone()));
+
+        let answered = checking(picking(), true);
+        let card = answered.pairing_check().expect("a card");
+        assert_eq!(check_key(card, KeyCode::Char('2')), None, "answered twice");
+        assert_eq!(check_key(card, KeyCode::Esc), Some(cancel));
     }
 }

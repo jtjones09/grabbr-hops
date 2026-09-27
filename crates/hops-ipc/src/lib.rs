@@ -19,9 +19,9 @@ use serde::{Deserialize, Serialize};
 
 mod connect;
 mod connect_async;
+pub mod identity;
 mod listen;
 mod ownership;
-pub mod pairing;
 pub mod token;
 
 pub use connect::{FrontendEventReader, FrontendRequestWriter, connect, connect_to};
@@ -29,7 +29,6 @@ pub use connect_async::{
     AsyncFrontendEventReader, AsyncFrontendRequestWriter, connect_async, connect_async_to,
 };
 pub use listen::{AsyncFrontendListener, PREAUTH_CONNECTIONS_MAX, PREAUTH_DEADLINE};
-pub use pairing::{PairingCode, PairingError};
 
 #[derive(Debug, Error)]
 pub enum ConnectionError {
@@ -281,7 +280,7 @@ pub struct ClientState {
     /// in it is revoked. It IS persisted (`[[clients]] fingerprint`) so the device
     /// join works from a cold start and the pin survives a restart — meaning a
     /// restart does NOT clear a bad pin, and the on-disk value is validated on
-    /// read (`hops_ipc::pairing::valid_fingerprint`). Also
+    /// read (`hops_ipc::identity::valid_fingerprint`). Also
     /// the join key a frontend uses to correlate this client with its
     /// `authorized_fingerprints` entry (byte-identical to the allowlist key).
     #[serde(default)]
@@ -340,9 +339,6 @@ pub enum FrontendEvent {
     TrustUpdated(HashMap<String, PeerTrust>),
     /// public key fingerprint of this device
     PublicKeyFingerprint(String),
-    /// this device's own pairing code (encoded, ready to share out-of-band), or
-    /// empty if no shareable LAN address is available. See `pairing::PairingCode`.
-    PairingCode(String),
     /// the set of deliberately-revoked fingerprints changed
     RevokedUpdated(HashMap<String, RevokedEntry>),
     /// new device connected
@@ -394,6 +390,22 @@ pub enum FrontendEvent {
     /// Pairing prompts may appear on this machine for this many more seconds.
     /// Zero means the window is closed (#195).
     PairingOpen { seconds: u32 },
+    /// Both machines approved a pairing, and a person must now compare the
+    /// number they arrived at (#11, #167). Sent again when this machine's
+    /// answer is given, and to a frontend that attaches while it is open.
+    PairingCheck {
+        fingerprint: String,
+        /// Where the other machine is, when known.
+        addr: Option<SocketAddr>,
+        check: PairingCheck,
+        /// The person here has confirmed, or picked the right number, and
+        /// this machine now waits for the other.
+        answered: bool,
+    },
+    /// The pairing check for `fingerprint` is over: both machines confirmed
+    /// (`paired`), or it ended and this machine kept nothing. Why it ended is
+    /// said in an `Error` beside it.
+    PairingEnded { fingerprint: String, paired: bool },
     /// The build this daemon runs. Sent first on every sync, before any
     /// state, so a frontend that sees state without it knows the daemon
     /// predates this event.
@@ -416,6 +428,22 @@ pub struct PeerTrust {
     pub clipboard_from: bool,
     /// This machine sends that machine its clipboard.
     pub clipboard_to: bool,
+    /// Approved here, and not yet confirmed on both machines, so it grants
+    /// nothing yet (#167). Absent from an older daemon, which has no such
+    /// state.
+    #[serde(default)]
+    pub pending: bool,
+}
+
+/// What a person compares to finish a pairing (#11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PairingCheck {
+    /// This machine added the other. Show this number; the other machine
+    /// asks which of three it sees, and this one confirms too.
+    Show(String),
+    /// This machine is being added. Which of these does the other machine
+    /// show? Only one is right, and a wrong pick ends the attempt.
+    Pick(Vec<String>),
 }
 
 /// Which build a program is: its package version and the commit it was built
@@ -545,6 +573,17 @@ pub enum FrontendRequest {
     /// peer drives this machine. There is deliberately no request that turns
     /// it back on: widening a pairing is not a frontend verb (#107).
     DisableClipboard(String),
+    /// Answer the pairing check for `fingerprint` (#11, #167): the number
+    /// this machine shows, to confirm it, or the one picked from three. The
+    /// daemon compares it with the number it arrived at; a different one ends
+    /// the attempt and keeps no pairing.
+    ///
+    /// Widens trust, so it is refused while a peer drives this machine, as an
+    /// approval is.
+    ConfirmPairing { fingerprint: String, number: String },
+    /// End the pairing check for `fingerprint` without pairing: "none of
+    /// these", or a cancel. Only takes away, so it is always honoured.
+    CancelPairing(String),
     /// Answered with [`FrontendEvent::Barrier`] carrying the same number once
     /// every request sent before it on this connection has been handled.
     ///

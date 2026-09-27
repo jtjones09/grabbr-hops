@@ -102,7 +102,15 @@ impl ServerCertVerifier for FpServerVerifier {
         _now: UnixTime,
     ) -> Result<ServerCertVerified, TlsError> {
         let fingerprint = fingerprint_of(end_entity);
-        let permitted = self.trust.read().expect("lock").we_may_drive(&fingerprint);
+        // Or a receiver this machine approved driving and has not yet
+        // compared a number with: far enough to compare it, and no further
+        // (#167). Only in this direction, so a machine that approved being
+        // driven by that receiver does not reach it this way.
+        let permitted = {
+            let trust = self.trust.read().expect("lock");
+            trust.we_may_drive(&fingerprint)
+                || trust.awaits(&fingerprint, crate::trust::Caps::I_MAY_DRIVE)
+        };
         *self.observed.lock().expect("lock") = Some(fingerprint);
         if permitted {
             Ok(ServerCertVerified::assertion())
@@ -206,7 +214,16 @@ impl ClientCertVerifier for FpClientVerifier {
         // we hold an outbound lease on — a receiver we confirmed our own dial
         // reached — gets nothing here. Nobody was asked whether it may drive
         // this machine.
-        if self.trust.read().expect("lock").may_drive_us(&fingerprint) {
+        //
+        // Or a sender this machine approved, whose number is not yet compared:
+        // admitted far enough to compare it, and in this direction only
+        // (#167). Nothing it sends is read until both machines confirm.
+        let permitted = {
+            let trust = self.trust.read().expect("lock");
+            trust.may_drive_us(&fingerprint)
+                || trust.awaits(&fingerprint, crate::trust::Caps::DRIVE_ME)
+        };
+        if permitted {
             Ok(ClientCertVerified::assertion())
         } else {
             // This connection's own slot, so the rejection reaches the accept
