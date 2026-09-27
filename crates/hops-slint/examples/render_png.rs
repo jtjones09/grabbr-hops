@@ -123,7 +123,14 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
     // flip to true to review the "we dialled this device" wording (#61)
     ui.set_pairing_from_our_dial(std::env::var_os("PREVIEW_OUR_DIAL").is_some());
     if std::env::var_os("PREVIEW_OUR_DIAL").is_some() {
-        ui.set_pairing_addr("10.0.0.5:4242".into());
+        ui.set_pairing_addr("192.0.2.7:4242".into());
+        // The words the poll loop sets, for the device this machine dialled
+        // (#93); PREVIEW_OUR_DIAL=unknown for a dial that matches no device.
+        let dialled = match std::env::var("PREVIEW_OUR_DIAL").as_deref() {
+            Ok("unknown") => vec![],
+            _ => vec!["desk mac (desk-mac.local:4242)".to_string()],
+        };
+        ui.set_pairing_dialled(hops_frontend_core::our_dial_words(&dialled).into());
     }
     // PREVIEW_KNOCK_ADDR=1: an inbound request with the address it came from
     // (#83), and a name typed into the card (#168).

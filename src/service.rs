@@ -1002,10 +1002,7 @@ impl Service {
                 self.save_config();
             }
             FrontendRequest::ChangePort(port) => self.change_port(port),
-            FrontendRequest::Create => {
-                self.add_client();
-                self.save_config();
-            }
+            FrontendRequest::Create(device) => self.add_device(device),
             FrontendRequest::Delete {
                 handle,
                 fingerprint,
@@ -2761,11 +2758,42 @@ impl Service {
         self.notify_frontend(FrontendEvent::Enumerate(clients));
     }
 
-    fn add_client(&mut self) {
+    /// Add `device` whole, switched on and dialled, and save it; or, if it
+    /// cannot be dialled, add nothing and say why (#32).
+    ///
+    /// Its first announcement already carries its address, port and edge, so
+    /// no frontend ever shows it blank, and no follow-up request has to find
+    /// it by handle.
+    fn add_device(&mut self, device: hops_ipc::NewDevice) {
+        if let Some(why) = device.refusal() {
+            log::warn!("no device added: {why}");
+            self.notify_frontend(FrontendEvent::Error(format!("Nothing was added. {why}")));
+            return;
+        }
+        let hostname = device
+            .hostname
+            .map(|h| h.trim().to_owned())
+            .filter(|h| !h.is_empty());
         let handle = self.client_manager.add_client();
+        self.client_manager.set_config(
+            handle,
+            hops_ipc::ClientConfig {
+                hostname,
+                port: device.port,
+                pos: device.pos,
+                ..Default::default()
+            },
+        );
+        self.client_manager.set_fix_ips(handle, device.fix_ips);
         log::info!("added client {handle}");
-        let (c, s) = self.client_manager.get_state(handle).unwrap();
-        self.notify_frontend(FrontendEvent::Created(handle, c, s));
+        if let Some((c, s)) = self.client_manager.get_state(handle) {
+            self.notify_frontend(FrontendEvent::Created(handle, c, s));
+        }
+        // Adding a device tries it: an inert card that is never dialled
+        // looks the same as a broken one.
+        self.set_client_active(handle, true);
+        self.begin_adding(handle);
+        self.save_config();
     }
 
     fn set_client_active(&mut self, handle: ClientHandle, active: bool) {
@@ -3870,6 +3898,9 @@ mod refusals_and_bounds;
 
 #[cfg(all(test, unix))]
 mod removal_reaches_the_other_machine;
+
+#[cfg(all(test, unix))]
+mod adding_a_device;
 
 /// The whole daemon in this process, for a test that drives it the way a
 /// frontend and a peer do.

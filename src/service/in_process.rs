@@ -129,6 +129,11 @@ impl Daemon {
         PairingClock(self.service.pairing_skew.clone())
     }
 
+    /// The config file it reads and saves.
+    pub(crate) fn config_file(&self) -> PathBuf {
+        self.scratch.dir.join("config.toml")
+    }
+
     /// Where a frontend reaches it.
     pub(crate) fn ipc(&self) -> Ipc {
         Ipc {

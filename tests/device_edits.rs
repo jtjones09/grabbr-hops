@@ -595,21 +595,20 @@ fn a_machine_added_a_second_time_is_refused_and_the_user_is_told() {
     local(async {
         let (daemon, receiver, mut frontend, first) = connected("6").await;
         frontend.send(FrontendRequest::OpenPairing).await;
-        frontend.send(FrontendRequest::Create).await;
+        frontend
+            .send(FrontendRequest::Create(hops_ipc::NewDevice {
+                hostname: None,
+                fix_ips: vec!["127.0.0.1".parse().expect("ip")],
+                port: receiver.port,
+                pos: hops_ipc::Position::Right,
+            }))
+            .await;
         let again = frontend
             .next("the new device", |e| match e {
                 FrontendEvent::Created(h, ..) => Some(h),
                 _ => None,
             })
             .await;
-        for request in [
-            FrontendRequest::UpdateFixIps(again, vec!["127.0.0.1".parse().expect("ip")]),
-            FrontendRequest::UpdatePort(again, receiver.port),
-            FrontendRequest::UpdatePosition(again, hops_ipc::Position::Right),
-            FrontendRequest::Activate(again, true),
-        ] {
-            frontend.send(request).await;
-        }
 
         let told = frontend
             .next(

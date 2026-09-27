@@ -287,46 +287,6 @@ fn free_edge(model: &AppModel) -> Position {
     .unwrap_or(Position::Left)
 }
 
-/// A device the user asked to add: its address, port and edge, waiting for
-/// the handle the daemon assigns.
-type NewDevice = (String, u16, Position);
-
-/// Ask the daemon to create a device, and stage `device` for its handle.
-///
-/// `request` returns the connection that took the request, the model's
-/// `link`, or `None` when no daemon did. Then nothing is staged: a staged add
-/// with none in flight would claim whichever handle appears next, another
-/// device's.
-fn stage_add(
-    request: impl FnOnce(FrontendRequest) -> Option<u64>,
-    device: NewDevice,
-) -> Option<(u64, NewDevice)> {
-    request(FrontendRequest::Create).map(|link| (link, device))
-}
-
-/// The staged add and its handle, once `arrived` is a handle this frontend
-/// had not seen; left staged until then.
-///
-/// `link` is the connection the model now describes. An add staged on
-/// another one is dropped: that connection was lost, and the `Create` or any
-/// word of its handle with it, so the next handle to appear is another
-/// device's, and would be given this one's address, edge and a switch-on
-/// (#34).
-fn claim_add(
-    staged: &mut Option<(u64, NewDevice)>,
-    link: u64,
-    arrived: Option<ClientHandle>,
-) -> Option<(ClientHandle, NewDevice)> {
-    match (staged.take()?, arrived) {
-        ((on, _), _) if on != link => None,
-        ((_, device), Some(handle)) => Some((handle, device)),
-        (kept, None) => {
-            *staged = Some(kept);
-            None
-        }
-    }
-}
-
 /// Split a typed `host` / `host:port` into its parts.
 ///
 /// A bare IPv6 literal is all host and no port, so it is recognised *before*
@@ -428,35 +388,8 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
     let mut notice: Option<(String, Instant)> = opening;
     // The model's error sequence last put in the footer.
     let mut errors_seen: u64 = 0;
-    // A device the user just asked to create, awaiting the handle the daemon
-    // assigns: `Create` is fire-and-forget, and the handle only exists once the
-    // resulting `Created` event lands in a snapshot. Applied below as soon as a
-    // handle we have not seen before shows up. Without this, TUI "add" made a
-    // blank unnamed card with no address, no port and no edge — a device that
-    // could never connect and that the TUI had no way to finish configuring.
-    let mut pending_new: Option<(u64, NewDevice)> = None;
-    let mut known_handles: HashSet<ClientHandle> = HashSet::new();
-
     let result = loop {
         let model = client.snapshot();
-
-        // finish an add as soon as the daemon hands back a handle
-        let current: HashSet<ClientHandle> = model.clients.keys().copied().collect();
-        let arrived = current.difference(&known_handles).copied().next();
-        if let Some((h, (host, port, pos))) = claim_add(&mut pending_new, model.link, arrived) {
-            // Just created: never connected, so no pin.
-            client.request(FrontendRequest::UpdateHostname {
-                handle: h,
-                hostname: Some(host),
-                fingerprint: None,
-            });
-            client.request(FrontendRequest::UpdatePort(h, port));
-            client.request(FrontendRequest::UpdatePosition(h, pos));
-            // actually try the machine: an inert card that is never
-            // dialed looks identical to a broken one.
-            client.request(FrontendRequest::Activate(h, true));
-        }
-        known_handles = current;
 
         // A request refused with no daemon, or one the daemon never took, is
         // said here rather than only in the log (#34).
@@ -533,12 +466,19 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                         // ---- text-input mode ----
                         match k.code {
                             KeyCode::Enter => match input.take().expect("input set") {
-                                Input::Add { buf } => match parse_target(&buf) {
-                                    Ok((host, port)) => {
-                                        pending_new = stage_add(
-                                            |r| client.request_on(r),
-                                            (host, port, free_edge(&model)),
-                                        );
+                                // The whole device in one request (#32).
+                                Input::Add { buf } => match parse_target(&buf).and_then(
+                                    |(host, port)| {
+                                        hops_frontend_core::new_device(
+                                            &host,
+                                            Vec::new(),
+                                            port,
+                                            free_edge(&model),
+                                        )
+                                    },
+                                ) {
+                                    Ok(add) => {
+                                        client.request(add);
                                     }
                                     Err(msg) => {
                                         notice = Some((msg.to_string(), Instant::now()));
@@ -1294,6 +1234,7 @@ fn ui(
                 &attempt.fingerprint,
                 Some(attempt.origin),
                 attempt.addr,
+                &model.dialled(attempt),
                 answers,
                 theme,
             );
@@ -1427,17 +1368,36 @@ fn footer_line(
 }
 
 /// Render a centered approve/deny popup for an untrusted incoming peer.
+///
+/// `dialled` names the devices added here that this machine's own dial
+/// reached (#93): the card for that dial says which, so it reads against the
+/// device being added and never as a machine knocking.
 fn pairing_popup(
     f: &mut Frame,
     fp: &str,
     origin: Option<AttemptOrigin>,
     addr: Option<std::net::SocketAddr>,
+    dialled: &[String],
     answers: &PairingAnswers,
     theme: &Theme,
 ) {
     let ours = origin == Some(AttemptOrigin::OutboundDial);
-    // one extra row when there is an address line to render
-    let area = centered_rect(70, if addr.is_some() { 13 } else { 12 }, f.area());
+    let first = if ours {
+        // We went looking for it. Nobody knocked — do not imply they did.
+        hops_frontend_core::our_dial_words(dialled)
+    } else {
+        "An untrusted device asks to pair with this machine:".to_string()
+    };
+    // Room for the first line as it wraps, and one more row when there is an
+    // address line to render.
+    let inner = (f.area().width as usize * 70 / 100)
+        .saturating_sub(2)
+        .max(1);
+    let wrapped = u16::try_from(wrapped_rows(&first, inner)).unwrap_or(u16::MAX);
+    let rows = 11u16
+        .saturating_add(wrapped.max(1))
+        .saturating_add(u16::from(addr.is_some()));
+    let area = centered_rect(70, rows, f.area());
     let base = Style::default()
         .bg(col(theme.background))
         .fg(col(theme.foreground));
@@ -1465,15 +1425,7 @@ fn pairing_popup(
             warn,
         ));
     let mut body = vec![
-        Line::from(Span::styled(
-            if ours {
-                // We went looking for it. Nobody knocked — do not imply they did.
-                "This machine dialled out and found an untrusted device:"
-            } else {
-                "An untrusted device asks to pair with this machine:"
-            },
-            base,
-        )),
+        Line::from(Span::styled(first, base)),
         // Before the fingerprint, and brighter than it: the address is the only
         // part of this a human can check against what they typed (#93). The
         // fingerprint is opaque to them.
@@ -1542,6 +1494,31 @@ fn pairing_popup(
             .block(block),
         area,
     );
+}
+
+/// How many rows `text` takes wrapped at word boundaries to `width`
+/// columns, as the card's paragraph wraps it: a word that does not fit on
+/// the row starts the next one.
+fn wrapped_rows(text: &str, width: usize) -> usize {
+    let width = width.max(1);
+    let mut rows = 1;
+    let mut used = 0;
+    for word in text.split(' ') {
+        let len = word.chars().count();
+        let need = if used == 0 { len } else { used + 1 + len };
+        if used > 0 && need > width {
+            rows += 1;
+            used = len;
+        } else {
+            used = need;
+        }
+        // A word longer than the row is broken across rows.
+        while used > width {
+            rows += 1;
+            used -= width;
+        }
+    }
+    rows
 }
 
 /// Render the number card (#11, #167): on the machine adding the other, the
@@ -1723,71 +1700,6 @@ mod tests {
 
     const FP: &str = "1e:19:1b:2c:3d:4e:5f:60:71:82:93:a4:b5:c6:d7:e8";
     const OTHER_FP: &str = "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
-
-    // LEDGER T531 | class B | 1 return value + requests passed to stage_add's sender
-    /// An add no daemon took stages nothing: the first handles a daemon
-    /// reports later are the existing devices', and one of them would take
-    /// this address and edge.
-    #[test]
-    fn an_add_no_daemon_took_stages_nothing() {
-        let mut sent = Vec::new();
-        let staged = stage_add(
-            |r| {
-                sent.push(r);
-                None
-            },
-            ("desk-pc.local".into(), 4242, Position::Left),
-        );
-        assert!(
-            matches!(sent.as_slice(), [FrontendRequest::Create]),
-            "the add did not ask the daemon for a handle: {sent:?}"
-        );
-        assert_eq!(
-            staged, None,
-            "an add that never reached a daemon was left waiting for a handle"
-        );
-        assert_eq!(
-            stage_add(|_| Some(2), ("desk-pc.local".into(), 4242, Position::Left)),
-            Some((2, ("desk-pc.local".into(), 4242, Position::Left))),
-            "an add a daemon took must wait for its handle on that connection"
-        );
-    }
-
-    // LEDGER T532 | class B | 1 return value + 6 struct state: claim_add and its staged add
-    /// An add waits for its handle on the connection that took it, and is
-    /// dropped once that connection is lost (#34).
-    #[test]
-    fn an_add_is_claimed_once_and_only_on_its_connection() {
-        let add = || Some((0, ("desk-pc.local".to_string(), 4242, Position::Left)));
-
-        let mut staged = add();
-        assert_eq!(claim_add(&mut staged, 0, None), None);
-        assert_eq!(
-            staged,
-            add(),
-            "an add whose handle has not come yet was lost"
-        );
-        assert_eq!(
-            claim_add(&mut staged, 0, Some(7)),
-            Some((7, ("desk-pc.local".to_string(), 4242, Position::Left)))
-        );
-        assert_eq!(
-            staged, None,
-            "a claimed add would configure the next handle too"
-        );
-
-        let mut staged = add();
-        assert_eq!(
-            claim_add(&mut staged, 1, Some(7)),
-            None,
-            "an add staged before the daemon was lost gave its address, edge and \
-             a switch-on to the next handle to appear"
-        );
-        assert_eq!(
-            staged, None,
-            "an add from a lost connection stayed staged, to claim a later handle"
-        );
-    }
 
     // LEDGER T15 | class B | 6 struct state: the TUI's armed Confirm and Input after drop_stale
     /// An armed delete and an open rename go once their device changes, and
@@ -2184,6 +2096,79 @@ mod tests {
         assert!(
             !out.contains("10.0.0.9") && !out.contains("we dialled"),
             "the prompt described the other waiting machine:\n{out}"
+        );
+    }
+
+    /// The card this machine's own dial raised names the device it dialled,
+    /// as it was added here, beside the address that answered, so it cannot
+    /// read as a machine knocking; a knock names no device (#93).
+    // LEDGER T4 | class B | 3 render: ui() on a ratatui TestBackend
+    #[test]
+    fn our_dial_names_the_device_it_dialled_and_a_knock_names_none() {
+        let dialled: std::net::SocketAddr = "192.0.2.7:4242".parse().expect("addr");
+        let card = |origin: AttemptOrigin, addr: std::net::SocketAddr| {
+            let mut model = AppModel::default();
+            model.apply(FrontendEvent::Created(
+                3,
+                ClientConfig {
+                    hostname: Some("desk-mac.local".into()),
+                    ..Default::default()
+                },
+                ClientState {
+                    active: true,
+                    ips: [dialled.ip()].into(),
+                    ..Default::default()
+                },
+            ));
+            model.apply(FrontendEvent::ConnectionAttempt {
+                fingerprint: FP.into(),
+                origin,
+                addr: Some(addr),
+            });
+            let shown = PairingCard::default()
+                .show(&model, Instant::now(), |_| false)
+                .cloned()
+                .expect("a prompt");
+            let theme = theme::default_theme();
+            let mut term = Terminal::new(TestBackend::new(120, 30)).expect("test terminal");
+            term.draw(|f| {
+                ui(
+                    f,
+                    &model,
+                    &[],
+                    &mut ListState::default(),
+                    None,
+                    None,
+                    Some(&shown),
+                    &Default::default(),
+                    None,
+                    false,
+                    &theme,
+                )
+            })
+            .expect("draw");
+            let buf = term.backend().buffer().clone();
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let ours = card(AttemptOrigin::OutboundDial, dialled);
+        assert!(
+            ours.contains("desk-mac.local:4242") && ours.contains("192.0.2.7:4242 answered"),
+            "the card for this machine's own dial does not name the device it dialled:\n{ours}"
+        );
+        // The same address knocking from the same port is still a knock.
+        let knock = card(AttemptOrigin::Inbound, dialled);
+        assert!(
+            knock.contains("pairing request")
+                && !knock.contains("desk-mac.local")
+                && !knock.contains("dialled"),
+            "a machine knocking was described as a device this machine dialled:\n{knock}"
         );
     }
 

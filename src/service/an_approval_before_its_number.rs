@@ -390,7 +390,12 @@ fn a_removal_drops_an_approval_waiting_for_its_number() {
         let (mut service, scratch) = daemon("rmap").await;
         let peer = machine().fingerprint;
         service.handle_frontend_request(Some(Ok(FrontendRequest::OpenPairing)));
-        service.handle_frontend_request(Some(Ok(FrontendRequest::Create)));
+        service.handle_frontend_request(Some(Ok(FrontendRequest::Create(hops_ipc::NewDevice {
+            hostname: None,
+            fix_ips: vec![peer_addr().ip()],
+            port: peer_addr().port(),
+            pos: hops_ipc::Position::Right,
+        }))));
         let handle = sent(&mut service)
             .iter()
             .find_map(|e| match e {
@@ -398,13 +403,6 @@ fn a_removal_drops_an_approval_waiting_for_its_number() {
                 _ => None,
             })
             .expect("a device is created");
-        for request in [
-            FrontendRequest::UpdateFixIps(handle, vec![peer_addr().ip()]),
-            FrontendRequest::UpdatePort(handle, peer_addr().port()),
-            FrontendRequest::Activate(handle, true),
-        ] {
-            service.handle_frontend_request(Some(Ok(request)));
-        }
         assert!(
             service.adding.contains_key(&handle),
             "the add dial did not start"

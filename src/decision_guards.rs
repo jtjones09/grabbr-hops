@@ -2098,7 +2098,7 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
         match request {
             R::AuthorizeKey { .. } | R::EnableClipboard(_) | R::ConfirmPairing { .. } => true,
             R::Activate(..)
-            | R::Create
+            | R::Create(_)
             | R::ChangePort(_)
             | R::Delete { .. }
             | R::Enumerate()
@@ -2171,6 +2171,17 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
             },
             R::RemoveAuthorizedKey(super::fp32(0x5e)),
         ]
+    }
+
+    /// A device added here, pointed at `port` on loopback, where nothing
+    /// answers when `port` is the sweep's `nowhere`.
+    fn new_device(port: u16) -> hops_ipc::NewDevice {
+        hops_ipc::NewDevice {
+            hostname: None,
+            fix_ips: vec![std::net::IpAddr::from([127, 0, 0, 1])],
+            port,
+            pos: Position::Left,
+        }
     }
 
     /// What the daemon's store grants each machine it holds a pairing for.
@@ -2251,7 +2262,7 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
         let others = every_other_request(&fp, &fp, 0, 1, 2);
         let mut sent: BTreeSet<String> = others.iter().map(name).collect();
         sent.extend(widening.iter().map(name));
-        sent.insert(name(&R::Create));
+        sent.insert(name(&R::Create(new_device(1))));
         assert_eq!(
             sent,
             every_request_name(),
@@ -2423,7 +2434,7 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
                     let waiting_before = waiting(&trust);
 
                     // Everything else, aimed where a widening would show.
-                    let created = app.exchange(&[R::Create]).await;
+                    let created = app.exchange(&[R::Create(new_device(nowhere))]).await;
                     let added = created
                         .iter()
                         .find_map(|e| match e {

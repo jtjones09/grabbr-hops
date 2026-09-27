@@ -138,7 +138,18 @@ async fn add_device(
     port: u16,
 ) -> u64 {
     requests
-        .request(FrontendRequest::Create)
+        .request(FrontendRequest::Create(hops_ipc::NewDevice {
+            hostname: Some("127.0.0.1".into()),
+            // Pinned, so the address is known the moment the device is
+            // switched on and the first dial really reaches the receiver, as
+            // it does for a device picked from the network list.
+            fix_ips: vec!["127.0.0.1".parse().expect("ip")],
+            port,
+            // The dummy capture backend crosses at the left edge only, a
+            // thousand times a second. On the right, nothing ever crosses to
+            // this device.
+            pos: Position::Right,
+        }))
         .await
         .expect("create");
     let handle = loop {
@@ -148,23 +159,6 @@ async fn add_device(
             other => panic!("no Created event: {other:?}"),
         }
     };
-    for r in [
-        FrontendRequest::UpdateHostname {
-            handle,
-            hostname: Some("127.0.0.1".into()),
-            fingerprint: None,
-        },
-        // Pinned, so the address is known the moment the device is switched on
-        // and the first dial really reaches the receiver, as it does for a
-        // device picked from the network list.
-        FrontendRequest::UpdateFixIps(handle, vec!["127.0.0.1".parse().expect("ip")]),
-        FrontendRequest::UpdatePort(handle, port),
-        // The dummy capture backend crosses at the left edge only, a thousand
-        // times a second. On the right, nothing ever crosses to this device.
-        FrontendRequest::UpdatePosition(handle, Position::Right),
-    ] {
-        requests.request(r).await.expect("configure");
-    }
     handle
 }
 

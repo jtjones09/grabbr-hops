@@ -11,7 +11,7 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     rc::Rc,
     sync::{
         Arc,
@@ -80,6 +80,9 @@ struct PolledUi {
     /// The address that answered our dial, so the user can compare it with the
     /// one they typed (#93). Empty when unknown (every inbound attempt).
     pairing_addr: String,
+    /// What the card for our own dial says: which device added here it
+    /// dialled (#93). Empty for a knock.
+    pairing_dialled: String,
     free_position: String,
     /// Seconds left in the pairing window, 0 when closed (#195).
     pairing_seconds: i32,
@@ -259,6 +262,10 @@ fn polled_ui(m: &AppModel, shown: Option<&PairingAttempt>, now: Instant) -> Poll
         .unwrap_or_default();
     let pairing_from_our_dial =
         shown.is_some_and(|a| a.origin == hops_frontend_core::AttemptOrigin::OutboundDial);
+    let pairing_dialled = shown
+        .filter(|_| pairing_from_our_dial)
+        .map(|a| hops_frontend_core::our_dial_words(&m.dialled(a)))
+        .unwrap_or_default();
     let devices = device_rows(m);
     PolledUi {
         connected: m.connected,
@@ -305,6 +312,7 @@ fn polled_ui(m: &AppModel, shown: Option<&PairingAttempt>, now: Instant) -> Poll
             .collect(),
         pairing_from_our_dial,
         pairing_addr,
+        pairing_dialled,
         // the first edge nothing active is already using, so adding a
         // second device does not silently switch off the first
         free_position: ["left", "right", "top", "bottom"]
@@ -367,6 +375,7 @@ impl Repaint {
         ui.set_discovery_empty(snap.discovery_empty.as_str().into());
         ui.set_pairing_from_our_dial(snap.pairing_from_our_dial);
         ui.set_pairing_addr(snap.pairing_addr.as_str().into());
+        ui.set_pairing_dialled(snap.pairing_dialled.as_str().into());
         ui.set_pairing_seconds(snap.pairing_seconds);
         show_check(ui, &snap.check);
         // Every tick that changed, not only one with a new notice: the free
@@ -585,43 +594,32 @@ fn acquire_single_instance(show_requested: Arc<AtomicBool>) -> Instance {
     }
 }
 
-/// A device staged for creation, waiting for the daemon to hand back a handle:
-/// its name, port, screen edge, and the addresses to pin.
+/// The request "add" sends, from the add form's words or a machine picked off
+/// the network list: the whole device in one request (#32), or what to tell
+/// the person instead.
 ///
-/// Pinned addresses are empty for a hand-typed device (resolve the name) and
-/// populated for one picked off the network list, where mDNS already said
-/// exactly where it is.
-type PendingCreate = (String, u16, Position, Vec<std::net::IpAddr>);
-
-/// Stage a device to be created, and ask the daemon for a handle.
+/// Both ways to add a machine go through here. Each used to carry its own copy
+/// of a two-step sequence, a blank device and then its details once its handle
+/// came back, and the discovered one only ever did the first step.
 ///
-/// Both halves, always, together. There are two ways to add a machine — typing
-/// a hostname, and picking one off the network list — and each used to do this
-/// itself. The discovered path only ever did the first half: it stored the
-/// name, port, position and addresses, and never sent the request. The poll
-/// loop only acts once a NEW handle turns up in a daemon snapshot, so it waited
-/// for one that was never coming, and clicking "add" on a machine hops had
-/// found did nothing at all, silently, for as long as discovery has existed.
-///
-/// Taking the request as an argument is what makes that testable: the omission
-/// was invisible precisely because nothing could observe it.
-///
-/// `request` returns the connection that took the request, the model's
-/// `link`, or `None` when no daemon did. Then nothing is staged: a staged
-/// create with none in flight would claim the next handle to appear, which
-/// is another device's once a daemon answers. What is staged is kept with
-/// its connection, so [`claim_pending`] can drop it once that one is lost.
-fn stage_create(
-    pending: &RefCell<Option<(u64, PendingCreate)>>,
-    request: impl FnOnce(FrontendRequest) -> Option<u64>,
-    name: String,
-    port: u16,
+/// `port` is as typed: blank is the default port, and anything that is not a
+/// port from 1 to 65535 is refused rather than quietly replaced. `fix_ips`
+/// is empty for a typed device (its name is resolved) and holds the addresses
+/// a discovered machine announced.
+fn add_request(
+    name: &str,
+    port: &str,
     position: Position,
     fix_ips: Vec<std::net::IpAddr>,
-) {
-    let staged =
-        request(FrontendRequest::Create).map(|link| (link, (name, port, position, fix_ips)));
-    *pending.borrow_mut() = staged;
+) -> Result<FrontendRequest, &'static str> {
+    let port = match port.trim() {
+        "" => DEFAULT_PORT,
+        typed => typed.parse::<u16>().map_err(|_| {
+            "That port is not valid. Use a number from 1 to 65535, or leave it blank \
+             for the default."
+        })?,
+    };
+    hops_frontend_core::new_device(name, fix_ips, port, position)
 }
 
 /// Put `fingerprint`'s request on the pairing card.
@@ -704,55 +702,6 @@ fn readdress_request(handle: &str, pin: &str, address: &str) -> Option<FrontendR
         hostname: Some(address.to_string()),
         fingerprint: (!pin.is_empty()).then(|| pin.to_string()),
     })
-}
-
-/// Claim a pending "create device" once its handle appears, or leave it for the
-/// next tick.
-///
-/// The take and the put-back must never overlap, and keeping them in one
-/// function is the whole point of it existing. The call site used to read
-///
-/// ```ignore
-/// if let Some(v) = cell.borrow_mut().take() {
-///     match arrived {
-///         Some(h) => { /* use it */ }
-///         None => *cell.borrow_mut() = Some(v),   // panics
-///     }
-/// }
-/// ```
-///
-/// which panics with `RefCell already borrowed`. On edition 2021 a temporary in
-/// an `if let` scrutinee lives until the end of the whole block, so the borrow
-/// taken to call `.take()` is still held when the retry arm borrows again.
-///
-/// That arm is not an edge case — it runs every time a device is created and
-/// its handle has not yet reached a snapshot, which is the ordinary case on the
-/// tick right after "add". The window died there with no message, because a
-/// panic under `panic = "abort"` was the last thing the process wrote and
-/// nothing was reading its output.
-///
-/// `link` is the connection the model now describes. A create staged on
-/// another one is dropped, never claimed: its connection was lost, and with
-/// it the `Create`, or at least any word of its handle. Kept, it would give
-/// its name, edge and a switch-on to the next handle to appear, another
-/// device's (#34).
-fn claim_pending<T>(
-    cell: &RefCell<Option<(u64, T)>>,
-    link: u64,
-    arrived: Option<ClientHandle>,
-) -> Option<(ClientHandle, T)> {
-    // Ends at the semicolon, before anything else can borrow.
-    let taken = cell.borrow_mut().take();
-    match (arrived, taken) {
-        (_, Some((on, _))) if on != link => None,
-        (Some(handle), Some((_, value))) => Some((handle, value)),
-        // No handle yet — put it back and try again next tick.
-        (None, Some(value)) => {
-            *cell.borrow_mut() = Some(value);
-            None
-        }
-        (_, None) => None,
-    }
 }
 
 /// Run the Slint GUI front-end. Blocks on the Slint event loop until the user
@@ -1056,22 +1005,11 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
         });
     }
 
-    // A device the user just asked to create, awaiting the handle the daemon
-    // assigns (Create is fire-and-forget; the handle only appears once the
-    // resulting `Created` event reaches the next snapshot). Applied by the poll
-    // loop below as soon as a handle absent from `known_handles` shows up.
-    // name, port, position, and addresses to pin. The last is empty for a
-    // hand-typed device (resolve the name) and populated for one picked off the
-    // network list, where we already know exactly where it is and should not
-    // make DNS agree with mDNS before it will connect (#136).
-    let pending_new_device: Rc<RefCell<Option<(u64, PendingCreate)>>> = Rc::new(RefCell::new(None));
-    let known_handles: Rc<RefCell<HashSet<ClientHandle>>> = Rc::new(RefCell::new(HashSet::new()));
     {
         // Add a machine picked off the network list. Same create sequence as a
         // hand-typed device -- it still dials, and it still goes through the
         // ordinary approval prompt. Discovery supplies the address; it does not
         // supply trust (#136).
-        let pending = pending_new_device.clone();
         let notice = notice_sink.clone();
         let c = client.clone();
         ui.on_add_discovered(move |label, ips, port, position| {
@@ -1083,7 +1021,6 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
                 notice("That machine did not advertise an address hops can use.");
                 return;
             }
-            let port = port.trim().parse::<u16>().unwrap_or(DEFAULT_PORT);
             let position = Position::try_from(position.as_str()).unwrap_or_default();
             // Store the mDNS hostname, not the bare label. `desk-mac` does not
             // resolve; `desk-mac.local` does, through the OS name stack
@@ -1096,14 +1033,12 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
             // resolved ones on every reconnect, so a resolvable `.local` name
             // keeps working after every address it was added with has changed.
             let hostname = hops_frontend_core::discovered_hostname(&label);
-            stage_create(
-                &pending,
-                |r| c.request_on(r),
-                hostname,
-                port,
-                position,
-                addrs,
-            );
+            match add_request(&hostname, &port, position, addrs) {
+                Ok(add) => {
+                    c.request(add);
+                }
+                Err(why) => notice(why),
+            }
         });
     }
     {
@@ -1114,44 +1049,18 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
     }
     {
         let c = client.clone();
-        let pending = pending_new_device.clone();
         let notice = notice_sink.clone();
         ui.on_create_device(move |name, port, position| {
-            let name = name.trim().to_string();
-            // An empty name produced a permanent "unnamed device / unresolved"
-            // ghost card that could never connect — reachable by a stray
-            // double-click, since the primary button was always live.
-            if name.is_empty() {
-                notice("Enter the other machine's hostname or IP address.");
-                return;
-            }
-            // A port that does not parse was silently replaced with 4242, and the
-            // panel closed as if obeyed. Port 0 was accepted and could never
-            // connect. Say so instead of quietly substituting.
-            let port_raw = port.trim();
-            let port = if port_raw.is_empty() {
-                DEFAULT_PORT
-            } else {
-                match port_raw.parse::<u16>() {
-                    Ok(p) if p > 0 => p,
-                    _ => {
-                        notice(
-                            "That port is not valid. Use a number from 1 to 65535, \
-                             or leave it blank for the default.",
-                        );
-                        return;
-                    }
-                }
-            };
             let position = Position::try_from(position.as_str()).unwrap_or_default();
-            stage_create(
-                &pending,
-                |r| c.request_on(r),
-                name,
-                port,
-                position,
-                Vec::new(),
-            );
+            // The whole device, or a notice saying what is missing: an empty
+            // name once made a permanent "unnamed device" card, and a port
+            // that did not parse was quietly replaced with 4242.
+            match add_request(&name, &port, position, Vec::new()) {
+                Ok(add) => {
+                    c.request(add);
+                }
+                Err(why) => notice(why),
+            }
         });
     }
     {
@@ -1231,41 +1140,6 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
             }
 
             let m = client.snapshot();
-
-            // apply a pending create's name/port/position once its handle shows up
-            {
-                let current: HashSet<ClientHandle> = m.clients.keys().copied().collect();
-                let arrived = current.difference(&known_handles.borrow()).next().copied();
-                if let Some((new_handle, (name, port, position, fix_ips))) =
-                    claim_pending(&pending_new_device, m.link, arrived)
-                {
-                    if !name.is_empty() {
-                        // Just created: never connected, so no pin.
-                        client.request(FrontendRequest::UpdateHostname {
-                            handle: new_handle,
-                            hostname: Some(name),
-                            fingerprint: None,
-                        });
-                    }
-                    if !fix_ips.is_empty() {
-                        // Picked off the network list: pin what mDNS
-                        // told us rather than hoping the name resolves.
-                        client.request(FrontendRequest::UpdateFixIps(new_handle, fix_ips.clone()));
-                    }
-                    client.request(FrontendRequest::UpdatePort(new_handle, port));
-                    client.request(FrontendRequest::UpdatePosition(new_handle, position));
-                    // ACTUALLY try the machine. Previously "add device"
-                    // created an inert card: nothing was dialed, the other
-                    // machine showed nothing, and two unnamed steps stood
-                    // between "added" and "works" (find the unlabeled
-                    // toggle, then shove the cursor off that edge). The
-                    // form now opens on a free edge, so this cannot evict
-                    // another device, and a name that will not resolve
-                    // now reports itself.
-                    client.request(FrontendRequest::Activate(new_handle, true));
-                }
-                *known_handles.borrow_mut() = current;
-            }
 
             // An armed delete or an open rename names a device by handle and
             // the pin it had. Once that device is gone or pinned to another
@@ -1855,173 +1729,91 @@ mod tray_const_property {
 }
 
 #[cfg(test)]
-mod pending_create {
-    //! The tray died here, silently, every time a device was added.
-    //!
-    //! Adding a device stages a pending create and waits for its handle to show
-    //! up in a daemon snapshot. On the tick right after "add" it has not shown
-    //! up yet, so the retry path runs — and the retry path used to borrow a
-    //! `RefCell` that the enclosing `if let` was still holding, which panics.
-    //! Under `panic = "abort"` that was the last thing the process ever did.
+mod adding_a_device {
+    //! "add" sends the whole device in one request, typed or picked off the
+    //! network list (#32), and the card for the dial it starts names it (#93).
+    use super::*;
+    use hops_frontend_core::{
+        AppModel, AttemptOrigin, ClientConfig, ClientState, FrontendEvent, NewDevice,
+    };
 
-    use super::claim_pending;
-    use std::cell::RefCell;
-
+    // LEDGER T6 | class B | 1 return value: add_request, which both add callbacks send
     #[test]
-    fn a_handle_that_has_not_arrived_yet_leaves_the_create_in_place() {
-        let cell = RefCell::new(Some((0, ("mac", 4242u16))));
-
-        // This is the tick right after "add": the create was sent, no handle
-        // has reached a snapshot. It must not panic, and must not lose the
-        // create — losing it means the device is never configured or dialed.
-        let claimed = claim_pending(&cell, 0, None);
-
-        assert!(claimed.is_none(), "nothing to claim without a handle");
+    fn both_ways_to_add_send_the_whole_device_or_say_why() {
+        let ip: std::net::IpAddr = "192.0.2.7".parse().expect("ip");
         assert_eq!(
-            *cell.borrow(),
-            Some((0, ("mac", 4242))),
-            "the pending create must survive for the next tick. Taking it and \
-             failing to put it back loses the device silently; borrowing twice \
-             to put it back panics with `RefCell already borrowed`, which is \
-             what killed the window on every add."
-        );
-    }
-
-    #[test]
-    fn an_arrived_handle_claims_the_create_exactly_once() {
-        let cell = RefCell::new(Some((0, ("mac", 4242u16))));
-        let claimed = claim_pending(&cell, 0, Some(7));
-        assert_eq!(claimed, Some((7, ("mac", 4242))));
-        assert!(
-            cell.borrow().is_none(),
-            "a claimed create must be cleared, or the next tick configures the \
-             same device again"
-        );
-        assert!(
-            claim_pending(&cell, 0, Some(8)).is_none(),
-            "and there must be nothing left to claim"
-        );
-    }
-
-    #[test]
-    fn no_pending_create_is_not_an_error() {
-        let cell: RefCell<Option<(u64, (&str, u16))>> = RefCell::new(None);
-        assert!(claim_pending(&cell, 0, Some(7)).is_none());
-        assert!(claim_pending(&cell, 0, None).is_none());
-    }
-
-    /// The daemon connection that took the `Create` was lost before its
-    /// handle came back. The request was dropped with it, or its handle will
-    /// never be reported on this connection, so the next handle to appear is
-    /// another device's: one renumbered by the next daemon, or added from the
-    /// other frontend or the command line (#34).
-    // LEDGER T530 | class B | 1 return value + 6 struct state: claim_pending and its cell
-    #[test]
-    fn a_create_staged_on_a_lost_connection_claims_nothing() {
-        let cell = RefCell::new(Some((0, ("mac", 4242u16))));
-        assert_eq!(
-            claim_pending(&cell, 1, Some(7)),
-            None,
-            "a create staged before the daemon was lost gave its name, edge \
-             and a switch-on to the next handle to appear"
-        );
-        assert!(
-            cell.borrow().is_none(),
-            "a create from a lost connection stayed staged, to claim a later handle"
-        );
-    }
-}
-
-#[cfg(test)]
-mod staging_a_create {
-    //! Clicking "add" on a machine hops had found did nothing at all.
-    //!
-    //! Two ways to add a device, two copies of the same two-step sequence, and
-    //! the discovered one only ever did step one: it stored the details and
-    //! never asked the daemon for a handle. The poll loop waits for a new
-    //! handle to appear in a snapshot, so it waited forever — no error, no
-    //! panic, no log line, nothing on screen. It shipped that way with
-    //! discovery and stayed that way.
-
-    use super::{FrontendRequest, Position, stage_create};
-    use std::cell::RefCell;
-
-    // LEDGER T524 | class B | 6 struct state + requests passed to stage_create's sender
-    #[test]
-    fn staging_also_asks_the_daemon_for_a_handle() {
-        let pending = RefCell::new(None);
-        let sent: RefCell<Vec<FrontendRequest>> = RefCell::new(Vec::new());
-
-        stage_create(
-            &pending,
-            |r| {
-                sent.borrow_mut().push(r);
-                Some(0)
-            },
-            "desk-pc.local".into(),
-            4242,
-            Position::Left,
-            vec!["192.0.2.5".parse().unwrap()],
-        );
-
-        assert!(
-            pending.borrow().is_some(),
-            "the details must be staged for the poll loop to apply"
-        );
-        assert!(
-            sent.borrow()
-                .iter()
-                .any(|r| matches!(r, FrontendRequest::Create)),
-            "staging without asking is a wait for a handle that never comes. \
-             The poll loop only acts when a NEW handle appears in a snapshot, \
-             so a create that is never requested means the button does nothing \
-             at all — no error, no panic, nothing on screen."
-        );
-    }
-
-    // LEDGER T525 | class B | 6 struct state: stage_create's pending cell
-    #[test]
-    fn what_was_staged_is_what_was_given() {
-        let pending = RefCell::new(None);
-        let sent: RefCell<Vec<FrontendRequest>> = RefCell::new(Vec::new());
-        let ips: Vec<std::net::IpAddr> = vec!["192.0.2.5".parse().unwrap()];
-        stage_create(
-            &pending,
-            |r| {
-                sent.borrow_mut().push(r);
-                Some(3)
-            },
-            "host".into(),
-            9999,
-            Position::Right,
-            ips.clone(),
+            add_request("desk-mac.local", "", Position::Right, vec![]),
+            Ok(FrontendRequest::Create(NewDevice {
+                hostname: Some("desk-mac.local".into()),
+                fix_ips: vec![],
+                port: DEFAULT_PORT,
+                pos: Position::Right,
+            })),
+            "a typed device"
         );
         assert_eq!(
-            *pending.borrow(),
-            Some((3, ("host".to_string(), 9999u16, Position::Right, ips))),
-            "a discovered machine's pinned addresses are why it connects \
-             without DNS agreeing first — dropping them there would be silent"
+            add_request("desk-mac.local", " 4300 ", Position::Top, vec![ip]),
+            Ok(FrontendRequest::Create(NewDevice {
+                hostname: Some("desk-mac.local".into()),
+                fix_ips: vec![ip],
+                port: 4300,
+                pos: Position::Top,
+            })),
+            "a machine picked off the network list"
         );
+        for (name, port) in [
+            ("", ""),
+            ("desk-mac.local", "0"),
+            ("desk-mac.local", "70000"),
+        ] {
+            assert!(
+                add_request(name, port, Position::Left, vec![]).is_err(),
+                "{name:?} on port {port:?} would add a device that can never be dialled"
+            );
+        }
     }
-    /// With no daemon connected the create is refused, and nothing may wait
-    /// for a handle: the first handles a daemon reports later are the
-    /// existing devices', and one of them would take this name and edge.
-    // LEDGER T519 | class B | 6 struct state: stage_create's pending cell
+
+    // LEDGER T7 | class B | 6 struct state: polled_ui, the pairing-dialled property it sets
     #[test]
-    fn a_create_no_daemon_took_stages_nothing() {
-        let pending = RefCell::new(None);
-        stage_create(
-            &pending,
-            |_| None,
-            "host".into(),
-            4242,
-            Position::Left,
-            Vec::new(),
+    fn the_card_for_our_dial_names_the_device_and_a_knock_names_none() {
+        const FP: &str = "1e:19:1b:2c:3d:4e:5f:60:71:82:93:a4:b5:c6:d7:e8";
+        let answered: std::net::SocketAddr = "192.0.2.7:4242".parse().expect("addr");
+        let shown = |origin| {
+            let mut m = AppModel::default();
+            m.apply(FrontendEvent::Created(
+                2,
+                ClientConfig {
+                    hostname: Some("desk-mac.local".into()),
+                    ..Default::default()
+                },
+                ClientState {
+                    active: true,
+                    ips: [answered.ip()].into(),
+                    ..Default::default()
+                },
+            ));
+            m.apply(FrontendEvent::ConnectionAttempt {
+                fingerprint: FP.into(),
+                origin,
+                addr: Some(answered),
+            });
+            let now = Instant::now();
+            let attempt = hops_frontend_core::PairingCard::default()
+                .show(&m, now, |_| false)
+                .cloned();
+            polled_ui(&m, attempt.as_ref(), now)
+        };
+        let ours = shown(AttemptOrigin::OutboundDial);
+        assert!(
+            ours.pairing_from_our_dial && ours.pairing_dialled.contains("desk-mac.local:4242"),
+            "the card for this machine's own dial does not name the device: {:?}",
+            ours.pairing_dialled
         );
-        assert_eq!(
-            *pending.borrow(),
-            None,
-            "an add that never reached a daemon was left waiting for a handle"
+        let knock = shown(AttemptOrigin::Inbound);
+        assert!(
+            !knock.pairing_from_our_dial && knock.pairing_dialled.is_empty(),
+            "a knock was described as this machine's own dial: {:?}",
+            knock.pairing_dialled
         );
     }
 }

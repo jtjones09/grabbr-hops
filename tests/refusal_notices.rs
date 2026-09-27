@@ -274,22 +274,20 @@ async fn refusals_reach_the_app_as_errors_or_activity_and_a_stranger_prompts_onc
     // never an error.
     let desk = common::Identity::new();
     let desk_port = refusing_receiver(&desk);
-    app.request(FrontendRequest::Create).await;
-    let handle = app
-        .until(Duration::from_secs(10), |e| {
-            e.get("Created")?.get(0)?.as_u64()
-        })
-        .await
-        .expect("the new device is created") as hops_ipc::ClientHandle;
-    for request in [
-        FrontendRequest::UpdateFixIps(handle, vec!["127.0.0.1".parse().expect("ip")]),
-        FrontendRequest::UpdatePort(handle, desk_port),
-        FrontendRequest::UpdatePosition(handle, Position::Left),
-        FrontendRequest::OpenPairing,
-        FrontendRequest::Activate(handle, true),
-    ] {
-        app.request(request).await;
-    }
+    // Add device open first, as the app opens it before adding.
+    app.request(FrontendRequest::OpenPairing).await;
+    app.request(FrontendRequest::Create(hops_ipc::NewDevice {
+        hostname: None,
+        fix_ips: vec!["127.0.0.1".parse().expect("ip")],
+        port: desk_port,
+        pos: Position::Left,
+    }))
+    .await;
+    app.until(Duration::from_secs(10), |e| {
+        e.get("Created")?.get(0)?.as_u64()
+    })
+    .await
+    .expect("the new device is created");
     let desk_fp = desk.fingerprint();
     let prompted = app
         .until(Duration::from_secs(20), |e| {

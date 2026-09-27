@@ -275,28 +275,25 @@ where
 async fn pair(m: &mut Machines) -> Result<u64, String> {
     ask(&mut m.ra, FrontendRequest::OpenPairing).await;
     ask(&mut m.rb, FrontendRequest::OpenPairing).await;
-    ask(&mut m.ra, FrontendRequest::Create).await;
+    ask(
+        &mut m.ra,
+        FrontendRequest::Create(hops_ipc::NewDevice {
+            hostname: Some("127.0.0.1".into()),
+            fix_ips: vec!["127.0.0.1".parse().expect("ip")],
+            port: m.desk.port,
+            // The dummy capture backend crosses at the left edge only:
+            // nothing ever crosses to this device, so every dial here comes
+            // from adding it.
+            pos: Position::Right,
+        }),
+    )
+    .await;
     let handle = until(&mut m.fa, WITHIN, |e| match e {
         FrontendEvent::Created(handle, _, _) => Some(*handle),
         _ => None,
     })
     .await
     .ok_or("the laptop created no device")?;
-    for r in [
-        FrontendRequest::UpdateHostname {
-            handle,
-            hostname: Some("127.0.0.1".into()),
-            fingerprint: None,
-        },
-        FrontendRequest::UpdateFixIps(handle, vec!["127.0.0.1".parse().expect("ip")]),
-        FrontendRequest::UpdatePort(handle, m.desk.port),
-        // The dummy capture backend crosses at the left edge only: nothing
-        // ever crosses to this device, so every dial here comes from adding it.
-        FrontendRequest::UpdatePosition(handle, Position::Right),
-        FrontendRequest::Activate(handle, true),
-    ] {
-        ask(&mut m.ra, r).await;
-    }
     until(
         &mut m.fa,
         WITHIN,

@@ -9,7 +9,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     future::Future,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -20,8 +20,8 @@ use tokio::sync::{Notify, mpsc};
 
 pub use hops_ipc::{
     AttemptOrigin, Build, CaptureFault, CaptureState, ClientConfig, ClientHandle, ClientState,
-    Controller, CrossingRefusal, DiscoveredDevice, FrontendEvent, FrontendRequest, PairingCheck,
-    PeerTrust, Permission, Position, Status, connect_async,
+    Controller, CrossingRefusal, DiscoveredDevice, FrontendEvent, FrontendRequest, NewDevice,
+    PairingCheck, PeerTrust, Permission, Position, Status, connect_async,
 };
 
 pub mod connection;
@@ -411,6 +411,39 @@ impl AppModel {
         }
     }
 
+    /// The devices added here that `attempt` reached, when it is this
+    /// machine's own dial, each named as the person here knows it: its name,
+    /// and where it is dialled (#93). The card for that dial names them, so
+    /// it is read against a device being added, never as a machine knocking.
+    /// Empty for a knock, and for a dial that matches no device listed.
+    pub fn dialled(&self, attempt: &PairingAttempt) -> Vec<String> {
+        let Some(addr) = attempt
+            .addr
+            .filter(|_| attempt.origin == AttemptOrigin::OutboundDial)
+        else {
+            return Vec::new();
+        };
+        self.clients
+            .values()
+            .filter(|(c, s)| c.port == addr.port() && s.ips.contains(&addr.ip()))
+            .map(|(c, _)| {
+                let host = c
+                    .hostname
+                    .clone()
+                    .or_else(|| c.fix_ips.first().map(IpAddr::to_string))
+                    .unwrap_or_else(|| addr.ip().to_string());
+                let at = match host.parse::<IpAddr>() {
+                    Ok(ip) => SocketAddr::new(ip, c.port).to_string(),
+                    Err(_) => format!("{host}:{}", c.port),
+                };
+                match c.label.as_deref() {
+                    Some(label) if label != host => format!("{label} ({at})"),
+                    _ => at,
+                }
+            })
+            .collect()
+    }
+
     /// The pairing request to put in front of the user: the pending attempt,
     /// unless the direction it arrived in is already permitted. Freshness and
     /// the user's snooze are the front-end's.
@@ -775,6 +808,51 @@ pub fn approval_request(
         controller,
         clipboard,
     })
+}
+
+/// What the card for this machine's own dial says under its title (#61,
+/// #93), naming the devices [`AppModel::dialled`] found. A knock is never
+/// described with this: nobody here dialled it.
+pub fn our_dial_words(dialled: &[String]) -> String {
+    match dialled {
+        [] => "This machine dialled out, and the machine that answered is not paired \
+               with this one. Pair it only if you just added a device here; if you did \
+               not, deny it."
+            .to_string(),
+        [one] => format!(
+            "This machine dialled {one}, a device added here. The machine that \
+             answered is not paired with this one: pair it only if you are adding \
+             that device, and deny it if you are not."
+        ),
+        several => format!(
+            "This machine dialled {}, devices added here. The machine that answered \
+             is not paired with this one: pair it only if you are adding one of \
+             them, and deny it if you are not.",
+            several.join(" and ")
+        ),
+    }
+}
+
+/// The request adding a device sends (#32): the whole device, dialled at
+/// `hostname` or at `fix_ips`, on `port`, at `pos`, in one request; or, when
+/// it cannot be dialled, why, to say instead of sending anything.
+pub fn new_device(
+    hostname: &str,
+    fix_ips: Vec<IpAddr>,
+    port: u16,
+    pos: Position,
+) -> Result<FrontendRequest, &'static str> {
+    let hostname = hostname.trim();
+    let device = NewDevice {
+        hostname: (!hostname.is_empty()).then(|| hostname.to_string()),
+        fix_ips,
+        port,
+        pos,
+    };
+    match device.refusal() {
+        Some(why) => Err(why),
+        None => Ok(FrontendRequest::Create(device)),
+    }
 }
 
 /// Which pairing request the prompt shows, and whether an approval of it
@@ -1558,6 +1636,102 @@ mod pairing_card {
             "the machine that left the card was approved"
         );
         assert_eq!(card.approve(C, t1 + PairingCard::ARM_AFTER), Ok(()));
+    }
+}
+
+#[cfg(test)]
+mod adding_a_device {
+    //! Adding a device is one request carrying all of it (#32), and the card
+    //! for the dial it starts names it (#93).
+    use super::{
+        AppModel, AttemptOrigin, ClientConfig, ClientState, FrontendEvent, FrontendRequest,
+        NewDevice, PairingAttempt, Position, new_device, our_dial_words,
+    };
+    use std::net::{IpAddr, SocketAddr};
+    use std::time::Instant;
+
+    // LEDGER T3 | class B | 1 return value: new_device
+    /// What the add form says becomes one request holding the whole device,
+    /// or the reason it cannot be added; never a device with nowhere to dial.
+    #[test]
+    fn the_add_form_becomes_one_whole_request_or_a_reason() {
+        let ip: IpAddr = "192.0.2.7".parse().expect("ip");
+        assert_eq!(
+            new_device(" desk-mac.local ", vec![], 4300, Position::Top),
+            Ok(FrontendRequest::Create(NewDevice {
+                hostname: Some("desk-mac.local".into()),
+                fix_ips: vec![],
+                port: 4300,
+                pos: Position::Top,
+            }))
+        );
+        assert_eq!(
+            new_device("", vec![ip], 4242, Position::Right),
+            Ok(FrontendRequest::Create(NewDevice {
+                hostname: None,
+                fix_ips: vec![ip],
+                port: 4242,
+                pos: Position::Right,
+            })),
+            "a machine picked off the network list is added by its addresses"
+        );
+        for (hostname, ips, port) in [("  ", vec![], 4242), ("desk-mac.local", vec![], 0)] {
+            assert!(
+                new_device(hostname, ips, port, Position::Left).is_err(),
+                "{hostname:?} on port {port} would add a device that can never be dialled"
+            );
+        }
+    }
+
+    fn with_device(label: Option<&str>, hostname: &str, ip: IpAddr, port: u16) -> AppModel {
+        let mut m = AppModel::default();
+        m.apply(FrontendEvent::Created(
+            4,
+            ClientConfig {
+                label: label.map(str::to_owned),
+                hostname: Some(hostname.into()),
+                port,
+                ..Default::default()
+            },
+            ClientState {
+                active: true,
+                ips: [ip].into(),
+                ..Default::default()
+            },
+        ));
+        m
+    }
+
+    fn attempt(origin: AttemptOrigin, addr: SocketAddr) -> PairingAttempt {
+        PairingAttempt {
+            fingerprint: "AA:BB".into(),
+            origin,
+            addr: Some(addr),
+            since: Instant::now(),
+        }
+    }
+
+    // LEDGER T5 | class B | 1 return value: AppModel::dialled, our_dial_words
+    /// This machine's own dial is named by the device it dialled, as it was
+    /// added here; a knock from the very same address names no device.
+    #[test]
+    fn our_dial_is_named_by_the_device_it_dialled_and_a_knock_by_none() {
+        let answered: SocketAddr = "192.0.2.7:4242".parse().expect("addr");
+        let m = with_device(Some("desk mac"), "desk-mac.local", answered.ip(), 4242);
+        let named = m.dialled(&attempt(AttemptOrigin::OutboundDial, answered));
+        assert_eq!(named, vec!["desk mac (desk-mac.local:4242)".to_string()]);
+        assert!(our_dial_words(&named).contains("dialled desk mac (desk-mac.local:4242)"));
+        assert!(
+            m.dialled(&attempt(AttemptOrigin::Inbound, answered))
+                .is_empty(),
+            "a knock was named as a device this machine dialled"
+        );
+        let elsewhere: SocketAddr = "192.0.2.7:4300".parse().expect("addr");
+        assert!(
+            m.dialled(&attempt(AttemptOrigin::OutboundDial, elsewhere))
+                .is_empty(),
+            "a device on another port was named as the one that answered"
+        );
     }
 }
 
@@ -2687,7 +2861,10 @@ mod the_daemon_gone {
                 drop(first.received);
                 assert!(client.request(FrontendRequest::RemoveAuthorizedKey(FP.into())));
                 let add_on = client
-                    .request_on(FrontendRequest::Create)
+                    .request_on(
+                        super::new_device("desk-mac.local", vec![], 4242, Position::Right)
+                            .expect("a device that can be added"),
+                    )
                     .expect("a daemon is connected");
                 until(&client, "the loss is noticed", |m| !m.connected).await;
                 let gone = client.snapshot();
