@@ -120,11 +120,14 @@ fn hung_up(client: &mut UnixStream, wait: Duration) -> bool {
     if client.set_read_timeout(Some(wait)).is_err() {
         return true;
     }
+    // A refusal the daemon says before it hangs up is read past.
     let mut buf = [0u8; 64];
-    match client.read(&mut buf) {
-        Ok(0) => true,
-        Ok(_) => false,
-        Err(e) => !matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
+    loop {
+        match client.read(&mut buf) {
+            Ok(0) => return true,
+            Ok(_) => continue,
+            Err(e) => return !matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
+        }
     }
 }
 

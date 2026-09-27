@@ -886,9 +886,10 @@ impl DaemonEndpoint {
     /// frontend that closed before it proved anything, and drops it without
     /// logging a warning. A Unix socket whose queue of connections waiting to
     /// be accepted is full has a listener, and answers, as does a pipe whose
-    /// instances are all busy. A pipe this user may not open does not: the
-    /// daemon's own pipe admits this user, and a daemon started beside such
-    /// a pipe says what holds it.
+    /// instances are all busy. A pipe held by a process of another user does
+    /// not, whether or not it lets this user open it: only this user's
+    /// daemon counts, and a daemon started beside such a pipe says what
+    /// holds it.
     pub fn answers(&self) -> bool {
         match self {
             #[cfg(unix)]
@@ -1238,7 +1239,8 @@ async fn build_follows(
                 } else {
                     // Not a proof of the token. A daemon from before the
                     // token sends its state to anything that connects; an
-                    // answer made with another token says nothing.
+                    // answer made with another token says nothing, and so
+                    // does a daemon too busy to take the connection.
                     match build_in(&line) {
                         Some(Some(build)) => return Ok(Some(StatedBuild::Is(build))),
                         Some(None) => served = true,
@@ -1415,6 +1417,47 @@ mod serves_whatever_its_version {
         );
     }
 
+    /// A stand-in on a loopback port that reads the challenge, sends `lines`
+    /// without making the proof, and stays connected until the asker hangs
+    /// up.
+    fn unproven(lines: &'static [&'static str]) -> DaemonEndpoint {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        let endpoint = DaemonEndpoint::Tcp(listener.local_addr().expect("its address"));
+        std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = BufReader::new(stream.try_clone().expect("a second handle"));
+            let mut writer = stream;
+            let _ = std::io::BufRead::read_line(&mut reader, &mut String::new());
+            for line in lines {
+                let _ = writer.write_all(line.as_bytes());
+            }
+            let _ = reader.read_to_end(&mut Vec::new());
+        });
+        endpoint
+    }
+
+    /// What does not prove the token does not serve, whatever it sends
+    /// after: the front door would take it for the daemon it started.
+    // LEDGER T9626 | class B | bytes over a real socket + 2 return values
+    #[test]
+    fn an_endpoint_that_does_not_prove_the_token_does_not_serve() {
+        const FORGED: &str = "answer 0000000000000000000000000000000000000000000000000000000000000000 \
+                              1111111111111111111111111111111111111111111111111111111111111111\n";
+        const STATE: &str = "{\"Enumerate\":[]}\n";
+        let within = Duration::from_secs(2);
+        let forged = unproven(&[FORGED, STATE, STATE]).serves(TOKEN, within);
+        let state_at_once = unproven(&[STATE, STATE]).serves(TOKEN, within);
+        assert_eq!(
+            (forged, state_at_once),
+            (false, false),
+            "(a forged answer then state, state in place of an answer). An \
+             endpoint that cannot prove it holds the token was counted as a \
+             daemon serving frontends."
+        );
+    }
+
     // LEDGER T42 | class B | 1 return value + elapsed time over a real socket
     #[test]
     fn a_peer_that_never_ends_its_line_is_given_up_on_when_the_ask_is_due() {
@@ -1524,6 +1567,23 @@ mod asks_a_daemon_its_build {
         endpoint
     }
 
+    /// A daemon stand-in on a loopback port that reads the challenge and
+    /// then says nothing, staying connected until the asker hangs up: a
+    /// daemon that has bound its endpoint and is still starting.
+    fn challenged_then_silent() -> DaemonEndpoint {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        let endpoint = DaemonEndpoint::Tcp(listener.local_addr().expect("its address"));
+        std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = BufReader::new(stream);
+            let _ = reader.read_line(&mut String::new());
+            let _ = reader.read_to_end(&mut Vec::new());
+        });
+        endpoint
+    }
+
     const STATED: &str = "{\"DaemonBuild\":{\"version\":\"0.13.0\",\"commit\":\"abcd1234\"}}\n";
 
     fn stated() -> Option<StatedBuild> {
@@ -1563,17 +1623,20 @@ mod asks_a_daemon_its_build {
         let before_token = saying(false, &["{\"Enumerate\":[]}\n"]).build(None, within);
         let silent = saying(true, &[]).build(Some(TOKEN), within);
         let garbage = saying(true, &["not json\n"]).build(Some(TOKEN), within);
+        let unanswered = challenged_then_silent().build(Some(TOKEN), within);
         assert_eq!(
-            (with_token, before_token, silent, garbage),
+            (with_token, before_token, silent, garbage, unanswered),
             (
                 Some(StatedBuild::Unstated),
                 Some(StatedBuild::Unstated),
                 None,
+                None,
                 None
             ),
-            "(state and no build, state without a token, nothing, not JSON). \
-             Only a daemon that sends state and never says its build is one from \
-             before the statement; one that says nothing may be still starting."
+            "(state and no build, state without a token, nothing after the proof, \
+             not JSON, no answer to the challenge). Only a daemon that sends state \
+             and never says its build is one from before the statement; one that \
+             says nothing may be still starting, and read as older it is restarted."
         );
     }
 
@@ -1600,6 +1663,26 @@ mod asks_a_daemon_its_build {
             None,
             "a daemon whose answer did not prove the token was read as a build it \
              stated or as one that states none, which the app restarts"
+        );
+    }
+
+    /// A daemon too busy to take the connection has said nothing about its
+    /// build: read as one that states none, it would be restarted.
+    // LEDGER T9630 | class B | bytes over a real socket + 1 return value
+    #[test]
+    fn a_daemon_too_busy_to_take_the_ask_has_said_nothing() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        let endpoint = DaemonEndpoint::Tcp(listener.local_addr().expect("its address"));
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.write_all(crate::proof::BUSY_LINE.as_bytes());
+            }
+        });
+        assert_eq!(
+            endpoint.build(Some(TOKEN), Duration::from_secs(5)),
+            None,
+            "a daemon that said it was too busy to take the ask was read as a \
+             build it stated or as one that states none, which the app restarts"
         );
     }
 

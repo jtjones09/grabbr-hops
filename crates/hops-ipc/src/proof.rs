@@ -43,6 +43,9 @@ const CHALLENGE: &str = "challenge";
 const ANSWER: &str = "answer";
 /// The frontend's second line starts with this.
 const PROOF: &str = "proof";
+/// All a daemon says to a connection it will not take, because too many are
+/// part-way through the proof already.
+pub(crate) const BUSY_LINE: &str = "busy\n";
 
 /// What the daemon's MAC covers besides the nonces.
 const DAEMON_LABEL: &[u8] = b"hops-ipc/2 daemon\0";
@@ -94,14 +97,26 @@ where
         Ok::<_, io::Error>(line)
     };
     let line = match tokio::time::timeout(PROOF_WITHIN, asked).await {
+        // Slow is not shown to be an impostor: a daemon may be starting.
         Err(_) => {
-            return Err(ConnectionError::Unproven(format!(
-                "nothing answered its challenge within {} s",
-                PROOF_WITHIN.as_secs()
+            return Err(ConnectionError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "nothing at the hops daemon's endpoint answered the challenge within {} s",
+                    PROOF_WITHIN.as_secs()
+                ),
             )));
         }
         Ok(result) => result?,
     };
+    if line == BUSY_LINE.as_bytes() {
+        return Err(ConnectionError::Io(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "the hops daemon took no more connections: too many others are \
+             part-way through proving they hold the IPC token",
+        )));
+    }
+
     if line.is_empty() {
         return Err(ConnectionError::Unproven(
             "it closed the connection without answering, as a hops daemon from \
@@ -362,6 +377,40 @@ mod tests {
             a.rsplit('-').next(),
             gui.rsplit('-').next(),
             "the GUI's name must not give the pipe's away"
+        );
+    }
+
+    /// Something holding the endpoint that answers the challenge with more
+    /// than any answer and no end of line is refused once the frontend has
+    /// read as much as an answer may be. Reading on, a frontend would take
+    /// whatever it is sent for as long as it waits for an answer, on every
+    /// reconnect.
+    // LEDGER T9627 | class B | 1 return value of proof::prove_to_daemon + bytes it took over a duplex
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_frontend_reads_no_more_of_an_answer_than_one_may_be() {
+        const CHUNK: usize = 64;
+        let (frontend, endpoint) = tokio::io::duplex(CHUNK);
+        let flood = tokio::spawn(async move {
+            let (rx, mut tx) = tokio::io::split(endpoint);
+            let _ = tokio::io::BufReader::new(rx)
+                .read_line(&mut String::new())
+                .await;
+            let mut taken = 0usize;
+            while tx.write_all(&[b'a'; CHUNK]).await.is_ok() {
+                taken += CHUNK;
+            }
+            taken
+        });
+        let (rx, mut tx) = tokio::io::split(frontend);
+        let mut rx = tokio::io::BufReader::new(rx);
+        let proven = prove_to_daemon(&mut rx, &mut tx, TOKEN).await;
+        drop((rx, tx));
+        let taken = flood.await.expect("the flood");
+        assert!(
+            matches!(proven, Err(ConnectionError::Unproven(_)))
+                && taken <= ANSWER_LINE_MAX + 4 * CHUNK,
+            "the frontend took {taken} bytes of an answer that never ended and \
+             came away with {proven:?}; no answer is longer than {ANSWER_LINE_MAX}"
         );
     }
 }

@@ -298,8 +298,13 @@ fn denied(e: &io::Error) -> bool {
     e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32)
 }
 
-/// Whether a pipe `name` exists that this user may open. See
+/// Whether a pipe `name` exists that a process of this user holds. See
 /// [`crate::DaemonEndpoint::answers`].
+///
+/// A pipe of that name held by any other user, even one that lets this
+/// user open it, is not this user's daemon: nothing answers, so the front
+/// door starts one, which names what holds the pipe and exits (#96). A pipe
+/// whose instances are all busy cannot be asked, and counts as answering.
 pub(crate) fn pipe_answers(name: &str) -> bool {
     use std::os::windows::fs::OpenOptionsExt;
     let opened = std::fs::OpenOptions::new()
@@ -308,7 +313,7 @@ pub(crate) fn pipe_answers(name: &str) -> bool {
         .security_qos_flags(SECURITY_IDENTIFICATION)
         .open(name);
     match opened {
-        Ok(_) => true,
+        Ok(client) => matches!(held_by(client.as_raw_handle()), Holder::ThisUser),
         Err(e) => busy(&e),
     }
 }
@@ -347,9 +352,14 @@ pub(crate) async fn who_holds(name: &str) -> Holder {
         }
         Err(e) => return Holder::Other(format!("a pipe that could not be opened ({e})")),
     };
+    held_by(client.as_raw_handle())
+}
+
+/// Who holds the pipe `client` is connected to, as the system reports it.
+fn held_by(client: std::os::windows::io::RawHandle) -> Holder {
     let mut pid = 0u32;
     // SAFETY: `client` is an open pipe handle; `pid` outlives the call.
-    if unsafe { GetNamedPipeServerProcessId(client.as_raw_handle(), &mut pid) } == 0 {
+    if unsafe { GetNamedPipeServerProcessId(client, &mut pid) } == 0 {
         let e = io::Error::last_os_error();
         return Holder::Other(format!("a pipe whose process could not be named ({e})"));
     }

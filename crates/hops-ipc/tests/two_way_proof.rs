@@ -168,6 +168,30 @@ async fn heard(listener: &mut AsyncFrontendListener, within: Duration) -> Vec<Fr
     got
 }
 
+/// What the listener yields, other than `Sync`, until it yields one that
+/// is `enough` or `within` passes.
+async fn heard_until(
+    listener: &mut AsyncFrontendListener,
+    within: Duration,
+    enough: impl Fn(&FrontendRequest) -> bool,
+) -> Vec<FrontendRequest> {
+    let mut got = Vec::new();
+    let deadline = tokio::time::Instant::now() + within;
+    while let Ok(Some(request)) = tokio::time::timeout_at(deadline, listener.next()).await {
+        match request {
+            Ok(FrontendRequest::Sync) | Err(_) => {}
+            Ok(request) => {
+                let done = enough(&request);
+                got.push(request);
+                if done {
+                    break;
+                }
+            }
+        }
+    }
+    got
+}
+
 /// An endpoint held by something that answers the first line with a proof
 /// made without the token: the frontend refuses it, and sends it nothing it
 /// could present to the daemon.
@@ -240,6 +264,12 @@ async fn a_frontend_gives_up_on_an_endpoint_that_never_answers() {
         "a frontend connecting to an endpoint that never proves itself must fail, \
          and not wait forever; got {connected:?} after {took:?}"
     );
+    // Slow is not shown to be an impostor: a daemon may be starting.
+    assert!(
+        matches!(&connected, Ok(Err(e)) if !e.contains("did not prove")),
+        "an endpoint that only took its time was called one that is not this \
+         user's daemon: {connected:?}"
+    );
 }
 
 /// Bytes a real frontend sent on one connection admit nothing on another:
@@ -288,6 +318,7 @@ async fn what_one_frontend_sent_admits_nothing_on_another_connection() {
         tokio::join!(up, down);
     });
 
+    let (was_heard, heard_it) = tokio::sync::oneshot::channel::<()>();
     let frontend = async {
         let (_events, mut requests) =
             connect_async_to(&relay_endpoint, Some(Duration::from_secs(5)))
@@ -298,9 +329,17 @@ async fn what_one_frontend_sent_admits_nothing_on_another_connection() {
             .await
             .expect("the request is sent");
         // Held open until the daemon has heard it.
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        let _ = tokio::time::timeout(Duration::from_secs(30), heard_it).await;
     };
-    let (_, first) = tokio::join!(frontend, heard(&mut listener, Duration::from_secs(4)));
+    let daemon = async {
+        let first = heard_until(&mut listener, Duration::from_secs(30), |request| {
+            matches!(request, FrontendRequest::Enumerate())
+        })
+        .await;
+        let _ = was_heard.send(());
+        first
+    };
+    let (_, first) = tokio::join!(frontend, daemon);
     relay.abort();
     let recorded = sent.lock().expect("the record").clone();
 

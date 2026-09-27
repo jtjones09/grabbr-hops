@@ -884,6 +884,31 @@ impl AsyncFrontendListener {
     }
 }
 
+/// Tell a connection the daemon will not take that it is busy, rather than
+/// only hang up: a daemon from before the two-way proof hangs up on the
+/// challenge, and an ask for the build reads that as an older daemon, which
+/// the app restarts (#222).
+///
+/// Written straight to the new socket, which has room for it: the runtime
+/// has not yet seen the socket writable, so its own write would not try.
+#[cfg(unix)]
+fn say_busy(stream: &Sock) {
+    use std::os::fd::AsRawFd;
+    let line = proof::BUSY_LINE.as_bytes();
+    #[cfg(target_os = "linux")]
+    let flags = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL;
+    #[cfg(not(target_os = "linux"))]
+    let flags = libc::MSG_DONTWAIT;
+    // SAFETY: the descriptor is open while `stream` lives, and `line`
+    // outlives the call.
+    let _ = unsafe { libc::send(stream.as_raw_fd(), line.as_ptr().cast(), line.len(), flags) };
+}
+
+/// On Windows the app never restarts a daemon it did not see started, so a
+/// hang-up is all a refused connection gets.
+#[cfg(windows)]
+fn say_busy(_: &Sock) {}
+
 impl Stream for AsyncFrontendListener {
     type Item = Result<FrontendRequest, IpcError>;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -902,6 +927,7 @@ impl Stream for AsyncFrontendListener {
                     );
                     self.refusing = true;
                 }
+                say_busy(&stream);
                 drop(stream);
                 continue;
             }
@@ -2125,13 +2151,16 @@ mod an_unauthenticated_client_cannot_grow_memory {
         );
     }
 
-    /// Whether the daemon has closed `client`, without waiting.
+    /// Whether the daemon has closed `client`, without waiting. What it said
+    /// first, a refusal, is read past.
     fn hung_up(client: &UnixStream) -> bool {
         let mut buf = [0u8; 64];
-        match client.try_read(&mut buf) {
-            Ok(0) => true,
-            Ok(_) => false,
-            Err(e) => e.kind() != ErrorKind::WouldBlock,
+        loop {
+            match client.try_read(&mut buf) {
+                Ok(0) => return true,
+                Ok(_) => continue,
+                Err(e) => return e.kind() != ErrorKind::WouldBlock,
+            }
         }
     }
 
@@ -2190,6 +2219,46 @@ mod an_unauthenticated_client_cannot_grow_memory {
         assert!(
             !frontend_closed,
             "a frontend that made the proof was closed at the deadline"
+        );
+    }
+
+    /// A daemon holding as many connections part-way through the proof as
+    /// it may tells the next one it is busy, rather than hang up on it as a
+    /// daemon from before the two-way proof does (#222).
+    // LEDGER T9628 | class B | 2 bytes a refused connection reads from the real listener
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_connection_past_the_cap_is_told_the_daemon_is_busy() {
+        let (mut listener, path) = listener("busy").await;
+        let mut idle = vec![];
+        for _ in 0..PREAUTH_CONNECTIONS_MAX {
+            idle.push(UnixStream::connect(&path).await.expect("connect"));
+        }
+        serve_for(&mut listener, Duration::from_millis(100)).await;
+        let mut refused = UnixStream::connect(&path).await.expect("connect");
+        let challenge = proof::challenge_line(&proof::nonce().expect("a nonce"));
+        refused
+            .write_all(challenge.as_bytes())
+            .await
+            .expect("the challenge is written");
+        let reading = async {
+            let mut said = Vec::new();
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut refused, &mut said).await;
+            said
+        };
+        let (said, ()) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(20), reading),
+            serve_for(&mut listener, Duration::from_millis(500)),
+        );
+        drop(idle);
+        drop(listener);
+        remove(&path);
+        let said = said.map(|s| String::from_utf8_lossy(&s).into_owned());
+        assert_eq!(
+            said.as_deref(),
+            Ok(proof::BUSY_LINE),
+            "a connection the daemon would not take was told this. Hung up on \
+             without a word, it reads as a daemon from before the two-way proof, \
+             and the app restarts a daemon of its own build."
         );
     }
 
@@ -2411,6 +2480,29 @@ mod the_pipe {
             "a daemon starting beside a pipe it may not open got {}, saying {message:?}. \
              It must say what holds its endpoint, and exit unsuccessfully.",
             describe(&got)
+        );
+    }
+
+    /// Only a pipe a process of this user holds answers the front door. One
+    /// held by anything else, however it lets this user in, is no daemon of
+    /// this user's: nothing answers, so the front door starts one, which
+    /// says what holds its pipe (#96).
+    // LEDGER T9625 | class B | 3 return values of DaemonEndpoint::answers on real pipes
+    #[tokio::test(flavor = "current_thread")]
+    async fn only_a_pipe_this_user_holds_answers() {
+        let ours = endpoint("answers-ours");
+        let _claim = Claim::take(&ours).await.expect("a claim on a fresh pipe");
+        let held = endpoint("answers-held");
+        let crate::DaemonEndpoint::Pipe(name) = &held else {
+            unreachable!("a pipe")
+        };
+        let _squatter =
+            crate::windows::testing::pipe_no_one_may_open(name).expect("a pipe no one may open");
+        let none = endpoint("answers-none");
+        assert_eq!(
+            (ours.answers(), held.answers(), none.answers()),
+            (true, false, false),
+            "(this user's pipe, a pipe this user may not open, no pipe)"
         );
     }
 
