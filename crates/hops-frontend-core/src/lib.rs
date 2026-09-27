@@ -20,8 +20,8 @@ use tokio::sync::{Notify, mpsc};
 
 pub use hops_ipc::{
     AttemptOrigin, Build, CaptureFault, CaptureState, ClientConfig, ClientHandle, ClientState,
-    DiscoveredDevice, FrontendEvent, FrontendRequest, PeerTrust, Permission, Position,
-    RevokedEntry, Status, connect_async,
+    CrossingRefusal, DiscoveredDevice, FrontendEvent, FrontendRequest, PeerTrust, Permission,
+    Position, RevokedEntry, Status, connect_async,
 };
 
 pub mod prefs;
@@ -298,6 +298,21 @@ impl AppModel {
             FrontendEvent::NoSuchClient(_) => {}
             // Sent to every frontend, and meant for the one that asked.
             FrontendEvent::Barrier(_) => {}
+            // The pointer stayed on this machine. That is "that didn't
+            // work" to someone pushing at an edge, so it takes the banner.
+            FrontendEvent::CrossingRefused { handle, reason } => {
+                let device = self
+                    .devices()
+                    .into_iter()
+                    .find(|d| d.send.as_ref().is_some_and(|s| s.handle == handle));
+                let text = match device {
+                    Some(d) => {
+                        crossing_refused(&d.label, d.trust == TrustState::Provisional, reason)
+                    }
+                    None => crossing_refused("That device", false, reason),
+                };
+                self.push_error(text);
+            }
         }
     }
 
@@ -798,6 +813,36 @@ pub fn fallback_label(fp: &str) -> String {
         return "unnamed device".to_string();
     }
     short_fingerprint(fp)
+}
+
+/// What to say when the pointer crossed toward `label` and stayed here (#115).
+///
+/// The device and the reason lead, so the start says why wherever the text
+/// is cut or wrapped. `never_paired` is a device this machine has never
+/// completed a handshake with, which is what #115 met: added, never paired.
+/// Such a device may be refused for want of a permission it was never given,
+/// and "no longer" would be wrong for it.
+pub fn crossing_refused(label: &str, never_paired: bool, reason: CrossingRefusal) -> String {
+    match reason {
+        CrossingRefusal::NotConnected | CrossingRefusal::NotPermitted if never_paired => format!(
+            "{label} is not paired yet, so the pointer stayed here. Pair the two machines, \
+             then try again."
+        ),
+        CrossingRefusal::NotConnected => format!(
+            "{label} is not connected, so the pointer stayed here. Check that hops is \
+             running on it."
+        ),
+        CrossingRefusal::NotAcceptingInput => format!(
+            "{label} is not accepting input, so the pointer stayed here. hops on it may \
+             be missing a permission."
+        ),
+        CrossingRefusal::NotPermitted => {
+            format!("This machine may no longer control {label}, so the pointer stayed here.")
+        }
+        CrossingRefusal::Unanswered => {
+            format!("{label} did not answer the crossing, so the pointer came back.")
+        }
+    }
 }
 
 /// Pick a display label, preferring the user-typed send-side hostname, then the
@@ -2443,6 +2488,102 @@ mod capture_that_cannot_run {
                 None,
                 None,
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod a_refused_crossing {
+    //! A crossing that left the pointer on this machine is said in the
+    //! banner, naming the device as its card does and saying why (#115).
+    use super::*;
+
+    fn device(hostname: &str, peer_fp: Option<&str>) -> (ClientConfig, ClientState) {
+        let config = ClientConfig {
+            hostname: Some(hostname.to_string()),
+            ..Default::default()
+        };
+        let state = ClientState {
+            peer_fingerprint: peer_fp.map(String::from),
+            ..Default::default()
+        };
+        (config, state)
+    }
+
+    // LEDGER T115-8 | class B | 6 struct state: AppModel::apply, latest_error/error_seq
+    #[test]
+    fn a_refused_crossing_names_the_device_and_the_reason_in_the_banner() {
+        let mut m = AppModel::default();
+        m.apply(FrontendEvent::Created(
+            3,
+            device("studio-pc", None).0,
+            device("studio-pc", None).1,
+        ));
+        let seq = m.error_seq;
+
+        m.apply(FrontendEvent::CrossingRefused {
+            handle: 3,
+            reason: CrossingRefusal::NotConnected,
+        });
+        assert!(
+            m.error_seq > seq,
+            "a refused crossing must raise the banner"
+        );
+        assert_eq!(
+            m.latest_error(),
+            Some(
+                "studio-pc is not paired yet, so the pointer stayed here. Pair the two \
+                 machines, then try again."
+            ),
+            "a device added and never paired, as in #115"
+        );
+
+        // Paired, and its link down.
+        let fp = "aa:bb:cc:dd";
+        let (config, state) = device("desk-mac", Some(fp));
+        m.apply(FrontendEvent::Created(4, config, state));
+        m.authorized.insert(fp.to_string(), "desk-mac".to_string());
+        m.apply(FrontendEvent::CrossingRefused {
+            handle: 4,
+            reason: CrossingRefusal::NotConnected,
+        });
+        assert!(
+            m.latest_error()
+                .is_some_and(|e| e.starts_with("desk-mac is not connected")),
+            "a paired device that is not connected: {:?}",
+            m.latest_error()
+        );
+
+        m.apply(FrontendEvent::CrossingRefused {
+            handle: 4,
+            reason: CrossingRefusal::Unanswered,
+        });
+        assert_eq!(
+            m.latest_error(),
+            Some("desk-mac did not answer the crossing, so the pointer came back.")
+        );
+
+        // Pinned to a machine this one was never given permission to drive:
+        // not paired yet, not a permission it lost.
+        let (config, state) = device("studio-mac", Some("ee:ff"));
+        m.apply(FrontendEvent::Created(5, config, state));
+        m.apply(FrontendEvent::CrossingRefused {
+            handle: 5,
+            reason: CrossingRefusal::NotPermitted,
+        });
+        assert!(
+            m.latest_error()
+                .is_some_and(|e| e.starts_with("studio-mac is not paired yet")),
+            "a device never paired was said to be one this machine may no longer control: {:?}",
+            m.latest_error()
+        );
+        m.apply(FrontendEvent::CrossingRefused {
+            handle: 4,
+            reason: CrossingRefusal::NotPermitted,
+        });
+        assert_eq!(
+            m.latest_error(),
+            Some("This machine may no longer control desk-mac, so the pointer stayed here.")
         );
     }
 }

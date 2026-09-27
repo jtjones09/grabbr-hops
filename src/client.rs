@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     net::{IpAddr, SocketAddr},
     rc::Rc,
 };
@@ -30,6 +30,10 @@ struct Clients {
     /// clears the pin and replaced only by the next pin. The device switch
     /// gates the machine it names (#218), so an edit cannot lift the switch.
     last_pins: BTreeMap<ClientHandle, String>,
+    /// Devices whose peer has answered a ping on the link it has now. Until
+    /// it has, `alive` false says only that it has not answered yet, not
+    /// that it refuses input.
+    answered: BTreeSet<ClientHandle>,
 }
 
 impl Clients {
@@ -182,6 +186,7 @@ impl ClientManager {
     pub fn remove_client(&self, client: ClientHandle) -> Option<(ClientConfig, ClientState)> {
         let mut clients = self.clients.borrow_mut();
         clients.last_pins.remove(&client);
+        clients.answered.remove(&client);
         clients.entries.remove(&client)
     }
 
@@ -377,9 +382,30 @@ impl ClientManager {
     }
 
     pub(crate) fn set_active_addr(&self, handle: ClientHandle, addr: Option<SocketAddr>) {
-        if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle) {
+        let mut clients = self.clients.borrow_mut();
+        if addr.is_none() {
+            clients.answered.remove(&handle);
+        }
+        if let Some((_, s)) = clients.get_mut(handle) {
             s.active_addr = addr;
         }
+    }
+
+    /// `handle`'s peer answered a ping, saying whether it injects input.
+    /// Returns whether this changed `alive`, as [`Self::set_alive`] does.
+    pub(crate) fn answered_ping(&self, handle: ClientHandle, alive: bool) -> bool {
+        {
+            let mut clients = self.clients.borrow_mut();
+            if clients.entries.contains_key(&handle) {
+                clients.answered.insert(handle);
+            }
+        }
+        self.set_alive(handle, alive)
+    }
+
+    /// Whether `handle`'s peer has answered a ping on its current link.
+    pub(crate) fn answered(&self, handle: ClientHandle) -> bool {
+        self.clients.borrow().answered.contains(&handle)
     }
 
     /// Returns whether this actually changed `alive`.
@@ -703,6 +729,29 @@ mod alive_transitions {
             m.get_state(h).map(|(_, s)| s.alive),
             Some(true),
             "reporting the transition must not come at the cost of recording it"
+        );
+    }
+
+    // LEDGER T115-13 | class B | 6 struct state: ClientManager::answered_ping, set_active_addr, answered
+    /// A peer answered on one link has said nothing on the next: until it
+    /// answers there, `alive` false is silence, not a refusal (#115).
+    #[test]
+    fn an_answer_is_forgotten_with_the_link_it_came_on() {
+        let m = ClientManager::default();
+        let h = m.add_client();
+        let addr = "192.0.2.1:4242".parse().expect("addr");
+        m.set_active_addr(h, Some(addr));
+        assert!(!m.answered(h), "a link nobody has answered on yet");
+
+        m.answered_ping(h, false);
+        assert!(m.answered(h), "the peer answered a ping");
+        assert_eq!(m.get_state(h).map(|(_, s)| s.alive), Some(false));
+
+        m.set_active_addr(h, None);
+        m.set_active_addr(h, Some(addr));
+        assert!(
+            !m.answered(h),
+            "an answer given on a link that went down was kept for the next one"
         );
     }
 

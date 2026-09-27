@@ -413,6 +413,38 @@ pub enum FrontendEvent {
     /// request sent before it on that connection has been handled, and every
     /// event those requests caused was sent before this one.
     Barrier(u64),
+    /// The pointer crossed toward the device `handle` sits at, and was left
+    /// on this machine instead, for `reason` (#115). Sent once per device and
+    /// reason while the user keeps pushing at that edge, not per push.
+    CrossingRefused {
+        handle: ClientHandle,
+        reason: CrossingRefusal,
+    },
+}
+
+/// Why a crossing did not take the pointer to the device it was toward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CrossingRefusal {
+    /// There is no connection to the device: it never answered, or its link
+    /// is down. Crossing to it starts a dial.
+    NotConnected,
+    /// The device is connected and says it is not accepting input.
+    NotAcceptingInput,
+    /// This machine may no longer control the device.
+    NotPermitted,
+    /// The device did not acknowledge the crossing in time.
+    Unanswered,
+}
+
+impl Display for CrossingRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotConnected => "not connected",
+            Self::NotAcceptingInput => "not accepting input",
+            Self::NotPermitted => "this machine may no longer control it",
+            Self::Unanswered => "it did not acknowledge the crossing",
+        })
+    }
 }
 
 /// What this machine's trust store grants one paired machine, beyond the

@@ -3,14 +3,21 @@
 //!
 //! Runs the built binary with dummy capture and emulation. The dummy capture
 //! backend crosses at the left edge, so a device placed there is entered and
-//! its hook runs. The hook's arguments hold a `;`: a shell would split the
+//! its hook runs, once the device answers: a crossing to a device with no
+//! link enters nothing (#115). The device is a QUIC server that answers as a
+//! machine whose input emulation works, trusted through the config tables an
+//! upgrade reads. The hook's arguments hold a `;`: a shell would split the
 //! command there, and a program run directly receives it as part of an
 //! argument.
 #![cfg(unix)]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+use hops_proto::ProtoEvent;
 
 struct Daemon {
     child: Child,
@@ -32,6 +39,54 @@ impl Daemon {
     }
 }
 
+/// A device that answers every ping with "my input emulation is on" and
+/// acknowledges every crossing, on its own thread; its port and fingerprint.
+fn device() -> (u16, String) {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let identity = common::Identity::new();
+    let fingerprint = identity.fingerprint();
+    let (port_tx, port_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        tokio::task::LocalSet::new().block_on(&rt, async move {
+            let ep = quinn::Endpoint::server(
+                identity.server_config(),
+                "127.0.0.1:0".parse().expect("addr"),
+            )
+            .expect("server");
+            let port = ep.local_addr().expect("local addr").port();
+            port_tx.send(port).expect("the port is handed back");
+            while let Some(incoming) = ep.accept().await {
+                tokio::task::spawn_local(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    let Ok(mut input) = conn.accept_uni().await else {
+                        return;
+                    };
+                    let Ok(mut replies) = conn.open_uni().await else {
+                        return;
+                    };
+                    while let Some(event) = common::read(&mut input).await {
+                        match event {
+                            ProtoEvent::Ping => {
+                                common::write(&mut replies, ProtoEvent::Pong(true)).await
+                            }
+                            ProtoEvent::Enter(_) => {
+                                common::write(&mut replies, ProtoEvent::Ack(0)).await
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+            }
+        });
+    });
+    let port = port_rx.recv().expect("the device's port");
+    (port, fingerprint)
+}
+
 /// Start a daemon with one device on the left whose enter hook is `hook`,
 /// with `{out}` replaced by a directory the test reads afterwards.
 fn start(hook: &str) -> (Daemon, PathBuf) {
@@ -48,7 +103,8 @@ fn start(hook: &str) -> (Daemon, PathBuf) {
             .expect("a free port")
             .port()
     };
-    let (port, device_port) = (free_port(), free_port());
+    let port = free_port();
+    let (device_port, fp) = device();
     let hook = hook.replace("{out}", &out.display().to_string());
     let config = config_dir.join("config.toml");
     std::fs::write(
@@ -59,11 +115,15 @@ fn start(hook: &str) -> (Daemon, PathBuf) {
              emulation_backend = \"dummy\"\n\
              discovery = false\n\
              \n\
+             [authorized_fingerprints]\n\
+             \"{fp}\" = \"device\"\n\
+             \n\
              [[clients]]\n\
              position = \"left\"\n\
              hostname = \"127.0.0.1\"\n\
              ips = [\"127.0.0.1\"]\n\
              port = {device_port}\n\
+             fingerprint = \"{fp}\"\n\
              activate_on_startup = true\n\
              enter_hook = {}\n",
             toml_string(&hook)

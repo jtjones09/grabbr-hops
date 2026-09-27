@@ -2486,4 +2486,68 @@ mod tests {
             "c on a device whose clipboard is off must say so and ask nothing"
         );
     }
+
+    /// `model` drawn at `width` columns with `notice` in the footer, as the
+    /// run loop draws it.
+    fn render_with_notice(model: &AppModel, notice: &str, width: u16) -> String {
+        let devices = listable(model);
+        let mut state = ListState::default();
+        state.select(Some(0));
+        let theme = theme::default_theme();
+        let mut term = Terminal::new(TestBackend::new(width, 24)).expect("test terminal");
+        term.draw(|f| {
+            ui(
+                f,
+                model,
+                &devices,
+                &mut state,
+                None,
+                None,
+                None,
+                Some(notice),
+                false,
+                &theme,
+            )
+        })
+        .expect("draw");
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect()
+    }
+
+    // LEDGER T115-9 | class B | 3 render: ui() on a ratatui TestBackend, its notice from new_error after AppModel::apply
+    /// A crossing that left the pointer on this machine is said in the
+    /// footer, the device and the reason first, so an 80-column terminal
+    /// still shows why (#115).
+    #[test]
+    fn a_refused_crossing_is_said_in_the_footer() {
+        let mut model = AppModel::default();
+        model.connected = true;
+        model.apply(FrontendEvent::Created(
+            0,
+            ClientConfig {
+                hostname: Some("studio-pc".into()),
+                ..Default::default()
+            },
+            ClientState::default(),
+        ));
+        let mut seen = model.error_seq;
+        model.apply(FrontendEvent::CrossingRefused {
+            handle: 0,
+            reason: hops_frontend_core::CrossingRefusal::NotConnected,
+        });
+        let notice = new_error(&model, &mut seen).expect("a refused crossing raises a notice");
+
+        let screen = render_with_notice(&model, &notice, 80);
+        assert!(
+            screen.contains("studio-pc is not paired yet, so the pointer stayed here."),
+            "the footer does not say why the pointer stayed here:\n{screen}"
+        );
+    }
 }
