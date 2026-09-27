@@ -1186,6 +1186,11 @@ mod on_the_wire {
     /// and when nobody answers in time.
     #[test]
     fn a_pending_pairing_closes_on_removal_and_after_120_s() {
+        assert_eq!(
+            Pairings::DEADLINE,
+            Duration::from_secs(120),
+            "the time both machines have to answer is not the two minutes the notices name"
+        );
         run_local(async {
             // Removed on the machine being added.
             let (b, a) = (machine(), machine());

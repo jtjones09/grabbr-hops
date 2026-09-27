@@ -425,8 +425,9 @@ struct SignatureBlock {
 // ---------------------------------------------------------------------------
 // hex
 //
-// Not base64: no crate here depends on base64, and hex is already this project's on-disk encoding for key material — it is
-// how `generate_fingerprint` renders a SHA-256. One convention, no new crate.
+// Not base64: no crate here depends on base64, and hex is already this
+// project's on-disk encoding for key material — it is how
+// `generate_fingerprint` renders a SHA-256. One convention, no new crate.
 // ---------------------------------------------------------------------------
 
 fn hex_encode(bytes: &[u8]) -> String {

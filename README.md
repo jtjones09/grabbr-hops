@@ -148,8 +148,8 @@ usual.
   is delegated to fingerprint pinning, so a machine is trusted only after you
   approve its fingerprint on both machines and confirm the number both arrive
   at, which is bound to that connection's TLS session (trust on first use,
-  with explicit consent). The number shows no machine in the middle; it does
-  not vouch for the machine you chose to add.
+  with explicit consent). A machine in the middle would show a different
+  number; the number does not vouch for the machine you chose to add.
 - **No cloud, no accounts:** machines connect directly over your LAN. There is no
   relay and no telemetry.
 
