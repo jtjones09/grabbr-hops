@@ -2924,8 +2924,15 @@ mod the_wire_contract_is_frozen {
     //! **Decided 2026-07-04.** The wire ALPN stays the exact byte string
     //! `grabbr-hop/1`.
     //!
-    //! **Decided 2026-07-28.** The QUIC listen port stays 4242, and moving to
-    //! 443 may never be scheduled as a traversal requirement.
+    //! **Amended 2026-09-26 (#15).** A second ALPN, `grabbr-hop/1-driven`,
+    //! sits beside it, for a machine that dials the machine that controls it,
+    //! so each side knows its role when the handshake ends. A v0.12 peer
+    //! refuses it. The two are the whole list a listener serves.
+    //!
+    //! **Decided 2026-07-28, corrected 2026-09-15 (#16).** Traversal is about
+    //! connection direction, not the port, so 443 may never be scheduled as a
+    //! traversal requirement. The default port moves from 4242, inherited from
+    //! upstream, to 4722, in the same release as #15, as one breaking change.
     //!
     //! **Decided 2026-08-24.** Capability flag bits are never reassigned or
     //! removed, and a peer that advertises no capabilities is handled as having
@@ -2963,9 +2970,9 @@ mod the_wire_contract_is_frozen {
     /// **What it does not prove.** `listen::server_config` and
     /// `connect::client_config` are private, so this builds both ends itself
     /// from `transport::ALPN`. It therefore demonstrates the CONSEQUENCE of a
-    /// rename; the test above is what pins the production value. A change that
-    /// made the real server offer two ALPNs during a migration would slip past
-    /// this one — that needs the config builders to be reachable.
+    /// rename; the test above is what pins the production value, and
+    /// `the_production_listener_completes_a_handshake_for_the_two_alpns_and_no_other`
+    /// runs the real server config.
     #[test]
     fn a_peer_offering_a_different_alpn_cannot_complete_a_handshake() {
         use crate::transport::{self, FpClientVerifier, FpServerVerifier};
@@ -3077,21 +3084,137 @@ mod the_wire_contract_is_frozen {
         });
     }
 
+    /// Reads the real constants. The values ARE the rule.
     #[test]
-    fn the_quic_listen_port_is_still_4242() {
+    fn the_quic_listen_port_is_4722_and_the_alpns_are_the_pair_both_ends_serve() {
         assert_eq!(
             hops_ipc::DEFAULT_PORT,
-            4242,
-            "the default QUIC port moved. 4242 is arbitrary, inherited from \
-             upstream, and deliberately not worth changing: it is above 1024, so \
-             either machine binds it unprivileged and the macOS TCC-versus-root \
-             conflict never arises. If this moved to 443 to 'fix traversal', it \
-             fixes nothing — traversal was MEASURED to be about connection \
-             direction, not the port: the SASE client is stateful and blocks \
-             unsolicited inbound flows, not ports. Moving to 443 re-imports the \
-             privileged-bind conflict plus installer work to solve a problem \
-             that does not exist."
+            4722,
+            "the default QUIC port moved off 4722. It moved from 4242 once, in the \
+             release that let a controlled machine dial out (#15, #16), as one \
+             breaking change both machines take together. It is above 1024, so \
+             either machine binds it unprivileged. If it moved to 443 to 'fix \
+             traversal', that fixes nothing: traversal was MEASURED to be about \
+             connection direction, not the port."
         );
+        assert_eq!(
+            hops_ipc::PORT_BEFORE_V013,
+            4242,
+            "the port older versions listened on is what a dial that finds nothing \
+             asks, to say an older hops is there. It is a fact about v0.12, not a \
+             setting."
+        );
+        assert_eq!(
+            crate::transport::ALPN_DRIVEN,
+            b"grabbr-hop/1-driven",
+            "the ALPN a controlled machine dials with changed. Like grabbr-hop/1, \
+             it is a wire identifier every deployed peer must match byte for byte."
+        );
+        assert_eq!(
+            crate::transport::served_alpns(),
+            vec![
+                crate::transport::ALPN.to_vec(),
+                crate::transport::ALPN_DRIVEN.to_vec()
+            ],
+            "a listener serves exactly the two ALPNs, the forward one first. The \
+             order is how rustls chooses for a client offering both, and the \
+             certificate resolver mirrors it to pick the question the TLS door \
+             asks: a third, or a new order, changes which question is asked."
+        );
+    }
+
+    /// The consequence, on the production listener config: a dialler
+    /// offering either ALPN completes a handshake, and one offering anything
+    /// else does not.
+    #[test]
+    fn the_production_listener_completes_a_handshake_for_the_two_alpns_and_no_other() {
+        use crate::transport::{self, Dialler};
+        use std::net::SocketAddr;
+        use std::sync::{Arc, Mutex, RwLock};
+        use std::time::Duration;
+
+        transport::install_crypto_provider();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let server = super::a_test_identity();
+            let client = super::a_test_identity();
+            let server_fp = transport::fingerprint_of(&server.cert);
+            let client_fp = transport::fingerprint_of(&client.cert);
+            let trusting = |ours: &str, theirs: &str| {
+                let mut s = crate::trust::TrustStore::new(ours, 0).expect("ours");
+                s.issue_confirmed(theirs, "peer", crate::trust::Caps::KNOWN)
+                    .expect("issue");
+                Arc::new(RwLock::new(s))
+            };
+            let cfg = crate::listen::server_config(
+                &server,
+                trusting(&server_fp, &client_fp),
+                Default::default(),
+            )
+            .expect("the production server config");
+            let endpoint = quinn::Endpoint::server(cfg, "127.0.0.1:0".parse().expect("addr"))
+                .expect("server endpoint");
+            let addr = endpoint.local_addr().expect("local addr");
+            tokio::spawn(async move {
+                while let Some(incoming) = endpoint.accept().await {
+                    tokio::spawn(async move {
+                        if let Ok(conn) = incoming.await {
+                            conn.closed().await;
+                        }
+                    });
+                }
+            });
+            let client_trust = trusting(&client_fp, &server_fp);
+            let dial = |alpn: &[u8], role: Dialler| {
+                let mut crypto = rustls::ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(
+                        transport::FpServerVerifier::for_role(
+                            client_trust.clone(),
+                            Arc::new(Mutex::new(None)),
+                            role,
+                        ),
+                    ))
+                    .with_client_auth_cert(vec![client.cert.clone()], client.key.clone_key())
+                    .expect("client auth");
+                crypto.alpn_protocols = vec![alpn.to_vec()];
+                let cfg = quinn::ClientConfig::new(Arc::new(
+                    quinn::crypto::rustls::QuicClientConfig::try_from(crypto).expect("quic client"),
+                ));
+                let ep =
+                    quinn::Endpoint::client("127.0.0.1:0".parse::<SocketAddr>().expect("addr"))
+                        .expect("client endpoint");
+                (ep, cfg)
+            };
+            for (alpn, role, completes) in [
+                (transport::ALPN, Dialler::Drives, true),
+                (transport::ALPN_DRIVEN, Dialler::IsDriven, true),
+                (&b"grabbr-hop/2"[..], Dialler::Drives, false),
+                (&b"hops/1"[..], Dialler::Drives, false),
+            ] {
+                let (ep, cfg) = dial(alpn, role);
+                let done = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    ep.connect_with(cfg, addr, "grabbr").expect("connect"),
+                )
+                .await;
+                assert_eq!(
+                    matches!(done, Ok(Ok(_))),
+                    completes,
+                    "a dialler offering `{}` {} a handshake with the production \
+                     listener",
+                    String::from_utf8_lossy(alpn),
+                    if completes {
+                        "could not complete"
+                    } else {
+                        "completed"
+                    }
+                );
+            }
+        });
     }
 
     /// Reads the real constants. Append-only means the VALUES are the contract,

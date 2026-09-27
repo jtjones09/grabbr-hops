@@ -46,6 +46,130 @@ pub type Trust = Arc<RwLock<crate::trust::TrustStore>>;
 /// protocol bump: bump the version suffix and rebuild both ends together.
 pub const ALPN: &[u8] = b"grabbr-hop/1";
 
+/// The ALPN a machine dials with to be DRIVEN by the machine it dials (#15).
+///
+/// [`ALPN`] says the dialler will drive the machine it reached; this one says
+/// the reverse, so each side knows its role when the handshake ends, before a
+/// byte of input moves. A machine behind a client that drops unsolicited
+/// inbound connections reaches the machine that controls it this way. It is
+/// offered on its own, never beside [`ALPN`], and a peer that does not serve
+/// it (v0.12 and earlier) refuses it as `no_application_protocol`.
+pub const ALPN_DRIVEN: &[u8] = b"grabbr-hop/1-driven";
+
+/// What the machine that dialled a link does over it: which of the two
+/// ALPNs it offered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Dialler {
+    /// It sends input to the machine it dialled ([`ALPN`]).
+    Drives,
+    /// It receives input from the machine it dialled ([`ALPN_DRIVEN`]).
+    IsDriven,
+}
+
+impl Dialler {
+    /// The ALPN a dialler in this role offers.
+    pub fn alpn(self) -> &'static [u8] {
+        match self {
+            Dialler::Drives => ALPN,
+            Dialler::IsDriven => ALPN_DRIVEN,
+        }
+    }
+
+    /// The role an ALPN names, if it is one of ours.
+    pub fn of_alpn(alpn: &[u8]) -> Option<Dialler> {
+        SERVED.into_iter().find(|d| d.alpn() == alpn)
+    }
+}
+
+/// The roles a listener serves, in the order it prefers them. rustls picks
+/// the first of the server's list that the client offers, and
+/// [`chosen_role`] must pick the same one.
+pub const SERVED: [Dialler; 2] = [Dialler::Drives, Dialler::IsDriven];
+
+/// The ALPN list a listener serves.
+pub fn served_alpns() -> Vec<Vec<u8>> {
+    SERVED.iter().map(|d| d.alpn().to_vec()).collect()
+}
+
+/// The role a listener will negotiate with a client that offered `offered`:
+/// the first of [`SERVED`] among them, as rustls chooses.
+pub fn chosen_role(offered: &[&[u8]]) -> Option<Dialler> {
+    SERVED
+        .into_iter()
+        .find(|d| offered.iter().any(|o| *o == d.alpn()))
+}
+
+/// The role the dialler of `conn` took, from the ALPN its handshake settled
+/// on. `None` for a connection with none of ours, which is refused.
+pub fn negotiated_role(conn: &quinn::Connection) -> Option<Dialler> {
+    let data = conn.handshake_data()?;
+    let data = data
+        .downcast::<quinn::crypto::rustls::HandshakeData>()
+        .ok()?;
+    Dialler::of_alpn(data.protocol.as_deref()?)
+}
+
+/// Where a listener's certificate resolver writes the role a connecting
+/// client asked for, for that connection's [`FpClientVerifier`] to read.
+pub type Offered = Arc<Mutex<Option<Dialler>>>;
+
+/// Hands every connection this machine's certificate, and notes which role
+/// the client asked for on the way.
+///
+/// rustls gives a client-certificate verifier the certificate and nothing
+/// else, so a verifier cannot see the ALPN. The resolver runs on the
+/// ClientHello, before the client sends its certificate, and each connection
+/// is accepted with a config of its own, so the slot it writes belongs to one
+/// connection, and the verifier asks the question for that role.
+#[derive(Debug)]
+pub struct RoleResolver {
+    key: Arc<rustls::sign::CertifiedKey>,
+    offered: Offered,
+}
+
+impl RoleResolver {
+    pub fn new(key: Arc<rustls::sign::CertifiedKey>, offered: Offered) -> Self {
+        Self { key, offered }
+    }
+}
+
+impl rustls::server::ResolvesServerCert for RoleResolver {
+    fn resolve(
+        &self,
+        client_hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        let role = client_hello.alpn().and_then(|offered| {
+            let offered: Vec<&[u8]> = offered.collect();
+            chosen_role(&offered)
+        });
+        *self.offered.lock().expect("lock") = role;
+        Some(self.key.clone())
+    }
+}
+
+/// This machine's certificate and key, for a [`RoleResolver`].
+pub fn certified_key(
+    identity: &crate::crypto::Identity,
+) -> Result<Arc<rustls::sign::CertifiedKey>, TlsError> {
+    rustls::sign::CertifiedKey::from_der(
+        vec![identity.cert.clone()],
+        identity.key.clone_key(),
+        &provider(),
+    )
+    .map(Arc::new)
+}
+
+/// The QUIC transport error for the TLS alert `no_application_protocol`
+/// (120): a peer that serves none of the ALPNs offered. A v0.12 peer answers
+/// [`ALPN_DRIVEN`] this way.
+pub(crate) const NO_APPLICATION_PROTOCOL: u64 = 0x100 + 120;
+
+/// Whether the peer refused the ALPN this machine offered.
+pub(crate) fn refused_protocol(e: &quinn::ConnectionError) -> bool {
+    matches!(e, quinn::ConnectionError::ConnectionClosed(close)
+        if u64::from(close.error_code) == NO_APPLICATION_PROTOCOL)
+}
+
 /// The reason a link closes with when this machine holds no pairing with the
 /// machine at the other end, because it was removed here (#184).
 ///
@@ -130,14 +254,25 @@ pub struct FpServerVerifier {
     provider: Arc<CryptoProvider>,
     trust: Trust,
     observed: Arc<Mutex<Option<String>>>,
+    role: Dialler,
 }
 
 impl FpServerVerifier {
+    /// For a dial that will drive the machine it reaches.
+    #[cfg(test)]
     pub fn new(trust: Trust, observed: Arc<Mutex<Option<String>>>) -> Self {
+        Self::for_role(trust, observed, Dialler::Drives)
+    }
+
+    /// For a dial in `role`: one that will drive the machine it reaches
+    /// asks whether this machine may drive it, and one that will be driven
+    /// asks whether it may drive this machine (#15).
+    pub fn for_role(trust: Trust, observed: Arc<Mutex<Option<String>>>, role: Dialler) -> Self {
         Self {
             provider: provider(),
             trust,
             observed,
+            role,
         }
     }
 }
@@ -157,13 +292,26 @@ impl ServerCertVerifier for FpServerVerifier {
         // (#167). In either direction: which way control goes is what the
         // person approving chose (#220), not which machine dials, and until
         // both confirm nothing moves on the connection either way.
+        //
+        // A dial to be driven asks the inbound question of the machine it
+        // reached, and nothing else: it is admitted only by a machine this
+        // one lets drive it, and a pairing is never made over it.
         let permitted = {
             let trust = self.trust.read().expect("lock");
-            trust.we_may_drive(&fingerprint) || trust.is_pairing(&fingerprint)
+            match self.role {
+                Dialler::Drives => {
+                    trust.we_may_drive(&fingerprint) || trust.is_pairing(&fingerprint)
+                }
+                Dialler::IsDriven => trust.may_drive_us(&fingerprint),
+            }
         };
         *self.observed.lock().expect("lock") = Some(fingerprint);
         if permitted {
             Ok(ServerCertVerified::assertion())
+        } else if self.role == Dialler::IsDriven {
+            Err(TlsError::General(
+                "we hold no live lease letting that machine drive this one".into(),
+            ))
         } else {
             Err(TlsError::General(
                 "we hold no live lease permitting us to drive that receiver".into(),
@@ -226,16 +374,30 @@ pub struct FpClientVerifier {
     provider: Arc<CryptoProvider>,
     trust: Trust,
     refused: Arc<Mutex<Option<String>>>,
+    /// Which role the client asked for, written by this connection's
+    /// [`RoleResolver`]. `None`: a verifier for [`ALPN`] alone.
+    offered: Option<Offered>,
 }
 
 impl FpClientVerifier {
     /// `refused` receives the fingerprint of a certificate this verifier
-    /// turned away. Give each connection its own.
+    /// turned away. Give each connection its own. Asks only the question for
+    /// a dialler that drives this machine.
     pub fn new(trust: Trust, refused: Arc<Mutex<Option<String>>>) -> Self {
         Self {
             provider: provider(),
             trust,
             refused,
+            offered: None,
+        }
+    }
+
+    /// [`Self::new`], for a listener serving both roles: the question asked
+    /// is the one for the role `offered` holds when the certificate arrives.
+    pub fn for_roles(trust: Trust, refused: Arc<Mutex<Option<String>>>, offered: Offered) -> Self {
+        Self {
+            offered: Some(offered),
+            ..Self::new(trust, refused)
         }
     }
 }
@@ -260,6 +422,40 @@ impl ClientCertVerifier for FpClientVerifier {
         _now: UnixTime,
     ) -> Result<ClientCertVerified, TlsError> {
         let fingerprint = fingerprint_of(end_entity);
+        let role = match &self.offered {
+            None => Some(Dialler::Drives),
+            Some(offered) => *offered.lock().expect("lock"),
+        };
+        match role {
+            Some(Dialler::Drives) => {}
+            // A machine dialling to be driven by this one (#15): admitted only
+            // if this machine may drive it. Never a pairing, and never a
+            // prompt: a refusal here is not a request to pair.
+            Some(Dialler::IsDriven) => {
+                let (permitted, known) = {
+                    let trust = self.trust.read().expect("lock");
+                    (
+                        trust.we_may_drive(&fingerprint),
+                        trust.is_known(&fingerprint),
+                    )
+                };
+                return if permitted {
+                    Ok(ClientCertVerified::assertion())
+                } else if known {
+                    Err(TlsError::General(
+                        "no live lease lets this machine drive that dialler".into(),
+                    ))
+                } else {
+                    Err(TlsError::InvalidCertificate(
+                        CertificateError::ApplicationVerificationFailure,
+                    ))
+                };
+            }
+            // No role of ours was asked for: rustls refuses the ALPN too.
+            None => {
+                return Err(TlsError::General("no role of ours was offered".into()));
+            }
+        }
         // The INBOUND question, and deliberately not the outbound one. A peer
         // we hold an outbound lease on — a receiver we confirmed our own dial
         // reached — gets nothing here. Nobody was asked whether it may drive

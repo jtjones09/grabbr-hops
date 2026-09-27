@@ -91,6 +91,27 @@ pub(crate) enum DialRefusal {
         handle: ClientHandle,
         seen: Vec<(SocketAddr, String)>,
     },
+    /// This machine dialled the device to be driven by it (#15), and it
+    /// refused: it holds no pairing that lets it drive this machine.
+    WontDrive {
+        handle: ClientHandle,
+        fingerprint: String,
+        addr: SocketAddr,
+    },
+    /// Something at `addr` refused the ALPN this machine offers to be
+    /// driven, which hops v0.12 and earlier do not serve, or answered only
+    /// on the port those versions listened on (#16).
+    OlderVersion {
+        handle: ClientHandle,
+        addr: SocketAddr,
+    },
+    /// Nothing answered at the device's port, and a hops of this version
+    /// answered at `addr`, the port hops listened on before v0.13: its
+    /// config still names that port (#16).
+    OldPort {
+        handle: ClientHandle,
+        addr: SocketAddr,
+    },
 }
 
 /// Whether the receiver ended this connection because it will not take this
@@ -167,6 +188,9 @@ struct PeerLink {
     /// make it forget the fingerprint above and its address while this link
     /// stays up, and it is still that device's link (#218).
     handle: ClientHandle,
+    /// The machine at the other end dialled it, to be driven by this one
+    /// (#15), rather than this machine dialling it.
+    dialled_in: bool,
 }
 
 fn client_config(
@@ -174,13 +198,25 @@ fn client_config(
     trust: Trust,
     observed: Arc<StdMutex<Option<String>>>,
 ) -> ClientConfig {
-    let verifier = Arc::new(FpServerVerifier::new(trust, observed));
+    client_config_for(identity, trust, observed, transport::Dialler::Drives)
+}
+
+/// A dial's config for `role`: the ALPN it offers, and the question its
+/// verifier asks of the machine that answers (#15). Only that one ALPN is
+/// offered, so the role cannot be negotiated into another.
+pub(crate) fn client_config_for(
+    identity: &Identity,
+    trust: Trust,
+    observed: Arc<StdMutex<Option<String>>>,
+    role: transport::Dialler,
+) -> ClientConfig {
+    let verifier = Arc::new(FpServerVerifier::for_role(trust, observed, role));
     let mut crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_client_auth_cert(vec![identity.cert.clone()], identity.key.clone_key())
         .expect("client auth cert");
-    crypto.alpn_protocols = vec![transport::ALPN.to_vec()];
+    crypto.alpn_protocols = vec![role.alpn().to_vec()];
     // Same hazard, mirrored: a resumed CLIENT handshake skips server-certificate
     // verification, so `FpServerVerifier` and the fail-closed fingerprint pin would
     // both be bypassed when redialing a receiver we have since revoked. Refuse
@@ -287,6 +323,7 @@ async fn connect(
             send: Arc::new(Mutex::new(send)),
             fingerprint,
             handle,
+            dialled_in: false,
         }),
         addr,
     ))
@@ -539,6 +576,24 @@ impl LanMouseConnection {
         }
     }
 
+    /// A handle that takes a link a machine dialled to be driven by this one
+    /// as its device's link (#15). Grabbed before this connection is moved
+    /// into `Capture`.
+    pub(crate) fn adopter(&self) -> Adopter {
+        Adopter {
+            session: Session {
+                client_manager: self.client_manager.clone(),
+                conns: self.conns.clone(),
+                recv_tx: self.recv_tx.clone(),
+                ping_response: self.ping_response.clone(),
+                trust: self.trust.clone(),
+                clipboard_in: self.clipboard_in.clone(),
+                refusals: self.refusals.clone(),
+                state_tx: self.state_tx.clone(),
+            },
+        }
+    }
+
     /// A handle for broadcasting local clipboard changes to the connected
     /// peers the pairing shares it with. Grabbed before this connection is
     /// moved into `Capture` so the service can drive it directly.
@@ -750,6 +805,92 @@ impl LanMouseConnection {
     }
 }
 
+/// Takes a link a machine dialled to be driven by this one (#15) as the
+/// link of the device pinned to it, and drives it like a link this machine
+/// dialled: every event this machine sends over it is checked against the
+/// lease as it goes, as on any other.
+#[derive(Clone)]
+pub(crate) struct Adopter {
+    session: Session,
+}
+
+impl Adopter {
+    /// Take `dialled` as `handle`'s link. Refused, and closed, unless this
+    /// machine still may drive the machine that dialled, `handle` is pinned
+    /// to it and is switched on, and no link this machine dialled to it is
+    /// up. A link it dialled earlier is replaced: the newer one is the one
+    /// its network still carries. Returns whether it was taken.
+    pub(crate) async fn adopt(
+        &self,
+        handle: ClientHandle,
+        dialled: crate::listen::DialledIn,
+    ) -> bool {
+        let crate::listen::DialledIn {
+            conn,
+            fingerprint,
+            addr,
+        } = dialled;
+        let s = &self.session;
+        let refuse = |why: &'static [u8], what: &str| {
+            log::info!(
+                "client {handle}: not taking the link {fingerprint} dialled from {addr}: {what}"
+            );
+            conn.close(0u32.into(), why);
+            false
+        };
+        if !s.trust.read().expect("lock").we_may_drive(&fingerprint) {
+            return refuse(b"not permitted", "this machine may not drive it");
+        }
+        if s.client_manager.peer_fingerprint(handle).as_deref() != Some(fingerprint.as_str()) {
+            return refuse(
+                b"not this device",
+                "the device is pinned to another machine",
+            );
+        }
+        if !s.client_manager.is_on(handle) {
+            return refuse(b"switched off", "the device is switched off");
+        }
+        let send = match tokio::time::timeout(DEFAULT_CONNECTION_TIMEOUT, conn.open_uni()).await {
+            Ok(Ok(send)) => send,
+            _ => return refuse(b"bye", "its input stream did not open"),
+        };
+        let link = PeerLink {
+            conn: conn.clone(),
+            send: Arc::new(Mutex::new(send)),
+            fingerprint: fingerprint.clone(),
+            handle,
+            dialled_in: true,
+        };
+        let mut open = s.conns.lock().await;
+        if let Some(current) = s.client_manager.active_addr(handle) {
+            match open.get(&current) {
+                Some(old) if old.dialled_in => {
+                    old.conn.close(0u32.into(), b"replaced");
+                    open.remove(&current);
+                }
+                Some(_) => {
+                    drop(open);
+                    return refuse(b"already linked", "this machine's own link to it is up");
+                }
+                None => {}
+            }
+        }
+        log::info!(
+            "client ({handle}) connected: {fingerprint} dialled in from {addr} to be driven"
+        );
+        s.client_manager.set_active_addr(handle, Some(addr));
+        s.client_manager.set_removed_by_peer(handle, false);
+        // Its machine dials this one: seen, not assumed. A dial turned away
+        // above says nothing about how the device is reached.
+        s.client_manager.set_dials_us(handle, true);
+        open.insert(addr, link.clone());
+        drop(open);
+        let _ = s.state_tx.send(handle);
+        run_link(s.clone(), handle, addr, link, None).await;
+        true
+    }
+}
+
 /// Broadcasts clipboard text to each connected peer the pairing shares it
 /// with, each on its own ephemeral uni stream. Cloneable handle over the
 /// shared connection map.
@@ -937,6 +1078,32 @@ async fn connect_to_handle(
                         let _ = refusals.send(DialRefusal::NotThePinnedMachine { handle, seen });
                     }
                     _ => match decide_trust_prompt(&seen) {
+                        // Nothing answered at the port hops listens on. An
+                        // older hops may still answer at the port it used to
+                        // (#16): asked, so the person hears why, not just
+                        // that it is unreachable.
+                        TrustPrompt::Nothing if port == DEFAULT_PORT && !addrs.is_empty() => {
+                            let ips: Vec<_> = addrs.iter().map(|a| a.ip()).collect();
+                            let refusals = refusals.clone();
+                            spawn_local(async move {
+                                let at = crate::dial_back::older_version_at(
+                                    &ips,
+                                    hops_ipc::PORT_BEFORE_V013,
+                                )
+                                .await;
+                                let refusal = at.map(|answer| match answer {
+                                    crate::dial_back::LegacyAnswer::OlderVersion(addr) => {
+                                        DialRefusal::OlderVersion { handle, addr }
+                                    }
+                                    crate::dial_back::LegacyAnswer::OldPort(addr) => {
+                                        DialRefusal::OldPort { handle, addr }
+                                    }
+                                });
+                                if let Some(refusal) = refusal {
+                                    let _ = refusals.send(refusal);
+                                }
+                            });
+                        }
                         TrustPrompt::Nothing => {}
                         TrustPrompt::Offer { addr, fp }
                             if matches!(e, LanMouseConnectionError::Forgotten) =>
@@ -1041,6 +1208,7 @@ async fn connect_to_handle(
                     send: Arc::new(Mutex::new(confirmed.send)),
                     fingerprint,
                     handle,
+                    dialled_in: false,
                 };
                 (link, Some((confirmed.recv, confirmed.commit)))
             }
@@ -1071,6 +1239,20 @@ async fn connect_to_handle(
                  switched off; closing it"
             );
             link.conn.close(0u32.into(), b"switched off");
+            connecting.lock().await.remove(&handle);
+            return Err(LanMouseConnectionError::NotConnected);
+        }
+        // Its machine dialled in to be driven while this dial ran (#15): one
+        // link per device, and the first one up keeps it.
+        if client_manager
+            .active_addr(handle)
+            .is_some_and(|a| open.contains_key(&a))
+        {
+            drop(open);
+            log::info!(
+                "client {handle}: a link to it came up while dialling {addr}; closing this one"
+            );
+            link.conn.close(0u32.into(), b"already linked");
             connecting.lock().await.remove(&handle);
             return Err(LanMouseConnectionError::NotConnected);
         }
@@ -1130,76 +1312,130 @@ async fn connect_to_handle(
         open.insert(addr, link.clone());
         drop(open);
         connecting.lock().await.remove(&handle);
-
-        // Best-effort version + capability handshake (see ProtoEvent::Hello and
-        // ProtoEvent::Capability docs). Both writes share the one send guard so
-        // the ping_pong task (spawned just below) can't wedge a Ping between
-        // them — the peer observes Hello then Capability, in order. A link that
-        // paired sent both as its confirmation, and has the answer's build.
-        let recv = match greeted {
-            Some((recv, commit)) => {
-                client_manager.set_peer_commit(handle, Some(commit));
-                let _ = state_tx.send(handle);
-                Some(recv)
-            }
-            None => None,
-        };
-        if recv.is_none() {
-            let mut send = link.send.lock().await;
-            if let Err(e) = transport::write_frame(
-                &mut send,
-                ProtoEvent::Hello {
-                    commit: local_commit(),
-                },
-            )
-            .await
-            {
-                log::debug!("hello send to {addr} failed: {e}");
-            }
-            if let Err(e) = transport::write_frame(
-                &mut send,
-                ProtoEvent::Capability {
-                    flags: local_caps(),
-                },
-            )
-            .await
-            {
-                log::debug!("capability send to {addr} failed: {e}");
-            }
-        }
-
-        spawn_local(ping_pong(
-            client_manager.clone(),
-            handle,
-            addr,
-            link.clone(),
-            conns.clone(),
-            ping_response.clone(),
-            state_tx.clone(),
-        ));
-        let clipboard = ClipboardInlet {
-            from: link.fingerprint.clone(),
-            dialled_for: Some(handle),
-            trust,
-            tx: clipboard_in,
-        };
-        spawn_local(receive_loop(
-            client_manager,
+        run_link(
+            Session {
+                client_manager,
+                conns,
+                recv_tx: tx,
+                ping_response,
+                trust,
+                clipboard_in,
+                refusals,
+                state_tx,
+            },
             handle,
             addr,
             link,
-            conns,
-            tx,
-            ping_response.clone(),
-            clipboard,
-            state_tx,
-            recv,
-            refusals,
-        ));
+            greeted,
+        )
+        .await;
         return Ok(());
     }
     connecting.lock().await.remove(&handle);
     Err(LanMouseConnectionError::NotConnected)
+}
+
+/// What a link to a machine this one drives needs once it is up, whichever
+/// machine dialled it (#15).
+#[derive(Clone)]
+struct Session {
+    client_manager: ClientManager,
+    conns: Rc<Mutex<HashMap<SocketAddr, PeerLink>>>,
+    recv_tx: Sender<(ClientHandle, ProtoEvent)>,
+    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    trust: Trust,
+    clipboard_in: Sender<PeerClipboard>,
+    refusals: Sender<DialRefusal>,
+    state_tx: Sender<ClientHandle>,
+}
+
+/// Greet the machine at the other end of `link`, recorded as `handle`'s
+/// link at `addr`, and start its ping and receive tasks. The same for a link
+/// this machine dialled and for one its peer dialled to be driven (#15): once
+/// up, a link is driven the same way whoever opened it.
+async fn run_link(
+    session: Session,
+    handle: ClientHandle,
+    addr: SocketAddr,
+    link: PeerLink,
+    greeted: Option<(RecvStream, [u8; 8])>,
+) {
+    let Session {
+        client_manager,
+        conns,
+        recv_tx: tx,
+        ping_response,
+        trust,
+        clipboard_in,
+        refusals,
+        state_tx,
+    } = session;
+
+    // Best-effort version + capability handshake (see ProtoEvent::Hello and
+    // ProtoEvent::Capability docs). Both writes share the one send guard so
+    // the ping_pong task (spawned just below) can't wedge a Ping between
+    // them — the peer observes Hello then Capability, in order. A link that
+    // paired sent both as its confirmation, and has the answer's build.
+    let recv = match greeted {
+        Some((recv, commit)) => {
+            client_manager.set_peer_commit(handle, Some(commit));
+            let _ = state_tx.send(handle);
+            Some(recv)
+        }
+        None => None,
+    };
+    if recv.is_none() {
+        let mut send = link.send.lock().await;
+        if let Err(e) = transport::write_frame(
+            &mut send,
+            ProtoEvent::Hello {
+                commit: local_commit(),
+            },
+        )
+        .await
+        {
+            log::debug!("hello send to {addr} failed: {e}");
+        }
+        if let Err(e) = transport::write_frame(
+            &mut send,
+            ProtoEvent::Capability {
+                flags: local_caps(),
+            },
+        )
+        .await
+        {
+            log::debug!("capability send to {addr} failed: {e}");
+        }
+    }
+
+    spawn_local(ping_pong(
+        client_manager.clone(),
+        handle,
+        addr,
+        link.clone(),
+        conns.clone(),
+        ping_response.clone(),
+        state_tx.clone(),
+    ));
+    let clipboard = ClipboardInlet {
+        from: link.fingerprint.clone(),
+        dialled_for: Some(handle),
+        trust,
+        tx: clipboard_in,
+    };
+    spawn_local(receive_loop(
+        client_manager,
+        handle,
+        addr,
+        link,
+        conns,
+        tx,
+        ping_response.clone(),
+        clipboard,
+        state_tx,
+        recv,
+        refusals,
+    ));
 }
 
 async fn ping_pong(
@@ -1517,6 +1753,14 @@ async fn disconnect(
         }
     };
     log::warn!("client ({handle}) @ {addr} connection closed");
+    // The device's link is another one by now: a link its machine dialled
+    // again replaced this one (#15). What the device shows is that link's.
+    if client_manager
+        .active_addr(handle)
+        .is_some_and(|current| current != addr)
+    {
+        return;
+    }
     let was_up = client_manager.active_addr(handle).is_some();
     client_manager.set_active_addr(handle, None);
     // `alive` is only ever SET from the pong path, so without clearing it here

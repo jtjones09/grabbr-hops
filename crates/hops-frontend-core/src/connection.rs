@@ -47,6 +47,9 @@ pub enum Connection {
     /// with none of this machine's own up since. A link the device opened
     /// in does not clear it: that is the other direction.
     Unreachable,
+    /// Paired, and the device's machine dials this one to be controlled from
+    /// here (#15): this machine never dials it, and waits for it to connect.
+    AwaitingItsDial,
     /// Paired, and no link either way, with nothing wrong known: this
     /// machine dials it when the pointer crosses to it, or waits for it to
     /// connect in.
@@ -69,7 +72,7 @@ pub enum Tone {
 
 impl Connection {
     /// Every state, for frontends and tests that show or check them all.
-    pub const ALL: [Connection; 10] = [
+    pub const ALL: [Connection; 11] = [
         Connection::ServiceGone,
         Connection::NoLongerTrusts,
         Connection::ComparingNumber,
@@ -79,6 +82,7 @@ impl Connection {
         Connection::Off,
         Connection::NotPaired,
         Connection::Unreachable,
+        Connection::AwaitingItsDial,
         Connection::NotConnected,
     ];
 
@@ -97,16 +101,23 @@ impl Connection {
         // then the switch here; then a crossing that found no link; only then
         // the inbound link. What the other machine does in its direction
         // never hides a fact about this one (#92).
-        match (f.service, f.removed_by_peer, f.standing, f.send, f.inbound) {
-            (false, _, _, _, _) => C::ServiceGone,
+        match (
+            f.service,
+            f.removed_by_peer,
+            f.standing,
+            f.send,
+            f.inbound,
+            f.dials_us,
+        ) {
+            (false, _, _, _, _, _) => C::ServiceGone,
             // That machine refuses this one outright: no link, switch or
             // pairing here changes that, and the card must say what does.
-            (true, true, _, _, _) => C::NoLongerTrusts,
-            (true, false, _, On(Up { accepting: false }), _) => C::NotAcceptingInput,
+            (true, true, _, _, _, _) => C::NoLongerTrusts,
+            (true, false, _, On(Up { accepting: false }), _, _) => C::NotAcceptingInput,
             // The number of a pairing in progress is on its own card; the dot
             // says whether input gets through the link that is up.
-            (true, false, _, On(Up { accepting: true }), _) => C::Connected,
-            (true, false, Pairing(OnScreen), SendFacet::None | Off | On(Down { .. }), _) => {
+            (true, false, _, On(Up { accepting: true }), _, _) => C::Connected,
+            (true, false, Pairing(OnScreen), SendFacet::None | Off | On(Down { .. }), _, _) => {
                 C::ComparingNumber
             }
             (
@@ -115,20 +126,27 @@ impl Connection {
                 Pairing(NotYet | Answered),
                 SendFacet::None | Off | On(Down { .. }),
                 _,
+                _,
             ) => C::AwaitingOtherMachine,
             // A device switched off here stays connected in when its own
             // pairing lets it drive this machine; the switch is still said.
-            (true, false, NotPaired | Paired, Off, _) => C::Off,
+            (true, false, NotPaired | Paired, Off, _, _) => C::Off,
+            // A device whose machine dials this one is waited for, not
+            // unreachable: this machine never dials it (#15).
+            (true, false, Paired, On(Down { unanswered: true }), _, true) => C::AwaitingItsDial,
             // So is a dial that failed while the other machine's link in is
             // up: one direction can be blocked while the other gets through.
-            (true, false, Paired, On(Down { unanswered: true }), _) => C::Unreachable,
-            (true, false, NotPaired, SendFacet::None | On(Down { .. }), true) => C::Connected,
-            (true, false, Paired, SendFacet::None | On(Down { unanswered: false }), true) => {
+            (true, false, Paired, On(Down { unanswered: true }), _, false) => C::Unreachable,
+            (true, false, NotPaired, SendFacet::None | On(Down { .. }), true, _) => C::Connected,
+            (true, false, Paired, SendFacet::None | On(Down { unanswered: false }), true, _) => {
                 C::Connected
             }
-            (true, false, NotPaired, On(Down { .. }), false) => C::NotPaired,
-            (true, false, Paired, On(Down { unanswered: false }), false) => C::NotConnected,
-            (true, false, NotPaired | Paired, SendFacet::None, false) => C::NotConnected,
+            (true, false, NotPaired, On(Down { .. }), false, _) => C::NotPaired,
+            (true, false, Paired, On(Down { unanswered: false }), false, true) => {
+                C::AwaitingItsDial
+            }
+            (true, false, Paired, On(Down { unanswered: false }), false, false) => C::NotConnected,
+            (true, false, NotPaired | Paired, SendFacet::None, false, _) => C::NotConnected,
         }
     }
 
@@ -141,7 +159,10 @@ impl Connection {
             | Connection::AwaitingOtherMachine
             | Connection::NotPaired
             | Connection::Unreachable => Tone::Warn,
-            Connection::ServiceGone | Connection::Off | Connection::NotConnected => Tone::Quiet,
+            Connection::ServiceGone
+            | Connection::Off
+            | Connection::AwaitingItsDial
+            | Connection::NotConnected => Tone::Quiet,
         }
     }
 
@@ -160,6 +181,7 @@ impl Connection {
             Connection::Off => "off",
             Connection::NotPaired => "not paired",
             Connection::Unreachable => "unreachable",
+            Connection::AwaitingItsDial => "waiting for it to dial",
             Connection::NotConnected => "not connected",
         }
     }
@@ -180,6 +202,9 @@ pub struct Facts {
     /// The device's machine refused this one as a machine it holds no
     /// pairing with, and no link to it has come up since (#184).
     pub removed_by_peer: bool,
+    /// The device's machine dials this one to be controlled from here, so
+    /// this machine waits for it rather than dialling it (#15).
+    pub dials_us: bool,
 }
 
 /// Where the pairing with a device stands.
@@ -254,13 +279,16 @@ mod tests {
                 for send in sends {
                     for inbound in [false, true] {
                         for removed_by_peer in [false, true] {
-                            all.push(Facts {
-                                service,
-                                standing,
-                                send,
-                                inbound,
-                                removed_by_peer,
-                            });
+                            for dials_us in [false, true] {
+                                all.push(Facts {
+                                    service,
+                                    standing,
+                                    send,
+                                    inbound,
+                                    removed_by_peer,
+                                    dials_us,
+                                });
+                            }
                         }
                     }
                 }
@@ -273,13 +301,13 @@ mod tests {
         matches!(f.send, SendFacet::On(Link::Up { .. }))
     }
 
-    // LEDGER T148-1 | class B | 1 return value: Connection::of over every Facts
+    // LEDGER T148-1 | class B | 1 return value: Connection::of over every Facts (T12: extended with dials_us, #15)
     #[test]
     fn every_combination_of_facts_keeps_every_rule() {
         let all = every();
         assert_eq!(
             all.len(),
-            2 * 5 * 6 * 2 * 2,
+            2 * 5 * 6 * 2 * 2 * 2,
             "the enumeration missed a value"
         );
         for f in all {
@@ -318,13 +346,26 @@ mod tests {
             if paired_or_not && f.send == SendFacet::Off {
                 assert_eq!(c, Connection::Off, "the switch is masked: {why}");
             }
+            // For a device whose machine dials this one, the crossing found
+            // it not yet connected, which is what its state already says.
             if f.standing == Standing::Paired
                 && f.send == SendFacet::On(Link::Down { unanswered: true })
             {
-                assert_eq!(
-                    c,
-                    Connection::Unreachable,
-                    "the failed dial is masked: {why}"
+                let expected = if f.dials_us {
+                    Connection::AwaitingItsDial
+                } else {
+                    Connection::Unreachable
+                };
+                assert_eq!(c, expected, "the failed dial is masked: {why}");
+            }
+            // Waiting for it to connect is said only of a paired device
+            // that dials this machine, with this machine's link to it down
+            // (#15): never of one this machine dials, and never over a
+            // link that is up.
+            if c == Connection::AwaitingItsDial {
+                assert!(
+                    f.dials_us && f.standing == Standing::Paired && !link_up(&f),
+                    "waiting for a device that does not dial in: {why}"
                 );
             }
             // Green only with a live link, one way or the other (#34, #156).
@@ -342,6 +383,13 @@ mod tests {
                     (Standing::Pairing(Number::OnScreen), _, _) => Connection::ComparingNumber,
                     (Standing::Pairing(_), _, _) => Connection::AwaitingOtherMachine,
                     (_, SendFacet::Off, _) => Connection::Off,
+                    // A device that dials this machine is waited for,
+                    // not unreachable: this machine never dials it (#15).
+                    (_, SendFacet::On(Link::Down { unanswered: true }), _)
+                        if f.standing == Standing::Paired && f.dials_us =>
+                    {
+                        Connection::AwaitingItsDial
+                    }
                     (_, SendFacet::On(Link::Down { unanswered: true }), _)
                         if f.standing == Standing::Paired =>
                     {
@@ -349,6 +397,9 @@ mod tests {
                     }
                     (_, _, true) => Connection::Connected,
                     (Standing::NotPaired, SendFacet::On(_), _) => Connection::NotPaired,
+                    (Standing::Paired, SendFacet::On(Link::Down { .. }), false) if f.dials_us => {
+                        Connection::AwaitingItsDial
+                    }
                     _ => Connection::NotConnected,
                 };
                 assert_eq!(c, expected, "{f:?}");

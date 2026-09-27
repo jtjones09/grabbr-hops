@@ -169,7 +169,17 @@ pub enum IpcError {
     Listen(#[from] IpcListenerCreationError),
 }
 
-pub const DEFAULT_PORT: u16 = 4242;
+/// The QUIC port hops listens on unless configured otherwise (#16).
+///
+/// 4722 ("GRAB" on a phone keypad) since v0.13, which moved it in the same
+/// breaking change that lets a controlled machine dial out (#15). Above 1024,
+/// so either machine binds it without privileges.
+pub const DEFAULT_PORT: u16 = 4722;
+
+/// The port hops v0.12 and earlier listened on. Nothing listens here now: a
+/// dial that finds no answer on [`DEFAULT_PORT`] asks here only whether an
+/// older hops answers, to say so.
+pub const PORT_BEFORE_V013: u16 = 4242;
 
 /// How the service's [`FrontendEvent::Error`] begins when it made a change and
 /// could not save the config, so the change is gone when it restarts. Shared
@@ -394,6 +404,12 @@ pub struct ClientState {
     /// to remove it. Cleared once a link to it is up again.
     #[serde(default)]
     pub removed_by_peer: bool,
+    /// The device's machine dials this one to be driven by it (#15): this
+    /// machine never dials it, and waits for it to connect. Set for a device
+    /// with no address that is pinned to its machine, and for one whose
+    /// machine dialled in since the service started.
+    #[serde(default)]
+    pub dials_us: bool,
 }
 
 /// Who caused a connection attempt to be raised.

@@ -102,6 +102,11 @@ impl ClientManager {
             // seed the pin from config so the device view can join this client to
             // its authorized_fingerprints entry from a COLD START, and so the
             // fail-closed dial pin survives a restart
+            // A device with no address, pinned to its machine, is one that
+            // dials this machine to be driven (#15): nothing else reaches it.
+            dials_us: config.hostname.is_none()
+                && config.fix_ips.is_empty()
+                && config_client.fingerprint.is_some(),
             peer_fingerprint: config_client.fingerprint,
             ..Default::default()
         };
@@ -476,6 +481,18 @@ impl ClientManager {
         match self.clients.borrow_mut().get_mut(handle) {
             Some((_, s)) if s.removed_by_peer != removed => {
                 s.removed_by_peer = removed;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the machine `handle` is pinned to dials this one to be driven
+    /// by it (#15). `true` when that changed.
+    pub(crate) fn set_dials_us(&self, handle: ClientHandle, dials_us: bool) -> bool {
+        match self.clients.borrow_mut().get_mut(handle) {
+            Some((_, s)) if s.dials_us != dials_us => {
+                s.dials_us = dials_us;
                 true
             }
             _ => false,

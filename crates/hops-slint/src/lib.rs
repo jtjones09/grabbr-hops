@@ -200,7 +200,15 @@ fn device_rows(m: &AppModel) -> Vec<DeviceRow> {
                                 .next()
                                 .map(|ip| format!("{ip}:{}", s.config.port))
                         })
-                        .unwrap_or_else(|| "unresolved".into());
+                        // A device with no address that dials this machine (#15).
+                        .unwrap_or_else(|| {
+                            if s.state.dials_us {
+                                "dials in"
+                            } else {
+                                "unresolved"
+                            }
+                            .into()
+                        });
                     (
                         s.handle.to_string(),
                         addr,
@@ -1777,7 +1785,9 @@ mod adding_a_device {
     #[test]
     fn the_card_for_our_dial_names_the_device_and_a_knock_names_none() {
         const FP: &str = "1e:19:1b:2c:3d:4e:5f:60:71:82:93:a4:b5:c6:d7:e8";
-        let answered: std::net::SocketAddr = "192.0.2.7:4242".parse().expect("addr");
+        // The device's port is the default; the machine answers there.
+        let port = hops_ipc::DEFAULT_PORT;
+        let answered = std::net::SocketAddr::from(([192, 0, 2, 7], port));
         let shown = |origin| {
             let mut m = AppModel::default();
             m.apply(FrontendEvent::Created(
@@ -1805,7 +1815,10 @@ mod adding_a_device {
         };
         let ours = shown(AttemptOrigin::OutboundDial);
         assert!(
-            ours.pairing_from_our_dial && ours.pairing_dialled.contains("desk-mac.local:4242"),
+            ours.pairing_from_our_dial
+                && ours
+                    .pairing_dialled
+                    .contains(&format!("desk-mac.local:{port}")),
             "the card for this machine's own dial does not name the device: {:?}",
             ours.pairing_dialled
         );
