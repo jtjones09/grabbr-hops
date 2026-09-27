@@ -9,11 +9,11 @@
 //!
 //! * [`FrontendRequest::AuthorizeKey`] approves a pairing prompt the daemon
 //!   raised: a machine that connected while add device was open, or one the
-//!   daemon dialled then. The approval is shaped by how that machine
-//!   arrived, and with no prompt waiting it grants nothing. A prompt is
-//!   forgotten when the pairing window closes. An approval lets the two
-//!   machines connect far enough to compare a number, and grants nothing
-//!   more until both confirm it.
+//!   daemon dialled then. It carries the answers given on the card: which
+//!   way control goes, and whether to share the clipboard. With no prompt
+//!   waiting it grants nothing. A prompt is forgotten when the pairing
+//!   window closes. An approval lets the two machines connect far enough to
+//!   compare a number, and grants nothing more until both confirm it.
 //! * [`FrontendRequest::ConfirmPairing`] answers that number: confirmed here
 //!   and on the other machine, the approval becomes a pairing (#167).
 //! * [`FrontendRequest::EnableClipboard`] turns a paired machine's clipboard
@@ -519,6 +519,39 @@ pub struct PeerTrust {
     pub pending: bool,
 }
 
+/// Which way control goes between two paired machines, as the person
+/// approving the pairing says on its card (#220), from this machine's side.
+///
+/// Asked, never inferred: which machine dialled which says nothing about
+/// which one a person means to control the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Controller {
+    /// This machine controls that one.
+    ThisMachine,
+    /// That machine controls this one.
+    ThatMachine,
+    /// Each controls the other.
+    Both,
+}
+
+impl Controller {
+    /// All three answers, in the order a card offers them.
+    pub const ALL: [Controller; 3] = [
+        Controller::ThisMachine,
+        Controller::ThatMachine,
+        Controller::Both,
+    ];
+
+    /// The answer as a card words it, the same in every frontend.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Controller::ThisMachine => "This machine controls that one",
+            Controller::ThatMachine => "That machine controls this one",
+            Controller::Both => "Each controls the other",
+        }
+    }
+}
+
 /// What a person compares to finish a pairing (#11).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PairingCheck {
@@ -627,12 +660,23 @@ pub enum FrontendRequest {
     EnableEmulation,
     /// synchronize all state
     Sync,
-    /// Approve the pairing prompt the daemon raised for this fingerprint:
-    /// (description, fingerprint). What it grants is shaped by how that
-    /// machine arrived, never by this request, and with no prompt waiting it
-    /// grants nothing. Refused while a peer drives this machine. One of the
-    /// two requests that widen trust; see the crate docs.
-    AuthorizeKey(String, String),
+    /// Approve the pairing prompt the daemon raised for `fingerprint`, with
+    /// the two answers the person approving gave on its card: which way
+    /// control goes (#220), and whether the two machines share a clipboard
+    /// (#182). The pairing grants exactly those directions, and a clipboard
+    /// only on a yes. With no prompt waiting it grants nothing. Refused while
+    /// a peer drives this machine. One of the requests that widen trust; see
+    /// the crate docs.
+    AuthorizeKey {
+        /// What to call the machine.
+        label: String,
+        fingerprint: String,
+        /// Which machine controls which.
+        controller: Controller,
+        /// Share the clipboard, in the directions control goes. No unless
+        /// the person said yes.
+        clipboard: bool,
+    },
     /// remove fingerprint (fingerprint)
     RemoveAuthorizedKey(String),
     /// rename an ALREADY-authorized device: (fingerprint, label)

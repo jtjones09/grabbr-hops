@@ -345,7 +345,7 @@ fn a_write_verb_for_a_device_that_does_not_exist_fails_and_says_so() {
 fn a_grant_nobody_asked_for_fails_with_the_reason() {
     let d = Daemon::start("grant", "");
     let fp = ["ab"; 32].join(":");
-    let out = d.cli(&["authorize-key", "desk mac", &fp]);
+    let out = d.cli(&["authorize-key", "desk mac", &fp, "--controller", "that"]);
     assert!(
         !out.status.success(),
         "no device asked to pair, so nothing was granted, and the command \
@@ -363,7 +363,7 @@ fn a_grant_nobody_asked_for_fails_with_the_reason() {
     let gone = ["ef"; 32].join(":");
     ok(&d, &["remove-authorized-key", &gone]);
     for (why, fp) in [("removed", gone.as_str()), ("valid", "not-a-fingerprint")] {
-        let out = d.cli(&["authorize-key", "desk mac", fp]);
+        let out = d.cli(&["authorize-key", "desk mac", fp, "--controller", "that"]);
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(
             !out.status.success() && err.contains("not done: nothing was trusted"),
@@ -534,7 +534,7 @@ fn a_grant_made_is_reported_made_when_the_config_is_not_saved() {
     let fp = d.asked_to_pair();
     // an edit in progress: the config the daemon copies trust into does not parse
     std::fs::write(&d.config, "port = 4343\n[[clients]\n").expect("an edit in progress");
-    let out = d.cli_beside(&["authorize-key", "laptop", &fp]);
+    let out = d.cli_beside(&["authorize-key", "laptop", &fp, "--controller", "that"]);
     let text = said(&out);
     assert!(
         !text.contains("nothing was trusted") && !text.contains("not trusted"),
@@ -582,7 +582,7 @@ fn a_grant_the_trust_store_could_not_save_fails_and_says_it_is_in_effect() {
         eprintln!("this user writes to read-only directories: skipped");
         return;
     };
-    let out = d.cli_beside(&["authorize-key", "laptop", &fp]);
+    let out = d.cli_beside(&["authorize-key", "laptop", &fp, "--controller", "that"]);
     let text = said(&out);
     assert!(
         !text.contains("nothing was trusted"),

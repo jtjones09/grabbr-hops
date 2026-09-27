@@ -893,7 +893,11 @@ mod tests {
     /// body — and the body here is a REAL AuthorizeKey, so a regression is loud.
     #[tokio::test]
     async fn an_http_post_from_a_browser_is_refused() {
-        let body = r#"{"AuthorizeKey":["attacker","aa:bb:cc:dd"]}"#;
+        let body = r#"{"AuthorizeKey":{"label":"attacker","fingerprint":"aa:bb:cc:dd","controller":"ThatMachine","clipboard":true}}"#;
+        assert!(
+            serde_json::from_str::<crate::FrontendRequest>(body).is_ok(),
+            "the body must be a request the daemon would honour, or this proves nothing"
+        );
         let got = drive(&format!(
             "POST / HTTP/1.1\r\nHost: 127.0.0.1:5252\r\n\
              Content-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}\n",

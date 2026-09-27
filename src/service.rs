@@ -197,14 +197,11 @@ pub struct Service {
     /// paired, dialled every second until they connect, with when that began.
     /// Without it a new device is only dialled when the pointer crosses to it.
     adding: HashMap<ClientHandle, Instant>,
-    /// Pairings approved here whose number is not yet shown, with when and
-    /// where from. One that shows no number within the pairing window is
-    /// forgotten, so it cannot summon a number card later (#195).
-    approved: HashMap<String, (Instant, Option<SocketAddr>)>,
-    /// Approvals above whose machine knocked to drive this one while this
-    /// one adds it: both machines are adding each other, and each approved
-    /// itself as the one in control, so neither door admits the other.
-    crossed: HashSet<String>,
+    /// Pairings approved here and not yet confirmed on both machines, with
+    /// when, where from, and whether that machine knocked here. One that has
+    /// no number on screen once the pairing window has passed is forgotten,
+    /// so it cannot summon a number card later (#195).
+    approved: HashMap<String, Approved>,
     /// Pairings whose number is on screen here, until both machines confirm
     /// or the attempt ends (#11, #167).
     ceremonies: HashMap<String, Ceremony>,
@@ -292,6 +289,8 @@ struct Incoming {
 #[derive(Debug, Clone)]
 struct Ceremony {
     role: crate::pairing::Role,
+    /// The connection the number was compared on.
+    conn: usize,
     /// The number this machine arrived at.
     number: String,
     /// What a machine being added offers: the number among two others.
@@ -397,33 +396,36 @@ pub(crate) enum GrantRefused {
     Store(#[from] crate::trust::TrustError),
 }
 
-/// The grant an approved prompt makes, shaped by how the peer arrived.
+/// The grant an approved prompt makes: what the person approving answered
+/// on its card (#220, #182).
 ///
-/// An unsolicited knock is the user answering "may this machine drive mine":
-/// INBOUND. Our own dial is the user answering "may I drive that machine":
-/// OUTBOUND. Granting INBOUND for both is exactly the defect the direction
-/// split exists to remove, and it hid in the grant door because the split was
-/// built in the store and never wired to it.
+/// Which way control goes is asked, and never inferred from how the other
+/// machine arrived: a knock here and a dial from here can each be approved
+/// in any direction, and the lease drives in exactly the one chosen, recorded
+/// as the origin the store checks. The clipboard is shared, the way control
+/// goes, only on a yes.
 ///
-/// Unknown provenance grants nothing. A grant with no prompt behind it is the
-/// case worth failing closed on.
+/// An attempt is still required. A grant with no prompt behind it is the case
+/// worth failing closed on.
 ///
-/// Through [`crate::trust::TrustStore::issue`], which takes no term, so the
-/// grant does not lapse (#183). Out of `Service::add_authorized_key` so a test
-/// can run the grant itself without standing up a daemon.
+/// Through [`crate::trust::TrustStore::issue_answered`], which takes no term,
+/// so the grant does not lapse (#183). Out of `Service::add_authorized_key`
+/// so a test can run the grant itself without standing up a daemon.
 pub(crate) fn grant_for_attempt(
     trust: &mut crate::trust::TrustStore,
     fingerprint: &str,
     label: &str,
     origin: Option<AttemptOrigin>,
+    controller: hops_ipc::Controller,
+    clipboard: bool,
 ) -> Result<crate::trust::Caps, GrantRefused> {
-    let caps = match origin {
-        Some(AttemptOrigin::Inbound) => crate::trust::Caps::INBOUND,
-        Some(AttemptOrigin::OutboundDial) => crate::trust::Caps::OUTBOUND,
-        None => return Err(GrantRefused::NoAttempt),
-    };
-    trust.issue(fingerprint, label, caps)?;
-    Ok(caps)
+    if origin.is_none() {
+        return Err(GrantRefused::NoAttempt);
+    }
+    trust.issue_answered(fingerprint, label, controller, clipboard)?;
+    Ok(trust
+        .lease(fingerprint)
+        .map_or(crate::trust::Caps::NONE, |l| l.caps))
 }
 
 /// Where a device being added stands, for [`adding_verdict`].
@@ -440,9 +442,16 @@ struct Adding {
     /// This machine approved the machine that answered, which has not
     /// approved this one back (#167).
     approved_here: bool,
-    /// The other machine is adding this one too, and approved itself as the
-    /// one in control, as this machine did.
-    crossed: bool,
+}
+
+/// An approval here waiting for its pairing to finish.
+#[derive(Debug, Clone, Copy)]
+struct Approved {
+    at: Instant,
+    /// Where the attempt approved came from.
+    addr: Option<SocketAddr>,
+    /// That machine knocked here, rather than this machine dialling it.
+    knocked: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -465,8 +474,6 @@ enum GaveUp {
     NotPaired,
     /// This machine approved; the other never did.
     NotApprovedThere,
-    /// Both machines added each other and approved themselves in control.
-    BothAdding,
 }
 
 impl GaveUp {
@@ -480,12 +487,6 @@ impl GaveUp {
                 "Pairing with {name} did not finish in two minutes: this machine approved \
                  it, and {name} never approved this one. Open add device on {name}, then \
                  switch {name} off and on here to try again."
-            ),
-            GaveUp::BothAdding => format!(
-                "Pairing with {name} did not finish in two minutes: {name} was adding this \
-                 machine at the same time, so each machine approved itself as the one in \
-                 control. Switch the device off on one machine, then switch it off and on \
-                 on the other to add it from there."
             ),
         }
     }
@@ -504,9 +505,7 @@ fn adding_verdict(a: Adding) -> AddVerdict {
         if a.linked {
             return AddVerdict::Done;
         }
-        return AddVerdict::GaveUp(if a.crossed {
-            GaveUp::BothAdding
-        } else if a.approved_here {
+        return AddVerdict::GaveUp(if a.approved_here {
             GaveUp::NotApprovedThere
         } else {
             GaveUp::NotPaired
@@ -554,6 +553,10 @@ fn ended_notice(name: &str, why: &crate::pairing::Why, answered_adding: bool) ->
         Why::Failed(e) => {
             format!("Pairing with {name} failed ({e}), so nothing was trusted.{stranded}")
         }
+        // Not an end: `Service::pairing_ended` says nothing for it.
+        Why::Withdrawn => format!(
+            "Pairing with {name} goes on over the other connection between the two machines."
+        ),
     }
 }
 
@@ -739,6 +742,9 @@ impl Service {
         // and the attempts each holds for a machine mid-pairing (#167)
         let pairings_in = listener.pairings();
         let pairing_events_in = listener.take_pairing_events();
+        // One board for both, so a machine dialled while it dials holds one
+        // attempt, not two (#220).
+        conn.share_pairings(pairings_in.clone());
         let pairings_out = conn.pairings();
         let pairing_events_out = conn.take_pairing_events();
 
@@ -780,7 +786,6 @@ impl Service {
             pairing_skew: Default::default(),
             adding: HashMap::new(),
             approved: HashMap::new(),
-            crossed: HashSet::new(),
             ceremonies: HashMap::new(),
             pairings_in,
             pairing_events_in,
@@ -987,11 +992,16 @@ impl Service {
                 }
                 self.save_config();
             }
-            FrontendRequest::AuthorizeKey(desc, fp) => {
+            FrontendRequest::AuthorizeKey {
+                label,
+                fingerprint,
+                controller,
+                clipboard,
+            } => {
                 if self.refuse_while_remotely_driven(hops_ipc::GRANT_REFUSED, "grant trust") {
                     return;
                 }
-                self.add_authorized_key(desc, fp);
+                self.add_authorized_key(label, fingerprint, controller, clipboard);
                 self.save_config();
             }
             FrontendRequest::ChangePort(port) => self.change_port(port),
@@ -1631,7 +1641,13 @@ impl Service {
         self.frontend_event_pending.notify_one();
     }
 
-    fn add_authorized_key(&mut self, desc: String, fp: String) {
+    fn add_authorized_key(
+        &mut self,
+        desc: String,
+        fp: String,
+        controller: hops_ipc::Controller,
+        clipboard: bool,
+    ) {
         // Canonicalise BEFORE the tombstone lookup. The check below is an exact
         // map lookup, so an uppercased spelling of an expelled fingerprint used
         // to miss it — and `Config::authorized_fingerprints` then folded that
@@ -1667,8 +1683,8 @@ impl Service {
             )));
             return;
         }
-        // Shaped by how the peer arrived; see `grant_for_attempt`. A prompt
-        // whose pairing window has closed grants nothing.
+        // What the card was answered; see `grant_for_attempt`. A prompt whose
+        // pairing window has closed grants nothing.
         let now = self.pairing_now();
         let attempt = self.pending_attempts.take(&self.prompt_gate, &fp, now);
         let origin = attempt.map(|a| a.origin);
@@ -1677,7 +1693,7 @@ impl Service {
         // its match set without failing anything.
         let issued = {
             let mut trust = self.trust.write().expect("lock");
-            grant_for_attempt(&mut trust, &fp, &desc, origin)
+            grant_for_attempt(&mut trust, &fp, &desc, origin, controller, clipboard)
         };
         if let Err(e) = issued {
             log::warn!("refusing to authorize {fp}: {e}");
@@ -1711,43 +1727,17 @@ impl Service {
                 "approved {}: pairing finishes once both machines confirm the number",
                 named(&stored, &fp)
             );
-            self.approved
-                .insert(fp.clone(), (Instant::now(), attempt.and_then(|a| a.addr)));
+            self.approved.insert(
+                fp.clone(),
+                Approved {
+                    at: Instant::now(),
+                    addr: attempt.and_then(|a| a.addr),
+                    knocked: origin == Some(AttemptOrigin::Inbound),
+                },
+            );
         }
         self.persist_trust(format!("trusting {}", named(&stored, &fp)));
         self.publish_trust();
-    }
-
-    /// A knock from `fp`, which asks to drive this machine, while this
-    /// machine waits to drive `fp`: that machine is adding this one while
-    /// this one adds it, and each approved itself as the one in control.
-    /// Neither door admits the other, so no number can appear until both
-    /// approvals lapse. Said once, when it is first seen, rather than two
-    /// minutes later as a failure of the other machine to approve. Choosing
-    /// the direction on the card is what ends this (#220).
-    fn note_crossed(&mut self, fp: &str) {
-        if !self.approved.contains_key(fp) || self.crossed.contains(fp) {
-            return;
-        }
-        let (adding_it, label) = {
-            let trust = self.trust.read().expect("lock");
-            (
-                trust.awaits(fp, crate::trust::Caps::I_MAY_DRIVE),
-                trust.label(fp).unwrap_or_default(),
-            )
-        };
-        if !adding_it {
-            return;
-        }
-        self.crossed.insert(fp.to_string());
-        let name = named(&label, fp);
-        log::info!("{name} is adding this machine while this machine adds it");
-        self.notify_frontend(FrontendEvent::Error(format!(
-            "{name} is adding this machine at the same time as this machine adds it, so \
-             each approved itself as the one in control and the pairing cannot finish. \
-             Both approvals lapse within two minutes; then add the device from one \
-             machine only."
-        )));
     }
 
     /// A dial that ended in a way the person here may need telling about.
@@ -1927,13 +1917,8 @@ impl Service {
             return;
         }
         // Approved here already, and waiting for its number: the request was
-        // answered, and a second prompt for it would only confuse. Covers the
-        // machine being added dialling the one adding it, too, which the TLS
-        // doors refuse in that direction (#167).
+        // answered, and a second prompt for it would only confuse (#167).
         if self.trust.read().expect("lock").is_pairing(&fingerprint) {
-            if origin == AttemptOrigin::Inbound {
-                self.note_crossed(&fingerprint);
-            }
             log::debug!("{fingerprint} is mid-pairing here; no prompt for its {origin:?} attempt");
             return;
         }
@@ -2227,13 +2212,15 @@ impl Service {
                 role,
                 number,
                 handle,
-            } => self.show_pairing_number(fingerprint, addr, role, number, handle),
+                conn,
+            } => self.show_pairing_number(fingerprint, addr, role, number, handle, conn),
             PairingEvent::PeerConfirmed { fingerprint } => self.settle_pairing(fingerprint),
             PairingEvent::Ended {
                 fingerprint,
                 why,
                 handle,
-            } => self.pairing_ended(fingerprint, why, handle),
+                conn,
+            } => self.pairing_ended(fingerprint, why, handle, conn),
         }
     }
 
@@ -2246,15 +2233,16 @@ impl Service {
         role: crate::pairing::Role,
         number: String,
         handle: Option<ClientHandle>,
+        conn: usize,
     ) {
         use crate::pairing::Role;
         // The add dial stops once the comparison started: it has its own
-        // deadline from here.
+        // deadline from here. The approval stays until the pairing finishes
+        // or ends: the number can move to another connection between the two
+        // machines (#220), and it is bounded by the pairing window meanwhile.
         if let Some(h) = handle {
             self.adding.remove(&h);
         }
-        self.approved.remove(&fp);
-        self.crossed.remove(&fp);
         // Removed or cancelled here since it was approved: nothing to show.
         if !self.trust.read().expect("lock").is_pairing(&fp) {
             log::info!("{fp}: its number arrived after the pairing ended here");
@@ -2300,6 +2288,7 @@ impl Service {
         }
         let ceremony = Ceremony {
             role,
+            conn,
             number,
             choices,
             addr,
@@ -2386,7 +2375,8 @@ impl Service {
             self.forget_pairing(&fp);
             return;
         }
-        self.ceremonies.remove(&fp);
+        let at = self.ceremonies.remove(&fp).map(|c| c.addr.ip());
+        self.approved.remove(&fp);
         self.pairings_in.settled(&fp);
         self.pairings_out.settled(&fp);
         let label = self
@@ -2398,10 +2388,26 @@ impl Service {
         log::info!("paired with {}", named(&label, &fp));
         self.persist_trust(format!("pairing with {}", named(&label, &fp)));
         self.publish_trust();
+        let unreachable = self.trust.read().expect("lock").we_may_drive(&fp)
+            && self.client_manager.every_pinned_to(&fp).is_empty()
+            && !self
+                .client_manager
+                .get_client_states()
+                .iter()
+                .any(|(_, _, s)| at.is_some_and(|ip| s.ips.contains(&ip)));
+        let name = named(&label, &fp);
         self.notify_frontend(FrontendEvent::PairingEnded {
             fingerprint: fp,
             paired: true,
         });
+        // This machine may control that one, and has no device to dial it
+        // at: only the machine in control dials, so say what is missing.
+        if unreachable {
+            self.notify_frontend(FrontendEvent::Activity(format!(
+                "Paired with {name}. To control it from this machine, add it here as a \
+                 device at its address."
+            )));
+        }
     }
 
     /// An attempt ended on its own: closed, out of time, or a peer that
@@ -2412,7 +2418,26 @@ impl Service {
         fp: String,
         why: crate::pairing::Why,
         handle: Option<ClientHandle>,
+        conn: usize,
     ) {
+        // An attempt on a connection other than the one whose number is on
+        // screen: the pairing goes on there.
+        if self.ceremonies.get(&fp).is_some_and(|c| c.conn != conn) {
+            log::debug!("pairing with {fp}: a connection it no longer uses ended ({why:?})");
+            return;
+        }
+        // The other machine keeps the comparison on another connection
+        // between the two: nothing ended, and the approval stays for it.
+        if why == crate::pairing::Why::Withdrawn {
+            log::info!("pairing with {fp}: the other machine compares on another connection");
+            if self.ceremonies.remove(&fp).is_some() {
+                self.notify_frontend(FrontendEvent::PairingEnded {
+                    fingerprint: fp,
+                    paired: false,
+                });
+            }
+            return;
+        }
         if let Some(h) = handle {
             self.adding.remove(&h);
         }
@@ -2474,7 +2499,6 @@ impl Service {
     /// pairing is never touched. Its label when one was dropped.
     fn forget_pairing(&mut self, fp: &str) -> Option<String> {
         self.approved.remove(fp);
-        self.crossed.remove(fp);
         let label = self
             .trust
             .read()
@@ -2498,22 +2522,16 @@ impl Service {
     /// chose (#195).
     fn forget_unstarted_pairings(&mut self) {
         let now = Instant::now();
-        let stale: Vec<String> = self
+        let stale = self
             .approved
             .iter()
-            .filter(|(fp, (at, _))| {
-                now.saturating_duration_since(*at) >= PromptGate::WINDOW
+            .filter(|(fp, a)| {
+                now.saturating_duration_since(a.at) >= PromptGate::WINDOW
                     && !self.ceremonies.contains_key(*fp)
             })
-            .map(|(fp, _)| fp.clone())
-            .collect();
-        for fp in stale {
-            let being_added = self
-                .trust
-                .read()
-                .expect("lock")
-                .lease(&fp)
-                .is_some_and(|l| l.origin == crate::trust::Origin::Inbound);
+            .map(|(fp, a)| (fp.clone(), a.knocked))
+            .collect::<Vec<_>>();
+        for (fp, being_added) in stale {
             let Some(label) = self.forget_pairing(&fp) else {
                 continue;
             };
@@ -2768,8 +2786,7 @@ impl Service {
                 linked: self.client_manager.active_addr(handle).is_some(),
                 waited: now.saturating_duration_since(started),
                 window_open,
-                approved_here: self.approved_for(handle, false),
-                crossed: self.approved_for(handle, true),
+                approved_here: self.approved_for(handle),
             });
             match verdict {
                 AddVerdict::Dial => {
@@ -2799,12 +2816,11 @@ impl Service {
     }
 
     /// Whether this machine approved the machine that answered a dial for
-    /// device `handle`, and that pairing waits for the other machine; only
-    /// one that machine crossed, when `crossed`.
-    fn approved_for(&self, handle: ClientHandle, crossed: bool) -> bool {
-        self.approved.iter().any(|(fp, (_, addr))| {
-            (!crossed || self.crossed.contains(fp))
-                && addr.is_some_and(|a| self.client_manager.targets(handle, a))
+    /// device `handle`, and that pairing waits for the other machine.
+    fn approved_for(&self, handle: ClientHandle) -> bool {
+        self.approved.values().any(|a| {
+            a.addr
+                .is_some_and(|addr| self.client_manager.targets(handle, addr))
         })
     }
 
@@ -3853,8 +3869,12 @@ mod the_app_cannot_approve_a_prompt_after_its_window_closed {
                     // Inside the window, on the moved clock: approved, and
                     // paired once both machines confirm the number (#167).
                     clock.advance(PromptGate::WINDOW / 2);
-                    app.exchange(&[R::AuthorizeKey("early".to_owned(), early_fp.clone())])
-                        .await;
+                    app.exchange(&[crate::test_harness::approval(
+                        "early",
+                        &early_fp,
+                        hops_ipc::Controller::ThatMachine,
+                    )])
+                    .await;
                     let comparing = compare_number(&mut app, &early, port, &ours).await;
                     app.exchange(&[R::ConfirmPairing {
                         fingerprint: early_fp.clone(),
@@ -3881,7 +3901,11 @@ mod the_app_cannot_approve_a_prompt_after_its_window_closed {
                     // which may rightly be approved.
                     clock.advance(PromptGate::WINDOW);
                     let events = app
-                        .exchange(&[R::AuthorizeKey("late".to_owned(), late_fp.clone())])
+                        .exchange(&[crate::test_harness::approval(
+                            "late",
+                            &late_fp,
+                            hops_ipc::Controller::ThatMachine,
+                        )])
                         .await;
                     assert!(
                         !trust.read().expect("lock").is_known(&late_fp),
@@ -3919,7 +3943,6 @@ mod pairing_notices {
             waited,
             window_open: true,
             approved_here,
-            crossed: false,
         }
     }
 
@@ -3970,20 +3993,6 @@ mod pairing_notices {
             AddVerdict::Wait,
             "a device whose link came up stopped being added before its time ran out"
         );
-        let crossed = adding_verdict(Adding {
-            crossed: true,
-            ..adding(late, true)
-        });
-        assert_eq!(
-            crossed,
-            AddVerdict::GaveUp(GaveUp::BothAdding),
-            "machines that added each other were told something else"
-        );
-        let notice = GaveUp::BothAdding.notice("desk mac");
-        assert!(
-            notice.contains("at the same time") && !notice.contains("never approved"),
-            "{notice}"
-        );
     }
 
     // LEDGER G-15b | class B | 1 return value: service::ended_notice
@@ -4009,6 +4018,9 @@ mod pairing_notices {
 
 #[cfg(all(test, unix))]
 mod an_approval_before_its_number;
+
+#[cfg(all(test, unix))]
+mod asked_at_pairing;
 
 #[cfg(all(test, unix))]
 mod a_wrong_pairing_answer_is_not_a_refused_grant {
@@ -4044,8 +4056,12 @@ mod a_wrong_pairing_answer_is_not_a_refused_grant {
                         .await;
                     app.exchange(&[R::OpenPairing]).await;
                     prompt_from(&mut app, &stranger, port, &ours).await;
-                    app.exchange(&[R::AuthorizeKey("desk".to_owned(), fp.clone())])
-                        .await;
+                    app.exchange(&[crate::test_harness::approval(
+                        "desk",
+                        &fp,
+                        hops_ipc::Controller::ThatMachine,
+                    )])
+                    .await;
                     let comparing = compare_number(&mut app, &stranger, port, &ours).await;
                     let wrong = if comparing.number == "000000" {
                         "000001"

@@ -5,7 +5,7 @@
 //! save it: the device commands and `save-config` by the config, the trust
 //! commands by the trust store, which the config only copies.
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures::{Stream, StreamExt};
 
 use std::{
@@ -83,15 +83,45 @@ enum CliSubcommand {
     EnableCapture,
     /// re-enable emulation
     EnableEmulation,
-    /// authorize a public key
+    /// approve a pairing request: name the machine, and say which way
+    /// control goes and whether to share the clipboard
     AuthorizeKey {
         description: String,
         sha256_fingerprint: String,
+        /// Which machine is in control: this one, that one, or both. Asked,
+        /// never assumed (#220).
+        #[arg(long, value_enum)]
+        controller: Controller,
+        /// Share the clipboard, in the directions control goes. Off unless
+        /// given (#182).
+        #[arg(long)]
+        clipboard: bool,
     },
     /// deauthorize a public key
     RemoveAuthorizedKey { sha256_fingerprint: String },
     /// save configuration to file
     SaveConfig,
+}
+
+/// Which machine is in control, as `authorize-key --controller` takes it.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Controller {
+    /// This machine controls that one.
+    This,
+    /// That machine controls this one.
+    That,
+    /// Each controls the other.
+    Both,
+}
+
+impl From<Controller> for hops_ipc::Controller {
+    fn from(c: Controller) -> Self {
+        match c {
+            Controller::This => hops_ipc::Controller::ThisMachine,
+            Controller::That => hops_ipc::Controller::ThatMachine,
+            Controller::Both => hops_ipc::Controller::Both,
+        }
+    }
 }
 
 /// How long a command waits for the service to say it handled it. Long
@@ -499,8 +529,15 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
         CliSubcommand::AuthorizeKey {
             description,
             sha256_fingerprint,
+            controller,
+            clipboard,
         } => {
-            let request = FrontendRequest::AuthorizeKey(description, sha256_fingerprint.clone());
+            let request = FrontendRequest::AuthorizeKey {
+                label: description,
+                fingerprint: sha256_fingerprint.clone(),
+                controller: controller.into(),
+                clipboard,
+            };
             let answer = send(rx, tx, [request]).await?;
             answer.tell();
             granted(&answer, &now, &sha256_fingerprint)?

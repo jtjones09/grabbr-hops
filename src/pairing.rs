@@ -2,11 +2,21 @@
 //! two approvals let two machines make, until both machines confirm.
 //!
 //! An approval issues a lease that grants nothing (`TrustStore::confirm`).
-//! It admits the other machine at TLS in the approved direction only, far
-//! enough to run [`crate::pair_ceremony`] and no further. The machine that
-//! added the other shows the number; the machine being added offers three and
-//! asks which one it sees. A wrong pick ends the attempt, and the adding
+//! It admits the other machine at TLS, whichever machine dials, far enough
+//! to run [`crate::pair_ceremony`] and no further: which way control goes is
+//! what each person answered on the card (#220), not who dialled. The machine
+//! that dialled shows the number; the machine it reached offers three and
+//! asks which one it sees. A wrong pick ends the attempt, and the dialling
 //! machine still confirms on its side.
+//!
+//! # One comparison per pair of machines
+//!
+//! Two machines adding each other dial each other, and both dials reach a
+//! machine mid-pairing. Each machine holds one attempt per machine, for both
+//! of its transports, and both keep the same one: the connection the machine
+//! whose fingerprint sorts first dialled ([`preferred`]). The other is closed
+//! as superseded while nobody here has answered it yet, and the machine at
+//! its other end lets it go without ending the pairing.
 //!
 //! # Nothing moves before both machines confirm
 //!
@@ -73,6 +83,10 @@ pub(crate) enum Why {
     Unexpected,
     /// The comparison itself failed.
     Failed(String),
+    /// The other machine closed this connection because another connection
+    /// between the two carries the comparison. Ends nothing: the approval
+    /// stays, and the number card goes until that connection shows one.
+    Withdrawn,
 }
 
 /// What a held attempt tells the service.
@@ -86,16 +100,21 @@ pub(crate) enum PairingEvent {
         role: Role,
         number: String,
         handle: Option<ClientHandle>,
+        /// The connection it was compared on.
+        conn: usize,
     },
     /// The person here answered, and the other machine's confirmation then
     /// arrived on the connection. The service confirms the lease and calls
     /// [`Pairings::settled`].
     PeerConfirmed { fingerprint: String },
-    /// Ended without pairing. The service forgets the lease.
+    /// Ended without pairing. The service forgets the lease, unless the
+    /// attempt was [`Why::Withdrawn`].
     Ended {
         fingerprint: String,
         why: Why,
         handle: Option<ClientHandle>,
+        /// The connection it ended on.
+        conn: usize,
     },
 }
 
@@ -116,6 +135,41 @@ struct Held {
     conn: Connection,
     stage: Stage,
     wake: Rc<Notify>,
+    /// Dialled by the machine whose fingerprint sorts first.
+    preferred: bool,
+}
+
+/// Whether the connection `dialler` made to `listener` is the one two
+/// machines pairing compare their number on, when there are two: the dial
+/// of the machine whose fingerprint sorts first. Both machines work it out
+/// alike from the same two fingerprints, so both keep the same connection.
+pub(crate) fn preferred(dialler: &str, listener: &str) -> bool {
+    dialler < listener
+}
+
+/// What closing a connection for another between the same two machines
+/// says, so the machine at its other end ends nothing.
+const SUPERSEDED: &[u8] = b"pairing superseded";
+/// What closing a second connection while one is held says.
+const BUSY: &[u8] = b"pairing busy";
+
+/// Whether the other machine closed `conn` because another connection
+/// between the two carries the comparison.
+fn withdrawn_by_peer(conn: &Connection) -> bool {
+    matches!(
+        conn.close_reason(),
+        Some(quinn::ConnectionError::ApplicationClosed(c))
+            if &c.reason[..] == SUPERSEDED || &c.reason[..] == BUSY
+    )
+}
+
+/// Why an attempt whose connection closed ended.
+fn closed(conn: &Connection) -> Why {
+    if withdrawn_by_peer(conn) {
+        Why::Withdrawn
+    } else {
+        Why::Closed
+    }
 }
 
 struct Board {
@@ -148,6 +202,16 @@ impl Pairings {
             },
             rx,
         )
+    }
+
+    /// The connection held for `fingerprint`, if any.
+    #[cfg(test)]
+    fn held_conn(&self, fingerprint: &str) -> Option<usize> {
+        self.board
+            .borrow()
+            .held
+            .get(fingerprint)
+            .map(|h| h.conn.stable_id())
     }
 
     /// A shorter deadline, so a test can watch one pass.
@@ -197,11 +261,30 @@ impl Pairings {
         let _ = self.events.send(event);
     }
 
-    /// Hold `conn` for `fingerprint`, unless another attempt with it is held.
-    fn hold(&self, fingerprint: &str, conn: &Connection) -> Option<Ticket> {
+    /// Whether an attempt with `fingerprint` on a connection that is
+    /// `preferred` or not may start: nothing is held for it, or what is held
+    /// gives way to this one.
+    fn may_start(&self, fingerprint: &str, preferred: bool) -> bool {
+        self.board
+            .borrow()
+            .held
+            .get(fingerprint)
+            .is_none_or(|held| gives_way(held, preferred))
+    }
+
+    /// Hold `conn` for `fingerprint`, unless another attempt with it is held
+    /// that this one does not supersede (see [`preferred`]).
+    fn hold(&self, fingerprint: &str, conn: &Connection, preferred: bool) -> Option<Ticket> {
         let mut board = self.board.borrow_mut();
-        if board.held.contains_key(fingerprint) {
-            return None;
+        if let Some(held) = board.held.get_mut(fingerprint) {
+            if !gives_way(held, preferred) {
+                return None;
+            }
+            // Its holder ends quietly: the attempt goes on, here.
+            log::info!("{fingerprint}: the other connection between the two carries the pairing");
+            held.stage = Stage::Over;
+            held.conn.close(0u32.into(), SUPERSEDED);
+            held.wake.notify_one();
         }
         let wake = Rc::new(Notify::new());
         board.held.insert(
@@ -210,6 +293,7 @@ impl Pairings {
                 conn: conn.clone(),
                 stage: Stage::Comparing,
                 wake: wake.clone(),
+                preferred,
             },
         );
         Some(Ticket {
@@ -220,6 +304,14 @@ impl Pairings {
             deadline: tokio::time::Instant::now() + board.deadline,
         })
     }
+}
+
+/// Whether `held` gives way to an attempt on a connection that is
+/// `preferred` or not: only the one both machines keep supersedes, and only
+/// before anyone here answered, so an answer given is never thrown away
+/// here.
+fn gives_way(held: &Held, preferred: bool) -> bool {
+    preferred && !held.preferred && held.stage == Stage::Comparing
 }
 
 /// One held attempt. Dropping it releases the slot.
@@ -245,13 +337,21 @@ impl Drop for Ticket {
 }
 
 impl Ticket {
+    /// This attempt's stage: over once another took its place.
     fn stage(&self) -> Stage {
         self.pairings
             .board
             .borrow()
             .held
             .get(&self.fingerprint)
+            .filter(|h| h.conn.stable_id() == self.id)
             .map_or(Stage::Over, |h| h.stage)
+    }
+
+    /// Why this attempt ended with its connection closed: nothing to say
+    /// when it was ended here, another taking its place included.
+    fn why_closed(&self, conn: &Connection) -> Option<Why> {
+        (self.stage() != Stage::Over).then(|| closed(conn))
     }
 
     /// Wait until the stage reaches `want`, or say why it never will.
@@ -272,7 +372,7 @@ impl Ticket {
             }
             tokio::select! {
                 _ = self.wake.notified() => {}
-                _ = conn.closed() => return Err(Some(Why::Closed)),
+                _ = conn.closed() => return Err(self.why_closed(conn)),
                 _ = tokio::time::sleep_until(self.deadline) => return Err(Some(Why::TimedOut)),
                 _ = tick.tick() => {
                     if !still() {
@@ -293,10 +393,10 @@ impl Ticket {
         tokio::select! {
             r = f => match r {
                 Some(v) => Ok(v),
-                None if conn.close_reason().is_some() => Err(Some(Why::Closed)),
+                None if conn.close_reason().is_some() => Err(self.why_closed(conn)),
                 None => Err(Some(Why::Unexpected)),
             },
-            _ = conn.closed() => Err(Some(Why::Closed)),
+            _ = conn.closed() => Err(self.why_closed(conn)),
             _ = tokio::time::sleep_until(self.deadline) => Err(Some(Why::TimedOut)),
             _ = async {
                 loop {
@@ -354,11 +454,20 @@ pub(crate) async fn as_added(
                 fingerprint: theirs.to_string(),
                 why,
                 handle: None,
+                conn: conn.stable_id(),
             });
         }
-        conn.close(0u32.into(), b"pairing ended");
+        if conn.close_reason().is_none() {
+            conn.close(0u32.into(), b"pairing ended");
+        }
         None
     };
+    let preferred = preferred(theirs, ours);
+    if !pairings.may_start(theirs, preferred) {
+        log::info!("{addr}: a pairing with {theirs} is already open; closing this one");
+        conn.close(0u32.into(), BUSY);
+        return None;
+    }
     let number = match pair_ceremony::as_responder(conn, ours, theirs).await {
         Ok(number) => number,
         Err(e) => {
@@ -366,9 +475,9 @@ pub(crate) async fn as_added(
             return ended(before_number(conn, e));
         }
     };
-    let Some(ticket) = pairings.hold(theirs, conn) else {
+    let Some(ticket) = pairings.hold(theirs, conn, preferred) else {
         log::info!("{addr}: a pairing with {theirs} is already open; closing this one");
-        conn.close(0u32.into(), b"pairing busy");
+        conn.close(0u32.into(), BUSY);
         return None;
     };
     pairings.tell(PairingEvent::Number {
@@ -377,6 +486,7 @@ pub(crate) async fn as_added(
         role: Role::Pick,
         number,
         handle: None,
+        conn: conn.stable_id(),
     });
     if let Err(why) = ticket.until(conn, Stage::Answered, || true).await {
         return ended(why);
@@ -431,6 +541,7 @@ pub(crate) async fn as_adding(
                 fingerprint: theirs.to_string(),
                 why,
                 handle: Some(handle),
+                conn: conn.stable_id(),
             });
         }
         // A connection the other machine already closed keeps its reason, so
@@ -441,6 +552,12 @@ pub(crate) async fn as_adding(
         }
         None
     };
+    let preferred = preferred(ours, theirs);
+    if !pairings.may_start(theirs, preferred) {
+        log::info!("{addr}: a pairing with {theirs} is already open; closing this one");
+        conn.close(0u32.into(), BUSY);
+        return None;
+    }
     let number = match pair_ceremony::as_initiator(conn, ours, theirs).await {
         Ok(number) => number,
         Err(e) => {
@@ -448,9 +565,9 @@ pub(crate) async fn as_adding(
             return ended(before_number(conn, e));
         }
     };
-    let Some(ticket) = pairings.hold(theirs, conn) else {
+    let Some(ticket) = pairings.hold(theirs, conn, preferred) else {
         log::info!("{addr}: a pairing with {theirs} is already open; closing this one");
-        conn.close(0u32.into(), b"pairing busy");
+        conn.close(0u32.into(), BUSY);
         return None;
     };
     pairings.tell(PairingEvent::Number {
@@ -459,6 +576,7 @@ pub(crate) async fn as_adding(
         role: Role::Show,
         number,
         handle: Some(handle),
+        conn: conn.stable_id(),
     });
     let still = || clients.targets(handle, addr) && clients.is_on(handle);
     if let Err(why) = ticket.until(conn, Stage::Answered, still).await {
@@ -736,20 +854,6 @@ mod on_the_wire {
             match tokio::time::timeout(WITHIN, connecting).await {
                 Ok(r) => r.map_err(|e| e.to_string()),
                 Err(_) => Err("timed out".to_string()),
-            }
-        }
-
-        /// Whether the listener's TLS check refused this dialler: the
-        /// handshake fails, or the connection it thought complete is closed
-        /// by a TLS alert rather than by the listener's code after it.
-        async fn refused_at_tls(&self, port: u16) -> bool {
-            let conn = match self.connect(port).await {
-                Ok(conn) => conn,
-                Err(_) => return true,
-            };
-            match tokio::time::timeout(WITHIN, conn.closed()).await {
-                Ok(quinn::ConnectionError::ConnectionClosed(_)) => true,
-                Ok(_) | Err(_) => false,
             }
         }
     }
@@ -1139,49 +1243,174 @@ mod on_the_wire {
         });
     }
 
-    // LEDGER G-7 | class B | 2 handshake outcome at each end + 6 struct state: no PairingEvent
-    /// The machine being added holds its approval in the other direction:
-    /// "may drive me". Crossing into the machine adding it, it dials the
-    /// wrong way, and each end's TLS check refuses on its own, so no
-    /// comparison starts.
+    // LEDGER G-7 | class B | 2 handshake outcome at each end + 1 PairingEvent: Number, each way
+    /// Which machine dials says nothing about which way control goes (#220):
+    /// a machine approved here, whichever way the person approving chose,
+    /// reaches the number whether it dials this machine or this machine dials
+    /// it. So two machines adding each other can pair.
     #[test]
-    fn the_added_machine_crossing_into_its_pending_peer_starts_no_ceremony() {
+    fn either_machine_dialling_reaches_the_number_whichever_way_control_goes() {
         run_local(async {
-            // The adding machine listening: its approval is "I may drive it".
-            let (adding, being_added) = (machine(), machine());
-            let trust = approved(&adding, &being_added, Caps::OUTBOUND);
-            let mut listening = added(adding, trust).await;
-            let crossing = raw_dialer(being_added, &listening.me);
-            assert!(
-                crossing.refused_at_tls(listening.port).await,
-                "the adding machine's TLS check let the machine it is adding dial it"
-            );
-            assert!(
-                next_within(&mut listening.events, NEVER_WITHIN)
-                    .await
-                    .is_none(),
-                "a comparison started the wrong way"
-            );
+            // Approved here as the machine this one controls, and dialling here.
+            let (here, there) = (machine(), machine());
+            let trust = approved(&here, &there, Caps::OUTBOUND);
+            let mut listening = added(here, trust).await;
+            let dialling = raw_dialer(there, &listening.me);
+            let conn = dialling
+                .connect(listening.port)
+                .await
+                .expect("the machine approved here is admitted, to compare a number");
+            crate::pair_ceremony::as_initiator(
+                &conn,
+                &dialling.me.fingerprint,
+                &listening.me.fingerprint,
+            )
+            .await
+            .expect("the two machines compare a number");
+            let (role, _) = number(
+                &mut listening.events,
+                "a dial from the machine this one controls",
+            )
+            .await;
+            assert_eq!(role, Role::Pick, "the machine dialled picks");
 
-            // The machine being added dialling: its approval is "it may drive me".
-            let (adding, being_added) = (machine(), machine());
-            let receiving = raw_receiver(adding, &being_added);
+            // Approved here as the machine that controls this one, and dialled
+            // from here.
+            let (here, there) = (machine(), machine());
+            let receiving = raw_receiver(there, &here);
             let mut d = dialer(
-                &being_added,
-                approved(&being_added, &receiving.me, Caps::INBOUND),
+                &here,
+                approved(&here, &receiving.me, Caps::INBOUND),
                 receiving.port,
                 Position::Left,
             );
             let mut events = d.conn.take_pairing_events().expect("pairing events");
             d.conn.dial(d.handle).await;
-            assert!(
-                receiving.next(NEVER_WITHIN * 3).await.is_none(),
-                "the machine being added completed a dial to the machine adding it"
-            );
-            assert!(
-                next_within(&mut events, NEVER_WITHIN).await.is_none(),
-                "a comparison started the wrong way"
-            );
+            let conn = receiving
+                .next(WITHIN)
+                .await
+                .expect("this machine dials the machine it approved to control it");
+            crate::pair_ceremony::as_responder(&conn, &receiving.me.fingerprint, &here.fingerprint)
+                .await
+                .expect("the two machines compare a number");
+            let (role, _) =
+                number(&mut events, "a dial to the machine that controls this one").await;
+            assert_eq!(role, Role::Show, "the machine dialling shows the number");
+        });
+    }
+
+    // LEDGER G-21 | class B | 6 struct state + 2 connection closed: the connection each machine's board holds, the close reason at the other end
+    /// Two machines adding each other have two connections between them,
+    /// and each machine can meet them in either order. Whatever the order,
+    /// both machines keep the same one: the dial of the machine whose
+    /// fingerprint sorts first (#220).
+    #[test]
+    fn two_machines_meeting_both_connections_keep_the_same_one() {
+        run_local(async {
+            for (l_first, h_first) in [(true, true), (true, false), (false, true), (false, false)] {
+                let (one, two) = (machine(), machine());
+                let (low, high) = if one.fingerprint < two.fingerprint {
+                    (one, two)
+                } else {
+                    (two, one)
+                };
+                let (lf, hf) = (low.fingerprint.clone(), high.fingerprint.clone());
+                // The connection the machine sorting last dialled, and the
+                // other: each seen from both ends.
+                let on_low = raw_receiver(low.clone(), &high);
+                let from_high = raw_dialer(high.clone(), &low);
+                let (x_high, x_low) =
+                    tokio::join!(from_high.connect(on_low.port), on_low.next(WITHIN));
+                let (x_high, x_low) = (x_high.expect("a dial"), x_low.expect("its other end"));
+                let on_high = raw_receiver(high.clone(), &low);
+                let from_low = raw_dialer(low.clone(), &high);
+                let (z_low, z_high) =
+                    tokio::join!(from_low.connect(on_high.port), on_high.next(WITHIN));
+                let (z_low, z_high) = (z_low.expect("a dial"), z_high.expect("its other end"));
+
+                let (at_low, _low_events) = Pairings::new();
+                let (at_high, _high_events) = Pairings::new();
+                let mut held = Vec::new();
+                // As `as_added` and `as_adding` do: a connection not held
+                // is closed as busy.
+                let mut meet =
+                    |board: &Pairings, peer: &str, conns: [(&quinn::Connection, bool); 2]| {
+                        for (conn, preferred) in conns {
+                            match board.hold(peer, conn, preferred) {
+                                Some(ticket) => held.push(ticket),
+                                None => conn.close(0u32.into(), BUSY),
+                            }
+                        }
+                    };
+                let x_pref = preferred(&hf, &lf);
+                let z_pref = preferred(&lf, &hf);
+                let low_order = if l_first {
+                    [(&x_low, x_pref), (&z_low, z_pref)]
+                } else {
+                    [(&z_low, z_pref), (&x_low, x_pref)]
+                };
+                let high_order = if h_first {
+                    [(&x_high, x_pref), (&z_high, z_pref)]
+                } else {
+                    [(&z_high, z_pref), (&x_high, x_pref)]
+                };
+                meet(&at_low, &hf, low_order);
+                meet(&at_high, &lf, high_order);
+                let order = format!(
+                    "the machine sorting first met {}, the other {}",
+                    if l_first {
+                        "the other's dial first"
+                    } else {
+                        "its own dial first"
+                    },
+                    if h_first {
+                        "its own dial first"
+                    } else {
+                        "the other's dial first"
+                    }
+                );
+                assert_eq!(
+                    (at_low.held_conn(&hf), at_high.held_conn(&lf)),
+                    (Some(z_low.stable_id()), Some(z_high.stable_id())),
+                    "{order}: the two machines did not both keep the dial of the machine \
+                     sorting first, so each can wait on a number the other never shows"
+                );
+                drop(held);
+            }
+        });
+    }
+
+    // LEDGER G-22 | class B | 1 return value: Ticket::until on a connection the other end closed
+    /// An attempt whose connection the other machine closed because another
+    /// connection between the two carries the comparison is withdrawn, which
+    /// ends nothing here; closed for any other reason, it ended (#220).
+    #[test]
+    fn a_connection_given_up_for_the_other_one_ends_nothing() {
+        run_local(async {
+            for (reason, want) in [
+                (SUPERSEDED, Why::Withdrawn),
+                (BUSY, Why::Withdrawn),
+                (&b"pairing ended"[..], Why::Closed),
+            ] {
+                let (here, there) = (machine(), machine());
+                let receiving = raw_receiver(here.clone(), &there);
+                let dialling = raw_dialer(there.clone(), &here);
+                let (theirs, ours) =
+                    tokio::join!(dialling.connect(receiving.port), receiving.next(WITHIN));
+                let (theirs, ours) = (theirs.expect("a dial"), ours.expect("its other end"));
+                let (board, _events) = Pairings::new();
+                let ticket = board
+                    .hold(&there.fingerprint, &ours, false)
+                    .expect("nothing else is held");
+                theirs.close(0u32.into(), reason);
+                let ended = ticket.until(&ours, Stage::Answered, || true).await;
+                assert_eq!(
+                    ended,
+                    Err(Some(want.clone())),
+                    "closed by the other machine as {:?}",
+                    String::from_utf8_lossy(reason)
+                );
+            }
         });
     }
 

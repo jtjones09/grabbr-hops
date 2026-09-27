@@ -135,6 +135,13 @@ mod a_grant_carries_only_the_direction_that_was_approved {
     //! 2026-07-24 entry still states "one approval establishes trust in BOTH
     //! directions" as a goal. That clause is superseded. Trust is per-machine
     //! AND per-direction.
+    //!
+    //! **Amended 2026-09-26 (#220).** The direction is no longer taken from
+    //! how the other machine arrived: the person approving chooses it on the
+    //! card (this machine controls that one, that one controls this one, or
+    //! both), and the lease records the choice as its origin, which the store
+    //! checks. What stands from #130: nothing grants a direction nobody was
+    //! asked about.
 
     use crate::trust::{Caps, Origin, TrustStore};
 
@@ -201,21 +208,34 @@ mod a_grant_carries_only_the_direction_that_was_approved {
     }
 
     /// The two tests above ask the store. This asks the grant the door makes
-    /// (`Service::add_authorized_key` through `service::grant_for_attempt`):
-    /// the direction comes from the attempt the user approved, and an approval
-    /// with no attempt behind it grants nothing.
-    // LEDGER T11 | class B | 1 return value + 6 struct state: service::grant_for_attempt, TrustStore::capabilities
+    /// (`Service::add_authorized_key` through `service::grant_for_attempt`).
+    ///
+    /// **Amended 2026-09-26 (#220).** The direction is what the person
+    /// approving chose on the card, never how the other machine arrived:
+    /// either attempt can be approved in any direction, and the lease drives
+    /// in exactly that one, recorded as the origin the store checks. The
+    /// clipboard is shared only on a yes, the way control goes (#182). An
+    /// approval with no attempt behind it still grants nothing.
+    // LEDGER T11 | class B | 1 return value + 6 struct state: service::grant_for_attempt, TrustStore::capabilities, TrustStore::lease
     #[test]
-    fn the_grant_door_mints_the_direction_it_observed_and_nothing_without_an_attempt() {
+    fn the_grant_door_mints_the_direction_the_person_chose_and_nothing_without_an_attempt() {
         use crate::service::{GrantRefused, grant_for_attempt};
-        use hops_ipc::AttemptOrigin;
+        use crate::trust::{drive_of, existing_pairing_clipboard};
+        use hops_ipc::{AttemptOrigin, Controller};
 
         let peer = fp32(0x44);
         let fresh = || TrustStore::new(&fp32(0x01), 0).expect("our own fingerprint");
 
         let mut store = fresh();
         assert_eq!(
-            grant_for_attempt(&mut store, &peer, "no prompt behind this", None),
+            grant_for_attempt(
+                &mut store,
+                &peer,
+                "no prompt behind this",
+                None,
+                Controller::Both,
+                true
+            ),
             Err(GrantRefused::NoAttempt),
             "an approval with no pending attempt must be refused"
         );
@@ -225,34 +245,84 @@ mod a_grant_carries_only_the_direction_that_was_approved {
             "and it must grant nothing"
         );
 
-        let mut store = fresh();
-        grant_for_attempt(&mut store, &peer, "knocked", Some(AttemptOrigin::Inbound))
-            .expect("grant");
-        assert_eq!(
-            store.capabilities(&peer),
-            Caps::NONE,
-            "an approval alone grants nothing until both machines confirm the \
-             number (#167)"
-        );
-        store.confirm(&peer).expect("confirm");
-        assert!(
-            store.may_drive_us(&peer) && !store.we_may_drive(&peer),
-            "an approved inbound knock must grant inbound and only inbound (#130)"
-        );
+        for arrived in [AttemptOrigin::Inbound, AttemptOrigin::OutboundDial] {
+            for chosen in Controller::ALL {
+                for clipboard in [false, true] {
+                    let mut store = fresh();
+                    grant_for_attempt(&mut store, &peer, "desk", Some(arrived), chosen, clipboard)
+                        .expect("grant");
+                    assert_eq!(
+                        store.capabilities(&peer),
+                        Caps::NONE,
+                        "an approval alone grants nothing until both machines confirm \
+                         the number (#167)"
+                    );
+                    store.confirm(&peer).expect("confirm");
+                    let drive = drive_of(chosen);
+                    let shared = if clipboard {
+                        existing_pairing_clipboard(drive)
+                    } else {
+                        Caps::NONE
+                    };
+                    assert_eq!(
+                        (
+                            store.capabilities(&peer),
+                            store.lease(&peer).map(|l| l.origin)
+                        ),
+                        (drive | shared, Some(Origin::Chosen(chosen))),
+                        "approving a {arrived:?} attempt as {chosen:?}, clipboard \
+                         {clipboard}: the pairing grants something other than what the \
+                         person chose, or does not record the choice. Which machine \
+                         dialled says nothing about which way control goes (#220), and \
+                         the clipboard is shared only on a yes (#182)."
+                    );
+                }
+            }
+        }
+    }
 
-        let mut store = fresh();
-        grant_for_attempt(
-            &mut store,
-            &peer,
-            "dialled",
-            Some(AttemptOrigin::OutboundDial),
-        )
-        .expect("grant");
-        store.confirm(&peer).expect("confirm");
-        assert!(
-            store.we_may_drive(&peer) && !store.may_drive_us(&peer),
-            "an approved outbound dial must grant outbound and only outbound (#130)"
-        );
+    /// The store is the last place that can refuse a direction nobody chose,
+    /// and it does at both of its doors: a grant, and a record replayed off
+    /// disk (#220).
+    // LEDGER T11b | class B | 1 error: TrustStore::issue_with_origin, TrustStore::admit
+    #[test]
+    fn a_lease_recorded_as_chosen_drives_in_exactly_that_direction() {
+        use crate::trust::{Expiry, Lease, TrustError};
+        use hops_ipc::Controller;
+
+        let ours = fp32(0x01);
+        let peer = fp32(0x45);
+        for (chosen, caps) in [
+            (Controller::ThisMachine, Caps::DRIVE_ME),
+            (Controller::ThisMachine, Caps::DRIVE_ME | Caps::I_MAY_DRIVE),
+            (Controller::ThatMachine, Caps::I_MAY_DRIVE),
+            (Controller::Both, Caps::DRIVE_ME),
+            (Controller::Both, Caps::CLIPBOARD_FROM),
+        ] {
+            let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
+            let granted = store.issue_with_origin(&peer, "desk", caps, Origin::Chosen(chosen));
+            assert!(
+                matches!(granted, Err(TrustError::NotAsChosen { .. })),
+                "a grant recorded as {chosen:?} carrying {caps:?} was not refused: \
+                 {granted:?}"
+            );
+            let replayed = store.admit(Lease {
+                peer: peer.clone(),
+                issued_to: ours.clone(),
+                label: "desk".into(),
+                caps,
+                origin: Origin::Chosen(chosen),
+                issued_at: 1,
+                expiry: Expiry::Never,
+                clipboard_chosen: true,
+                confirmed: true,
+            });
+            assert!(
+                matches!(replayed, Err(TrustError::NotAsChosen { .. })),
+                "a record recorded as {chosen:?} carrying {caps:?} was loaded: {replayed:?}"
+            );
+            assert!(store.capabilities(&peer).is_empty());
+        }
     }
 
     /// The property the two verifiers must keep, checked by calling both of
@@ -483,14 +553,16 @@ mod pairings_made_before_182_keep_the_clipboard_direction_their_lease_grants {
 
     use std::collections::{HashMap, HashSet};
 
-    use hops_ipc::{AttemptOrigin, RevokedEntry};
+    use hops_ipc::RevokedEntry;
 
-    use crate::service::grant_for_attempt;
     use crate::test_harness::{
         ARRIVES_WITHIN, Machine, NEVER_WITHIN, applied_within, clipboard_pair, machine, run_local,
     };
-    use crate::trust::TrustStore;
-    use crate::trust_file::{rebuild, records_of};
+    use crate::trust::{Caps, TrustStore, existing_pairing_clipboard};
+    use crate::trust_file::{
+        DiskCap, DiskOrigin, DiskState, LeaseRecord, expiry_older_builds_accept, rebuild,
+        records_of,
+    };
 
     /// Through disk, as every start after the one that made the pairing
     /// loads it. The start that made it runs on the store in memory, so each
@@ -505,29 +577,27 @@ mod pairings_made_before_182_keep_the_clipboard_direction_their_lease_grants {
         loaded
     }
 
-    /// Paired on a build with the trust store: each machine approved the
-    /// other's prompt once, in the direction it was asked, and both confirmed
-    /// the number.
+    /// Paired on a build with the trust store and before #182: each machine
+    /// approved the other's prompt once, and the grant was shaped by how the
+    /// other machine arrived, its clipboard following the drive bits, which
+    /// is what such a build wrote. Nobody chose a clipboard.
     fn approved(driven: &Machine, driver: &Machine) -> (TrustStore, TrustStore) {
-        let mut on_driven = TrustStore::new(&driven.fingerprint, 0).expect("ours");
-        grant_for_attempt(
-            &mut on_driven,
-            &driver.fingerprint,
-            "driver",
-            Some(AttemptOrigin::Inbound),
+        let before_182 = |me: &Machine, peer: &Machine, drive: Caps| {
+            let mut store = TrustStore::new(&me.fingerprint, 0).expect("ours");
+            store
+                .issue(
+                    &peer.fingerprint,
+                    "peer",
+                    drive | existing_pairing_clipboard(drive),
+                )
+                .expect("grant");
+            store.confirm(&peer.fingerprint).expect("confirm");
+            store
+        };
+        (
+            before_182(driven, driver, Caps::DRIVE_ME),
+            before_182(driver, driven, Caps::I_MAY_DRIVE),
         )
-        .expect("grant");
-        on_driven.confirm(&driver.fingerprint).expect("confirm");
-        let mut on_driver = TrustStore::new(&driver.fingerprint, 0).expect("ours");
-        grant_for_attempt(
-            &mut on_driver,
-            &driven.fingerprint,
-            "driven",
-            Some(AttemptOrigin::OutboundDial),
-        )
-        .expect("grant");
-        on_driver.confirm(&driven.fingerprint).expect("confirm");
-        (on_driven, on_driver)
     }
 
     /// Paired on v0.12, which kept one flat allowlist: each machine listed the
@@ -616,6 +686,64 @@ mod pairings_made_before_182_keep_the_clipboard_direction_their_lease_grants {
                 );
             }
         });
+    }
+
+    // LEDGER E2b-5 | class B | 1 return value: trust_file::rebuild, trust_file::records_of, TrustStore::capabilities
+    /// A store an earlier build saved, each of its pairings made before #182:
+    /// loaded by this build and saved again, every record is as it was, and
+    /// each still grants the clipboard its drive bits did (#186). #220 and
+    /// #182 change what a new pairing is, never what an old one holds.
+    #[test]
+    fn a_store_saved_before_182_loads_and_saves_unchanged() {
+        let ours = machine().fingerprint;
+        let issued_at = 1_780_000_000;
+        let record = |origin: DiskOrigin, caps: Vec<DiskCap>| LeaseRecord {
+            fingerprint: machine().fingerprint,
+            label: format!("{origin:?}"),
+            state: DiskState::Active,
+            origin,
+            issued_at,
+            expires_at: Some(expiry_older_builds_accept(issued_at)),
+            revoked_at: None,
+            caps,
+            confirmed: true,
+            clipboard: None,
+        };
+        let mut saved = vec![
+            record(DiskOrigin::Inbound, vec![DiskCap::Inbound]),
+            record(DiskOrigin::OutboundDial, vec![DiskCap::Outbound]),
+            record(
+                DiskOrigin::Migrated,
+                vec![DiskCap::Inbound, DiskCap::Outbound],
+            ),
+        ];
+        saved.sort_by(|a, b| a.fingerprint.cmp(&b.fingerprint));
+        let (store, refused) = rebuild(&ours, issued_at + 60, &saved).expect("rebuild");
+        assert!(
+            refused.is_empty(),
+            "an older build's store was refused: {refused:?}"
+        );
+        let mut again = records_of(&store);
+        again.sort_by(|a, b| a.fingerprint.cmp(&b.fingerprint));
+        assert_eq!(
+            again, saved,
+            "this build rewrote a pairing an older build saved. The upgrade writes \
+             nothing new and rewrites no lease (#186)."
+        );
+        for r in &saved {
+            let drive = r.caps.iter().fold(Caps::NONE, |acc, c| {
+                acc | match c {
+                    DiskCap::Inbound => Caps::DRIVE_ME,
+                    DiskCap::Outbound => Caps::I_MAY_DRIVE,
+                }
+            });
+            assert_eq!(
+                store.capabilities(&r.fingerprint),
+                drive | existing_pairing_clipboard(drive),
+                "a pairing made before #182 ({:?}) lost, or gained, clipboard it held",
+                r.origin
+            );
+        }
     }
 }
 
@@ -732,6 +860,8 @@ mod no_pairing_expires_until_renewal_exists {
             &peer_fp,
             "a sender",
             Some(AttemptOrigin::Inbound),
+            hops_ipc::Controller::ThatMachine,
+            false,
         )
         .expect("the grant door grants an approved inbound attempt");
         let mut sending = TrustStore::new(&super::fp32(0x02), 0).expect("ours");
@@ -740,6 +870,8 @@ mod no_pairing_expires_until_renewal_exists {
             &peer_fp,
             "a receiver",
             Some(AttemptOrigin::OutboundDial),
+            hops_ipc::Controller::ThisMachine,
+            false,
         )
         .expect("the grant door grants an approved outbound dial");
         // and both machines confirmed the number (#167)
@@ -805,6 +937,8 @@ mod no_pairing_expires_until_renewal_exists {
                         &peer_fp,
                         "a sender",
                         Some(AttemptOrigin::Inbound),
+                        hops_ipc::Controller::ThatMachine,
+                        false,
                     )
                     .expect("grant");
                     grant_for_attempt(
@@ -812,6 +946,8 @@ mod no_pairing_expires_until_renewal_exists {
                         &peer_fp,
                         "a receiver",
                         Some(AttemptOrigin::OutboundDial),
+                        hops_ipc::Controller::ThisMachine,
+                        false,
                     )
                     .expect("grant");
                     receiving.confirm(&peer_fp).expect("confirm");
@@ -2010,7 +2146,9 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
     //! **The limit.** Three frontend requests widen trust, and nothing else
     //! a frontend can send does: `AuthorizeKey`, which approves a prompt the
     //! daemon raised for a machine that arrived while the pairing window was
-    //! open; `ConfirmPairing`, which answers the number that approval's
+    //! open, with the card's answers, which way control goes (#220) and a yes
+    //! or no to the clipboard (#182), so a yes is refused while driven with
+    //! the approval it is part of; `ConfirmPairing`, which answers the number that approval's
     //! pairing compares, and without which the approval grants nothing
     //! (#167); and `EnableClipboard`, which turns a paired machine's
     //! clipboard back on in the directions it already drives. The daemon
@@ -2053,7 +2191,7 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
     fn widens(request: &FrontendRequest) -> bool {
         use FrontendRequest as R;
         match request {
-            R::AuthorizeKey(..) | R::EnableClipboard(_) | R::ConfirmPairing { .. } => true,
+            R::AuthorizeKey { .. } | R::EnableClipboard(_) | R::ConfirmPairing { .. } => true,
             R::Activate(..)
             | R::Create
             | R::ChangePort(_)
@@ -2197,7 +2335,7 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
         use FrontendRequest as R;
         let fp = super::fp32(0x5f);
         let widening = [
-            R::AuthorizeKey(String::new(), fp.clone()),
+            crate::test_harness::approval("", &fp, hops_ipc::Controller::Both),
             R::ConfirmPairing {
                 fingerprint: fp.clone(),
                 number: String::new(),
@@ -2260,8 +2398,12 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
                     // one, and compares its number: what is left is the answer
                     // that makes its approval grant (#167).
                     prompt_from(&mut app, &newcomer, port, &ours).await;
-                    app.exchange(&[R::AuthorizeKey("newcomer".to_owned(), newcomer_fp.clone())])
-                        .await;
+                    app.exchange(&[crate::test_harness::approval(
+                        "newcomer",
+                        &newcomer_fp,
+                        hops_ipc::Controller::ThatMachine,
+                    )])
+                    .await;
                     let comparing = compare_number(&mut app, &newcomer, port, &ours).await;
                     let before = granted(&trust);
                     let waiting_before = waiting(&trust);
@@ -2305,7 +2447,12 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
                         })
                         .await;
                         app.exchange(&[
-                            R::AuthorizeKey("new laptop".to_owned(), stranger_fp.clone()),
+                            R::AuthorizeKey {
+                                label: "new laptop".to_owned(),
+                                fingerprint: stranger_fp.clone(),
+                                controller: hops_ipc::Controller::ThatMachine,
+                                clipboard: true,
+                            },
                             R::EnableClipboard(desk_fp.clone()),
                             R::ConfirmPairing {
                                 fingerprint: newcomer_fp.clone(),
@@ -2428,7 +2575,12 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
                     // seen a widening. An approval pairs once both machines
                     // confirm its number (#167).
                     app.exchange(&[
-                        R::AuthorizeKey("new laptop".to_owned(), stranger_fp.clone()),
+                        R::AuthorizeKey {
+                            label: "new laptop".to_owned(),
+                            fingerprint: stranger_fp.clone(),
+                            controller: hops_ipc::Controller::ThatMachine,
+                            clipboard: true,
+                        },
                         R::EnableClipboard(desk_fp.clone()),
                         R::ConfirmPairing {
                             fingerprint: newcomer_fp.clone(),
@@ -2454,13 +2606,14 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
                     assert_eq!(
                         (now.get(&stranger_fp).copied(), now.get(&desk_fp).copied()),
                         (
-                            Some(Caps::INBOUND),
+                            Some(Caps::DRIVE_ME | Caps::CLIPBOARD_FROM),
                             Some(Caps::DRIVE_ME | Caps::CLIPBOARD_FROM)
                         ),
-                        "approving the prompt must pair the machine that knocked as \
-                         one that may drive this one, and turning the clipboard on \
-                         must give the paired machine the clipboard its drive bits \
-                         allow and nothing else"
+                        "approving the prompt as the machine that controls this one, \
+                         with a yes to the clipboard, must pair it so and share the \
+                         clipboard the way control goes (#220, #182); and turning the \
+                         clipboard on must give the paired machine the clipboard its \
+                         drive bits allow and nothing else"
                     );
                 })
                 .await;

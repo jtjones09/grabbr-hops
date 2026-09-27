@@ -412,10 +412,7 @@ impl LanMouseListener {
                                         // repeated rather than assumed.
                                         let (drives, pairing) = {
                                             let t = trust.read().expect("lock");
-                                            (
-                                                t.may_drive_us(&fingerprint),
-                                                t.awaits(&fingerprint, crate::trust::Caps::DRIVE_ME),
-                                            )
+                                            (t.may_drive_us(&fingerprint), t.is_pairing(&fingerprint))
                                         };
                                         let mut first = None;
                                         if !drives && pairing {
@@ -435,6 +432,21 @@ impl LanMouseListener {
                                             if first.is_none() {
                                                 return;
                                             }
+                                        }
+                                        if pairing
+                                            && first.is_some()
+                                            && !trust.read().expect("lock").may_drive_us(&fingerprint)
+                                        {
+                                            // Paired, and the person here did not
+                                            // choose that machine to control this
+                                            // one (#220): the connection the
+                                            // number was compared on carries
+                                            // nothing.
+                                            log::info!(
+                                                "{addr}: paired with {fingerprint}, which does not control this machine; closing the pairing connection"
+                                            );
+                                            conn.close(0u32.into(), b"paired");
+                                            return;
                                         }
                                         if !trust.read().expect("lock").may_drive_us(&fingerprint) {
                                             log::warn!(

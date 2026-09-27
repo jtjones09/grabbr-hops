@@ -20,8 +20,8 @@ use tokio::sync::{Notify, mpsc};
 
 pub use hops_ipc::{
     AttemptOrigin, Build, CaptureFault, CaptureState, ClientConfig, ClientHandle, ClientState,
-    CrossingRefusal, DiscoveredDevice, FrontendEvent, FrontendRequest, PairingCheck, PeerTrust,
-    Permission, Position, RevokedEntry, Status, connect_async,
+    Controller, CrossingRefusal, DiscoveredDevice, FrontendEvent, FrontendRequest, PairingCheck,
+    PeerTrust, Permission, Position, RevokedEntry, Status, connect_async,
 };
 
 pub mod prefs;
@@ -672,6 +672,8 @@ pub enum ApprovalRefused {
     /// The card switched to this machine too recently for the click to have
     /// been meant for it.
     JustChanged,
+    /// Nobody said which way control goes. There is no default (#220).
+    NoController,
 }
 
 impl ApprovalRefused {
@@ -685,8 +687,76 @@ impl ApprovalRefused {
                 "The pairing request changed just before you approved it, so nothing \
                  was trusted. Check which device it is now, then approve again."
             }
+            ApprovalRefused::NoController => {
+                "Choose which machine is in control first. Nothing was trusted."
+            }
         }
     }
+}
+
+/// What the person approving a pairing answered on its card (#220, #182):
+/// which way control goes, which has no default, and whether to share the
+/// clipboard, which is no until they say yes.
+///
+/// Held for one machine. Answers given while the card showed another are
+/// cleared when it changes, so they can never be sent for this one (#168).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PairingAnswers {
+    fingerprint: Option<String>,
+    /// Which machine is in control, once the person said.
+    pub controller: Option<Controller>,
+    /// Share the clipboard, in the directions control goes.
+    pub clipboard: bool,
+}
+
+impl PairingAnswers {
+    /// The answers for the card showing `fingerprint`: those given while it
+    /// showed that machine, or none.
+    pub fn for_card(&mut self, fingerprint: &str) -> &mut Self {
+        if self.fingerprint.as_deref() != Some(fingerprint) {
+            *self = PairingAnswers {
+                fingerprint: Some(fingerprint.to_string()),
+                ..Default::default()
+            };
+        }
+        self
+    }
+
+    /// The approval of `fingerprint`, named `name`, with these answers, if
+    /// they were given for that machine and say which way control goes.
+    pub fn approval(
+        &self,
+        fingerprint: &str,
+        name: &str,
+    ) -> Result<FrontendRequest, ApprovalRefused> {
+        if self.fingerprint.as_deref() != Some(fingerprint) {
+            return Err(ApprovalRefused::NotOnScreen);
+        }
+        approval_request(fingerprint, name, self.controller, self.clipboard)
+    }
+}
+
+/// The request approving `fingerprint` sends, named `name` or, left blank,
+/// by [`fallback_label`], with the card's two answers. Refused while nobody
+/// said which way control goes: that is never assumed (#220).
+pub fn approval_request(
+    fingerprint: &str,
+    name: &str,
+    controller: Option<Controller>,
+    clipboard: bool,
+) -> Result<FrontendRequest, ApprovalRefused> {
+    let controller = controller.ok_or(ApprovalRefused::NoController)?;
+    let label = if name.trim().is_empty() {
+        fallback_label(fingerprint)
+    } else {
+        name.trim().to_string()
+    };
+    Ok(FrontendRequest::AuthorizeKey {
+        label,
+        fingerprint: fingerprint.to_string(),
+        controller,
+        clipboard,
+    })
 }
 
 /// Which pairing request the prompt shows, and whether an approval of it

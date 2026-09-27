@@ -646,30 +646,49 @@ fn stage_create(
 
 /// Put `fingerprint`'s request on the pairing card.
 ///
-/// A name typed while the card showed another machine is cleared, so it can
-/// never be sent to approve this one (#168).
+/// A name typed, and answers given, while the card showed another machine
+/// are cleared, so they can never be sent to approve this one (#168).
 fn show_pairing_card(ui: &AppWindow, fingerprint: &str) {
     if ui.get_pairing_fp().as_str() != fingerprint {
         ui.set_pairing_name("".into());
+        ui.set_pairing_controller(-1);
+        ui.set_pairing_clipboard(false);
     }
     ui.set_pairing_fp(fingerprint.into());
 }
 
-/// The request a click on "trust & name" sends: `name` for `fingerprint`, if
-/// that is the machine the card has been showing (#168).
+/// What the card's answers are: which way control goes, as the index of the
+/// row chosen (-1 for none), and the clipboard switch.
+#[derive(Debug, Clone, Copy)]
+struct CardAnswers {
+    controller: i32,
+    clipboard: bool,
+}
+
+impl CardAnswers {
+    fn of(ui: &AppWindow) -> Self {
+        CardAnswers {
+            controller: ui.get_pairing_controller(),
+            clipboard: ui.get_pairing_clipboard(),
+        }
+    }
+}
+
+/// The request a click on "trust & name" sends: `name` for `fingerprint`,
+/// with the card's answers (#220, #182), if that is the machine the card has
+/// been showing (#168) and someone chose which way control goes.
 fn approval(
     card: &PairingCard,
     name: &str,
     fingerprint: &str,
+    answers: CardAnswers,
     now: Instant,
 ) -> Result<FrontendRequest, ApprovalRefused> {
     card.approve(fingerprint, now)?;
-    let desc = if name.trim().is_empty() {
-        hops_frontend_core::fallback_label(fingerprint)
-    } else {
-        name.trim().to_string()
-    };
-    Ok(FrontendRequest::AuthorizeKey(desc, fingerprint.to_string()))
+    let controller = usize::try_from(answers.controller)
+        .ok()
+        .and_then(|i| hops_frontend_core::Controller::ALL.get(i).copied());
+    hops_frontend_core::approval_request(fingerprint, name, controller, answers.clipboard)
 }
 
 /// What "save" on the rename field sends for the row keyed `id`: a handle for
@@ -802,6 +821,13 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
 
     let ui = AppWindow::new()?;
     show_opening_info(&ui, opening_info.as_deref());
+    // The pairing card's answers, in the words every frontend uses (#220).
+    ui.set_controller_choices(ModelRc::new(VecModel::from(
+        hops_frontend_core::Controller::ALL
+            .iter()
+            .map(|c| slint::SharedString::from(c.describe()))
+            .collect::<Vec<_>>(),
+    )));
 
     // Force the opening size to 560x690. preferred-width/height in app.slint
     // aren't enough alone: the ScrollView lets the window shrink to a tiny
@@ -985,7 +1011,16 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
         let weak = ui.as_weak();
         let notice = notice_sink.clone();
         ui.on_approve_pairing(move |name, fp| {
-            match approval(&card.borrow(), name.as_str(), fp.as_str(), Instant::now()) {
+            let Some(answers) = weak.upgrade().map(|ui| CardAnswers::of(&ui)) else {
+                return;
+            };
+            match approval(
+                &card.borrow(),
+                name.as_str(),
+                fp.as_str(),
+                answers,
+                Instant::now(),
+            ) {
                 Ok(request) => {
                     c.request(request);
                     if let Some(ui) = weak.upgrade() {
@@ -1996,6 +2031,7 @@ mod pairing_card_binds_the_approval {
             card,
             ui.get_pairing_name().as_str(),
             ui.get_pairing_fp().as_str(),
+            CardAnswers::of(ui),
             now,
         )
     }
@@ -2014,11 +2050,21 @@ mod pairing_card_binds_the_approval {
         ui.set_pairing_name("laptop".into()); // typed into the card's field
         assert_eq!(
             click(&ui, &card, t0 + Duration::from_secs(2)),
-            Ok(FrontendRequest::AuthorizeKey(
-                "laptop".into(),
-                "bb:bb".into()
-            )),
-            "the approval did not carry the name typed and the machine on the card"
+            Err(ApprovalRefused::NoController),
+            "an approval went out before anyone chose which way control goes"
+        );
+        ui.set_pairing_controller(1); // "That machine controls this one"
+        ui.set_pairing_clipboard(true);
+        assert_eq!(
+            click(&ui, &card, t0 + Duration::from_secs(2)),
+            Ok(FrontendRequest::AuthorizeKey {
+                label: "laptop".into(),
+                fingerprint: "bb:bb".into(),
+                controller: hops_frontend_core::Controller::ThatMachine,
+                clipboard: true,
+            }),
+            "the approval did not carry the name typed, the answers given and the \
+             machine on the card"
         );
 
         // B stops asking while the name is still in the field; C is live.
@@ -2030,6 +2076,10 @@ mod pairing_card_binds_the_approval {
             ui.get_pairing_name().as_str(),
             "",
             "the name typed for bb:bb was left in the card once it showed cc:cc"
+        );
+        assert!(
+            ui.get_pairing_controller() == -1 && !ui.get_pairing_clipboard(),
+            "the answers given for bb:bb were left in the card once it showed cc:cc"
         );
         assert_eq!(
             click(&ui, &card, t1 + Duration::from_millis(300)),

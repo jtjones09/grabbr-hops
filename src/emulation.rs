@@ -2737,6 +2737,13 @@ mod a_pairing_approved_both_ways {
             &peer.machine.fingerprint,
             "the other machine",
             Some(origin),
+            // The direction these tests pair in: the machine that knocked
+            // controls, and the one dialled is controlled.
+            match origin {
+                AttemptOrigin::Inbound => hops_ipc::Controller::ThatMachine,
+                AttemptOrigin::OutboundDial => hops_ipc::Controller::ThisMachine,
+            },
+            false,
         )
         .expect("the approval grants");
         if trust.is_pairing(&peer.machine.fingerprint) {

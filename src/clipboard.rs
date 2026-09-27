@@ -273,8 +273,8 @@ mod clipboard_follows_the_pairing {
             // The driver removes the machine it drives, and the link is still up.
             let (driven, driver) = (machine(), machine());
             let (on_driven, on_driver) = (
-                store(&driven, &driver, Caps::INBOUND),
-                store(&driver, &driven, Caps::OUTBOUND),
+                store(&driven, &driver, Caps::INBOUND.union(Caps::CLIPBOARD_FROM)),
+                store(&driver, &driven, Caps::OUTBOUND.union(Caps::CLIPBOARD_TO)),
             );
             let mut pair = clipboard_pair(driven, on_driven, driver, on_driver).await;
             pair.driver_sends.broadcast("before".into()).await;
@@ -297,7 +297,8 @@ mod clipboard_follows_the_pairing {
             // The driven machine removes its driver, on a pairing that shares
             // the clipboard both ways.
             let (driven, driver) = (machine(), machine());
-            let both = Caps::INBOUND | Caps::OUTBOUND;
+            let both = Caps::INBOUND.union(Caps::CLIPBOARD_FROM)
+                | Caps::OUTBOUND.union(Caps::CLIPBOARD_TO);
             let (on_driven, on_driver) =
                 (store(&driven, &driver, both), store(&driver, &driven, both));
             let mut pair = clipboard_pair(driven, on_driven, driver, on_driver).await;
@@ -328,7 +329,7 @@ mod clipboard_follows_the_pairing {
             let (driven, driver) = (machine(), machine());
             let (on_driven, on_driver) = (
                 store(&driven, &driver, Caps::DRIVE_ME),
-                store(&driver, &driven, Caps::OUTBOUND),
+                store(&driver, &driven, Caps::OUTBOUND.union(Caps::CLIPBOARD_TO)),
             );
             let mut pair = clipboard_pair(driven, on_driven, driver, on_driver).await;
             pair.driver_sends.broadcast("unasked".into()).await;
@@ -343,8 +344,12 @@ mod clipboard_follows_the_pairing {
             // while that machine's lease says it may share.
             let (driven, driver) = (machine(), machine());
             let (on_driven, on_driver) = (
-                store(&driven, &driver, Caps::INBOUND | Caps::CLIPBOARD_TO),
-                store(&driver, &driven, Caps::OUTBOUND),
+                store(
+                    &driven,
+                    &driver,
+                    Caps::INBOUND.union(Caps::CLIPBOARD_FROM) | Caps::CLIPBOARD_TO,
+                ),
+                store(&driver, &driven, Caps::OUTBOUND.union(Caps::CLIPBOARD_TO)),
             );
             let mut pair = clipboard_pair(driven, on_driven, driver, on_driver).await;
             pair.driven_sends.broadcast("unasked".into()).await;
@@ -383,7 +388,11 @@ mod clipboard_follows_the_pairing {
             quinn::Endpoint::client("127.0.0.1:0".parse().expect("loopback")).expect("endpoint");
         endpoint.set_default_client_config(raw_client_config(
             &driver,
-            trust(&driver, &[&driven], Caps::OUTBOUND),
+            trust(
+                &driver,
+                &[&driven],
+                Caps::OUTBOUND.union(Caps::CLIPBOARD_TO),
+            ),
             1 << 20,
         ));
         let conn = endpoint
@@ -428,7 +437,7 @@ mod clipboard_follows_the_pairing {
     #[test]
     fn a_transfer_in_flight_at_removal_is_not_applied() {
         run_local(async {
-            let mut raw = raw_driver(Caps::INBOUND).await;
+            let mut raw = raw_driver(Caps::INBOUND.union(Caps::CLIPBOARD_FROM)).await;
             let mut send = raw.conn.open_uni().await.expect("clipboard stream");
             send.write_all(b"half of ").await.expect("write");
             // Long enough on loopback for the listener to take the stream while
@@ -453,7 +462,7 @@ mod clipboard_follows_the_pairing {
     fn a_transfer_queued_at_removal_is_not_applied() {
         run_local(async {
             let (me, peer) = (machine(), machine());
-            let trust = trust(&me, &[&peer], Caps::INBOUND);
+            let trust = trust(&me, &[&peer], Caps::INBOUND.union(Caps::CLIPBOARD_FROM));
             let (queue, rx) = channel();
             let mut inbox = ClipboardInbox::new(rx, trust.clone(), Default::default());
             let from_peer = |text: &str| PeerClipboard {

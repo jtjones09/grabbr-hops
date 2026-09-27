@@ -85,6 +85,7 @@ use crate::trust::{
     Caps, Denial, Expiry, Lease, Origin, TrustError, TrustStore, existing_pairing_clipboard,
 };
 
+use hops_ipc::Controller;
 use hops_ipc::identity::canonical_fingerprint;
 
 use crate::authority::{Authority, AuthorityError, SignatureAlg, verify};
@@ -144,7 +145,7 @@ const OLDER_BUILD_CEILING_SECS: u64 = 400 * 86_400;
 /// so builds on both sides of #183 could share one config directory. Version 2
 /// keeps writing the same date, which no build reads: [`rebuild`] makes every
 /// active lease [`Expiry::Never`].
-fn expiry_older_builds_accept(issued_at: u64) -> u64 {
+pub(crate) fn expiry_older_builds_accept(issued_at: u64) -> u64 {
     issued_at.saturating_add(OLDER_BUILD_CEILING_SECS)
 }
 
@@ -246,6 +247,14 @@ pub enum DiskOrigin {
     OutboundDial,
     /// Carried forward from `[authorized_fingerprints]` by [`TrustStore::migrate_from_config`].
     Migrated,
+    /// The person approving chose that this machine controls the peer
+    /// (#220). The lease drives in exactly the chosen direction; a record
+    /// whose capabilities say otherwise is refused when the store loads.
+    ChosenIMayDrive,
+    /// The person approving chose that the peer controls this machine.
+    ChosenDriveMe,
+    /// The person approving chose that each controls the other.
+    ChosenBoth,
     // No `Restored`. An expelled fingerprint is never re-authorised — the
     // machine returns by generating a new identity, which arrives as `Inbound`
     // or `OutboundDial` like any other first contact.
@@ -1158,6 +1167,9 @@ pub fn rebuild(
                         DiskOrigin::Inbound => Origin::Inbound,
                         DiskOrigin::OutboundDial => Origin::OutboundDial,
                         DiskOrigin::Migrated => Origin::Migrated,
+                        DiskOrigin::ChosenIMayDrive => Origin::Chosen(Controller::ThisMachine),
+                        DiskOrigin::ChosenDriveMe => Origin::Chosen(Controller::ThatMachine),
+                        DiskOrigin::ChosenBoth => Origin::Chosen(Controller::Both),
                     },
                     issued_at: r.issued_at,
                     // Not `r.expires_at`. Builds from before #183 wrote 30
@@ -1381,6 +1393,9 @@ pub fn records_of(store: &TrustStore) -> Vec<LeaseRecord> {
                     Origin::Inbound => DiskOrigin::Inbound,
                     Origin::OutboundDial => DiskOrigin::OutboundDial,
                     Origin::Migrated => DiskOrigin::Migrated,
+                    Origin::Chosen(Controller::ThisMachine) => DiskOrigin::ChosenIMayDrive,
+                    Origin::Chosen(Controller::ThatMachine) => DiskOrigin::ChosenDriveMe,
+                    Origin::Chosen(Controller::Both) => DiskOrigin::ChosenBoth,
                 },
                 issued_at: l.issued_at,
                 // Never absent. A build from before #183 refuses to start on
@@ -2437,8 +2452,15 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
         let (mut file, _) = TrustFile::open(&d, auth.clone()).expect("open");
         let mut store = TrustStore::new(&ours(), file.now()).expect("ours");
 
-        grant_for_attempt(&mut store, B, "desk mac", Some(AttemptOrigin::Inbound))
-            .expect("the first approval grants");
+        grant_for_attempt(
+            &mut store,
+            B,
+            "desk mac",
+            Some(AttemptOrigin::Inbound),
+            hops_ipc::Controller::ThatMachine,
+            true,
+        )
+        .expect("the first approval grants");
         store
             .confirm(B)
             .expect("both machines confirmed the number");
@@ -2447,6 +2469,8 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
             B,
             "b4:ab short name",
             Some(AttemptOrigin::OutboundDial),
+            hops_ipc::Controller::ThisMachine,
+            false,
         )
         .expect("the second approval grants");
         file.save(&records_of(&store)).expect("save");
@@ -2458,9 +2482,10 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
         let (store, refused) = rebuild(&ours(), file.now(), &leases).expect("rebuild");
         assert!(refused.is_empty(), "refused on load: {refused:?}");
 
+        // Both directions, and the clipboard the first approval said yes to.
         let lost: Vec<String> = Caps::NAMED
             .iter()
-            .filter(|(bit, _)| !store.permits(B, *bit))
+            .filter(|(bit, _)| *bit != Caps::CLIPBOARD_TO && !store.permits(B, *bit))
             .map(|(_, name)| (*name).to_owned())
             .collect();
         assert!(
@@ -2478,9 +2503,10 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
         );
         assert_eq!(
             store.lease(B).map(|l| l.origin),
-            Some(Origin::Migrated),
-            "a pairing that holds both directions was saved as coming from \
-             one approval; two approvals add up to what `origin_of` names"
+            Some(Origin::Chosen(hops_ipc::Controller::Both)),
+            "a pairing that holds both directions, each chosen, was saved as \
+             something else; two chosen directions add up to the choice that \
+             names both (#220)"
         );
         let _ = fs::remove_dir_all(&d);
     }
@@ -2658,8 +2684,16 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
         // What the pairings grant is unchanged, before and after a restart.
         let (_, reloaded) = start_in(&d, &auth);
         for s in [&store, &reloaded] {
-            assert_eq!(s.capabilities(A), Caps::INBOUND, "{A}");
-            assert_eq!(s.capabilities(B), Caps::OUTBOUND, "{B}");
+            assert_eq!(
+                s.capabilities(A),
+                Caps::DRIVE_ME | existing_pairing_clipboard(Caps::DRIVE_ME),
+                "{A}"
+            );
+            assert_eq!(
+                s.capabilities(B),
+                Caps::I_MAY_DRIVE | existing_pairing_clipboard(Caps::I_MAY_DRIVE),
+                "{B}"
+            );
         }
         let _ = fs::remove_dir_all(&d);
     }
@@ -2683,8 +2717,15 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
             let auth = authority(&d);
             let (mut file, _) = TrustFile::open(&d, auth.clone()).expect("open");
             let mut store = TrustStore::new(&ours(), file.now()).expect("ours");
-            grant_for_attempt(&mut store, B, "desk mac", Some(AttemptOrigin::Inbound))
-                .expect("the first approval grants");
+            grant_for_attempt(
+                &mut store,
+                B,
+                "desk mac",
+                Some(AttemptOrigin::Inbound),
+                hops_ipc::Controller::ThatMachine,
+                true,
+            )
+            .expect("the first approval grants");
             store
                 .confirm(B)
                 .expect("both machines confirmed the number");
@@ -2698,8 +2739,17 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
                 std::mem::drop(file);
                 (file, store) = start_in(&d, &auth);
             }
-            grant_for_attempt(&mut store, B, "desk mac", Some(AttemptOrigin::OutboundDial))
-                .expect("the second approval grants");
+            // A yes to the clipboard, on the approval of the other direction,
+            // does not turn back on a clipboard switched off.
+            grant_for_attempt(
+                &mut store,
+                B,
+                "desk mac",
+                Some(AttemptOrigin::OutboundDial),
+                hops_ipc::Controller::ThisMachine,
+                true,
+            )
+            .expect("the second approval grants");
             file.save(&records_of(&store)).expect("save");
             let (_, reloaded) = start_in(&d, &auth);
 
@@ -2738,13 +2788,27 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
         let auth = authority(&d);
         let (mut file, _) = TrustFile::open(&d, auth.clone()).expect("open");
         let mut store = TrustStore::new(&ours(), file.now()).expect("ours");
-        grant_for_attempt(&mut store, B, "desk mac", Some(AttemptOrigin::Inbound))
-            .expect("the first approval");
+        grant_for_attempt(
+            &mut store,
+            B,
+            "desk mac",
+            Some(AttemptOrigin::Inbound),
+            hops_ipc::Controller::ThatMachine,
+            false,
+        )
+        .expect("the first approval");
         store
             .confirm(B)
             .expect("both machines confirmed the number");
-        grant_for_attempt(&mut store, B, "desk mac", Some(AttemptOrigin::OutboundDial))
-            .expect("the second approval");
+        grant_for_attempt(
+            &mut store,
+            B,
+            "desk mac",
+            Some(AttemptOrigin::OutboundDial),
+            hops_ipc::Controller::ThisMachine,
+            false,
+        )
+        .expect("the second approval");
         assert!(
             !store.is_pairing(B),
             "a second direction asked for the number again"

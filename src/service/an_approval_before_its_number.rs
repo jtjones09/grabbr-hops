@@ -131,9 +131,10 @@ fn approve(service: &mut Service, fp: &str, origin: AttemptOrigin) {
         1,
         "add device is open and {fp} was not asked about"
     );
-    service.handle_frontend_request(Some(Ok(FrontendRequest::AuthorizeKey(
-        "desk b".into(),
-        fp.to_string(),
+    service.handle_frontend_request(Some(Ok(crate::test_harness::approval(
+        "desk b",
+        fp,
+        hops_ipc::Controller::ThatMachine,
     ))));
     assert!(
         service.trust.read().expect("lock").is_pairing(fp),
@@ -220,7 +221,7 @@ fn an_approval_that_shows_no_number_within_the_window_is_forgotten() {
             .approved
             .get_mut(&peer)
             .expect("the approval is held");
-        when.0 = a_window_before(when.0);
+        when.at = a_window_before(when.at);
 
         let mut frontend = Frontend::connect(&scratch).await;
         let told = serve(
@@ -275,7 +276,7 @@ fn a_machine_approved_here_is_not_asked_about_again_while_it_pairs() {
         let (mut service, _scratch) = daemon("again").await;
         let peer = machine().fingerprint;
         approve(&mut service, &peer, AttemptOrigin::Inbound);
-        let approved_at = service.approved[&peer].0;
+        let approved_at = service.approved[&peer].at;
 
         tokio::time::sleep(PAST_THE_REPEAT).await;
         knock(&mut service, &peer);
@@ -290,12 +291,13 @@ fn a_machine_approved_here_is_not_asked_about_again_while_it_pairs() {
             notices(&events).is_empty(),
             "a knock from a machine approved to drive this one raised a notice: {events:?}"
         );
-        service.handle_frontend_request(Some(Ok(FrontendRequest::AuthorizeKey(
-            "desk b".into(),
-            peer.clone(),
+        service.handle_frontend_request(Some(Ok(crate::test_harness::approval(
+            "desk b",
+            &peer,
+            hops_ipc::Controller::ThatMachine,
         ))));
         assert_eq!(
-            service.approved.get(&peer).map(|a| a.0),
+            service.approved.get(&peer).map(|a| a.at),
             Some(approved_at),
             "approving again restarted the time the pairing has to show its number"
         );
@@ -335,96 +337,6 @@ fn a_cancel_forgets_the_approval() {
         assert!(
             knock_until_asked(&mut service, &peer).await,
             "a knock after the cancel was not asked about afresh"
-        );
-        shut_down(service).await;
-    });
-}
-
-/// Both machines adding each other, each approving the dial it made: each
-/// approved itself as the machine in control, so neither TLS door admits
-/// the other and no number can appear. The other machine's knock says so
-/// once, and the add dial that gives up says so too, not that the other
-/// machine never approved.
-// LEDGER G-20 | class B | 1 events the daemon sends + 2 notice over the real IPC socket
-#[test]
-fn machines_adding_each_other_are_told_so() {
-    run_local(async {
-        let (mut service, scratch) = daemon("both").await;
-        let peer = machine().fingerprint;
-        service.handle_frontend_request(Some(Ok(FrontendRequest::OpenPairing)));
-        service.handle_frontend_request(Some(Ok(FrontendRequest::Create)));
-        let handle = sent(&mut service)
-            .iter()
-            .find_map(|e| match e {
-                FrontendEvent::Created(handle, _, _) => Some(*handle),
-                _ => None,
-            })
-            .expect("a device is created");
-        for request in [
-            FrontendRequest::UpdateFixIps(handle, vec![peer_addr().ip()]),
-            FrontendRequest::UpdatePort(handle, peer_addr().port()),
-            FrontendRequest::Activate(handle, true),
-        ] {
-            service.handle_frontend_request(Some(Ok(request)));
-        }
-        assert!(
-            service.adding.contains_key(&handle),
-            "the add dial did not start"
-        );
-        approve(&mut service, &peer, AttemptOrigin::OutboundDial);
-
-        knock(&mut service, &peer);
-        let first = sent(&mut service);
-        tokio::time::sleep(PAST_THE_REPEAT).await;
-        knock(&mut service, &peer);
-        let again = sent(&mut service);
-        let told: Vec<String> = notices(&first)
-            .into_iter()
-            .filter(|t| t.contains("at the same time"))
-            .collect();
-        assert_eq!(
-            told.len(),
-            1,
-            "the other machine's knock, while this machine adds it, did not say once \
-             that both machines are adding each other: {first:?}"
-        );
-        assert_eq!(
-            (prompts_for(&first, &peer), prompts_for(&again, &peer)),
-            (0, 0),
-            "a machine approved here was asked about again"
-        );
-        assert!(
-            notices(&again).is_empty(),
-            "the same crossing was announced again: {again:?}"
-        );
-
-        let started = service.adding.get_mut(&handle).expect("still adding");
-        *started = a_window_before(*started);
-        // The loop sets up capture for every device switched on as it starts,
-        // and this one was switched on before it ran: undo that here.
-        service.capture.destroy(handle);
-        let mut frontend = Frontend::connect(&scratch).await;
-        let gave_up = serve(
-            &mut service,
-            async {
-                while let Some(event) = frontend.next().await {
-                    if let FrontendEvent::Error(text) = event {
-                        if text.contains("did not finish") {
-                            return Some(text);
-                        }
-                    }
-                }
-                None
-            },
-            "an add dial past the pairing window never gave up",
-        )
-        .await;
-        assert!(
-            gave_up
-                .as_deref()
-                .is_some_and(|t| t.contains("at the same time") && !t.contains("never approved")),
-            "the add dial's notice blames the other machine for not approving, when \
-             both machines approved themselves as the one in control: {gave_up:?}"
         );
         shut_down(service).await;
     });
@@ -493,6 +405,74 @@ fn a_machine_waiting_for_its_number_is_not_treated_as_paired() {
             "a paired machine was offered to add again"
         );
         assert_eq!(service.device_name(handle), "desk b", "once paired");
+        shut_down(service).await;
+    });
+}
+
+/// Two machines adding each other can meet on two connections, and keep
+/// one (#220). The other machine giving up a connection for the other one
+/// takes its number card down and ends nothing: the approval waits for the
+/// number on the connection kept. An attempt on a connection whose number is
+/// no longer on screen ends nothing either. Only the attempt on screen ends
+/// the pairing, and forgets the approval.
+// LEDGER G-23 | class B | 1 events the daemon sends + 1 the trust the TLS door consults: Service::handle_pairing_event
+#[test]
+fn an_attempt_given_up_for_another_connection_ends_nothing() {
+    use crate::pairing::{PairingEvent, Role, Why};
+    run_local(async {
+        let (mut service, _scratch) = daemon("moved").await;
+        let peer = machine().fingerprint;
+        approve(&mut service, &peer, AttemptOrigin::Inbound);
+        let number = |service: &mut Service, conn: usize| {
+            service.handle_pairing_event(PairingEvent::Number {
+                fingerprint: peer.clone(),
+                addr: peer_addr(),
+                role: Role::Pick,
+                number: "042917".into(),
+                handle: None,
+                conn,
+            });
+        };
+        let ended = |service: &mut Service, why: Why, conn: usize| {
+            service.handle_pairing_event(PairingEvent::Ended {
+                fingerprint: peer.clone(),
+                why,
+                handle: None,
+                conn,
+            });
+            sent(service)
+        };
+        let card_down = |events: &[FrontendEvent]| {
+            events.iter().any(|e| {
+                matches!(e, FrontendEvent::PairingEnded { fingerprint, paired: false }
+                    if *fingerprint == peer)
+            })
+        };
+
+        number(&mut service, 1);
+        let events = ended(&mut service, Why::Withdrawn, 1);
+        assert!(
+            card_down(&events) && notices(&events).is_empty(),
+            "a connection the other machine gave up for another did not take its card \
+             down quietly: {events:?}"
+        );
+        assert!(
+            service.trust.read().expect("lock").is_pairing(&peer),
+            "a connection the other machine gave up for another ended the pairing"
+        );
+
+        number(&mut service, 2);
+        let events = ended(&mut service, Why::Closed, 1);
+        assert!(
+            !card_down(&events) && service.trust.read().expect("lock").is_pairing(&peer),
+            "an attempt on a connection no longer on screen ended the pairing: {events:?}"
+        );
+
+        let events = ended(&mut service, Why::Closed, 2);
+        assert!(
+            card_down(&events) && !service.trust.read().expect("lock").is_pairing(&peer),
+            "the attempt on screen closing did not end the pairing: {events:?}"
+        );
         shut_down(service).await;
     });
 }

@@ -3,7 +3,7 @@
 // fields, the two lists, and the live pairing-fp; the callbacks send FrontendRequests.
 
 import { Theme, Type, Space, Radius, Motion, Size } from "theme.slint";
-import { Card, Separator, Dot, Chip, StatChip, SectionTitle, PillButton, TextField, Toggle, NumberButton } from "widgets.slint";
+import { Card, Separator, Dot, Chip, StatChip, SectionTitle, PillButton, TextField, Toggle, NumberButton, ChoiceRow } from "widgets.slint";
 import { OnboardingWindow } from "onboarding.slint";
 import { LayoutCanvas, CanvasBox } from "layout_canvas.slint";
 import { HopsTray } from "tray.slint";
@@ -119,6 +119,18 @@ export component AppWindow inherits Window {
     // for one machine must never be sent to approve another (#168). `in-out`
     // because the field writes it and Rust clears it.
     in-out property <string> pairing-name: "";
+    // The card's two questions (#220, #182), answered for the machine on it
+    // and cleared by Rust when it changes machine, as the name is. Which way
+    // control goes: an index into `controller-choices`, or -1 until someone
+    // chooses, and approving waits for it. The clipboard: off until switched on.
+    in-out property <int> pairing-controller: -1;
+    in-out property <bool> pairing-clipboard: false;
+    // The three answers, in the words every frontend uses; Rust sets them.
+    in property <[string]> controller-choices: [
+        "This machine controls that one",
+        "That machine controls this one",
+        "Each controls the other",
+    ];
     // true when WE dialled out and found this untrusted receiver, rather than it
     // connecting to us. A console verb can cause the former, so the card must not
     // present it as a peer knocking (#61).
@@ -498,6 +510,43 @@ export component AppWindow inherits Window {
                             letter-spacing: Type.mono-tracking;
                             overflow: elide;
                         }
+                        // Asked, never assumed (#220): nothing is chosen until
+                        // a click, and "trust & name" waits for one.
+                        Text {
+                            text: "Which machine is in control?";
+                            color: Theme.c.foreground;
+                            font-size: Type.small;
+                            font-weight: Type.semibold;
+                        }
+                        for choice[i] in root.controller-choices: ChoiceRow {
+                            text: choice;
+                            selected: root.pairing-controller == i;
+                            clicked => { root.pairing-controller = i; }
+                        }
+                        HorizontalLayout {
+                            spacing: Space.sm;
+                            VerticalLayout {
+                                alignment: center;
+                                Toggle {
+                                    checked: root.pairing-clipboard;
+                                    toggled(on) => { root.pairing-clipboard = on; }
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                horizontal-stretch: 1;
+                                Text {
+                                    text: root.pairing-clipboard
+                                        ? "Share the clipboard: yes, the way control goes"
+                                        : "Share the clipboard: no";
+                                    color: root.pairing-clipboard
+                                        ? Theme.c.foreground
+                                        : Theme.c.muted;
+                                    font-size: Type.small;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
                         HorizontalLayout {
                             spacing: Space.sm;
                             // Rust clears the name once an approval is sent, and
@@ -513,6 +562,7 @@ export component AppWindow inherits Window {
                             PillButton {
                                 text: "trust & name";
                                 primary: true;
+                                enabled: root.pairing-controller >= 0;
                                 clicked => {
                                     root.approve-pairing(root.pairing-name, root.pairing-fp);
                                 }

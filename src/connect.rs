@@ -212,10 +212,7 @@ async fn connect(
     };
     let (drive, pairing) = {
         let t = trust.read().expect("lock");
-        (
-            t.we_may_drive(&fingerprint),
-            t.awaits(&fingerprint, crate::trust::Caps::I_MAY_DRIVE),
-        )
+        (t.we_may_drive(&fingerprint), t.is_pairing(&fingerprint))
     };
     if !drive && pairing {
         return Ok((Landed::Pairing { conn, fingerprint }, addr));
@@ -452,6 +449,16 @@ impl LanMouseConnection {
     /// What those attempts tell the service. Once: `None` after the first.
     pub(crate) fn take_pairing_events(&mut self) -> Option<Receiver<crate::pairing::PairingEvent>> {
         self.pairing_events.take()
+    }
+
+    /// Hold this connection's attempts on `pairings`, the listener's, so a
+    /// machine holds one attempt per machine it pairs with, whichever
+    /// machine dialled (see `crate::pairing::preferred`). Before any dial:
+    /// each dial takes its own handle when it starts. Its own events go
+    /// with its own board.
+    pub(crate) fn share_pairings(&mut self, pairings: crate::pairing::Pairings) {
+        self.pairings = pairings;
+        self.pairing_events = None;
     }
 
     pub(crate) async fn recv(&mut self) -> (ClientHandle, ProtoEvent) {
@@ -1030,6 +1037,20 @@ async fn connect_to_handle(
                 "client {handle}: connected but could not read the receiver's \
                  leaf-cert fingerprint; keeping any prior pin"
             ),
+        }
+        // Paired on this connection, and the person here did not choose this
+        // machine to control that one (#220): pinned above, so the device
+        // shows as that machine, and closed, carrying nothing.
+        if greeted.is_some() && !trust.read().expect("lock").we_may_drive(&link.fingerprint) {
+            drop(open);
+            log::info!(
+                "client {handle}: paired with {}, which this machine does not control; \
+                 closing the pairing connection",
+                link.fingerprint
+            );
+            link.conn.close(0u32.into(), b"paired");
+            connecting.lock().await.remove(&handle);
+            return Err(LanMouseConnectionError::NotConnected);
         }
         log::info!("client ({handle}) connected @ {addr}");
         client_manager.set_active_addr(handle, Some(addr));
