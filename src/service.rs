@@ -1944,9 +1944,6 @@ impl Service {
             Some(&handle) => handle,
             None => self.add_device_that_dials_us(&fp),
         };
-        if self.client_manager.set_dials_us(handle, true) {
-            self.broadcast_client(handle);
-        }
         let adopter = self.adopter.clone();
         tokio::task::spawn_local(async move {
             adopter.adopt(handle, dialled).await;

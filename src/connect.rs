@@ -880,6 +880,9 @@ impl Adopter {
         );
         s.client_manager.set_active_addr(handle, Some(addr));
         s.client_manager.set_removed_by_peer(handle, false);
+        // Its machine dials this one: seen, not assumed. A dial turned away
+        // above says nothing about how the device is reached.
+        s.client_manager.set_dials_us(handle, true);
         open.insert(addr, link.clone());
         drop(open);
         let _ = s.state_tx.send(handle);
@@ -1081,12 +1084,9 @@ async fn connect_to_handle(
                         // that it is unreachable.
                         TrustPrompt::Nothing if port == DEFAULT_PORT && !addrs.is_empty() => {
                             let ips: Vec<_> = addrs.iter().map(|a| a.ip()).collect();
-                            let (identity, trust, refusals) =
-                                (identity.clone(), trust.clone(), refusals.clone());
+                            let refusals = refusals.clone();
                             spawn_local(async move {
                                 let at = crate::dial_back::older_version_at(
-                                    &identity,
-                                    &trust,
                                     &ips,
                                     hops_ipc::PORT_BEFORE_V013,
                                 )

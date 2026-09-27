@@ -82,13 +82,14 @@ pub(crate) enum DialBackError {
     /// The machine that answered took the link and closed it for a reason
     /// of its own, such as its device for this machine being switched off.
     NotTaken,
-    /// This machine no longer lets that machine drive it.
-    NotPermitted,
 }
 
 /// A link made, with the first frame the machine that answered sent on it.
 pub(crate) struct DialledOut {
     pub(crate) conn: Connection,
+    /// The machine the handshake proved is at the other end: the one the
+    /// device is pinned to, or no link is made.
+    pub(crate) fingerprint: String,
     /// Kept for as long as the link: the connection's own socket.
     pub(crate) endpoint: Endpoint,
     pub(crate) first: (RecvStream, ProtoEvent),
@@ -160,17 +161,18 @@ async fn attempt(
                 .ok()
         })
         .and_then(|certs| certs.first().map(transport::fingerprint_of));
-    if actual.as_deref() != Some(expected.as_str()) {
-        conn.close(0u32.into(), b"fingerprint mismatch");
-        return Err(DialBackError::NotThePinnedMachine(
-            addr,
-            actual.unwrap_or_default(),
-        ));
-    }
-    if !trust.read().expect("lock").may_drive_us(&expected) {
-        conn.close(0u32.into(), b"not permitted");
-        return Err(DialBackError::NotPermitted);
-    }
+    let fingerprint = match actual {
+        Some(actual) if actual == expected => actual,
+        actual => {
+            conn.close(0u32.into(), b"fingerprint mismatch");
+            return Err(DialBackError::NotThePinnedMachine(
+                addr,
+                actual.unwrap_or_default(),
+            ));
+        }
+    };
+    // Whether that machine may drive this one was asked in the handshake,
+    // and is asked again as the link is admitted ([`Admitter::admit`]).
     // The machine that answered checks this one's certificate after this
     // side's half of the handshake, so its refusal can land on a connection
     // that looked open. It opens its input stream only for a machine it
@@ -194,6 +196,7 @@ async fn attempt(
     match first {
         Ok(Some(first)) => Ok(DialledOut {
             conn,
+            fingerprint,
             endpoint,
             first,
         }),
@@ -252,7 +255,6 @@ fn rank(e: &DialBackError) -> u8 {
         DialBackError::Refused(_) => 3,
         DialBackError::Forgotten(_) => 4,
         DialBackError::NotThePinnedMachine(..) => 5,
-        DialBackError::NotPermitted => 6,
     }
 }
 
@@ -267,43 +269,105 @@ pub(crate) enum LegacyAnswer {
     OldPort(SocketAddr),
 }
 
+/// The server-certificate check of a port probe: it notes the certificate
+/// it is shown and refuses it, whoever it names.
+///
+/// Refusing it is what makes the probe a probe. Under TLS 1.3 a client
+/// checks the server's certificate before it sends its own, so the machine
+/// probed never sees one, never finishes the handshake, and has no link to
+/// hand over or pairing to prompt for. A certificate shown at all says
+/// that a hops serving [`transport::ALPN_DRIVEN`] answered.
+#[derive(Debug)]
+struct ProbeVerifier {
+    shown: Arc<StdMutex<Option<String>>>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for ProbeVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        *self.shown.lock().expect("lock") = Some(transport::fingerprint_of(end_entity));
+        Err(rustls::Error::General("a port probe takes no link".into()))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::General("a port probe takes no link".into()))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::General("a port probe takes no link".into()))
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// A probe's config: [`transport::ALPN_DRIVEN`] alone, no certificate of
+/// this machine's, and a [`ProbeVerifier`] writing to `shown`.
+fn probe_config(shown: Arc<StdMutex<Option<String>>>) -> Option<quinn::ClientConfig> {
+    transport::install_crypto_provider();
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut crypto = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(ProbeVerifier { shown, provider }))
+        .with_no_client_auth();
+    crypto.alpn_protocols = vec![transport::ALPN_DRIVEN.to_vec()];
+    crypto.resumption = rustls::client::Resumption::disabled();
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(crypto).ok()?;
+    Some(quinn::ClientConfig::new(Arc::new(crypto)))
+}
+
 /// Ask `ips` at `port`, where hops listened before v0.13 (#16), whether a
-/// hops answers there, and which. Nothing is sent but a handshake offering
-/// [`transport::ALPN_DRIVEN`]: an older hops refuses that ALPN before it
-/// reads a certificate, and a newer one is closed at once if it lets the
-/// handshake finish.
-pub(crate) async fn older_version_at(
-    identity: &Arc<Identity>,
-    trust: &Trust,
-    ips: &[IpAddr],
-    port: u16,
-) -> Option<LegacyAnswer> {
+/// hops answers there, and which. Nothing is sent but the start of a
+/// handshake offering [`transport::ALPN_DRIVEN`], and no handshake is
+/// finished: an older hops refuses that ALPN before it shows a
+/// certificate, and a newer one shows its certificate, which the probe
+/// refuses before sending one of its own ([`ProbeVerifier`]). Neither
+/// machine's lease is asked, so the controlling machine and the controlled
+/// one hear the same answer.
+pub(crate) async fn older_version_at(ips: &[IpAddr], port: u16) -> Option<LegacyAnswer> {
     let mut probes = JoinSet::new();
     for &ip in ips {
         let addr = SocketAddr::new(ip, port);
-        let (identity, trust) = (identity.clone(), trust.clone());
         probes.spawn_local(async move {
+            let shown: Arc<StdMutex<Option<String>>> = Default::default();
+            let cfg = probe_config(shown.clone())?;
             let endpoint = Endpoint::client(unspecified(addr)).ok()?;
-            let cfg = client_config_for(
-                &identity,
-                trust,
-                Arc::new(StdMutex::new(None)),
-                Dialler::IsDriven,
-            );
             let connecting = endpoint.connect_with(cfg, addr, "grabbr").ok()?;
-            match tokio::time::timeout(DIAL_TIMEOUT, connecting).await {
-                Err(_) => None,
-                Ok(Err(e)) if transport::refused_protocol(&e) => {
-                    Some(LegacyAnswer::OlderVersion(addr))
-                }
-                Ok(Err(quinn::ConnectionError::ConnectionClosed(_))) => {
-                    Some(LegacyAnswer::OldPort(addr))
-                }
-                Ok(Err(_)) => None,
+            let ended = match tokio::time::timeout(DIAL_TIMEOUT, connecting).await {
+                Err(_) => return None,
                 Ok(Ok(conn)) => {
+                    // Not reached: the verifier refuses every certificate.
                     conn.close(0u32.into(), b"probe");
-                    Some(LegacyAnswer::OldPort(addr))
+                    None
                 }
+                Ok(Err(e)) => Some(e),
+            };
+            if shown.lock().expect("lock").is_some() {
+                Some(LegacyAnswer::OldPort(addr))
+            } else if ended.as_ref().is_some_and(transport::refused_protocol) {
+                Some(LegacyAnswer::OlderVersion(addr))
+            } else {
+                None
             }
         });
     }
@@ -336,10 +400,7 @@ fn told(handle: ClientHandle, fingerprint: &str, e: &DialBackError) -> Option<Di
             handle,
             seen: vec![(*addr, seen.clone())],
         }),
-        DialBackError::NoAddress
-        | DialBackError::NotAnswered
-        | DialBackError::NotTaken
-        | DialBackError::NotPermitted => None,
+        DialBackError::NoAddress | DialBackError::NotAnswered | DialBackError::NotTaken => None,
     }
 }
 
@@ -498,13 +559,16 @@ async fn hold(
                 let started = Instant::now();
                 let DialledOut {
                     conn,
+                    fingerprint: proven,
                     endpoint,
                     first,
                 } = up;
                 *link.borrow_mut() = Some(conn.clone());
+                // Admitted as the machine the handshake proved, which the
+                // pin above made the one this device is pinned to.
                 if context
                     .admitter
-                    .admit(conn.clone(), fingerprint.clone(), Some(first))
+                    .admit(conn.clone(), proven, Some(first))
                     .await
                 {
                     log::info!(
@@ -527,13 +591,7 @@ async fn hold(
                 let mut refusal = told(handle, &fingerprint, &e);
                 if matches!(e, DialBackError::NotAnswered) && port == hops_ipc::DEFAULT_PORT {
                     let ips: Vec<IpAddr> = addrs.iter().map(|a| a.ip()).collect();
-                    let legacy = older_version_at(
-                        &context.identity,
-                        &context.trust,
-                        &ips,
-                        hops_ipc::PORT_BEFORE_V013,
-                    )
-                    .await;
+                    let legacy = older_version_at(&ips, hops_ipc::PORT_BEFORE_V013).await;
                     refusal = legacy.map(|answer| match answer {
                         LegacyAnswer::OlderVersion(addr) => {
                             DialRefusal::OlderVersion { handle, addr }
@@ -667,14 +725,13 @@ mod tests {
         let at = SocketAddr::from(([127, 0, 0, 1], port));
         let DialledOut {
             conn,
+            fingerprint,
             endpoint,
             first,
         } = dial_to_be_driven(&me.identity, &trust, &[at], controller).await?;
         let emulation = Emulation::new(Some(recording.backend()), listener, trust.clone());
         assert!(
-            admitter
-                .admit(conn.clone(), controller.to_string(), Some(first))
-                .await,
+            admitter.admit(conn.clone(), fingerprint, Some(first)).await,
             "the controlled machine refused the link it dialled"
         );
         Ok(Controlled {
@@ -772,6 +829,165 @@ mod tests {
         });
     }
 
+    /// How a dial made with `cfg` to the listener at `port` ended: the
+    /// handshake's error, or what closed the connection it made.
+    async fn how_it_ended(cfg: quinn::ClientConfig, port: u16) -> quinn::ConnectionError {
+        let endpoint = Endpoint::client("127.0.0.1:0".parse().expect("addr")).expect("ep");
+        let at = SocketAddr::from(([127, 0, 0, 1], port));
+        let conn = tokio::time::timeout(
+            ARRIVES_WITHIN,
+            endpoint.connect_with(cfg, at, "grabbr").expect("dial"),
+        )
+        .await
+        .expect("an answer");
+        // The listener checks the dialler's certificate after the dialler's
+        // half of the handshake: its refusal lands on the connection.
+        match conn {
+            Ok(conn) => tokio::time::timeout(ARRIVES_WITHIN, conn.closed())
+                .await
+                .expect("the listener ends the connection"),
+            Err(e) => e,
+        }
+    }
+
+    /// Whether `e` is the listener refusing in the handshake itself: a TLS
+    /// alert, not a close after it.
+    fn at_the_door(e: &quinn::ConnectionError) -> bool {
+        matches!(e, quinn::ConnectionError::ConnectionClosed(close)
+            if (0x100..=0x1ff).contains(&u64::from(close.error_code)))
+    }
+
+    // LEDGER T7c | class B | 1 return value: the connection error of a handshake against listen::server_config
+    /// A machine that may not drive the dialler refuses it at the TLS door,
+    /// known to it or not: nothing the dialler sends is read, and the check
+    /// after the handshake is a second one, not the only one.
+    #[test]
+    fn a_listener_that_may_not_drive_the_dialler_refuses_it_in_the_handshake() {
+        run_local(async {
+            for k_caps in [Caps::NONE, Caps::INBOUND] {
+                let (k_m, c_m) = (machine(), machine());
+                let k = controller(&k_m, store(&k_m, &c_m, k_caps), &c_m.fingerprint).await;
+                let cfg = client_config_for(
+                    &c_m.identity,
+                    trust(&c_m, &[&k_m], Caps::INBOUND),
+                    Arc::new(StdMutex::new(None)),
+                    Dialler::IsDriven,
+                );
+                let ended = how_it_ended(cfg, k.port).await;
+                assert!(
+                    at_the_door(&ended),
+                    "controller {k_caps:?}: refused otherwise than at the TLS door: {ended:?}"
+                );
+                assert!(k.adopted.borrow().is_empty(), "controller {k_caps:?}");
+            }
+        });
+    }
+
+    // LEDGER T13 | class B | 1 return value: dial_to_be_driven's error when another machine answers
+    /// The dialler takes the link only from the machine its device is pinned
+    /// to. Another machine at that address, even one this machine also lets
+    /// drive it, is refused before any of its input is read.
+    #[test]
+    fn a_dial_to_be_driven_is_taken_only_from_the_pinned_machine() {
+        run_local(async {
+            let (pinned, other, c) = (machine(), machine(), machine());
+            let recording = Recording::new();
+            let answers =
+                controller(&other, trust(&other, &[&c], Caps::OUTBOUND), &c.fingerprint).await;
+            let c_trust = trust(&c, &[&pinned, &other], Caps::INBOUND);
+            let got = controlled(&c, c_trust, &pinned.fingerprint, answers.port, &recording).await;
+            assert!(
+                matches!(&got, Err(DialBackError::NotThePinnedMachine(_, seen))
+                    if *seen == other.fingerprint),
+                "another machine answering at the address was taken as the pinned one: {:?}",
+                got.as_ref().map(|_| "linked")
+            );
+        });
+    }
+
+    // LEDGER T14 | class B | 1 return value: Admitter::admit after the lease was withdrawn
+    /// A lease withdrawn between the dial and its admission admits nothing:
+    /// the link is closed, not read.
+    #[test]
+    fn a_lease_withdrawn_before_admission_admits_nothing() {
+        run_local(async {
+            let (k_m, c_m) = (machine(), machine());
+            let k = controller(&k_m, trust(&k_m, &[&c_m], Caps::OUTBOUND), &c_m.fingerprint).await;
+            let c_trust = trust(&c_m, &[&k_m], Caps::INBOUND);
+            let (clipboard_tx, _heard) = channel();
+            let listener =
+                LanMouseListener::dial_only(c_m.identity.clone(), c_trust.clone(), clipboard_tx)
+                    .await
+                    .expect("a listener on no port");
+            let admitter = listener.admitter();
+            let at = SocketAddr::from(([127, 0, 0, 1], k.port));
+            let out = dial_to_be_driven(&c_m.identity, &c_trust, &[at], &k_m.fingerprint)
+                .await
+                .expect("dialled");
+            c_trust
+                .write()
+                .expect("lock")
+                .drop_capabilities(&k_m.fingerprint, Caps::DRIVE_ME);
+            let conn = out.conn.clone();
+            assert!(
+                !admitter
+                    .admit(out.conn, out.fingerprint, Some(out.first))
+                    .await,
+                "a link was admitted after the lease letting its machine drive this one was \
+                 withdrawn"
+            );
+            tokio::time::timeout(ARRIVES_WITHIN, conn.closed())
+                .await
+                .expect("the link not admitted is closed");
+            drop(listener);
+        });
+    }
+
+    // LEDGER T15 | class B | 6 struct state: the controlling machine's ClientManager behind Adopter::adopt
+    /// A device switched off takes no link its machine dials (#218), and its
+    /// card says nothing new about who dials. Switched on, it takes the next
+    /// one, and its card says its machine dials in.
+    #[test]
+    fn a_device_switched_off_takes_no_link_its_machine_dials() {
+        run_local(async {
+            let (k_m, c_m) = (machine(), machine());
+            let recording = Recording::new();
+            let k = controller(&k_m, trust(&k_m, &[&c_m], Caps::OUTBOUND), &c_m.fingerprint).await;
+            let c_trust = trust(&c_m, &[&k_m], Caps::INBOUND);
+            let dials_us = |k: &Controller| {
+                k.dialer
+                    .clients
+                    .get_state(k.dialer.handle)
+                    .is_some_and(|(_, s)| s.dials_us)
+            };
+            k.dialer.clients.deactivate_client(k.dialer.handle);
+            let got = controlled(&c_m, c_trust.clone(), &k_m.fingerprint, k.port, &recording).await;
+            wait_until("the dial to be handed over", ARRIVES_WITHIN, || {
+                !k.adopted.borrow().is_empty()
+            })
+            .await;
+            assert!(
+                got.is_err() && *k.adopted.borrow() == vec![false],
+                "a device switched off took the link its machine dialled: {:?}",
+                k.adopted.borrow()
+            );
+            assert!(
+                !dials_us(&k),
+                "a dial turned away marked the card as dialled into"
+            );
+
+            k.dialer.clients.activate_client(k.dialer.handle);
+            let _c = controlled(&c_m, c_trust, &k_m.fingerprint, k.port, &recording)
+                .await
+                .expect("linked once switched on");
+            wait_until("the dial to be taken", ARRIVES_WITHIN, || {
+                k.adopted.borrow().contains(&true)
+            })
+            .await;
+            assert!(dials_us(&k), "the card does not say its machine dials in");
+        });
+    }
+
     // LEDGER T5 | class B | 6 struct state: Recording::calls() behind Admitter::admit and the emulation gates
     /// #212 on the reversed link: input from the controlling machine is
     /// injected only once it crossed onto this machine.
@@ -861,12 +1077,30 @@ mod tests {
     // LEDGER T10 | class B | 6 queue state: the transports' clipboard queues on both ends of a reversed link
     /// The clipboard over a reversed link follows each machine's lease, as
     /// over any link: the controller's text reaches the controlled machine,
-    /// which takes it, and the controlled machine's does not reach a
-    /// controller whose lease does not take it.
+    /// which takes it; the controlled machine's reaches a controller whose
+    /// lease takes it, and not one whose lease does not.
     #[test]
     fn the_clipboard_over_a_reversed_link_follows_the_lease() {
         run_local(async {
             let recording = Recording::new();
+            let (mut k, c) = reversed(
+                Caps::OUTBOUND | Caps::CLIPBOARD_FROM,
+                Caps::INBOUND | Caps::CLIPBOARD_TO,
+                &recording,
+            )
+            .await;
+            let c = c.expect("linked");
+            k.dialer.until_alive().await;
+            c.sends.broadcast("taken by the controller".into()).await;
+            assert_eq!(
+                heard_within(&mut k.dialer.notices.clipboard, ARRIVES_WITHIN)
+                    .await
+                    .map(|(text, _)| text),
+                Some("taken by the controller".to_string()),
+                "the controlled machine's clipboard did not reach a controller whose lease \
+                 takes it"
+            );
+
             let (mut k, c) = reversed(
                 Caps::OUTBOUND | Caps::CLIPBOARD_TO,
                 Caps::INBOUND | Caps::CLIPBOARD_FROM | Caps::CLIPBOARD_TO,
@@ -997,27 +1231,59 @@ mod tests {
             );
             let loopback = [IpAddr::from([127, 0, 0, 1])];
             assert_eq!(
-                older_version_at(&c.identity, &c_trust, &loopback, port).await,
+                older_version_at(&loopback, port).await,
                 Some(LegacyAnswer::OlderVersion(at))
             );
 
             // This version, told by its config to listen on the old port.
             let newer = controller(&k, trust(&k, &[&c], Caps::OUTBOUND), &c.fingerprint).await;
             assert_eq!(
-                older_version_at(&c.identity, &c_trust, &loopback, newer.port).await,
+                older_version_at(&loopback, newer.port).await,
                 Some(LegacyAnswer::OldPort(SocketAddr::from((
                     [127, 0, 0, 1],
                     newer.port
                 )))),
             );
+            // A probe is not a dial: it hands the machine it reached nothing
+            // to adopt. A real dial after it is taken, and is the only one.
+            let recording = Recording::new();
+            let _c = controlled(&c, c_trust.clone(), &k.fingerprint, newer.port, &recording)
+                .await
+                .expect("linked");
+            wait_until("the dial to be taken", ARRIVES_WITHIN, || {
+                newer.adopted.borrow().contains(&true)
+            })
+            .await;
+            assert_eq!(
+                *newer.adopted.borrow(),
+                vec![true],
+                "the port probe was handed over as a dial to be driven"
+            );
+
+            // The controlling machine probes too, when its own dial finds
+            // nothing. Its lease does not let the machine it reached drive
+            // it, and it still hears that a newer hops is there.
+            let (clipboard_tx, _) = channel();
+            let (_on_old_port, old_port) = LanMouseListener::bind_loopback(
+                c.identity.clone(),
+                trust(&c, &[&k], Caps::INBOUND),
+                clipboard_tx,
+            )
+            .await
+            .expect("listener");
+            assert_eq!(
+                older_version_at(&loopback, old_port).await,
+                Some(LegacyAnswer::OldPort(SocketAddr::from((
+                    [127, 0, 0, 1],
+                    old_port
+                )))),
+                "the controlling machine's probe did not hear the newer hops on the old port"
+            );
 
             // Nothing there at all.
             let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("a silent port");
             let silent_port = silent.local_addr().expect("addr").port();
-            assert_eq!(
-                older_version_at(&c.identity, &c_trust, &loopback, silent_port).await,
-                None
-            );
+            assert_eq!(older_version_at(&loopback, silent_port).await, None);
         });
     }
 }

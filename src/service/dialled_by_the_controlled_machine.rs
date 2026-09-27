@@ -78,12 +78,14 @@ fn dials_out_to(fp: &str, port: u16) -> String {
 }
 
 // LEDGER T1 | class B | 6 struct state: Recording::calls() on the dialling daemon, two whole daemons in-process
-// LEDGER T3 | class B | 6 struct state: Recording::calls() on the controlling daemon (same test)
+// LEDGER T3 | class B | 6 struct state: Recording::calls() on the controlling daemon (same test); an absence over NEVER_WITHIN, a regression check only
+// LEDGER T16 | class B | 2 bytes: FrontendEvent::State over the controlling daemon's IPC socket, after an Activate on the dialling daemon's (same test)
 /// The desk mac only dials out, and chose the desk pc to control it. It
 /// dials the desk pc, which gains a device for it keyed by its fingerprint,
 /// and the desk pc's keyboard types on the desk mac over the link the mac
 /// opened. Nothing flows the other way: the mac crossing to the pc drives
-/// nothing there.
+/// nothing there. Switched off on the mac, the pc's device there closes the
+/// link the mac holds to it (#218).
 #[test]
 fn the_controlled_machine_dials_out_and_is_driven_over_its_own_link() {
     run_local(async {
@@ -99,7 +101,7 @@ fn the_controlled_machine_dials_out_and_is_driven_over_its_own_link() {
             on_mac.backend(),
         )
         .await;
-        let (mac_fp, mac_trust) = (mac.fingerprint(), mac.trust());
+        let (mac_fp, mac_trust, mac_ipc) = (mac.fingerprint(), mac.trust(), mac.ipc());
         // The pc controls the mac, and not the other way round.
         mac_trust
             .write()
@@ -153,6 +155,37 @@ fn the_controlled_machine_dials_out_and_is_driven_over_its_own_link() {
                 "the controlled mac drove the pc over the link it dialled: {:?}",
                 on_pc.calls()
             );
+
+            // Off means off on the dialling end too: the mac switches its
+            // device for the pc off, and the link it holds to the pc closes.
+            let mut on_mac_app = mac_ipc.connect().await;
+            let pc_on_mac = on_mac_app
+                .exchange(&[FrontendRequest::Enumerate()])
+                .await
+                .into_iter()
+                .find_map(|e| match e {
+                    FrontendEvent::Enumerate(all) => all
+                        .into_iter()
+                        .find(|(_, _, s)| s.peer_fingerprint.as_deref() == Some(pc_fp.as_str()))
+                        .map(|(h, _, _)| h),
+                    _ => None,
+                })
+                .expect("the mac's device for the pc");
+            on_mac_app
+                .exchange(&[FrontendRequest::Activate(pc_on_mac, false)])
+                .await;
+            until(
+                &mut on_pc_app,
+                "the link closing once the mac switched the pc off",
+                || {},
+                |e| match e {
+                    FrontendEvent::State(h, _, s) if *h == handle && s.active_addr.is_none() => {
+                        Some(())
+                    }
+                    _ => None,
+                },
+            )
+            .await;
         };
         pc.run_while(mac.run_while(body)).await;
     });
@@ -189,9 +222,10 @@ fn a_machine_that_only_dials_out_binds_no_port() {
 // LEDGER T4 | class B | 2 bytes: FrontendEvent::State over the controlling daemon's IPC socket
 /// The link is the controlled machine's to keep up, and a machine that
 /// only dials out keeps one to each machine that may drive it, even one it
-/// may drive too. Switched off on the pc,
-/// the link closes and the mac's dials are turned away; switched on again,
-/// the mac's next dial is taken, and meanwhile the pc's card waits for it.
+/// may drive too. Switched off on the pc, the link closes and the pc's
+/// card waits for the mac to dial; switched on again, the mac's next dial
+/// is taken. That a device switched off turns the dials away is pinned by
+/// `a_device_switched_off_takes_no_link_its_machine_dials`.
 #[test]
 fn the_controlled_machine_dials_again_until_its_link_is_taken() {
     run_local(async {
