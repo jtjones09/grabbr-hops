@@ -62,8 +62,8 @@ impl EventThread {
         self.client_update(ClientUpdate::Destroy(pos));
     }
 
-    fn exit(&self) {
-        self.signal(RequestType::Exit);
+    fn exit(&self) -> bool {
+        self.signal(RequestType::Exit)
     }
 
     fn client_update(&self, request: ClientUpdate) {
@@ -74,24 +74,33 @@ impl EventThread {
         self.signal(RequestType::ClientUpdate);
     }
 
-    fn signal(&self, event_type: RequestType) {
+    /// Whether the request reached the thread's message queue.
+    fn signal(&self, event_type: RequestType) -> bool {
         let id = self.thread_id;
         // Runs on the daemon's side, including in `drop`: a failure is
         // logged, never a panic. The thread creates its message queue before
         // it reports its id, so a post to a running thread does not fail.
         let posted =
             unsafe { PostThreadMessageW(id, WM_USER, WPARAM(event_type as usize), LPARAM(0)) };
-        if let Err(e) = posted {
+        if let Err(e) = &posted {
             log::warn!("input capture: could not signal the hook thread: {e}");
         }
+        posted.is_ok()
     }
 }
 
 impl Drop for EventThread {
     fn drop(&mut self) {
-        self.exit();
+        // Joining a thread that was never told to exit would block the
+        // daemon's loop for good; detached, it only outlives its queue,
+        // whose pushes are then discarded.
+        let told = self.exit();
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            if told {
+                let _ = thread.join();
+            } else {
+                log::warn!("input capture: the hook thread was left running");
+            }
         }
     }
 }
@@ -317,11 +326,16 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
         return ret;
     }
 
-    /* update active client and entry point */
-    ACTIVE_CLIENT.replace(Some(pos));
+    /* a crossing needs the display it left, to know where the cursor stops */
     let entry_point = DISPLAYS.with_borrow(|(displays, _)| {
         display_util::clamp_to_display_bounds(displays, prev_pos, curr_pos)
     });
+    let Some(entry_point) = entry_point else {
+        return ret;
+    };
+
+    /* update active client and entry point */
+    ACTIVE_CLIENT.replace(Some(pos));
     ENTRY_POINT.replace(entry_point);
 
     /* notify main thread */

@@ -2,28 +2,45 @@
 //!
 //! Its behaviour can only run on Windows, and no test there drives a real
 //! low-level hook, so these read the source. They are scoped to named
-//! functions with comments stripped, and each one was checked by putting the
-//! defect back and watching it fail.
+//! functions with comments stripped, and a renamed function fails them.
 
 const EVENT_THREAD: &str = include_str!("windows/event_thread.rs");
+const DISPLAY_UTIL: &str = include_str!("windows/display_util.rs");
 const WINDOWS: &str = include_str!("windows.rs");
 
 /// Everything the OS can call into while a hook is installed: the hook and
-/// window procedures and what they call. A panic in any of them unwinds into
-/// a Win32 callback, which with `panic = "abort"` ends the daemon while its
-/// hooks are still swallowing the machine's input (#80).
-const HOOK_PATH: &[&str] = &[
-    "mouse_proc",
-    "kybrd_proc",
-    "window_proc",
-    "check_client_activation",
-    "push_event",
-    "to_mouse_event",
-    "to_key_event",
-    "media_vk_to_evdev",
-    "is_lock_vk",
-    "update_display_regions",
-    "enumerate_displays",
+/// window procedures and what they call, by file. A panic in any of them
+/// unwinds into a Win32 callback, which with `panic = "abort"` ends the
+/// daemon while its hooks are still swallowing the machine's input (#80).
+const HOOK_PATH: &[(&str, &[&str])] = &[
+    (
+        EVENT_THREAD,
+        &[
+            "mouse_proc",
+            "kybrd_proc",
+            "window_proc",
+            "check_client_activation",
+            "push_event",
+            "to_mouse_event",
+            "to_key_event",
+            "media_vk_to_evdev",
+            "is_lock_vk",
+            "update_display_regions",
+            "enumerate_displays",
+        ],
+    ),
+    (
+        DISPLAY_UTIL,
+        &[
+            "is_within_dp_region",
+            "is_within_dp_boundary",
+            "in_bounds",
+            "in_display_region",
+            "moved_across_boundary",
+            "entered_barrier",
+            "clamp_to_display_bounds",
+        ],
+    ),
 ];
 
 fn strip_comments(src: &str) -> String {
@@ -68,7 +85,6 @@ fn body<'a>(src: &'a str, name: &str) -> &'a str {
 
 #[test]
 fn nothing_the_os_calls_into_while_hooked_can_panic() {
-    let src = strip_comments(EVENT_THREAD);
     let forbidden = [
         ".unwrap()",
         ".expect(",
@@ -76,18 +92,45 @@ fn nothing_the_os_calls_into_while_hooked_can_panic() {
         "unreachable!(",
         "todo!(",
         "unimplemented!(",
+        // Panics when its bounds are out of order.
+        ".clamp(",
         "blocking_send",
         "try_send",
+        // `with` panics once the thread's locals are being destroyed.
+        "EVENT_TX.with(",
     ];
-    for name in HOOK_PATH {
-        let body = body(&src, name);
-        for f in forbidden {
-            assert!(
-                !body.contains(f),
-                "fn {name} in the hook path contains `{f}`"
-            );
+    for (file, names) in HOOK_PATH {
+        let src = strip_comments(file);
+        for name in *names {
+            let body = body(&src, name);
+            for f in forbidden {
+                assert!(
+                    !body.contains(f),
+                    "fn {name} in the hook path contains `{f}`"
+                );
+            }
         }
     }
+}
+
+#[test]
+fn the_hook_thread_is_joined_only_once_told_to_exit() {
+    let src = strip_comments(EVENT_THREAD);
+    let drop = body(&src, "drop");
+    let exit = drop
+        .find(" = self.exit();")
+        .expect("drop keeps whether it told the thread to exit");
+    let told = drop[..exit]
+        .rsplit("let ")
+        .next()
+        .expect("a binding")
+        .trim();
+    let join = drop.find(".join()").expect("drop joins the thread");
+    assert!(
+        exit < join && drop[exit..join].contains(&format!("if {told} {{")),
+        "EventThread::drop joins the hook thread even when it could not tell it to exit, \
+         which blocks the daemon's loop for good"
+    );
 }
 
 #[test]

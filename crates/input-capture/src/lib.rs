@@ -32,6 +32,11 @@ mod windows;
 #[cfg(any(windows, test))]
 mod event_queue;
 
+// The Windows backend's display geometry, also built for tests elsewhere.
+#[cfg(all(test, not(windows)))]
+#[path = "windows/display_util.rs"]
+mod display_util;
+
 #[cfg(x11)]
 mod x11;
 
