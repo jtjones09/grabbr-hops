@@ -197,6 +197,10 @@ pub struct Service {
     /// where from. One that shows no number within the pairing window is
     /// forgotten, so it cannot summon a number card later (#195).
     approved: HashMap<String, (Instant, Option<SocketAddr>)>,
+    /// Approvals above whose machine knocked to drive this one while this
+    /// one adds it: both machines are adding each other, and each approved
+    /// itself as the one in control, so neither door admits the other.
+    crossed: HashSet<String>,
     /// Pairings whose number is on screen here, until both machines confirm
     /// or the attempt ends (#11, #167).
     ceremonies: HashMap<String, Ceremony>,
@@ -425,6 +429,9 @@ struct Adding {
     /// This machine approved the machine that answered, which has not
     /// approved this one back (#167).
     approved_here: bool,
+    /// The other machine is adding this one too, and approved itself as the
+    /// one in control, as this machine did.
+    crossed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -443,6 +450,8 @@ enum GaveUp {
     NotPaired,
     /// This machine approved; the other never did.
     NotApprovedThere,
+    /// Both machines added each other and approved themselves in control.
+    BothAdding,
 }
 
 impl GaveUp {
@@ -457,6 +466,12 @@ impl GaveUp {
                  it, and {name} never approved this one. Open add device on {name}, then \
                  switch {name} off and on here to try again."
             ),
+            GaveUp::BothAdding => format!(
+                "Pairing with {name} did not finish in two minutes: {name} was adding this \
+                 machine at the same time, so each machine approved itself as the one in \
+                 control. Switch the device off on one machine, then switch it off and on \
+                 on the other to add it from there."
+            ),
         }
     }
 }
@@ -470,7 +485,9 @@ fn adding_verdict(a: Adding) -> AddVerdict {
         return AddVerdict::Done;
     }
     if !a.window_open || a.waited >= PromptGate::WINDOW {
-        return AddVerdict::GaveUp(if a.approved_here {
+        return AddVerdict::GaveUp(if a.crossed {
+            GaveUp::BothAdding
+        } else if a.approved_here {
             GaveUp::NotApprovedThere
         } else {
             GaveUp::NotPaired
@@ -738,6 +755,7 @@ impl Service {
             prompt_gate: crate::prompt_gate::PromptGate::new(),
             adding: HashMap::new(),
             approved: HashMap::new(),
+            crossed: HashSet::new(),
             ceremonies: HashMap::new(),
             pairings_in,
             pairing_events_in,
@@ -1635,6 +1653,38 @@ impl Service {
         self.publish_trust();
     }
 
+    /// A knock from `fp`, which asks to drive this machine, while this
+    /// machine waits to drive `fp`: that machine is adding this one while
+    /// this one adds it, and each approved itself as the one in control.
+    /// Neither door admits the other, so no number can appear until both
+    /// approvals lapse. Said once, when it is first seen, rather than two
+    /// minutes later as a failure of the other machine to approve. Choosing
+    /// the direction on the card is what ends this (#220).
+    fn note_crossed(&mut self, fp: &str) {
+        if !self.approved.contains_key(fp) || self.crossed.contains(fp) {
+            return;
+        }
+        let (adding_it, label) = {
+            let trust = self.trust.read().expect("lock");
+            (
+                trust.awaits(fp, crate::trust::Caps::I_MAY_DRIVE),
+                trust.label(fp).unwrap_or_default(),
+            )
+        };
+        if !adding_it {
+            return;
+        }
+        self.crossed.insert(fp.to_string());
+        let name = named(&label, fp);
+        log::info!("{name} is adding this machine while this machine adds it");
+        self.notify_frontend(FrontendEvent::Error(format!(
+            "{name} is adding this machine at the same time as this machine adds it, so \
+             each approved itself as the one in control and the pairing cannot finish. \
+             Both approvals lapse within two minutes; then add the device from one \
+             machine only."
+        )));
+    }
+
     /// Refuse a trust GRANT while a peer is driving this machine's input.
     ///
     /// On a KVM the pointer is not proof of local presence: a peer that still
@@ -1693,6 +1743,9 @@ impl Service {
         // machine being added dialling the one adding it, too, which the TLS
         // doors refuse in that direction (#167).
         if self.trust.read().expect("lock").is_pairing(&fingerprint) {
+            if origin == AttemptOrigin::Inbound {
+                self.note_crossed(&fingerprint);
+            }
             log::debug!("{fingerprint} is mid-pairing here; no prompt for its {origin:?} attempt");
             return;
         }
@@ -2002,6 +2055,7 @@ impl Service {
             self.adding.remove(&h);
         }
         self.approved.remove(&fp);
+        self.crossed.remove(&fp);
         // Removed or cancelled here since it was approved: nothing to show.
         if !self.trust.read().expect("lock").is_pairing(&fp) {
             log::info!("{fp}: its number arrived after the pairing ended here");
@@ -2221,6 +2275,7 @@ impl Service {
     /// pairing is never touched. Its label when one was dropped.
     fn forget_pairing(&mut self, fp: &str) -> Option<String> {
         self.approved.remove(fp);
+        self.crossed.remove(fp);
         let label = self
             .trust
             .read()
@@ -2458,7 +2513,8 @@ impl Service {
                 linked: self.client_manager.active_addr(handle).is_some(),
                 waited: now.saturating_duration_since(started),
                 window_open,
-                approved_here: self.approved_for(handle),
+                approved_here: self.approved_for(handle, false),
+                crossed: self.approved_for(handle, true),
             });
             match verdict {
                 AddVerdict::Dial => {
@@ -2480,11 +2536,13 @@ impl Service {
     }
 
     /// Whether this machine approved the machine that answered a dial for
-    /// device `handle`, and that pairing waits for the other machine.
-    fn approved_for(&self, handle: ClientHandle) -> bool {
-        self.approved
-            .values()
-            .any(|(_, addr)| addr.is_some_and(|a| self.client_manager.targets(handle, a)))
+    /// device `handle`, and that pairing waits for the other machine; only
+    /// one that machine crossed, when `crossed`.
+    fn approved_for(&self, handle: ClientHandle, crossed: bool) -> bool {
+        self.approved.iter().any(|(fp, (_, addr))| {
+            (!crossed || self.crossed.contains(fp))
+                && addr.is_some_and(|a| self.client_manager.targets(handle, a))
+        })
     }
 
     fn deactivate_client(&mut self, handle: ClientHandle) {
@@ -3548,6 +3606,7 @@ mod pairing_notices {
             waited,
             window_open: true,
             approved_here,
+            crossed: false,
         }
     }
 
@@ -3588,6 +3647,20 @@ mod pairing_notices {
             AddVerdict::Done,
             "a device that connected was told pairing failed"
         );
+        let crossed = adding_verdict(Adding {
+            crossed: true,
+            ..adding(late, true)
+        });
+        assert_eq!(
+            crossed,
+            AddVerdict::GaveUp(GaveUp::BothAdding),
+            "machines that added each other were told something else"
+        );
+        let notice = GaveUp::BothAdding.notice("desk mac");
+        assert!(
+            notice.contains("at the same time") && !notice.contains("never approved"),
+            "{notice}"
+        );
     }
 
     // LEDGER G-15b | class B | 1 return value: service::ended_notice
@@ -3610,3 +3683,6 @@ mod pairing_notices {
         );
     }
 }
+
+#[cfg(all(test, unix))]
+mod an_approval_before_its_number;

@@ -697,3 +697,74 @@ fn removing_the_machine_mid_pairing_ends_it_on_both() {
         failures
     });
 }
+
+// LEDGER G-20b | class B | 5 process: notices from two built daemons
+/// Both machines add each other, and each approves the dial it made
+/// before the other's knock reaches it: each approved itself as the
+/// machine in control, so neither admits the other and no number can
+/// appear. Both say so, instead of waiting two minutes to blame the other
+/// machine for never approving.
+#[test]
+fn machines_adding_each_other_say_so() {
+    machines("crossed", |mut m| async move {
+        let mut failures: Vec<String> = Vec::new();
+        ask(&mut m.ra, FrontendRequest::OpenPairing).await;
+        ask(&mut m.rb, FrontendRequest::OpenPairing).await;
+        let on_a = add_device(&mut m.fa, &mut m.ra, m.added.port).await;
+        let on_b = add_device(&mut m.fb, &mut m.rb, m.adding.port).await;
+        ask(&mut m.ra, FrontendRequest::Activate(on_a, true)).await;
+        ask(&mut m.rb, FrontendRequest::Activate(on_b, true)).await;
+        let asked_a = until(
+            &mut m.fa,
+            WITHIN,
+            attempt_from(&m.fp_b, AttemptOrigin::OutboundDial),
+        )
+        .await;
+        let asked_b = until(
+            &mut m.fb,
+            WITHIN,
+            attempt_from(&m.fp_a, AttemptOrigin::OutboundDial),
+        )
+        .await;
+        if asked_a.is_none() || asked_b.is_none() {
+            return vec![format!(
+                "each machine's own dial did not raise a prompt there (a: {asked_a:?}, \
+                 b: {asked_b:?})"
+            )];
+        }
+        // Together, so neither machine's knock reaches the other first.
+        ask(
+            &mut m.ra,
+            FrontendRequest::AuthorizeKey("desk b".into(), m.fp_b.clone()),
+        )
+        .await;
+        ask(
+            &mut m.rb,
+            FrontendRequest::AuthorizeKey("desk a".into(), m.fp_a.clone()),
+        )
+        .await;
+        let crossed = |e: &FrontendEvent| match e {
+            FrontendEvent::Error(text) if text.contains("at the same time") => Some(()),
+            FrontendEvent::PairingCheck { .. } => Some(()),
+            _ => None,
+        };
+        for (who, events, daemon) in [
+            ("adding b", &mut m.fa, &m.adding),
+            ("adding a", &mut m.fb, &m.added),
+        ] {
+            let said = until(events, WITHIN, |e| {
+                crossed(e).map(|()| matches!(e, FrontendEvent::Error(_)))
+            })
+            .await;
+            if said != Some(true) {
+                failures.push(format!(
+                    "the machine {who} did not say both machines are adding each other \
+                     ({said:?}: None is nothing within {WITHIN:?}, false a number, which \
+                     means a knock reached it before its own approval); its log:\n{}",
+                    daemon.log()
+                ));
+            }
+        }
+        failures
+    });
+}
