@@ -748,7 +748,7 @@ impl Service {
                 self.save_config();
             }
             FrontendRequest::AuthorizeKey(desc, fp) => {
-                if self.refuse_while_remotely_driven("grant trust") {
+                if self.refuse_while_remotely_driven(hops_ipc::GRANT_REFUSED, "grant trust") {
                     return;
                 }
                 self.add_authorized_key(desc, fp);
@@ -846,7 +846,12 @@ impl Service {
             // Behind it, like a grant: it widens a pairing, and a peer driving
             // this machine could click it for itself.
             FrontendRequest::EnableClipboard(fp) => {
-                if self.refuse_while_remotely_driven("turn the clipboard on") {
+                // Not said as a refused grant: `hops cli authorize-key` reads
+                // any notice that begins that way as its own grant refused.
+                if self.refuse_while_remotely_driven(
+                    "The clipboard is still off",
+                    "turn the clipboard on",
+                ) {
                     return;
                 }
                 self.enable_clipboard(fp);
@@ -1472,16 +1477,17 @@ impl Service {
     /// Deliberately NOT applied to revocation: refusing to let you revoke while a
     /// peer is driving you would block the one action you most need in exactly
     /// the moment you need it.
-    fn refuse_while_remotely_driven(&mut self, what: &str) -> bool {
+    ///
+    /// The notice begins with `refused`, which says what did not happen.
+    fn refuse_while_remotely_driven(&mut self, refused: &str, what: &str) -> bool {
         const QUIET: std::time::Duration = std::time::Duration::from_secs(2);
         if !self.emulation.remotely_driven_within(QUIET) {
             return false;
         }
         log::warn!("refusing to {what} — this machine is being driven by a peer right now");
         self.notify_frontend(FrontendEvent::Error(format!(
-            "{}: this machine is being controlled remotely, so it refused to \
-             {what}. Use its own keyboard and mouse, then try again.",
-            hops_ipc::GRANT_REFUSED
+            "{refused}: this machine is being controlled remotely, so it refused to \
+             {what}. Use its own keyboard and mouse, then try again."
         )));
         true
     }

@@ -1045,9 +1045,10 @@ impl TrustStore {
     /// else: [`existing_pairing_clipboard`], the mapping every pairing made
     /// before #182 keeps (#186). A machine that may drive this one sends its
     /// clipboard here; one this machine may drive is sent this machine's.
-    /// Records that the clipboard was chosen, as the off arm does, so the
-    /// choice is saved and a later approval of another direction to drive
-    /// adds no clipboard with it.
+    /// Records that the clipboard was chosen, as the off arm does. Only the
+    /// off arm can leave a clipboard to turn on, and it has already recorded
+    /// the choice, so this keeps the record true rather than changing what a
+    /// later approval adds.
     ///
     /// Widening, so the caller decides whether the request may be honoured:
     /// the daemon refuses it while a peer drives this machine (#107). It

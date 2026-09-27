@@ -1866,7 +1866,7 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
     //! own.
     #![cfg(unix)]
 
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::time::Duration;
 
     use hops_ipc::{ClientHandle, FrontendEvent, FrontendRequest, Position};
@@ -1881,7 +1881,8 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
 
     /// Whether a request can widen trust. There is no wildcard: a new request
     /// fails to compile here until it is placed on one side, and one placed
-    /// on the `false` side belongs in [`every_other_request`] as well.
+    /// on the `false` side must be in [`every_other_request`] as well, which
+    /// `every_request_is_sent_by_the_sweep` checks.
     fn widens(request: &FrontendRequest) -> bool {
         use FrontendRequest as R;
         match request {
@@ -1962,16 +1963,71 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
         trust.read().expect("lock").pairings().into_iter().collect()
     }
 
+    /// The notices that refused a request because this machine was driven.
     fn refusals(events: &[FrontendEvent]) -> Vec<&str> {
         events
             .iter()
             .filter_map(|e| match e {
-                FrontendEvent::Error(text) if text.starts_with(hops_ipc::GRANT_REFUSED) => {
+                FrontendEvent::Error(text) if text.contains("controlled remotely") => {
                     Some(text.as_str())
                 }
                 _ => None,
             })
             .collect()
+    }
+
+    /// The name a request goes by on the IPC channel.
+    fn name(request: &FrontendRequest) -> String {
+        match serde_json::to_value(request).expect("a request serialises") {
+            serde_json::Value::String(name) => name,
+            serde_json::Value::Object(map) if map.len() == 1 => {
+                map.into_iter().next().expect("one entry").0
+            }
+            other => panic!("a request serialised as neither a name nor one entry: {other}"),
+        }
+    }
+
+    /// Every request the IPC channel carries, by name: the decoder lists them
+    /// when it is handed one it does not know.
+    fn every_request_name() -> BTreeSet<String> {
+        let refused = serde_json::from_str::<FrontendRequest>("\"NoSuchRequest\"")
+            .expect_err("no request is called NoSuchRequest")
+            .to_string();
+        let (_, expected) = refused
+            .split_once("expected one of")
+            .unwrap_or_else(|| panic!("the decoder no longer lists the requests: {refused}"));
+        expected
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    // LEDGER EN-5 | class B | 1 return value: the requests the IPC decoder accepts, against the guard's own tables
+    /// The sweep below proves nothing about a request it never sends. Every
+    /// request is one of the two that widen, `Create` (sent first for the
+    /// handle the others aim at), or in [`every_other_request`].
+    #[test]
+    fn every_request_is_sent_by_the_sweep() {
+        use FrontendRequest as R;
+        let fp = super::fp32(0x5f);
+        let widening = [
+            R::AuthorizeKey(String::new(), fp.clone()),
+            R::EnableClipboard(fp.clone()),
+        ];
+        assert!(widening.iter().all(widens));
+        let others = every_other_request(&fp, &fp, 0, 1, 2);
+        let mut sent: BTreeSet<String> = others.iter().map(name).collect();
+        sent.extend(widening.iter().map(name));
+        sent.insert(name(&R::Create));
+        assert_eq!(
+            sent,
+            every_request_name(),
+            "a request the IPC channel carries is missing from every_other_request, \
+             so the sweep never checks whether it widens trust. Add it there, aimed \
+             where a widening would show."
+        );
     }
 
     // LEDGER EN-3 | class B | 5 process-in-test + 1 struct state: FrontendRequest over the daemon's IPC socket, a peer driving it over loopback QUIC, the daemon's trust store
@@ -2065,11 +2121,16 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
                         refusals(&events)
                     );
                     let refused = refusals(&events);
+                    let grants = refused
+                        .iter()
+                        .filter(|r| r.starts_with(hops_ipc::GRANT_REFUSED))
+                        .count();
                     assert!(
-                        refused.len() == 2
-                            && refused.iter().all(|r| r.contains("controlled remotely")),
+                        refused.len() == 2 && grants == 1,
                         "both widening requests must be refused, each saying why, while a \
-                         peer drives this machine; the app was told {refused:?}"
+                         peer drives this machine, and only the grant's refusal may begin \
+                         as a refused grant: `hops cli authorize-key` reads any notice \
+                         that does as its own grant refused. The app was told {refused:?}"
                     );
 
                     // No longer driven: once the quiet window has passed, a
@@ -2100,9 +2161,15 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
                         !others.iter().any(widens),
                         "every_other_request holds a request that widens trust"
                     );
+                    // Turning a clipboard on for a machine that is not paired,
+                    // one prompting and one never seen, widens nothing either.
+                    let unpaired = [
+                        R::EnableClipboard(stranger_fp.clone()),
+                        R::EnableClipboard(super::fp32(0x5f)),
+                    ];
                     // One at a time, checked after each: a later request that
                     // narrows must not hide an earlier one that widened.
-                    for request in others {
+                    for request in unpaired.into_iter().chain(others) {
                         app.exchange(std::slice::from_ref(&request)).await;
                         let after = granted(&trust);
                         let widened: Vec<_> = after
@@ -2114,7 +2181,8 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
                         assert!(
                             widened.is_empty(),
                             "{request:?} widened trust: {widened:?} (before: {before:?}). \
-                             Only approving a prompt and turning a clipboard on may. \
+                             Only approving a prompt, and turning on the clipboard of a \
+                             paired machine, may. \
                              A same-user program holding the IPC token can send any of \
                              them, and the stated limit is that it can do exactly two \
                              things to trust, neither while this machine is driven. A \

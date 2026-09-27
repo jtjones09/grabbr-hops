@@ -1021,7 +1021,14 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                                     PillButton {
                                                         text: "turn on";
                                                         ghost: true;
-                                                        clicked => { root.enable-clipboard(d.fp-full); }
+                                                        // A question left open
+                                                        // from before it went
+                                                        // off must not come
+                                                        // back once it is on.
+                                                        clicked => {
+                                                            root.confirm-clipboard-off = false;
+                                                            root.enable-clipboard(d.fp-full);
+                                                        }
                                                     }
                                                 }
                                                 if asking: VerticalLayout {
