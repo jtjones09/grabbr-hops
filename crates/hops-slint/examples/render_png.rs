@@ -123,12 +123,12 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
     // flip to true to review the "we dialled this device" wording (#61)
     ui.set_pairing_from_our_dial(std::env::var_os("PREVIEW_OUR_DIAL").is_some());
     if std::env::var_os("PREVIEW_OUR_DIAL").is_some() {
-        ui.set_pairing_addr("10.0.0.5:4722".into());
+        ui.set_pairing_addr("192.0.2.5:4722".into());
     }
     // PREVIEW_KNOCK_ADDR=1: an inbound request with the address it came from
     // (#83), and a name typed into the card (#168).
     if std::env::var_os("PREVIEW_KNOCK_ADDR").is_some() {
-        ui.set_pairing_addr("10.0.0.7:51234".into());
+        ui.set_pairing_addr("192.0.2.7:51234".into());
         ui.set_pairing_name("laptop".into());
     }
     // PREVIEW_CONTROLLER=0|1|2 answers "which machine is in control?" on the
