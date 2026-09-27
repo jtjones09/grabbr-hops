@@ -137,6 +137,9 @@ export component AppWindow inherits Window {
     // the address that actually answered our dial — the user typed one, and the
     // machine that replies is not always the one they meant (#93)
     in property <string> pairing-addr: "";
+    // What the card for our own dial says: the device added here that it
+    // dialled, and when to deny it (#93). Rust fills it; empty for a knock.
+    in property <string> pairing-dialled: "";
     // The number card (#11, #167). Both machines approved, and a person must
     // compare the six digits they arrived at over this connection. The adding
     // machine shows the number and confirms; the machine being added picks it
@@ -497,10 +500,8 @@ export component AppWindow inherits Window {
                             font-weight: Type.semibold;
                         }
                         if root.pairing-from-our-dial: Text {
-                            text: "hops went looking for this device — you should only see "
-                                + "this if you just asked to connect one. If you did not, "
-                                + "deny it. Check the address below is the one you typed.";
-                            color: Theme.c.muted;
+                            text: root.pairing-dialled;
+                            color: Theme.c.foreground;
                             font-size: Type.caption;
                             wrap: word-wrap;
                         }

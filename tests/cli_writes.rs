@@ -176,8 +176,9 @@ impl Daemon {
     /// A machine this daemon has never seen asks to pair, and waits: its
     /// fingerprint, once the daemon has admitted the request.
     fn asked_to_pair(&self) -> String {
-        // add device, which is what lets a request prompt
-        ok(self, &["add-client"]);
+        // add device, which is what lets a request prompt; the device added
+        // is at a documentation address nothing answers on
+        ok(self, &["add-client", "--ips", "192.0.2.1"]);
         let fp = knock(self.port);
         let deadline = Instant::now() + Duration::from_secs(30);
         while !self.log().contains(&format!("fingerprint {fp}")) {
@@ -431,6 +432,14 @@ fn each_write_verb_is_saved_by_the_time_it_returns() {
     assert_eq!(value(&d.saved_clients()[0], "activate_on_startup"), "true");
     ok(&d, &["deactivate", "0"]);
     assert_ne!(value(&d.saved_clients()[0], "activate_on_startup"), "true");
+
+    // A device with nowhere to dial is not added at all (#32).
+    let blank = d.cli(&["add-client", "--port", "4303"]);
+    assert!(
+        !blank.status.success() && d.saved_clients().len() == 1,
+        "add-client with no address added a device, or said it did:\n{}",
+        said(&blank)
+    );
 
     ok(&d, &["add-client", "--port", "4303", "--ips", "127.0.0.3"]);
     let added = d.saved_clients();

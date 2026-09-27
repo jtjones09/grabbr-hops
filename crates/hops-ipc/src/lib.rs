@@ -301,6 +301,46 @@ impl Default for ClientConfig {
 
 pub type ClientHandle = u64;
 
+/// A device to add, whole (#32): where it is dialled, on which port, and the
+/// screen edge it sits on.
+///
+/// Adding used to be a blank device the frontend filled in afterwards, one
+/// request per field. Every interruption between the two, a closed window or
+/// a lost connection, left a device with no address saved in the config, and
+/// a frontend that took the next new device for its own configured that one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewDevice {
+    /// The hostname or address typed, or the name a discovered machine
+    /// resolves at.
+    pub hostname: Option<String>,
+    /// Addresses dialled without a lookup: those a discovered machine
+    /// announced.
+    pub fix_ips: Vec<IpAddr>,
+    pub port: u16,
+    pub pos: Position,
+}
+
+impl NewDevice {
+    /// Why this device cannot be added, in words for the person adding it,
+    /// or `None` when it can: it needs somewhere to dial, and a port.
+    pub fn refusal(&self) -> Option<&'static str> {
+        let named = self
+            .hostname
+            .as_deref()
+            .is_some_and(|h| !h.trim().is_empty());
+        if !named && self.fix_ips.is_empty() {
+            return Some("Enter the other machine's hostname or IP address.");
+        }
+        if self.port == 0 {
+            return Some(
+                "That port is not valid. Use a number from 1 to 65535, or leave it \
+                 blank for the default.",
+            );
+        }
+        None
+    }
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ClientState {
     /// events should be sent to and received from the client
@@ -641,8 +681,10 @@ pub struct RevokedEntry {
 pub enum FrontendRequest {
     /// activate/deactivate client
     Activate(ClientHandle, bool),
-    /// add a new client
-    Create,
+    /// Add a device, all of it at once, and start dialling it (#32). A
+    /// device the daemon cannot dial is refused whole: nothing is added,
+    /// and an `Error` says why.
+    Create(NewDevice),
     /// change the listen port (recreate udp listener)
     ChangePort(u16),
     /// Remove a device, and revoke the machine it is pinned to.

@@ -17,8 +17,8 @@ use thiserror::Error;
 
 use hops_ipc::{
     AsyncFrontendRequestWriter, ClientConfig, ClientHandle, ClientState, ConnectionError,
-    FrontendEvent, FrontendRequest, GRANT_REFUSED, IpcError, NOT_SAVED, Position, TRUST_NOT_SAVED,
-    connect_async, identity::canonical_fingerprint,
+    DEFAULT_PORT, FrontendEvent, FrontendRequest, GRANT_REFUSED, IpcError, NOT_SAVED, NewDevice,
+    Position, TRUST_NOT_SAVED, connect_async, identity::canonical_fingerprint,
 };
 
 #[derive(Debug, Error)]
@@ -398,6 +398,20 @@ fn removed(answer: &Answer, before: &Answer, fp: &str) -> Result<(), CliError> {
     saved(answer, TRUST_NOT_SAVED)
 }
 
+/// The first edge no listed device sits on, or the left edge once all four
+/// are taken.
+fn free_edge(devices: &[(ClientHandle, ClientConfig, ClientState)]) -> Position {
+    [
+        Position::Left,
+        Position::Right,
+        Position::Top,
+        Position::Bottom,
+    ]
+    .into_iter()
+    .find(|p| devices.iter().all(|(_, c, _)| c.pos != *p))
+    .unwrap_or(Position::Left)
+}
+
 pub async fn run(args: CliArgs) -> Result<(), CliError> {
     execute(args.command).await?;
     Ok(())
@@ -412,47 +426,44 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
             port,
             ips,
         }) => {
+            // The whole device in one request, or nothing (#32), on an edge
+            // no device uses yet, so adding it switches none off.
+            let device = NewDevice {
+                hostname: hostname.clone(),
+                fix_ips: ips.clone().unwrap_or_default(),
+                port: port.unwrap_or(DEFAULT_PORT),
+                pos: free_edge(&now.devices),
+            };
+            if let Some(why) = device.refusal() {
+                return Err(CliError::NotDone(format!("nothing was added: {why}")));
+            }
             // Adding a device from here is the add-device flow too, so pairing
             // prompts may appear on this machine for the next two minutes (#195).
-            let made = send(
+            let answer = send(
                 rx,
                 tx,
-                [FrontendRequest::OpenPairing, FrontendRequest::Create],
+                [
+                    FrontendRequest::OpenPairing,
+                    FrontendRequest::Create(device),
+                ],
             )
             .await?;
-            made.tell();
-            saved(&made, NOT_SAVED)?;
-            let Some(&handle) = made.created.first() else {
-                return Err(CliError::NotDone("no device was created".to_string()));
-            };
-            let mut edits = vec![];
-            if let Some(hostname) = hostname.clone() {
-                // Just created: never connected, so no pin.
-                edits.push(FrontendRequest::UpdateHostname {
-                    handle,
-                    hostname: Some(hostname),
-                    fingerprint: None,
-                });
-            }
-            if let Some(port) = port {
-                edits.push(FrontendRequest::UpdatePort(handle, port));
-            }
-            if let Some(ips) = ips.clone() {
-                edits.push(FrontendRequest::UpdateFixIps(handle, ips));
-            }
-            let answer = send(rx, tx, edits).await?;
             answer.tell();
+            let Some(&handle) = answer.created.first() else {
+                return Err(CliError::NotDone("no device was added".to_string()));
+            };
             let Some((c, _)) = answer.device(handle) else {
                 return Err(CliError::NotDone(format!(
-                    "device {handle} was removed while it was being set up"
+                    "device {handle} was removed while it was being added"
                 )));
             };
+            let hostname = hostname.map(|h| h.trim().to_owned());
             let set = hostname.is_none_or(|h| c.hostname.as_deref() == Some(h.as_str()))
                 && port.is_none_or(|p| c.port == p)
                 && ips.is_none_or(|ips| same_ips(&c.fix_ips, &ips));
             if !set {
                 return Err(CliError::NotDone(format!(
-                    "device {handle} was added, but not all of its settings were"
+                    "device {handle} was added, but not as it was asked for"
                 )));
             }
             saved(&answer, NOT_SAVED)?;
