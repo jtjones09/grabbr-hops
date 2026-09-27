@@ -649,9 +649,8 @@ mod clipboard_follows_the_switch {
             let (mut peer_applies, mut here_applies) = pair.inboxes();
             let (switch, device) = (pair.dialer.clients.clone(), pair.dialer.handle);
 
-            // Each edit forgets the machine the device was pinned to and
-            // leaves its link up: a rename from the app, and a change of
-            // address.
+            // Each edit leaves the device pinned to its machine (#99) and
+            // its link up: a rename from the app, and a change of address.
             type Edit = fn(&ClientManager, ClientHandle);
             let edits: [(&str, Edit); 2] = [
                 ("renamed", |m, h| {
@@ -671,9 +670,9 @@ mod clipboard_follows_the_switch {
                 );
                 apply(&switch, device);
                 assert_eq!(
-                    switch.peer_fingerprint(device),
-                    None,
-                    "precondition: the {edit} device forgot its pin"
+                    switch.peer_fingerprint(device).as_deref(),
+                    Some(pair.driven.fingerprint.as_str()),
+                    "precondition: the {edit} device kept its pin"
                 );
 
                 assert!(switch.deactivate_client(device), "precondition");
@@ -695,7 +694,7 @@ mod clipboard_follows_the_switch {
                 );
 
                 // What switching it off does to the link, as the service does
-                // it: closed, though the device no longer names the machine.
+                // it: closed.
                 let pin = switch.peer_fingerprint(device);
                 assert_eq!(
                     pair.dialer
@@ -814,6 +813,7 @@ mod clipboard_follows_the_switch {
         /// Another entry here pinned to `peer`, switched on.
         fn entry_for(&self, peer: &Machine) -> ClientHandle {
             self.clients.add_with_config(ConfigClient {
+                label: None,
                 ips: HashSet::new(),
                 hostname: None,
                 port: hops_ipc::DEFAULT_PORT,
@@ -923,7 +923,7 @@ mod clipboard_follows_the_switch {
             let (mut peer_link, mut device) = here.device_dialling_in(&peer).await;
             let peer_sends = peer_link.conn.clipboard_sender();
 
-            // A rename clears the pin. The switch has to keep naming the
+            // A rename keeps the pin (#99). The switch has to keep naming the
             // machine whether the rename comes before it or after it. Each
             // case takes a fresh entry for the machine, pinned to it.
             type Step = fn(&ClientManager, ClientHandle);
@@ -957,9 +957,9 @@ mod clipboard_follows_the_switch {
                     step(&here.clients, device);
                 }
                 assert_eq!(
-                    here.clients.peer_fingerprint(device),
-                    None,
-                    "precondition: the rename cleared the pin"
+                    here.clients.peer_fingerprint(device).as_deref(),
+                    Some(peer.fingerprint.as_str()),
+                    "precondition: the rename kept the pin"
                 );
                 here.sends.broadcast(case.to_string()).await;
                 assert_eq!(

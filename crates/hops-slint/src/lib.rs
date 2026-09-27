@@ -22,9 +22,9 @@ use std::{
 };
 
 use hops_frontend_core::{
-    AppModel, ApprovalRefused, ClientHandle, Clipboard, FrontendClient, FrontendRequest, Launch,
-    PairingAttempt, PairingCard, PairingCheck, Position, Status, TrustState, prefs, spaced_number,
-    theme,
+    AppModel, ApprovalRefused, CaptureState, ClientHandle, Clipboard, FrontendClient,
+    FrontendRequest, Launch, PairingAttempt, PairingCard, PairingCheck, Position, Status,
+    TrustState, prefs, spaced_number, theme,
 };
 use hops_ipc::{DEFAULT_PORT, Geometry};
 use slint::{ComponentHandle, ModelRc, VecModel};
@@ -34,6 +34,7 @@ slint::include_modules!();
 
 #[cfg(target_os = "macos")]
 mod macos_app;
+mod privacy;
 
 /// After the user denies a pairing, snooze the prompt this long so a retrying
 /// peer doesn't nag — but a later attempt re-asks; matches the TUI's `DISMISS_TTL`.
@@ -57,6 +58,11 @@ pub enum SlintError {
 struct PolledUi {
     connected: bool,
     capture: String,
+    /// Why capture, which should run, does not, from
+    /// `AppModel::capture_problem`, or empty (#91).
+    capture_problem: String,
+    /// Whether the window offers the setting that mends it (#169).
+    capture_settings: bool,
     emulation: String,
     port: String,
     fingerprint: String,
@@ -66,6 +72,8 @@ struct PolledUi {
     discovered: Vec<DiscoveredRow>,
     /// Whether hops is looking at all — see `AppModel::discovery_active`.
     discovery_active: bool,
+    /// What the network section says while it lists nobody.
+    discovery_empty: String,
     /// Whether that pairing prompt came from OUR outbound dial rather than a
     /// peer connecting in (#61) — the card says which.
     pairing_from_our_dial: bool,
@@ -253,7 +261,9 @@ fn polled_ui(m: &AppModel, shown: Option<&PairingAttempt>, now: Instant) -> Poll
     let devices = device_rows(m);
     PolledUi {
         connected: m.connected,
-        capture: status_text(m.capture).to_string(),
+        capture: capture_text(&m.capture).to_string(),
+        capture_problem: m.capture_problem().unwrap_or_default(),
+        capture_settings: cfg!(target_os = "macos") && privacy::for_capture(&m.capture).is_some(),
         emulation: status_text(m.emulation).to_string(),
         port: m
             .port
@@ -262,6 +272,7 @@ fn polled_ui(m: &AppModel, shown: Option<&PairingAttempt>, now: Instant) -> Poll
         fingerprint: m.fingerprint.clone().unwrap_or_else(|| "—".to_string()),
         pairing,
         discovery_active: m.discovery_active,
+        discovery_empty: discovery_empty(m.discovery_quiet).to_string(),
         discovered: m
             .discovered
             .iter()
@@ -344,12 +355,15 @@ impl Repaint {
         ui.set_connected(snap.connected);
         ui.set_service_problem(snap.service_problem.as_str().into());
         ui.set_capture(snap.capture.as_str().into());
+        ui.set_capture_problem(snap.capture_problem.as_str().into());
+        ui.set_capture_settings(snap.capture_settings);
         ui.set_emulation(snap.emulation.as_str().into());
         ui.set_port(snap.port.as_str().into());
         ui.set_fingerprint(snap.fingerprint.as_str().into());
         show_pairing_card(ui, &snap.pairing);
         ui.set_discovered(ModelRc::new(VecModel::from(snap.discovered.clone())));
         ui.set_discovery_active(snap.discovery_active);
+        ui.set_discovery_empty(snap.discovery_empty.as_str().into());
         ui.set_pairing_from_our_dial(snap.pairing_from_our_dial);
         ui.set_pairing_addr(snap.pairing_addr.as_str().into());
         ui.set_pairing_seconds(snap.pairing_seconds);
@@ -371,6 +385,28 @@ impl Repaint {
         ui.set_devices(ModelRc::new(VecModel::from(snap.devices.clone())));
         self.last = Some(snap);
         true
+    }
+}
+
+/// What the network section says while it lists nobody. Once discovery has
+/// heard no machine at all for a while, a Mac names the setting that keeps a
+/// process from hearing its network with no error (#149); elsewhere nothing
+/// is known to do that silently.
+fn discovery_empty(quiet: bool) -> &'static str {
+    if quiet && cfg!(target_os = "macos") {
+        "No other machine has answered. If one on this network runs hops, check that \
+         hops is on under System Settings → Privacy & Security → Local Network."
+    } else {
+        "looking — no other machines yet. They need hops running and to be on this network."
+    }
+}
+
+/// Capture's state as the window reads it: failed is not off (#91).
+fn capture_text(s: &CaptureState) -> &'static str {
+    match s {
+        CaptureState::Enabled => status_text(Status::Enabled),
+        CaptureState::Disabled => status_text(Status::Disabled),
+        CaptureState::Failed(_) => "failed",
     }
 }
 
@@ -406,14 +442,13 @@ pub fn theme_colors(t: &theme::Theme) -> ThemeColors {
     }
 }
 
-/// What the edit panel says under "clipboard". Off says it cannot be turned
-/// back on here, because nothing in this frontend can (#182, #107).
+/// What the edit panel says under "clipboard", beside its switch (#182).
 fn clipboard_words(c: Clipboard) -> &'static str {
     match c {
         Clipboard::BothWays => "shared both ways",
         Clipboard::FromIt => "arrives here from this device",
         Clipboard::ToIt => "goes from here to this device",
-        Clipboard::Off => "off — it cannot be turned back on here yet",
+        Clipboard::Off => "off",
     }
 }
 
@@ -637,6 +672,41 @@ fn approval(
     Ok(FrontendRequest::AuthorizeKey(desc, fingerprint.to_string()))
 }
 
+/// What "save" on the rename field sends for the row keyed `id`: a handle for
+/// a device this machine dials, else the fingerprint of a paired machine.
+///
+/// A device this machine dials is given a name of its own. Its hostname is
+/// where it is dialled, and a rename used to replace it (#13).
+fn rename_request(id: &str, name: &str) -> FrontendRequest {
+    let name = name.trim();
+    if let Ok(h) = id.parse::<u64>() {
+        return FrontendRequest::UpdateLabel(h, (!name.is_empty()).then(|| name.to_string()));
+    }
+    // A rename is a rename. This used to re-send AuthorizeKey, so the
+    // wire could not tell relabelling from granting trust; SetLabel
+    // refuses a fingerprint that is not already authorized.
+    let desc = if name.is_empty() {
+        hops_frontend_core::fallback_label(id)
+    } else {
+        name.to_string()
+    };
+    FrontendRequest::SetLabel(id.to_string(), desc)
+}
+
+/// What "save" on the address field sends for the device `handle`: the
+/// hostname or address to dial it at, carrying the pin the row showed. Its
+/// pin stays, so only the same machine is reached there (#99). Nothing for a
+/// blank field or a row that is not a device this machine dials.
+fn readdress_request(handle: &str, pin: &str, address: &str) -> Option<FrontendRequest> {
+    let address = address.trim();
+    let handle = handle.parse::<u64>().ok()?;
+    (!address.is_empty()).then(|| FrontendRequest::UpdateHostname {
+        handle,
+        hostname: Some(address.to_string()),
+        fingerprint: (!pin.is_empty()).then(|| pin.to_string()),
+    })
+}
+
 /// Claim a pending "create device" once its handle appears, or leave it for the
 /// next tick.
 ///
@@ -822,8 +892,24 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
     {
         let c = client.clone();
         ui.on_enable_input(move || {
+            // Turning capture on is when macOS is asked for what it lacks,
+            // so its prompt shows then (#169).
+            #[cfg(target_os = "macos")]
+            if let Some(ask) = privacy::for_capture(&c.snapshot().capture) {
+                privacy::act(ask, false);
+            }
             c.request(FrontendRequest::EnableCapture);
             c.request(FrontendRequest::EnableEmulation);
+        });
+    }
+    {
+        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+        let c = client.clone();
+        ui.on_open_capture_settings(move || {
+            #[cfg(target_os = "macos")]
+            if let Some(ask) = privacy::for_capture(&c.snapshot().capture) {
+                privacy::act(ask, true);
+            }
         });
     }
     {
@@ -850,26 +936,18 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
         // handle, so keying this on the handle alone meant the parse failed and
         // the rename silently did nothing — which is why the GUI could not name
         // an inbound peer at all while the TUI could.
-        ui.on_rename_device(move |id, pin, name| {
-            let name = name.trim();
-            if let Ok(h) = id.as_str().parse::<u64>() {
-                let name = (!name.is_empty()).then(|| name.to_string());
-                c.request(FrontendRequest::UpdateHostname {
-                    handle: h,
-                    hostname: name,
-                    fingerprint: (!pin.is_empty()).then(|| pin.to_string()),
-                });
-                return;
+        ui.on_rename_device(move |id, _pin, name| {
+            c.request(rename_request(id.as_str(), name.as_str()));
+        });
+    }
+    {
+        let c = client.clone();
+        ui.on_readdress_device(move |handle, pin, address| {
+            if let Some(request) =
+                readdress_request(handle.as_str(), pin.as_str(), address.as_str())
+            {
+                c.request(request);
             }
-            // A rename is a rename. This used to re-send AuthorizeKey, so the
-            // wire could not tell relabelling from granting trust; SetLabel
-            // refuses a fingerprint that is not already authorized.
-            let desc = if name.is_empty() {
-                hops_frontend_core::fallback_label(id.as_str())
-            } else {
-                name.to_string()
-            };
-            c.request(FrontendRequest::SetLabel(id.to_string(), desc));
         });
     }
     {
@@ -893,6 +971,12 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
         let c = client.clone();
         ui.on_disable_clipboard(move |fp| {
             c.request(FrontendRequest::DisableClipboard(fp.to_string()));
+        });
+    }
+    {
+        let c = client.clone();
+        ui.on_enable_clipboard(move |fp| {
+            c.request(FrontendRequest::EnableClipboard(fp.to_string()));
         });
     }
     {
@@ -2151,6 +2235,7 @@ mod the_window_without_a_daemon {
                 claimed_fingerprint: None,
                 addrs: vec!["192.0.2.7:4242".parse().expect("addr")],
             }],
+            quiet: false,
         });
         tick(&ui, &mut repaint, &mut card, &m);
         let live = rows(&ui);
@@ -2326,6 +2411,151 @@ mod the_restart_note_is_news_not_an_error {
             ui.get_notice().as_str(),
             "",
             "a restart that worked was shown as an error"
+        );
+    }
+}
+
+#[cfg(test)]
+mod a_capture_that_cannot_run {
+    //! A capture that failed reads as failed, not off, with what to change
+    //! and, on a Mac, the way to the setting (#91, #169).
+    use super::*;
+    use hops_frontend_core::{CaptureFault, CaptureState, FrontendEvent, Permission};
+
+    fn tick(ui: &AppWindow, repaint: &mut Repaint, m: &AppModel) {
+        repaint.push(ui, polled_ui(m, None, Instant::now()), &Cell::new(0));
+    }
+
+    // LEDGER T9 | class B | 3 widget tree: AppWindow capture properties after polled_ui + Repaint::push
+    #[test]
+    fn the_window_says_capture_failed_and_what_to_change() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = AppWindow::new().expect("window");
+        let mut repaint = Repaint::default();
+        let mut m = AppModel::default();
+        m.connected = true;
+        m.apply(FrontendEvent::CaptureStatus(CaptureState::Failed(
+            CaptureFault::Missing(vec![Permission::InputMonitoring]),
+        )));
+        tick(&ui, &mut repaint, &m);
+        let failed = (
+            ui.get_capture().to_string(),
+            ui.get_capture_problem().to_string(),
+            ui.get_capture_settings(),
+        );
+        m.apply(FrontendEvent::CaptureStatus(CaptureState::Disabled));
+        tick(&ui, &mut repaint, &m);
+        let off = (
+            ui.get_capture().to_string(),
+            ui.get_capture_problem().to_string(),
+            ui.get_capture_settings(),
+        );
+        assert_eq!(
+            [failed, off],
+            [
+                (
+                    "failed".to_string(),
+                    "Input capture cannot run: macOS does not grant hops Input Monitoring, \
+                     which this Mac needs to control other machines. Turn hops on under \
+                     System Settings → Privacy & Security → Input Monitoring."
+                        .to_string(),
+                    cfg!(target_os = "macos"),
+                ),
+                ("disabled".to_string(), String::new(), false),
+            ],
+            "(capture, problem, settings button) for a capture refused Input \
+             Monitoring, then for one merely off"
+        );
+    }
+}
+
+#[cfg(test)]
+mod a_network_that_answers_nothing {
+    //! Discovery that has heard nobody says, on a Mac, which setting can keep
+    //! it from hearing anything (#149).
+    use super::*;
+    use hops_frontend_core::FrontendEvent;
+
+    // LEDGER T14 | class B | 3 widget tree: AppWindow discovery-empty after polled_ui + Repaint::push
+    #[test]
+    fn a_quiet_network_names_the_local_network_setting_on_a_mac() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = AppWindow::new().expect("window");
+        let mut repaint = Repaint::default();
+        let mut m = AppModel::default();
+        m.connected = true;
+        let mut said = Vec::new();
+        for quiet in [false, true, false] {
+            m.apply(FrontendEvent::Discovered {
+                active: true,
+                peers: vec![],
+                quiet,
+            });
+            repaint.push(&ui, polled_ui(&m, None, Instant::now()), &Cell::new(0));
+            said.push(ui.get_discovery_empty().contains("Local Network"));
+        }
+        assert_eq!(
+            said,
+            [false, cfg!(target_os = "macos"), false],
+            "(names Local Network) while looking, once nothing answered, and once \
+             something did"
+        );
+    }
+}
+
+#[cfg(test)]
+mod a_rename_names_and_changes_nothing_else {
+    //! Renaming a device from its card names it. The name used to be the
+    //! hostname it is dialled at, so a rename sent a new address: the device
+    //! then dialled its new name, and until #99 lost its pin (#13).
+    use super::*;
+
+    const PIN: &str = "1e:19:1b:2c:3d:4e:5f:60:71:82:93:a4:b5:c6:d7:e8";
+
+    // LEDGER T9907 | class B | 1 return value: rename_request, the request the rename field's save sends
+    #[test]
+    fn renaming_a_device_this_machine_dials_sends_its_name_only() {
+        assert_eq!(
+            rename_request("4", "  den "),
+            FrontendRequest::UpdateLabel(4, Some("den".into())),
+            "renaming a device this machine dials has to send its name, and \
+             not a hostname: that is where it dials"
+        );
+        assert_eq!(
+            rename_request("4", ""),
+            FrontendRequest::UpdateLabel(4, None),
+            "clearing the name of a device never connected has to clear its \
+             name, and not its address"
+        );
+        assert_eq!(
+            rename_request(PIN, "laptop"),
+            FrontendRequest::SetLabel(PIN.into(), "laptop".into()),
+            "a paired machine this one does not dial is renamed by its \
+             fingerprint, as before"
+        );
+    }
+
+    // LEDGER T9908 | class B | 1 return value: readdress_request, the request the address field's save sends
+    #[test]
+    fn a_new_address_is_sent_as_the_hostname_with_the_pin_shown() {
+        assert_eq!(
+            readdress_request("4", PIN, " 192.0.2.20 "),
+            Some(FrontendRequest::UpdateHostname {
+                handle: 4,
+                hostname: Some("192.0.2.20".into()),
+                fingerprint: Some(PIN.into()),
+            }),
+            "a new address has to be sent as where the device is dialled, with \
+             the pin the row showed"
+        );
+        assert_eq!(
+            (
+                readdress_request("4", PIN, "  "),
+                readdress_request(PIN, PIN, "192.0.2.20")
+            ),
+            (None, None),
+            "(a blank address, a row this machine does not dial): neither may \
+             change where anything is dialled"
         );
     }
 }

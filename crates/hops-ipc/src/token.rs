@@ -24,7 +24,8 @@
 //! process that can read the token file can already read `config.toml` and the
 //! TLS identity next to it, at which point the machine is lost regardless. The
 //! goal is to stop a process (or page) that can *reach a socket* but cannot
-//! *read the user's config directory*.
+//! *read the user's config directory*. What a process that *can* read it may
+//! do to trust is stated in the crate docs (#107).
 
 use std::io;
 use std::path::PathBuf;

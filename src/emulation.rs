@@ -76,13 +76,22 @@ pub(crate) enum EmulationEvent {
     /// broken (one-way setups, asymmetric NAT, peer's TCP listener
     /// down). The connect-side path stays as the primary source;
     /// this is the defensive fallback.
-    PeerHello { addr: SocketAddr, commit: [u8; 8] },
+    ///
+    /// `fingerprint` is the certificate the connection presented: the
+    /// service records the commit on the device pinned to it. Two machines
+    /// can share an address, so the address says nothing about which device
+    /// this is.
+    PeerHello {
+        fingerprint: Rc<str>,
+        commit: [u8; 8],
+    },
     /// peer sent us a Capability event advertising its supported
     /// features. Routed upward (mirroring `PeerHello`) so the service
     /// can record it via `client_manager.set_peer_caps` — the receiver
     /// side needs the sender's caps to gate the future Trueloop
-    /// return-channel, just as the sender needs the receiver's.
-    PeerCaps { addr: SocketAddr, flags: u32 },
+    /// return-channel, just as the sender needs the receiver's. Matched to
+    /// a device by `fingerprint`, as `PeerHello` is.
+    PeerCaps { fingerprint: Rc<str>, flags: u32 },
 }
 
 enum EmulationRequest {
@@ -367,10 +376,14 @@ impl ListenTask {
                                 // sender that predates the event skips the unknown type
                                 // and keeps the connection alive.
                                 self.listener.reply(addr, ProtoEvent::Capability { flags: local_caps() }).await;
-                                self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
+                                if let Some(fingerprint) = self.peer_of.get(&addr).cloned() {
+                                    self.event_tx.send(EmulationEvent::PeerHello { fingerprint, commit }).expect("channel closed");
+                                }
                             }
                             ProtoEvent::Capability { flags } => {
-                                self.event_tx.send(EmulationEvent::PeerCaps { addr, flags }).expect("channel closed");
+                                if let Some(fingerprint) = self.peer_of.get(&addr).cloned() {
+                                    self.event_tx.send(EmulationEvent::PeerCaps { fingerprint, flags }).expect("channel closed");
+                                }
                             }
                             // Stage 2 absolute motion: reconstruct the per-event delta
                             // from the cumulative displacement and feed the UNCHANGED

@@ -71,6 +71,13 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
         ui.set_service_problem(problem.into());
     }
     ui.set_capture("enabled".into());
+    // PREVIEW_CAPTURE_PROBLEM=<text> shows a capture that failed, with the
+    // settings button a Mac offers for a missing permission.
+    if let Ok(problem) = std::env::var("PREVIEW_CAPTURE_PROBLEM") {
+        ui.set_capture("failed".into());
+        ui.set_capture_problem(problem.into());
+        ui.set_capture_settings(true);
+    }
     ui.set_emulation("enabled".into());
     ui.set_port("4242".into());
     ui.set_fingerprint("73:90:2a:3c:9d:e5:18:52:7c:aa:c3:de:de:04:cd:ec".into());
@@ -81,8 +88,16 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
     // inactive would exercise a state the product cannot produce.
     let nothing_found = matches!(
         std::env::var("PREVIEW_DISCOVERY").as_deref(),
-        Ok("empty") | Ok("off")
+        Ok("empty") | Ok("off") | Ok("quiet")
     );
+    // PREVIEW_DISCOVERY=quiet: looking, and nobody has answered for a while.
+    if std::env::var("PREVIEW_DISCOVERY").as_deref() == Ok("quiet") {
+        ui.set_discovery_empty(
+            "No other machine has answered. If one on this network runs hops, check that \
+             hops is on under System Settings → Privacy & Security → Local Network."
+                .into(),
+        );
+    }
     ui.set_discovered(ModelRc::new(VecModel::from(if nothing_found {
         vec![]
     } else {
@@ -208,7 +223,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             online: false,
             trusted: true,
             revoked: false,
-            clipboard: "off — it cannot be turned back on here yet".into(),
+            clipboard: "off".into(),
             clipboard_on: false,
         },
         // the user deliberately expelled this one — it must read as EXPELLED,
@@ -296,9 +311,16 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
     match std::env::args().nth(5).as_deref() {
         Some("settings") => ui.set_show_settings(true),
         Some("add-device") => ui.set_show_add_device(true),
-        Some("edit-device") => ui.set_editing_device("1".into()), // matches the mock studio-pc handle
+        // matches the mock studio-pc handle: paired, so its address carries its pin
+        Some("edit-device") => {
+            ui.set_editing_device("1".into());
+            ui.set_editing_pin("1e:19:1b:c4:a8:44".into());
+            ui.set_editing_send(true);
+        }
         Some("clipboard-confirm") => {
             ui.set_editing_device("1".into());
+            ui.set_editing_pin("1e:19:1b:c4:a8:44".into());
+            ui.set_editing_send(true);
             ui.set_confirm_clipboard_off(true);
         }
         // laptop-air: a receive-only row, keyed by fingerprint, clipboard off
@@ -310,7 +332,10 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             ui.set_confirm_clipboard_off(true);
         }
         // media-rig: never connected, so no pairing and no clipboard to show
-        Some("edit-unpaired") => ui.set_editing_device("2".into()),
+        Some("edit-unpaired") => {
+            ui.set_editing_device("2".into());
+            ui.set_editing_send(true);
+        }
         Some("delete-confirm") => ui.set_confirm_delete_handle("1".into()),
         // b7:2a:55 is the mock windows-pc — a trusted, receive-capable peer
         Some("revoke-confirm") => ui.set_confirm_revoke_fp("b7:2a:55:e1:90:33".into()),

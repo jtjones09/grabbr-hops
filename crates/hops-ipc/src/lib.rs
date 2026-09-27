@@ -1,3 +1,34 @@
+//! The channel between the hops daemon and its frontends.
+//!
+//! # What a frontend can do to trust: a stated limit (#107)
+//!
+//! Reaching this channel takes the token beside `config.toml` ([`token`]),
+//! so any program running as the user who owns that file can send what a
+//! frontend sends. Three requests widen what a machine may do, and nothing
+//! else a frontend sends does:
+//!
+//! * [`FrontendRequest::AuthorizeKey`] approves a pairing prompt the daemon
+//!   raised: a machine that connected while add device was open, or one the
+//!   daemon dialled then. The approval is shaped by how that machine
+//!   arrived, and with no prompt waiting it grants nothing. A prompt is
+//!   forgotten when the pairing window closes. An approval lets the two
+//!   machines connect far enough to compare a number, and grants nothing
+//!   more until both confirm it.
+//! * [`FrontendRequest::ConfirmPairing`] answers that number: confirmed here
+//!   and on the other machine, the approval becomes a pairing (#167).
+//! * [`FrontendRequest::EnableClipboard`] turns a paired machine's clipboard
+//!   back on, in the directions that pairing already drives.
+//!
+//! The daemon refuses all three while a peer is driving this machine, so
+//! the machine holding the keyboard and pointer cannot click its own
+//! approval. That is the whole of the check, and it is a limit rather than
+//! a defence: a program running as the user, holding the token, can approve
+//! a pending prompt, answer its number or turn a clipboard on whenever no
+//! peer is driving, and since it can also open add device and add a device
+//! to dial, it can pair a machine of its choosing. Such a program could
+//! equally re-sign the trust store on disk. A peer driving this machine can
+//! start such a program, which acts once the peer stops sending input.
+
 use std::{
     collections::{HashMap, HashSet},
     env::VarError,
@@ -206,6 +237,11 @@ pub struct Geometry {
 
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
+    /// What the user calls the device, kept apart from the address it is
+    /// dialled at so a rename never changes where it dials (#13). `None`: it
+    /// goes by its hostname, or by the name its pairing gave it.
+    #[serde(default)]
+    pub label: Option<String>,
     /// hostname of this client
     pub hostname: Option<String>,
     /// fix ips, determined by the user
@@ -227,6 +263,7 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             port: DEFAULT_PORT,
+            label: None,
             hostname: Default::default(),
             fix_ips: Default::default(),
             pos: Default::default(),
@@ -275,9 +312,9 @@ pub struct ClientState {
     /// outgoing client dials), read from the completed TLS handshake. `None`
     /// until a connection completes; then RETAINED as the client's last-known
     /// identity — unlike `peer_commit`/`peer_caps` it is NOT cleared on
-    /// disconnect (it pins the reconnect dial, see `connect`). It is cleared
-    /// only when the target address config changes (hostname / fix_ips) or trust
-    /// in it is revoked. It IS persisted (`[[clients]] fingerprint`) so the device
+    /// disconnect (it pins the reconnect dial, see `connect`). A new hostname
+    /// or address keeps it (#99); it is cleared only when trust in it is
+    /// revoked. It IS persisted (`[[clients]] fingerprint`) so the device
     /// join works from a cold start and the pin survives a restart — meaning a
     /// restart does NOT clear a bad pin, and the on-disk value is validated on
     /// read (`hops_ipc::identity::valid_fingerprint`). Also
@@ -324,8 +361,16 @@ pub enum FrontendEvent {
     Enumerate(Vec<(ClientHandle, ClientConfig, ClientState)>),
     /// an error occured
     Error(String),
-    /// capture status
-    CaptureStatus(Status),
+    /// Something the daemon did that nobody at this machine asked for and
+    /// nobody here need act on, such as refusing a machine that is not
+    /// paired: a line for the activity log, never the error banner. Anyone on
+    /// the network can cause some of these, and an error surface that cries
+    /// wolf stops being read (#150).
+    ///
+    /// Newer than `Error`; older frontends skip it.
+    Activity(String),
+    /// Whether input capture runs, and why not when it should (#91).
+    CaptureStatus(CaptureState),
     /// emulation status
     EmulationStatus(Status),
     /// authorized public key fingerprints have been updated
@@ -375,6 +420,13 @@ pub enum FrontendEvent {
         /// only sees `[]` renders the same silence for all three (#141).
         active: bool,
         peers: Vec<DiscoveredDevice>,
+        /// Discovery has run a while and heard no other machine at all,
+        /// paired or not. On macOS that is also how a daemon without the
+        /// Local Network permission looks (#149), so a frontend names the
+        /// setting rather than saying only that nothing is there. Absent
+        /// from an older daemon, which never says it.
+        #[serde(default)]
+        quiet: bool,
     },
     /// failed connection attempt (approval for fingerprint required)
     ConnectionAttempt {
@@ -418,6 +470,38 @@ pub enum FrontendEvent {
     /// request sent before it on that connection has been handled, and every
     /// event those requests caused was sent before this one.
     Barrier(u64),
+    /// The pointer crossed toward the device `handle` sits at, and was left
+    /// on this machine instead, for `reason` (#115). Sent once per device and
+    /// reason while the user keeps pushing at that edge, not per push.
+    CrossingRefused {
+        handle: ClientHandle,
+        reason: CrossingRefusal,
+    },
+}
+
+/// Why a crossing did not take the pointer to the device it was toward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CrossingRefusal {
+    /// There is no connection to the device: it never answered, or its link
+    /// is down. Crossing to it starts a dial.
+    NotConnected,
+    /// The device is connected and says it is not accepting input.
+    NotAcceptingInput,
+    /// This machine may no longer control the device.
+    NotPermitted,
+    /// The device did not acknowledge the crossing in time.
+    Unanswered,
+}
+
+impl Display for CrossingRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotConnected => "not connected",
+            Self::NotAcceptingInput => "not accepting input",
+            Self::NotPermitted => "this machine may no longer control it",
+            Self::Unanswered => "it did not acknowledge the crossing",
+        })
+    }
 }
 
 /// What this machine's trust store grants one paired machine, beyond the
@@ -517,8 +601,12 @@ pub enum FrontendRequest {
     Enumerate(),
     /// resolve dns
     ResolveDns(ClientHandle),
-    /// Rename a device: set the hostname it dials. `fingerprint` is its pin as
-    /// the frontend showed it, and a mismatch is refused, as for `Delete`.
+    /// Name a device: set its label, or clear it with `None`. Changes nothing
+    /// it dials and nothing it is trusted with (#13).
+    UpdateLabel(ClientHandle, Option<String>),
+    /// Set the hostname a device is dialled at. Its pin stays, so only the
+    /// same machine is reached there (#99). `fingerprint` is its pin as the
+    /// frontend showed it, and a mismatch is refused, as for `Delete`.
     UpdateHostname {
         handle: ClientHandle,
         hostname: Option<String>,
@@ -539,7 +627,11 @@ pub enum FrontendRequest {
     EnableEmulation,
     /// synchronize all state
     Sync,
-    /// authorize fingerprint (description, fingerprint)
+    /// Approve the pairing prompt the daemon raised for this fingerprint:
+    /// (description, fingerprint). What it grants is shaped by how that
+    /// machine arrived, never by this request, and with no prompt waiting it
+    /// grants nothing. Refused while a peer drives this machine. One of the
+    /// two requests that widen trust; see the crate docs.
     AuthorizeKey(String, String),
     /// remove fingerprint (fingerprint)
     RemoveAuthorizedKey(String),
@@ -570,8 +662,8 @@ pub enum FrontendRequest {
     /// stays off across restarts and when the other direction is approved.
     ///
     /// Only takes permission away, so, like removal, it is honoured while a
-    /// peer drives this machine. There is deliberately no request that turns
-    /// it back on: widening a pairing is not a frontend verb (#107).
+    /// peer drives this machine. [`FrontendRequest::EnableClipboard`] turns
+    /// it back on.
     DisableClipboard(String),
     /// Answer the pairing check for `fingerprint` (#11, #167): the number
     /// this machine shows, to confirm it, or the one picked from three. The
@@ -584,6 +676,16 @@ pub enum FrontendRequest {
     /// End the pairing check for `fingerprint` without pairing: "none of
     /// these", or a cancel. Only takes away, so it is always honoured.
     CancelPairing(String),
+    /// Turn the clipboard back on for the paired machine with this
+    /// fingerprint: the on arm of the per-device switch (#182). Only in the
+    /// directions the pairing drives: that machine's clipboard arrives here
+    /// if it may drive this one, and this machine's goes there if this one
+    /// may drive it. Saved, like `DisableClipboard`. Never grants or changes
+    /// a direction to drive.
+    ///
+    /// Widens a pairing, so, like `AuthorizeKey`, it is refused while a peer
+    /// drives this machine. See the crate docs for the limit that states.
+    EnableClipboard(String),
     /// Answered with [`FrontendEvent::Barrier`] carrying the same number once
     /// every request sent before it on this connection has been handled.
     ///
@@ -608,6 +710,54 @@ impl From<Status> for bool {
             Status::Enabled => true,
             Status::Disabled => false,
         }
+    }
+}
+
+/// Whether input capture runs: [`Status`]'s two states, written on the wire
+/// exactly as `Status` writes them, and a third for a capture that should run
+/// and cannot (#91). Capture that failed is not capture switched off: the
+/// user is told why, and what to change.
+///
+/// A frontend older than this skips a `Failed` it cannot read.
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum CaptureState {
+    /// Not running, and nothing is wrong: not started yet, or ended.
+    #[default]
+    Disabled,
+    Enabled,
+    /// It could not start, or it stopped.
+    Failed(CaptureFault),
+}
+
+impl CaptureState {
+    pub fn is_enabled(&self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
+/// Why capture could not start, or stopped.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum CaptureFault {
+    /// macOS does not grant hops these permissions.
+    Missing(Vec<Permission>),
+    /// Any other failure, as the backend reported it.
+    Backend(String),
+}
+
+/// A macOS permission, named as System Settings → Privacy & Security lists
+/// it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+pub enum Permission {
+    Accessibility,
+    InputMonitoring,
+}
+
+impl Display for Permission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Accessibility => "Accessibility",
+            Self::InputMonitoring => "Input Monitoring",
+        })
     }
 }
 
@@ -1382,6 +1532,49 @@ mod a_full_accept_queue {
              the front door must not start a daemon beside it, and it takes the \
              token from no one, so it does not serve.",
             (answers, serves)
+        );
+    }
+}
+
+#[cfg(test)]
+mod capture_state_on_the_wire {
+    //! Capture's third state is new; its first two must read as they always
+    //! have, so a frontend and a daemon of different builds still agree on
+    //! them (#91).
+
+    use super::{CaptureFault, CaptureState, FrontendEvent, Permission, Status};
+
+    fn wire(event: &FrontendEvent) -> String {
+        serde_json::to_string(event).expect("serializes")
+    }
+
+    // LEDGER T7 | class B | 2 bytes: serde_json of FrontendEvent::CaptureStatus
+    #[test]
+    fn on_and_off_are_written_as_status_writes_them_and_failed_names_the_setting() {
+        let old = |s: Status| {
+            serde_json::to_string(&serde_json::json!({ "CaptureStatus": s })).expect("json")
+        };
+        assert_eq!(
+            (
+                wire(&FrontendEvent::CaptureStatus(CaptureState::Enabled)),
+                wire(&FrontendEvent::CaptureStatus(CaptureState::Disabled)),
+            ),
+            (old(Status::Enabled), old(Status::Disabled)),
+            "an older frontend reads capture's state as a Status"
+        );
+        let failed =
+            FrontendEvent::CaptureStatus(CaptureState::Failed(CaptureFault::Missing(vec![
+                Permission::InputMonitoring,
+            ])));
+        let read: FrontendEvent = serde_json::from_str(&wire(&failed)).expect("reads back");
+        assert!(
+            matches!(
+                read,
+                FrontendEvent::CaptureStatus(CaptureState::Failed(CaptureFault::Missing(ref m)))
+                    if m == &[Permission::InputMonitoring]
+            ),
+            "a failed capture must arrive naming what is missing: {}",
+            wire(&failed)
         );
     }
 }

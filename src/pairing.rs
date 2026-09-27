@@ -433,7 +433,12 @@ pub(crate) async fn as_adding(
                 handle: Some(handle),
             });
         }
-        conn.close(0u32.into(), b"pairing ended");
+        // A connection the other machine already closed keeps its reason, so
+        // the dial can tell a refusal of this machine from any other end
+        // (#171): closing it here would overwrite that with our own.
+        if conn.close_reason().is_none() {
+            conn.close(0u32.into(), b"pairing ended");
+        }
         None
     };
     let number = match pair_ceremony::as_initiator(conn, ours, theirs).await {

@@ -11,7 +11,7 @@ use std::{
     net::SocketAddr,
     rc::Rc,
     sync::{Arc, Mutex as StdMutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio::{
@@ -105,6 +105,42 @@ pub(crate) enum ListenEvent {
     Closed {
         addr: SocketAddr,
     },
+}
+
+/// Failed handshakes, summarised in the log rather than one line each.
+///
+/// Anyone who can reach the port can fail a handshake as fast as it can dial,
+/// and each failure wrote a warning: a stranger minting a key per dial did 120
+/// a second (#101). The first failure is logged at once, then one line per
+/// [`Self::EVERY`] at most, counting the ones between.
+#[derive(Default)]
+struct HandshakeFailures {
+    last: Option<Instant>,
+    since: u32,
+}
+
+impl HandshakeFailures {
+    const EVERY: Duration = Duration::from_secs(10);
+
+    /// Count one failure, and log it when a line is due.
+    fn note(&mut self, from: SocketAddr, why: &dyn std::fmt::Display, now: Instant) {
+        self.since = self.since.saturating_add(1);
+        if self
+            .last
+            .is_some_and(|last| now.saturating_duration_since(last) < Self::EVERY)
+        {
+            return;
+        }
+        self.last = Some(now);
+        let more = std::mem::take(&mut self.since) - 1;
+        if more == 0 {
+            log::warn!("handshake from {from} failed: {why}");
+        } else {
+            log::warn!(
+                "handshake from {from} failed: {why} ({more} more failed since the last line)"
+            );
+        }
+    }
 }
 
 /// A live inbound connection plus the queue its replies wait in and the
@@ -311,6 +347,7 @@ impl LanMouseListener {
             let listen_tx = listen_tx.clone();
             let authorized_accept = trust.clone();
             let pairings = pairings.clone();
+            let failures: Rc<RefCell<HandshakeFailures>> = Default::default();
             spawn_local(async move {
                 loop {
                     tokio::select! {
@@ -330,7 +367,7 @@ impl LanMouseListener {
                                 Ok(cfg) => match incoming.accept_with(Arc::new(cfg)) {
                                     Ok(connecting) => connecting,
                                     Err(e) => {
-                                        log::warn!("handshake from {remote} failed: {e}");
+                                        failures.borrow_mut().note(remote, &e, Instant::now());
                                         continue;
                                     }
                                 },
@@ -349,6 +386,7 @@ impl LanMouseListener {
                             let trust = authorized_accept.clone();
                             let pairings = pairings.clone();
                             let ours = ours.clone();
+                            let failures = failures.clone();
                             spawn_local(async move {
                                 match connecting.await {
                                     Ok(conn) => {
@@ -423,7 +461,7 @@ impl LanMouseListener {
                                         .await;
                                     }
                                     Err(e) => {
-                                        log::warn!("handshake from {remote} failed: {e}");
+                                        failures.borrow_mut().note(remote, &e, Instant::now());
                                         let refused = refused.lock().expect("lock").take();
                                         if let Some(fingerprint) = refused {
                                             let _ = listen_tx.send(ListenEvent::Rejected {
@@ -1336,5 +1374,83 @@ mod clipboard_failures_are_visible {
                  daemon log and a 4.4 GB keystroke log before it"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod failed_handshakes_are_summarised {
+    //! Anyone who can reach the port can fail a handshake, as fast as it can
+    //! dial. One warning per failure let a stranger minting a key per dial
+    //! write 120 lines a second into the log (#101).
+    use super::*;
+    use crate::test_harness::{logs, machine, raw_client_config, run_local, trust, wait_until};
+    use crate::trust::Caps;
+    use std::cell::Cell;
+
+    // LEDGER T2373 | class B | 5 log lines captured from the real listener's thread
+    #[test]
+    fn a_stranger_dialling_in_a_loop_writes_a_line_not_a_line_per_dial() {
+        run_local(async {
+            let captured = logs::capture();
+            let receiver = machine();
+            let nobody = trust(&receiver, &[], Caps::INBOUND);
+            let (clip_tx, _clip_rx) = channel();
+            let (mut listener, port) =
+                LanMouseListener::bind_loopback(receiver.identity.clone(), nobody, clip_tx)
+                    .await
+                    .expect("listener");
+            let rejected = Rc::new(Cell::new(0u32));
+            let counted = rejected.clone();
+            spawn_local(async move {
+                while let Some(event) = listener.next().await {
+                    if matches!(event, ListenEvent::Rejected { .. }) {
+                        counted.set(counted.get() + 1);
+                    }
+                }
+            });
+
+            const DIALS: u32 = 40;
+            let at = SocketAddr::new("127.0.0.1".parse().expect("loopback"), port);
+            let endpoint =
+                Endpoint::client("127.0.0.1:0".parse().expect("loopback")).expect("endpoint");
+            for _ in 0..DIALS {
+                // A fresh key per dial, as the stranger in #101 did.
+                let stranger = machine();
+                let config = raw_client_config(
+                    &stranger,
+                    trust(&stranger, &[&receiver], Caps::OUTBOUND),
+                    1 << 20,
+                );
+                if let Ok(connecting) = endpoint.connect_with(config, at, "grabbr") {
+                    if let Ok(Ok(conn)) =
+                        tokio::time::timeout(Duration::from_secs(5), connecting).await
+                    {
+                        let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+                    }
+                }
+            }
+            wait_until(
+                "the listener to refuse every dial",
+                Duration::from_secs(20),
+                || rejected.get() == DIALS,
+            )
+            .await;
+
+            let warned: Vec<String> = captured
+                .lines()
+                .into_iter()
+                .filter(|l| l.text.starts_with("handshake from"))
+                .map(|l| l.text)
+                .collect();
+            assert!(
+                !warned.is_empty(),
+                "no failed handshake was logged at all; the first must be"
+            );
+            assert!(
+                warned.len() <= 2,
+                "{DIALS} refused dials in a few seconds wrote {} warnings: {warned:#?}",
+                warned.len()
+            );
+        });
     }
 }

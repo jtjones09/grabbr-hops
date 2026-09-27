@@ -229,6 +229,7 @@ fn change_fields(entry: &mut Table, base: &ConfigClient, ours: &ConfigClient, fr
     // Every field named, so a field added to `ConfigClient` does not compile
     // until it is placed here.
     let ConfigClient {
+        label,
         ips,
         hostname,
         port,
@@ -239,6 +240,7 @@ fn change_fields(entry: &mut Table, base: &ConfigClient, ours: &ConfigClient, fr
         fingerprint,
     } = base;
     let changed = [
+        ("label", *label != ours.label),
         ("hostname", *hostname != ours.hostname),
         ("ips", *ips != ours.ips),
         ("port", *port != ours.port),
@@ -360,8 +362,8 @@ enum Against {
 /// Against memory, the one entry left on each side after that is the same
 /// device if they differ in a single field, which is what one change by the
 /// daemon does: a rename of a device known by nothing else. A pin on the
-/// left missing on the right is not counted: memory forgets a pin with every
-/// new name or address, until the next handshake learns it.
+/// left missing on the right is not counted: memory forgets a pin when trust
+/// in its machine is revoked. A new name or address keeps it (#99).
 ///
 /// Against the file, nothing left over is paired: an entry changed by hand
 /// past recognition cannot be told from a device removed and another added,
@@ -375,6 +377,7 @@ fn pair(left: &[ConfigClient], right: &[ConfigClient], against: Against) -> Vec<
     fn differences(a: &ConfigClient, b: &ConfigClient) -> usize {
         // Every field named, as in `change_fields`.
         let ConfigClient {
+            label,
             ips,
             hostname,
             port,
@@ -384,6 +387,7 @@ fn pair(left: &[ConfigClient], right: &[ConfigClient], against: Against) -> Vec<
             fingerprint,
         } = a;
         [
+            *label != b.label,
             *hostname != b.hostname,
             *ips != b.ips,
             *port != b.port,

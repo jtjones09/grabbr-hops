@@ -94,8 +94,11 @@ enum CliSubcommand {
     SaveConfig,
 }
 
-/// How long a command waits for the service to say it handled it.
-const CONFIRM_WITHIN: Duration = Duration::from_secs(10);
+/// How long a command waits for the service to say it handled it. Long
+/// enough that a busy machine, or a service that has only just started, is
+/// not reported as not answering: 10 s did that under load, for commands
+/// the service then applied. A service that is truly stuck is still named.
+const CONFIRM_WITHIN: Duration = Duration::from_secs(30);
 
 /// What the service said while it handled a command's requests.
 #[derive(Default)]

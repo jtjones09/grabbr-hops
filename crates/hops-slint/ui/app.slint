@@ -85,6 +85,10 @@ export component AppWindow inherits Window {
     // rendering the same silence for all three is how a working feature looks
     // broken (#141).
     in property <bool> discovery-active: false;
+    // What the network section says while it lists nobody: that hops is
+    // looking, or, once nothing has answered for a while, what on this
+    // system can keep hops from hearing other machines (#149).
+    in property <string> discovery-empty: "looking — no other machines yet. They need hops running and to be on this network.";
     in property <string> notice: "";
     in property <int> notice-seq: 0;
     property <int> dismissed-seq: 0;
@@ -99,6 +103,12 @@ export component AppWindow inherits Window {
     // this app. Not dismissible: it stays while it is true.
     in property <string> service-problem: "";
     in property <string> capture: "—";
+    // Why capture, which should run, does not, or empty (#91). Stays while
+    // it is true; not dismissible.
+    in property <string> capture-problem: "";
+    // Whether this Mac can take the user to the setting that mends it: the
+    // problem is a missing permission (#169).
+    in property <bool> capture-settings: false;
     in property <string> emulation: "—";
     in property <string> port: "—";
     in property <string> fingerprint: "—";
@@ -149,8 +159,14 @@ export component AppWindow inherits Window {
     in-out property <string> editing-device: "";
     // The row's pin when its rename opened, carried like confirm-delete-pin.
     in-out property <string> editing-pin: "";
+    // The device being edited is one this machine dials, so it has an
+    // address to change as well as a name (#13).
+    in-out property <bool> editing-send: false;
+    // What is typed into its address field, on `root` so cancel can clear a
+    // field that exists only while `editing-send` holds.
+    in-out property <string> editing-address: "";
     // The edit panel is asking whether to turn the device's clipboard off.
-    // Asked, because nothing here turns it back on (#182, #107).
+    // "turn on" puts it back (#182).
     in-out property <bool> confirm-clipboard-off: false;
     // `in-out` (not a plain internal property) so the render_png self-review
     // harness can open these overlays from outside for a look — not used by the
@@ -183,12 +199,17 @@ export component AppWindow inherits Window {
     in-out property <[CanvasBox]> canvas-boxes: [];
 
     callback enable-input();
+    callback open-capture-settings();
     callback activate-device(string /* handle */, bool /* active */);
     callback reposition-device(string /* handle */, string /* new position */);
     callback rename-device(string /* handle */, string /* pin */, string /* new name */);
+    // A device this machine dials, at a new hostname or address. Its pin
+    // stays: only the same machine is accepted there (#99).
+    callback readdress-device(string /* handle */, string /* pin */, string /* address */);
     callback delete-device(string /* handle */, string /* pin */);
     callback revoke(string /* full fingerprint */);
     callback disable-clipboard(string /* full fingerprint */);
+    callback enable-clipboard(string /* full fingerprint */);
     callback approve-pairing(string /* name */, string /* full fingerprint */);
     callback deny-pairing(string /* full fingerprint */);
     // the number shown, to confirm it, or the one picked from three
@@ -254,9 +275,10 @@ export component AppWindow inherits Window {
             HorizontalLayout {
                 spacing: 5px;
                 Text { text: "capture"; color: Theme.c.muted; font-size: Type.small; }
+                // Failed is not off: capture should run and cannot (#91).
                 Text {
-                    text: root.capture == "enabled" ? "on" : "off";
-                    color: root.capture == "enabled" ? Theme.c.success : Theme.c.muted;
+                    text: root.capture == "enabled" ? "on" : (root.capture == "failed" ? "failed" : "off");
+                    color: root.capture == "enabled" ? Theme.c.success : (root.capture == "failed" ? Theme.c.warn : Theme.c.muted);
                     font-size: Type.small;
                     font-weight: Type.semibold;
                 }
@@ -288,6 +310,34 @@ export component AppWindow inherits Window {
                 text: "enable input";
                 primary: true;
                 clicked => { root.enable-input(); }
+            }
+        }
+
+        // --- capture that should run and cannot, and what to change (#91) ------
+        if root.capture-problem != "": Rectangle {
+            vertical-stretch: 0;
+            background: Theme.c.warn.transparentize(0.9);
+            border-radius: Radius.lg;
+            border-width: 1px;
+            border-color: Theme.c.warn.transparentize(0.55);
+            HorizontalLayout {
+                padding: Space.md;
+                spacing: Space.md;
+                Text {
+                    horizontal-stretch: 1;
+                    text: root.capture-problem;
+                    color: Theme.c.foreground;
+                    font-size: Type.small;
+                    wrap: word-wrap;
+                    vertical-alignment: center;
+                }
+                if root.capture-settings: VerticalLayout {
+                    alignment: center;
+                    PillButton {
+                        text: "open settings";
+                        clicked => { root.open-capture-settings(); }
+                    }
+                }
             }
         }
 
@@ -620,8 +670,7 @@ export component AppWindow inherits Window {
                         if root.discovered.length == 0: HorizontalLayout {
                             padding: Space.sm;
                             Text {
-                                text: "looking — no other machines yet. They need hops "
-                                    + "running and to be on this network.";
+                                text: root.discovery-empty;
                                 color: Theme.c.muted;
                                 font-size: Type.small;
                                 wrap: word-wrap;
@@ -877,6 +926,8 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                         clicked => {
                                             root.confirm-clipboard-off = false;
                                             root.editing-pin = d.pin;
+                                            root.editing-send = d.has-send;
+                                            root.editing-address = "";
                                             root.editing-device = root.editing-device == (d.has-send ? d.handle : d.fp-full)
                                                 ? ""
                                                 : (d.has-send ? d.handle : d.fp-full);
@@ -1023,10 +1074,25 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                             VerticalLayout {
                                 padding: Space.md;
                                 spacing: Space.sm;
-                                Text {
-                                    text: "rename device";
-                                    color: Theme.c.muted;
-                                    font-size: Type.caption;
+                                // Cancel sits up here, for the whole panel, so
+                                // the name and address rows line up (#13).
+                                HorizontalLayout {
+                                    Text {
+                                        text: root.editing-send ? "name" : "rename device";
+                                        color: Theme.c.muted;
+                                        font-size: Type.caption;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                    }
+                                    PillButton {
+                                        text: "cancel";
+                                        ghost: true;
+                                        clicked => {
+                                            rename-field.text = "";
+                                            root.editing-address = "";
+                                            root.editing-device = "";
+                                        }
+                                    }
                                 }
                                 HorizontalLayout {
                                     spacing: Space.sm;
@@ -1048,11 +1114,34 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                             root.editing-device = "";
                                         }
                                     }
+                                }
+                                // Where it is dialled, apart from its name (#13).
+                                // Outside the `for` below, like the name field,
+                                // so the poll tick cannot wipe what is typed.
+                                if root.editing-send: Text {
+                                    text: root.editing-pin != ""
+                                        ? "address — the same machine has to answer there"
+                                        : "address";
+                                    color: Theme.c.muted;
+                                    font-size: Type.caption;
+                                }
+                                if root.editing-send: HorizontalLayout {
+                                    spacing: Space.sm;
+                                    TextField {
+                                        text <=> root.editing-address;
+                                        placeholder: "hostname or IP address";
+                                        horizontal-stretch: 1;
+                                        accepted => {
+                                            root.readdress-device(root.editing-device, root.editing-pin, root.editing-address);
+                                            root.editing-address = "";
+                                            root.editing-device = "";
+                                        }
+                                    }
                                     PillButton {
-                                        text: "cancel";
-                                        ghost: true;
+                                        text: "save";
                                         clicked => {
-                                            rename-field.text = "";
+                                            root.readdress-device(root.editing-device, root.editing-pin, root.editing-address);
+                                            root.editing-address = "";
                                             root.editing-device = "";
                                         }
                                     }
@@ -1060,8 +1149,9 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                 // The device's clipboard (#182), found in the
                                 // fresh `devices` model by the key the edit
                                 // button set, so it shows the daemon's latest
-                                // word. Off offers nothing: nothing here turns
-                                // it back on.
+                                // word. On offers "turn off", asked first; off
+                                // offers "turn on", which the daemon does in
+                                // the directions the pairing drives.
                                 // One wrapper with no spacing: every device
                                 // adds an element here, empty but for the one
                                 // being edited.
@@ -1085,9 +1175,7 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                                     alignment: center;
                                                     horizontal-stretch: 1;
                                                     Text {
-                                                        text: asking
-                                                            ? "turn it off? it cannot be turned back on here yet"
-                                                            : d.clipboard;
+                                                        text: asking ? "turn it off?" : d.clipboard;
                                                         color: asking ? Theme.c.warn
                                                             : d.clipboard-on ? Theme.c.foreground : Theme.c.muted;
                                                         font-size: Type.small;
@@ -1100,6 +1188,21 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                                         text: "turn off";
                                                         ghost: true;
                                                         clicked => { root.confirm-clipboard-off = true; }
+                                                    }
+                                                }
+                                                if !d.clipboard-on: VerticalLayout {
+                                                    alignment: center;
+                                                    PillButton {
+                                                        text: "turn on";
+                                                        ghost: true;
+                                                        // A question left open
+                                                        // from before it went
+                                                        // off must not come
+                                                        // back once it is on.
+                                                        clicked => {
+                                                            root.confirm-clipboard-off = false;
+                                                            root.enable-clipboard(d.fp-full);
+                                                        }
                                                     }
                                                 }
                                                 if asking: VerticalLayout {

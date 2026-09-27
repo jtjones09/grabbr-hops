@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::time::{Duration, Instant};
 
 use local_channel::mpsc::{Receiver, Sender, channel};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
@@ -34,6 +35,9 @@ use tokio_util::sync::CancellationToken;
 pub(crate) const SERVICE_TYPE: &str = "_hops._udp.local.";
 /// TXT key carrying the advertised certificate fingerprint (a claim).
 const TXT_FINGERPRINT: &str = "fp";
+/// How long discovery hears no other machine before it says so. Another
+/// machine running hops on the same network answers within seconds.
+const QUIET_AFTER: Duration = Duration::from_secs(30);
 /// TXT key carrying the wire-protocol version, so a future incompatible hops
 /// can be filtered out of the list instead of failing confusingly on dial.
 const TXT_VERSION: &str = "v";
@@ -58,6 +62,11 @@ pub enum DiscoveryEvent {
     Found(DiscoveredPeer),
     /// A peer stopped advertising. Carries the instance label it was listed by.
     Lost(String),
+    /// No other machine has been heard since discovery started, for
+    /// [`QUIET_AFTER`]. Said once, and never after one has been. On macOS
+    /// this is what a process without the Local Network permission sees: its
+    /// announcement goes out and nothing comes back, with no error (#149).
+    Quiet,
 }
 
 pub struct Discovery {
@@ -67,6 +76,8 @@ pub struct Discovery {
     /// Held so the responder keeps advertising for as long as we run; dropping
     /// the daemon withdraws the advertisement.
     daemon: Option<ServiceDaemon>,
+    /// When to say nothing has been heard, until something is.
+    quiet_at: Option<tokio::time::Instant>,
 }
 
 impl Discovery {
@@ -148,11 +159,45 @@ impl Discovery {
             task,
             event_rx,
             daemon: Some(daemon),
+            quiet_at: Some(tokio::time::Instant::now() + QUIET_AFTER),
         })
     }
 
+    /// Discovery fed by `event_rx` in place of the network, quiet after
+    /// `quiet_after`.
+    #[cfg(test)]
+    pub(crate) fn fed(event_rx: Receiver<DiscoveryEvent>, quiet_after: Duration) -> Self {
+        Self {
+            cancellation_token: CancellationToken::new(),
+            task: None,
+            event_rx,
+            daemon: None,
+            quiet_at: Some(tokio::time::Instant::now() + quiet_after),
+        }
+    }
+
+    /// The next thing discovery has to say. Safe to drop at any await: the
+    /// quiet deadline is kept, not restarted.
     pub async fn event(&mut self) -> Option<DiscoveryEvent> {
-        self.event_rx.recv().await
+        let quiet_at = self.quiet_at;
+        let quiet = async move {
+            match quiet_at {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            event = self.event_rx.recv() => {
+                if matches!(event, Some(DiscoveryEvent::Found(_))) {
+                    self.quiet_at = None;
+                }
+                event
+            }
+            _ = quiet => {
+                self.quiet_at = None;
+                Some(DiscoveryEvent::Quiet)
+            }
+        }
     }
 
     pub async fn terminate(&mut self) {
@@ -306,6 +351,91 @@ pub fn peer_key(p: &DiscoveredPeer) -> String {
         .unwrap_or_else(|| p.label.clone())
 }
 
+/// The most addresses kept for one machine. A machine has a handful, one or
+/// two per interface; anything announcing more is not worth the memory.
+const MAX_ADDRS: usize = 16;
+
+/// The machines seen on the network, bounded.
+///
+/// Anything on the network can announce, under any name and fingerprint, as
+/// often as it likes, and an entry left only when its announcement was
+/// withdrawn. So a stranger announcing fresh fingerprints grew this for the
+/// life of the daemon, and one announcing fresh addresses grew an entry
+/// (#101). Past [`Self::MAX`] machines, the one heard from longest ago makes
+/// room: a real machine announces again, and is back once a flood stops.
+#[derive(Default)]
+pub(crate) struct DiscoveredPeers {
+    peers: HashMap<String, (DiscoveredPeer, Instant)>,
+}
+
+impl DiscoveredPeers {
+    /// More machines than a network running hops has.
+    pub(crate) const MAX: usize = 64;
+
+    /// Record an announcement heard at `now`. Whether the list changed: a
+    /// machine not listed before, or something new about one that was.
+    pub(crate) fn found(&mut self, mut peer: DiscoveredPeer, now: Instant) -> bool {
+        peer.addrs.truncate(MAX_ADDRS);
+        let key = peer_key(&peer);
+        if let Some((known, heard)) = self.peers.get_mut(&key) {
+            *heard = now;
+            return merge(known, peer);
+        }
+        if self.peers.len() >= Self::MAX {
+            let stalest = self
+                .peers
+                .iter()
+                .min_by_key(|(_, (_, heard))| *heard)
+                .map(|(k, _)| k.clone());
+            if let Some((gone, _)) = stalest.and_then(|k| self.peers.remove(&k)) {
+                log::debug!(
+                    "discovery: {} machines listed; dropping {:?}, heard from longest ago",
+                    Self::MAX,
+                    gone.label
+                );
+            }
+        }
+        log::info!(
+            "found {:?} on the local network at {:?}{}",
+            peer.label,
+            peer.addrs,
+            match &peer.claimed_fingerprint {
+                Some(fp) => format!(" claiming {fp}"),
+                None => String::new(),
+            }
+        );
+        self.peers.insert(key, (peer, now));
+        true
+    }
+
+    /// Forget the machine announced as `label`, which stopped announcing.
+    ///
+    /// Filed by fingerprint, but withdrawn by name — so find the entry whose
+    /// label matches rather than assuming the key. Compare BASE labels: mDNS
+    /// can announce a peer as `name` and withdraw it as `name (2)`, and a raw
+    /// comparison then never matches, leaving the row on screen forever.
+    pub(crate) fn lost(&mut self, label: &str) -> Option<DiscoveredPeer> {
+        let want = base_label(label);
+        let key = self
+            .peers
+            .iter()
+            .find(|(_, (p, _))| base_label(&p.label) == want)
+            .map(|(k, _)| k.clone())?;
+        self.peers.remove(&key).map(|(p, _)| p)
+    }
+
+    /// Every machine listed.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &DiscoveredPeer> {
+        self.peers.values().map(|(p, _)| p)
+    }
+
+    /// How many machines are listed.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.peers.len()
+    }
+}
+
 /// Fold a new announcement into what we already knew.
 ///
 /// Announcements arrive **per interface and piecemeal**: on this rig one peer
@@ -317,9 +447,15 @@ pub fn peer_key(p: &DiscoveredPeer) -> String {
 ///
 /// Returns `true` if anything actually changed, so a re-announcement that
 /// tells us nothing new does not wake the frontend.
+///
+/// At most [`MAX_ADDRS`] addresses are kept, the first ones heard: an
+/// announcement can carry any addresses at all.
 pub fn merge(into: &mut DiscoveredPeer, new: DiscoveredPeer) -> bool {
     let before = into.clone();
     for a in new.addrs {
+        if into.addrs.len() >= MAX_ADDRS {
+            break;
+        }
         if !into.addrs.contains(&a) {
             into.addrs.push(a);
         }
@@ -377,6 +513,72 @@ fn local_addresses() -> Vec<IpAddr> {
         seen.insert(i.ip(), ());
     }
     seen.into_keys().collect()
+}
+
+#[cfg(test)]
+mod heard_nobody {
+    //! Discovery says when it has heard no other machine, which on macOS is
+    //! how a missing Local Network permission looks (#149), and never once
+    //! it has heard one.
+
+    use super::{DiscoveredPeer, Discovery, DiscoveryEvent};
+    use crate::test_harness::run_local;
+    use local_channel::mpsc::channel;
+    use std::time::Duration;
+
+    /// What must happen is waited for this long at most.
+    const DEADLINE: Duration = Duration::from_secs(30);
+
+    fn peer() -> DiscoveredPeer {
+        DiscoveredPeer {
+            claimed_fingerprint: Some("11:22:33".into()),
+            label: "desk-pc".into(),
+            addrs: vec!["192.0.2.5:4242".parse().expect("addr")],
+        }
+    }
+
+    fn what(event: &Option<DiscoveryEvent>) -> &'static str {
+        match event {
+            Some(DiscoveryEvent::Found(_)) => "Found",
+            Some(DiscoveryEvent::Lost(_)) => "Lost",
+            Some(DiscoveryEvent::Quiet) => "Quiet",
+            None => "None",
+        }
+    }
+
+    // LEDGER T12 | class B | 1 return value: Discovery::event
+    #[test]
+    fn hearing_nobody_is_said_once_and_hearing_someone_is_never_quiet() {
+        run_local(async {
+            // Nobody answers.
+            let (_tx, rx) = channel();
+            let mut alone = Discovery::fed(rx, Duration::from_millis(50));
+            let first = tokio::time::timeout(DEADLINE, alone.event()).await;
+            let again = tokio::time::timeout(Duration::from_millis(300), alone.event()).await;
+
+            // A machine answers before the deadline, and leaves again.
+            let (tx, rx) = channel();
+            let mut heard = Discovery::fed(rx, Duration::from_millis(50));
+            tx.send(DiscoveryEvent::Found(peer())).expect("sent");
+            tx.send(DiscoveryEvent::Lost("desk-pc".into()))
+                .expect("sent");
+            let mut said = Vec::new();
+            for _ in 0..3 {
+                match tokio::time::timeout(Duration::from_millis(300), heard.event()).await {
+                    Ok(event) => said.push(what(&event)),
+                    Err(_) => said.push("nothing"),
+                }
+            }
+
+            assert_eq!(
+                (first.as_ref().map(what).ok(), again.is_err(), said),
+                (Some("Quiet"), true, vec!["Found", "Lost", "nothing"]),
+                "(first event with nobody heard, nothing more after it, events once \
+                 a machine was heard). Quiet must be said once nobody has answered, \
+                 and never once somebody has, even after it left."
+            );
+        });
+    }
 }
 
 #[cfg(test)]
@@ -495,6 +697,58 @@ mod tests {
             "every route seen must be kept: {:?}",
             known.addrs
         );
+    }
+
+    /// An announcement can carry any addresses, and anyone can announce as
+    /// often as it likes: the addresses kept for one machine are bounded, and
+    /// the first ones heard stay (#101).
+    // LEDGER T2374 | class B | 1 return value: merge
+    #[test]
+    fn announced_addresses_cannot_grow_an_entry_without_bound() {
+        let mut known = peer("p", Some("aa:aa"), &["192.0.2.1:4242"]);
+        for i in 0..10_000u32 {
+            let ip = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i as u16);
+            let addr = SocketAddr::new(IpAddr::V6(ip), 4242).to_string();
+            merge(&mut known, peer("p", Some("aa:aa"), &[addr.as_str()]));
+        }
+        assert!(
+            known.addrs.len() <= MAX_ADDRS,
+            "10,000 announced addresses left {} on one row",
+            known.addrs.len()
+        );
+        assert!(
+            known.addrs.contains(&"192.0.2.1:4242".parse().unwrap()),
+            "the first address heard was pushed out: {:?}",
+            known.addrs
+        );
+    }
+
+    /// A stranger announcing fresh fingerprints adds a row each time; past
+    /// the cap the machine heard from longest ago makes room, and a real
+    /// machine that keeps announcing stays listed.
+    // LEDGER T2381 | class B | 6 struct state: DiscoveredPeers after found/lost
+    #[test]
+    fn a_flood_of_announcements_keeps_the_list_bounded_and_a_live_machine_on_it() {
+        let mut list = DiscoveredPeers::default();
+        let start = Instant::now();
+        let at = |ms: u64| start + std::time::Duration::from_millis(ms);
+        assert!(list.found(peer("desk", Some("de:5k"), &["192.0.2.1:4242"]), at(0)));
+        for i in 0..5_000u64 {
+            let fp = format!("f1:{i:04x}");
+            list.found(peer("flood", Some(&fp), &["192.0.2.66:4242"]), at(i + 1));
+            // The real machine announces again now and then, as mDNS does.
+            if i % 20 == 0 {
+                list.found(peer("desk", Some("de:5k"), &["192.0.2.1:4242"]), at(i + 1));
+            }
+        }
+        assert!(list.len() <= DiscoveredPeers::MAX, "{} rows", list.len());
+        assert!(
+            list.iter()
+                .any(|p| p.claimed_fingerprint.as_deref() == Some("de:5k")),
+            "a machine announcing all along was pushed off the list"
+        );
+        assert!(list.lost("desk").is_some());
+        assert!(list.iter().all(|p| p.label != "desk"));
     }
 
     /// The same set in a different order is not news. Without this the daemon

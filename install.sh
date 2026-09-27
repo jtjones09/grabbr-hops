@@ -16,6 +16,17 @@ echo "==> Building hops (first build takes a couple of minutes)…"
 
 case "$(uname -s)" in
   Darwin)
+    # Run from an app bundle made by the generator the release uses. macOS
+    # reads what hops may do from the bundle's Info.plist: a bare binary
+    # declares no Bonjour service, so its discovery is blocked with no prompt
+    # and no error (#149).
+    VERSION="$(grep -m1 '^version' "$REPO/Cargo.toml" | sed -E 's/.*"(.*)".*/\1/')"
+    APP="$REPO/target/release/hops.app"
+    "$REPO/scripts/macos-app-bundle.sh" "$BIN" "$VERSION" "$APP" >/dev/null
+    # Seal the Info.plist into the bundle. Ad hoc: a local build has no
+    # Developer ID, so macOS grants still end with each rebuild.
+    codesign --force --deep --identifier com.grabbr.hops --sign - "$APP" >/dev/null 2>&1 || true
+    BIN="$APP/Contents/MacOS/hops"
     echo "==> Setting up login agents: background receiver + menu-bar tray…"
     mkdir -p "$HOME/hops/logs" "$HOME/Library/LaunchAgents"
     uid="$(id -u)"
@@ -59,8 +70,10 @@ PLIST
     done
     echo
     echo "✅  hops is running (look for the tray icon in your menu bar)."
-    echo "⚠️  ONE manual step — macOS needs your OK for hops to move the cursor:"
-    echo "      System Settings → Privacy & Security → Accessibility → turn on \"hops\""
+    echo "⚠️  macOS needs your OK, under System Settings → Privacy & Security:"
+    echo "      Accessibility     → turn on \"hops\" (to move the cursor)"
+    echo "      Input Monitoring  → turn on \"hops\" (to control other machines from this one)"
+    echo "      Local Network     → turn on \"hops\" (to find the other machines)"
     open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility" 2>/dev/null || true
     ;;
   Linux)

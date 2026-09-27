@@ -429,3 +429,70 @@ fn machines_adding_each_other_are_told_so() {
         shut_down(service).await;
     });
 }
+
+/// Approved here and waiting for its number is not paired (#167): the
+/// network list still offers the machine as one to add, and a device pinned
+/// to it is not named by the approval's label as the name it was paired
+/// under. Once confirmed, both change, so neither check could pass on a
+/// daemon that ignored the pairing.
+// LEDGER G-19 | class B | 1 events the daemon sends + 1 return value: Service::publish_discovered, Service::device_name
+#[test]
+fn a_machine_waiting_for_its_number_is_not_treated_as_paired() {
+    run_local(async {
+        let (mut service, _scratch) = daemon("np").await;
+        let (listed, pinned) = (machine().fingerprint, machine().fingerprint);
+        approve(&mut service, &listed, AttemptOrigin::Inbound);
+        approve(&mut service, &pinned, AttemptOrigin::OutboundDial);
+
+        service.discovered.found(
+            crate::discovery::DiscoveredPeer {
+                claimed_fingerprint: Some(listed.clone()),
+                label: "desk-b.local".into(),
+                addrs: vec![peer_addr()],
+            },
+            Instant::now(),
+        );
+        let offered = |service: &mut Service| {
+            service.publish_discovered();
+            sent(service).iter().any(|e| {
+                matches!(e, FrontendEvent::Discovered { peers, .. }
+                    if peers.iter().any(|p| p.claimed_fingerprint.as_deref() == Some(listed.as_str())))
+            })
+        };
+        assert!(
+            offered(&mut service),
+            "a machine whose pairing waits for its number was hidden from the \
+             network list as if it were paired"
+        );
+
+        let handle = service.client_manager.add_client();
+        service
+            .client_manager
+            .set_fix_ips(handle, vec![peer_addr().ip()]);
+        service
+            .client_manager
+            .pin(handle, pinned.clone())
+            .expect("the only device for that machine");
+        assert_eq!(
+            service.device_name(handle),
+            peer_addr().ip().to_string(),
+            "a device pinned to a machine whose pairing waits for its number was \
+             named by the approval, as the name it was paired under"
+        );
+
+        for fp in [&listed, &pinned] {
+            service
+                .trust
+                .write()
+                .expect("lock")
+                .confirm(fp)
+                .expect("confirm");
+        }
+        assert!(
+            !offered(&mut service),
+            "a paired machine was offered to add again"
+        );
+        assert_eq!(service.device_name(handle), "desk b", "once paired");
+        shut_down(service).await;
+    });
+}

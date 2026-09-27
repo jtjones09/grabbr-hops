@@ -19,8 +19,9 @@ use hops_ipc::{AsyncFrontendRequestWriter, ConnectionError, IpcError};
 use tokio::sync::{Notify, mpsc};
 
 pub use hops_ipc::{
-    AttemptOrigin, Build, ClientConfig, ClientHandle, ClientState, DiscoveredDevice, FrontendEvent,
-    FrontendRequest, PairingCheck, PeerTrust, Position, RevokedEntry, Status, connect_async,
+    AttemptOrigin, Build, CaptureFault, CaptureState, ClientConfig, ClientHandle, ClientState,
+    CrossingRefusal, DiscoveredDevice, FrontendEvent, FrontendRequest, PairingCheck, PeerTrust,
+    Permission, Position, RevokedEntry, Status, connect_async,
 };
 
 pub mod prefs;
@@ -81,8 +82,8 @@ pub struct AppModel {
     pub left_running: Option<String>,
     /// Configured clients, keyed + ordered by handle.
     pub clients: BTreeMap<ClientHandle, (ClientConfig, ClientState)>,
-    /// Local input-capture status.
-    pub capture: Status,
+    /// Local input-capture status, and why it failed when it did.
+    pub capture: CaptureState,
     /// Local input-emulation status.
     pub emulation: Status,
     /// This device's public-key fingerprint.
@@ -138,6 +139,8 @@ pub struct AppModel {
     /// or genuinely nothing there. Rendering the same silence for all three is
     /// how a working feature looks broken (#141).
     pub discovery_active: bool,
+    /// Discovery has run a while and heard no other machine at all (#149).
+    pub discovery_quiet: bool,
     /// An untrusted peer's fingerprint awaiting the user's pairing approval. Set
     /// on `ConnectionAttempt`; cleared once it becomes authorized or the daemon
     /// link drops. The UI surfaces this as an approve/deny prompt.
@@ -309,6 +312,7 @@ impl AppModel {
                 }
             }
             FrontendEvent::Error(e) => self.push_error(e),
+            FrontendEvent::Activity(line) => self.push_message(line),
             FrontendEvent::DeviceConnected { addr, fingerprint } => {
                 self.register_peer(addr, fingerprint);
                 self.push_message(format!("device connected: {addr}"));
@@ -356,8 +360,13 @@ impl AppModel {
                     self.pending_pairing_since = Some(now);
                 }
             }
-            FrontendEvent::Discovered { active, peers } => {
+            FrontendEvent::Discovered {
+                active,
+                peers,
+                quiet,
+            } => {
                 self.discovery_active = active;
+                self.discovery_quiet = quiet;
                 self.discovered = peers;
             }
             FrontendEvent::PairingOpen { seconds } => {
@@ -367,6 +376,21 @@ impl AppModel {
             FrontendEvent::NoSuchClient(_) => {}
             // Sent to every frontend, and meant for the one that asked.
             FrontendEvent::Barrier(_) => {}
+            // The pointer stayed on this machine. That is "that didn't
+            // work" to someone pushing at an edge, so it takes the banner.
+            FrontendEvent::CrossingRefused { handle, reason } => {
+                let device = self
+                    .devices()
+                    .into_iter()
+                    .find(|d| d.send.as_ref().is_some_and(|s| s.handle == handle));
+                let text = match device {
+                    Some(d) => {
+                        crossing_refused(&d.label, d.trust == TrustState::Provisional, reason)
+                    }
+                    None => crossing_refused("That device", false, reason),
+                };
+                self.push_error(text);
+            }
         }
     }
 
@@ -487,6 +511,34 @@ impl AppModel {
         ))
     }
 
+    /// Why capture, which should run, does not, for a frontend to show while
+    /// it is so (#91); `None` while capture runs or is simply off.
+    ///
+    /// A missing permission is named with where to grant it, and with what
+    /// it is for: a Mac that is only ever controlled never needs it.
+    pub fn capture_problem(&self) -> Option<String> {
+        let CaptureState::Failed(fault) = &self.capture else {
+            return None;
+        };
+        Some(match fault {
+            CaptureFault::Missing(missing) => {
+                let names: Vec<String> = missing.iter().map(ToString::to_string).collect();
+                let names = names.join(" and ");
+                let where_ = if missing.len() > 1 {
+                    format!(", in both {names}")
+                } else {
+                    format!(" → {names}")
+                };
+                format!(
+                    "Input capture cannot run: macOS does not grant hops {names}, which \
+                     this Mac needs to control other machines. Turn hops on under System \
+                     Settings → Privacy & Security{where_}."
+                )
+            }
+            CaptureFault::Backend(error) => format!("Input capture is not running: {error}"),
+        })
+    }
+
     /// The model a frontend opens with: this build, and what the front door
     /// found. A service it restarted is told as a notice.
     pub fn launched(launch: Launch) -> Self {
@@ -570,7 +622,8 @@ impl AppModel {
         self.pairing_open_until = None;
         self.discovered.clear();
         self.discovery_active = false;
-        self.capture = Status::Disabled;
+        self.discovery_quiet = false;
+        self.capture = CaptureState::Disabled;
         self.emulation = Status::Disabled;
         for (_, state) in self.clients.values_mut() {
             state.active_addr = None;
@@ -709,7 +762,8 @@ impl PairingCard {
 /// This machine's clipboard with one paired device (#182).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Clipboard {
-    /// Neither way. There is no way to turn it on from a frontend yet.
+    /// Neither way. `EnableClipboard` turns it back on, in the directions
+    /// the pairing drives.
     Off,
     /// That device's clipboard arrives here, and nothing goes back.
     FromIt,
@@ -720,7 +774,8 @@ pub enum Clipboard {
 }
 
 impl Clipboard {
-    /// A direction is on, so the off switch has something to turn off.
+    /// A direction is on, so the switch offers to turn it off; otherwise it
+    /// offers to turn it back on.
     pub fn is_on(self) -> bool {
         self != Clipboard::Off
     }
@@ -868,6 +923,41 @@ pub fn fallback_label(fp: &str) -> String {
     short_fingerprint(fp)
 }
 
+/// What to say when the pointer crossed toward `label` and stayed here (#115).
+///
+/// The device and the reason lead, so the start says why wherever the text
+/// is cut or wrapped. `never_paired` is a device this machine has never
+/// completed a handshake with, which is what #115 met: added, never paired.
+/// Such a device may be refused for want of a permission it was never given,
+/// and "no longer" would be wrong for it.
+pub fn crossing_refused(label: &str, never_paired: bool, reason: CrossingRefusal) -> String {
+    match reason {
+        CrossingRefusal::NotConnected | CrossingRefusal::NotPermitted if never_paired => format!(
+            "{label} is not paired yet, so the pointer stayed here. Pair the two machines, \
+             then try again."
+        ),
+        CrossingRefusal::NotConnected => format!(
+            "{label} is not connected, so the pointer stayed here. Check that hops is \
+             running on it."
+        ),
+        CrossingRefusal::NotAcceptingInput => format!(
+            "{label} is not accepting input, so the pointer stayed here. hops on it may \
+             be missing a permission."
+        ),
+        CrossingRefusal::NotPermitted => {
+            format!("This machine may no longer control {label}, so the pointer stayed here.")
+        }
+        CrossingRefusal::Unanswered => {
+            format!("{label} did not answer the crossing, so the pointer came back.")
+        }
+    }
+}
+
+/// The name the user gave a device we dial, apart from its address (#13).
+fn given_name(config: &ClientConfig) -> Option<&str> {
+    config.label.as_deref().filter(|l| !l.trim().is_empty())
+}
+
 /// Pick a display label, preferring the user-typed send-side hostname, then the
 /// trusted description, then a short fingerprint, then a placeholder.
 fn display_label(hostname: Option<&str>, description: Option<&str>, fp: &str) -> String {
@@ -886,7 +976,7 @@ fn display_label(hostname: Option<&str>, description: Option<&str>, fp: &str) ->
 impl AppModel {
     /// The clipboard with the paired device whose fingerprint is `fp`, or
     /// `None` when no pairing holds one, so there is nothing to show or to
-    /// switch off.
+    /// switch.
     pub fn clipboard(&self, fp: &str) -> Option<Clipboard> {
         self.trust
             .get(fp)
@@ -952,11 +1042,22 @@ impl AppModel {
                         send: None,
                         receive: false,
                     });
-                    // A user-typed send-side hostname is the preferred label --
-                    // EXCEPT when it is a bare IP literal. Adding a device by
-                    // address puts the IP in the name field, and an address is a
-                    // worse name than the peer's own advertised description.
-                    if let Some(host) = config
+                    // One entry per card. Of two entries for one machine, the
+                    // first added names the card and takes its buttons (#12):
+                    // the name used to come from one and the buttons from the
+                    // other. `clients` is ordered by handle, and the daemon
+                    // dials the machine for that same entry only.
+                    if device.send.is_some() {
+                        continue;
+                    }
+                    // The name the user gave the device comes first (#13). Then
+                    // a user-typed send-side hostname -- EXCEPT when it is a
+                    // bare IP literal. Adding a device by address puts the IP
+                    // in the name field, and an address is a worse name than
+                    // the peer's own advertised description.
+                    if let Some(name) = given_name(config) {
+                        device.label = name.to_string();
+                    } else if let Some(host) = config
                         .hostname
                         .as_deref()
                         .filter(|h| !h.is_empty())
@@ -969,7 +1070,10 @@ impl AppModel {
                 // never connected (or our own fp somehow) -> own provisional card
                 _ => provisional.push(Device {
                     fingerprint: None,
-                    label: display_label(config.hostname.as_deref(), None, ""),
+                    label: given_name(config).map_or_else(
+                        || display_label(config.hostname.as_deref(), None, ""),
+                        str::to_string,
+                    ),
                     trust: TrustState::Provisional,
                     online: false,
                     send: Some(send),
@@ -1954,6 +2058,80 @@ mod projection {
         }
     }
 
+    /// The same machine added twice, once by name and once by address: one
+    /// card, whose name and controls come from the same entry, the first
+    /// added (#12). The name came from one entry and the handle every button
+    /// acts on from the other.
+    // LEDGER T9902 | class B | 6 struct state: AppModel::devices()
+    #[test]
+    fn a_machine_added_twice_is_one_card_named_and_driven_by_one_entry() {
+        let desk = "73:90:2a:3c:9d:e5";
+        for (first, second) in [
+            (Some("desk-mac.local"), Some("192.0.2.10")),
+            (Some("192.0.2.10"), Some("desk-mac.local")),
+            (Some("desk-mac.local"), Some("den")),
+        ] {
+            let mut m = AppModel::default();
+            m.clients.insert(3, client(first, Some(desk)));
+            m.clients.insert(7, client(second, Some(desk)));
+            m.authorized
+                .insert(desk.to_string(), "desk mac".to_string());
+            let devices = m.devices();
+            let cards: Vec<(&str, Option<u64>, Option<&str>)> = devices
+                .iter()
+                .map(|d| {
+                    let send = d.send.as_ref();
+                    (
+                        d.label.as_str(),
+                        send.map(|s| s.handle),
+                        send.and_then(|s| s.config.hostname.as_deref()),
+                    )
+                })
+                .collect();
+            let named = match first {
+                Some(h) if h.parse::<std::net::IpAddr>().is_err() => h,
+                _ => "desk mac",
+            };
+            assert_eq!(
+                cards,
+                [(named, Some(3), first)],
+                "(name, the handle its buttons act on, that handle's hostname): \
+                 {first:?} then {second:?}, both the desk. The card has to be the \
+                 first entry's, name and buttons both"
+            );
+        }
+    }
+
+    /// A device the user named is shown by that name, whatever it is dialled
+    /// at and whatever its pairing called it, connected or not (#13). The
+    /// name used to be the hostname, so naming it changed where it dialled.
+    // LEDGER T9906 | class B | 6 struct state: AppModel::devices()
+    #[test]
+    fn a_named_device_is_shown_by_its_name_and_not_its_address() {
+        let desk = "73:90:2a:3c:9d:e5";
+        let named = |host: &str, pin: Option<&str>| {
+            let (mut config, state) = client(Some(host), pin);
+            config.label = Some("den".to_string());
+            (config, state)
+        };
+        let mut m = AppModel::default();
+        m.clients.insert(0, named("desk-mac.local", Some(desk)));
+        m.clients.insert(1, named("192.0.2.11", None));
+        m.authorized
+            .insert(desk.to_string(), "desk mac".to_string());
+        let labels: Vec<(Option<u64>, String)> = m
+            .devices()
+            .into_iter()
+            .map(|d| (d.send.map(|s| s.handle), d.label))
+            .collect();
+        assert_eq!(
+            labels,
+            [(Some(0), "den".to_string()), (Some(1), "den".to_string())],
+            "a paired device and a device never connected, both named den, were \
+             not shown as den"
+        );
+    }
+
     /// A denial the trust store still holds must never render like a device
     /// never met.
     // LEDGER T503 | class B | 6 struct state: AppModel::devices()
@@ -2191,6 +2369,27 @@ mod errors_apart_from_activity {
     //! everything, and only what went wrong is an error.
     use super::*;
 
+    /// A machine refused in the background is a line in the log. Anyone on
+    /// the network can cause one, so it must never raise the error banner.
+    // LEDGER T2372 | class B | 6 struct state: AppModel::apply, messages and latest_error
+    #[test]
+    fn a_background_refusal_is_activity_and_never_an_error() {
+        let mut m = AppModel::default();
+        let line = "Refused a connection from 192.0.2.7: it is not paired to control this \
+                    machine, and add device is not open here.";
+        m.apply(FrontendEvent::Activity(line.into()));
+        assert_eq!(
+            m.latest_message(),
+            Some(line),
+            "a background refusal must be the log's latest line, as it was sent"
+        );
+        assert_eq!(
+            (m.latest_error(), m.error_seq),
+            (None, 0),
+            "a background refusal raised the error banner"
+        );
+    }
+
     // LEDGER T516 | class B | 6 struct state: AppModel::apply, latest_error/error_seq
     #[test]
     fn routine_events_reach_the_log_and_not_the_errors() {
@@ -2350,7 +2549,7 @@ mod the_daemon_gone {
                         fingerprint: FP.into(),
                     },
                     FrontendEvent::PairingOpen { seconds: 120 },
-                    FrontendEvent::CaptureStatus(Status::Enabled),
+                    FrontendEvent::CaptureStatus(CaptureState::Enabled),
                     FrontendEvent::ConnectionAttempt {
                         fingerprint: "cc:dd".into(),
                         origin: AttemptOrigin::Inbound,
@@ -2363,6 +2562,7 @@ mod the_daemon_gone {
                             claimed_fingerprint: None,
                             addrs: vec!["192.0.2.7:4242".parse().expect("addr")],
                         }],
+                        quiet: false,
                     },
                 ] {
                     first.events.unbounded_send(Ok(event)).expect("open");
@@ -2429,7 +2629,7 @@ mod the_daemon_gone {
                 );
                 assert!(
                     gone.pairing_seconds_left(Instant::now()).is_none()
-                        && gone.capture == Status::Disabled,
+                        && gone.capture == CaptureState::Disabled,
                     "with no daemon the pairing window or capture still reads open"
                 );
                 assert!(
@@ -2555,6 +2755,153 @@ mod pick_the_number {
         assert!(
             m.pairing_check().is_none(),
             "a number card outlived the daemon that asked"
+        );
+    }
+}
+
+#[cfg(test)]
+mod capture_that_cannot_run {
+    //! What a frontend says about a capture that failed (#91).
+
+    use super::{AppModel, CaptureFault, CaptureState, FrontendEvent, Permission};
+
+    fn said(state: CaptureState) -> Option<String> {
+        let mut m = AppModel::default();
+        m.apply(FrontendEvent::CaptureStatus(state));
+        m.capture_problem()
+    }
+
+    // LEDGER T8 | class B | 1 return value: AppModel::apply then AppModel::capture_problem
+    #[test]
+    fn a_missing_permission_is_named_with_where_to_turn_it_on() {
+        let missing = |p: &[Permission]| CaptureState::Failed(CaptureFault::Missing(p.to_vec()));
+        assert_eq!(
+            [
+                said(missing(&[Permission::InputMonitoring])),
+                said(missing(&[
+                    Permission::Accessibility,
+                    Permission::InputMonitoring
+                ])),
+                said(CaptureState::Failed(CaptureFault::Backend(
+                    "no backend available".into()
+                ))),
+                said(CaptureState::Disabled),
+                said(CaptureState::Enabled),
+            ],
+            [
+                Some(
+                    "Input capture cannot run: macOS does not grant hops Input Monitoring, \
+                     which this Mac needs to control other machines. Turn hops on under \
+                     System Settings → Privacy & Security → Input Monitoring."
+                        .to_string()
+                ),
+                Some(
+                    "Input capture cannot run: macOS does not grant hops Accessibility and \
+                     Input Monitoring, which this Mac needs to control other machines. Turn \
+                     hops on under System Settings → Privacy & Security, in both \
+                     Accessibility and Input Monitoring."
+                        .to_string()
+                ),
+                Some("Input capture is not running: no backend available".to_string()),
+                None,
+                None,
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod a_refused_crossing {
+    //! A crossing that left the pointer on this machine is said in the
+    //! banner, naming the device as its card does and saying why (#115).
+    use super::*;
+
+    fn device(hostname: &str, peer_fp: Option<&str>) -> (ClientConfig, ClientState) {
+        let config = ClientConfig {
+            hostname: Some(hostname.to_string()),
+            ..Default::default()
+        };
+        let state = ClientState {
+            peer_fingerprint: peer_fp.map(String::from),
+            ..Default::default()
+        };
+        (config, state)
+    }
+
+    // LEDGER T115-8 | class B | 6 struct state: AppModel::apply, latest_error/error_seq
+    #[test]
+    fn a_refused_crossing_names_the_device_and_the_reason_in_the_banner() {
+        let mut m = AppModel::default();
+        m.apply(FrontendEvent::Created(
+            3,
+            device("studio-pc", None).0,
+            device("studio-pc", None).1,
+        ));
+        let seq = m.error_seq;
+
+        m.apply(FrontendEvent::CrossingRefused {
+            handle: 3,
+            reason: CrossingRefusal::NotConnected,
+        });
+        assert!(
+            m.error_seq > seq,
+            "a refused crossing must raise the banner"
+        );
+        assert_eq!(
+            m.latest_error(),
+            Some(
+                "studio-pc is not paired yet, so the pointer stayed here. Pair the two \
+                 machines, then try again."
+            ),
+            "a device added and never paired, as in #115"
+        );
+
+        // Paired, and its link down.
+        let fp = "aa:bb:cc:dd";
+        let (config, state) = device("desk-mac", Some(fp));
+        m.apply(FrontendEvent::Created(4, config, state));
+        m.authorized.insert(fp.to_string(), "desk-mac".to_string());
+        m.apply(FrontendEvent::CrossingRefused {
+            handle: 4,
+            reason: CrossingRefusal::NotConnected,
+        });
+        assert!(
+            m.latest_error()
+                .is_some_and(|e| e.starts_with("desk-mac is not connected")),
+            "a paired device that is not connected: {:?}",
+            m.latest_error()
+        );
+
+        m.apply(FrontendEvent::CrossingRefused {
+            handle: 4,
+            reason: CrossingRefusal::Unanswered,
+        });
+        assert_eq!(
+            m.latest_error(),
+            Some("desk-mac did not answer the crossing, so the pointer came back.")
+        );
+
+        // Pinned to a machine this one was never given permission to drive:
+        // not paired yet, not a permission it lost.
+        let (config, state) = device("studio-mac", Some("ee:ff"));
+        m.apply(FrontendEvent::Created(5, config, state));
+        m.apply(FrontendEvent::CrossingRefused {
+            handle: 5,
+            reason: CrossingRefusal::NotPermitted,
+        });
+        assert!(
+            m.latest_error()
+                .is_some_and(|e| e.starts_with("studio-mac is not paired yet")),
+            "a device never paired was said to be one this machine may no longer control: {:?}",
+            m.latest_error()
+        );
+        m.apply(FrontendEvent::CrossingRefused {
+            handle: 4,
+            reason: CrossingRefusal::NotPermitted,
+        });
+        assert_eq!(
+            m.latest_error(),
+            Some("This machine may no longer control desk-mac, so the pointer stayed here.")
         );
     }
 }

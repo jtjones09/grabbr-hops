@@ -10,7 +10,12 @@ use tokio::time::{self, Instant, Interval};
 
 use super::{Capture, CaptureError, CaptureEvent, Position};
 
+/// A capture backend that reads no device: a pointer held at the left edge,
+/// moving in a circle. It crosses as it starts, when a barrier is made, and
+/// again [`RECROSS_AFTER`] after it is released, as a pointer still pushing
+/// at a real edge does.
 pub struct DummyInputCapture {
+    /// When the current crossing began; `None` until the next one does.
     start: Option<Instant>,
     interval: Interval,
     offset: (i32, i32),
@@ -26,6 +31,19 @@ impl DummyInputCapture {
     }
 }
 
+/// How long after a release the pointer crosses again. A hand pushing at
+/// an edge does not cross a thousand times a second, and a refused crossing
+/// is released at once: without a pause this looped at the tick rate.
+const RECROSS_AFTER: Duration = Duration::from_millis(250);
+
+impl DummyInputCapture {
+    /// Make the next event a crossing.
+    fn cross_again(&mut self) {
+        self.start = None;
+        self.offset = (0, 0);
+    }
+}
+
 impl Default for DummyInputCapture {
     fn default() -> Self {
         Self::new()
@@ -35,6 +53,7 @@ impl Default for DummyInputCapture {
 #[async_trait(?Send)]
 impl Capture for DummyInputCapture {
     async fn create(&mut self, _pos: Position) -> Result<(), CaptureError> {
+        self.cross_again();
         Ok(())
     }
 
@@ -43,6 +62,8 @@ impl Capture for DummyInputCapture {
     }
 
     async fn release(&mut self) -> Result<(), CaptureError> {
+        self.cross_again();
+        self.interval.reset_after(RECROSS_AFTER);
         Ok(())
     }
 
@@ -82,5 +103,45 @@ impl Stream for DummyInputCapture {
             }
         };
         Poll::Ready(Some(Ok((Position::Left, event))))
+    }
+}
+
+#[cfg(test)]
+mod crossing_again {
+    use futures::StreamExt;
+
+    use super::*;
+
+    async fn next_begin(capture: &mut DummyInputCapture) {
+        loop {
+            let (_, event) = capture
+                .next()
+                .await
+                .expect("the dummy never ends")
+                .expect("the dummy never fails");
+            if event == CaptureEvent::Begin {
+                return;
+            }
+        }
+    }
+
+    // LEDGER TD-1 | class B | the backend's own event stream
+    /// Released, it crosses again, but not before [`RECROSS_AFTER`]: a
+    /// crossing refused and released at once otherwise loops at the tick
+    /// rate. A lower bound, which a loaded run only makes longer.
+    #[tokio::test]
+    async fn a_released_pointer_crosses_again_after_a_pause() {
+        let mut capture = DummyInputCapture::new();
+        capture.create(Position::Left).await.expect("create");
+        next_begin(&mut capture).await;
+
+        capture.release().await.expect("release");
+        let released = Instant::now();
+        next_begin(&mut capture).await;
+        assert!(
+            released.elapsed() >= RECROSS_AFTER,
+            "the pointer crossed again {:?} after it was released",
+            released.elapsed()
+        );
     }
 }

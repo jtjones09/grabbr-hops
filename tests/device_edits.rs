@@ -331,10 +331,9 @@ fn deleting_a_connected_device_closes_its_link() {
     });
 }
 
-// LEDGER T9 | class B | 2 connection closed at a real QUIC receiver, dialled by the hops binary
-/// The same after the device's address was edited while it was connected,
-/// which clears its pin: the delete then revokes nothing, and closing the
-/// link is left to the removal alone.
+// LEDGER T9 | class B | 2 connection closed at a real QUIC receiver, dialled by the hops binary; 1 device list returned over IPC
+/// The same after the device's address was edited while it was connected.
+/// The edit keeps the pin (#99), which the row shows and the delete carries.
 #[test]
 fn deleting_a_connected_device_after_an_address_edit_closes_its_link() {
     local(async {
@@ -345,12 +344,22 @@ fn deleting_a_connected_device_after_an_address_edit_closes_its_link() {
                 vec!["192.0.2.1".parse().expect("ip")],
             ))
             .await;
+        let shown = frontend
+            .devices()
+            .await
+            .get(&handle)
+            .and_then(|(_, s)| s.peer_fingerprint.clone());
+        assert_eq!(
+            shown.as_ref(),
+            Some(&receiver.fingerprint),
+            "a new address cleared the device's pin (#99); log:\n{}",
+            daemon.log()
+        );
 
-        // The edit cleared the pin, and the row shows none.
         frontend
             .send(FrontendRequest::Delete {
                 handle,
-                fingerprint: None,
+                fingerprint: shown,
             })
             .await;
 
@@ -542,24 +551,187 @@ fn a_delete_or_rename_for_a_pin_the_device_no_longer_has_is_refused() {
             daemon.log()
         );
 
-        // With the device's own pin, both are carried out. The rename clears
-        // the pin, as a new name may be another machine.
+        // With the device's own pin, both are carried out. The new name keeps
+        // the pin (#99): a machine answering to it has to be the same one.
         frontend
             .send(FrontendRequest::UpdateHostname {
                 handle,
                 hostname: Some("renamed.invalid".into()),
-                fingerprint: Some(pin),
+                fingerprint: Some(pin.clone()),
             })
             .await;
+        let renamed = frontend.devices().await;
+        assert_eq!(
+            renamed
+                .get(&handle)
+                .map(|(c, s)| (c.hostname.clone(), s.peer_fingerprint.clone())),
+            Some((Some("renamed.invalid".to_string()), Some(pin.clone()))),
+            "a new hostname for the device did not keep its pin (#99); log:\n{}",
+            daemon.log()
+        );
         frontend
             .send(FrontendRequest::Delete {
                 handle,
-                fingerprint: None,
+                fingerprint: Some(pin),
             })
             .await;
         assert!(
             frontend.devices().await.is_empty(),
             "a rename and a delete made for the device's own pin were refused; \
+             log:\n{}",
+            daemon.log()
+        );
+    });
+}
+
+// LEDGER T9904 | class B | 1 error event and device list returned over IPC by the hops binary, dialling a real QUIC receiver
+/// A machine added a second time, here by address while it is already a
+/// device, is not dialled for the new device, and the user is told which
+/// device it already is (#12). It used to be pinned to the machine too, and
+/// the two made one card whose name came from one and whose buttons acted
+/// on the other.
+#[test]
+fn a_machine_added_a_second_time_is_refused_and_the_user_is_told() {
+    local(async {
+        let (daemon, receiver, mut frontend, first) = connected("6").await;
+        frontend.send(FrontendRequest::OpenPairing).await;
+        frontend.send(FrontendRequest::Create).await;
+        let again = frontend
+            .next("the new device", |e| match e {
+                FrontendEvent::Created(h, ..) => Some(h),
+                _ => None,
+            })
+            .await;
+        for request in [
+            FrontendRequest::UpdateFixIps(again, vec!["127.0.0.1".parse().expect("ip")]),
+            FrontendRequest::UpdatePort(again, receiver.port),
+            FrontendRequest::UpdatePosition(again, hops_ipc::Position::Right),
+            FrontendRequest::Activate(again, true),
+        ] {
+            frontend.send(request).await;
+        }
+
+        let told = frontend
+            .next(
+                "the notice that the machine is already added",
+                |e| match e {
+                    FrontendEvent::Error(m) if m.contains("same machine") => Some(m),
+                    _ => None,
+                },
+            )
+            .await;
+        assert!(
+            told.contains("127.0.0.1"),
+            "the notice does not name the device already added: {told}"
+        );
+        let devices = frontend.devices().await;
+        assert_eq!(
+            (
+                devices
+                    .get(&first)
+                    .and_then(|(_, s)| s.peer_fingerprint.clone()),
+                devices
+                    .get(&again)
+                    .and_then(|(_, s)| s.peer_fingerprint.clone()),
+            ),
+            (Some(receiver.fingerprint.clone()), None),
+            "(first device's pin, second device's pin): only the first device \
+             may be pinned to the machine; log:\n{}",
+            daemon.log()
+        );
+    });
+}
+
+// LEDGER T9905 | class B | 1 device list returned over IPC by the hops binary after a real config load
+/// A config saved before #12 can hold two devices pinned to one machine,
+/// shown as one card. Deleting that card removes both: the machine is
+/// revoked, and a device left behind would lose its pin to the revocation
+/// and dial whatever answers at its address.
+#[test]
+fn deleting_a_machine_saved_as_two_devices_removes_both() {
+    local(async {
+        let pin = format!("{}33", "33:".repeat(31));
+        let entry = |name: &str, pos: &str| {
+            format!(
+                "\n[[clients]]\nhostname = \"{name}\"\nposition = \"{pos}\"\n\
+                 fingerprint = \"{pin}\"\n"
+            )
+        };
+        let daemon = Daemon::start(
+            "7",
+            &format!(
+                "{DUMMY}{}{}\n[authorized_fingerprints]\n\"{pin}\" = \"desk\"\n",
+                entry("desk.invalid", "top"),
+                entry("192.0.2.10", "bottom"),
+            ),
+        );
+        let mut frontend = Frontend::attach().await;
+        let shown = frontend.devices().await;
+        assert_eq!(shown.len(), 2, "precondition: both devices loaded");
+        let desk = handle_named(&shown, "desk.invalid");
+
+        frontend
+            .send(FrontendRequest::Delete {
+                handle: desk,
+                fingerprint: Some(pin),
+            })
+            .await;
+        assert_eq!(
+            names(&frontend.devices().await),
+            Vec::<String>::new(),
+            "the machine was deleted and a second device pinned to it is still \
+             there; log:\n{}",
+            daemon.log()
+        );
+    });
+}
+
+// LEDGER T9910 | class B | 1 device list returned over IPC by the hops binary; 2 connection at a real QUIC receiver; 4 config file written by the hops binary
+/// Naming a connected device names it, and nothing else: it is dialled
+/// where it was, stays pinned to its machine and keeps its link, and the
+/// name is saved beside its address (#13). The name used to be the
+/// hostname, so naming a device changed where it dialled.
+#[test]
+fn naming_a_connected_device_changes_only_its_name() {
+    local(async {
+        let (daemon, receiver, mut frontend, handle) = connected("n").await;
+
+        frontend
+            .send(FrontendRequest::UpdateLabel(handle, Some("den".into())))
+            .await;
+
+        let shown = frontend.devices().await;
+        assert_eq!(
+            shown.get(&handle).map(|(c, s)| (
+                c.label.as_deref(),
+                c.hostname.as_deref(),
+                s.peer_fingerprint.as_deref()
+            )),
+            Some((
+                Some("den"),
+                Some("127.0.0.1"),
+                Some(receiver.fingerprint.as_str())
+            )),
+            "(name, where it is dialled, pin) after naming the device den; log:\n{}",
+            daemon.log()
+        );
+        let saved = until("the name to be saved", Duration::from_secs(20), || {
+            std::fs::read_to_string(&daemon.config).is_ok_and(|t| t.contains("label = \"den\""))
+        })
+        .await;
+        let file = std::fs::read_to_string(&daemon.config).unwrap_or_default();
+        assert!(
+            saved
+                && file.contains("hostname = \"127.0.0.1\"")
+                && file.contains(&format!("fingerprint = \"{}\"", receiver.fingerprint)),
+            "the name was not saved beside the device's address and pin:\n{file}"
+        );
+        // after the daemon has read its own save back
+        let _ = frontend.devices().await;
+        assert_eq!(
+            (receiver.accepted.get(), receiver.closed.get()),
+            (1, 0),
+            "(links opened, links closed): naming the device touched its link; \
              log:\n{}",
             daemon.log()
         );

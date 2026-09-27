@@ -11,6 +11,10 @@
 #   hops.app         — the app bundle (a menu-bar / LSUIElement app; the same
 #                      binary also serves the CLI at Contents/MacOS/hops)
 #   hops-macos.dmg   — a drag-to-Applications disk image
+#
+# LICENSE, THIRD-PARTY-NOTICES.txt and the SBOMs (*.cdx.json) found beside
+# <hops-binary> go into hops.app/Contents/Resources; the release build puts
+# them there. LICENSE falls back to the repository's own.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -36,6 +40,28 @@ fi
 
 # Signing and notarization stay in sign-macos.sh; this only assembles.
 "$REPO/scripts/macos-app-bundle.sh" "$BIN" "$VERSION" "$APP" "$ICNS" >/dev/null
+
+# The licence, the third-party notices and the SBOMs travel inside the app,
+# where the signature seals them. scripts/verify-macos-release.sh refuses a
+# release app without them.
+BESIDE="$(dirname "$BIN")"
+RES="$APP/Contents/Resources"
+if [ -f "$BESIDE/LICENSE" ]; then
+    cp "$BESIDE/LICENSE" "$RES/LICENSE"
+else
+    cp "$REPO/LICENSE" "$RES/LICENSE"
+fi
+if [ -f "$BESIDE/THIRD-PARTY-NOTICES.txt" ]; then
+    cp "$BESIDE/THIRD-PARTY-NOTICES.txt" "$RES/THIRD-PARTY-NOTICES.txt"
+    echo "    + THIRD-PARTY-NOTICES.txt"
+else
+    echo "    (no THIRD-PARTY-NOTICES.txt beside the binary — not a release bundle)"
+fi
+for sbom in "$BESIDE"/*.cdx.json; do
+    [ -f "$sbom" ] || continue
+    cp "$sbom" "$RES/"
+    echo "    + $(basename "$sbom")"
+done
 
 echo "==> Building $OUT/hops-macos.dmg"
 STAGE="$(mktemp -d)"

@@ -37,8 +37,8 @@ use std::{
 };
 
 use hops_frontend_core::{
-    AppModel, ApprovalRefused, AttemptOrigin, ClientHandle, Clipboard, Device, DeviceSend,
-    FrontendClient, FrontendRequest, Launch, PairingAttempt, PairingCard, PairingCheck,
+    AppModel, ApprovalRefused, AttemptOrigin, CaptureState, ClientHandle, Clipboard, Device,
+    DeviceSend, FrontendClient, FrontendRequest, Launch, PairingAttempt, PairingCard, PairingCheck,
     PairingCheckCard, Position, Status, TrustState,
     prefs::Frontend,
     spaced_number,
@@ -105,8 +105,12 @@ fn check_key(card: &PairingCheckCard, code: KeyCode) -> Option<FrontendRequest> 
 enum Input {
     /// Adding a device: `host` or `host:port`.
     Add { buf: String },
-    /// Editing an outgoing client's hostname. `pin` is the client's pin when
-    /// the edit opened, which the request carries (#94).
+    /// Naming a device this machine dials. Only its name: where it is
+    /// dialled and its pin stay (#13).
+    Name { handle: ClientHandle, buf: String },
+    /// Editing where a device this machine dials is dialled: its hostname or
+    /// address. `pin` is the client's pin when the edit opened, which the
+    /// request carries (#94), and which the new address keeps (#99).
     Hostname {
         handle: ClientHandle,
         pin: Option<String>,
@@ -129,6 +133,7 @@ impl Input {
     fn buf_mut(&mut self) -> &mut String {
         match self {
             Input::Add { buf } => buf,
+            Input::Name { buf, .. } => buf,
             Input::Hostname { buf, .. } => buf,
             Input::TrustedName { buf, .. } => buf,
             Input::Port { buf } => buf,
@@ -152,13 +157,40 @@ enum Confirm {
         pin: Option<String>,
         destructive: bool,
     },
-    /// Turn a paired device's clipboard off. Asked first, because nothing
-    /// here turns it back on (#182, #107).
+    /// Turn a paired device's clipboard off. Asked first; `c` again turns it
+    /// back on (#182).
     ClipboardOff { label: String, fp: String },
 }
 
 /// What the TUI says when it drops an armed action.
 const CHANGED_NOTE: &str = "That device changed, so nothing was done. Check it and try again.";
+
+/// What saving the name typed for the device `handle` sends: that name, or
+/// none for a blank one, so it goes by its hostname or pairing again (#13).
+fn name_request(handle: ClientHandle, buf: &str) -> FrontendRequest {
+    let name = buf.trim();
+    FrontendRequest::UpdateLabel(handle, (!name.is_empty()).then(|| name.to_string()))
+}
+
+/// What `n` opens on the row `d`, which is not revoked.
+fn name_input(d: &Device) -> Option<Input> {
+    match (&d.send, &d.fingerprint) {
+        // a device this machine dials has a name of its own, apart from the
+        // address it dials (#13)
+        (Some(s), _) => Some(Input::Name {
+            handle: s.handle,
+            buf: d.label.clone(),
+        }),
+        // receive-only: re-authorizing the same fingerprint with a new
+        // description IS the rename
+        (None, Some(fp)) if d.receive => Some(Input::TrustedName {
+            fp: fp.clone(),
+            buf: d.label.clone(),
+            granting: false,
+        }),
+        _ => None,
+    }
+}
 
 /// Drop an armed delete or an open rename whose device is gone or now pinned
 /// to another machine. Returns whether anything was dropped.
@@ -476,6 +508,9 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                                         notice = Some((msg.to_string(), Instant::now()));
                                     }
                                 },
+                                Input::Name { handle, buf } => {
+                                    client.request(name_request(handle, &buf));
+                                }
                                 Input::Hostname { handle, pin, buf } => {
                                     let val = (!buf.trim().is_empty()).then_some(buf);
                                     client.request(FrontendRequest::UpdateHostname {
@@ -607,28 +642,28 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                                 Some(d) if d.trust == TrustState::Revoked => {
                                     notice = Some((REVOKED_NOTE.to_string(), Instant::now()));
                                 }
-                                // an outgoing client is named by its hostname —
-                                // that is also the address it dials
-                                Some(d) if d.send.is_some() => {
-                                    let s = d.send.as_ref().expect("send facet");
+                                Some(d) => {
+                                    if let Some(open) = name_input(d) {
+                                        input = Some(open);
+                                    }
+                                }
+                                None => {}
+                            },
+                            // where a device this machine dials is dialled
+                            KeyCode::Char('h') => match selected {
+                                Some(d) if d.trust == TrustState::Revoked => {
+                                    notice = Some((REVOKED_NOTE.to_string(), Instant::now()));
+                                }
+                                Some(Device { send: Some(s), .. }) => {
                                     input = Some(Input::Hostname {
                                         handle: s.handle,
                                         pin: s.state.peer_fingerprint.clone(),
                                         buf: s.config.hostname.clone().unwrap_or_default(),
                                     });
                                 }
-                                // receive-only: re-authorizing the same
-                                // fingerprint with a new description IS the rename
-                                Some(d) if d.receive => {
-                                    if let Some(fp) = d.fingerprint.clone() {
-                                        input = Some(Input::TrustedName {
-                                            fp,
-                                            buf: d.label.clone(),
-                                            granting: false,
-                                        });
-                                    }
+                                _ => {
+                                    notice = Some((NO_SEND_NOTE.to_string(), Instant::now()));
                                 }
-                                _ => {}
                             },
                             KeyCode::Char('p') => match selected.and_then(|d| d.send.as_ref()) {
                                 Some(s) => {
@@ -652,8 +687,11 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                                     notice = Some((NO_SEND_NOTE.to_string(), Instant::now()));
                                 }
                             },
-                            KeyCode::Char('c') => match clipboard_off(&model, selected) {
-                                Ok(ask) => confirm = Some(ask),
+                            KeyCode::Char('c') => match clipboard_key(&model, selected) {
+                                Ok(ClipboardKey::AskOff(ask)) => confirm = Some(ask),
+                                Ok(ClipboardKey::TurnOn(request)) => {
+                                    client.request(request);
+                                }
                                 Err(why) => notice = Some((why.to_string(), Instant::now())),
                             },
                             KeyCode::Char('d') | KeyCode::Delete => match selected {
@@ -701,9 +739,7 @@ const REVOKED_NOTE: &str =
     "This device was removed. It must pair again with a new identity — there is no way back in.";
 const NO_SEND_NOTE: &str =
     "This device only connects in to you. Add it as a device to cross to it.";
-const CLIPBOARD_OFF_NOTE: &str =
-    "The clipboard is already off for this device. It cannot be turned back on from here yet.";
-const NO_CLIPBOARD_NOTE: &str = "This device is not paired, so it has no clipboard to turn off.";
+const NO_CLIPBOARD_NOTE: &str = "This device is not paired, so it has no clipboard to switch.";
 
 /// The request a confirmation answered `y` sends, if any.
 fn confirmed(confirm: Confirm) -> Option<FrontendRequest> {
@@ -729,18 +765,30 @@ fn clipboard_of(model: &AppModel, d: &Device) -> Option<Clipboard> {
     d.fingerprint.as_deref().and_then(|fp| model.clipboard(fp))
 }
 
+/// What `c` does on a paired row: the per-device clipboard switch (#182).
+enum ClipboardKey {
+    /// Ask before turning it off.
+    AskOff(Confirm),
+    /// Turn it back on, which the daemon does in the directions the pairing
+    /// drives, and refuses while a peer drives this machine (#107).
+    TurnOn(FrontendRequest),
+}
+
 /// What `c` does on the selected row: ask before turning its clipboard off,
-/// or say why there is nothing to turn off.
-fn clipboard_off(model: &AppModel, selected: Option<&Device>) -> Result<Confirm, &'static str> {
+/// turn an off one back on, or say why there is no clipboard to switch.
+fn clipboard_key(
+    model: &AppModel,
+    selected: Option<&Device>,
+) -> Result<ClipboardKey, &'static str> {
     let Some(d) = selected else {
         return Err(NO_CLIPBOARD_NOTE);
     };
     match (d.fingerprint.clone(), clipboard_of(model, d)) {
-        (Some(fp), Some(c)) if c.is_on() => Ok(Confirm::ClipboardOff {
+        (Some(fp), Some(c)) if c.is_on() => Ok(ClipboardKey::AskOff(Confirm::ClipboardOff {
             label: d.label.clone(),
             fp,
-        }),
-        (_, Some(_)) => Err(CLIPBOARD_OFF_NOTE),
+        })),
+        (Some(fp), Some(_)) => Ok(ClipboardKey::TurnOn(FrontendRequest::EnableClipboard(fp))),
         _ => Err(NO_CLIPBOARD_NOTE),
     }
 }
@@ -1109,7 +1157,7 @@ fn ui(
     let status = Line::from(vec![
         conn,
         Span::raw("   capture: "),
-        status_span(model.capture, theme),
+        capture_span(&model.capture, theme),
         Span::raw("   emulation: "),
         status_span(model.emulation, theme),
         Span::styled(
@@ -1126,6 +1174,13 @@ fn ui(
     // What is wrong with the service: a start that did not come up, or a
     // daemon of another build. Wrapped under the status line.
     let mut header = vec![status];
+    // Why capture, which should run, does not (#91).
+    if let Some(problem) = model.capture_problem() {
+        header.push(Line::from(Span::styled(
+            problem,
+            Style::default().fg(col(theme.warn)),
+        )));
+    }
     if let Some(problem) = model.service_problem() {
         for line in problem.lines() {
             header.push(Line::from(Span::styled(
@@ -1276,7 +1331,8 @@ fn footer_line(
     if let Some(inp) = input {
         let (label, buf) = match inp {
             Input::Add { buf } => ("add device — host or host:port: ".to_string(), buf.clone()),
-            Input::Hostname { handle, buf, .. } => (format!("name [{handle}]: "), buf.clone()),
+            Input::Name { handle, buf } => (format!("name [{handle}]: "), buf.clone()),
+            Input::Hostname { handle, buf, .. } => (format!("address [{handle}]: "), buf.clone()),
             Input::TrustedName { buf, .. } => ("trust as: ".to_string(), buf.clone()),
             Input::Port { buf } => ("listen port: ".to_string(), buf.clone()),
         };
@@ -1309,12 +1365,7 @@ fn footer_line(
     }
     if let Some(Confirm::ClipboardOff { label, .. }) = confirm {
         return Line::from(vec![
-            Span::styled(
-                format!(
-                    "turn the clipboard off for {label}? it cannot be turned back on here yet — "
-                ),
-                warn,
-            ),
+            Span::styled(format!("turn the clipboard off for {label}? "), warn),
             Span::styled("y", key),
             Span::raw(" yes  "),
             Span::styled("n", key),
@@ -1339,14 +1390,18 @@ fn footer_line(
                 " rename  "
             }));
             if d.send.is_some() {
-                for (k, label) in [("p", " pos  "), ("spc", " on/off  ")] {
+                for (k, label) in [("h", " address  "), ("p", " pos  "), ("spc", " on/off  ")] {
                     spans.push(Span::styled(k, key));
                     spans.push(Span::raw(label));
                 }
             }
-            if clipboard.is_some_and(Clipboard::is_on) {
+            if let Some(c) = clipboard {
                 spans.push(Span::styled("c", key));
-                spans.push(Span::raw(" clipboard off  "));
+                spans.push(Span::raw(if c.is_on() {
+                    " clipboard off  "
+                } else {
+                    " clipboard on  "
+                }));
             }
             spans.push(Span::styled("d", key));
             spans.push(Span::raw(" remove  "));
@@ -1596,6 +1651,15 @@ fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
         y: area.y + area.height.saturating_sub(h) / 2,
         width: w,
         height: h,
+    }
+}
+
+/// Capture's state: a capture that failed reads apart from one that is off.
+fn capture_span(s: &CaptureState, theme: &Theme) -> Span<'static> {
+    match s {
+        CaptureState::Enabled => status_span(Status::Enabled, theme),
+        CaptureState::Disabled => status_span(Status::Disabled, theme),
+        CaptureState::Failed(_) => Span::styled("failed", Style::default().fg(col(theme.error))),
     }
 }
 
@@ -2091,6 +2155,35 @@ mod tests {
         );
     }
 
+    /// A capture that failed reads as failed, not off, with what to change
+    /// under the status line (#91).
+    // LEDGER T11 | class B | 3 widget tree: ui() rendered into a TestBackend
+    #[test]
+    fn a_capture_that_failed_says_so_and_what_to_change() {
+        use hops_frontend_core::{CaptureFault, CaptureState, FrontendEvent, Permission};
+        let mut model = AppModel::default();
+        model.connected = true;
+        model.apply(FrontendEvent::CaptureStatus(CaptureState::Failed(
+            CaptureFault::Missing(vec![Permission::InputMonitoring]),
+        )));
+        let rows = render_at(&model, 0, 120, 30);
+        if let Some(out) = std::env::var_os("HOPS_TUI_RENDER_CAPTURE") {
+            let _ = std::fs::write(out, render_at(&model, 0, 80, 24).join("\n"));
+        }
+        let words = rows
+            .iter()
+            .flat_map(|row| row.trim_matches('│').split_whitespace().map(str::to_owned))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let problem = model.capture_problem().expect("a problem to show");
+        let problem = problem.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            words.contains("capture: failed") && words.contains(&problem),
+            "the header must say capture failed and why:\n{}",
+            rows.join("\n")
+        );
+    }
+
     /// A service the front door restarted is said in the footer as the TUI
     /// opens (#222), whole, at the width of a default terminal.
     // LEDGER T2231 | class B | 3 widget tree: opening_notice, ui() into a TestBackend
@@ -2308,6 +2401,49 @@ mod tests {
         );
     }
 
+    // LEDGER T9911 | class B | 1 return value: name_input and name_request, what `n` opens and what saving it sends; 3 render: footer_line in ui() on a TestBackend
+    /// `n` on a device this machine dials names it, and saving sends that
+    /// name only; its address has a key of its own (#13). `n` used to edit
+    /// the hostname, which is where the device dials.
+    #[test]
+    fn naming_a_device_this_machine_dials_changes_its_name_and_not_its_address() {
+        let mut model = AppModel::default();
+        model.clients.insert(
+            4,
+            (
+                ClientConfig {
+                    hostname: Some("desk-mac.local".into()),
+                    ..Default::default()
+                },
+                ClientState {
+                    peer_fingerprint: Some(FP.into()),
+                    ..Default::default()
+                },
+            ),
+        );
+        model.authorized.insert(FP.into(), "desk mac".into());
+        let devices = listable(&model);
+        let opened = devices.first().and_then(name_input);
+        assert!(
+            matches!(&opened, Some(Input::Name { handle: 4, buf }) if buf == "desk-mac.local"),
+            "n on a device this machine dials has to open its name, not its \
+             address"
+        );
+        assert_eq!(
+            (name_request(4, "  den "), name_request(4, " ")),
+            (
+                FrontendRequest::UpdateLabel(4, Some("den".into())),
+                FrontendRequest::UpdateLabel(4, None)
+            ),
+            "saving a name has to send the name, or clear it when blank"
+        );
+        let shown = screen(&model, 0);
+        assert!(
+            shown.contains("h address") && shown.contains("n name"),
+            "the keymap has to offer the name and the address apart:\n{shown}"
+        );
+    }
+
     /// A client that has never completed a handshake has no identity yet, and
     /// must not be dressed up as trusted.
     #[test]
@@ -2459,12 +2595,13 @@ mod tests {
         assert!(out.contains("@?"), "unknown build must be explicit:\n{out}");
     }
     /// Each paired row says whether its clipboard is on, off included, and
-    /// `c` asks before sending the one request that turns it off. With it off,
-    /// `c` says so and asks nothing, and the keymap offers nothing: this
-    /// frontend cannot turn it back on (#182, #107).
-    // LEDGER E2A-10 | class B | 3 render + 1 return value: ui() into a TestBackend, clipboard_off, confirmed
+    /// `c` is its switch: on a row whose clipboard is on it asks before
+    /// sending the one request that turns it off, and on a row whose
+    /// clipboard is off it sends the one request that turns it back on, and
+    /// the keymap says which (#182).
+    // LEDGER E2A-10 | class B | 3 render + 2 return value: ui() into a TestBackend, clipboard_key, confirmed
     #[test]
-    fn the_clipboard_switch_turns_it_off_and_shows_it_off() {
+    fn the_clipboard_switch_turns_it_off_and_back_on() {
         use hops_frontend_core::{FrontendEvent, PeerTrust};
         const LAPTOP: &str = "2e:29:2b:3c:4d:5e:6f:70:81:92:a3:b4:c5:d6:e7:f8";
         let mut model = AppModel::default();
@@ -2516,8 +2653,13 @@ mod tests {
             on.contains("c clipboard off"),
             "the keymap does not offer to turn the clipboard off:\n{on}"
         );
-        let ask = clipboard_off(&model, devices.get(at("desk mac")))
-            .unwrap_or_else(|why| panic!("c asked nothing: {why}"));
+        let ask = match clipboard_key(&model, devices.get(at("desk mac"))) {
+            Ok(ClipboardKey::AskOff(ask)) => ask,
+            Ok(ClipboardKey::TurnOn(request)) => {
+                panic!("c on a clipboard that is on sent {request:?}")
+            }
+            Err(why) => panic!("c asked nothing: {why}"),
+        };
         let theme = theme::default_theme();
         let mut state = ListState::default();
         state.select(Some(at("desk mac")));
@@ -2547,10 +2689,12 @@ mod tests {
             })
             .collect();
         assert!(
-            asking.contains(
-                "turn the clipboard off for desk mac? it cannot be turned back on here yet"
-            ),
+            asking.contains("turn the clipboard off for desk mac? y yes"),
             "the question does not say what y does:\n{asking}"
+        );
+        assert!(
+            !asking.contains("cannot be turned back on"),
+            "the question still says the clipboard cannot be turned back on:\n{asking}"
         );
         assert_eq!(
             confirmed(ask),
@@ -2560,15 +2704,80 @@ mod tests {
 
         let off = screen(&model, at("laptop"));
         assert!(
-            !off.contains("c clipboard"),
-            "the keymap offers a clipboard key for a device whose clipboard is off:\n{off}"
+            off.contains("c clipboard on"),
+            "the keymap does not offer to turn an off clipboard back on:\n{off}"
         );
         assert!(
             matches!(
-                clipboard_off(&model, devices.get(at("laptop"))),
-                Err(CLIPBOARD_OFF_NOTE)
+                clipboard_key(&model, devices.get(at("laptop"))),
+                Ok(ClipboardKey::TurnOn(FrontendRequest::EnableClipboard(fp))) if fp == LAPTOP
             ),
-            "c on a device whose clipboard is off must say so and ask nothing"
+            "c on a device whose clipboard is off must send the request that turns \
+             that device's clipboard back on"
+        );
+    }
+
+    /// `model` drawn at `width` columns with `notice` in the footer, as the
+    /// run loop draws it.
+    fn render_with_notice(model: &AppModel, notice: &str, width: u16) -> String {
+        let devices = listable(model);
+        let mut state = ListState::default();
+        state.select(Some(0));
+        let theme = theme::default_theme();
+        let mut term = Terminal::new(TestBackend::new(width, 24)).expect("test terminal");
+        term.draw(|f| {
+            ui(
+                f,
+                model,
+                &devices,
+                &mut state,
+                None,
+                None,
+                None,
+                Some(notice),
+                false,
+                &theme,
+            )
+        })
+        .expect("draw");
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect()
+    }
+
+    // LEDGER T115-9 | class B | 3 render: ui() on a ratatui TestBackend, its notice from new_error after AppModel::apply
+    /// A crossing that left the pointer on this machine is said in the
+    /// footer, the device and the reason first, so an 80-column terminal
+    /// still shows why (#115).
+    #[test]
+    fn a_refused_crossing_is_said_in_the_footer() {
+        let mut model = AppModel::default();
+        model.connected = true;
+        model.apply(FrontendEvent::Created(
+            0,
+            ClientConfig {
+                hostname: Some("studio-pc".into()),
+                ..Default::default()
+            },
+            ClientState::default(),
+        ));
+        let mut seen = model.error_seq;
+        model.apply(FrontendEvent::CrossingRefused {
+            handle: 0,
+            reason: hops_frontend_core::CrossingRefusal::NotConnected,
+        });
+        let notice = new_error(&model, &mut seen).expect("a refused crossing raises a notice");
+
+        let screen = render_with_notice(&model, &notice, 80);
+        assert!(
+            screen.contains("studio-pc is not paired yet, so the pointer stayed here."),
+            "the footer does not say why the pointer stayed here:\n{screen}"
         );
     }
 

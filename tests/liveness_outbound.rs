@@ -57,17 +57,17 @@ fn a_closed_outbound_link_is_shown_down_within_a_second() {
         let receiver = receiver(&identity);
         let port = receiver.local_addr().expect("local addr").port();
         let fp = identity.fingerprint();
-        // The first client, pinned to the receiver, is what makes the upgrade
-        // grant driving it. The second, not yet pinned, is the one switched on:
-        // a device being added is dialled at once, without waiting for the
-        // pointer to cross to it.
+        // The client, pinned to the receiver, is what makes the upgrade grant
+        // driving it. Switched on at the left edge, it is dialled as the dummy
+        // capture crosses there, which it does continuously. (One device per
+        // machine (#12): a second, unpinned device for the same receiver is
+        // refused, so it cannot stand in for this one.)
         let (daemon, _) = common::start(
             "h-live-out",
             &format!(
                 "[authorized_fingerprints]\n\"{fp}\" = \"receiver\"\n\n\
-                 [[clients]]\nposition = \"top\"\nips = [\"127.0.0.1\"]\nport = {port}\n\
-                 fingerprint = \"{fp}\"\n\n\
-                 [[clients]]\nposition = \"right\"\nips = [\"127.0.0.1\"]\nport = {port}\n"
+                 [[clients]]\nposition = \"left\"\nips = [\"127.0.0.1\"]\nport = {port}\n\
+                 fingerprint = \"{fp}\"\n"
             ),
         );
         let (mut events, mut requests) = hops_ipc::connect_async(Some(Duration::from_secs(10)))
@@ -81,16 +81,12 @@ fn a_closed_outbound_link_is_shown_down_within_a_second() {
         let handle = common::next_matching(&mut events, Duration::from_secs(10), |e| match e {
             FrontendEvent::Enumerate(clients) => clients
                 .into_iter()
-                .find(|(_, c, _)| c.pos == Position::Right)
+                .find(|(_, c, _)| c.pos == Position::Left)
                 .map(|(h, _, _)| h),
             _ => None,
         })
         .await
         .expect("the configured device is listed");
-        requests
-            .request(FrontendRequest::OpenPairing)
-            .await
-            .expect("open pairing");
         requests
             .request(FrontendRequest::Activate(handle, true))
             .await

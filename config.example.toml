@@ -17,6 +17,8 @@ port = 4242
 position = "right"
 # hostname
 hostname = "iridium"
+# optional: what the device is called, apart from where it is dialled
+label = "studio"
 # activate this client immediately when hops is started
 activate_on_startup = true
 # optional list of (known) ip addresses
