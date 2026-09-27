@@ -3,7 +3,7 @@
 // This is how the GUI's design gets reviewed without a display.
 //
 //   cargo run -p lan-mouse-slint --example render_png -- /path/to/out.png [w] [h] [theme_index] [mode]
-//   mode: normal (default) | settings | add-device | edit-device | delete-confirm | revoke-confirm | layout-canvas
+//   mode: normal (default) | settings | add-device | edit-device | delete-confirm | removed-delete-confirm | revoke-confirm | layout-canvas
 //         | layout-canvas
 //
 // Requires the crate's slint dep to carry feature "software-renderer-systemfonts"
@@ -21,7 +21,8 @@ use slint::{ComponentHandle, Model, ModelRc, PhysicalSize, VecModel};
 // invocation would compile the SAME .slint source into a SECOND, nominally
 // distinct set of Rust types, incompatible with the lib's (e.g. two different
 // `ThemeColors` structs), even though they look identical.
-use hops_slint::{AppWindow, CanvasBox, DeviceRow, DiscoveredRow, Theme, theme_colors};
+use hops_frontend_core::Connection;
+use hops_slint::{AppWindow, CanvasBox, DeviceRow, DiscoveredRow, DotTone, Theme, theme_colors};
 
 /// Headless platform: every window is a MinimalSoftwareWindow (CPU renderer, no OS window).
 struct HeadlessPlatform {
@@ -167,15 +168,13 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             addr: "192.0.2.42:4242".into(),
             pos: "left".into(),
             active: true,
-            alive: false,
-            refuses_input: true,
+            tone: DotTone::Bad,
+            status: "not accepting input".into(),
             has_send: true,
             fingerprint: "1e:19:1b".into(),
             fp_full: "1e:19:1b:c4:a8:44".into(),
             pin: "1e:19:1b:c4:a8:44".into(),
-            online: true,
             trusted: true,
-            revoked: false,
             clipboard: "shared both ways".into(),
             clipboard_on: true,
         },
@@ -186,15 +185,13 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             addr: "unresolved".into(),
             pos: "top".into(),
             active: false,
-            alive: false,
-            refuses_input: false,
+            tone: DotTone::Quiet,
+            status: "off".into(),
             has_send: true,
             fingerprint: "".into(),
             fp_full: "".into(),
             pin: "".into(),
-            online: false,
             trusted: false,
-            revoked: false,
             clipboard: "".into(),
             clipboard_on: false,
         },
@@ -205,15 +202,13 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             addr: "".into(),
             pos: "".into(),
             active: false,
-            alive: false,
-            refuses_input: false,
+            tone: DotTone::Good,
+            status: "connected".into(),
             has_send: false,
             fingerprint: "b7:2a:55".into(),
             fp_full: "b7:2a:55:e1:90:33".into(),
             pin: "b7:2a:55:e1:90:33".into(),
-            online: true,
             trusted: true,
-            revoked: false,
             clipboard: "arrives here from this device".into(),
             clipboard_on: true,
         },
@@ -224,35 +219,31 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             addr: "".into(),
             pos: "".into(),
             active: false,
-            alive: false,
-            refuses_input: false,
+            tone: DotTone::Quiet,
+            status: "not connected".into(),
             has_send: false,
             fingerprint: "c3:de:04".into(),
             fp_full: "c3:de:04:aa:11:22".into(),
             pin: "c3:de:04:aa:11:22".into(),
-            online: false,
             trusted: true,
-            revoked: false,
             clipboard: "off".into(),
             clipboard_on: false,
         },
-        // the user deliberately expelled this one — it must read as EXPELLED,
-        // not as a stranger, and offer a deliberate way back
+        // the machine this one dials removed this one (#184): the card says
+        // so and keeps its delete button, rather than vanishing
         DeviceRow {
-            handle: "".into(),
+            handle: "4".into(),
             name: "old-thinkpad".into(),
-            addr: "".into(),
-            pos: "".into(),
-            active: false,
-            alive: false,
-            refuses_input: false,
-            has_send: false,
+            addr: "192.0.2.61:4242".into(),
+            pos: "top".into(),
+            active: true,
+            tone: DotTone::Bad,
+            status: Connection::NoLongerTrusts.words().into(),
+            has_send: true,
             fingerprint: "9f:04:7c".into(),
             fp_full: "9f:04:7c:12:aa:03".into(),
             pin: "9f:04:7c:12:aa:03".into(),
-            online: false,
-            trusted: false,
-            revoked: true,
+            trusted: true,
             clipboard: "".into(),
             clipboard_on: false,
         },
@@ -274,13 +265,35 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             .get_devices()
             .iter()
             .map(|d| DeviceRow {
-                online: false,
-                alive: false,
-                refuses_input: false,
+                tone: hops_slint::dot_tone(Connection::ServiceGone.tone()),
+                status: Connection::ServiceGone.words().into(),
                 ..d
             })
             .collect();
         ui.set_devices(ModelRc::new(VecModel::from(rows)));
+    }
+
+    // PREVIEW_STATES=1 lists one device in each connection state, drawn with
+    // the window's own tone and words for it, to check each reads apart (#148).
+    if std::env::var_os("PREVIEW_STATES").is_some() {
+        let template = ui.get_devices().row_data(0).expect("a seeded row");
+        let rows: Vec<DeviceRow> = Connection::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, c)| DeviceRow {
+                handle: (i + 1).to_string().into(),
+                name: format!("{c:?}").to_lowercase().into(),
+                active: !matches!(c, Connection::Off),
+                tone: hops_slint::dot_tone(c.tone()),
+                status: c.words().into(),
+                trusted: true,
+                has_send: true,
+                ..template.clone()
+            })
+            .collect();
+        ui.set_devices(ModelRc::new(VecModel::from(rows)));
+        ui.set_notice("".into());
+        ui.set_pairing_fp("".into());
     }
 
     // PREVIEW_FIRST_RUN=1 shows the case discovery exists FOR: a fresh install
@@ -347,6 +360,8 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             ui.set_editing_send(true);
         }
         Some("delete-confirm") => ui.set_confirm_delete_handle("1".into()),
+        // the device whose machine removed this one, asked about deleting it
+        Some("removed-delete-confirm") => ui.set_confirm_delete_handle("4".into()),
         // b7:2a:55 is the mock windows-pc — a trusted, receive-capable peer
         Some("revoke-confirm") => ui.set_confirm_revoke_fp("b7:2a:55:e1:90:33".into()),
         // The arrange overlay is a hardcoded 560x420 centred by

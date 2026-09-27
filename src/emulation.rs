@@ -51,6 +51,9 @@ pub(crate) enum EmulationEvent {
     },
     /// connection closed
     Disconnected { addr: SocketAddr },
+    /// The machine that proved `fingerprint` closed the link it opened to
+    /// this one because it removed this machine (#184).
+    RemovedBy { fingerprint: String },
     /// the port of the listener has changed
     PortChanged(Result<u16, ListenerCreationError>),
     /// emulation was disabled
@@ -425,6 +428,9 @@ impl ListenTask {
                     // no longer arrive. Let go of what it held now, after
                     // anything it sent first, rather than at the watchdog
                     // 10-15 s later, and end its session (#156).
+                    Some(ListenEvent::RemovedBy { fingerprint }) => {
+                        self.event_tx.send(EmulationEvent::RemovedBy { fingerprint }).expect("channel closed");
+                    }
                     Some(ListenEvent::Closed { addr }) => {
                         log::debug!("{addr} closed its connection: letting go of anything it held");
                         self.emulation_proxy.remove(addr);
@@ -1538,7 +1544,7 @@ mod held_input_is_released {
             s.trust
                 .write()
                 .expect("trust lock")
-                .revoke(&s.fingerprints[0]);
+                .forget(&s.fingerprints[0]);
             s.revoker.close_fingerprint(&s.fingerprints[0]).await;
 
             wait_until(
@@ -2197,7 +2203,7 @@ mod held_input_is_released {
             s.trust
                 .write()
                 .expect("trust lock")
-                .revoke(&s.fingerprints[0]);
+                .forget(&s.fingerprints[0]);
             for seq in 1..=5 {
                 s.peers[0].send(absolute(seq)).await;
             }
@@ -2222,7 +2228,7 @@ mod held_input_is_released {
             s.trust
                 .write()
                 .expect("trust lock")
-                .revoke(&s.fingerprints[0]);
+                .forget(&s.fingerprints[0]);
             s.peers[0].send(ProtoEvent::Enter(Position::Right)).await;
             let seen = sync(&mut s, 0).await;
             assert!(
@@ -2253,7 +2259,7 @@ mod held_input_is_released {
             s.trust
                 .write()
                 .expect("trust lock")
-                .revoke(&s.fingerprints[0]);
+                .forget(&s.fingerprints[0]);
 
             assert!(
                 s.released_before_destroy(handle, button(BTN_LEFT, 0)).await,
@@ -2380,7 +2386,7 @@ mod held_input_is_released {
             s.trust
                 .write()
                 .expect("trust lock")
-                .revoke(&s.fingerprints[0]);
+                .forget(&s.fingerprints[0]);
             // Refused: the peer is no longer allowed to drive this machine.
             s.dialer()
                 .send(ProtoEvent::Input(button(BTN_LEFT, 0)))
@@ -2423,7 +2429,7 @@ mod held_input_is_released {
             s.trust
                 .write()
                 .expect("trust lock")
-                .revoke(&s.fingerprints[0]);
+                .forget(&s.fingerprints[0]);
             let scroll = Event::Pointer(PointerEvent::Axis {
                 time: 0,
                 axis: 0,

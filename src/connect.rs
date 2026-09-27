@@ -45,6 +45,8 @@ pub(crate) enum LanMouseConnectionError {
     FingerprintMismatch,
     #[error("the receiver refused this machine")]
     RefusedByPeer,
+    #[error("the receiver holds no pairing with this machine")]
+    Forgotten,
 }
 
 /// A dial that ended in a way the person at this machine may need telling
@@ -63,6 +65,20 @@ pub(crate) enum DialRefusal {
         handle: ClientHandle,
         fingerprint: String,
         addr: SocketAddr,
+    },
+    /// A receiver refused this machine as one it holds no pairing with
+    /// (`access_denied`, #184): if this machine holds one with it, the
+    /// receiver removed this machine.
+    Forgotten {
+        handle: ClientHandle,
+        fingerprint: String,
+        addr: SocketAddr,
+    },
+    /// The receiver closed the link this machine dialled to it because it
+    /// removed this machine (#184).
+    RemovedBy {
+        handle: ClientHandle,
+        fingerprint: String,
     },
     /// The device's addresses answered, but as another paired machine than
     /// the one the device is pinned to.
@@ -93,6 +109,43 @@ fn refused_by_peer(e: &quinn::ConnectionError) -> bool {
             close.reason.as_ref() == b"unauthorized"
         }
         _ => false,
+    }
+}
+
+/// What the service is told when the receiver `fingerprint` at `addr` ended
+/// the dial for `handle` with `e`, if it refused this machine.
+fn refusal(
+    e: &quinn::ConnectionError,
+    handle: ClientHandle,
+    fingerprint: String,
+    addr: SocketAddr,
+) -> Option<DialRefusal> {
+    if transport::refused_as_unknown(e) {
+        Some(DialRefusal::Forgotten {
+            handle,
+            fingerprint,
+            addr,
+        })
+    } else if refused_by_peer(e) {
+        Some(DialRefusal::RefusedByPeer {
+            handle,
+            fingerprint,
+            addr,
+        })
+    } else {
+        None
+    }
+}
+
+/// The error a dial ended by `e` failed with: a refusal kept apart from any
+/// other failure, so the service can say which.
+fn dial_error(e: quinn::ConnectionError) -> LanMouseConnectionError {
+    if transport::refused_as_unknown(&e) {
+        LanMouseConnectionError::Forgotten
+    } else if refused_by_peer(&e) {
+        LanMouseConnectionError::RefusedByPeer
+    } else {
+        e.into()
     }
 }
 
@@ -184,6 +237,11 @@ async fn connect(
         .map_err(|e| (addr, e.into()))?;
     let conn = match tokio::time::timeout(DEFAULT_CONNECTION_TIMEOUT, connecting).await {
         Err(_) => return Err((addr, LanMouseConnectionError::Timeout)),
+        // The receiver's refusal, when it lands before our side of the
+        // handshake completed.
+        Ok(Err(e)) if transport::refused_as_unknown(&e) => {
+            return Err((addr, LanMouseConnectionError::Forgotten));
+        }
         Ok(Err(e)) => return Err((addr, e.into())),
         Ok(Ok(conn)) => conn,
     };
@@ -222,14 +280,7 @@ async fn connect(
         conn.close(0u32.into(), b"not permitted");
         return Err((addr, LanMouseConnectionError::NotPermitted));
     }
-    let send = conn.open_uni().await.map_err(|e| {
-        let e = if refused_by_peer(&e) {
-            LanMouseConnectionError::RefusedByPeer
-        } else {
-            e.into()
-        };
-        (addr, e)
-    })?;
+    let send = conn.open_uni().await.map_err(|e| (addr, dial_error(e)))?;
     Ok((
         Landed::Link(PeerLink {
             conn,
@@ -336,11 +387,14 @@ async fn connect_any(
     // that distinctly so the caller logs the right recovery guidance.
     let mut only_mismatch = !addrs.is_empty();
     let mut refused = false;
+    let mut forgotten = false;
     loop {
         match joinset.join_next().await {
             None => {
                 return Err(if only_mismatch {
                     LanMouseConnectionError::FingerprintMismatch
+                } else if forgotten {
+                    LanMouseConnectionError::Forgotten
                 } else if refused {
                     LanMouseConnectionError::RefusedByPeer
                 } else {
@@ -354,6 +408,7 @@ async fn connect_any(
                         only_mismatch = false;
                     }
                     refused |= matches!(e, LanMouseConnectionError::RefusedByPeer);
+                    forgotten |= matches!(e, LanMouseConnectionError::Forgotten);
                     log::warn!("failed to connect to {a}: `{e}`");
                 }
             },
@@ -480,6 +535,7 @@ impl LanMouseConnection {
             conns: self.conns.clone(),
             client_manager: self.client_manager.clone(),
             state_tx: self.state_tx.clone(),
+            trust: self.trust.clone(),
         }
     }
 
@@ -883,6 +939,19 @@ async fn connect_to_handle(
                     _ => match decide_trust_prompt(&seen) {
                         TrustPrompt::Nothing => {}
                         TrustPrompt::Offer { addr, fp }
+                            if matches!(e, LanMouseConnectionError::Forgotten) =>
+                        {
+                            log::warn!(
+                                "client {handle}: {addr} ({fp}) refused this machine as one it \
+                                 holds no pairing with"
+                            );
+                            let _ = refusals.send(DialRefusal::Forgotten {
+                                handle,
+                                fingerprint: fp,
+                                addr,
+                            });
+                        }
+                        TrustPrompt::Offer { addr, fp }
                             if matches!(e, LanMouseConnectionError::RefusedByPeer) =>
                         {
                             log::warn!("client {handle}: {addr} ({fp}) refused this machine");
@@ -957,13 +1026,12 @@ async fn connect_to_handle(
                     // the handshake, so a machine that has not approved this
                     // one ends the connection before any number, as it ends a
                     // link that looked open (#171).
-                    if conn.close_reason().as_ref().is_some_and(refused_by_peer) {
+                    let refused = conn
+                        .close_reason()
+                        .and_then(|e| refusal(&e, handle, fingerprint.clone(), addr));
+                    if let Some(refused) = refused {
                         log::warn!("client {handle}: {addr} ({fingerprint}) refused this machine");
-                        let _ = refusals.send(DialRefusal::RefusedByPeer {
-                            handle,
-                            fingerprint,
-                            addr,
-                        });
+                        let _ = refusals.send(refused);
                         return Err(LanMouseConnectionError::RefusedByPeer);
                     }
                     return Err(LanMouseConnectionError::NotConnected);
@@ -1054,6 +1122,11 @@ async fn connect_to_handle(
         }
         log::info!("client ({handle}) connected @ {addr}");
         client_manager.set_active_addr(handle, Some(addr));
+        // The machine answers for this device again, so it holds a pairing
+        // with this one: whatever its last refusal said no longer holds.
+        if client_manager.set_removed_by_peer(handle, false) {
+            let _ = state_tx.send(handle);
+        }
         open.insert(addr, link.clone());
         drop(open);
         connecting.lock().await.remove(&handle);
@@ -1203,13 +1276,10 @@ async fn receive_loop(
             // The receiver checks our certificate after our half of the
             // handshake, so its refusal ends a link that looked open. It
             // opens its stream only for a machine it admitted.
-            if refused_by_peer(&e) {
-                let _ = refusals.send(DialRefusal::RefusedByPeer {
-                    handle,
-                    fingerprint: link.fingerprint.clone(),
-                    addr,
-                });
+            if let Some(refused) = refusal(&e, handle, link.fingerprint.clone(), addr) {
+                let _ = refusals.send(refused);
             }
+            told_removed(&link, handle, &refusals);
             disconnect(
                 &client_manager,
                 handle,
@@ -1271,6 +1341,7 @@ async fn receive_loop(
             }
         }
     }
+    told_removed(&link, handle, &refusals);
     disconnect(
         &client_manager,
         handle,
@@ -1280,6 +1351,26 @@ async fn receive_loop(
         &state_tx,
     )
     .await;
+}
+
+/// Say so when the receiver closed `link` because it removed this machine
+/// (#184). Read before this side closes the link, which would otherwise be the
+/// reason recorded.
+fn told_removed(link: &PeerLink, handle: ClientHandle, refusals: &Sender<DialRefusal>) {
+    if link
+        .conn
+        .close_reason()
+        .is_some_and(|e| transport::closed_as_removed(&e))
+    {
+        log::info!(
+            "client {handle}: {} closed its link: it removed this machine",
+            link.fingerprint
+        );
+        let _ = refusals.send(DialRefusal::RemovedBy {
+            handle,
+            fingerprint: link.fingerprint.clone(),
+        });
+    }
 }
 
 /// Force-closes outgoing sessions when we revoke trust in the receiver.
@@ -1293,6 +1384,7 @@ pub(crate) struct OutboundRevoker {
     conns: Rc<Mutex<HashMap<SocketAddr, PeerLink>>>,
     client_manager: ClientManager,
     state_tx: Sender<ClientHandle>,
+    trust: Trust,
 }
 
 impl OutboundRevoker {
@@ -1346,8 +1438,19 @@ impl OutboundRevoker {
 
     /// Close the link open to `addr`, if there is one, and clear it from any
     /// device still recorded as connected there. Returns whether one was open.
+    ///
+    /// A receiver this machine no longer holds any pairing with is told so as
+    /// the link closes ([`transport::REMOVED`], #184). The first close is the
+    /// one QUIC sends, so it is made here, before `disconnect` closes it again.
     pub(crate) async fn close_addr(&self, addr: SocketAddr) -> bool {
-        let open = self.conns.lock().await.contains_key(&addr);
+        let open = match self.conns.lock().await.get(&addr) {
+            Some(link) => {
+                let reason = transport::close_reason(&self.trust, &link.fingerprint, b"bye");
+                link.conn.close(0u32.into(), reason);
+                true
+            }
+            None => false,
+        };
         let handles = self.client_manager.handles_at(addr);
         if handles.is_empty() {
             if let Some(link) = self.conns.lock().await.remove(&addr) {
@@ -1880,7 +1983,7 @@ mod tests {
             r.conn.send(key(30, 1), r.handle).await.expect("sent");
             assert!(r.heard(key(30, 1)).await, "a permitted receiver gets input");
 
-            r.trust.write().expect("lock").revoke(&r.receiver);
+            r.trust.write().expect("lock").forget(&r.receiver);
             let refused = r.conn.send(key(48, 1), r.handle).await;
 
             assert!(
@@ -1904,7 +2007,7 @@ mod tests {
     fn letting_go_still_reaches_a_receiver_we_may_no_longer_drive() {
         local(async {
             let r = sender_to_a_recording_receiver().await;
-            r.trust.write().expect("lock").revoke(&r.receiver);
+            r.trust.write().expect("lock").forget(&r.receiver);
 
             for frame in [key(30, 0), ProtoEvent::Leave(0)] {
                 r.conn
@@ -2171,7 +2274,7 @@ mod tests {
             );
 
             // revoke the receiver — what remove_authorized_key does to the shared map
-            trusted.write().expect("lock").revoke(&server_fp);
+            trusted.write().expect("lock").forget(&server_fp);
 
             assert!(
                 !dials_ok(&client_ep, addr).await,
@@ -2635,12 +2738,13 @@ mod a_refusing_receiver_is_reported {
             let reported = next_within(&mut d.notices.refusals, Duration::from_secs(10)).await;
             assert_eq!(
                 reported,
-                Some(DialRefusal::RefusedByPeer {
+                Some(DialRefusal::Forgotten {
                     handle: d.handle,
                     fingerprint: receiver.fingerprint.clone(),
                     addr: SocketAddr::new("127.0.0.1".parse().expect("ip"), port),
                 }),
-                "a receiver that refused this machine was not reported as such"
+                "a receiver that refused this machine as one it holds no pairing \
+                 with was not reported as such (#184)"
             );
         });
     }

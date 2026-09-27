@@ -128,16 +128,20 @@ fn run_daemon() -> Result<(), HopsError> {
 }
 
 /// What the daemon's end means for how the process exits. One that found
-/// another daemon running leaves quietly. Any other error exits 1: that
-/// includes a macOS permission granted while it ran (#221), whose exit is
-/// what makes launchd, which restarts it only after a failure, start a fresh
-/// process with the grant.
+/// another daemon of this user running says so and exits 0. Any other error
+/// exits 1: that includes an endpoint something else holds (#96), and a
+/// macOS permission granted while it ran (#221), whose exit is what makes
+/// launchd, which restarts it only after a failure, start a fresh process
+/// with the grant.
 fn daemon_ended(ended: Result<(), HopsError>) -> Result<(), HopsError> {
     match ended {
         Err(HopsError::Service(ServiceError::IpcListen(
             IpcListenerCreationError::AlreadyRunning,
         ))) => {
-            log::info!("service already running!");
+            log::warn!(
+                "a hops daemon is already running for this user; this one exits and \
+                 leaves it running"
+            );
             Ok(())
         }
         r => r,
@@ -393,12 +397,19 @@ mod a_daemon_ended_for_a_grant_exits_unsuccessfully {
 
     // LEDGER T2251 | class B | 1 return value of daemon_ended
     #[test]
-    fn only_a_daemon_that_found_another_running_leaves_quietly() {
+    fn only_a_daemon_that_found_another_of_this_user_exits_0() {
         let granted = daemon_ended(Err(HopsError::Service(ServiceError::PermissionGranted(
             "Accessibility".into(),
         ))));
         let beside = daemon_ended(Err(HopsError::Service(ServiceError::IpcListen(
             IpcListenerCreationError::AlreadyRunning,
+        ))));
+        let held = daemon_ended(Err(HopsError::Service(ServiceError::IpcListen(
+            IpcListenerCreationError::Held {
+                endpoint: hops_ipc::DaemonEndpoint::Tcp("127.0.0.1:9".parse().expect("an address")),
+                why: "a program that is not hops".into(),
+                hint: String::new(),
+            },
         ))));
         assert!(
             matches!(
@@ -409,6 +420,11 @@ mod a_daemon_ended_for_a_grant_exits_unsuccessfully {
              until the next login: {granted:?}"
         );
         assert!(beside.is_ok(), "{beside:?}");
+        assert!(
+            held.is_err(),
+            "a daemon whose endpoint something else holds must exit 1 with the \
+             reason, not as if a daemon were running: {held:?}"
+        );
     }
 }
 

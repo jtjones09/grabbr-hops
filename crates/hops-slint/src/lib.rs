@@ -23,8 +23,8 @@ use std::{
 
 use hops_frontend_core::{
     AppModel, ApprovalRefused, CaptureState, ClientHandle, Clipboard, FrontendClient,
-    FrontendRequest, Launch, PairingAttempt, PairingCard, PairingCheck, Position, Status,
-    TrustState, prefs, spaced_number, theme,
+    FrontendRequest, Launch, PairingAttempt, PairingCard, PairingCheck, Position, Status, Tone,
+    prefs, spaced_number, theme,
 };
 use hops_ipc::{DEFAULT_PORT, Geometry};
 use slint::{ComponentHandle, ModelRc, VecModel};
@@ -178,7 +178,7 @@ fn device_rows(m: &AppModel) -> Vec<DeviceRow> {
         .filter(|d| d.is_listable())
         .map(|d| {
             let clipboard = d.fingerprint.as_deref().and_then(|fp| m.clipboard(fp));
-            let (handle, addr, pos, active, alive, has_send) = match &d.send {
+            let (handle, addr, pos, active, has_send) = match &d.send {
                 Some(s) => {
                     let addr = s
                         .state
@@ -203,18 +203,10 @@ fn device_rows(m: &AppModel) -> Vec<DeviceRow> {
                         addr,
                         s.config.pos.to_string(),
                         s.state.active,
-                        s.state.alive,
                         true,
                     )
                 }
-                None => (
-                    String::new(),
-                    String::new(),
-                    String::new(),
-                    false,
-                    false,
-                    false,
-                ),
+                None => (String::new(), String::new(), String::new(), false, false),
             };
             DeviceRow {
                 handle: handle.into(),
@@ -222,8 +214,8 @@ fn device_rows(m: &AppModel) -> Vec<DeviceRow> {
                 addr: addr.into(),
                 pos: pos.into(),
                 active,
-                alive,
-                refuses_input: d.refuses_our_input(),
+                tone: dot_tone(d.connection.tone()),
+                status: d.connection.words().into(),
                 has_send,
                 fingerprint: d
                     .fingerprint
@@ -238,14 +230,23 @@ fn device_rows(m: &AppModel) -> Vec<DeviceRow> {
                     .and_then(|s| s.state.peer_fingerprint.clone())
                     .unwrap_or_default()
                     .into(),
-                online: d.online,
                 trusted: d.receive,
-                revoked: d.trust == TrustState::Revoked,
                 clipboard: clipboard.map(clipboard_words).unwrap_or_default().into(),
                 clipboard_on: clipboard.is_some_and(|c| c.is_on()),
             }
         })
         .collect()
+}
+
+/// The window's dot tone for a state's tone: the state is derived once, in
+/// hops-frontend-core, for both frontends (#148).
+pub fn dot_tone(tone: Tone) -> DotTone {
+    match tone {
+        Tone::Good => DotTone::Good,
+        Tone::Warn => DotTone::Warn,
+        Tone::Bad => DotTone::Bad,
+        Tone::Quiet => DotTone::Quiet,
+    }
 }
 
 /// What one poll tick puts in the window, from `m` and the request the
@@ -473,12 +474,11 @@ fn default_canvas_pos(pos: Position) -> (f32, f32) {
 }
 
 /// Single-instance coordination result. A second `hops gui` launch signals the
-/// first (any connection to the rendezvous = "show your window") and exits, so
-/// re-launching focuses the resident menu-bar app instead of stacking duplicate
-/// tray icons. The rendezvous is a Unix-domain socket on unix (per-user, scoped
-/// by `~/.config` permissions) and a loopback `TcpListener` on Windows (no
-/// per-user filesystem socket there; a `127.0.0.1` listener is the std-only
-/// equivalent).
+/// first ("show your window") and exits, so re-launching focuses the resident
+/// menu-bar app instead of stacking duplicate tray icons. The rendezvous is a
+/// Unix-domain socket on unix (per-user, scoped by `~/.config` permissions)
+/// and, on Windows, a named event in the session's `Local\` namespace that
+/// grants this user alone ([`hops_ipc::instance`]).
 #[cfg(any(unix, windows))]
 enum Instance {
     /// We're the first instance; the guard cleans up the rendezvous on exit.
@@ -488,14 +488,15 @@ enum Instance {
 }
 
 /// Cleans up the single-instance rendezvous on drop (normal GUI exit). Only Unix
-/// leaves a filesystem artifact (the socket file); on Windows the `TcpListener`
-/// closes itself, so `path` is left empty.
+/// leaves a filesystem artifact (the socket file). On Windows the event lasts
+/// until the process exits: the thread that waits on it holds a handle of its
+/// own, blocked for as long as the GUI runs.
 #[cfg(any(unix, windows))]
 struct SingleInstanceGuard {
-    // only Drop (unix-only) reads this; on Windows there's no socket file to
-    // clean up, so the field is written-but-unread there.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg(unix)]
     path: std::path::PathBuf,
+    #[cfg(windows)]
+    _event: hops_ipc::instance::First,
 }
 
 #[cfg(any(unix, windows))]
@@ -567,41 +568,20 @@ fn acquire_single_instance(show_requested: Arc<AtomicBool>) -> Instance {
     }
 }
 
-/// Windows single-instance via a loopback `TcpListener`. Bound to `127.0.0.1`
-/// only (never `0.0.0.0`), so it's a local rendezvous — not a reachable service —
-/// and a loopback bind doesn't trip the Windows Firewall prompt. Any successful
-/// connect from a second launch flips `show_requested`; the second launch then
-/// exits. Degrades gracefully (runs without single-instance) on any bind error.
+/// Windows single-instance through [`hops_ipc::instance::claim_gui`]: only a
+/// running hops window of this user, found and asked to show, keeps this
+/// launch closed. Anything else holding the name opens the window anyway,
+/// so no other program can stop the GUI appearing (#176).
 #[cfg(windows)]
 fn acquire_single_instance(show_requested: Arc<AtomicBool>) -> Instance {
-    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-    // fixed high port below the ephemeral range (49152+) to avoid churn collisions
-    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 47842));
-    match TcpListener::bind(addr) {
-        Ok(listener) => {
-            std::thread::spawn(move || {
-                for _stream in listener.incoming() {
-                    show_requested.store(true, Ordering::SeqCst);
-                }
-            });
-            Instance::Primary(SingleInstanceGuard {
-                path: std::path::PathBuf::new(),
-            })
+    match hops_ipc::instance::claim_gui(move || show_requested.store(true, Ordering::SeqCst)) {
+        hops_ipc::instance::Found::First(first) => {
+            Instance::Primary(SingleInstanceGuard { _event: first })
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            // a live primary already owns the port; poke it to surface, then exit
-            if TcpStream::connect(addr).is_ok() {
-                Instance::Secondary
-            } else {
-                Instance::Primary(SingleInstanceGuard {
-                    path: std::path::PathBuf::new(),
-                })
-            }
+        hops_ipc::instance::Found::Running => {
+            log::info!("a hops window is already open for this user; it was asked to show");
+            Instance::Secondary
         }
-        // any other bind error → run anyway without single-instance
-        Err(_) => Instance::Primary(SingleInstanceGuard {
-            path: std::path::PathBuf::new(),
-        }),
     }
 }
 
@@ -1493,118 +1473,253 @@ mod armed_actions_follow_their_device {
 
 #[cfg(test)]
 mod destructive_actions_say_so {
-    //! The confirm text for delete and revoke must say the change is permanent.
+    //! The confirm text for delete and revoke must say what removal costs:
+    //! using the device again means pairing the two machines again (#184).
     //!
-    //! Both write a tombstone: the fingerprint can never be trusted again, and
-    //! the device has to present a NEW identity to return. The GUI said
-    //! "delete + untrust?" and "remove?", neither of which reads as irreversible
-    //! — and on 2026-08-31 both machines on the rig were permanently expelled by
-    //! accident, needing hand-edited config files to recover. The TUI had said
-    //! "permanently ... NEW identity" all along; the GUI had not (#33, #125).
+    //! It used to say the other machine needed a NEW identity, which was the
+    //! tombstone rule removal no longer follows: a removed machine keeps its
+    //! identity and pairs again in full. A confirm that still said so would
+    //! send someone to reinstall a machine for nothing.
     //!
     //! This is a source guard because Slint draws its own pixels — there is no
     //! runtime assertion that reaches this text.
 
     const APP_SLINT: &str = include_str!("../ui/app.slint");
 
-    #[test]
-    fn the_delete_confirm_says_it_is_permanent() {
-        assert!(
-            APP_SLINT.contains(r#""delete permanently?""#),
-            "the delete confirm must say `permanently`. `delete + untrust?` reads as \
-             reversible, and it is not."
-        );
-    }
-
-    #[test]
-    fn the_revoke_confirm_says_it_is_permanent() {
-        assert!(
-            APP_SLINT.contains(r#""remove permanently?""#),
-            "the revoke confirm must say `permanently` — it writes a tombstone"
-        );
-    }
-
-    #[test]
-    fn both_confirms_explain_the_consequence() {
-        // Saying "permanently" is not enough on its own: the user needs to know
-        // what it costs them, which is a fresh identity on the other machine.
-        let n = APP_SLINT
-            .matches("it must pair again with a NEW identity")
-            .count();
-        assert_eq!(
-            n, 2,
-            "delete and revoke must BOTH explain the consequence; found {n} of 2"
-        );
-    }
-}
-
-#[cfg(test)]
-mod refusal_reaches_the_ui {
-    //! Both front-ends must consult the refusal BEFORE the green arm.
-    //!
-    //! `hops_frontend_core::refusal_is_not_maskable` proves the predicate. It
-    //! cannot prove either UI asks it — and the original defect was precisely a
-    //! correct fact discarded at the render step, `online || alive` (#92). So
-    //! the render sites get their own guard.
-
-    /// Non-test source only; split without a trailing newline so a CRLF
-    /// checkout still matches.
-    fn body(src: &str, marker: &str) -> String {
-        let src = src.split("\n#[cfg(test)]").next().unwrap_or(src);
-        // Generous window: too small silently misses the code under test and the
-        // guard then fails on its own slicing rather than on the defect.
-        let at = src
-            .find(marker)
-            .unwrap_or_else(|| panic!("{marker} must exist; if it moved, update this guard"));
-        let window: String = src[at..].chars().take(4000).collect();
-        // Strip comments. Both of these guards describe the very identifiers
-        // they search for, so a raw search finds the PROSE and reads the order
-        // backwards — that produced a clean false pass here (the mutation put
-        // the green arm first and the test still went green), and the identical
-        // mistake had already been made in config.rs the same day.
-        window
+    /// The window's text, comments dropped: the guard is about what a
+    /// person reads, and a comment may name the old rule to explain it.
+    fn shown() -> String {
+        APP_SLINT
             .lines()
             .map(|l| l.split("//").next().unwrap_or(""))
             .collect::<Vec<_>>()
             .join("\n")
     }
 
+    // LEDGER R184-7 | class S | source text: app.slint confirms, comments stripped
     #[test]
-    fn the_slint_dot_checks_refusal_before_going_green() {
-        const UI: &str = include_str!("../ui/app.slint");
-        // Two anchors, because there is another `Dot {` at the top of the window
-        // (the daemon-connection indicator) and it is not this one: narrow to
-        // the device-row loop first, then to the dot inside it.
-        let rows = body(UI, "for d in root.devices:");
-        let dot = body(&rows, "Dot {");
-        let refuses = dot
-            .find("refuses-input")
-            .expect("the device dot must consult refuses-input (#92)");
-        let green = dot
-            .find("d.online || d.alive")
-            .expect("the green arm should still exist; if it was rewritten, update this guard");
-        assert!(
-            refuses < green,
-            "the dot evaluates `online || alive` before the refusal, so an inbound \
-             connection masks a receiver that refuses everything we send — the #92 \
-             defect exactly."
+    fn both_confirms_say_the_device_returns_by_pairing_again() {
+        let n = shown()
+            .matches(r#""to use it again, pair it again""#)
+            .count();
+        assert_eq!(
+            n, 2,
+            "delete and revoke must BOTH say what removal costs; found {n} of 2"
         );
     }
 
+    // LEDGER R184-8 | class S | source text: app.slint, comments stripped
     #[test]
-    fn the_tui_dot_checks_refusal_before_going_green() {
-        const TUI: &str = include_str!("../../hops-tui/src/lib.rs");
-        let f = body(TUI, "fn device_row(");
-        let refuses = f
-            .find("refuses_our_input()")
-            .expect("the TUI row must consult refuses_our_input (#92)");
-        let green = f
-            .find("d.online ||")
-            .expect("the green arm should still exist; if it was rewritten, update this guard");
+    fn nothing_on_screen_teaches_the_tombstone() {
+        for old in ["NEW identity", "new identity", "permanently"] {
+            assert!(
+                !shown().contains(old),
+                "app.slint still shows `{old}`: removal forgets the device, and it \
+                 pairs again with the identity it has (#184)"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod the_window_draws_the_state {
+    //! The window's dot and status words are the device's one connection
+    //! state, derived in hops-frontend-core for both frontends (#148). The
+    //! row carries nothing else the dot could be computed from; the original
+    //! #92 defect was a correct fact discarded at the render step.
+    use super::*;
+    use hops_frontend_core::{
+        ClientConfig, ClientState, CrossingRefusal, FrontendEvent, PairingCheck, PeerTrust,
+    };
+    use slint::Model;
+
+    const FP: &str = "1e:19:1b:2c:3d:4e:5f:60:71:82:93:a4:b5:c6:d7:e8";
+
+    fn pinned(active: bool, link: bool, alive: bool) -> ClientState {
+        ClientState {
+            active,
+            alive,
+            active_addr: link.then(|| "192.0.2.5:4242".parse().expect("addr")),
+            peer_fingerprint: Some(FP.into()),
+            ..Default::default()
+        }
+    }
+
+    /// A model attached to a daemon, holding one device this machine dials.
+    fn dialled(state: ClientState, paired: bool) -> AppModel {
+        let mut m = AppModel::default();
+        m.connected = true;
+        m.apply(FrontendEvent::Enumerate(vec![(
+            0,
+            ClientConfig {
+                hostname: Some("desk-mac".into()),
+                ..Default::default()
+            },
+            state,
+        )]));
+        if paired {
+            m.apply(FrontendEvent::TrustUpdated(
+                [(
+                    FP.to_string(),
+                    PeerTrust {
+                        clipboard_from: true,
+                        clipboard_to: true,
+                        pending: false,
+                    },
+                )]
+                .into(),
+            ));
+        }
+        m
+    }
+
+    /// One model per state, built from daemon events, with the words and
+    /// dot the window must show. The same table as the terminal's, so the
+    /// two frontends are held to one answer.
+    fn scenarios() -> Vec<(AppModel, &'static str, DotTone)> {
+        let connected = dialled(pinned(true, true, true), true);
+        let mut refusing = dialled(pinned(true, true, false), true);
+        refusing.apply(FrontendEvent::DeviceConnected {
+            addr: "192.0.2.5:50001".parse().expect("addr"),
+            fingerprint: FP.into(),
+        });
+        let mut unreachable = dialled(pinned(true, false, false), true);
+        unreachable.apply(FrontendEvent::CrossingRefused {
+            handle: 0,
+            reason: CrossingRefusal::NotConnected,
+        });
+        let mut waiting = dialled(pinned(true, false, false), false);
+        waiting.apply(FrontendEvent::TrustUpdated(
+            [(
+                FP.to_string(),
+                PeerTrust {
+                    pending: true,
+                    ..Default::default()
+                },
+            )]
+            .into(),
+        ));
+        let mut comparing = waiting.clone();
+        comparing.apply(FrontendEvent::PairingCheck {
+            fingerprint: FP.into(),
+            addr: None,
+            check: PairingCheck::Show("042917".into()),
+            answered: false,
+        });
+        // Its machine refused this one's dial as one it holds no pairing
+        // with: it removed this machine (#184).
+        let removed_here = dialled(
+            ClientState {
+                removed_by_peer: true,
+                ..pinned(true, false, false)
+            },
+            true,
+        );
+        let in_too = |mut m: AppModel| {
+            m.apply(FrontendEvent::DeviceConnected {
+                addr: "192.0.2.5:50001".parse().expect("addr"),
+                fingerprint: FP.into(),
+            });
+            m
+        };
+        let off_in = in_too(dialled(pinned(false, false, false), true));
+        let unreachable_in = in_too(unreachable.clone());
+        let mut gone = connected.clone();
+        gone.daemon_gone();
+        vec![
+            (connected, "connected", DotTone::Good),
+            (off_in, "off", DotTone::Quiet),
+            (unreachable_in, "unreachable", DotTone::Warn),
+            (refusing, "not accepting input", DotTone::Bad),
+            (
+                dialled(pinned(false, false, false), true),
+                "off",
+                DotTone::Quiet,
+            ),
+            (
+                dialled(pinned(true, false, false), true),
+                "not connected",
+                DotTone::Quiet,
+            ),
+            (unreachable, "unreachable", DotTone::Warn),
+            (
+                dialled(
+                    ClientState {
+                        active: true,
+                        ..Default::default()
+                    },
+                    false,
+                ),
+                "not paired",
+                DotTone::Warn,
+            ),
+            (waiting, "waiting for its approval", DotTone::Warn),
+            (comparing, "compare the number", DotTone::Warn),
+            (removed_here, "it removed this machine", DotTone::Bad),
+            (gone, "service not answering", DotTone::Quiet),
+        ]
+    }
+
+    // LEDGER T148-10 | class B | 3 widget tree: AppWindow devices after polled_ui + Repaint::push
+    #[test]
+    fn every_state_reaches_the_window_as_its_words_and_tone() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = AppWindow::new().expect("window");
+        let mut repaint = Repaint::default();
+        for (m, words, tone) in scenarios() {
+            repaint.push(&ui, polled_ui(&m, None, Instant::now()), &Cell::new(0));
+            let row = ui.get_devices().row_data(0).expect("one row");
+            assert_eq!(
+                (row.status.as_str(), row.tone),
+                (words, tone),
+                "the window shows another state"
+            );
+        }
+    }
+
+    /// Non-test source only, comments stripped, whitespace collapsed.
+    fn slint_code() -> String {
+        include_str!("../ui/app.slint")
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// A headless window can be asked neither a colour nor, without the
+    /// compiler's debug info, which text an element draws. So these are
+    /// checked in the source: each tone gets its own theme colour, the
+    /// device dot is coloured by the tone alone, and the row draws the
+    /// status words in that colour.
+    // LEDGER T148-11 | class S | source text: ui/app.slint tone-color, the device-row Dot and status Text
+    #[test]
+    fn each_tone_has_its_own_colour_and_the_row_uses_it() {
+        let code = slint_code();
+        for (tone, colour) in [("good", "success"), ("warn", "warn"), ("bad", "error")] {
+            let rule = format!("if tone == DotTone.{tone} {{ return Theme.c.{colour}; }}");
+            assert!(code.contains(&rule), "tone-color lost `{rule}`");
+        }
+        let rows = code
+            .split("for d in root.devices:")
+            .nth(1)
+            .expect("the device list");
+        let dot = rows.split("Dot {").nth(1).expect("the device dot");
         assert!(
-            refuses < green,
-            "the TUI row reaches its green arm before checking the refusal, so a \
-             peer connected inbound masks one that refuses our input (#92)."
+            dot.trim_start()
+                .starts_with("tint: root.tone-color(d.tone); }"),
+            "the device dot is coloured from something other than its tone: {}",
+            &dot[..dot.len().min(120)]
+        );
+        // the row's own markup: up to the next item of the list, if any
+        let row = rows.split("for ").next().unwrap_or(rows);
+        let status = "Text { text: d.status; color: root.tone-color(d.tone);";
+        assert!(
+            row.contains(status),
+            "the device row no longer draws its status words in its tone: \
+             `{status}` is gone"
         );
     }
 }
@@ -2097,7 +2212,7 @@ mod the_repaint_gate {
     //! Drives a real `AppWindow` on Slint's headless testing backend through
     //! the functions the poll calls.
     use super::*;
-    use hops_frontend_core::{ClientConfig, ClientState, FrontendEvent, RevokedEntry};
+    use hops_frontend_core::{ClientConfig, ClientState, Connection, FrontendEvent};
     use slint::Model;
 
     const FP: &str = "1e:19:1b:2c:3d:4e:5f:60:71:82:93:a4:b5:c6:d7:e8";
@@ -2118,6 +2233,7 @@ mod the_repaint_gate {
         let ui = AppWindow::new().expect("window");
         let mut repaint = Repaint::default();
         let mut m = AppModel::default();
+        m.connected = true;
 
         // Added by one fixed address, routed to, and dialled: no link yet.
         let config = ClientConfig {
@@ -2136,8 +2252,9 @@ mod the_repaint_gate {
             dialling.clone(),
         )]));
         tick(&ui, &mut repaint, &m);
+        let refused = Connection::NotAcceptingInput;
         assert!(
-            !row(&ui).refuses_input,
+            row(&ui).status.as_str() != refused.words() && row(&ui).tone != DotTone::Bad,
             "precondition: nothing is refused before a link is up"
         );
 
@@ -2145,35 +2262,33 @@ mod the_repaint_gate {
         // emulation is off. The row's address reads the same before and after.
         m.apply(FrontendEvent::State(
             0,
-            config,
+            config.clone(),
             ClientState {
                 active_addr: Some("192.0.2.5:4242".parse().expect("addr")),
+                ..dialling.clone()
+            },
+        ));
+        tick(&ui, &mut repaint, &m);
+        assert!(
+            row(&ui).status.as_str() == refused.words() && row(&ui).tone == DotTone::Bad,
+            "the window never said \"not accepting input\" for a machine that \
+             refuses everything sent to it"
+        );
+
+        // Then its machine refuses it as removed (#184): the row says so.
+        m.apply(FrontendEvent::State(
+            0,
+            config,
+            ClientState {
+                removed_by_peer: true,
                 ..dialling
             },
         ));
         tick(&ui, &mut repaint, &m);
         assert!(
-            row(&ui).refuses_input,
-            "the window never said \"not accepting input\" for a machine that \
-             refuses everything sent to it"
-        );
-
-        // Then its identity is denied: of everything on the row, only
-        // `revoked` changes.
-        m.apply(FrontendEvent::RevokedUpdated(
-            [(
-                FP.to_owned(),
-                RevokedEntry {
-                    label: "desk mac".into(),
-                    revoked_at: 1,
-                },
-            )]
-            .into(),
-        ));
-        tick(&ui, &mut repaint, &m);
-        assert!(
-            row(&ui).revoked,
-            "the window never showed the row as removed"
+            row(&ui).status.as_str() == Connection::NoLongerTrusts.words()
+                && row(&ui).tone == DotTone::Bad,
+            "the window never said the machine no longer trusts this one"
         );
     }
 
@@ -2208,7 +2323,9 @@ mod the_window_without_a_daemon {
     //! Drives a real `AppWindow` on Slint's headless testing backend through
     //! what the poll calls.
     use super::*;
-    use hops_frontend_core::{ClientConfig, ClientState, DiscoveredDevice, FrontendEvent};
+    use hops_frontend_core::{
+        ClientConfig, ClientState, Connection, DiscoveredDevice, FrontendEvent,
+    };
     use slint::Model;
 
     const FP: &str = "1e:19:1b:2c:3d:4e:5f:60:71:82:93:a4:b5:c6:d7:e8";
@@ -2291,9 +2408,10 @@ mod the_window_without_a_daemon {
         let live = rows(&ui);
         assert!(
             ui.get_connected()
-                && live[0].alive
-                && live[0].online
-                && live[1].refuses_input
+                && live[0].status.as_str() == Connection::Connected.words()
+                && live[0].tone == DotTone::Good
+                && live[1].status.as_str() == Connection::NotAcceptingInput.words()
+                && live[1].tone == DotTone::Bad
                 && ui.get_discovered().row_count() == 1
                 && !ui.get_pairing_fp().is_empty(),
             "precondition: the window shows the daemon's live state"
@@ -2313,13 +2431,12 @@ mod the_window_without_a_daemon {
         );
         for row in &last_known {
             assert!(
-                !row.alive && !row.online && !row.refuses_input,
-                "with no daemon {} still reads alive {}, connected {}, or \
-                 not accepting input {}",
+                row.status.as_str() == Connection::ServiceGone.words()
+                    && row.tone == DotTone::Quiet,
+                "with no daemon {} still reads \"{}\" in {:?}",
                 row.name,
-                row.alive,
-                row.online,
-                row.refuses_input
+                row.status,
+                row.tone
             );
         }
         assert_eq!(

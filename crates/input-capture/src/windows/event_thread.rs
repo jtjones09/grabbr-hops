@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashSet;
 use std::ptr::addr_of_mut;
 
@@ -6,8 +6,6 @@ use std::default::Default;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use tokio::sync::mpsc::Sender;
-use tokio::sync::mpsc::error::TrySendError;
 use windows::Win32::Foundation::{FALSE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     DEVMODEW, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICEW, ENUM_CURRENT_SETTINGS,
@@ -19,11 +17,12 @@ use windows::core::{PCWSTR, w};
 
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DispatchMessageW, EDD_GET_DEVICE_INTERFACE_NAME, GetMessageW,
-    HOOKPROC, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PostThreadMessageW,
-    RegisterClassW, SetWindowsHookExW, TranslateMessage, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_STYLE,
-    WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WNDPROC,
+    HOOKPROC, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, PeekMessageW,
+    PostThreadMessageW, RegisterClassW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_STYLE, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER,
+    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WNDPROC,
 };
 
 use input_event::{
@@ -31,6 +30,7 @@ use input_event::{
     scancode::{self, Linux},
 };
 
+use super::event_queue::QueueSender;
 use super::{CaptureEvent, Position, display_util};
 
 pub(crate) struct EventThread {
@@ -40,7 +40,7 @@ pub(crate) struct EventThread {
 }
 
 impl EventThread {
-    pub(crate) fn new(event_tx: Sender<(Position, CaptureEvent)>) -> Self {
+    pub(crate) fn new(event_tx: QueueSender) -> Self {
         let request_buffer = Default::default();
         let (thread, thread_id) = start(event_tx, Arc::clone(&request_buffer));
         Self {
@@ -62,8 +62,8 @@ impl EventThread {
         self.client_update(ClientUpdate::Destroy(pos));
     }
 
-    fn exit(&self) {
-        self.signal(RequestType::Exit);
+    fn exit(&self) -> bool {
+        self.signal(RequestType::Exit)
     }
 
     fn client_update(&self, request: ClientUpdate) {
@@ -74,16 +74,34 @@ impl EventThread {
         self.signal(RequestType::ClientUpdate);
     }
 
-    fn signal(&self, event_type: RequestType) {
+    /// Whether the request reached the thread's message queue.
+    fn signal(&self, event_type: RequestType) -> bool {
         let id = self.thread_id;
-        unsafe { PostThreadMessageW(id, WM_USER, WPARAM(event_type as usize), LPARAM(0)).unwrap() };
+        // Runs on the daemon's side, including in `drop`: a failure is
+        // logged, never a panic. The thread creates its message queue before
+        // it reports its id, so a post to a running thread does not fail.
+        let posted =
+            unsafe { PostThreadMessageW(id, WM_USER, WPARAM(event_type as usize), LPARAM(0)) };
+        if let Err(e) = &posted {
+            log::warn!("input capture: could not signal the hook thread: {e}");
+        }
+        posted.is_ok()
     }
 }
 
 impl Drop for EventThread {
     fn drop(&mut self) {
-        self.exit();
-        let _ = self.thread.take().expect("thread").join();
+        // Joining a thread that was never told to exit would block the
+        // daemon's loop for good; detached, it only outlives its queue,
+        // whose pushes are then discarded.
+        let told = self.exit();
+        if let Some(thread) = self.thread.take() {
+            if told {
+                let _ = thread.join();
+            } else {
+                log::warn!("input capture: the hook thread was left running");
+            }
+        }
     }
 }
 
@@ -98,15 +116,16 @@ enum ClientUpdate {
     Destroy(Position),
 }
 
-fn blocking_send_event(pos: Position, event: CaptureEvent) {
-    EVENT_TX.with_borrow_mut(|tx| tx.as_mut().unwrap().blocking_send((pos, event)).unwrap())
-}
-
-fn try_send_event(
-    pos: Position,
-    event: CaptureEvent,
-) -> Result<(), TrySendError<(Position, CaptureEvent)>> {
-    EVENT_TX.with_borrow_mut(|tx| tx.as_mut().unwrap().try_send((pos, event)))
+/// Hands an event to the daemon. Called from inside the hook procedures, so
+/// it cannot block, fail or panic: the queue decides what a full queue costs
+/// (motion merges, presses are refused, held keys and buttons are released),
+/// never a lost release (#81, #80).
+fn push_event(pos: Position, event: CaptureEvent) {
+    let _ = EVENT_TX.try_with(|tx| {
+        if let Some(tx) = tx.get() {
+            tx.push(pos, event);
+        }
+    });
 }
 
 thread_local! {
@@ -114,8 +133,8 @@ thread_local! {
     static CLIENTS: RefCell<HashSet<Position>> = RefCell::new(HashSet::new());
     /// currently active client
     static ACTIVE_CLIENT: Cell<Option<Position>> = const { Cell::new(None) };
-    /// input event channel
-    static EVENT_TX: RefCell<Option<Sender<(Position, CaptureEvent)>>> = const { RefCell::new(None) };
+    /// input event queue; set once, before the hooks are installed
+    static EVENT_TX: OnceCell<QueueSender> = const { OnceCell::new() };
     /// position of barrier entry
     static ENTRY_POINT: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
     /// previous mouse position
@@ -137,7 +156,7 @@ fn get_msg() -> Option<MSG> {
 }
 
 fn start(
-    event_tx: Sender<(Position, CaptureEvent)>,
+    event_tx: QueueSender,
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
 ) -> (thread::JoinHandle<()>, u32) {
     /* condition variable to wait for thead id */
@@ -157,10 +176,16 @@ fn start(
 
 fn start_routine(
     ready: Arc<(Condvar, Mutex<Option<u32>>)>,
-    event_tx: Sender<(Position, CaptureEvent)>,
+    event_tx: QueueSender,
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
 ) {
-    EVENT_TX.replace(Some(event_tx));
+    let _ = EVENT_TX.with(|tx| tx.set(event_tx));
+    /* create this thread's message queue, so a PostThreadMessageW made as
+     * soon as the id is known cannot fail for want of one */
+    unsafe {
+        let mut msg: MSG = std::mem::zeroed();
+        let _ = PeekMessageW(addr_of_mut!(msg), None, WM_USER, WM_USER, PM_NOREMOVE);
+    }
     /* communicate thread id */
     {
         let (cnd, mtx) = &*ready;
@@ -174,10 +199,12 @@ fn start_routine(
     let window_proc: WNDPROC = Some(window_proc);
 
     /* register hooks */
-    unsafe {
-        let _ = SetWindowsHookExW(WH_MOUSE_LL, mouse_proc, None, 0).unwrap();
-        let _ = SetWindowsHookExW(WH_KEYBOARD_LL, kybrd_proc, None, 0).unwrap();
-    }
+    let hooks = unsafe {
+        [
+            SetWindowsHookExW(WH_MOUSE_LL, mouse_proc, None, 0).unwrap(),
+            SetWindowsHookExW(WH_KEYBOARD_LL, kybrd_proc, None, 0).unwrap(),
+        ]
+    };
 
     let instance = unsafe { GetModuleHandleW(None).unwrap() };
     let instance = instance.into();
@@ -255,6 +282,16 @@ fn start_routine(
             }
         }
     }
+
+    /* Remove both hooks before returning: this thread's queue sender goes
+     * with its thread-locals, and the receiver goes after the join that
+     * waits for this. No hook procedure runs after this point. */
+    for hook in hooks {
+        if let Err(e) = unsafe { UnhookWindowsHookEx(hook) } {
+            log::warn!("input capture: could not remove a hook: {e}");
+        }
+    }
+    ACTIVE_CLIENT.take();
 }
 
 fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
@@ -289,17 +326,21 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
         return ret;
     }
 
-    /* update active client and entry point */
-    ACTIVE_CLIENT.replace(Some(pos));
+    /* a crossing needs the display it left, to know where the cursor stops */
     let entry_point = DISPLAYS.with_borrow(|(displays, _)| {
         display_util::clamp_to_display_bounds(displays, prev_pos, curr_pos)
     });
+    let Some(entry_point) = entry_point else {
+        return ret;
+    };
+
+    /* update active client and entry point */
+    ACTIVE_CLIENT.replace(Some(pos));
     ENTRY_POINT.replace(entry_point);
 
     /* notify main thread */
     log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
-    let active = ACTIVE_CLIENT.get().expect("active client");
-    blocking_send_event(active, CaptureEvent::Begin);
+    push_event(pos, CaptureEvent::Begin);
 
     ret
 }
@@ -322,10 +363,8 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
         return LRESULT(1);
     };
 
-    /* notify mainthread (drop events if sending too fast) */
-    if let Err(e) = try_send_event(pos, CaptureEvent::Input(Event::Pointer(pointer_event))) {
-        log::warn!("e: {e}");
-    }
+    /* notify mainthread */
+    push_event(pos, CaptureEvent::Input(Event::Pointer(pointer_event)));
 
     /* don't pass event to applications */
     LRESULT(1)
@@ -354,9 +393,7 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
         return LRESULT(1);
     };
 
-    if let Err(e) = try_send_event(client, CaptureEvent::Input(Event::Keyboard(key_event))) {
-        log::warn!("e: {e}");
-    }
+    push_event(client, CaptureEvent::Input(Event::Keyboard(key_event)));
 
     // Lock keys must NOT be swallowed, unlike every other key.
     //

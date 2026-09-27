@@ -23,7 +23,9 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
-use rustls::{DigitallySignedStruct, DistinguishedName, Error as TlsError, SignatureScheme};
+use rustls::{
+    CertificateError, DigitallySignedStruct, DistinguishedName, Error as TlsError, SignatureScheme,
+};
 use thiserror::Error;
 
 use crate::crypto::generate_fingerprint;
@@ -43,6 +45,54 @@ pub type Trust = Arc<RwLock<crate::trust::TrustStore>>;
 /// "rebrand" it to `hops/1` to match the app name. Changing it is a breaking
 /// protocol bump: bump the version suffix and rebuild both ends together.
 pub const ALPN: &[u8] = b"grabbr-hop/1";
+
+/// The reason a link closes with when this machine holds no pairing with the
+/// machine at the other end, because it was removed here (#184).
+///
+/// It can only take trust away: the machine that receives it forgets the one
+/// that sent it, and nothing else, and only when it held a pairing with it.
+/// A link carries it only while its TLS identity is proven, so no machine can
+/// send it for another.
+pub(crate) const REMOVED: &[u8] = b"removed";
+
+/// The QUIC transport error for the TLS alert `access_denied` (49): QUIC
+/// carries a TLS alert as `0x100` plus the alert (RFC 9001, section 4.8).
+///
+/// A receiver refuses a dialler it holds no pairing with this way (#184), and
+/// every other refusal as `handshake_failure`, so a dialler that holds a
+/// pairing with the receiver can tell that the receiver removed it.
+pub(crate) const ACCESS_DENIED: u64 = 0x100 + 49;
+
+/// Whether the machine at the other end closed this link because it removed
+/// this machine ([`REMOVED`]).
+pub(crate) fn closed_as_removed(e: &quinn::ConnectionError) -> bool {
+    matches!(e, quinn::ConnectionError::ApplicationClosed(close) if close.reason.as_ref() == REMOVED)
+}
+
+/// Whether the receiver refused this machine's certificate as one it holds
+/// no pairing with ([`ACCESS_DENIED`]).
+pub(crate) fn refused_as_unknown(e: &quinn::ConnectionError) -> bool {
+    matches!(e, quinn::ConnectionError::ConnectionClosed(close)
+        if u64::from(close.error_code) == ACCESS_DENIED)
+}
+
+/// The reason to close a link to `fingerprint` with: [`REMOVED`] when this
+/// machine holds no pairing with it any more, `otherwise` when it does.
+///
+/// Decided from the store, at the moment of closing, rather than by the
+/// caller: removal forgets first and closes after, and whichever of the
+/// closers reaches a link first sends the one reason QUIC keeps.
+pub(crate) fn close_reason(
+    trust: &Trust,
+    fingerprint: &str,
+    otherwise: &'static [u8],
+) -> &'static [u8] {
+    if trust.read().expect("lock").is_known(fingerprint) {
+        otherwise
+    } else {
+        REMOVED
+    }
+}
 
 static INSTALL: Once = Once::new();
 
@@ -219,19 +269,32 @@ impl ClientCertVerifier for FpClientVerifier {
         // admitted far enough to compare it (#167), whichever way the person
         // approving chose control to go (#220). Nothing it sends is read
         // until both machines confirm.
-        let permitted = {
+        let (permitted, known) = {
             let trust = self.trust.read().expect("lock");
-            trust.may_drive_us(&fingerprint) || trust.is_pairing(&fingerprint)
+            (
+                trust.may_drive_us(&fingerprint) || trust.is_pairing(&fingerprint),
+                trust.is_known(&fingerprint),
+            )
         };
         if permitted {
-            Ok(ClientCertVerified::assertion())
-        } else {
-            // This connection's own slot, so the rejection reaches the accept
-            // loop tied to the connection that presented it. One value per
-            // connection: nothing a stranger does grows it.
-            *self.refused.lock().expect("lock") = Some(fingerprint);
+            return Ok(ClientCertVerified::assertion());
+        }
+        // This connection's own slot, so the rejection reaches the accept
+        // loop tied to the connection that presented it. One value per
+        // connection: nothing a stranger does grows it.
+        *self.refused.lock().expect("lock") = Some(fingerprint);
+        if known {
+            // Paired, in the other direction only, or waiting for its number
+            // the other way: said as `handshake_failure`.
             Err(TlsError::General(
                 "no live lease permits that sender to drive this machine".into(),
+            ))
+        } else {
+            // No pairing at all, as for a machine removed here: said as
+            // `access_denied`, which is how a dialler that still holds a
+            // pairing with this machine learns it was removed (#184).
+            Err(TlsError::InvalidCertificate(
+                CertificateError::ApplicationVerificationFailure,
             ))
         }
     }

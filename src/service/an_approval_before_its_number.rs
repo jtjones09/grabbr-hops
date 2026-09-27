@@ -22,7 +22,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// What must happen is waited for this long at most.
 const DEADLINE: Duration = Duration::from_secs(30);
@@ -159,7 +159,10 @@ async fn knock_until_asked(service: &mut Service, fp: &str) -> bool {
 
 /// A frontend connected to the daemon over its IPC socket.
 struct Frontend {
-    lines: tokio::io::Lines<BufReader<tokio::net::UnixStream>>,
+    lines: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    tx: tokio::net::unix::OwnedWriteHalf,
+    /// The token, until the proof is made on the first read.
+    unproven: Option<String>,
 }
 
 impl Frontend {
@@ -168,20 +171,30 @@ impl Frontend {
             unreachable!("a unix socket")
         };
         let token = std::fs::read_to_string(scratch.dir.join("ipc-token")).expect("the token");
-        let mut stream = tokio::net::UnixStream::connect(path)
+        let stream = tokio::net::UnixStream::connect(path)
             .await
             .expect("the daemon's socket");
-        stream
-            .write_all(format!("{}\n", token.trim()).as_bytes())
-            .await
-            .expect("the token is sent");
+        let (rx, tx) = stream.into_split();
         Self {
-            lines: BufReader::new(stream).lines(),
+            lines: BufReader::new(rx).lines(),
+            tx,
+            unproven: Some(token.trim().to_string()),
+        }
+    }
+
+    /// Make the two-way proof, the first time it is read from. The daemon
+    /// answers only while its loop runs, which it does while this is read.
+    async fn prove(&mut self) {
+        if let Some(token) = self.unproven.take() {
+            hops_ipc::prove_to_daemon(self.lines.get_mut(), &mut self.tx, &token)
+                .await
+                .expect("the two-way proof is made");
         }
     }
 
     /// The next event it is sent; `None` once the daemon hangs up.
     async fn next(&mut self) -> Option<FrontendEvent> {
+        self.prove().await;
         while let Ok(Some(line)) = self.lines.next_line().await {
             if let Ok(event) = serde_json::from_str(&line) {
                 return Some(event);
@@ -198,6 +211,29 @@ async fn serve<T>(service: &mut Service, until: impl Future<Output = T>, what: &
         found = until => found,
         _ = tokio::time::sleep(DEADLINE) => panic!("{what}"),
     }
+}
+
+/// A frontend that has made the two-way proof, which the daemon's listener
+/// answers only while it is polled, and before which it sends a frontend
+/// nothing. Polls the listener alone, not the loop, so a test can attach
+/// before it sets up what the loop will tell frontends about.
+async fn attached(service: &mut Service, scratch: &Scratch) -> Frontend {
+    use futures::StreamExt;
+    let mut frontend = Frontend::connect(scratch).await;
+    {
+        let proving = frontend.prove();
+        tokio::pin!(proving);
+        let deadline = tokio::time::sleep(DEADLINE);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                () = &mut proving => break,
+                _ = service.frontend_listener.next() => {}
+                _ = &mut deadline => panic!("the frontend's two-way proof was never answered"),
+            }
+        }
+    }
+    frontend
 }
 
 /// `at` moved back by the pairing window: as if it happened that long ago.
@@ -217,13 +253,13 @@ fn an_approval_that_shows_no_number_within_the_window_is_forgotten() {
         let (mut service, scratch) = daemon("late").await;
         let peer = machine().fingerprint;
         approve(&mut service, &peer, AttemptOrigin::Inbound);
+        let mut frontend = attached(&mut service, &scratch).await;
         let when = service
             .approved
             .get_mut(&peer)
             .expect("the approval is held");
         when.at = a_window_before(when.at);
 
-        let mut frontend = Frontend::connect(&scratch).await;
         let told = serve(
             &mut service,
             async {
@@ -337,6 +373,102 @@ fn a_cancel_forgets_the_approval() {
         assert!(
             knock_until_asked(&mut service, &peer).await,
             "a knock after the cancel was not asked about afresh"
+        );
+        shut_down(service).await;
+    });
+}
+
+/// Removing a device whose approval here waits for its number drops that
+/// approval with its lease (#184, #220): what the card answered goes, the
+/// TLS door stops admitting the machine, the add dial that gives up does
+/// not say this machine approved it, and a knock is asked about afresh, so
+/// pairing it again goes through the card again.
+// LEDGER R184-19 | class B | 2 events over the real IPC socket + 6 struct state: Service::remove_authorized_key
+#[test]
+fn a_removal_drops_an_approval_waiting_for_its_number() {
+    run_local(async {
+        let (mut service, scratch) = daemon("rmap").await;
+        let peer = machine().fingerprint;
+        service.handle_frontend_request(Some(Ok(FrontendRequest::OpenPairing)));
+        service.handle_frontend_request(Some(Ok(FrontendRequest::Create)));
+        let handle = sent(&mut service)
+            .iter()
+            .find_map(|e| match e {
+                FrontendEvent::Created(handle, _, _) => Some(*handle),
+                _ => None,
+            })
+            .expect("a device is created");
+        for request in [
+            FrontendRequest::UpdateFixIps(handle, vec![peer_addr().ip()]),
+            FrontendRequest::UpdatePort(handle, peer_addr().port()),
+            FrontendRequest::Activate(handle, true),
+        ] {
+            service.handle_frontend_request(Some(Ok(request)));
+        }
+        assert!(
+            service.adding.contains_key(&handle),
+            "the add dial did not start"
+        );
+        service.raise_connection_attempt(
+            peer.clone(),
+            AttemptOrigin::OutboundDial,
+            Some(peer_addr()),
+        );
+        service.handle_frontend_request(Some(Ok(FrontendRequest::AuthorizeKey {
+            label: "desk b".into(),
+            fingerprint: peer.clone(),
+            controller: hops_ipc::Controller::Both,
+            clipboard: true,
+        })));
+        assert!(
+            service.trust.read().expect("lock").is_pairing(&peer),
+            "precondition: the approval waits for its number: {:?}",
+            notices(&sent(&mut service))
+        );
+        sent(&mut service);
+
+        service
+            .handle_frontend_request(Some(Ok(FrontendRequest::RemoveAuthorizedKey(peer.clone()))));
+        {
+            let trust = service.trust.read().expect("lock");
+            assert!(
+                !trust.is_known(&peer) && !trust.is_pairing(&peer),
+                "the removal left the approval's lease, and the TLS doors still admit \
+                 the machine"
+            );
+        }
+
+        let mut frontend = attached(&mut service, &scratch).await;
+        let started = service.adding.get_mut(&handle).expect("still adding");
+        *started = a_window_before(*started);
+        // The loop sets up capture for every device switched on as it starts,
+        // and this one was switched on before it ran: undo that here.
+        service.capture.destroy(handle);
+        let gave_up = serve(
+            &mut service,
+            async {
+                while let Some(event) = frontend.next().await {
+                    if let FrontendEvent::Error(text) = event {
+                        if text.contains("did not finish") {
+                            return Some(text);
+                        }
+                    }
+                }
+                None
+            },
+            "an add dial past the pairing window never gave up",
+        )
+        .await;
+        assert!(
+            gave_up
+                .as_deref()
+                .is_some_and(|t| !t.contains("this machine approved")),
+            "the add dial says this machine approved a pairing that was removed: \
+             the approval outlived the removal: {gave_up:?}"
+        );
+        assert!(
+            knock_until_asked(&mut service, &peer).await,
+            "a knock after the removal was not asked about afresh"
         );
         shut_down(service).await;
     });
