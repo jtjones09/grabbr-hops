@@ -468,6 +468,11 @@ impl Ticket {
                     // Ended here, or another took its place: quiet.
                     None => return Err(None),
                     Some(h) if h.stage == Stage::Over => return Err(None),
+                    // Still this attempt, by the board: the other machine
+                    // closed it.
+                    Some(_) if held_back && conn.close_reason().is_some() => {
+                        return Err(Some(Why::Closed));
+                    }
                     Some(_) if held_back => {}
                     Some(h) => {
                         h.shown = true;
@@ -477,7 +482,10 @@ impl Ticket {
             }
             tokio::select! {
                 _ = self.wake.notified() => {}
-                _ = conn.closed() => return Err(self.why_closed(conn)),
+                // Read against the board above, never on its own: taking
+                // this attempt's place here closes its connection too, and
+                // either may be seen first.
+                _ = conn.closed() => {}
                 _ = tokio::time::sleep_until(self.deadline) => {
                     return Err((self.stage() != Stage::Over).then_some(Why::TimedOut));
                 }
@@ -1581,6 +1589,54 @@ mod on_the_wire {
                 );
                 drop((xl, xh, zl, zh));
             }
+        });
+    }
+
+    // LEDGER G-31 | class B | 1 return value: Ticket::show on a real connection, held back and waiting, when the attempt that supersedes it is held on the same board
+    /// A number held back for the dial of the machine sorting first, and then
+    /// given up here for that dial, ends quietly: its holder is already
+    /// waiting when it is given up, and closing its connection is part of
+    /// giving it up, so what it reads of that close must not speak for it.
+    /// The approval stays with the attempt that took its place (#220).
+    #[test]
+    fn a_number_held_back_and_given_up_here_ends_quietly() {
+        run_local(async {
+            let (one, two) = (machine(), machine());
+            let (low, high) = if one.fingerprint < two.fingerprint {
+                (one, two)
+            } else {
+                (two, one)
+            };
+            let (lf, hf) = (low.fingerprint.clone(), high.fingerprint.clone());
+            let on_low = raw_receiver(low.clone(), &high);
+            let from_high = raw_dialer(high.clone(), &low);
+            let mut ends = Vec::new();
+            for _ in 0..2 {
+                let (dialled, arrived) =
+                    tokio::join!(from_high.connect(on_low.port), on_low.next(WITHIN));
+                ends.push((dialled.expect("a dial"), arrived.expect("its other end")));
+            }
+            let (pairings, _events) = Pairings::new();
+            // At the machine sorting first: the other's dial, which it picks
+            // on, then its own, which it shows on and both machines keep.
+            let given_up = pairings.begin(Role::Pick, &lf, &hf).expect("first");
+            let kept = pairings.begin(Role::Show, &lf, &hf).expect("second");
+            let ticket = given_up.hold(&ends[0].1).expect("nothing held yet");
+            let shown = ticket.show(&ends[0].1);
+            let mut shown = std::pin::pin!(shown);
+            assert!(
+                futures::poll!(shown.as_mut()).is_pending(),
+                "a number on the dial not kept was shown while the kept one was compared"
+            );
+            let _kept = kept
+                .hold(&ends[1].1)
+                .expect("the kept dial takes its place");
+            assert_eq!(
+                shown.await,
+                Err(None),
+                "a number given up here for the one kept said why it ended, ending the \
+                 approval that one carries"
+            );
         });
     }
 
