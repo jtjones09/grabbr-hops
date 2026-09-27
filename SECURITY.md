@@ -46,6 +46,11 @@ Out of scope:
 - vulnerabilities in a dependency that hops does not reach. Report those to
   the dependency; report them here too if hops is affected.
 
+## Security model
+
+[docs/SECURITY.md](docs/SECURITY.md) states what pairing protects against,
+what it cannot protect against, and how to remove a machine or recover one.
+
 ## Verifying a release
 
 `SHA256SUMS` in each release holds the SHA-256 of every other asset, and

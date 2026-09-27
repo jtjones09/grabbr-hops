@@ -20,10 +20,11 @@ part of the **grabbr** suite · repo: **grabbr-hops** · a fork of
   (quinn + rustls). Peers are pinned by public-key fingerprint, so only machines
   you've explicitly paired can connect (see [Security](#security)).
 - **Explicit pairing** — a new machine shows up as a pairing request with its
-  fingerprint; you approve it on both machines, saying which machine controls
-  which and whether to share the clipboard (off unless you say so), then compare
-  a six-digit number (the machine you added from shows it, the other picks it
-  from three), and the trust persists.
+  fingerprint, and only while add device is open; you approve it on both
+  machines, saying which machine controls which and whether to share the
+  clipboard (off unless you say so), then compare a six-digit number (the
+  machine you added from shows it, the other picks it from three), and the
+  trust persists.
 - **Three ways to drive it** — a native **GUI**, a **terminal UI** for SSH /
   keyboard-driven use, and a **system-tray** icon; all attach to the same
   background daemon.
@@ -90,10 +91,12 @@ cargo build --release --no-default-features --features "tui slint"
 ## Connect two machines
 
 1. Both machines are running hops now.
-2. On both, open **+ add**. On one, add the other machine: its IP address and
-   which screen edge it sits on (left/right/top/bottom).
-3. Each machine shows a **pairing request** with a fingerprint — name it and hit
-   **trust & name** on both.
+2. On both, open **+ add**: a machine shows a pairing request only for two
+   minutes after add was opened on it. On one, add the other machine: its IP
+   address and which screen edge it sits on (left/right/top/bottom).
+3. Each machine shows a **pairing request** with a fingerprint. On both, choose
+   which machine is in control (this one, that one, or both) and whether to
+   share the clipboard, name it, and hit **trust & name**.
 4. The machine you added from shows a six-digit number; the other asks which of
    three numbers it sees. Pick it there and **confirm** here. A wrong pick ends
    the attempt and nothing is trusted. Just once per pair.
@@ -155,6 +158,12 @@ usual.
   number; the number does not vouch for the machine you chose to add.
 - **No cloud, no accounts:** machines connect directly over your LAN. There is no
   relay and no telemetry.
+- **Removal:** removing a device ends its pairing at once and tells it if it is
+  connected. hops keeps no record of it; to use it again, pair again.
+
+What pairing cannot protect against, such as another program running as your
+user, and how to remove a lost machine or recover one that no longer connects,
+are in [docs/SECURITY.md](docs/SECURITY.md).
 
 Trust, config, and the keypair live in `~/.config/lan-mouse/` (Linux/macOS) or
 `%LOCALAPPDATA%\lan-mouse\` (Windows).
@@ -170,4 +179,6 @@ what this fork changes are in [NOTICE.md](NOTICE.md). All original copyright is
 preserved in the git history.
 
 Licensed under the **GNU General Public License v3.0 or later** — see
-[LICENSE](LICENSE).
+[LICENSE](LICENSE). Builds with the graphical interface include Slint, used
+under GPL-3.0-only, so those binaries are distributed under GPL-3.0 only (see
+[NOTICE.md](NOTICE.md)).
