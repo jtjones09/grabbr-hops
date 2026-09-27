@@ -26,6 +26,24 @@ use crate::{
     trust::{Caps, TrustStore},
 };
 
+/// The approval a person gives on a pairing card (#220, #182): the machine
+/// named `label`, `controller` saying which way control goes, and the
+/// clipboard left as it starts, off. The daemon tests that send it run on
+/// unix, where they reach its IPC socket.
+#[cfg(unix)]
+pub(crate) fn approval(
+    label: &str,
+    fingerprint: &str,
+    controller: hops_ipc::Controller,
+) -> hops_ipc::FrontendRequest {
+    hops_ipc::FrontendRequest::AuthorizeKey {
+        label: label.to_string(),
+        fingerprint: fingerprint.to_string(),
+        controller,
+        clipboard: false,
+    }
+}
+
 /// Run `f` the way the daemon runs: one thread, inside a `LocalSet`.
 pub(crate) fn run_local<F: Future>(f: F) -> F::Output {
     transport::install_crypto_provider();
@@ -37,6 +55,7 @@ pub(crate) fn run_local<F: Future>(f: F) -> F::Output {
 }
 
 /// One machine's identity.
+#[derive(Clone)]
 pub(crate) struct Machine {
     pub(crate) identity: Arc<Identity>,
     pub(crate) fingerprint: String,

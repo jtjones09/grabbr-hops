@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use hops_ipc::{
-    AsyncFrontendEventReader, AsyncFrontendRequestWriter, AttemptOrigin, DaemonEndpoint,
-    FrontendEvent, FrontendRequest, PairingCheck, Position,
+    AsyncFrontendEventReader, AsyncFrontendRequestWriter, AttemptOrigin, Controller,
+    DaemonEndpoint, FrontendEvent, FrontendRequest, PairingCheck, Position,
 };
 
 /// How long anything that must happen may take, under a loaded test run.
@@ -306,7 +306,13 @@ async fn pair(m: &mut Machines) -> Result<u64, String> {
     .ok_or("the laptop's dial raised no prompt")?;
     ask(
         &mut m.ra,
-        FrontendRequest::AuthorizeKey("desk".into(), m.fp_b.clone()),
+        // the laptop adds the desk to control it (#220)
+        FrontendRequest::AuthorizeKey {
+            label: "desk".into(),
+            fingerprint: m.fp_b.clone(),
+            controller: Controller::ThisMachine,
+            clipboard: false,
+        },
     )
     .await;
     until(
@@ -318,7 +324,13 @@ async fn pair(m: &mut Machines) -> Result<u64, String> {
     .ok_or_else(|| format!("the desk was never asked; its log:\n{}", m.desk.log()))?;
     ask(
         &mut m.rb,
-        FrontendRequest::AuthorizeKey("laptop".into(), m.fp_a.clone()),
+        // and the desk lets the laptop control it (#220)
+        FrontendRequest::AuthorizeKey {
+            label: "laptop".into(),
+            fingerprint: m.fp_a.clone(),
+            controller: Controller::ThatMachine,
+            clipboard: false,
+        },
     )
     .await;
     let fp_b = m.fp_b.clone();

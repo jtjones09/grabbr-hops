@@ -311,10 +311,12 @@ async fn an_admitted_pairing_request_names_its_address_is_logged_and_survives_a_
     other.knock(port).await;
     let _ = events_for(&mut first, Duration::from_secs(2)).await;
     requests
-        .request(FrontendRequest::AuthorizeKey(
-            "laptop".to_owned(),
-            laptop.fingerprint.clone(),
-        ))
+        .request(FrontendRequest::AuthorizeKey {
+            label: "laptop".to_owned(),
+            fingerprint: laptop.fingerprint.clone(),
+            controller: hops_ipc::Controller::ThatMachine,
+            clipboard: false,
+        })
         .await
         .expect("approval sent");
     let after_approval = events_for(&mut first, Duration::from_secs(3)).await;

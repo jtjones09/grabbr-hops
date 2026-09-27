@@ -82,6 +82,7 @@ use crate::trust::{
     Caps, Expiry, Lease, Origin, TrustError, TrustStore, existing_pairing_clipboard,
 };
 
+use hops_ipc::Controller;
 use hops_ipc::identity::canonical_fingerprint;
 
 use crate::authority::{Authority, AuthorityError, SignatureAlg, verify};
@@ -141,7 +142,7 @@ const OLDER_BUILD_CEILING_SECS: u64 = 400 * 86_400;
 /// so builds on both sides of #183 could share one config directory. Version 2
 /// keeps writing the same date, which no build reads: [`rebuild`] makes every
 /// active lease [`Expiry::Never`].
-fn expiry_older_builds_accept(issued_at: u64) -> u64 {
+pub(crate) fn expiry_older_builds_accept(issued_at: u64) -> u64 {
     issued_at.saturating_add(OLDER_BUILD_CEILING_SECS)
 }
 
@@ -243,6 +244,14 @@ pub enum DiskOrigin {
     OutboundDial,
     /// Carried forward from `[authorized_fingerprints]` by [`TrustStore::migrate_from_config`].
     Migrated,
+    /// The person approving chose that this machine controls the peer
+    /// (#220). The lease drives in exactly the chosen direction; a record
+    /// whose capabilities say otherwise is refused when the store loads.
+    ChosenIMayDrive,
+    /// The person approving chose that the peer controls this machine.
+    ChosenDriveMe,
+    /// The person approving chose that each controls the other.
+    ChosenBoth,
     // No `Restored`. Removal forgets the machine, so one that comes back is a
     // first contact: it arrives as `Inbound` or `OutboundDial` (#184).
 }
@@ -1149,6 +1158,9 @@ pub fn rebuild(
                         DiskOrigin::Inbound => Origin::Inbound,
                         DiskOrigin::OutboundDial => Origin::OutboundDial,
                         DiskOrigin::Migrated => Origin::Migrated,
+                        DiskOrigin::ChosenIMayDrive => Origin::Chosen(Controller::ThisMachine),
+                        DiskOrigin::ChosenDriveMe => Origin::Chosen(Controller::ThatMachine),
+                        DiskOrigin::ChosenBoth => Origin::Chosen(Controller::Both),
                     },
                     issued_at: r.issued_at,
                     // Not `r.expires_at`. Builds from before #183 wrote 30
@@ -1357,6 +1369,9 @@ pub fn records_of(store: &TrustStore) -> Vec<LeaseRecord> {
                     Origin::Inbound => DiskOrigin::Inbound,
                     Origin::OutboundDial => DiskOrigin::OutboundDial,
                     Origin::Migrated => DiskOrigin::Migrated,
+                    Origin::Chosen(Controller::ThisMachine) => DiskOrigin::ChosenIMayDrive,
+                    Origin::Chosen(Controller::ThatMachine) => DiskOrigin::ChosenDriveMe,
+                    Origin::Chosen(Controller::Both) => DiskOrigin::ChosenBoth,
                 },
                 issued_at: l.issued_at,
                 // Never absent. A build from before #183 refuses to start on
@@ -2378,8 +2393,15 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
         let (mut file, _) = TrustFile::open(&d, auth.clone()).expect("open");
         let mut store = TrustStore::new(&ours(), file.now()).expect("ours");
 
-        grant_for_attempt(&mut store, B, "desk mac", Some(AttemptOrigin::Inbound))
-            .expect("the first approval grants");
+        grant_for_attempt(
+            &mut store,
+            B,
+            "desk mac",
+            Some(AttemptOrigin::Inbound),
+            hops_ipc::Controller::ThatMachine,
+            true,
+        )
+        .expect("the first approval grants");
         store
             .confirm(B)
             .expect("both machines confirmed the number");
@@ -2388,6 +2410,8 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
             B,
             "b4:ab short name",
             Some(AttemptOrigin::OutboundDial),
+            hops_ipc::Controller::ThisMachine,
+            false,
         )
         .expect("the second approval grants");
         file.save(&records_of(&store)).expect("save");
@@ -2399,9 +2423,10 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
         let (store, refused) = rebuild(&ours(), file.now(), &leases).expect("rebuild");
         assert!(refused.is_empty(), "refused on load: {refused:?}");
 
+        // Both directions, and the clipboard the first approval said yes to.
         let lost: Vec<String> = Caps::NAMED
             .iter()
-            .filter(|(bit, _)| !store.permits(B, *bit))
+            .filter(|(bit, _)| *bit != Caps::CLIPBOARD_TO && !store.permits(B, *bit))
             .map(|(_, name)| (*name).to_owned())
             .collect();
         assert!(
@@ -2419,11 +2444,129 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
         );
         assert_eq!(
             store.lease(B).map(|l| l.origin),
-            Some(Origin::Migrated),
-            "a pairing that holds both directions was saved as coming from \
-             one approval; two approvals add up to what `origin_of` names"
+            Some(Origin::Chosen(hops_ipc::Controller::Both)),
+            "a pairing that holds both directions, each chosen, was saved as \
+             something else; two chosen directions add up to the choice that \
+             names both (#220)"
         );
         let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Each answer on the pairing card, with and without the clipboard,
+    /// survives the save and a restart as it was given (#220, #182): the
+    /// direction recorded as chosen, and the store granting what it granted
+    /// before. Read back any other way, the store refuses the pairing as not
+    /// what was chosen, and it is lost at the next start.
+    // LEDGER T12 | class B | 4 file on disk + 1 return value: service::grant_for_attempt, records_of, TrustFile::save, TrustFile::open, rebuild
+    #[test]
+    fn every_answer_on_the_card_survives_a_restart() {
+        use crate::service::grant_for_attempt;
+        use hops_ipc::{AttemptOrigin, Controller};
+
+        for (controller, written) in [
+            (Controller::ThisMachine, DiskOrigin::ChosenIMayDrive),
+            (Controller::ThatMachine, DiskOrigin::ChosenDriveMe),
+            (Controller::Both, DiskOrigin::ChosenBoth),
+        ] {
+            for clipboard in [false, true] {
+                let d = tmpdir("every-answer");
+                let auth = authority(&d);
+                let (mut file, _) = TrustFile::open(&d, auth.clone()).expect("open");
+                let mut store = TrustStore::new(&ours(), file.now()).expect("ours");
+                grant_for_attempt(
+                    &mut store,
+                    B,
+                    "desk mac",
+                    Some(AttemptOrigin::Inbound),
+                    controller,
+                    clipboard,
+                )
+                .expect("the approval grants");
+                store
+                    .confirm(B)
+                    .expect("both machines confirmed the number");
+                let granted = store.capabilities(B);
+                let records = records_of(&store);
+                assert_eq!(
+                    records
+                        .iter()
+                        .find(|r| r.fingerprint == B)
+                        .map(|r| r.origin),
+                    Some(written),
+                    "{controller:?}, clipboard {clipboard}: the answer was written as another"
+                );
+                file.save(&records).expect("save");
+
+                let (file, loaded) = TrustFile::open(&d, auth).expect("reopen");
+                let Loaded::Present { leases, .. } = loaded else {
+                    panic!("the saved store must be found");
+                };
+                let (store, refused) = rebuild(&ours(), file.now(), &leases).expect("rebuild");
+                assert!(
+                    refused.is_empty(),
+                    "{controller:?}, clipboard {clipboard}: refused at the next start: \
+                     {refused:?}"
+                );
+                assert_eq!(
+                    (store.lease(B).map(|l| l.origin), store.capabilities(B)),
+                    (Some(Origin::Chosen(controller)), granted),
+                    "{controller:?}, clipboard {clipboard}: a restart changed the pairing"
+                );
+                let _ = fs::remove_dir_all(&d);
+            }
+        }
+    }
+
+    /// A second approval to a pairing in force asks the clipboard question
+    /// again (#182), for the direction it adds: a yes shares the clipboard
+    /// that way, and a no leaves the clipboard the first answer gave.
+    // LEDGER T13 | class B | 1 return value: service::grant_for_attempt twice, TrustStore::capabilities
+    #[test]
+    fn a_second_approval_answers_the_clipboard_for_the_direction_it_adds() {
+        use crate::service::grant_for_attempt;
+        use hops_ipc::{AttemptOrigin, Controller};
+
+        for (first, second, want) in [
+            (
+                false,
+                true,
+                Caps::DRIVE_ME | Caps::I_MAY_DRIVE | Caps::CLIPBOARD_TO,
+            ),
+            (
+                true,
+                false,
+                Caps::DRIVE_ME | Caps::I_MAY_DRIVE | Caps::CLIPBOARD_FROM,
+            ),
+        ] {
+            let mut store = TrustStore::new(&ours(), NOW).expect("ours");
+            grant_for_attempt(
+                &mut store,
+                B,
+                "desk mac",
+                Some(AttemptOrigin::Inbound),
+                Controller::ThatMachine,
+                first,
+            )
+            .expect("the first approval grants");
+            store
+                .confirm(B)
+                .expect("both machines confirmed the number");
+            grant_for_attempt(
+                &mut store,
+                B,
+                "desk mac",
+                Some(AttemptOrigin::OutboundDial),
+                Controller::ThisMachine,
+                second,
+            )
+            .expect("the second approval grants");
+            assert_eq!(
+                store.capabilities(B),
+                want,
+                "clipboard {first} on the first approval, then {second} on the second: the \
+                 pairing does not share the clipboard the answers gave"
+            );
+        }
     }
     // -- schema 2 (#187) ----------------------------------------------------
 
@@ -2599,8 +2742,16 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
         // What the pairings grant is unchanged, before and after a restart.
         let (_, reloaded) = start_in(&d, &auth);
         for s in [&store, &reloaded] {
-            assert_eq!(s.capabilities(A), Caps::INBOUND, "{A}");
-            assert_eq!(s.capabilities(B), Caps::OUTBOUND, "{B}");
+            assert_eq!(
+                s.capabilities(A),
+                Caps::DRIVE_ME | existing_pairing_clipboard(Caps::DRIVE_ME),
+                "{A}"
+            );
+            assert_eq!(
+                s.capabilities(B),
+                Caps::I_MAY_DRIVE | existing_pairing_clipboard(Caps::I_MAY_DRIVE),
+                "{B}"
+            );
         }
         let _ = fs::remove_dir_all(&d);
     }
@@ -2608,7 +2759,8 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
     /// Approving the other direction of a pairing adds that direction (#166)
     /// and leaves a clipboard switched off, off: approved in the run that
     /// switched it off, or in a later one that read the choice back from disk,
-    /// and across a restart after the approval too.
+    /// and across a restart after the approval too. A yes on that approval's
+    /// card answers for the direction it adds, and only that one (#182).
     // LEDGER E2A-3 | class B | 4 file on disk: service::grant_for_attempt, TrustStore::disable_clipboard, TrustFile::save, start
     #[test]
     fn approving_the_second_direction_keeps_the_clipboard_off() {
@@ -2624,8 +2776,15 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
             let auth = authority(&d);
             let (mut file, _) = TrustFile::open(&d, auth.clone()).expect("open");
             let mut store = TrustStore::new(&ours(), file.now()).expect("ours");
-            grant_for_attempt(&mut store, B, "desk mac", Some(AttemptOrigin::Inbound))
-                .expect("the first approval grants");
+            grant_for_attempt(
+                &mut store,
+                B,
+                "desk mac",
+                Some(AttemptOrigin::Inbound),
+                hops_ipc::Controller::ThatMachine,
+                true,
+            )
+            .expect("the first approval grants");
             store
                 .confirm(B)
                 .expect("both machines confirmed the number");
@@ -2639,8 +2798,18 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
                 std::mem::drop(file);
                 (file, store) = start_in(&d, &auth);
             }
-            grant_for_attempt(&mut store, B, "desk mac", Some(AttemptOrigin::OutboundDial))
-                .expect("the second approval grants");
+            // A yes to the clipboard, on the approval of the other direction,
+            // shares it the way that direction goes, and does not turn back
+            // on the clipboard switched off.
+            grant_for_attempt(
+                &mut store,
+                B,
+                "desk mac",
+                Some(AttemptOrigin::OutboundDial),
+                hops_ipc::Controller::ThisMachine,
+                true,
+            )
+            .expect("the second approval grants");
             file.save(&records_of(&store)).expect("save");
             let (_, reloaded) = start_in(&d, &auth);
 
@@ -2654,12 +2823,12 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
                      not drive both ways: {}",
                     s.capabilities(B)
                 );
-                assert!(
-                    !s.capabilities(B).intersects(Caps::CLIPBOARD),
-                    "second direction approved {approved}: {when}, the clipboard is \
-                     back on: {}. It was switched off, and an approval to drive is \
-                     not an answer about the clipboard",
-                    s.capabilities(B)
+                assert_eq!(
+                    s.capabilities(B).intersection(Caps::CLIPBOARD),
+                    Caps::CLIPBOARD_TO,
+                    "second direction approved {approved}: {when}, the clipboard is not \
+                     what the answers gave: switched off the way the first direction \
+                     goes, and a yes for the way the second goes"
                 );
             }
             let _ = fs::remove_dir_all(&d);
@@ -2679,13 +2848,27 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
         let auth = authority(&d);
         let (mut file, _) = TrustFile::open(&d, auth.clone()).expect("open");
         let mut store = TrustStore::new(&ours(), file.now()).expect("ours");
-        grant_for_attempt(&mut store, B, "desk mac", Some(AttemptOrigin::Inbound))
-            .expect("the first approval");
+        grant_for_attempt(
+            &mut store,
+            B,
+            "desk mac",
+            Some(AttemptOrigin::Inbound),
+            hops_ipc::Controller::ThatMachine,
+            false,
+        )
+        .expect("the first approval");
         store
             .confirm(B)
             .expect("both machines confirmed the number");
-        grant_for_attempt(&mut store, B, "desk mac", Some(AttemptOrigin::OutboundDial))
-            .expect("the second approval");
+        grant_for_attempt(
+            &mut store,
+            B,
+            "desk mac",
+            Some(AttemptOrigin::OutboundDial),
+            hops_ipc::Controller::ThisMachine,
+            false,
+        )
+        .expect("the second approval");
         assert!(
             !store.is_pairing(B),
             "a second direction asked for the number again"

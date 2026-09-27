@@ -36,8 +36,9 @@ use std::{
 
 use hops_frontend_core::{
     AppModel, ApprovalRefused, AttemptOrigin, CaptureState, ClientHandle, Clipboard, Connection,
-    Device, DeviceSend, FrontendClient, FrontendRequest, Launch, PairingAttempt, PairingCard,
-    PairingCheck, PairingCheckCard, Position, Status, Tone, TrustState,
+    Controller, Device, DeviceSend, FrontendClient, FrontendRequest, Launch, PairingAnswers,
+    PairingAttempt, PairingCard, PairingCheck, PairingCheckCard, Position, Status, Tone,
+    TrustState,
     prefs::Frontend,
     spaced_number,
     theme::{self, Rgb, Theme},
@@ -66,16 +67,43 @@ pub enum TuiError {
     Io(#[from] io::Error),
 }
 
-/// `y` on the pairing prompt: the name prompt for `fp`, bound to that machine,
-/// if the prompt has shown it long enough for the key to have been meant for
-/// it (#168).
-fn approve_prompt(card: &PairingCard, fp: String, now: Instant) -> Result<Input, ApprovalRefused> {
+/// `y` on the pairing prompt: the name prompt for `fp`, bound to that machine
+/// and to the answers given for it, if the prompt has shown it long enough
+/// for the key to have been meant for it (#168) and someone said which way
+/// control goes (#220).
+fn approve_prompt(
+    card: &PairingCard,
+    answers: &PairingAnswers,
+    fp: String,
+    now: Instant,
+) -> Result<Input, ApprovalRefused> {
     card.approve(&fp, now)?;
+    // Checked now, so the name prompt never opens for an approval that
+    // cannot be sent; the request itself is built when the name is.
+    answers.approval(&fp, "")?;
     Ok(Input::TrustedName {
         fp,
         buf: String::new(),
-        granting: true,
+        grant: answers.controller.map(|c| (c, answers.clipboard)),
     })
+}
+
+/// A key on the pairing prompt that answers one of its questions (#220,
+/// #182): `1` this machine controls that one, `2` that one controls this
+/// one, `3` each controls the other, and `c` the clipboard, yes or no.
+/// `true` when the key was one of those.
+fn answer_key(answers: &mut PairingAnswers, code: KeyCode) -> bool {
+    match code {
+        KeyCode::Char(d @ '1'..='3') => {
+            answers.controller = Controller::ALL.get(d as usize - '1' as usize).copied();
+            true
+        }
+        KeyCode::Char('c') => {
+            answers.clipboard = !answers.clipboard;
+            true
+        }
+        _ => false,
+    }
 }
 
 /// A key on the number card, as the request it sends (#11, #167): `y`
@@ -114,14 +142,15 @@ enum Input {
         pin: Option<String>,
         buf: String,
     },
-    /// Naming a peer. `granting` distinguishes the two things this used to
-    /// conflate: approving a NEW device (a trust grant) versus renaming one that
-    /// is already trusted. They were the same wire request, so a rename could
-    /// not be expressed without also expressing "trust this fingerprint".
+    /// Naming a peer. `grant` distinguishes the two things this used to
+    /// conflate: approving a NEW device (a trust grant, with the answers its
+    /// card was given) versus renaming one that is already trusted (`None`).
+    /// They were the same wire request, so a rename could not be expressed
+    /// without also expressing "trust this fingerprint".
     TrustedName {
         fp: String,
         buf: String,
-        granting: bool,
+        grant: Option<(Controller, bool)>,
     },
     /// Editing the daemon's listen port.
     Port { buf: String },
@@ -184,7 +213,7 @@ fn name_input(d: &Device) -> Option<Input> {
         (None, Some(fp)) if d.receive => Some(Input::TrustedName {
             fp: fp.clone(),
             buf: d.label.clone(),
-            granting: false,
+            grant: None,
         }),
         _ => None,
     }
@@ -392,6 +421,9 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
     // request is live, so another machine asking cannot take over the prompt
     // between reading it and pressing `y` (#168).
     let mut card = PairingCard::default();
+    // What was answered on that prompt: which way control goes, and the
+    // clipboard (#220, #182).
+    let mut answers = PairingAnswers::default();
     let mut show_log = false;
     let mut notice: Option<(String, Instant)> = opening;
     // The model's error sequence last put in the footer.
@@ -455,6 +487,11 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                 dismissed.get(fp).is_some_and(|t| t.elapsed() < DISMISS_TTL)
             })
             .cloned();
+        // The answers belong to the machine on the prompt, and go when it
+        // changes (#168).
+        if let Some(p) = &pairing {
+            answers.for_card(&p.fingerprint);
+        }
 
         let mut list_state = ListState::default();
         if count > 0 {
@@ -471,6 +508,7 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                 input.as_ref(),
                 confirm.as_ref(),
                 pairing.as_ref(),
+                &answers,
                 notice.as_ref().map(|(m, _)| m.as_str()),
                 show_log,
                 theme,
@@ -517,20 +555,28 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                                         fingerprint: pin,
                                     });
                                 }
-                                Input::TrustedName { fp, buf, granting } => {
-                                    let desc = if buf.trim().is_empty() {
-                                        // same fallback the GUI uses, so a peer
-                                        // approved with no name gets one name
-                                        hops_frontend_core::fallback_label(&fp)
-                                    } else {
-                                        buf.trim().to_string()
-                                    };
-                                    if granting {
-                                        client.request(FrontendRequest::AuthorizeKey(desc, fp));
-                                    } else {
+                                Input::TrustedName { fp, buf, grant } => match grant {
+                                    // the same request, and the same fallback
+                                    // name, the GUI sends
+                                    Some((controller, clipboard)) => {
+                                        if let Ok(request) = hops_frontend_core::approval_request(
+                                            &fp,
+                                            &buf,
+                                            Some(controller),
+                                            clipboard,
+                                        ) {
+                                            client.request(request);
+                                        }
+                                    }
+                                    None => {
+                                        let desc = if buf.trim().is_empty() {
+                                            hops_frontend_core::fallback_label(&fp)
+                                        } else {
+                                            buf.trim().to_string()
+                                        };
                                         client.request(FrontendRequest::SetLabel(fp, desc));
                                     }
-                                }
+                                },
                                 Input::Port { buf } => {
                                     if let Ok(port) = buf.trim().parse::<u16>() {
                                         client.request(FrontendRequest::ChangePort(port));
@@ -575,12 +621,16 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                             // The name prompt that follows is bound to this
                             // machine, and only if the prompt has shown it long
                             // enough for the key to have been meant for it.
-                            KeyCode::Char('y') => match approve_prompt(&card, fp, Instant::now()) {
-                                Ok(naming) => input = Some(naming),
-                                Err(refused) => {
-                                    notice = Some((refused.notice().to_string(), Instant::now()));
+                            KeyCode::Char('y') => {
+                                match approve_prompt(&card, &answers, fp, Instant::now()) {
+                                    Ok(naming) => input = Some(naming),
+                                    Err(refused) => {
+                                        notice =
+                                            Some((refused.notice().to_string(), Instant::now()));
+                                    }
                                 }
-                            },
+                            }
+                            code if answer_key(answers.for_card(&fp), code) => {}
                             KeyCode::Char('n') | KeyCode::Esc => {
                                 dismissed.insert(fp, Instant::now());
                             }
@@ -1070,6 +1120,7 @@ fn ui(
     input: Option<&Input>,
     confirm: Option<&Confirm>,
     pairing: Option<&PairingAttempt>,
+    answers: &PairingAnswers,
     notice: Option<&str>,
     show_log: bool,
     theme: &Theme,
@@ -1243,6 +1294,7 @@ fn ui(
                 &attempt.fingerprint,
                 Some(attempt.origin),
                 attempt.addr,
+                answers,
                 theme,
             );
         }
@@ -1380,11 +1432,12 @@ fn pairing_popup(
     fp: &str,
     origin: Option<AttemptOrigin>,
     addr: Option<std::net::SocketAddr>,
+    answers: &PairingAnswers,
     theme: &Theme,
 ) {
     let ours = origin == Some(AttemptOrigin::OutboundDial);
     // one extra row when there is an address line to render
-    let area = centered_rect(70, if addr.is_some() { 10 } else { 9 }, f.area());
+    let area = centered_rect(70, if addr.is_some() { 13 } else { 12 }, f.area());
     let base = Style::default()
         .bg(col(theme.background))
         .fg(col(theme.foreground));
@@ -1417,7 +1470,7 @@ fn pairing_popup(
                 // We went looking for it. Nobody knocked — do not imply they did.
                 "This machine dialled out and found an untrusted device:"
             } else {
-                "An untrusted device wants to control this machine:"
+                "An untrusted device asks to pair with this machine:"
             },
             base,
         )),
@@ -1426,13 +1479,52 @@ fn pairing_popup(
         // fingerprint is opaque to them.
         Line::from(Span::styled(fp.to_string(), muted)),
         Line::from(Span::raw("")),
+        // Asked, never assumed (#220): nothing is marked until a key is
+        // pressed, and approving waits for it.
+        Line::from(Span::styled("Which machine is in control?", base)),
+    ];
+    for (i, c) in Controller::ALL.into_iter().enumerate() {
+        let chosen = answers.controller == Some(c);
+        body.push(Line::from(vec![
+            Span::styled(format!("  {} ", i + 1), key),
+            Span::styled(
+                if chosen { "(*) " } else { "( ) " },
+                if chosen { key } else { muted },
+            ),
+            Span::styled(c.describe(), if chosen { base } else { muted }),
+        ]));
+    }
+    body.push(Line::from(vec![
+        Span::styled("  c ", key),
+        Span::styled(
+            if answers.clipboard { "[x] " } else { "[ ] " },
+            if answers.clipboard { key } else { muted },
+        ),
+        Span::styled(
+            if answers.clipboard {
+                "share the clipboard: yes, the way control goes"
+            } else {
+                "share the clipboard: no"
+            },
+            if answers.clipboard { base } else { muted },
+        ),
+    ]));
+    body.push(Line::from(Span::raw("")));
+    body.push(if answers.controller.is_some() {
         Line::from(vec![
             Span::styled("y", key),
             Span::styled(" trust & name      ", muted),
             Span::styled("n", key),
             Span::styled(" deny (for now)", muted),
-        ]),
-    ];
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("1 2 3", key),
+            Span::styled(" choose first      ", muted),
+            Span::styled("n", key),
+            Span::styled(" deny (for now)", muted),
+        ])
+    });
     if let Some(a) = addr {
         // our dial: the address that answered (#93); a knock: where from (#83)
         let line = if ours {
@@ -1773,7 +1865,17 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
         term.draw(|f| {
             ui(
-                f, model, &devices, &mut state, None, None, None, None, false, &theme,
+                f,
+                model,
+                &devices,
+                &mut state,
+                None,
+                None,
+                None,
+                &Default::default(),
+                None,
+                false,
+                &theme,
             )
         })
         .expect("draw");
@@ -1891,6 +1993,7 @@ mod tests {
                 None,
                 None,
                 pairing.as_ref(),
+                &Default::default(),
                 None,
                 false,
                 &theme,
@@ -1910,6 +2013,116 @@ mod tests {
             out.contains("we dialled this device") && out.contains("10.0.0.5:4242 answered"),
             "no card asks whether this machine may drive a peer that may \
              already drive it:\n{out}"
+        );
+    }
+
+    /// The pairing prompt asks which machine is in control and whether to
+    /// share the clipboard (#220, #182). Nothing is chosen until a key says
+    /// so, `y` waits for a direction, and the answers go with the name to
+    /// the approval, for the machine on the prompt only.
+    // LEDGER E2b-3 | class B | 3 render + 1 return value: ui() on ratatui TestBackend, answer_key, approve_prompt
+    #[test]
+    fn the_pairing_prompt_asks_which_machine_is_in_control() {
+        let mut model = AppModel::default();
+        model.apply(FrontendEvent::ConnectionAttempt {
+            fingerprint: FP.into(),
+            origin: AttemptOrigin::Inbound,
+            addr: Some("192.0.2.7:51234".parse().expect("addr")),
+        });
+        let t0 = Instant::now();
+        let mut card = PairingCard::default();
+        let shown = card.show(&model, t0, |_| false).cloned().expect("a prompt");
+        let theme = theme::default_theme();
+        let render = |answers: &PairingAnswers, width: u16, height: u16| {
+            let mut term = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+            term.draw(|f| {
+                ui(
+                    f,
+                    &model,
+                    &[],
+                    &mut ListState::default(),
+                    None,
+                    None,
+                    Some(&shown),
+                    answers,
+                    None,
+                    false,
+                    &theme,
+                )
+            })
+            .expect("draw");
+            let buf = term.backend().buffer().clone();
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // Written out when asked, to be looked at.
+        let keep = |name: &str, out: &str| {
+            if let Some(dir) = std::env::var_os("HOPS_TUI_RENDERS") {
+                let _ = std::fs::write(std::path::Path::new(&dir).join(name), out);
+            }
+        };
+
+        let mut answers = PairingAnswers::default();
+        answers.for_card(FP);
+        let fresh = render(&answers, 100, 30);
+        keep("tui-pairing-unanswered-100x30.txt", &fresh);
+        keep(
+            "tui-pairing-unanswered-80x24.txt",
+            &render(&answers, 80, 24),
+        );
+        for line in Controller::ALL.map(|c| c.describe()) {
+            assert!(
+                fresh.contains(&format!("( ) {line}")),
+                "the prompt does not offer \"{line}\" unchosen:\n{fresh}"
+            );
+        }
+        assert!(
+            fresh.contains("Which machine is in control?")
+                && fresh.contains("share the clipboard: no")
+                && fresh.contains("choose first")
+                && !fresh.contains("(*)"),
+            "a fresh prompt reads as answered, or does not ask:\n{fresh}"
+        );
+        assert!(
+            matches!(
+                approve_prompt(&card, &answers, FP.into(), t0 + Duration::from_secs(2)),
+                Err(ApprovalRefused::NoController)
+            ),
+            "y approved before anyone chose which way control goes"
+        );
+
+        assert!(answer_key(answers.for_card(FP), KeyCode::Char('2')));
+        assert!(answer_key(answers.for_card(FP), KeyCode::Char('c')));
+        let answered = render(&answers, 100, 30);
+        keep("tui-pairing-answered-100x30.txt", &answered);
+        keep("tui-pairing-answered-80x24.txt", &render(&answers, 80, 24));
+        assert!(
+            answered.contains("(*) That machine controls this one")
+                && answered.contains("[x] share the clipboard: yes")
+                && answered.contains("trust & name"),
+            "the answers given are not shown as given:\n{answered}"
+        );
+        match approve_prompt(&card, &answers, FP.into(), t0 + Duration::from_secs(2)) {
+            Ok(Input::TrustedName { fp, grant, .. }) => assert_eq!(
+                (fp.as_str(), grant),
+                (FP, Some((Controller::ThatMachine, true))),
+                "the name prompt is not bound to the answers given"
+            ),
+            _ => panic!("y with a direction chosen did not open the name prompt"),
+        }
+
+        // Another machine on the prompt starts with nothing answered.
+        answers.for_card(OTHER_FP);
+        assert_eq!(
+            (answers.controller, answers.clipboard),
+            (None, false),
+            "answers given for one machine were kept for another"
         );
     }
 
@@ -1948,6 +2161,7 @@ mod tests {
                 None,
                 None,
                 Some(&shown),
+                &Default::default(),
                 None,
                 false,
                 &theme,
@@ -2156,6 +2370,7 @@ mod tests {
                 None,
                 None,
                 None,
+                &Default::default(),
                 Some(&notice),
                 false,
                 &theme,
@@ -2595,6 +2810,7 @@ mod tests {
                 None,
                 Some(&ask),
                 None,
+                &Default::default(),
                 None,
                 false,
                 &theme,
@@ -2656,6 +2872,7 @@ mod tests {
                 None,
                 None,
                 None,
+                &Default::default(),
                 Some(notice),
                 false,
                 &theme,
@@ -2760,6 +2977,7 @@ mod tests {
                     None,
                     None,
                     approval.as_ref(),
+                    &Default::default(),
                     None,
                     false,
                     &theme,
@@ -3035,7 +3253,17 @@ mod every_state_on_a_row {
         let mut term = Terminal::new(TestBackend::new(160, 24)).expect("test terminal");
         term.draw(|f| {
             ui(
-                f, model, &devices, &mut state, None, None, None, None, false, &theme,
+                f,
+                model,
+                &devices,
+                &mut state,
+                None,
+                None,
+                None,
+                &Default::default(),
+                None,
+                false,
+                &theme,
             )
         })
         .expect("draw");
@@ -3116,7 +3344,17 @@ mod every_state_on_a_row {
             let mut term = Terminal::new(TestBackend::new(160, 24)).expect("test terminal");
             term.draw(|f| {
                 ui(
-                    f, m, &devices, &mut state, None, None, None, None, false, &theme,
+                    f,
+                    m,
+                    &devices,
+                    &mut state,
+                    None,
+                    None,
+                    None,
+                    &Default::default(),
+                    None,
+                    false,
+                    &theme,
                 )
             })
             .expect("draw");

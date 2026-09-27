@@ -131,6 +131,16 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
         ui.set_pairing_addr("10.0.0.7:51234".into());
         ui.set_pairing_name("laptop".into());
     }
+    // PREVIEW_CONTROLLER=0|1|2 answers "which machine is in control?" on the
+    // card (#220); unset, nothing is chosen. PREVIEW_CLIPBOARD=1 switches the
+    // clipboard on (#182).
+    if let Some(i) = std::env::var("PREVIEW_CONTROLLER")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+    {
+        ui.set_pairing_controller(i);
+    }
+    ui.set_pairing_clipboard(std::env::var_os("PREVIEW_CLIPBOARD").is_some());
     // the notice banner — the daemon's only "that didn't work" channel
     ui.set_notice(
         "Refused to grant trust: this machine is being controlled remotely. \

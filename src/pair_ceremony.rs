@@ -61,6 +61,22 @@ pub(crate) enum CeremonyError {
     /// indistinguishable from here and both mean the same thing: show nothing.
     CommitmentBroken,
     Io(String),
+    /// Failed after this machine's own half went out: the dialler's nonce,
+    /// or the reveal. From then on the other machine may hold the number,
+    /// so the attempt cannot end as if nothing was compared.
+    Late(Box<CeremonyError>),
+}
+
+impl CeremonyError {
+    /// Whether the other machine may already know the number.
+    pub(crate) fn late(&self) -> bool {
+        matches!(self, Self::Late(_))
+    }
+}
+
+/// Mark a failure from here on as [`CeremonyError::Late`].
+fn late<T>(r: Result<T, CeremonyError>) -> Result<T, CeremonyError> {
+    r.map_err(|e| CeremonyError::Late(Box::new(e)))
 }
 
 impl std::fmt::Display for CeremonyError {
@@ -74,6 +90,7 @@ impl std::fmt::Display for CeremonyError {
                 "the revealed nonce did not open the commitment — no number can be shown"
             ),
             Self::Io(e) => write!(f, "{e}"),
+            Self::Late(e) => write!(f, "{e}, after this machine's half was sent"),
         }
     }
 }
@@ -145,12 +162,15 @@ pub(crate) async fn as_responder(
     }
 
     // Only now is the nonce revealed, and by now it is already committed to.
-    with_timeout("the reveal to flush", async {
-        send.write_all(&n_r)
-            .await
-            .map_err(|e| CeremonyError::Io(e.to_string()))
-    })
-    .await?;
+    // Any of it that arrives narrows the number down for the initiator.
+    late(
+        with_timeout("the reveal to flush", async {
+            send.write_all(&n_r)
+                .await
+                .map_err(|e| CeremonyError::Io(e.to_string()))
+        })
+        .await,
+    )?;
     let _ = send.finish();
 
     Ok(match_code::code(&x, my_fp, peer_fp, &n_i, &n_r))
@@ -182,26 +202,32 @@ pub(crate) async fn as_initiator(
     .await?;
 
     let n_i = nonce()?;
-    with_timeout("our nonce to flush", async {
-        send.write_all(&n_i)
-            .await
-            .map_err(|e| CeremonyError::Io(e.to_string()))
-    })
-    .await?;
+    // From the first byte of our nonce on, the responder, which already has
+    // its own half, narrows the number down, and has it before we do.
+    late(
+        with_timeout("our nonce to flush", async {
+            send.write_all(&n_i)
+                .await
+                .map_err(|e| CeremonyError::Io(e.to_string()))
+        })
+        .await,
+    )?;
     let _ = send.finish();
 
     let mut n_r = [0u8; NONCE_LEN];
-    with_timeout("the reveal", async {
-        recv.read_exact(&mut n_r)
-            .await
-            .map_err(|e| CeremonyError::Io(format!("{e:?}")))
-    })
-    .await?;
+    late(
+        with_timeout("the reveal", async {
+            recv.read_exact(&mut n_r)
+                .await
+                .map_err(|e| CeremonyError::Io(format!("{e:?}")))
+        })
+        .await,
+    )?;
 
     // The whole point of the ordering. Refusing here is what stops the
     // responder picking its half after seeing ours.
     if !match_code::opens(&commitment, &x, my_fp, peer_fp, &n_r) {
-        return Err(CeremonyError::CommitmentBroken);
+        return late(Err(CeremonyError::CommitmentBroken));
     }
 
     Ok(match_code::code(&x, my_fp, peer_fp, &n_i, &n_r))
@@ -261,6 +287,7 @@ mod tests {
             CeremonyError::NoRandomness,
             CeremonyError::CommitmentBroken,
             CeremonyError::Io("x".into()),
+            CeremonyError::Late(Box::new(CeremonyError::Io("x".into()))),
         ] {
             let s = e.to_string();
             assert!(!s.is_empty() && !s.contains("CeremonyError"), "got {s:?}");

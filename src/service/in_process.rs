@@ -274,6 +274,13 @@ pub(crate) struct Comparing {
     _endpoint: quinn::Endpoint,
 }
 
+impl Comparing {
+    /// Close the connection the number was compared on, saying `reason`.
+    pub(crate) fn close(&self, reason: &[u8]) {
+        self._conn.close(0u32.into(), reason);
+    }
+}
+
 /// Dial the daemon as `stranger` does once its knock was approved there, and
 /// compare the number: the machine that knocked is the one adding, so it
 /// shows the number, and the daemon asks the app which of three it is.

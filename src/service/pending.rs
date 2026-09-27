@@ -292,7 +292,14 @@ mod a_prompt_expires_with_its_pairing_window {
             .map(|a| a.origin);
         let mut store = TrustStore::new(&fp(0x01), 0).expect("our fingerprint");
         assert_eq!(
-            grant_for_attempt(&mut store, &fp(0xb0), "a stranger", origin),
+            grant_for_attempt(
+                &mut store,
+                &fp(0xb0),
+                "a stranger",
+                origin,
+                hops_ipc::Controller::ThatMachine,
+                false
+            ),
             Err(GrantRefused::NoAttempt),
             "a prompt from a pairing window that had closed was approved after add \
              device was opened again. The window is what makes a prompt answerable: \

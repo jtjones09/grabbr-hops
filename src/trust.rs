@@ -134,8 +134,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use hops_ipc::RevokedEntry;
 use hops_ipc::identity::{canonical_fingerprint, sanitize_label};
+use hops_ipc::{Controller, RevokedEntry};
 use thiserror::Error;
 
 /// How long a lease runs from the moment it is issued.
@@ -276,15 +276,16 @@ impl Caps {
     /// The clipboard, both ways: what the per-device switch turns off (#182).
     pub const CLIPBOARD: Caps = Caps::CLIPBOARD_FROM.union(Caps::CLIPBOARD_TO);
 
-    /// Everything the peer may do to us. The set a user is agreeing to when they
-    /// answer an unsolicited knock at the door: it may drive this machine, and
-    /// its clipboard follows it here ([`existing_pairing_clipboard`], #186).
-    pub const INBOUND: Caps = Caps::DRIVE_ME.union(existing_pairing_clipboard(Caps::DRIVE_ME));
-    /// Everything we may do to the peer. The set a user is agreeing to when they
-    /// confirm the receiver our own dial reached: this machine may drive it,
-    /// and this machine's clipboard follows it there.
-    pub const OUTBOUND: Caps =
-        Caps::I_MAY_DRIVE.union(existing_pairing_clipboard(Caps::I_MAY_DRIVE));
+    /// The peer may drive this machine, and nothing more. Drive only since
+    /// #182: a clipboard is a separate answer, no unless someone said yes. A
+    /// pairing made before #182 keeps the clipboard its lease always carried
+    /// ([`existing_pairing_clipboard`], #186).
+    pub const INBOUND: Caps = Caps::DRIVE_ME;
+    /// This machine may drive the peer, and nothing more. Drive only, as
+    /// [`Caps::INBOUND`] is.
+    pub const OUTBOUND: Caps = Caps::I_MAY_DRIVE;
+    /// Both directions to drive.
+    pub const DRIVE: Caps = Caps::DRIVE_ME.union(Caps::I_MAY_DRIVE);
 
     /// Name/bit pairs, for rendering, logging and the on-disk mapping.
     pub const NAMED: [(Caps, &'static str); 4] = [
@@ -348,8 +349,8 @@ impl Caps {
 /// reverse of each is nobody's grant, and stops. A pairing that goes both ways
 /// shares both ways.
 ///
-/// These are exactly the bits [`Caps::INBOUND`] and [`Caps::OUTBOUND`] always
-/// carried, so no lease on disk changes. What changes is that the clipboard
+/// These are exactly the bits `INBOUND` and `OUTBOUND` carried before #182,
+/// so no lease on disk changes. What changes is that the clipboard
 /// doors read them. Every existing pairing reaches this one function: the two
 /// constants, the migration from a v0.12 config, and the loader, for a lease
 /// on which nobody chose a clipboard (#187). The decision's guard,
@@ -366,6 +367,30 @@ pub const fn existing_pairing_clipboard(drive: Caps) -> Caps {
         clipboard = clipboard.union(Caps::CLIPBOARD_TO);
     }
     clipboard
+}
+
+/// The drive bits a person's answer on the pairing card grants (#220), from
+/// this machine's side: this machine controls that one ([`Caps::I_MAY_DRIVE`]),
+/// that one controls this one ([`Caps::DRIVE_ME`]), or both.
+pub const fn drive_of(controller: Controller) -> Caps {
+    match controller {
+        Controller::ThisMachine => Caps::I_MAY_DRIVE,
+        Controller::ThatMachine => Caps::DRIVE_ME,
+        Controller::Both => Caps::DRIVE,
+    }
+}
+
+/// The answer that grants exactly the drive bits in `caps`, if any does.
+fn controller_of(caps: Caps) -> Option<Controller> {
+    match (
+        caps.contains(Caps::I_MAY_DRIVE),
+        caps.contains(Caps::DRIVE_ME),
+    ) {
+        (true, true) => Some(Controller::Both),
+        (true, false) => Some(Controller::ThisMachine),
+        (false, true) => Some(Controller::ThatMachine),
+        (false, false) => None,
+    }
 }
 
 impl std::ops::BitOr for Caps {
@@ -495,6 +520,10 @@ pub enum Origin {
     /// Carried forward from `[authorized_fingerprints]`, or both directions
     /// from two approvals added together (#166).
     Migrated,
+    /// The person approving chose which way control goes (#220). The lease's
+    /// drive bits are exactly that choice: [`Lease::canonicalized`] refuses
+    /// any other, at every door into the store.
+    Chosen(Controller),
     // No `Restored`. Removal forgets the machine, so one that comes back is a
     // first contact: it arrives as `Inbound` or `OutboundDial` and pairs in
     // full, like any other (#184).
@@ -580,6 +609,17 @@ impl Lease {
             }
         }
         let caps = Caps::from_bits_truncating(self.caps.bits());
+        // A chosen direction is the whole of what a lease may drive (#220).
+        // Checked here, where an approval and a record replayed off disk
+        // both pass, so neither can carry a direction nobody chose.
+        if let Origin::Chosen(chosen) = self.origin {
+            if caps.intersection(Caps::DRIVE) != drive_of(chosen) {
+                return Err(TrustError::NotAsChosen {
+                    chosen,
+                    drive: caps.intersection(Caps::DRIVE),
+                });
+            }
+        }
         if caps.is_empty() {
             // A lease that permits nothing is either a typo in a hand-written
             // record or a lease from a build whose capabilities this one does
@@ -660,10 +700,9 @@ pub fn effective_capabilities(entry: &Entry, ours: &str, now: u64) -> Caps {
 /// for its number to be confirmed on both machines: its drive bits, or
 /// [`Caps::NONE`] when there is no such pairing.
 ///
-/// What a TLS door admits a peer mid-pairing on, and only in the direction
-/// asked for: the listener asks about [`Caps::DRIVE_ME`], the dialler about
-/// [`Caps::I_MAY_DRIVE`]. A machine being added that dials the machine adding
-/// it holds the wrong direction on both ends, so neither door lets it in.
+/// Not empty is what a TLS door admits a peer mid-pairing on, at either
+/// door: which way control goes is the person's answer (#220), not which
+/// machine dials, and nothing moves on the connection until both confirm.
 pub fn awaiting_confirmation(entry: &Entry, ours: &str, now: u64) -> Caps {
     match &entry.lease {
         Some(l) if !l.confirmed && l.issued_to == ours && l.is_valid_at(now) => {
@@ -686,6 +725,14 @@ pub enum TrustError {
         origin: Origin,
         granted: &'static str,
     },
+
+    /// A lease recorded as chosen on the pairing card drives in some other
+    /// direction than the one chosen (#220).
+    #[error(
+        "the person approving chose {chosen:?}, and a lease so recorded may drive \
+         in exactly that direction, not {drive:?}"
+    )]
+    NotAsChosen { chosen: Controller, drive: Caps },
 
     #[error("{0:?} is not a valid device fingerprint")]
     BadFingerprint(String),
@@ -810,7 +857,40 @@ impl TrustStore {
         caps: Caps,
         origin: Origin,
     ) -> Result<(), TrustError> {
-        self.issue_lease(fingerprint, label, caps, DEFAULT_TERM, origin)
+        self.issue_lease(fingerprint, label, caps, DEFAULT_TERM, origin, false)
+    }
+
+    /// Issue the lease a pairing card's answers grant (#220, #182): exactly
+    /// the drive bits `controller` names, and the clipboard in those
+    /// directions only when `clipboard` is a yes. Recorded as chosen, both
+    /// the direction ([`Origin::Chosen`]) and the clipboard, so a restart
+    /// keeps what the person said.
+    ///
+    /// A grant, as [`TrustStore::issue`] is, and pending as it is: the lease
+    /// grants nothing until both machines confirm the number. A grant to a
+    /// pairing in force adds the chosen directions to it and keeps its
+    /// clipboard as it was chosen.
+    pub fn issue_answered(
+        &mut self,
+        fingerprint: &str,
+        label: &str,
+        controller: Controller,
+        clipboard: bool,
+    ) -> Result<(), TrustError> {
+        let drive = drive_of(controller);
+        let shared = if clipboard {
+            existing_pairing_clipboard(drive)
+        } else {
+            Caps::NONE
+        };
+        self.issue_lease(
+            fingerprint,
+            label,
+            drive | shared,
+            DEFAULT_TERM,
+            Origin::Chosen(controller),
+            true,
+        )
     }
 
     /// [`TrustStore::issue`] under a term of the test's choosing, so the
@@ -826,7 +906,7 @@ impl TrustStore {
         caps: Caps,
         term: Term,
     ) -> Result<(), TrustError> {
-        self.issue_lease(fingerprint, label, caps, term, origin_of(caps))?;
+        self.issue_lease(fingerprint, label, caps, term, origin_of(caps), false)?;
         self.confirm(fingerprint)
     }
 
@@ -837,6 +917,7 @@ impl TrustStore {
         caps: Caps,
         term: Term,
         origin: Origin,
+        clipboard_chosen: bool,
     ) -> Result<(), TrustError> {
         let now = self.now();
         let lease = Lease {
@@ -847,7 +928,7 @@ impl TrustStore {
             origin,
             issued_at: now,
             expiry: term.expiry_from(now),
-            clipboard_chosen: false,
+            clipboard_chosen,
             // Nobody has compared a number for it yet. A grant to a pairing
             // in force keeps that pairing's confirmation below.
             confirmed: false,
@@ -893,10 +974,11 @@ impl TrustStore {
             .and_then(|e| e.lease.clone());
         let lease = match held {
             Some(held) => {
-                // A clipboard someone chose stays as chosen: approving a
-                // second direction to drive is not an answer about the
-                // clipboard, so it must not turn a switched-off one back on.
-                let granted = if held.clipboard_chosen {
+                // A clipboard someone chose stays as chosen: an approval that
+                // asked nothing about the clipboard must not turn a
+                // switched-off one back on. One that asked (#182) adds the
+                // clipboard its answer gave, the way it chose control to go.
+                let granted = if held.clipboard_chosen && !clipboard_chosen {
                     lease.caps.without(Caps::CLIPBOARD)
                 } else {
                     lease.caps
@@ -905,11 +987,14 @@ impl TrustStore {
                 Lease {
                     caps,
                     // Two directions from two approvals are what `origin_of`
-                    // says they add up to.
-                    origin: if caps == lease.caps {
-                        lease.origin
-                    } else {
-                        origin_of(caps)
+                    // says they add up to, and two chosen ones are the choice
+                    // that names both (#220).
+                    origin: match (caps == lease.caps, lease.origin) {
+                        (true, origin) => origin,
+                        (false, Origin::Chosen(_)) => {
+                            controller_of(caps).map_or(Origin::Migrated, Origin::Chosen)
+                        }
+                        (false, _) => origin_of(caps),
                     },
                     issued_at: lease.issued_at,
                     expiry: lease.expiry,
@@ -1035,9 +1120,8 @@ impl TrustStore {
     /// machines to confirm the number, in the direction `drive`
     /// ([`Caps::DRIVE_ME`] or [`Caps::I_MAY_DRIVE`]).
     ///
-    /// What a TLS door admits a peer mid-pairing on: far enough to compare a
-    /// number, and no further, since [`TrustStore::capabilities`] gives it
-    /// nothing.
+    /// The doors ask [`TrustStore::is_pairing`], in either direction; this
+    /// says which direction the pairing will grant once confirmed.
     pub fn awaits(&self, fingerprint: &str, drive: Caps) -> bool {
         let now = self.now();
         !drive.is_empty()
@@ -1047,7 +1131,9 @@ impl TrustStore {
                 .is_some_and(|e| awaiting_confirmation(e, &self.ours, now).contains(drive))
     }
 
-    /// Whether `fingerprint` is mid-pairing here, in either direction.
+    /// Whether `fingerprint` is mid-pairing here, in either direction: what
+    /// both TLS doors admit a peer on, far enough to compare a number and no
+    /// further, since [`TrustStore::capabilities`] gives it nothing.
     pub fn is_pairing(&self, fingerprint: &str) -> bool {
         let now = self.now();
         self.entries
@@ -1842,13 +1928,15 @@ mod tests {
         s.confirm(&receiver).expect("confirm");
 
         assert!(s.we_may_drive(&receiver));
-        assert!(s.clipboard_to(&receiver));
         assert!(
             !s.may_drive_us(&receiver),
             "confirming the receiver OUR OWN dial reached must never let it \
              drive us — nobody was asked that question"
         );
-        assert!(!s.clipboard_from(&receiver));
+        assert!(
+            !s.clipboard_from(&receiver) && !s.clipboard_to(&receiver),
+            "a direction to drive is drive only: the clipboard is its own answer (#182)"
+        );
         assert_eq!(s.capabilities(&receiver), Caps::OUTBOUND);
     }
 
@@ -1952,11 +2040,12 @@ mod tests {
 
     #[test]
     fn contains_means_every_bit_not_any_bit() {
-        let half = Caps::INBOUND | Caps::I_MAY_DRIVE;
-        assert!(half.intersects(Caps::OUTBOUND));
+        let shares_in = Caps::DRIVE_ME | Caps::CLIPBOARD_FROM;
+        let half = Caps::DRIVE_ME | Caps::CLIPBOARD_TO;
+        assert!(half.intersects(shares_in));
         assert!(
-            !half.contains(Caps::OUTBOUND),
-            "holding one bit of a direction is not holding the direction"
+            !half.contains(shares_in),
+            "holding one bit of a set is not holding the set"
         );
         assert!(half.contains(Caps::INBOUND));
     }
@@ -1980,8 +2069,12 @@ mod tests {
     #[test]
     fn capabilities_render_for_a_human() {
         assert_eq!(Caps::NONE.to_string(), "none");
-        assert_eq!(Caps::INBOUND.to_string(), "drive-me+clipboard-from");
-        assert_eq!(Caps::OUTBOUND.to_string(), "i-may-drive+clipboard-to");
+        assert_eq!(Caps::INBOUND.to_string(), "drive-me");
+        assert_eq!(Caps::OUTBOUND.to_string(), "i-may-drive");
+        assert_eq!(
+            (Caps::DRIVE_ME | Caps::CLIPBOARD_FROM).to_string(),
+            "drive-me+clipboard-from"
+        );
     }
 
     // ---------------------------------------------------------------- expiry
@@ -1994,10 +2087,15 @@ mod tests {
     fn a_lease_issued_today_still_grants_everything_ten_years_on() {
         let mut s = store();
         let (sender, receiver) = (fp(0x26), fp(0x27));
-        s.issue_confirmed(&sender, "sender", Caps::INBOUND)
+        s.issue_confirmed(&sender, "sender", Caps::INBOUND | Caps::CLIPBOARD_FROM)
             .expect("issue");
-        s.issue_with_origin(&receiver, "receiver", Caps::OUTBOUND, Origin::OutboundDial)
-            .expect("issue");
+        s.issue_with_origin(
+            &receiver,
+            "receiver",
+            Caps::OUTBOUND | Caps::CLIPBOARD_TO,
+            Origin::OutboundDial,
+        )
+        .expect("issue");
         s.confirm(&receiver).expect("confirm");
 
         for later in [T0 + 30 * DAY, T0 + 400 * DAY, T0 + 10 * YEAR] {

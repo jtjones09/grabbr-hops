@@ -304,10 +304,12 @@ async fn refusals_reach_the_app_as_errors_or_activity_and_a_stranger_prompts_onc
             app.prompts()
         ));
     } else {
-        app.request(FrontendRequest::AuthorizeKey(
-            "desk mac".into(),
-            desk_fp.clone(),
-        ))
+        app.request(FrontendRequest::AuthorizeKey {
+            label: "desk mac".into(),
+            fingerprint: desk_fp.clone(),
+            controller: hops_ipc::Controller::ThisMachine,
+            clipboard: false,
+        })
         .await;
         let waiting = app
             .until(Duration::from_secs(20), |e| {

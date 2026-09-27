@@ -20,9 +20,10 @@ part of the **grabbr** suite · repo: **grabbr-hops** · a fork of
   (quinn + rustls). Peers are pinned by public-key fingerprint, so only machines
   you've explicitly paired can connect (see [Security](#security)).
 - **Explicit pairing** — a new machine shows up as a pairing request with its
-  fingerprint; you approve it on both machines, then compare a six-digit number
-  (the machine you added from shows it, the other picks it from three), and the
-  trust persists.
+  fingerprint; you approve it on both machines, saying which machine controls
+  which and whether to share the clipboard (off unless you say so), then compare
+  a six-digit number (the machine you added from shows it, the other picks it
+  from three), and the trust persists.
 - **Three ways to drive it** — a native **GUI**, a **terminal UI** for SSH /
   keyboard-driven use, and a **system-tray** icon; all attach to the same
   background daemon.

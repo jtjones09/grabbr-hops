@@ -2,11 +2,28 @@
 //! two approvals let two machines make, until both machines confirm.
 //!
 //! An approval issues a lease that grants nothing (`TrustStore::confirm`).
-//! It admits the other machine at TLS in the approved direction only, far
-//! enough to run [`crate::pair_ceremony`] and no further. The machine that
-//! added the other shows the number; the machine being added offers three and
-//! asks which one it sees. A wrong pick ends the attempt, and the adding
+//! It admits the other machine at TLS, whichever machine dials, far enough
+//! to run [`crate::pair_ceremony`] and no further: which way control goes is
+//! what each person answered on the card (#220), not who dialled. The machine
+//! that dialled shows the number; the machine it reached offers three and
+//! asks which one it sees. A wrong pick ends the attempt, and the dialling
 //! machine still confirms on its side.
+//!
+//! # One number per approval
+//!
+//! Two machines adding each other dial each other, and both dials reach a
+//! machine mid-pairing. Each machine holds one attempt per machine, for both
+//! of its transports, and a number once shown never moves: a connection
+//! that arrives while one is on screen is closed as busy before any
+//! comparison. Two comparisons under way at once end on the same connection
+//! at both machines: the one the machine whose fingerprint sorts first
+//! dialled ([`preferred`]). The other's number is held back while that one
+//! is under way, and dropped unshown once it arrives.
+//!
+//! What the other machine says when it closes a connection counts for
+//! nothing: a number shown here ends the attempt however it closes, and the
+//! service forgets the approval, so no machine can draw a second number
+//! from one approval.
 //!
 //! # Nothing moves before both machines confirm
 //!
@@ -86,16 +103,21 @@ pub(crate) enum PairingEvent {
         role: Role,
         number: String,
         handle: Option<ClientHandle>,
+        /// The attempt it was compared in: one per connection, never reused.
+        attempt: u64,
     },
     /// The person here answered, and the other machine's confirmation then
     /// arrived on the connection. The service confirms the lease and calls
     /// [`Pairings::settled`].
     PeerConfirmed { fingerprint: String },
-    /// Ended without pairing. The service forgets the lease.
+    /// Ended without pairing. The service forgets the lease when this is
+    /// the attempt whose number is on screen.
     Ended {
         fingerprint: String,
         why: Why,
         handle: Option<ClientHandle>,
+        /// The attempt that ended.
+        attempt: u64,
     },
 }
 
@@ -114,12 +136,64 @@ enum Stage {
 
 struct Held {
     conn: Connection,
+    attempt: u64,
     stage: Stage,
     wake: Rc<Notify>,
+    /// Dialled by the machine whose fingerprint sorts first.
+    preferred: bool,
+    /// Its number went to the service, to put in front of the person. From
+    /// then on nothing takes its place.
+    shown: bool,
 }
+
+/// How many comparisons are under way with one machine, before their
+/// numbers, on connections the machine sorting first dialled and on others.
+#[derive(Default)]
+struct Arriving {
+    preferred: usize,
+    other: usize,
+}
+
+impl Arriving {
+    fn count(&mut self, preferred: bool) -> &mut usize {
+        if preferred {
+            &mut self.preferred
+        } else {
+            &mut self.other
+        }
+    }
+}
+
+/// Whether the connection `dialler` made to `listener` is the one two
+/// machines pairing compare their number on, when there are two: the dial
+/// of the machine whose fingerprint sorts first. Both machines work it out
+/// alike from the same two fingerprints, so both keep the same connection.
+pub(crate) fn preferred(dialler: &str, listener: &str) -> bool {
+    dialler < listener
+}
+
+/// Whether this machine's end of a connection is the one [`preferred`]
+/// keeps, given which half of the comparison it does there: the machine
+/// that dialled shows the number. Both call sites decide through this one.
+fn keeps(role: Role, ours: &str, theirs: &str) -> bool {
+    match role {
+        Role::Show => preferred(ours, theirs),
+        Role::Pick => preferred(theirs, ours),
+    }
+}
+
+/// What closing a connection whose number was never shown, for another
+/// between the same two machines, says. Informational: the other machine
+/// reads no close reason.
+const SUPERSEDED: &[u8] = b"pairing superseded";
+/// What closing a second connection while one is held says.
+const BUSY: &[u8] = b"pairing busy";
 
 struct Board {
     held: HashMap<String, Held>,
+    arriving: HashMap<String, Arriving>,
+    /// The last attempt number given out.
+    attempts: u64,
     deadline: Duration,
 }
 
@@ -142,12 +216,24 @@ impl Pairings {
             Pairings {
                 board: Rc::new(RefCell::new(Board {
                     held: HashMap::new(),
+                    arriving: HashMap::new(),
+                    attempts: 0,
                     deadline: Self::DEADLINE,
                 })),
                 events,
             },
             rx,
         )
+    }
+
+    /// The connection held for `fingerprint`, if any.
+    #[cfg(test)]
+    fn held_conn(&self, fingerprint: &str) -> Option<usize> {
+        self.board
+            .borrow()
+            .held
+            .get(fingerprint)
+            .map(|h| h.conn.stable_id())
     }
 
     /// A shorter deadline, so a test can watch one pass.
@@ -158,6 +244,7 @@ impl Pairings {
 
     /// The person here answered rightly: the adding machine's confirm, or the
     /// right pick. The held connection goes on to exchange confirmations.
+    /// Only one whose number was shown: an answer is to a number seen.
     pub(crate) fn answered(&self, fingerprint: &str) -> bool {
         self.advance(fingerprint, Stage::Comparing, Stage::Answered)
     }
@@ -184,7 +271,7 @@ impl Pairings {
     fn advance(&self, fingerprint: &str, from: Stage, to: Stage) -> bool {
         let mut board = self.board.borrow_mut();
         match board.held.get_mut(fingerprint) {
-            Some(held) if held.stage == from => {
+            Some(held) if held.shown && held.stage == from => {
                 held.stage = to;
                 held.wake.notify_one();
                 true
@@ -197,25 +284,115 @@ impl Pairings {
         let _ = self.events.send(event);
     }
 
-    /// Hold `conn` for `fingerprint`, unless another attempt with it is held.
-    fn hold(&self, fingerprint: &str, conn: &Connection) -> Option<Ticket> {
+    /// Start an attempt with `theirs` on a connection where this machine
+    /// does `role`, unless one already held does not give way to it (see
+    /// [`preferred`]). Several may be under way: a dial that raced to more
+    /// than one address of this machine arrives on each, and only the one
+    /// it compares on finishes.
+    fn begin(&self, role: Role, ours: &str, theirs: &str) -> Option<Arrival> {
+        let preferred = keeps(role, ours, theirs);
         let mut board = self.board.borrow_mut();
-        if board.held.contains_key(fingerprint) {
+        if board
+            .held
+            .get(theirs)
+            .is_some_and(|held| !gives_way(held, preferred))
+        {
             return None;
+        }
+        *board
+            .arriving
+            .entry(theirs.to_string())
+            .or_default()
+            .count(preferred) += 1;
+        board.attempts += 1;
+        Some(Arrival {
+            pairings: self.clone(),
+            fingerprint: theirs.to_string(),
+            preferred,
+            attempt: board.attempts,
+        })
+    }
+}
+
+/// Whether `held` gives way to an attempt on a connection that is
+/// `preferred` or not: only the one both machines keep supersedes, and only
+/// one whose number was never shown, so a number on screen never moves.
+fn gives_way(held: &Held, preferred: bool) -> bool {
+    preferred && !held.preferred && !held.shown && held.stage == Stage::Comparing
+}
+
+/// A comparison under way, before its number. Dropping it counts it out,
+/// and lets a number held back for it be shown.
+struct Arrival {
+    pairings: Pairings,
+    fingerprint: String,
+    preferred: bool,
+    attempt: u64,
+}
+
+impl Drop for Arrival {
+    fn drop(&mut self) {
+        let mut board = self.pairings.board.borrow_mut();
+        if let Some(arriving) = board.arriving.get_mut(&self.fingerprint) {
+            let count = arriving.count(self.preferred);
+            *count = count.saturating_sub(1);
+            if arriving.preferred == 0 && arriving.other == 0 {
+                board.arriving.remove(&self.fingerprint);
+            }
+        }
+        if let Some(held) = board.held.get(&self.fingerprint) {
+            held.wake.notify_one();
+        }
+    }
+}
+
+impl Arrival {
+    /// Whether an attempt already held with the same machine does not give
+    /// way to this one (see [`gives_way`]): then this one's number could
+    /// never be shown, and the pairing goes on over that one.
+    fn outranked(&self) -> bool {
+        self.pairings
+            .board
+            .borrow()
+            .held
+            .get(&self.fingerprint)
+            .is_some_and(|held| !gives_way(held, self.preferred))
+    }
+
+    /// Hold `conn`, whose comparison finished, unless an attempt held with
+    /// the same machine does not give way to it (see [`gives_way`]).
+    fn hold(self, conn: &Connection) -> Option<Ticket> {
+        let mut board = self.pairings.board.borrow_mut();
+        if let Some(held) = board.held.get_mut(&self.fingerprint) {
+            if !gives_way(held, self.preferred) {
+                return None;
+            }
+            // Never shown: its holder ends quietly, and nobody saw its number.
+            log::info!(
+                "{}: the other connection between the two carries the pairing",
+                self.fingerprint
+            );
+            held.stage = Stage::Over;
+            held.conn.close(0u32.into(), SUPERSEDED);
+            held.wake.notify_one();
         }
         let wake = Rc::new(Notify::new());
         board.held.insert(
-            fingerprint.to_string(),
+            self.fingerprint.clone(),
             Held {
                 conn: conn.clone(),
+                attempt: self.attempt,
                 stage: Stage::Comparing,
                 wake: wake.clone(),
+                preferred: self.preferred,
+                shown: false,
             },
         );
         Some(Ticket {
-            pairings: self.clone(),
-            fingerprint: fingerprint.to_string(),
-            id: conn.stable_id(),
+            pairings: self.pairings.clone(),
+            fingerprint: self.fingerprint.clone(),
+            attempt: self.attempt,
+            preferred: self.preferred,
             wake,
             deadline: tokio::time::Instant::now() + board.deadline,
         })
@@ -226,7 +403,8 @@ impl Pairings {
 struct Ticket {
     pairings: Pairings,
     fingerprint: String,
-    id: usize,
+    attempt: u64,
+    preferred: bool,
     wake: Rc<Notify>,
     deadline: tokio::time::Instant,
 }
@@ -237,7 +415,7 @@ impl Drop for Ticket {
         if board
             .held
             .get(&self.fingerprint)
-            .is_some_and(|h| h.conn.stable_id() == self.id)
+            .is_some_and(|h| h.attempt == self.attempt)
         {
             board.held.remove(&self.fingerprint);
         }
@@ -245,13 +423,74 @@ impl Drop for Ticket {
 }
 
 impl Ticket {
+    /// This attempt's stage: over once another took its place.
     fn stage(&self) -> Stage {
         self.pairings
             .board
             .borrow()
             .held
             .get(&self.fingerprint)
+            .filter(|h| h.attempt == self.attempt)
             .map_or(Stage::Over, |h| h.stage)
+    }
+
+    /// Why this attempt ended with its connection closed: nothing to say
+    /// when it was ended here. The other machine's close reason is not
+    /// read: it cannot turn an end into anything else.
+    fn why_closed(&self, _conn: &Connection) -> Option<Why> {
+        (self.stage() != Stage::Over).then_some(Why::Closed)
+    }
+
+    /// Wait until this attempt's number may be shown, and mark it shown:
+    /// at once, unless it is on a connection the machine sorting first did
+    /// not dial while one that machine dialled is being compared, which
+    /// then takes its place if it arrives.
+    ///
+    /// `Err` when it was never shown. It ends quietly only when it was ended
+    /// here, or another took its place here. Otherwise the other machine
+    /// already knows its number, and why it ended is said, so the approval
+    /// is forgotten: a number held back and closed by that machine would
+    /// otherwise let it draw another, and choose which one is shown.
+    async fn show(&self, conn: &Connection) -> Result<(), Option<Why>> {
+        loop {
+            {
+                let mut board = self.pairings.board.borrow_mut();
+                let held_back = !self.preferred
+                    && board
+                        .arriving
+                        .get(&self.fingerprint)
+                        .is_some_and(|a| a.preferred > 0);
+                match board
+                    .held
+                    .get_mut(&self.fingerprint)
+                    .filter(|h| h.attempt == self.attempt)
+                {
+                    // Ended here, or another took its place: quiet.
+                    None => return Err(None),
+                    Some(h) if h.stage == Stage::Over => return Err(None),
+                    // Still this attempt, by the board: the other machine
+                    // closed it.
+                    Some(_) if held_back && conn.close_reason().is_some() => {
+                        return Err(Some(Why::Closed));
+                    }
+                    Some(_) if held_back => {}
+                    Some(h) => {
+                        h.shown = true;
+                        return Ok(());
+                    }
+                }
+            }
+            tokio::select! {
+                _ = self.wake.notified() => {}
+                // Read against the board above, never on its own: taking
+                // this attempt's place here closes its connection too, and
+                // either may be seen first.
+                _ = conn.closed() => {}
+                _ = tokio::time::sleep_until(self.deadline) => {
+                    return Err((self.stage() != Stage::Over).then_some(Why::TimedOut));
+                }
+            }
+        }
     }
 
     /// Wait until the stage reaches `want`, or say why it never will.
@@ -272,7 +511,7 @@ impl Ticket {
             }
             tokio::select! {
                 _ = self.wake.notified() => {}
-                _ = conn.closed() => return Err(Some(Why::Closed)),
+                _ = conn.closed() => return Err(self.why_closed(conn)),
                 _ = tokio::time::sleep_until(self.deadline) => return Err(Some(Why::TimedOut)),
                 _ = tick.tick() => {
                     if !still() {
@@ -293,10 +532,10 @@ impl Ticket {
         tokio::select! {
             r = f => match r {
                 Some(v) => Ok(v),
-                None if conn.close_reason().is_some() => Err(Some(Why::Closed)),
+                None if conn.close_reason().is_some() => Err(self.why_closed(conn)),
                 None => Err(Some(Why::Unexpected)),
             },
-            _ = conn.closed() => Err(Some(Why::Closed)),
+            _ = conn.closed() => Err(self.why_closed(conn)),
             _ = tokio::time::sleep_until(self.deadline) => Err(Some(Why::TimedOut)),
             _ = async {
                 loop {
@@ -312,16 +551,23 @@ impl Ticket {
 
 /// What a comparison that did not produce a number means for the attempt.
 ///
-/// A connection that closed before a number was shown is dropped quietly: a
-/// dial raced to another address of the same machine and lost, or the link
-/// blipped, and the add dial tries again. One still open that offered no
-/// number is a peer that will never offer one.
-fn before_number(conn: &Connection, e: CeremonyError) -> Option<Why> {
+/// A connection that closed before this machine's half of the comparison
+/// went out is dropped quietly: nobody can know a number from it. A dial
+/// raced to another address of the same machine and lost, or the link
+/// blipped, and the add dial tries again. One that closed after it ends the
+/// approval, since the other machine may know the number and could draw
+/// again, unless an attempt held here outranks it and the pairing goes on
+/// there. One still open that offered no number is a peer that will never
+/// offer one.
+fn before_number(conn: &Connection, e: CeremonyError, outranked: bool) -> Option<Why> {
     if conn.close_reason().is_some() {
-        return None;
+        return (e.late() && !outranked).then_some(Why::Closed);
     }
     Some(match e {
         CeremonyError::NotSupported => Why::NoComparison,
+        // Which half had gone out decided how this ends; the person is told
+        // what failed.
+        CeremonyError::Late(e) => Why::Failed(e.to_string()),
         e => Why::Failed(e.to_string()),
     })
 }
@@ -331,6 +577,55 @@ async fn first_frame(conn: &Connection) -> Option<(RecvStream, ProtoEvent)> {
     let mut recv = conn.accept_uni().await.ok()?;
     let frame = transport::read_frame(&mut recv).await.ok()??;
     Some((recv, frame))
+}
+
+/// How an attempt that reached no number here ended: its attempt, and why,
+/// when there is something to say.
+type NoNumber = (u64, Option<Why>);
+
+/// The start both halves share: take this machine's place for a connection
+/// with `theirs`, compare the number on `conn`, hold it, and wait until it
+/// may be shown. `role` is the half this machine does, which also says
+/// which machine dialled.
+async fn reach_number(
+    pairings: &Pairings,
+    conn: &Connection,
+    role: Role,
+    ours: &str,
+    theirs: &str,
+    addr: SocketAddr,
+) -> Result<(Ticket, String), NoNumber> {
+    let Some(arrival) = pairings.begin(role, ours, theirs) else {
+        log::info!("{addr}: a pairing with {theirs} is already open; closing this one");
+        conn.close(0u32.into(), BUSY);
+        return Err((0, None));
+    };
+    let attempt = arrival.attempt;
+    let compared = match role {
+        Role::Show => pair_ceremony::as_initiator(conn, ours, theirs).await,
+        Role::Pick => pair_ceremony::as_responder(conn, ours, theirs).await,
+    };
+    let number = match compared {
+        Ok(number) => number,
+        Err(e) => {
+            log::info!("{addr}: no number compared with {theirs}: {e}");
+            let outranked = arrival.outranked();
+            drop(arrival);
+            return Err((attempt, before_number(conn, e, outranked)));
+        }
+    };
+    let Some(ticket) = arrival.hold(conn) else {
+        log::info!("{addr}: a pairing with {theirs} is already open; closing this one");
+        conn.close(0u32.into(), BUSY);
+        return Err((attempt, None));
+    };
+    if let Err(why) = ticket.show(conn).await {
+        if why.is_none() {
+            log::info!("{addr}: the pairing with {theirs} goes on over another connection");
+        }
+        return Err((attempt, why));
+    }
+    Ok((ticket, number))
 }
 
 /// The machine being added: the listener's half.
@@ -347,36 +642,35 @@ pub(crate) async fn as_added(
     theirs: &str,
     addr: SocketAddr,
 ) -> Option<(RecvStream, ProtoEvent)> {
-    let ended = |why: Option<Why>| {
+    let ended = |attempt: u64, why: Option<Why>| {
         if let Some(why) = why {
             log::info!("pairing with {theirs} at {addr} ended: {why:?}");
             pairings.tell(PairingEvent::Ended {
                 fingerprint: theirs.to_string(),
                 why,
                 handle: None,
+                attempt,
             });
         }
-        conn.close(0u32.into(), b"pairing ended");
+        if conn.close_reason().is_none() {
+            conn.close(0u32.into(), b"pairing ended");
+        }
         None
     };
-    let number = match pair_ceremony::as_responder(conn, ours, theirs).await {
-        Ok(number) => number,
-        Err(e) => {
-            log::info!("{addr}: no number compared with {theirs}: {e}");
-            return ended(before_number(conn, e));
-        }
+    let (ticket, number) = match reach_number(pairings, conn, Role::Pick, ours, theirs, addr).await
+    {
+        Ok(reached) => reached,
+        Err((attempt, why)) => return ended(attempt, why),
     };
-    let Some(ticket) = pairings.hold(theirs, conn) else {
-        log::info!("{addr}: a pairing with {theirs} is already open; closing this one");
-        conn.close(0u32.into(), b"pairing busy");
-        return None;
-    };
+    let attempt = ticket.attempt;
+    let ended = |why: Option<Why>| ended(attempt, why);
     pairings.tell(PairingEvent::Number {
         fingerprint: theirs.to_string(),
         addr,
         role: Role::Pick,
         number,
         handle: None,
+        attempt,
     });
     if let Err(why) = ticket.until(conn, Stage::Answered, || true).await {
         return ended(why);
@@ -424,13 +718,14 @@ pub(crate) async fn as_adding(
     handle: ClientHandle,
     clients: &ClientManager,
 ) -> Option<Confirmed> {
-    let ended = |why: Option<Why>| {
+    let ended = |attempt: u64, why: Option<Why>| {
         if let Some(why) = why {
             log::info!("pairing with {theirs} at {addr} ended: {why:?}");
             pairings.tell(PairingEvent::Ended {
                 fingerprint: theirs.to_string(),
                 why,
                 handle: Some(handle),
+                attempt,
             });
         }
         // A connection the other machine already closed keeps its reason, so
@@ -441,24 +736,20 @@ pub(crate) async fn as_adding(
         }
         None
     };
-    let number = match pair_ceremony::as_initiator(conn, ours, theirs).await {
-        Ok(number) => number,
-        Err(e) => {
-            log::info!("{addr}: no number compared with {theirs}: {e}");
-            return ended(before_number(conn, e));
-        }
+    let (ticket, number) = match reach_number(pairings, conn, Role::Show, ours, theirs, addr).await
+    {
+        Ok(reached) => reached,
+        Err((attempt, why)) => return ended(attempt, why),
     };
-    let Some(ticket) = pairings.hold(theirs, conn) else {
-        log::info!("{addr}: a pairing with {theirs} is already open; closing this one");
-        conn.close(0u32.into(), b"pairing busy");
-        return None;
-    };
+    let attempt = ticket.attempt;
+    let ended = |why: Option<Why>| ended(attempt, why);
     pairings.tell(PairingEvent::Number {
         fingerprint: theirs.to_string(),
         addr,
         role: Role::Show,
         number,
         handle: Some(handle),
+        attempt,
     });
     let still = || clients.targets(handle, addr) && clients.is_on(handle);
     if let Err(why) = ticket.until(conn, Stage::Answered, still).await {
@@ -736,20 +1027,6 @@ mod on_the_wire {
             match tokio::time::timeout(WITHIN, connecting).await {
                 Ok(r) => r.map_err(|e| e.to_string()),
                 Err(_) => Err("timed out".to_string()),
-            }
-        }
-
-        /// Whether the listener's TLS check refused this dialler: the
-        /// handshake fails, or the connection it thought complete is closed
-        /// by a TLS alert rather than by the listener's code after it.
-        async fn refused_at_tls(&self, port: u16) -> bool {
-            let conn = match self.connect(port).await {
-                Ok(conn) => conn,
-                Err(_) => return true,
-            };
-            match tokio::time::timeout(WITHIN, conn.closed()).await {
-                Ok(quinn::ConnectionError::ConnectionClosed(_)) => true,
-                Ok(_) | Err(_) => false,
             }
         }
     }
@@ -1139,49 +1416,689 @@ mod on_the_wire {
         });
     }
 
-    // LEDGER G-7 | class B | 2 handshake outcome at each end + 6 struct state: no PairingEvent
-    /// The machine being added holds its approval in the other direction:
-    /// "may drive me". Crossing into the machine adding it, it dials the
-    /// wrong way, and each end's TLS check refuses on its own, so no
-    /// comparison starts.
+    // LEDGER G-7 | class B | 2 handshake outcome at each end + 1 PairingEvent: Number, each way
+    /// Which machine dials says nothing about which way control goes (#220):
+    /// a machine approved here, whichever way the person approving chose,
+    /// reaches the number whether it dials this machine or this machine dials
+    /// it. So two machines adding each other can pair.
     #[test]
-    fn the_added_machine_crossing_into_its_pending_peer_starts_no_ceremony() {
+    fn either_machine_dialling_reaches_the_number_whichever_way_control_goes() {
         run_local(async {
-            // The adding machine listening: its approval is "I may drive it".
-            let (adding, being_added) = (machine(), machine());
-            let trust = approved(&adding, &being_added, Caps::OUTBOUND);
-            let mut listening = added(adding, trust).await;
-            let crossing = raw_dialer(being_added, &listening.me);
-            assert!(
-                crossing.refused_at_tls(listening.port).await,
-                "the adding machine's TLS check let the machine it is adding dial it"
-            );
-            assert!(
-                next_within(&mut listening.events, NEVER_WITHIN)
-                    .await
-                    .is_none(),
-                "a comparison started the wrong way"
-            );
+            // Approved here as the machine this one controls, and dialling here.
+            let (here, there) = (machine(), machine());
+            let trust = approved(&here, &there, Caps::OUTBOUND);
+            let mut listening = added(here, trust).await;
+            let dialling = raw_dialer(there, &listening.me);
+            let conn = dialling
+                .connect(listening.port)
+                .await
+                .expect("the machine approved here is admitted, to compare a number");
+            crate::pair_ceremony::as_initiator(
+                &conn,
+                &dialling.me.fingerprint,
+                &listening.me.fingerprint,
+            )
+            .await
+            .expect("the two machines compare a number");
+            let (role, _) = number(
+                &mut listening.events,
+                "a dial from the machine this one controls",
+            )
+            .await;
+            assert_eq!(role, Role::Pick, "the machine dialled picks");
 
-            // The machine being added dialling: its approval is "it may drive me".
-            let (adding, being_added) = (machine(), machine());
-            let receiving = raw_receiver(adding, &being_added);
+            // Approved here as the machine that controls this one, and dialled
+            // from here.
+            let (here, there) = (machine(), machine());
+            let receiving = raw_receiver(there, &here);
             let mut d = dialer(
-                &being_added,
-                approved(&being_added, &receiving.me, Caps::INBOUND),
+                &here,
+                approved(&here, &receiving.me, Caps::INBOUND),
                 receiving.port,
                 Position::Left,
             );
             let mut events = d.conn.take_pairing_events().expect("pairing events");
             d.conn.dial(d.handle).await;
+            let conn = receiving
+                .next(WITHIN)
+                .await
+                .expect("this machine dials the machine it approved to control it");
+            crate::pair_ceremony::as_responder(&conn, &receiving.me.fingerprint, &here.fingerprint)
+                .await
+                .expect("the two machines compare a number");
+            let (role, _) =
+                number(&mut events, "a dial to the machine that controls this one").await;
+            assert_eq!(role, Role::Show, "the machine dialling shows the number");
+        });
+    }
+
+    // LEDGER G-21 | class B | 1 return value + 6 struct state + 2 connection closed: reach_number, the start as_added and as_adding share, at both ends of two real connections; the connection each board holds; what each one given up says
+    /// Two machines adding each other have two connections between them,
+    /// and meet them in any order. Whatever the order, both machines end on
+    /// the same one, and a number already shown never moves: the first
+    /// connection to show a number keeps it, and only when both comparisons
+    /// run at once does the dial of the machine sorting first win, before
+    /// either number is shown. The one given up ends quietly: the approval
+    /// stays with the one kept (#220).
+    #[test]
+    fn two_machines_meeting_both_connections_keep_the_same_one() {
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        enum Order {
+            /// One machine's dial showed its number on both before the other
+            /// dial arrived: a crossed add at the speed of people.
+            TheirsShownFirst,
+            OursShownFirst,
+            /// Both comparisons under way at once on both machines.
+            AtOnce,
+            /// The machine sorting first began its own dial's comparison
+            /// before the other's number was shown there; the other machine
+            /// met that dial only once the number was on its screen.
+            MetLateThere,
+        }
+        run_local(async {
+            for order in [
+                Order::TheirsShownFirst,
+                Order::OursShownFirst,
+                Order::AtOnce,
+                Order::MetLateThere,
+            ] {
+                let (one, two) = (machine(), machine());
+                let (low, high) = if one.fingerprint < two.fingerprint {
+                    (one, two)
+                } else {
+                    (two, one)
+                };
+                let (lf, hf) = (low.fingerprint.clone(), high.fingerprint.clone());
+                // x: the dial of the machine sorting last. z: the other.
+                let on_low = raw_receiver(low.clone(), &high);
+                let from_high = raw_dialer(high.clone(), &low);
+                let (x_high, x_low) =
+                    tokio::join!(from_high.connect(on_low.port), on_low.next(WITHIN));
+                let (x_high, x_low) = (x_high.expect("a dial"), x_low.expect("its other end"));
+                let on_high = raw_receiver(high.clone(), &low);
+                let from_low = raw_dialer(low.clone(), &high);
+                let (z_low, z_high) =
+                    tokio::join!(from_low.connect(on_high.port), on_high.next(WITHIN));
+                let (z_low, z_high) = (z_low.expect("a dial"), z_high.expect("its other end"));
+                let (at_low, _low_events) = Pairings::new();
+                let (at_high, _high_events) = Pairings::new();
+                let at = SocketAddr::from(([127, 0, 0, 1], 4242));
+                // Each end as the production halves start it: the machine
+                // that dialled shows, the one dialled picks.
+                let x_at_low = || reach_number(&at_low, &x_low, Role::Pick, &lf, &hf, at);
+                let x_at_high = || reach_number(&at_high, &x_high, Role::Show, &hf, &lf, at);
+                let z_at_low = || reach_number(&at_low, &z_low, Role::Show, &lf, &hf, at);
+                let z_at_high = || reach_number(&at_high, &z_high, Role::Pick, &hf, &lf, at);
+                let ((xl, xh), (zl, zh)) = match order {
+                    Order::TheirsShownFirst => {
+                        let x = tokio::join!(x_at_low(), x_at_high());
+                        (x, tokio::join!(z_at_low(), z_at_high()))
+                    }
+                    Order::OursShownFirst => {
+                        let z = tokio::join!(z_at_low(), z_at_high());
+                        (tokio::join!(x_at_low(), x_at_high()), z)
+                    }
+                    Order::AtOnce => {
+                        let (xl, xh, zl, zh) =
+                            tokio::join!(x_at_low(), x_at_high(), z_at_low(), z_at_high());
+                        ((xl, xh), (zl, zh))
+                    }
+                    Order::MetLateThere => {
+                        let (zl, (xl, (xh, zh))) = tokio::join!(z_at_low(), async {
+                            tokio::join!(x_at_low(), async {
+                                let xh = x_at_high().await;
+                                (xh, z_at_high().await)
+                            })
+                        });
+                        ((xl, xh), (zl, zh))
+                    }
+                };
+                let kept_z = order == Order::OursShownFirst || order == Order::AtOnce;
+                let told = [&xl, &xh, &zl, &zh]
+                    .into_iter()
+                    .filter_map(|r| r.as_ref().err().and_then(|(_, why)| why.clone()))
+                    .collect::<Vec<_>>();
+                assert!(
+                    told.is_empty(),
+                    "{order:?}: a connection given up for the one kept ended the approval: \
+                     {told:?}"
+                );
+                let reached = |r: &Result<(Ticket, String), NoNumber>| r.is_ok();
+                assert_eq!(
+                    (reached(&xl), reached(&xh), reached(&zl), reached(&zh)),
+                    (!kept_z, !kept_z, kept_z, kept_z),
+                    "{order:?}: the numbers shown were not those of one connection, the same \
+                     at both machines (x at the machine sorting first, x at the other, then \
+                     z likewise)"
+                );
+                let (kept_low, kept_high) = if kept_z {
+                    (z_low.stable_id(), z_high.stable_id())
+                } else {
+                    (x_low.stable_id(), x_high.stable_id())
+                };
+                assert_eq!(
+                    (at_low.held_conn(&hf), at_high.held_conn(&lf)),
+                    (Some(kept_low), Some(kept_high)),
+                    "{order:?}: the two machines do not hold the same connection, so each can \
+                     wait on a number the other never shows"
+                );
+                let numbers = [&xl, &xh, &zl, &zh]
+                    .into_iter()
+                    .filter_map(|r| r.as_ref().ok().map(|(_, n)| n.clone()))
+                    .collect::<Vec<_>>();
+                assert!(
+                    numbers.len() == 2 && numbers[0] == numbers[1],
+                    "{order:?}: the two machines were shown different numbers: {numbers:?}"
+                );
+                drop((xl, xh, zl, zh));
+            }
+        });
+    }
+
+    // LEDGER G-31 | class B | 1 return value: Ticket::show on a real connection, held back and waiting, when the attempt that supersedes it is held on the same board
+    /// A number held back for the dial of the machine sorting first, and then
+    /// given up here for that dial, ends quietly: its holder is already
+    /// waiting when it is given up, and closing its connection is part of
+    /// giving it up, so what it reads of that close must not speak for it.
+    /// The approval stays with the attempt that took its place (#220).
+    #[test]
+    fn a_number_held_back_and_given_up_here_ends_quietly() {
+        run_local(async {
+            let (one, two) = (machine(), machine());
+            let (low, high) = if one.fingerprint < two.fingerprint {
+                (one, two)
+            } else {
+                (two, one)
+            };
+            let (lf, hf) = (low.fingerprint.clone(), high.fingerprint.clone());
+            let on_low = raw_receiver(low.clone(), &high);
+            let from_high = raw_dialer(high.clone(), &low);
+            let mut ends = Vec::new();
+            for _ in 0..2 {
+                let (dialled, arrived) =
+                    tokio::join!(from_high.connect(on_low.port), on_low.next(WITHIN));
+                ends.push((dialled.expect("a dial"), arrived.expect("its other end")));
+            }
+            let (pairings, _events) = Pairings::new();
+            // At the machine sorting first: the other's dial, which it picks
+            // on, then its own, which it shows on and both machines keep.
+            let given_up = pairings.begin(Role::Pick, &lf, &hf).expect("first");
+            let kept = pairings.begin(Role::Show, &lf, &hf).expect("second");
+            let ticket = given_up.hold(&ends[0].1).expect("nothing held yet");
+            let shown = ticket.show(&ends[0].1);
+            let mut shown = std::pin::pin!(shown);
             assert!(
-                receiving.next(NEVER_WITHIN * 3).await.is_none(),
-                "the machine being added completed a dial to the machine adding it"
+                futures::poll!(shown.as_mut()).is_pending(),
+                "a number on the dial not kept was shown while the kept one was compared"
             );
+            let _kept = kept
+                .hold(&ends[1].1)
+                .expect("the kept dial takes its place");
+            assert_eq!(
+                shown.await,
+                Err(None),
+                "a number given up here for the one kept said why it ended, ending the \
+                 approval that one carries"
+            );
+        });
+    }
+
+    // LEDGER G-32 | class B | 1 PairingEvent + 1 notice text: Ended from the production dialler whose comparison failed after its nonce went out, on a connection still open; the notice the service builds from it
+    /// A comparison that failed after this machine's half went out, on a
+    /// connection still open, is told in the words of what failed. Which
+    /// half had gone out decides how the attempt ends; it is not something
+    /// the person can act on.
+    #[test]
+    fn a_comparison_failed_late_is_told_in_plain_words() {
+        run_local(async {
+            let (here, there) = (machine(), machine());
+            let receiving = raw_receiver(there, &here);
+            let mut d = dialer(
+                &here,
+                approved(&here, &receiving.me, Caps::INBOUND),
+                receiving.port,
+                Position::Left,
+            );
+            let mut events = d.conn.take_pairing_events().expect("pairing events");
+            d.conn.dial(d.handle).await;
+            let conn = receiving.next(WITHIN).await.expect("a dial");
+            // The other machine's half, with a reveal that opens nothing.
+            let (mut send, mut recv) = conn.open_bi().await.expect("the comparison stream");
+            send.write_all(&[0u8; crate::match_code::COMMIT_LEN])
+                .await
+                .expect("commitment");
+            let mut theirs = [0u8; crate::match_code::NONCE_LEN];
+            recv.read_exact(&mut theirs)
+                .await
+                .expect("the dialler's nonce");
+            send.write_all(&[0u8; crate::match_code::NONCE_LEN])
+                .await
+                .expect("the reveal");
+            let _ = send.finish();
+            let why = match next_within(&mut events, WITHIN).await {
+                Some(PairingEvent::Ended { why, .. }) => why,
+                other => panic!("a comparison that failed did not end the attempt: {other:?}"),
+            };
+            let notice = crate::service::ended_notice("\"B\"", &why, false);
+            let failed = crate::pair_ceremony::CeremonyError::CommitmentBroken.to_string();
             assert!(
-                next_within(&mut events, NEVER_WITHIN).await.is_none(),
-                "a comparison started the wrong way"
+                notice.starts_with(&format!("Pairing with \"B\" failed ({failed}), ")),
+                "the notice for a comparison that failed late: {notice:?}"
             );
+            drop(conn);
+        });
+    }
+
+    // LEDGER G-22 | class B | 1 PairingEvent: Ended from the production listener after the other end closed a connection whose number was shown
+    /// A number shown here ends the attempt, whatever reason the other
+    /// machine gives for closing its connection: a machine that says it gave
+    /// the connection up for another cannot keep the approval standing and
+    /// draw a second number from it (#220).
+    #[test]
+    fn a_number_shown_ends_whatever_the_other_machine_says() {
+        run_local(async {
+            // Each machine stays up until the end, as its tasks expect.
+            let mut up = Vec::new();
+            for reason in [SUPERSEDED, BUSY, &b"pairing ended"[..]] {
+                let (b, a) = (machine(), machine());
+                let trust = approved(&b, &a, Caps::INBOUND);
+                let mut b = added(b, trust).await;
+                let a = raw_dialer(a, &b.me);
+                let conn = a.connect(b.port).await.expect("handshake");
+                crate::pair_ceremony::as_initiator(&conn, &a.me.fingerprint, &b.me.fingerprint)
+                    .await
+                    .expect("a number");
+                number(&mut b.events, "the receiver").await;
+                conn.close(0u32.into(), reason);
+                match next_within(&mut b.events, WITHIN).await {
+                    Some(PairingEvent::Ended { why, .. }) => assert_eq!(
+                        why,
+                        Why::Closed,
+                        "closed by the other machine as {:?}",
+                        String::from_utf8_lossy(reason)
+                    ),
+                    other => panic!(
+                        "a number shown here, its connection closed by the other machine as \
+                         {:?}, did not end the attempt: {other:?}",
+                        String::from_utf8_lossy(reason)
+                    ),
+                }
+                up.push((b, conn));
+            }
+        });
+    }
+
+    /// Wait until `pairings` counts a comparison with `fingerprint` under way
+    /// on a connection the machine sorting first dialled.
+    async fn arriving_preferred(pairings: &Pairings, fingerprint: &str) {
+        while !pairings
+            .board
+            .borrow()
+            .arriving
+            .get(fingerprint)
+            .is_some_and(|a| a.preferred > 0)
+        {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Wait until `pairings` holds a comparison with `fingerprint`.
+    async fn holds(pairings: &Pairings, fingerprint: &str) {
+        while pairings.held_conn(fingerprint).is_none() {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// The other machine's half of the comparison as far as the nonce of the
+    /// machine that dialled it: from there it can work out the number, and it
+    /// closes the connection before revealing its own half. What it commits
+    /// to does not matter; nothing checks it before the reveal.
+    async fn learn_the_number_and_close(conn: &quinn::Connection) {
+        let (mut send, mut recv) = conn.open_bi().await.expect("the comparison stream");
+        send.write_all(&[0u8; crate::match_code::COMMIT_LEN])
+            .await
+            .expect("commitment");
+        let mut theirs = [0u8; crate::match_code::NONCE_LEN];
+        recv.read_exact(&mut theirs)
+            .await
+            .expect("the dialler's nonce");
+        conn.close(0u32.into(), b"pairing ended");
+    }
+
+    // LEDGER G-24 | class B | 1 PairingEvent: Ended from the production listener after the other end closed a connection whose number was held back
+    /// A number compared here and held back, while the dial of the machine
+    /// sorting first is compared, is known to the other machine already.
+    /// That machine closing it ends the approval, so it cannot draw number
+    /// after number, and pick which one is shown, by closing each one while
+    /// it stalls the dial that holds it back (#220).
+    #[test]
+    fn a_number_held_back_and_closed_by_the_other_machine_ends_the_approval() {
+        run_local(async {
+            let here = machine();
+            let mut there = machine();
+            while here.fingerprint >= there.fingerprint {
+                there = machine();
+            }
+            let trust = approved(&here, &there, Caps::INBOUND);
+            let stall_end = raw_receiver(there.clone(), &here);
+            let ours_out = raw_dialer(here.clone(), &there);
+            let mut here = added(here, trust).await;
+            let (hf, tf) = (here.me.fingerprint.clone(), there.fingerprint.clone());
+
+            // This machine's own dial, which sorts first, stalled by the other.
+            let (stalled, stall) =
+                tokio::join!(ours_out.connect(stall_end.port), stall_end.next(WITHIN));
+            let (stalled, stall) = (stalled.expect("dial"), stall.expect("accepted"));
+            let pairings = here.pairings.clone();
+            let (h, t) = (hf.clone(), tf.clone());
+            let at = SocketAddr::from(([127, 0, 0, 1], 4242));
+            let _stalled = tokio::task::spawn_local(async move {
+                let _ = reach_number(&pairings, &stalled, Role::Show, &h, &t, at).await;
+            });
+            arriving_preferred(&here.pairings, &tf).await;
+
+            // The other machine's dial reaches a number, held back here.
+            let theirs = raw_dialer(there.clone(), &here.me);
+            let first = theirs.connect(here.port).await.expect("handshake");
+            crate::pair_ceremony::as_initiator(&first, &tf, &hf)
+                .await
+                .expect("a number");
+            holds(&here.pairings, &tf).await;
+            first.close(0u32.into(), b"pairing ended");
+            // Another, kept open: were the first forgotten quietly, this is
+            // the number shown once the stalled dial goes.
+            let second = theirs.connect(here.port).await.expect("handshake");
+            let _ = crate::pair_ceremony::as_initiator(&second, &tf, &hf).await;
+            stall.close(0u32.into(), b"pairing ended");
+
+            match next_within(&mut here.events, WITHIN).await {
+                Some(PairingEvent::Ended {
+                    fingerprint, why, ..
+                }) if fingerprint == tf => assert_eq!(why, Why::Closed),
+                other => panic!(
+                    "a number held back here, then closed by the machine that knew it, left \
+                     the approval standing: {other:?}"
+                ),
+            }
+            drop(second);
+        });
+    }
+
+    // LEDGER G-25 | class B | 1 PairingEvent: Ended from LanMouseConnection after the other end closed the comparison once it held the dialler's nonce
+    /// The machine being dialled can work out the number as soon as the
+    /// dialler's nonce arrives, before the dialler can. Closing then ends
+    /// the approval: otherwise the add dial comes back with a fresh number
+    /// each time, and the other machine lets through the one it likes.
+    #[test]
+    fn a_comparison_abandoned_after_the_dialler_s_nonce_ends_the_approval() {
+        run_local(async {
+            let (a, b) = (machine(), machine());
+            let b = raw_receiver(b, &a);
+            let mut d = dialer(
+                &a,
+                approved(&a, &b.me, Caps::OUTBOUND),
+                b.port,
+                Position::Left,
+            );
+            let mut a_events = d.conn.take_pairing_events().expect("pairing events");
+            d.conn.dial(d.handle).await;
+            let conn = b.next(WITHIN).await.expect("the dial reaches the receiver");
+            learn_the_number_and_close(&conn).await;
+            match next_within(&mut a_events, WITHIN).await {
+                Some(PairingEvent::Ended { why, .. }) => assert_eq!(why, Why::Closed),
+                other => panic!(
+                    "the machine dialled closed the comparison once it could know the \
+                     number, and the approval stood: {other:?}"
+                ),
+            }
+        });
+    }
+
+    // LEDGER G-26 | class B | 1 return value: reach_number on a real connection the other end closed after the dialler's nonce, with a number already shown here
+    /// Two machines adding each other: the one sorting first closes the
+    /// other's dial once its own is compared. The other machine is showing
+    /// that number by then, so its own dial ends quietly and the approval
+    /// stays with the number on screen (#220).
+    #[test]
+    fn a_comparison_closed_while_another_number_shows_ends_quietly() {
+        run_local(async {
+            let here = machine();
+            let mut there = machine();
+            while there.fingerprint >= here.fingerprint {
+                there = machine();
+            }
+            let trust = approved(&here, &there, Caps::INBOUND);
+            let their_end = raw_receiver(there.clone(), &here);
+            let ours_out = raw_dialer(here.clone(), &there);
+            let mut here = added(here, trust).await;
+            let (hf, tf) = (here.me.fingerprint.clone(), there.fingerprint.clone());
+
+            // This machine's dial, which does not sort first, under way.
+            let (ours, theirs_end) =
+                tokio::join!(ours_out.connect(their_end.port), their_end.next(WITHIN));
+            let (ours, theirs_end) = (ours.expect("dial"), theirs_end.expect("accepted"));
+            let pairings = here.pairings.clone();
+            let (h, t) = (hf.clone(), tf.clone());
+            let at = SocketAddr::from(([127, 0, 0, 1], 4242));
+            let ours_task = tokio::task::spawn_local(async move {
+                reach_number(&pairings, &ours, Role::Show, &h, &t, at)
+                    .await
+                    .map(|_| ())
+            });
+            let (mut send, mut recv) = theirs_end.open_bi().await.expect("stream");
+            send.write_all(&[0u8; crate::match_code::COMMIT_LEN])
+                .await
+                .expect("commitment");
+            let mut nonce = [0u8; crate::match_code::NONCE_LEN];
+            recv.read_exact(&mut nonce).await.expect("nonce");
+
+            // The other machine's dial, which sorts first, shows its number.
+            let dials = raw_dialer(there.clone(), &here.me);
+            let shown = dials.connect(here.port).await.expect("handshake");
+            crate::pair_ceremony::as_initiator(&shown, &tf, &hf)
+                .await
+                .expect("a number");
+            number(&mut here.events, "this machine").await;
+
+            theirs_end.close(0u32.into(), SUPERSEDED);
+            match ours_task.await.expect("task") {
+                Err((_, None)) => {}
+                other => panic!(
+                    "this machine's own dial, closed by the other machine for the connection \
+                     whose number shows here, ended the approval: {other:?}"
+                ),
+            }
+            drop(shown);
+        });
+    }
+
+    // LEDGER G-27 | class B | 1 PairingEvent: Number, not Ended, from the production listener after an earlier connection closed before the dialler's nonce
+    /// A connection closed before the dialler's nonce went out carries no
+    /// number anyone could know: a dial raced to another address and lost,
+    /// or the link blipped. It ends quietly, and the next reaches a number.
+    #[test]
+    fn a_comparison_closed_before_any_nonce_ends_quietly() {
+        run_local(async {
+            let (b, a) = (machine(), machine());
+            let trust = approved(&b, &a, Caps::INBOUND);
+            let mut b = added(b, trust).await;
+            let a = raw_dialer(a, &b.me);
+            let lost = a.connect(b.port).await.expect("handshake");
+            let (_send, mut recv) = lost.accept_bi().await.expect("the comparison stream");
+            let mut commitment = [0u8; crate::match_code::COMMIT_LEN];
+            recv.read_exact(&mut commitment).await.expect("commitment");
+            lost.close(0u32.into(), b"lost the race");
+            let conn = a.connect(b.port).await.expect("handshake");
+            crate::pair_ceremony::as_initiator(&conn, &a.me.fingerprint, &b.me.fingerprint)
+                .await
+                .expect("a number");
+            match next_within(&mut b.events, WITHIN).await {
+                Some(PairingEvent::Number { .. }) => {}
+                other => panic!(
+                    "a connection closed before any nonce went out ended the attempt: {other:?}"
+                ),
+            }
+        });
+    }
+
+    // LEDGER G-28 | class B | 1 PairingEvent: Ended from the production listener when the deadline passed on a number held back
+    /// A number held back past the deadline is known to the other machine
+    /// as well, so running out of time ends the approval too (#220).
+    #[test]
+    fn a_number_held_back_past_the_deadline_ends_the_approval() {
+        run_local(async {
+            let here = machine();
+            let mut there = machine();
+            while here.fingerprint >= there.fingerprint {
+                there = machine();
+            }
+            let trust = approved(&here, &there, Caps::INBOUND);
+            let stall_end = raw_receiver(there.clone(), &here);
+            let ours_out = raw_dialer(here.clone(), &there);
+            let mut here = added(here, trust).await;
+            here.pairings.set_deadline(Duration::from_millis(200));
+            let (hf, tf) = (here.me.fingerprint.clone(), there.fingerprint.clone());
+
+            // This machine's own dial, which sorts first, stalled for longer
+            // than the deadline: the other machine never opens the comparison.
+            let (stalled, stall) =
+                tokio::join!(ours_out.connect(stall_end.port), stall_end.next(WITHIN));
+            let (stalled, _stall) = (stalled.expect("dial"), stall.expect("accepted"));
+            let pairings = here.pairings.clone();
+            let (h, t) = (hf.clone(), tf.clone());
+            let at = SocketAddr::from(([127, 0, 0, 1], 4242));
+            let _stalled = tokio::task::spawn_local(async move {
+                let _ = reach_number(&pairings, &stalled, Role::Show, &h, &t, at).await;
+            });
+            arriving_preferred(&here.pairings, &tf).await;
+
+            let theirs = raw_dialer(there.clone(), &here.me);
+            let held = theirs.connect(here.port).await.expect("handshake");
+            crate::pair_ceremony::as_initiator(&held, &tf, &hf)
+                .await
+                .expect("a number");
+            match next_within(&mut here.events, WITHIN).await {
+                Some(PairingEvent::Ended {
+                    fingerprint, why, ..
+                }) if fingerprint == tf => assert_eq!(why, Why::TimedOut),
+                other => panic!(
+                    "a number held back here past the deadline left the approval standing: \
+                     {other:?}"
+                ),
+            }
+            drop(held);
+        });
+    }
+
+    /// A receiver like [`raw_receiver`] that lets the dialler send at most
+    /// `window` bytes on a stream before reading them.
+    fn raw_receiver_windowed(me: Machine, dialled_by: &Machine, window: u32) -> RawReceiver {
+        crate::transport::install_crypto_provider();
+        let mut cfg = crate::listen::server_config(
+            &me.identity,
+            paired(&me, dialled_by, Caps::INBOUND),
+            Default::default(),
+        )
+        .expect("server config");
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_concurrent_uni_streams(8u8.into());
+        transport.stream_receive_window(window.into());
+        cfg.transport_config(Arc::new(transport));
+        let endpoint = quinn::Endpoint::server(cfg, "127.0.0.1:0".parse().expect("loopback"))
+            .expect("endpoint");
+        let port = endpoint.local_addr().expect("bound").port();
+        RawReceiver { me, endpoint, port }
+    }
+
+    /// Wait until `conn` has received `frames` stream frames.
+    async fn stream_frames(conn: &quinn::Connection, frames: u64) {
+        while conn.stats().frame_rx.stream < frames {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    const PART: usize = 8;
+
+    // LEDGER G-29 | class B | 1 PairingEvent: Ended from LanMouseConnection after the other end closed the comparison holding part of the dialler's nonce
+    /// Part of the dialler's nonce is part of the number: a machine that
+    /// lets only some of it through before closing already narrows the
+    /// number down, so that ends the approval too.
+    #[test]
+    fn a_comparison_closed_on_part_of_the_dialler_s_nonce_ends_the_approval() {
+        run_local(async {
+            let (a, b) = (machine(), machine());
+            let b = raw_receiver_windowed(b, &a, PART as u32);
+            let mut d = dialer(
+                &a,
+                approved(&a, &b.me, Caps::OUTBOUND),
+                b.port,
+                Position::Left,
+            );
+            let mut a_events = d.conn.take_pairing_events().expect("pairing events");
+            d.conn.dial(d.handle).await;
+            let conn = b.next(WITHIN).await.expect("the dial reaches the receiver");
+            let (mut send, mut recv) = conn.open_bi().await.expect("the comparison stream");
+            send.write_all(&[0u8; crate::match_code::COMMIT_LEN])
+                .await
+                .expect("commitment");
+            // The first stream frame this end receives is the nonce, cut off
+            // at the window: read it whole, and close in the same step.
+            stream_frames(&conn, 1).await;
+            let mut part = [0u8; PART];
+            recv.read_exact(&mut part).await.expect("part of the nonce");
+            conn.close(0u32.into(), b"pairing ended");
+            match next_within(&mut a_events, WITHIN).await {
+                Some(PairingEvent::Ended { why, .. }) => assert_eq!(why, Why::Closed),
+                other => panic!(
+                    "the machine dialled closed the comparison on part of the dialler's \
+                     nonce, and the approval stood: {other:?}"
+                ),
+            }
+        });
+    }
+
+    // LEDGER G-30 | class B | 1 PairingEvent: Ended from the production listener after the other end closed the comparison holding part of the reveal
+    /// The machine being added reveals its half last. A dialler that lets
+    /// only part of the reveal through before closing can narrow the number
+    /// down against the commitment, so that ends the approval too.
+    #[test]
+    fn a_comparison_closed_on_part_of_the_reveal_ends_the_approval() {
+        run_local(async {
+            let (b, a) = (machine(), machine());
+            let trust = approved(&b, &a, Caps::INBOUND);
+            let mut b = added(b, trust).await;
+            let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().expect("loopback"))
+                .expect("endpoint");
+            endpoint.set_default_client_config(crate::test_harness::raw_client_config(
+                &a,
+                paired(&a, &b.me, Caps::OUTBOUND),
+                (crate::match_code::COMMIT_LEN + PART) as u32,
+            ));
+            let at = SocketAddr::new("127.0.0.1".parse().expect("loopback"), b.port);
+            let conn = endpoint
+                .connect(at, "grabbr")
+                .expect("connect")
+                .await
+                .expect("handshake");
+            let (mut send, mut recv) = conn.accept_bi().await.expect("the comparison stream");
+            // The commitment is left unread, so the window stays shut behind
+            // part of the reveal.
+            send.write_all(&[0u8; crate::match_code::NONCE_LEN])
+                .await
+                .expect("nonce");
+            stream_frames(&conn, 2).await;
+            let mut got = [0u8; crate::match_code::COMMIT_LEN + PART];
+            recv.read_exact(&mut got)
+                .await
+                .expect("the commitment and part of the reveal");
+            conn.close(0u32.into(), b"pairing ended");
+            match next_within(&mut b.events, WITHIN).await {
+                Some(PairingEvent::Ended { why, .. }) => assert_eq!(why, Why::Closed),
+                other => panic!(
+                    "the dialler closed the comparison on part of the reveal, and the \
+                     approval stood: {other:?}"
+                ),
+            }
         });
     }
 

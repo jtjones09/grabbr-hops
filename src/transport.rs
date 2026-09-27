@@ -152,14 +152,14 @@ impl ServerCertVerifier for FpServerVerifier {
         _now: UnixTime,
     ) -> Result<ServerCertVerified, TlsError> {
         let fingerprint = fingerprint_of(end_entity);
-        // Or a receiver this machine approved driving and has not yet
+        // Or a receiver this machine approved pairing with and has not yet
         // compared a number with: far enough to compare it, and no further
-        // (#167). Only in this direction, so a machine that approved being
-        // driven by that receiver does not reach it this way.
+        // (#167). In either direction: which way control goes is what the
+        // person approving chose (#220), not which machine dials, and until
+        // both confirm nothing moves on the connection either way.
         let permitted = {
             let trust = self.trust.read().expect("lock");
-            trust.we_may_drive(&fingerprint)
-                || trust.awaits(&fingerprint, crate::trust::Caps::I_MAY_DRIVE)
+            trust.we_may_drive(&fingerprint) || trust.is_pairing(&fingerprint)
         };
         *self.observed.lock().expect("lock") = Some(fingerprint);
         if permitted {
@@ -266,13 +266,13 @@ impl ClientCertVerifier for FpClientVerifier {
         // this machine.
         //
         // Or a sender this machine approved, whose number is not yet compared:
-        // admitted far enough to compare it, and in this direction only
-        // (#167). Nothing it sends is read until both machines confirm.
+        // admitted far enough to compare it (#167), whichever way the person
+        // approving chose control to go (#220). Nothing it sends is read
+        // until both machines confirm.
         let (permitted, known) = {
             let trust = self.trust.read().expect("lock");
             (
-                trust.may_drive_us(&fingerprint)
-                    || trust.awaits(&fingerprint, crate::trust::Caps::DRIVE_ME),
+                trust.may_drive_us(&fingerprint) || trust.is_pairing(&fingerprint),
                 trust.is_known(&fingerprint),
             )
         };
@@ -284,8 +284,9 @@ impl ClientCertVerifier for FpClientVerifier {
         // connection: nothing a stranger does grows it.
         *self.refused.lock().expect("lock") = Some(fingerprint);
         if known {
-            // Paired, in the other direction only, or waiting for its number
-            // the other way: said as `handshake_failure`.
+            // Paired, in the other direction only: said as
+            // `handshake_failure`. A machine waiting for its number, in either
+            // direction, was admitted above and never reaches here.
             Err(TlsError::General(
                 "no live lease permits that sender to drive this machine".into(),
             ))

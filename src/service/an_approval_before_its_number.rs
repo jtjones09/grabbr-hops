@@ -131,9 +131,10 @@ fn approve(service: &mut Service, fp: &str, origin: AttemptOrigin) {
         1,
         "add device is open and {fp} was not asked about"
     );
-    service.handle_frontend_request(Some(Ok(FrontendRequest::AuthorizeKey(
-        "desk b".into(),
-        fp.to_string(),
+    service.handle_frontend_request(Some(Ok(crate::test_harness::approval(
+        "desk b",
+        fp,
+        hops_ipc::Controller::ThatMachine,
     ))));
     assert!(
         service.trust.read().expect("lock").is_pairing(fp),
@@ -257,7 +258,7 @@ fn an_approval_that_shows_no_number_within_the_window_is_forgotten() {
             .approved
             .get_mut(&peer)
             .expect("the approval is held");
-        when.0 = a_window_before(when.0);
+        when.at = a_window_before(when.at);
 
         let told = serve(
             &mut service,
@@ -311,7 +312,7 @@ fn a_machine_approved_here_is_not_asked_about_again_while_it_pairs() {
         let (mut service, _scratch) = daemon("again").await;
         let peer = machine().fingerprint;
         approve(&mut service, &peer, AttemptOrigin::Inbound);
-        let approved_at = service.approved[&peer].0;
+        let approved_at = service.approved[&peer].at;
 
         tokio::time::sleep(PAST_THE_REPEAT).await;
         knock(&mut service, &peer);
@@ -326,12 +327,13 @@ fn a_machine_approved_here_is_not_asked_about_again_while_it_pairs() {
             notices(&events).is_empty(),
             "a knock from a machine approved to drive this one raised a notice: {events:?}"
         );
-        service.handle_frontend_request(Some(Ok(FrontendRequest::AuthorizeKey(
-            "desk b".into(),
-            peer.clone(),
+        service.handle_frontend_request(Some(Ok(crate::test_harness::approval(
+            "desk b",
+            &peer,
+            hops_ipc::Controller::ThatMachine,
         ))));
         assert_eq!(
-            service.approved.get(&peer).map(|a| a.0),
+            service.approved.get(&peer).map(|a| a.at),
             Some(approved_at),
             "approving again restarted the time the pairing has to show its number"
         );
@@ -376,16 +378,16 @@ fn a_cancel_forgets_the_approval() {
     });
 }
 
-/// Both machines adding each other, each approving the dial it made: each
-/// approved itself as the machine in control, so neither TLS door admits
-/// the other and no number can appear. The other machine's knock says so
-/// once, and the add dial that gives up says so too, not that the other
-/// machine never approved.
-// LEDGER G-20 | class B | 1 events the daemon sends + 2 notice over the real IPC socket
+/// Removing a device whose approval here waits for its number drops that
+/// approval with its lease (#184, #220): what the card answered goes, the
+/// TLS door stops admitting the machine, the add dial that gives up does
+/// not say this machine approved it, and a knock is asked about afresh, so
+/// pairing it again goes through the card again.
+// LEDGER R184-19 | class B | 2 events over the real IPC socket + 6 struct state: Service::remove_authorized_key
 #[test]
-fn machines_adding_each_other_are_told_so() {
+fn a_removal_drops_an_approval_waiting_for_its_number() {
     run_local(async {
-        let (mut service, scratch) = daemon("both").await;
+        let (mut service, scratch) = daemon("rmap").await;
         let peer = machine().fingerprint;
         service.handle_frontend_request(Some(Ok(FrontendRequest::OpenPairing)));
         service.handle_frontend_request(Some(Ok(FrontendRequest::Create)));
@@ -407,32 +409,34 @@ fn machines_adding_each_other_are_told_so() {
             service.adding.contains_key(&handle),
             "the add dial did not start"
         );
-        approve(&mut service, &peer, AttemptOrigin::OutboundDial);
-
-        knock(&mut service, &peer);
-        let first = sent(&mut service);
-        tokio::time::sleep(PAST_THE_REPEAT).await;
-        knock(&mut service, &peer);
-        let again = sent(&mut service);
-        let told: Vec<String> = notices(&first)
-            .into_iter()
-            .filter(|t| t.contains("at the same time"))
-            .collect();
-        assert_eq!(
-            told.len(),
-            1,
-            "the other machine's knock, while this machine adds it, did not say once \
-             that both machines are adding each other: {first:?}"
+        service.raise_connection_attempt(
+            peer.clone(),
+            AttemptOrigin::OutboundDial,
+            Some(peer_addr()),
         );
-        assert_eq!(
-            (prompts_for(&first, &peer), prompts_for(&again, &peer)),
-            (0, 0),
-            "a machine approved here was asked about again"
-        );
+        service.handle_frontend_request(Some(Ok(FrontendRequest::AuthorizeKey {
+            label: "desk b".into(),
+            fingerprint: peer.clone(),
+            controller: hops_ipc::Controller::Both,
+            clipboard: true,
+        })));
         assert!(
-            notices(&again).is_empty(),
-            "the same crossing was announced again: {again:?}"
+            service.trust.read().expect("lock").is_pairing(&peer),
+            "precondition: the approval waits for its number: {:?}",
+            notices(&sent(&mut service))
         );
+        sent(&mut service);
+
+        service
+            .handle_frontend_request(Some(Ok(FrontendRequest::RemoveAuthorizedKey(peer.clone()))));
+        {
+            let trust = service.trust.read().expect("lock");
+            assert!(
+                !trust.is_known(&peer) && !trust.is_pairing(&peer),
+                "the removal left the approval's lease, and the TLS doors still admit \
+                 the machine"
+            );
+        }
 
         let mut frontend = attached(&mut service, &scratch).await;
         let started = service.adding.get_mut(&handle).expect("still adding");
@@ -458,9 +462,13 @@ fn machines_adding_each_other_are_told_so() {
         assert!(
             gave_up
                 .as_deref()
-                .is_some_and(|t| t.contains("at the same time") && !t.contains("never approved")),
-            "the add dial's notice blames the other machine for not approving, when \
-             both machines approved themselves as the one in control: {gave_up:?}"
+                .is_some_and(|t| !t.contains("this machine approved")),
+            "the add dial says this machine approved a pairing that was removed: \
+             the approval outlived the removal: {gave_up:?}"
+        );
+        assert!(
+            knock_until_asked(&mut service, &peer).await,
+            "a knock after the removal was not asked about afresh"
         );
         shut_down(service).await;
     });
@@ -529,6 +537,76 @@ fn a_machine_waiting_for_its_number_is_not_treated_as_paired() {
             "a paired machine was offered to add again"
         );
         assert_eq!(service.device_name(handle), "desk b", "once paired");
+        shut_down(service).await;
+    });
+}
+
+/// One approval shows one number (#220). An attempt other than the one
+/// whose number is on screen ending ends nothing: the pairing goes on there.
+/// The one on screen ending ends the pairing, however its connection closed,
+/// and forgets the approval, so a number arriving after it shows nothing.
+// LEDGER G-23 | class B | 1 events the daemon sends + 1 the trust the TLS door consults: Service::handle_pairing_event
+#[test]
+fn one_approval_shows_one_number() {
+    use crate::pairing::{PairingEvent, Role, Why};
+    run_local(async {
+        let (mut service, _scratch) = daemon("once").await;
+        let peer = machine().fingerprint;
+        approve(&mut service, &peer, AttemptOrigin::Inbound);
+        let number = |service: &mut Service, attempt: u64| {
+            service.handle_pairing_event(PairingEvent::Number {
+                fingerprint: peer.clone(),
+                addr: peer_addr(),
+                role: Role::Pick,
+                number: "042917".into(),
+                handle: None,
+                attempt,
+            });
+            sent(service)
+        };
+        let ended = |service: &mut Service, why: Why, attempt: u64| {
+            service.handle_pairing_event(PairingEvent::Ended {
+                fingerprint: peer.clone(),
+                why,
+                handle: None,
+                attempt,
+            });
+            sent(service)
+        };
+        let card_down = |events: &[FrontendEvent]| {
+            events.iter().any(|e| {
+                matches!(e, FrontendEvent::PairingEnded { fingerprint, paired: false }
+                    if *fingerprint == peer)
+            })
+        };
+        let card_up = |events: &[FrontendEvent]| {
+            events.iter().any(|e| {
+                matches!(e, FrontendEvent::PairingCheck { fingerprint, .. }
+                    if *fingerprint == peer)
+            })
+        };
+
+        assert!(
+            card_up(&number(&mut service, 1)),
+            "the first number was not shown"
+        );
+        let events = ended(&mut service, Why::Closed, 2);
+        assert!(
+            !card_down(&events) && service.trust.read().expect("lock").is_pairing(&peer),
+            "an attempt other than the one on screen ended the pairing: {events:?}"
+        );
+
+        let events = ended(&mut service, Why::Closed, 1);
+        assert!(
+            card_down(&events) && !service.trust.read().expect("lock").is_pairing(&peer),
+            "the attempt on screen closing did not end the pairing and forget the \
+             approval: {events:?}"
+        );
+        let events = number(&mut service, 3);
+        assert!(
+            !card_up(&events),
+            "a second number was shown from one approval: {events:?}"
+        );
         shut_down(service).await;
     });
 }
