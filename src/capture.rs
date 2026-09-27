@@ -1766,6 +1766,78 @@ mod a_refused_crossing {
         });
     }
 
+    // LEDGER T115-10 | class B | 5 capture backend state + events the capture task sends the service, no link
+    /// The device is pinned to a receiver this machine may no longer drive,
+    /// and there is no link: the lease lapsed while the link was down, as
+    /// after the peer restarts. Every crossing says it is not permitted,
+    /// enters nothing and dials nothing: the refusal comes from the pin, not
+    /// from a link that is not there.
+    #[test]
+    fn a_crossing_to_a_pinned_receiver_this_machine_may_not_drive_dials_nothing() {
+        run_local(async {
+            let sender = machine();
+            let receiver = machine();
+            // Bound and silent: a dial to it would land here, and nothing
+            // may dial it.
+            let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("a silent port");
+            let port = silent.local_addr().expect("its address").port();
+            let store = trust(&sender, &[&receiver], Caps::OUTBOUND);
+            let crate::test_harness::Dialer {
+                conn,
+                clients,
+                handle,
+                notices: _notices,
+            } = dialer(&sender, store.clone(), port, hops_ipc::Position::Left);
+            clients.set_peer_fingerprint(handle, Some(receiver.fingerprint.clone()));
+            store
+                .write()
+                .expect("lock")
+                .drop_capabilities(&receiver.fingerprint, Caps::OUTBOUND)
+                .expect("the receiver's lease");
+            let script = Script::new();
+            let mut capture = Capture::new(
+                Some(script.backend()),
+                conn,
+                vec![scancode::Linux::KeyLeftCtrl],
+            );
+            capture.create(handle, hops_ipc::Position::Left, CaptureType::Default);
+
+            let mut told_since = Vec::new();
+            for _ in 0..3 {
+                let released = script.releases();
+                cross_until_let_go(&script, Position::Left, released).await;
+                told_since.extend(told(&mut capture));
+            }
+            assert!(
+                !entered(&told_since),
+                "a crossing to a receiver this machine may not drive counted as \
+                 entering it: {told_since:?}"
+            );
+            let refusals: Vec<&String> = told_since
+                .iter()
+                .filter(|t| t.starts_with("CrossingRefused"))
+                .collect();
+            assert!(
+                !refusals.is_empty()
+                    && refusals
+                        .iter()
+                        .all(|t| **t
+                            == format!("CrossingRefused({:?})", CrossingRefusal::NotPermitted)),
+                "with no link, a crossing to a pinned receiver this machine may \
+                 not drive gave another reason than the permission it lacks: \
+                 {told_since:?}"
+            );
+            silent.set_nonblocking(true).expect("nonblocking");
+            let mut packet = [0u8; 2048];
+            assert!(
+                silent.recv(&mut packet).is_err(),
+                "a crossing dialled a receiver this machine may not drive"
+            );
+
+            capture.terminate().await;
+        });
+    }
+
     // LEDGER T115-4 | class B | 5 capture backend state + events the capture task sends the service, link up over loopback
     /// The link is up, and this machine may no longer drive the receiver.
     /// A crossing to it does not count as entering it (which runs its enter
