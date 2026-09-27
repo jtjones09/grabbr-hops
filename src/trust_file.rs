@@ -2510,6 +2510,123 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
         );
         let _ = fs::remove_dir_all(&d);
     }
+
+    /// Each answer on the pairing card, with and without the clipboard,
+    /// survives the save and a restart as it was given (#220, #182): the
+    /// direction recorded as chosen, and the store granting what it granted
+    /// before. Read back any other way, the store refuses the pairing as not
+    /// what was chosen, and it is lost at the next start.
+    // LEDGER T12 | class B | 4 file on disk + 1 return value: service::grant_for_attempt, records_of, TrustFile::save, TrustFile::open, rebuild
+    #[test]
+    fn every_answer_on_the_card_survives_a_restart() {
+        use crate::service::grant_for_attempt;
+        use hops_ipc::{AttemptOrigin, Controller};
+
+        for (controller, written) in [
+            (Controller::ThisMachine, DiskOrigin::ChosenIMayDrive),
+            (Controller::ThatMachine, DiskOrigin::ChosenDriveMe),
+            (Controller::Both, DiskOrigin::ChosenBoth),
+        ] {
+            for clipboard in [false, true] {
+                let d = tmpdir("every-answer");
+                let auth = authority(&d);
+                let (mut file, _) = TrustFile::open(&d, auth.clone()).expect("open");
+                let mut store = TrustStore::new(&ours(), file.now()).expect("ours");
+                grant_for_attempt(
+                    &mut store,
+                    B,
+                    "desk mac",
+                    Some(AttemptOrigin::Inbound),
+                    controller,
+                    clipboard,
+                )
+                .expect("the approval grants");
+                store
+                    .confirm(B)
+                    .expect("both machines confirmed the number");
+                let granted = store.capabilities(B);
+                let records = records_of(&store);
+                assert_eq!(
+                    records
+                        .iter()
+                        .find(|r| r.fingerprint == B)
+                        .map(|r| r.origin),
+                    Some(written),
+                    "{controller:?}, clipboard {clipboard}: the answer was written as another"
+                );
+                file.save(&records).expect("save");
+
+                let (file, loaded) = TrustFile::open(&d, auth).expect("reopen");
+                let Loaded::Present { leases, .. } = loaded else {
+                    panic!("the saved store must be found");
+                };
+                let (store, refused) = rebuild(&ours(), file.now(), &leases).expect("rebuild");
+                assert!(
+                    refused.is_empty(),
+                    "{controller:?}, clipboard {clipboard}: refused at the next start: \
+                     {refused:?}"
+                );
+                assert_eq!(
+                    (store.lease(B).map(|l| l.origin), store.capabilities(B)),
+                    (Some(Origin::Chosen(controller)), granted),
+                    "{controller:?}, clipboard {clipboard}: a restart changed the pairing"
+                );
+                let _ = fs::remove_dir_all(&d);
+            }
+        }
+    }
+
+    /// A second approval to a pairing in force asks the clipboard question
+    /// again (#182), for the direction it adds: a yes shares the clipboard
+    /// that way, and a no leaves the clipboard the first answer gave.
+    // LEDGER T13 | class B | 1 return value: service::grant_for_attempt twice, TrustStore::capabilities
+    #[test]
+    fn a_second_approval_answers_the_clipboard_for_the_direction_it_adds() {
+        use crate::service::grant_for_attempt;
+        use hops_ipc::{AttemptOrigin, Controller};
+
+        for (first, second, want) in [
+            (
+                false,
+                true,
+                Caps::DRIVE_ME | Caps::I_MAY_DRIVE | Caps::CLIPBOARD_TO,
+            ),
+            (
+                true,
+                false,
+                Caps::DRIVE_ME | Caps::I_MAY_DRIVE | Caps::CLIPBOARD_FROM,
+            ),
+        ] {
+            let mut store = TrustStore::new(&ours(), NOW).expect("ours");
+            grant_for_attempt(
+                &mut store,
+                B,
+                "desk mac",
+                Some(AttemptOrigin::Inbound),
+                Controller::ThatMachine,
+                first,
+            )
+            .expect("the first approval grants");
+            store
+                .confirm(B)
+                .expect("both machines confirmed the number");
+            grant_for_attempt(
+                &mut store,
+                B,
+                "desk mac",
+                Some(AttemptOrigin::OutboundDial),
+                Controller::ThisMachine,
+                second,
+            )
+            .expect("the second approval grants");
+            assert_eq!(
+                store.capabilities(B),
+                want,
+                "clipboard {first} on the first approval, then {second} on the second: the \
+                 pairing does not share the clipboard the answers gave"
+            );
+        }
+    }
     // -- schema 2 (#187) ----------------------------------------------------
 
     fn authority_block(auth: &Arc<dyn Authority>) -> AuthorityBlock {
@@ -2701,7 +2818,8 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
     /// Approving the other direction of a pairing adds that direction (#166)
     /// and leaves a clipboard switched off, off: approved in the run that
     /// switched it off, or in a later one that read the choice back from disk,
-    /// and across a restart after the approval too.
+    /// and across a restart after the approval too. A yes on that approval's
+    /// card answers for the direction it adds, and only that one (#182).
     // LEDGER E2A-3 | class B | 4 file on disk: service::grant_for_attempt, TrustStore::disable_clipboard, TrustFile::save, start
     #[test]
     fn approving_the_second_direction_keeps_the_clipboard_off() {
@@ -2740,7 +2858,8 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
                 (file, store) = start_in(&d, &auth);
             }
             // A yes to the clipboard, on the approval of the other direction,
-            // does not turn back on a clipboard switched off.
+            // shares it the way that direction goes, and does not turn back
+            // on the clipboard switched off.
             grant_for_attempt(
                 &mut store,
                 B,
@@ -2763,12 +2882,12 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
                      not drive both ways: {}",
                     s.capabilities(B)
                 );
-                assert!(
-                    !s.capabilities(B).intersects(Caps::CLIPBOARD),
-                    "second direction approved {approved}: {when}, the clipboard is \
-                     back on: {}. It was switched off, and an approval to drive is \
-                     not an answer about the clipboard",
-                    s.capabilities(B)
+                assert_eq!(
+                    s.capabilities(B).intersection(Caps::CLIPBOARD),
+                    Caps::CLIPBOARD_TO,
+                    "second direction approved {approved}: {when}, the clipboard is not \
+                     what the answers gave: switched off the way the first direction \
+                     goes, and a yes for the way the second goes"
                 );
             }
             let _ = fs::remove_dir_all(&d);

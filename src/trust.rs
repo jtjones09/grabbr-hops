@@ -1056,10 +1056,11 @@ impl TrustStore {
             .and_then(|e| e.lease.clone());
         let lease = match held {
             Some(held) => {
-                // A clipboard someone chose stays as chosen: approving a
-                // second direction to drive is not an answer about the
-                // clipboard, so it must not turn a switched-off one back on.
-                let granted = if held.clipboard_chosen {
+                // A clipboard someone chose stays as chosen: an approval that
+                // asked nothing about the clipboard must not turn a
+                // switched-off one back on. One that asked (#182) adds the
+                // clipboard its answer gave, the way it chose control to go.
+                let granted = if held.clipboard_chosen && !clipboard_chosen {
                     lease.caps.without(Caps::CLIPBOARD)
                 } else {
                     lease.caps
