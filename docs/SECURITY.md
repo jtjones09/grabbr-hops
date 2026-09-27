@@ -30,7 +30,10 @@ and how to recover. How to report a vulnerability is in
 - **A trust file this machine did not write.** The list of paired machines
   is signed by a key kept beside it. A trust file edited by hand, copied
   from another installation, or restored on its own over a newer one stops
-  hops from starting instead of being trusted.
+  hops from starting instead of being trusted. This covers the trust file
+  only: when it is missing, hops rebuilds it from the list of machines in
+  `config.toml`, so a `config.toml` copied or edited while the trust file
+  is gone is trusted.
 
 ## What it cannot protect against
 
@@ -65,16 +68,19 @@ and how to recover. How to report a vulnerability is in
 
 ## Removing a machine
 
-Remove it from its card in the app, with `d` in the terminal UI (`hops tui`,
-which also works over SSH), or with
-`hops cli remove-authorized-key <fingerprint>`. `hops cli list` prints the
-fingerprint of each device this machine added. Removal is allowed even while
-another machine is controlling this one.
+Remove it from its card in the app, or with `d` in the terminal UI
+(`hops tui`, which also works over SSH). From a script, `hops cli list`
+prints each card's id, and `hops cli remove-client <id>` removes the card
+and the pairing with it. A machine with no card here, such as one that only
+controls this one, is not listed; remove it in the app or the terminal UI.
+Removal is allowed even while another machine is controlling this one.
 
 - It takes effect at once: its links close and its clipboard stops.
-- If it is connected, it is told, and removes this machine too. If not, its
-  card reads "it removed this machine" the next time it tries to reach this
-  one; remove it there as well.
+- If a link between the two is up and the other machine runs hops 0.13 or
+  later, it is told and removes this machine too. If not, its card reads
+  "it removed this machine" the next time it tries to control this one;
+  remove it there as well. A machine that never controls this one is not
+  told, so remove this machine on it by hand.
 - hops keeps no record of a removed machine and there is no undo. To use it
   again, pair the two machines again from the start.
 - Each machine keeps its own pairings. Removing a machine here does not
@@ -98,18 +104,21 @@ user account or a deleted directory gives the machine a new key. The other
 machines then no longer recognise it: remove its old card on each and pair
 again.
 
-**A device no longer connects.** Its card or the app says why:
+**A device no longer connects.** Its card says where it stands:
 
-| It says | What to do |
+| The card says | What to do |
 | --- | --- |
 | it removed this machine | Remove it here, then pair again. |
-| it does not let this machine control it | It was paired for the other direction only. Pair again, choosing the direction needed. |
-| its address answered for it as another machine | Its address now reaches a different machine. Correct the address on its card; the pairing is kept. |
-| waiting for it to approve this machine | Open add device on that machine. |
+| waiting for its approval | That machine has not approved the pairing or picked its number yet. Open add device on it and finish there. |
+| not accepting input | hops runs there but cannot inject input. It may lack a permission, such as Accessibility on macOS. |
+| unreachable | Check that hops runs on both machines and that a firewall lets UDP in on the port hops listens on (`port` in `config.toml`, or `o` in the terminal UI). |
 
-If nothing is said, check that hops runs on both machines and that a
-firewall lets UDP in on the port hops listens on (`port` in `config.toml`,
-or `o` in the terminal UI).
+A notice can say more:
+
+- "... does not let this machine control it": it was paired for the other
+  direction only. Pair again, choosing the direction needed.
+- "... answered for ... as ...": the device's address now reaches a
+  different machine. Correct the address on its card; the pairing is kept.
 
 **Starting over.** To end every pairing and keep this machine's key, remove
 each device. To give the machine a new key as well, for example when a copy
