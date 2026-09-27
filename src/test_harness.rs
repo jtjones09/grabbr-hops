@@ -148,7 +148,8 @@ pub(crate) struct Notices {
     /// Clipboard text this machine's transport received and queued for the
     /// service.
     pub(crate) clipboard: Receiver<crate::transport::PeerClipboard>,
-    _untrusted: Receiver<(String, std::net::SocketAddr)>,
+    /// Dials that ended in a way the service would tell the user about.
+    pub(crate) refusals: Receiver<crate::connect::DialRefusal>,
     _persist: Receiver<ClientHandle>,
     /// Which client's live state changed: what the service republishes to
     /// the frontend.
@@ -163,7 +164,7 @@ pub(crate) fn dialer(me: &Machine, trust: Trust, port: u16, pos: Position) -> Di
     clients.set_pos(handle, pos);
     clients.activate_client(handle);
     let (clipboard_tx, clipboard) = channel();
-    let (untrusted_tx, untrusted) = channel();
+    let (refusals_tx, refusals) = channel();
     let (persist_tx, persist) = channel();
     let (state_tx, state) = channel();
     let conn = LanMouseConnection::new(
@@ -171,7 +172,7 @@ pub(crate) fn dialer(me: &Machine, trust: Trust, port: u16, pos: Position) -> Di
         clients.clone(),
         trust,
         clipboard_tx,
-        untrusted_tx,
+        refusals_tx,
         persist_tx,
         state_tx,
     )
@@ -182,7 +183,7 @@ pub(crate) fn dialer(me: &Machine, trust: Trust, port: u16, pos: Position) -> Di
         handle,
         notices: Notices {
             clipboard,
-            _untrusted: untrusted,
+            refusals,
             _persist: persist,
             state,
         },
