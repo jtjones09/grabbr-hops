@@ -9,9 +9,13 @@
 //! or trust files.
 
 use super::Service;
+use crate::test_harness::{Machine, dialer};
 use crate::transport::Trust;
-use hops_ipc::{AsyncFrontendListener, DaemonEndpoint, FrontendEvent, FrontendRequest};
+use crate::trust::{Caps, TrustStore};
+use hops_ipc::{AsyncFrontendListener, DaemonEndpoint, FrontendEvent, FrontendRequest, Position};
+use hops_proto::ProtoEvent;
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -98,6 +102,11 @@ impl Daemon {
         self.port
     }
 
+    /// The clock its pairing window is timed by, to move on while it runs.
+    pub(crate) fn pairing_clock(&self) -> PairingClock {
+        PairingClock(self.service.pairing_skew.clone())
+    }
+
     /// Where a frontend reaches it.
     pub(crate) fn ipc(&self) -> Ipc {
         Ipc {
@@ -117,6 +126,18 @@ impl Daemon {
         self.service.emulation.terminate().await;
         self.service.resolver.terminate().await;
         out
+    }
+}
+
+/// The clock a daemon's pairing window is timed by.
+#[derive(Clone)]
+pub(crate) struct PairingClock(Arc<std::sync::atomic::AtomicU64>);
+
+impl PairingClock {
+    /// Move it on by `by`, as if that much time had passed.
+    pub(crate) fn advance(&self, by: Duration) {
+        let ms = u64::try_from(by.as_millis()).expect("a short step");
+        self.0.fetch_add(ms, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -183,5 +204,36 @@ impl Frontend {
                 Err(_) => {}
             }
         }
+    }
+}
+
+/// A store for `me` that may drive the daemon, as a peer's would be.
+pub(crate) fn trusting(me: &Machine, daemon: &str) -> Trust {
+    let mut store = TrustStore::new(&me.fingerprint, 0).expect("our fingerprint");
+    store
+        .issue(daemon, "the daemon", Caps::OUTBOUND)
+        .expect("issue");
+    Arc::new(RwLock::new(store))
+}
+
+/// Ask until the daemon has admitted `stranger`'s knock as a prompt.
+pub(crate) async fn prompt_from(app: &mut Frontend, stranger: &Machine, port: u16, daemon: &str) {
+    let knocker = dialer(stranger, trusting(stranger, daemon), port, Position::Left);
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    loop {
+        let _ = knocker.conn.send(ProtoEvent::Ping, knocker.handle).await;
+        let events = app.exchange(&[]).await;
+        let prompted = events.iter().any(|e| {
+            matches!(e, FrontendEvent::ConnectionAttempt { fingerprint, .. }
+                if *fingerprint == stranger.fingerprint)
+        });
+        if prompted {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a machine knocking while add device was open raised no prompt"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }

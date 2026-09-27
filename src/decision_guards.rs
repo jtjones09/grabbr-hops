@@ -1867,7 +1867,6 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
     #![cfg(unix)]
 
     use std::collections::BTreeMap;
-    use std::sync::{Arc, RwLock};
     use std::time::Duration;
 
     use hops_ipc::{ClientHandle, FrontendEvent, FrontendRequest, Position};
@@ -1875,10 +1874,10 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
     use input_emulation::recording::{Recorded, Recording};
     use input_event::{Event, PointerEvent};
 
-    use crate::service::in_process::{DEADLINE, Daemon, Frontend};
-    use crate::test_harness::{Machine, dialer, machine, run_local};
+    use crate::service::in_process::{DEADLINE, Daemon, prompt_from, trusting};
+    use crate::test_harness::{dialer, machine, run_local};
     use crate::transport::Trust;
-    use crate::trust::{Caps, TrustStore};
+    use crate::trust::Caps;
 
     /// Whether a request can widen trust. There is no wildcard: a new request
     /// fails to compile here until it is placed on one side, and one placed
@@ -1963,15 +1962,6 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
         trust.read().expect("lock").pairings().into_iter().collect()
     }
 
-    /// A store for `me` that may drive the daemon, as a peer's would be.
-    fn trusting(me: &Machine, daemon: &str) -> Trust {
-        let mut store = TrustStore::new(&me.fingerprint, 0).expect("our fingerprint");
-        store
-            .issue(daemon, "the daemon", Caps::OUTBOUND)
-            .expect("issue");
-        Arc::new(RwLock::new(store))
-    }
-
     fn refusals(events: &[FrontendEvent]) -> Vec<&str> {
         events
             .iter()
@@ -1982,28 +1972,6 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
                 _ => None,
             })
             .collect()
-    }
-
-    /// Ask until the daemon has admitted `stranger`'s knock as a prompt.
-    async fn prompt_from(app: &mut Frontend, stranger: &Machine, port: u16, daemon: &str) {
-        let knocker = dialer(stranger, trusting(stranger, daemon), port, Position::Left);
-        let deadline = tokio::time::Instant::now() + DEADLINE;
-        loop {
-            let _ = knocker.conn.send(ProtoEvent::Ping, knocker.handle).await;
-            let events = app.exchange(&[]).await;
-            let prompted = events.iter().any(|e| {
-                matches!(e, FrontendEvent::ConnectionAttempt { fingerprint, .. }
-                    if *fingerprint == stranger.fingerprint)
-            });
-            if prompted {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "a machine knocking while add device was open raised no prompt"
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
     }
 
     // LEDGER EN-3 | class B | 5 process-in-test + 1 struct state: FrontendRequest over the daemon's IPC socket, a peer driving it over loopback QUIC, the daemon's trust store
