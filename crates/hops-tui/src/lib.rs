@@ -37,9 +37,9 @@ use std::{
 };
 
 use hops_frontend_core::{
-    AppModel, ApprovalRefused, AttemptOrigin, CaptureState, ClientHandle, Clipboard, Device,
-    DeviceSend, FrontendClient, FrontendRequest, Launch, PairingAttempt, PairingCard, PairingCheck,
-    PairingCheckCard, Position, Status, TrustState,
+    AppModel, ApprovalRefused, AttemptOrigin, CaptureState, ClientHandle, Clipboard, Connection,
+    Device, DeviceSend, FrontendClient, FrontendRequest, Launch, PairingAttempt, PairingCard,
+    PairingCheck, PairingCheckCard, Position, Status, Tone, TrustState,
     prefs::Frontend,
     spaced_number,
     theme::{self, Rgb, Theme},
@@ -963,31 +963,17 @@ fn new_error(model: &AppModel, seen: &mut u64) -> Option<String> {
 /// The two facets a device can have — we cross *to* it, it may connect *in* to
 /// us — are shown as one arrow badge rather than as membership of two different
 /// lists, which is the whole point of the projection.
-/// `live` is false while no daemon is connected: the row is then what was
-/// last known, not what is, and is drawn muted with a hollow dot (#34).
-fn device_row(
-    d: &Device,
-    clipboard: Option<Clipboard>,
-    theme: &Theme,
-    live: bool,
-) -> ListItem<'static> {
+///
+/// The dot and the status words are drawn from [`Device::connection`] and
+/// nothing else, so this row and the window cannot disagree (#148). While no
+/// service answers, that state says so, and the rest of the row is drawn
+/// muted: it is what was last known, not what is (#34).
+fn device_row(d: &Device, clipboard: Option<Clipboard>, theme: &Theme) -> ListItem<'static> {
     let muted = Style::default().fg(col(theme.muted));
     let revoked = d.trust == TrustState::Revoked;
-
-    let dot = if revoked {
-        Span::styled("⊘", Style::default().fg(col(theme.error)))
-    } else if d.refuses_our_input() {
-        // Checked BEFORE the green arm. `online` is about the inbound
-        // direction and must not mask a device that will refuse our input
-        // (#92).
-        Span::styled("●", Style::default().fg(col(theme.error)))
-    } else if d.online || d.send.as_ref().is_some_and(|s| s.state.alive) {
-        Span::styled("●", Style::default().fg(col(theme.success)))
-    } else if d.send.as_ref().is_some_and(|s| s.state.active) {
-        Span::styled("●", Style::default().fg(col(theme.warn)))
-    } else {
-        Span::styled("○", muted)
-    };
+    let live = d.connection != Connection::ServiceGone;
+    let state = Style::default().fg(tone_colour(d.connection.tone(), theme));
+    let dot = Span::styled(dot_glyph(d.connection), state);
 
     let dir = match (d.send.is_some(), d.receive) {
         (true, true) => "⇄",
@@ -1025,6 +1011,10 @@ fn device_row(
             "pair again with a new identity to come back",
             muted,
         ));
+        // "removed" is already the trust word; any other state is said
+        if d.connection != Connection::Removed {
+            spans.push(Span::styled(format!("  {}", d.connection.words()), state));
+        }
         return row_item(spans, live, theme);
     }
 
@@ -1043,27 +1033,12 @@ fn device_row(
             format!("({}) ", s.config.pos),
             Style::default().fg(col(theme.accent)),
         ));
-        spans.push(Span::styled(
-            if d.refuses_our_input() {
-                // The dot alone cannot say WHY. This is the fact the user needs:
-                // the far end is up and refusing, not unreachable (#92).
-                " not accepting input"
-            } else if s.state.active {
-                " active"
-            } else {
-                " off"
-            },
-            if d.refuses_our_input() {
-                Style::default().fg(col(theme.error))
-            } else if s.state.active {
-                Style::default().fg(col(theme.foreground))
-            } else {
-                muted
-            },
-        ));
     } else {
-        spans.push(Span::styled("connects in only", muted));
+        spans.push(Span::styled("connects in only  ", muted));
     }
+    // The dot alone cannot say WHY: "not accepting input" and "unreachable"
+    // need different fixes from the user (#92, #144).
+    spans.push(Span::styled(d.connection.words().to_string(), state));
     // Off is said as plainly as on: there is no way to turn it back on from
     // here yet, so the row is the one place the user learns which it is.
     if let Some(c) = clipboard {
@@ -1080,8 +1055,28 @@ fn device_row(
     row_item(spans, live, theme)
 }
 
+/// The dot for a state: hollow when nothing is live and nothing is wrong,
+/// crossed out for a removed device.
+fn dot_glyph(c: Connection) -> &'static str {
+    match (c, c.tone()) {
+        (Connection::Removed, _) => "⊘",
+        (_, Tone::Quiet) => "○",
+        (_, Tone::Good | Tone::Warn | Tone::Bad) => "●",
+    }
+}
+
+/// The theme colour of a tone.
+fn tone_colour(tone: Tone, theme: &Theme) -> Color {
+    col(match tone {
+        Tone::Good => theme.success,
+        Tone::Warn => theme.warn,
+        Tone::Bad => theme.error,
+        Tone::Quiet => theme.muted,
+    })
+}
+
 /// A device row's spans as a list item: as built while a daemon is
-/// connected, and all muted, the dot hollow, while none is.
+/// connected, and all muted while none is.
 fn row_item(spans: Vec<Span<'static>>, live: bool, theme: &Theme) -> ListItem<'static> {
     if live {
         return ListItem::new(Line::from(spans));
@@ -1089,11 +1084,7 @@ fn row_item(spans: Vec<Span<'static>>, live: bool, theme: &Theme) -> ListItem<'s
     let muted = Style::default().fg(col(theme.muted));
     let spans: Vec<Span<'static>> = spans
         .into_iter()
-        .enumerate()
-        .map(|(i, span)| match i {
-            0 => Span::styled("○", muted),
-            _ => Span::styled(span.content, muted),
-        })
+        .map(|span| Span::styled(span.content, muted))
         .collect();
     ListItem::new(Line::from(spans))
 }
@@ -1219,7 +1210,7 @@ fn ui(
     } else {
         devices
             .iter()
-            .map(|d| device_row(d, clipboard_of(model, d), theme, model.connected))
+            .map(|d| device_row(d, clipboard_of(model, d), theme))
             .collect()
     };
     f.render_stateful_widget(
@@ -2932,5 +2923,264 @@ mod tests {
         let card = answered.pairing_check().expect("a card");
         assert_eq!(check_key(card, KeyCode::Char('2')), None, "answered twice");
         assert_eq!(check_key(card, KeyCode::Esc), Some(cancel));
+    }
+}
+
+#[cfg(test)]
+mod every_state_on_a_row {
+    //! Each connection state a device can be in reads on its row as its own
+    //! words, dot and colour (#148). The scenarios are built from daemon
+    //! events, as the running app gets them, and the row is read back from a
+    //! rendered terminal.
+    use super::*;
+    use hops_frontend_core::{
+        ClientConfig, ClientState, CrossingRefusal, FrontendEvent, PairingCheck, PeerTrust,
+        RevokedEntry,
+    };
+    use ratatui::widgets::List;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    const FP: &str = "1e:19:1b:2c:3d:4e:5f:60:71:82:93:a4:b5:c6:d7:e8";
+    const NAME: &str = "desk-mac";
+
+    /// What every state says, so a row can be checked for the others' words
+    /// being absent.
+    const ALL_WORDS: [&str; 10] = [
+        "service not answering",
+        "removed",
+        "compare the number",
+        "waiting for its approval",
+        "not accepting input",
+        "connected",
+        "off",
+        "not paired",
+        "unreachable",
+        "not connected",
+    ];
+
+    /// The dot colours, named apart from the crate's own `Tone` so the
+    /// expectations are written down here rather than taken from it.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Tone {
+        Good,
+        Warn,
+        Bad,
+        Quiet,
+    }
+
+    /// A model attached to a daemon, holding one device this machine dials.
+    fn dialled(state: ClientState, paired: bool) -> AppModel {
+        let mut m = AppModel::default();
+        m.connected = true;
+        m.apply(FrontendEvent::Enumerate(vec![(
+            0,
+            ClientConfig {
+                hostname: Some(NAME.into()),
+                ..Default::default()
+            },
+            state,
+        )]));
+        if paired {
+            m.apply(FrontendEvent::TrustUpdated(HashMap::from([(
+                FP.to_string(),
+                PeerTrust {
+                    clipboard_from: true,
+                    clipboard_to: true,
+                    pending: false,
+                },
+            )])));
+        }
+        m
+    }
+
+    fn pinned(active: bool, link: bool, alive: bool) -> ClientState {
+        ClientState {
+            active,
+            alive,
+            active_addr: link.then(|| "192.0.2.5:4242".parse().expect("addr")),
+            peer_fingerprint: Some(FP.into()),
+            ..Default::default()
+        }
+    }
+
+    /// One model per state, with the words, dot and tone its row must show.
+    fn scenarios() -> Vec<(&'static str, AppModel, &'static str, Tone)> {
+        let connected = dialled(pinned(true, true, true), true);
+        let mut refusing = dialled(pinned(true, true, false), true);
+        // connected in as well: the case where `online` masked a refusal (#92)
+        refusing.apply(FrontendEvent::DeviceConnected {
+            addr: "192.0.2.5:50001".parse().expect("addr"),
+            fingerprint: FP.into(),
+        });
+        let off = dialled(pinned(false, false, false), true);
+        let idle = dialled(pinned(true, false, false), true);
+        let mut unreachable = dialled(pinned(true, false, false), true);
+        unreachable.apply(FrontendEvent::CrossingRefused {
+            handle: 0,
+            reason: CrossingRefusal::NotConnected,
+        });
+        let not_paired = dialled(
+            ClientState {
+                active: true,
+                ..Default::default()
+            },
+            false,
+        );
+        let mut waiting = dialled(pinned(true, false, false), false);
+        waiting.apply(FrontendEvent::TrustUpdated(HashMap::from([(
+            FP.to_string(),
+            PeerTrust {
+                pending: true,
+                ..Default::default()
+            },
+        )])));
+        let mut comparing = waiting.clone();
+        comparing.apply(FrontendEvent::PairingCheck {
+            fingerprint: FP.into(),
+            addr: None,
+            check: PairingCheck::Show("042917".into()),
+            answered: false,
+        });
+        let mut removed = dialled(pinned(true, false, false), false);
+        removed.apply(FrontendEvent::RevokedUpdated(HashMap::from([(
+            FP.to_string(),
+            RevokedEntry {
+                label: NAME.into(),
+                revoked_at: 1,
+            },
+        )])));
+        let mut gone = connected.clone();
+        gone.daemon_gone();
+        vec![
+            ("connected", connected, "●", Tone::Good),
+            ("refusing", refusing, "●", Tone::Bad),
+            ("off", off, "○", Tone::Quiet),
+            ("idle", idle, "○", Tone::Quiet),
+            ("unreachable", unreachable, "●", Tone::Warn),
+            ("not paired", not_paired, "●", Tone::Warn),
+            ("waiting", waiting, "●", Tone::Warn),
+            ("comparing", comparing, "●", Tone::Warn),
+            ("removed", removed, "⊘", Tone::Bad),
+            ("service gone", gone, "○", Tone::Quiet),
+        ]
+    }
+
+    fn expected_words(scenario: &str) -> &'static str {
+        match scenario {
+            "connected" => "connected",
+            "refusing" => "not accepting input",
+            "off" => "off",
+            "idle" => "not connected",
+            "unreachable" => "unreachable",
+            "not paired" => "not paired",
+            "waiting" => "waiting for its approval",
+            "comparing" => "compare the number",
+            "removed" => "removed",
+            "service gone" => "service not answering",
+            other => panic!("no words for {other}"),
+        }
+    }
+
+    /// The device's row as text, and its dot's symbol and colour.
+    fn row(model: &AppModel) -> (String, String, Color) {
+        let devices = listable(model);
+        // nothing selected: the selection draws the row in its own colours
+        let mut state = ListState::default();
+        let theme = theme::default_theme();
+        let mut term = Terminal::new(TestBackend::new(160, 24)).expect("test terminal");
+        term.draw(|f| {
+            ui(
+                f, model, &devices, &mut state, None, None, None, None, false, &theme,
+            )
+        })
+        .expect("draw");
+        let buf = term.backend().buffer().clone();
+        for y in 0..buf.area.height {
+            let line: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            if let Some(at) = line.find(NAME) {
+                // the dot is two cells before the name
+                let x = line[..at].chars().count() as u16 - 2;
+                let dot = &buf[(x, y)];
+                return (line, dot.symbol().to_string(), dot.fg);
+            }
+        }
+        panic!("no row for {NAME}");
+    }
+
+    fn colour(tone: Tone) -> Color {
+        let t = theme::default_theme();
+        col(match tone {
+            Tone::Good => t.success,
+            Tone::Warn => t.warn,
+            Tone::Bad => t.error,
+            Tone::Quiet => t.muted,
+        })
+    }
+
+    /// The row draws the state it is given, and nothing else it can see: a
+    /// device whose link is up and whose peer takes input, handed over in
+    /// each state, reads as that state (#148).
+    // LEDGER T148-9 | class B | 3 widget tree: device_row rendered through List to a test terminal
+    #[test]
+    fn a_row_reads_its_state_and_not_the_facts_beside_it() {
+        let theme = theme::default_theme();
+        for c in Connection::ALL {
+            let d = Device {
+                fingerprint: Some(FP.into()),
+                label: NAME.into(),
+                trust: TrustState::Trusted,
+                connection: c,
+                send: Some(DeviceSend {
+                    handle: 0,
+                    config: ClientConfig::default(),
+                    state: pinned(true, true, true),
+                }),
+                receive: true,
+            };
+            let mut term = Terminal::new(TestBackend::new(160, 3)).expect("test terminal");
+            term.draw(|f| f.render_widget(List::new(vec![device_row(&d, None, &theme)]), f.area()))
+                .expect("draw");
+            let buf = term.backend().buffer().clone();
+            let line: String = (0..buf.area.width).map(|x| buf[(x, 0)].symbol()).collect();
+            let words = c.words();
+            assert!(
+                line.contains(words)
+                    && buf[(0, 0)].symbol() == dot_glyph(c)
+                    && buf[(0, 0)].fg
+                        == colour(match c.tone() {
+                            hops_frontend_core::Tone::Good => Tone::Good,
+                            hops_frontend_core::Tone::Warn => Tone::Warn,
+                            hops_frontend_core::Tone::Bad => Tone::Bad,
+                            hops_frontend_core::Tone::Quiet => Tone::Quiet,
+                        }),
+                "{c:?} is drawn from something else:\n{line}"
+            );
+        }
+    }
+
+    // LEDGER T148-3 | class B | 3 widget tree: ui() rendered to a test terminal from AppModel::apply
+    #[test]
+    fn every_state_reads_as_its_own_words_and_dot() {
+        for (scenario, model, glyph, tone) in scenarios() {
+            let words = expected_words(scenario);
+            let (line, dot, fg) = row(&model);
+            assert!(
+                line.contains(words),
+                "{scenario}: the row does not say \"{words}\":\n{line}"
+            );
+            for other in ALL_WORDS {
+                if !words.contains(other) {
+                    assert!(
+                        !line.contains(other),
+                        "{scenario}: the row also says \"{other}\":\n{line}"
+                    );
+                }
+            }
+            assert_eq!(
+                (dot.as_str(), fg),
+                (glyph, colour(tone)),
+                "{scenario}: wrong dot on\n{line}"
+            );
+        }
     }
 }

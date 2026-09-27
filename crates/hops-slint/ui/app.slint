@@ -17,28 +17,28 @@ import { ScrollView } from "std-widgets.slint";
 // nominally distinct types.
 export { Theme, OnboardingWindow, CanvasBox, HopsTray }
 
+// The colour family of a device's dot, from `Connection::tone` (#148).
+export enum DotTone { quiet, good, warn, bad }
+
 // One unified device (a physical peer). `has-send` = we dial it (outgoing
 // facet: pos/active/edit/delete); otherwise it's a receive-only trusted peer
-// (fingerprint + connected/offline + revoke). A machine that is both renders
-// once, as a send row. Built from `AppModel::devices()` in the Rust side.
+// (fingerprint + revoke). A machine that is both renders once, as a send row.
+// Built from `AppModel::devices()` in the Rust side.
 export struct DeviceRow {
     handle: string,      // ClientHandle (u64 as text — Slint int is only i32); "" if receive-only
     name: string,        // display label
     addr: string,        // "ip:port" / "unresolved" (send facet)
     pos: string,         // "left" / "right" / … (send facet)
-    active: bool,        // capture is routed to this device (send facet)
-    alive: bool,         // the peer's Pong says its emulation is ON (send facet)
-    refuses-input: bool, // we are routed to it and it says emulation is OFF, so
-                         // every event we send is refused before it is written.
-                         // NOT the same as offline, and `online` must not mask
-                         // it — that is the inbound direction (#92).
+    active: bool,        // switched on here: the toggle (send facet)
+    tone: DotTone,       // the dot, and the status words' colour, from the
+                         // device's one connection state (#148)
+    status: string,      // that state in words
     has-send: bool,      // has an outgoing (send-to) facet
     fingerprint: string, // short fingerprint (display)
     fp-full: string,     // full fingerprint (for revoke)
     pin: string,         // the send facet's pin, "" if none: what delete and
                          // rename carry, so the daemon can refuse them once
                          // the device is pinned to another machine (#94)
-    online: bool,        // a peer with this fingerprint is connected in
     trusted: bool,       // its fingerprint is in authorized_fingerprints
     revoked: bool,       // the user expelled it; shown, not forgotten
     clipboard: string,   // which way the clipboard goes, for the edit panel,
@@ -180,6 +180,20 @@ export component AppWindow inherits Window {
     // "left" meant the second device silently evicted the first
     property <string> add-device-position: "left";
     in property <string> free-position: "left";
+    // The theme colour of a device dot's tone (#148).
+    pure function tone-color(tone: DotTone) -> color {
+        if tone == DotTone.good {
+            return Theme.c.success;
+        }
+        if tone == DotTone.warn {
+            return Theme.c.warn;
+        }
+        if tone == DotTone.bad {
+            return Theme.c.error;
+        }
+        return Theme.c.muted;
+    }
+
     // ONE submit path for the add form, so the button and the Enter key cannot
     // drift apart. Enter previously did nothing at all, even though it works in
     // the rename box one panel below.
@@ -838,18 +852,11 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                 VerticalLayout {
                                     alignment: center;
                                     Dot {
-                                        // refuses-input is checked FIRST. `online`
-                                        // is about the inbound direction and used
-                                        // to OR this away, so a machine silently
-                                        // rejecting everything we sent showed
-                                        // green (#92).
-                                        tint: !root.connected
-                                            ? Theme.c.muted
-                                            : d.refuses-input
-                                            ? Theme.c.error
-                                            : (d.online || d.alive)
-                                            ? Theme.c.success
-                                            : (d.active ? Theme.c.warn : Theme.c.muted);
+                                        // The state is derived once, in
+                                        // hops-frontend-core, for both
+                                        // frontends; this only colours it
+                                        // (#148).
+                                        tint: root.tone-color(d.tone);
                                     }
                                 }
                                 VerticalLayout {
@@ -872,16 +879,15 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                         letter-spacing: Type.mono-tracking;
                                         overflow: elide;
                                     }
-                                    // The dot alone cannot say WHY, and a green
-                                    // "active" toggle beside a red dot reads as a
-                                    // contradiction. Say the fact: the far end is
-                                    // up and refusing, not unreachable (#92).
-                                    // One line, elided, NEVER wrapped: the row is
-                                    // a fixed 56px and a wrapped block overflows
-                                    // into the row below it.
-                                    if d.refuses-input && root.connected: Text {
-                                        text: "not accepting input";
-                                        color: Theme.c.error;
+                                    // The dot alone cannot say WHY: "not
+                                    // accepting input" and "unreachable" need
+                                    // different fixes (#92, #144). One line,
+                                    // elided, NEVER wrapped: the row is a fixed
+                                    // 56px and a wrapped block overflows into
+                                    // the row below it.
+                                    Text {
+                                        text: d.status;
+                                        color: root.tone-color(d.tone);
                                         font-size: Type.caption;
                                         font-weight: Type.medium;
                                         overflow: elide;
@@ -988,16 +994,7 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                     }
                                 }
 
-                                // --- receive-only facet: trust status + revoke ---
-                                if !d.has-send && !d.revoked && !revoking: VerticalLayout {
-                                    alignment: center;
-                                    Text {
-                                        text: d.online && root.connected ? "connected" : "offline";
-                                        color: d.online && root.connected ? Theme.c.success : Theme.c.muted;
-                                        font-size: Type.small;
-                                        font-weight: Type.medium;
-                                    }
-                                }
+                                // --- receive-only facet: revoke ---
                                 // An expelled device is shown, never re-trustable.
                                 // The identity is a tombstone: re-establishing means
                                 // that machine presenting a NEW one and pairing fresh.
