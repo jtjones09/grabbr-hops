@@ -745,7 +745,13 @@ impl Config {
     pub async fn changed(&mut self) -> Result<(), notify::Error> {
         loop {
             let event = self.watch_rx.recv().await.expect("channel closed");
-            let event = event.expect("filesystem event");
+            let event = match event {
+                Ok(event) => event,
+                Err(e) => {
+                    log::warn!("the config watcher reported an error: {e}");
+                    continue;
+                }
+            };
             if changes_config(&event, &self.config_path) && self.read_from_disk()? {
                 return Ok(());
             }
@@ -908,6 +914,17 @@ impl Config {
         log::info!("reading config from {:?}", self.config_path);
 
         let current_config = fs::read_to_string(&self.config_path)?;
+        // Saving in place truncates the file, then writes it, and the watcher
+        // can report the empty file between the two. Read as a config it has
+        // no devices, so every device would be dropped until the next read:
+        // an empty file is taken as a save still in progress.
+        if current_config.trim().is_empty() {
+            log::info!(
+                "{:?} is empty, as while a save is being written; keeping the config as it was",
+                self.config_path
+            );
+            return Ok(false);
+        }
         let current_config = match current_config.parse::<DocumentMut>() {
             Ok(c) => c,
             Err(e) => {
@@ -1606,6 +1623,48 @@ mod the_watcher_never_blocks {
             event(EventKind::Create(CreateKind::File), &config),
         );
         assert!(rx.try_recv().is_ok(), "a new config file was not passed on");
+    }
+}
+
+#[cfg(test)]
+mod a_file_being_written_is_not_read_as_empty {
+    //! Saving a file in place truncates it, then writes it. On Linux the
+    //! watcher reports both, and the empty file between them parsed as a
+    //! valid config with no devices: the daemon dropped every device, and
+    //! a broken final version then left them dropped.
+    use super::*;
+
+    // LEDGER T30 | class B | 6 struct state: Config::read_from_disk on a truncated file
+    #[test]
+    fn a_truncated_config_keeps_the_devices_it_had() {
+        let dir = std::env::temp_dir().join(format!("hops-empty-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("a scratch directory");
+        let path = dir.join("config.toml");
+        fs::write(
+            &path,
+            "port = 4343\n[[clients]]\nhostname = \"desk-mac\"\nposition = \"left\"\n",
+        )
+        .expect("a config");
+        let args = Args::parse_from([
+            "hops".as_ref(),
+            "--config".as_ref(),
+            path.as_os_str(),
+            "--cert-path".as_ref(),
+            dir.join("cert.pem").as_os_str(),
+        ]);
+        let mut config = Config::with_args(args).expect("the config loads");
+        assert_eq!(config.clients().len(), 1, "the device the file names");
+
+        fs::write(&path, "").expect("the truncation a save in place starts with");
+        let changed = config.read_from_disk().expect("the file reads");
+        let kept = config.clients().len();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            !changed && kept == 1,
+            "an empty config file, which a save in place passes through, was \
+             read as a config with no devices (changed: {changed}, devices: {kept})"
+        );
     }
 }
 
