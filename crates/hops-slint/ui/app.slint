@@ -85,6 +85,10 @@ export component AppWindow inherits Window {
     // rendering the same silence for all three is how a working feature looks
     // broken (#141).
     in property <bool> discovery-active: false;
+    // What the network section says while it lists nobody: that hops is
+    // looking, or, once nothing has answered for a while, what on this
+    // system can keep hops from hearing other machines (#149).
+    in property <string> discovery-empty: "looking — no other machines yet. They need hops running and to be on this network.";
     in property <string> notice: "";
     in property <int> notice-seq: 0;
     property <int> dismissed-seq: 0;
@@ -99,6 +103,12 @@ export component AppWindow inherits Window {
     // this app. Not dismissible: it stays while it is true.
     in property <string> service-problem: "";
     in property <string> capture: "—";
+    // Why capture, which should run, does not, or empty (#91). Stays while
+    // it is true; not dismissible.
+    in property <string> capture-problem: "";
+    // Whether this Mac can take the user to the setting that mends it: the
+    // problem is a missing permission (#169).
+    in property <bool> capture-settings: false;
     in property <string> emulation: "—";
     in property <string> port: "—";
     in property <string> fingerprint: "—";
@@ -177,6 +187,7 @@ export component AppWindow inherits Window {
     in-out property <[CanvasBox]> canvas-boxes: [];
 
     callback enable-input();
+    callback open-capture-settings();
     callback activate-device(string /* handle */, bool /* active */);
     callback reposition-device(string /* handle */, string /* new position */);
     callback rename-device(string /* handle */, string /* pin */, string /* new name */);
@@ -244,9 +255,10 @@ export component AppWindow inherits Window {
             HorizontalLayout {
                 spacing: 5px;
                 Text { text: "capture"; color: Theme.c.muted; font-size: Type.small; }
+                // Failed is not off: capture should run and cannot (#91).
                 Text {
-                    text: root.capture == "enabled" ? "on" : "off";
-                    color: root.capture == "enabled" ? Theme.c.success : Theme.c.muted;
+                    text: root.capture == "enabled" ? "on" : (root.capture == "failed" ? "failed" : "off");
+                    color: root.capture == "enabled" ? Theme.c.success : (root.capture == "failed" ? Theme.c.warn : Theme.c.muted);
                     font-size: Type.small;
                     font-weight: Type.semibold;
                 }
@@ -278,6 +290,34 @@ export component AppWindow inherits Window {
                 text: "enable input";
                 primary: true;
                 clicked => { root.enable-input(); }
+            }
+        }
+
+        // --- capture that should run and cannot, and what to change (#91) ------
+        if root.capture-problem != "": Rectangle {
+            vertical-stretch: 0;
+            background: Theme.c.warn.transparentize(0.9);
+            border-radius: Radius.lg;
+            border-width: 1px;
+            border-color: Theme.c.warn.transparentize(0.55);
+            HorizontalLayout {
+                padding: Space.md;
+                spacing: Space.md;
+                Text {
+                    horizontal-stretch: 1;
+                    text: root.capture-problem;
+                    color: Theme.c.foreground;
+                    font-size: Type.small;
+                    wrap: word-wrap;
+                    vertical-alignment: center;
+                }
+                if root.capture-settings: VerticalLayout {
+                    alignment: center;
+                    PillButton {
+                        text: "open settings";
+                        clicked => { root.open-capture-settings(); }
+                    }
+                }
             }
         }
 
@@ -534,8 +574,7 @@ export component AppWindow inherits Window {
                         if root.discovered.length == 0: HorizontalLayout {
                             padding: Space.sm;
                             Text {
-                                text: "looking — no other machines yet. They need hops "
-                                    + "running and to be on this network.";
+                                text: root.discovery-empty;
                                 color: Theme.c.muted;
                                 font-size: Type.small;
                                 wrap: word-wrap;

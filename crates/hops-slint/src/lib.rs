@@ -22,8 +22,9 @@ use std::{
 };
 
 use hops_frontend_core::{
-    AppModel, ApprovalRefused, ClientHandle, Clipboard, FrontendClient, FrontendRequest, Launch,
-    PairingAttempt, PairingCard, Position, Status, TrustState, prefs, theme,
+    AppModel, ApprovalRefused, CaptureState, ClientHandle, Clipboard, FrontendClient,
+    FrontendRequest, Launch, PairingAttempt, PairingCard, Position, Status, TrustState, prefs,
+    theme,
 };
 use hops_ipc::{DEFAULT_PORT, Geometry};
 use slint::{ComponentHandle, ModelRc, VecModel};
@@ -33,6 +34,7 @@ slint::include_modules!();
 
 #[cfg(target_os = "macos")]
 mod macos_app;
+mod privacy;
 
 /// After the user denies a pairing, snooze the prompt this long so a retrying
 /// peer doesn't nag — but a later attempt re-asks; matches the TUI's `DISMISS_TTL`.
@@ -56,6 +58,11 @@ pub enum SlintError {
 struct PolledUi {
     connected: bool,
     capture: String,
+    /// Why capture, which should run, does not, from
+    /// `AppModel::capture_problem`, or empty (#91).
+    capture_problem: String,
+    /// Whether the window offers the setting that mends it (#169).
+    capture_settings: bool,
     emulation: String,
     port: String,
     fingerprint: String,
@@ -65,6 +72,8 @@ struct PolledUi {
     discovered: Vec<DiscoveredRow>,
     /// Whether hops is looking at all — see `AppModel::discovery_active`.
     discovery_active: bool,
+    /// What the network section says while it lists nobody.
+    discovery_empty: String,
     /// Whether that pairing prompt came from OUR outbound dial rather than a
     /// peer connecting in (#61) — the card says which.
     pairing_from_our_dial: bool,
@@ -190,7 +199,9 @@ fn polled_ui(m: &AppModel, shown: Option<&PairingAttempt>, now: Instant) -> Poll
     let devices = device_rows(m);
     PolledUi {
         connected: m.connected,
-        capture: status_text(m.capture).to_string(),
+        capture: capture_text(&m.capture).to_string(),
+        capture_problem: m.capture_problem().unwrap_or_default(),
+        capture_settings: cfg!(target_os = "macos") && privacy::for_capture(&m.capture).is_some(),
         emulation: status_text(m.emulation).to_string(),
         port: m
             .port
@@ -199,6 +210,7 @@ fn polled_ui(m: &AppModel, shown: Option<&PairingAttempt>, now: Instant) -> Poll
         fingerprint: m.fingerprint.clone().unwrap_or_else(|| "—".to_string()),
         pairing,
         discovery_active: m.discovery_active,
+        discovery_empty: discovery_empty(m.discovery_quiet).to_string(),
         discovered: m
             .discovered
             .iter()
@@ -280,12 +292,15 @@ impl Repaint {
         ui.set_connected(snap.connected);
         ui.set_service_problem(snap.service_problem.as_str().into());
         ui.set_capture(snap.capture.as_str().into());
+        ui.set_capture_problem(snap.capture_problem.as_str().into());
+        ui.set_capture_settings(snap.capture_settings);
         ui.set_emulation(snap.emulation.as_str().into());
         ui.set_port(snap.port.as_str().into());
         ui.set_fingerprint(snap.fingerprint.as_str().into());
         show_pairing_card(ui, &snap.pairing);
         ui.set_discovered(ModelRc::new(VecModel::from(snap.discovered.clone())));
         ui.set_discovery_active(snap.discovery_active);
+        ui.set_discovery_empty(snap.discovery_empty.as_str().into());
         ui.set_pairing_from_our_dial(snap.pairing_from_our_dial);
         ui.set_pairing_addr(snap.pairing_addr.as_str().into());
         ui.set_pairing_seconds(snap.pairing_seconds);
@@ -306,6 +321,28 @@ impl Repaint {
         ui.set_devices(ModelRc::new(VecModel::from(snap.devices.clone())));
         self.last = Some(snap);
         true
+    }
+}
+
+/// What the network section says while it lists nobody. Once discovery has
+/// heard no machine at all for a while, a Mac names the setting that keeps a
+/// process from hearing its network with no error (#149); elsewhere nothing
+/// is known to do that silently.
+fn discovery_empty(quiet: bool) -> &'static str {
+    if quiet && cfg!(target_os = "macos") {
+        "No other machine has answered. If one on this network runs hops, check that \
+         hops is on under System Settings → Privacy & Security → Local Network."
+    } else {
+        "looking — no other machines yet. They need hops running and to be on this network."
+    }
+}
+
+/// Capture's state as the window reads it: failed is not off (#91).
+fn capture_text(s: &CaptureState) -> &'static str {
+    match s {
+        CaptureState::Enabled => status_text(Status::Enabled),
+        CaptureState::Disabled => status_text(Status::Disabled),
+        CaptureState::Failed(_) => "failed",
     }
 }
 
@@ -757,8 +794,24 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
     {
         let c = client.clone();
         ui.on_enable_input(move || {
+            // Turning capture on is when macOS is asked for what it lacks,
+            // so its prompt shows then (#169).
+            #[cfg(target_os = "macos")]
+            if let Some(ask) = privacy::for_capture(&c.snapshot().capture) {
+                privacy::act(ask, false);
+            }
             c.request(FrontendRequest::EnableCapture);
             c.request(FrontendRequest::EnableEmulation);
+        });
+    }
+    {
+        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+        let c = client.clone();
+        ui.on_open_capture_settings(move || {
+            #[cfg(target_os = "macos")]
+            if let Some(ask) = privacy::for_capture(&c.snapshot().capture) {
+                privacy::act(ask, true);
+            }
         });
     }
     {
@@ -2070,6 +2123,7 @@ mod the_window_without_a_daemon {
                 claimed_fingerprint: None,
                 addrs: vec!["192.0.2.7:4242".parse().expect("addr")],
             }],
+            quiet: false,
         });
         tick(&ui, &mut repaint, &mut card, &m);
         let live = rows(&ui);
@@ -2245,6 +2299,94 @@ mod the_restart_note_is_news_not_an_error {
             ui.get_notice().as_str(),
             "",
             "a restart that worked was shown as an error"
+        );
+    }
+}
+
+#[cfg(test)]
+mod a_capture_that_cannot_run {
+    //! A capture that failed reads as failed, not off, with what to change
+    //! and, on a Mac, the way to the setting (#91, #169).
+    use super::*;
+    use hops_frontend_core::{CaptureFault, CaptureState, FrontendEvent, Permission};
+
+    fn tick(ui: &AppWindow, repaint: &mut Repaint, m: &AppModel) {
+        repaint.push(ui, polled_ui(m, None, Instant::now()), &Cell::new(0));
+    }
+
+    // LEDGER T9 | class B | 3 widget tree: AppWindow capture properties after polled_ui + Repaint::push
+    #[test]
+    fn the_window_says_capture_failed_and_what_to_change() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = AppWindow::new().expect("window");
+        let mut repaint = Repaint::default();
+        let mut m = AppModel::default();
+        m.connected = true;
+        m.apply(FrontendEvent::CaptureStatus(CaptureState::Failed(
+            CaptureFault::Missing(vec![Permission::InputMonitoring]),
+        )));
+        tick(&ui, &mut repaint, &m);
+        let failed = (
+            ui.get_capture().to_string(),
+            ui.get_capture_problem().to_string(),
+            ui.get_capture_settings(),
+        );
+        m.apply(FrontendEvent::CaptureStatus(CaptureState::Disabled));
+        tick(&ui, &mut repaint, &m);
+        let off = (
+            ui.get_capture().to_string(),
+            ui.get_capture_problem().to_string(),
+            ui.get_capture_settings(),
+        );
+        assert_eq!(
+            [failed, off],
+            [
+                (
+                    "failed".to_string(),
+                    "Input capture cannot run: macOS does not grant hops Input Monitoring, \
+                     which this Mac needs to control other machines. Turn hops on under \
+                     System Settings → Privacy & Security → Input Monitoring."
+                        .to_string(),
+                    cfg!(target_os = "macos"),
+                ),
+                ("disabled".to_string(), String::new(), false),
+            ],
+            "(capture, problem, settings button) for a capture refused Input \
+             Monitoring, then for one merely off"
+        );
+    }
+}
+
+#[cfg(test)]
+mod a_network_that_answers_nothing {
+    //! Discovery that has heard nobody says, on a Mac, which setting can keep
+    //! it from hearing anything (#149).
+    use super::*;
+    use hops_frontend_core::FrontendEvent;
+
+    // LEDGER T14 | class B | 3 widget tree: AppWindow discovery-empty after polled_ui + Repaint::push
+    #[test]
+    fn a_quiet_network_names_the_local_network_setting_on_a_mac() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = AppWindow::new().expect("window");
+        let mut repaint = Repaint::default();
+        let mut m = AppModel::default();
+        m.connected = true;
+        let mut said = Vec::new();
+        for quiet in [false, true, false] {
+            m.apply(FrontendEvent::Discovered {
+                active: true,
+                peers: vec![],
+                quiet,
+            });
+            repaint.push(&ui, polled_ui(&m, None, Instant::now()), &Cell::new(0));
+            said.push(ui.get_discovery_empty().contains("Local Network"));
+        }
+        assert_eq!(
+            said,
+            [false, cfg!(target_os = "macos"), false],
+            "(names Local Network) while looking, once nothing answered, and once \
+             something did"
         );
     }
 }

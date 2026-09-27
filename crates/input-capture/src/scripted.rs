@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use futures_core::Stream;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use super::{Backend, Capture, CaptureError, CaptureEvent, Position};
+use super::{Backend, Capture, CaptureError, CaptureEvent, Permission, Position};
 
 /// Which [`Script`] a [`Backend::Scripted`] reads from.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -31,14 +31,17 @@ pub struct ScriptId(u64);
 enum Item {
     Event(Position, CaptureEvent),
     Fail,
+    Revoke(Vec<Permission>),
 }
 
 type Events = UnboundedReceiver<Item>;
 /// The receiving end, lent to one live backend at a time.
 type Slot = Arc<Mutex<Option<Events>>>;
+/// The permissions a backend is refused at creation, as macOS refuses one.
+type Withheld = Arc<Mutex<Vec<Permission>>>;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-static REGISTRY: Mutex<Option<HashMap<ScriptId, Slot>>> = Mutex::new(None);
+static REGISTRY: Mutex<Option<HashMap<ScriptId, (Slot, Withheld)>>> = Mutex::new(None);
 
 /// A test's handle for feeding a scripted capture backend.
 ///
@@ -46,6 +49,7 @@ static REGISTRY: Mutex<Option<HashMap<ScriptId, Slot>>> = Mutex::new(None);
 pub struct Script {
     id: ScriptId,
     tx: UnboundedSender<Item>,
+    withheld: Withheld,
 }
 
 impl Script {
@@ -53,12 +57,13 @@ impl Script {
     pub fn new() -> Self {
         let id = ScriptId(NEXT_ID.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = unbounded_channel();
+        let withheld: Withheld = Arc::default();
         REGISTRY
             .lock()
             .expect("script registry")
             .get_or_insert_with(HashMap::new)
-            .insert(id, Arc::new(Mutex::new(Some(rx))));
-        Self { id, tx }
+            .insert(id, (Arc::new(Mutex::new(Some(rx))), withheld.clone()));
+        Self { id, tx, withheld }
     }
 
     /// The backend to hand to `InputCapture::new`.
@@ -76,6 +81,19 @@ impl Script {
     pub fn fail(&self) {
         let _ = self.tx.send(Item::Fail);
     }
+
+    /// Refuse every backend created from now on for want of `missing`, as
+    /// macOS refuses one while a permission is not granted. An empty list
+    /// lets the next one start.
+    pub fn withhold(&self, missing: &[Permission]) {
+        *self.withheld.lock().expect("withheld") = missing.to_vec();
+    }
+
+    /// Take `missing` away from the running backend: its stream yields the
+    /// error the macOS backend yields once it finds a permission gone.
+    pub fn revoke(&self, missing: &[Permission]) {
+        let _ = self.tx.send(Item::Revoke(missing.to_vec()));
+    }
 }
 
 impl Drop for Script {
@@ -92,6 +110,8 @@ impl Drop for Script {
 pub enum ScriptedCaptureCreationError {
     #[error("no script is registered under this id, or a live backend already reads it")]
     Unavailable,
+    #[error("{}", crate::error::Permission::sentence(.0))]
+    MissingPermissions(Vec<Permission>),
 }
 
 pub(crate) struct ScriptedCapture {
@@ -101,12 +121,16 @@ pub(crate) struct ScriptedCapture {
 
 impl ScriptedCapture {
     pub(crate) fn new(id: ScriptId) -> Result<Self, ScriptedCaptureCreationError> {
-        let slot = REGISTRY
+        let (slot, withheld) = REGISTRY
             .lock()
             .expect("script registry")
             .as_ref()
             .and_then(|registry| registry.get(&id).cloned())
             .ok_or(ScriptedCaptureCreationError::Unavailable)?;
+        let missing = withheld.lock().expect("withheld").clone();
+        if !missing.is_empty() {
+            return Err(ScriptedCaptureCreationError::MissingPermissions(missing));
+        }
         let events = slot
             .lock()
             .expect("script slot")
@@ -159,6 +183,7 @@ impl Stream for ScriptedCapture {
                     Item::Fail => Err(CaptureError::Io(std::io::Error::other(
                         "scripted: failure requested by the test",
                     ))),
+                    Item::Revoke(missing) => Err(CaptureError::MissingPermissions(missing)),
                 })
             }),
             None => Poll::Ready(None),

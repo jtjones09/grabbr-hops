@@ -37,9 +37,9 @@ use std::{
 };
 
 use hops_frontend_core::{
-    AppModel, ApprovalRefused, AttemptOrigin, ClientHandle, Clipboard, Device, DeviceSend,
-    FrontendClient, FrontendRequest, Launch, PairingAttempt, PairingCard, Position, Status,
-    TrustState,
+    AppModel, ApprovalRefused, AttemptOrigin, CaptureState, ClientHandle, Clipboard, Device,
+    DeviceSend, FrontendClient, FrontendRequest, Launch, PairingAttempt, PairingCard, Position,
+    Status, TrustState,
     prefs::Frontend,
     theme::{self, Rgb, Theme},
 };
@@ -1082,7 +1082,7 @@ fn ui(
     let status = Line::from(vec![
         conn,
         Span::raw("   capture: "),
-        status_span(model.capture, theme),
+        capture_span(&model.capture, theme),
         Span::raw("   emulation: "),
         status_span(model.emulation, theme),
         Span::styled(
@@ -1099,6 +1099,13 @@ fn ui(
     // What is wrong with the service: a start that did not come up, or a
     // daemon of another build. Wrapped under the status line.
     let mut header = vec![status];
+    // Why capture, which should run, does not (#91).
+    if let Some(problem) = model.capture_problem() {
+        header.push(Line::from(Span::styled(
+            problem,
+            Style::default().fg(col(theme.warn)),
+        )));
+    }
     if let Some(problem) = model.service_problem() {
         for line in problem.lines() {
             header.push(Line::from(Span::styled(
@@ -1467,6 +1474,15 @@ fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
         y: area.y + area.height.saturating_sub(h) / 2,
         width: w,
         height: h,
+    }
+}
+
+/// Capture's state: a capture that failed reads apart from one that is off.
+fn capture_span(s: &CaptureState, theme: &Theme) -> Span<'static> {
+    match s {
+        CaptureState::Enabled => status_span(Status::Enabled, theme),
+        CaptureState::Disabled => status_span(Status::Disabled, theme),
+        CaptureState::Failed(_) => Span::styled("failed", Style::default().fg(col(theme.error))),
     }
 }
 
@@ -1959,6 +1975,35 @@ mod tests {
             clipped.iter().all(|(_, widths)| widths.is_empty()),
             "the header ends before the problem's last line, (case, widths): {clipped:?}\n{}",
             render_at(&failed, 0, 66, 30).join("\n")
+        );
+    }
+
+    /// A capture that failed reads as failed, not off, with what to change
+    /// under the status line (#91).
+    // LEDGER T11 | class B | 3 widget tree: ui() rendered into a TestBackend
+    #[test]
+    fn a_capture_that_failed_says_so_and_what_to_change() {
+        use hops_frontend_core::{CaptureFault, CaptureState, FrontendEvent, Permission};
+        let mut model = AppModel::default();
+        model.connected = true;
+        model.apply(FrontendEvent::CaptureStatus(CaptureState::Failed(
+            CaptureFault::Missing(vec![Permission::InputMonitoring]),
+        )));
+        let rows = render_at(&model, 0, 120, 30);
+        if let Some(out) = std::env::var_os("HOPS_TUI_RENDER_CAPTURE") {
+            let _ = std::fs::write(out, render_at(&model, 0, 80, 24).join("\n"));
+        }
+        let words = rows
+            .iter()
+            .flat_map(|row| row.trim_matches('│').split_whitespace().map(str::to_owned))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let problem = model.capture_problem().expect("a problem to show");
+        let problem = problem.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            words.contains("capture: failed") && words.contains(&problem),
+            "the header must say capture failed and why:\n{}",
+            rows.join("\n")
         );
     }
 
