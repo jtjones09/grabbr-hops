@@ -152,9 +152,10 @@ pub fn start_on(port: impl FnMut() -> u16, tag: &str, tables: &str) -> (Daemon, 
 /// How many ports a daemon is started on before its test gives up.
 const PORT_ATTEMPTS: usize = 10;
 
-/// The daemon's port was bound by something else before the daemon bound it.
+/// The daemon's port was bound by something else before the daemon bound it;
+/// what it logged.
 #[derive(Debug)]
-pub struct PortTaken;
+pub struct PortTaken(pub String);
 
 /// Whether a daemon's log says it stopped because its port was in use.
 pub fn port_taken(log: &str) -> bool {
@@ -162,8 +163,8 @@ pub fn port_taken(log: &str) -> bool {
 }
 
 /// Wait until the daemon `child`, logging to `log`, reports its service loop
-/// running, or `Err(PortTaken)` once it has exited because its port was
-/// taken. Its exiting for any other reason fails the test at once, and so
+/// running, or `Err(PortTaken)` once it has exited saying an address was in
+/// use. Its exiting for any other reason fails the test at once, and so
 /// does its not running within a minute, each with its log.
 pub fn wait_until_running(child: &mut Child, log: &Path) -> Result<(), PortTaken> {
     let read = || std::fs::read_to_string(log).unwrap_or_default();
@@ -178,7 +179,7 @@ pub fn wait_until_running(child: &mut Child, log: &Path) -> Result<(), PortTaken
                 return Ok(());
             }
             if port_taken(&text) {
-                return Err(PortTaken);
+                return Err(PortTaken(text));
             }
             panic!("the daemon exited ({status}) before its service loop ran; log:\n{text}");
         }
@@ -215,6 +216,7 @@ pub fn launch_on(
     log: &Path,
     mut spawn: impl FnMut() -> Child,
 ) -> (Child, u16) {
+    let mut last = String::new();
     for _ in 0..PORT_ATTEMPTS {
         let port = port();
         std::fs::write(config, config_for(port)).expect("a config");
@@ -222,11 +224,14 @@ pub fn launch_on(
         // read as this one's.
         let _ = std::fs::remove_file(log);
         let mut child = Reaped(Some(spawn()));
-        if wait_until_running(child.0.as_mut().expect("the child"), log).is_ok() {
-            return (child.0.take().expect("the child"), port);
+        match wait_until_running(child.0.as_mut().expect("the child"), log) {
+            Ok(()) => return (child.0.take().expect("the child"), port),
+            Err(PortTaken(text)) => last = text,
         }
     }
-    panic!("every port picked for the daemon was taken before it bound it");
+    // An address in use can also be something other than the port, so the
+    // last start's log goes with it.
+    panic!("every port picked for the daemon was taken before it bound it; last log:\n{last}");
 }
 
 /// A daemon killed and waited for when a start fails the test.

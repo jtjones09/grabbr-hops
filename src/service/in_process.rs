@@ -98,6 +98,7 @@ impl Daemon {
         std::fs::create_dir_all(&dir).expect("a scratch directory");
         let scratch = Scratch { dir };
         let dir = &scratch.dir;
+        let mut last = None;
         for _ in 0..PORT_ATTEMPTS {
             let port = port();
             let config = dir.join("config.toml");
@@ -125,11 +126,17 @@ impl Daemon {
                     };
                 }
                 Err(super::ServiceError::ListenError(ListenerCreationError::Io(e)))
-                    if e.kind() == std::io::ErrorKind::AddrInUse => {}
+                    if e.kind() == std::io::ErrorKind::AddrInUse =>
+                {
+                    last = Some(e);
+                }
                 Err(e) => panic!("a daemon in the scratch directory: {e:?}"),
             }
         }
-        panic!("every port picked for the daemon was taken before its listener bound it")
+        panic!(
+            "every port picked for the daemon was taken before its listener bound it; \
+             the last: {last:?}"
+        )
     }
 
     /// This machine's fingerprint.
@@ -416,5 +423,26 @@ fn a_daemon_whose_port_was_taken_first_is_built_on_another() {
             (vec![taken, port], true),
             "the daemon was not built again on a second port when its first was taken"
         );
+    });
+}
+
+// LEDGER T229i | class B | 1 how building a daemon whose every port is taken fails
+/// A daemon whose every port is taken fails its test with what the listener
+/// last failed with, so an address in use for another reason is not read as
+/// a port race alone.
+#[test]
+#[should_panic(expected = "was taken before its listener bound it; the last: Some(Os {")]
+fn a_daemon_whose_every_port_is_taken_fails_with_the_last_error() {
+    crate::test_harness::run_local(async {
+        let taken = crate::test_ports::pick();
+        let _holder = std::net::UdpSocket::bind(("127.0.0.1", taken)).expect("the port is held");
+        Daemon::build_on(
+            || taken,
+            "alltaken",
+            "",
+            input_capture::Backend::Dummy,
+            input_emulation::Backend::Dummy,
+        )
+        .await;
     });
 }
