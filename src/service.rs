@@ -1114,6 +1114,11 @@ impl Service {
                 log::info!("entering client {handle} ...");
                 self.spawn_hook_command(handle);
             }
+            // The pointer stayed here: say why where the user can see it,
+            // or the machine just seems to ignore the edge (#115).
+            ICaptureEvent::CrossingRefused { handle, reason } => {
+                self.notify_frontend(FrontendEvent::CrossingRefused { handle, reason });
+            }
         }
     }
 
@@ -2949,6 +2954,9 @@ mod a_second_daemon_leaves_the_running_daemons_files_alone {
 
 #[cfg(all(test, unix))]
 mod a_permission_granted_while_it_runs;
+
+#[cfg(all(test, unix))]
+mod a_refused_crossing;
 
 #[cfg(test)]
 mod replay_on_attach {

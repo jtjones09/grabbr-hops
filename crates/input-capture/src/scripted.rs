@@ -6,13 +6,17 @@
 //! dev-dependency and nothing else enables. A config file cannot name it, and
 //! the fallback list never picks it: the only way to select it is
 //! [`Script::backend`], which needs a [`Script`] in the same process.
+//!
+//! It holds the pointer the way a real backend does: from the `Begin` it
+//! yields until it is told to release, or ends. [`Script::held`] says whether
+//! it holds it now, which is what a user at the edge feels.
 
 use std::{
     collections::HashMap,
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
 };
@@ -34,11 +38,20 @@ enum Item {
 }
 
 type Events = UnboundedReceiver<Item>;
-/// The receiving end, lent to one live backend at a time.
-type Slot = Arc<Mutex<Option<Events>>>;
+
+/// What a script shares with the backend reading it.
+#[derive(Clone, Default)]
+struct Shared {
+    /// The receiving end, lent to one live backend at a time.
+    events: Arc<Mutex<Option<Events>>>,
+    /// The pointer is held: a `Begin` went out and no release came since.
+    held: Arc<AtomicBool>,
+    /// How many times the backend was told to release.
+    releases: Arc<AtomicUsize>,
+}
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-static REGISTRY: Mutex<Option<HashMap<ScriptId, Slot>>> = Mutex::new(None);
+static REGISTRY: Mutex<Option<HashMap<ScriptId, Shared>>> = Mutex::new(None);
 
 /// A test's handle for feeding a scripted capture backend.
 ///
@@ -46,6 +59,7 @@ static REGISTRY: Mutex<Option<HashMap<ScriptId, Slot>>> = Mutex::new(None);
 pub struct Script {
     id: ScriptId,
     tx: UnboundedSender<Item>,
+    shared: Shared,
 }
 
 impl Script {
@@ -53,12 +67,27 @@ impl Script {
     pub fn new() -> Self {
         let id = ScriptId(NEXT_ID.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = unbounded_channel();
+        let shared = Shared {
+            events: Arc::new(Mutex::new(Some(rx))),
+            ..Default::default()
+        };
         REGISTRY
             .lock()
             .expect("script registry")
             .get_or_insert_with(HashMap::new)
-            .insert(id, Arc::new(Mutex::new(Some(rx))));
-        Self { id, tx }
+            .insert(id, shared.clone());
+        Self { id, tx, shared }
+    }
+
+    /// Whether the backend holds the pointer: it yielded a `Begin` and was
+    /// not told to release since, nor ended.
+    pub fn held(&self) -> bool {
+        self.shared.held.load(Ordering::SeqCst)
+    }
+
+    /// How many times the backend was told to release the pointer.
+    pub fn releases(&self) -> usize {
+        self.shared.releases.load(Ordering::SeqCst)
     }
 
     /// The backend to hand to `InputCapture::new`.
@@ -95,25 +124,26 @@ pub enum ScriptedCaptureCreationError {
 }
 
 pub(crate) struct ScriptedCapture {
-    slot: Slot,
+    shared: Shared,
     events: Option<Events>,
 }
 
 impl ScriptedCapture {
     pub(crate) fn new(id: ScriptId) -> Result<Self, ScriptedCaptureCreationError> {
-        let slot = REGISTRY
+        let shared = REGISTRY
             .lock()
             .expect("script registry")
             .as_ref()
             .and_then(|registry| registry.get(&id).cloned())
             .ok_or(ScriptedCaptureCreationError::Unavailable)?;
-        let events = slot
+        let events = shared
+            .events
             .lock()
             .expect("script slot")
             .take()
             .ok_or(ScriptedCaptureCreationError::Unavailable)?;
         Ok(Self {
-            slot,
+            shared,
             events: Some(events),
         })
     }
@@ -121,9 +151,10 @@ impl ScriptedCapture {
 
 impl Drop for ScriptedCapture {
     /// Hand the stream back, so a capture task that restarts its backend reads
-    /// the same script.
+    /// the same script. A backend that ends holds nothing.
     fn drop(&mut self) {
-        if let (Some(events), Ok(mut slot)) = (self.events.take(), self.slot.lock()) {
+        self.shared.held.store(false, Ordering::SeqCst);
+        if let (Some(events), Ok(mut slot)) = (self.events.take(), self.shared.events.lock()) {
             *slot = Some(events);
         }
     }
@@ -140,10 +171,13 @@ impl Capture for ScriptedCapture {
     }
 
     async fn release(&mut self) -> Result<(), CaptureError> {
+        self.shared.held.store(false, Ordering::SeqCst);
+        self.shared.releases.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {
+        self.shared.held.store(false, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -151,11 +185,17 @@ impl Capture for ScriptedCapture {
 impl Stream for ScriptedCapture {
     type Item = Result<(Position, CaptureEvent), CaptureError>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.events.as_mut() {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let Self { shared, events } = self.get_mut();
+        match events.as_mut() {
             Some(events) => events.poll_recv(cx).map(|item| {
                 item.map(|item| match item {
-                    Item::Event(pos, event) => Ok((pos, event)),
+                    Item::Event(pos, event) => {
+                        if event == CaptureEvent::Begin {
+                            shared.held.store(true, Ordering::SeqCst);
+                        }
+                        Ok((pos, event))
+                    }
                     Item::Fail => Err(CaptureError::Io(std::io::Error::other(
                         "scripted: failure requested by the test",
                     ))),

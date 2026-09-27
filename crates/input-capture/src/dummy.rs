@@ -10,7 +10,12 @@ use tokio::time::{self, Instant, Interval};
 
 use super::{Capture, CaptureError, CaptureEvent, Position};
 
+/// A capture backend that reads no device: a pointer held at the left edge,
+/// moving in a circle. It crosses as it starts, when a barrier is made, and
+/// again as soon as it is released, as a pointer still pushing at a real
+/// edge does.
 pub struct DummyInputCapture {
+    /// When the current crossing began; `None` until the next one does.
     start: Option<Instant>,
     interval: Interval,
     offset: (i32, i32),
@@ -26,6 +31,14 @@ impl DummyInputCapture {
     }
 }
 
+impl DummyInputCapture {
+    /// Make the next event a crossing.
+    fn cross_again(&mut self) {
+        self.start = None;
+        self.offset = (0, 0);
+    }
+}
+
 impl Default for DummyInputCapture {
     fn default() -> Self {
         Self::new()
@@ -35,6 +48,7 @@ impl Default for DummyInputCapture {
 #[async_trait(?Send)]
 impl Capture for DummyInputCapture {
     async fn create(&mut self, _pos: Position) -> Result<(), CaptureError> {
+        self.cross_again();
         Ok(())
     }
 
@@ -43,6 +57,7 @@ impl Capture for DummyInputCapture {
     }
 
     async fn release(&mut self) -> Result<(), CaptureError> {
+        self.cross_again();
         Ok(())
     }
 

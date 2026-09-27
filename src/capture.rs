@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::{
     cell::{Cell, RefCell},
     net::SocketAddr,
@@ -7,6 +7,7 @@ use std::{
 };
 
 use futures::StreamExt;
+use hops_ipc::CrossingRefusal;
 use hops_proto::{ProtoEvent, caps};
 use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
@@ -39,7 +40,25 @@ pub(crate) enum ICaptureEvent {
     /// either the remote client leaving its device region,
     /// a new device entering the screen or the release bind.
     ClientEntered(u64),
+    /// A crossing to `handle` left the pointer on this machine, for
+    /// `reason`. Sent once per device and reason while the user keeps
+    /// pushing at that edge (see [`Told`]).
+    CrossingRefused {
+        handle: CaptureHandle,
+        reason: CrossingRefusal,
+    },
 }
+
+/// How long a crossing waits for the peer's Ack before the pointer is given
+/// back (#115). A peer on the LAN answers in milliseconds, and it answers
+/// every Enter re-send; one that has not answered in a second is not going
+/// to, and until then the user's pointer is frozen at the edge.
+const ACK_DEADLINE: Duration = Duration::from_secs(1);
+
+/// After a crossing a peer never acknowledged, how long crossings to it are
+/// refused without taking the pointer at all. Without it, pushing at that
+/// edge froze the pointer for [`ACK_DEADLINE`] out of every push.
+const UNANSWERED_BACKOFF: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CaptureType {
@@ -73,6 +92,16 @@ impl Capture {
         conn: LanMouseConnection,
         release_bind: Vec<scancode::Linux>,
     ) -> Self {
+        Self::with_ack_deadline(backend, conn, release_bind, ACK_DEADLINE)
+    }
+
+    /// As [`Capture::new`], with a crossing's Ack waited for `ack_deadline`.
+    fn with_ack_deadline(
+        backend: Option<input_capture::Backend>,
+        conn: LanMouseConnection,
+        release_bind: Vec<scancode::Linux>,
+        ack_deadline: Duration,
+    ) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let cancellation_token = CancellationToken::new();
@@ -81,6 +110,10 @@ impl Capture {
             buttons_down_on_peer: Default::default(),
             active_client: None,
             acked_at: None,
+            ack_deadline,
+            awaiting_ack: None,
+            unanswered: Default::default(),
+            told: Default::default(),
             backend,
             cancellation_token: cancellation_token.clone(),
             captures: Default::default(),
@@ -200,6 +233,15 @@ struct CaptureTask {
     /// client list before capture hears of it; looking the handle up then
     /// finds nothing, or a new client not yet connected.
     acked_at: Option<(CaptureHandle, SocketAddr)>,
+    /// How long a crossing waits for the peer's Ack ([`ACK_DEADLINE`]).
+    ack_deadline: Duration,
+    /// When the crossing to the active client is given up on if its Ack has
+    /// not come. Set as the crossing starts; cleared by the Ack or by leaving.
+    awaiting_ack: Option<tokio::time::Instant>,
+    /// Clients that left a crossing unacknowledged, and when.
+    unanswered: HashMap<CaptureHandle, Instant>,
+    /// Refused crossings the service was told of.
+    told: Told,
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
     captures: Vec<(CaptureHandle, Position, CaptureType)>,
@@ -376,6 +418,9 @@ impl CaptureTask {
                 _ = motion_flush.tick(), if self.coalesce_motion && self.pending_motion.is_some() => {
                     self.flush_pending_motion(capture).await?;
                 }
+                _ = until(self.awaiting_ack), if self.awaiting_ack.is_some() => {
+                    self.give_up_on_crossing(capture).await?;
+                }
                 event = capture.next() => match event {
                     Some(event) => self.handle_capture_event(capture, event?).await?,
                     None => return Ok(()),
@@ -395,6 +440,12 @@ impl CaptureTask {
                             log::info!("client {handle} acknowledged the connection!");
                             self.state = State::Sending;
                             if self.active_client == Some(handle) {
+                                // The crossing landed. An Ack with no crossing
+                                // under way answers a Leave, and says nothing
+                                // about whether this peer takes crossings.
+                                self.awaiting_ack = None;
+                                self.unanswered.remove(&handle);
+                                self.told.forget(handle);
                                 self.acked_at =
                                     self.conn.active_addr(handle).map(|addr| (handle, addr));
                             }
@@ -427,6 +478,8 @@ impl CaptureTask {
                             Ok(())
                         };
                         self.remove_capture(h);
+                        self.unanswered.remove(&h);
+                        self.told.forget(h);
                         released?;
                         capture.destroy(h).await?;
                     }
@@ -572,11 +625,27 @@ impl CaptureTask {
 
         // activated a new client
         if event == CaptureEvent::Begin && Some(handle) != self.active_client {
+            // Only a peer with a live link can take the pointer. Anything
+            // else would be held at the edge for a crossing that cannot land
+            // (#115), and would count as entering it.
+            if let Some(reason) = self.cannot_cross(handle).await {
+                self.refused(handle, reason);
+                return self.release_capture(capture).await;
+            }
             self.state = State::WaitingForAck;
             self.active_client.replace(handle);
+            self.awaiting_ack = Some(tokio::time::Instant::now() + self.ack_deadline);
             self.event_tx
                 .send(ICaptureEvent::ClientEntered(handle))
                 .expect("channel closed");
+        }
+
+        // Nothing reaches a peer outside a crossing to it that was let
+        // through. An event queued behind a refused or ended crossing is the
+        // local pointer's: sent, it went out as an Enter the gate had just
+        // refused, or as input after the Leave.
+        if self.active_client != Some(handle) {
+            return Ok(());
         }
 
         // Sending motion routes through send_motion (absolute-aware). Only
@@ -630,6 +699,11 @@ impl CaptureTask {
         if let Err(e) = self.conn.send(event, handle).await {
             const DUR: Duration = Duration::from_millis(500);
             debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
+            // The link failed before the peer took the crossing: it did not
+            // land, and the user is told why.
+            if self.state == State::WaitingForAck && self.active_client == Some(handle) {
+                self.refused(handle, refusal(&e));
+            }
             // Full release (not just capture.release()): also resets active_client
             // + state, so a re-entry to the SAME client re-arms the Enter->Ack
             // handshake (State::WaitingForAck) instead of silently skipping it and
@@ -644,6 +718,57 @@ impl CaptureTask {
         capture.release().await
     }
 
+    /// Why a crossing to `handle` cannot land now, if it cannot: no link to
+    /// its peer (a dial is started, as a crossing always has), a peer that
+    /// says it is not injecting, or one that left the last crossing
+    /// unacknowledged a moment ago.
+    async fn cannot_cross(&mut self, handle: CaptureHandle) -> Option<CrossingRefusal> {
+        if self.conn.active_addr(handle).is_none() {
+            self.conn.dial(handle).await;
+            return Some(CrossingRefusal::NotConnected);
+        }
+        if !self.conn.peer_alive(handle) {
+            return Some(CrossingRefusal::NotAcceptingInput);
+        }
+        match self.unanswered.get(&handle) {
+            Some(at) if at.elapsed() < UNANSWERED_BACKOFF => Some(CrossingRefusal::Unanswered),
+            _ => None,
+        }
+    }
+
+    /// The crossing to `handle` did not land: tell the service why, once
+    /// per device and reason while the user keeps pushing at the edge.
+    fn refused(&mut self, handle: CaptureHandle, reason: CrossingRefusal) {
+        if self.told.first(handle, reason, Instant::now()) {
+            log::info!("crossing to client {handle} refused ({reason}); the pointer stays here");
+            self.event_tx
+                .send(ICaptureEvent::CrossingRefused { handle, reason })
+                .expect("channel closed");
+        } else {
+            log::debug!("crossing to client {handle} refused ({reason})");
+        }
+    }
+
+    /// The active client did not acknowledge its crossing in time: give the
+    /// pointer back, and tell it the visit is over in case the Enter landed
+    /// and only the Ack was lost.
+    async fn give_up_on_crossing(
+        &mut self,
+        capture: &mut InputCapture,
+    ) -> Result<(), CaptureError> {
+        self.awaiting_ack = None;
+        let Some(handle) = self.active_client else {
+            return Ok(());
+        };
+        log::warn!(
+            "releasing capture: client {handle} did not acknowledge the crossing within {:?}",
+            self.ack_deadline
+        );
+        self.unanswered.insert(handle, Instant::now());
+        self.refused(handle, CrossingRefusal::Unanswered);
+        self.release_capture(capture).await
+    }
+
     /// Tell the active client we are leaving, after letting go of everything
     /// it was sent as held. Touches only the connection and the capture's own
     /// bookkeeping, never the capture backend, so it still works when that
@@ -653,6 +778,7 @@ impl CaptureTask {
         // belongs to the visit we're leaving; sending it after Leave would be
         // out of order.
         self.pending_motion = None;
+        self.awaiting_ack = None;
         let buttons = std::mem::take(&mut self.buttons_down_on_peer);
         let acked_at = self.acked_at.take();
         // If we have an active client, notify them we're leaving
@@ -734,6 +860,56 @@ impl CaptureTask {
 
 thread_local! {
     static PREV_LOG: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// Resolves at `deadline`; never, without one.
+async fn until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// What a failed send says about a crossing that had not landed yet.
+fn refusal(e: &LanMouseConnectionError) -> CrossingRefusal {
+    match e {
+        LanMouseConnectionError::NotPermitted => CrossingRefusal::NotPermitted,
+        LanMouseConnectionError::TargetEmulationDisabled => CrossingRefusal::NotAcceptingInput,
+        _ => CrossingRefusal::NotConnected,
+    }
+}
+
+/// Which refused crossings the service was told of, and when.
+///
+/// A user pushing at the edge of a device that cannot take the pointer
+/// makes a crossing per push. Saying why once is the point; saying it per
+/// push floods the activity log and re-raises a banner just dismissed.
+#[derive(Default)]
+struct Told(HashMap<CaptureHandle, (CrossingRefusal, Instant)>);
+
+impl Told {
+    /// The same refusal is told again after this long.
+    const AGAIN_AFTER: Duration = Duration::from_secs(10);
+
+    /// Whether this refusal is news: a new reason for `handle`, or the same
+    /// one told long enough ago. Records it if so.
+    fn first(&mut self, handle: CaptureHandle, reason: CrossingRefusal, now: Instant) -> bool {
+        match self.0.get(&handle) {
+            Some(&(told, at))
+                if told == reason && now.saturating_duration_since(at) < Self::AGAIN_AFTER =>
+            {
+                false
+            }
+            _ => {
+                self.0.insert(handle, (reason, now));
+                true
+            }
+        }
+    }
+
+    fn forget(&mut self, handle: CaptureHandle) {
+        self.0.remove(&handle);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -851,6 +1027,7 @@ mod release_mid_drag {
             (ProtoEvent::Input(a), ProtoEvent::Input(b)) => a == b,
             (ProtoEvent::Leave(_), ProtoEvent::Leave(_)) => true,
             (ProtoEvent::Enter(_), ProtoEvent::Enter(_)) => true,
+            (ProtoEvent::Ping, ProtoEvent::Ping) => true,
             _ => false,
         }
     }
@@ -863,7 +1040,7 @@ mod release_mid_drag {
         }))
     }
 
-    const MOTION: Event = Event::Pointer(PointerEvent::Motion {
+    pub(super) const MOTION: Event = Event::Pointer(PointerEvent::Motion {
         time: 0,
         dx: 1.0,
         dy: 0.0,
@@ -871,21 +1048,38 @@ mod release_mid_drag {
 
     /// A sender's capture task, crossed onto a receiver that writes down every
     /// frame reaching it.
-    struct Visit {
+    pub(super) struct Visit {
         wire: Rc<RefCell<Vec<ProtoEvent>>>,
-        script: Script,
-        capture: Capture,
+        pub(super) script: Script,
+        pub(super) capture: Capture,
         handle: hops_ipc::ClientHandle,
         /// The sender's client list, which the service changes before it
         /// tells capture.
         clients: crate::client::ClientManager,
+        /// What the sender's trust store grants the receiver.
+        pub(super) trust: crate::transport::Trust,
+        /// The receiver's fingerprint.
+        pub(super) receiver: String,
         _notices: Notices,
     }
 
     impl Visit {
         /// Cross onto a receiver that answers like a daemon. With `ack` false
-        /// it never acknowledges the Enter, so the sender stays waiting for it.
-        async fn start(ack: bool) -> Visit {
+        /// it never acknowledges the Enter, and the crossing is given up on
+        /// after the real [`ACK_DEADLINE`]. With `ack` true the deadline is
+        /// one no loaded test run can reach, since these tests are about
+        /// leaving, not about how fast the Ack comes.
+        pub(super) async fn start(ack: bool) -> Visit {
+            let deadline = if ack {
+                Duration::from_secs(3600)
+            } else {
+                ACK_DEADLINE
+            };
+            Self::start_with(ack, deadline).await
+        }
+
+        /// As [`Visit::start`], the Ack waited for `ack_deadline`.
+        pub(super) async fn start_with(ack: bool, ack_deadline: Duration) -> Visit {
             let receiver = machine();
             let sender = machine();
             let (clipboard_tx, _) = channel();
@@ -914,6 +1108,7 @@ mod release_mid_drag {
                 }
             });
 
+            let sender_trust = trust(&sender, &[&receiver], Caps::OUTBOUND);
             let Dialer {
                 conn,
                 handle,
@@ -922,7 +1117,7 @@ mod release_mid_drag {
             } = {
                 let d = dialer(
                     &sender,
-                    trust(&sender, &[&receiver], Caps::OUTBOUND),
+                    sender_trust.clone(),
                     port,
                     hops_ipc::Position::Left,
                 );
@@ -932,7 +1127,8 @@ mod release_mid_drag {
 
             let script = Script::new();
             let bind = vec![scancode::Linux::KeyLeftCtrl, scancode::Linux::KeyLeftShift];
-            let capture = Capture::new(Some(script.backend()), conn, bind);
+            let capture =
+                Capture::with_ack_deadline(Some(script.backend()), conn, bind, ack_deadline);
             capture.create(handle, hops_ipc::Position::Left, CaptureType::Default);
             let visit = Visit {
                 wire,
@@ -940,6 +1136,8 @@ mod release_mid_drag {
                 capture,
                 handle,
                 clients,
+                trust: sender_trust,
+                receiver: receiver.fingerprint.clone(),
                 _notices: notices,
             };
             visit.cross(ack).await;
@@ -951,7 +1149,7 @@ mod release_mid_drag {
         /// task took the crossing: a Begin that lands before the capture exists
         /// is dropped. Acknowledged, then keep moving until motion is on the
         /// wire, since before the Ack input goes out as repeated Enters.
-        async fn cross(&self, ack: bool) {
+        pub(super) async fn cross(&self, ack: bool) {
             let after = self.count(&ProtoEvent::Leave(0));
             self.until(
                 after,
@@ -979,16 +1177,16 @@ mod release_mid_drag {
             }
         }
 
-        fn frames(&self) -> Vec<ProtoEvent> {
+        pub(super) fn frames(&self) -> Vec<ProtoEvent> {
             self.wire.borrow().clone()
         }
 
-        fn count(&self, want: &ProtoEvent) -> usize {
+        pub(super) fn count(&self, want: &ProtoEvent) -> usize {
             self.wire.borrow().iter().filter(|e| same(e, want)).count()
         }
 
         /// How many `want` arrived after the `leaves`-th Leave.
-        fn since_leave(&self, leaves: usize, want: &ProtoEvent) -> usize {
+        pub(super) fn since_leave(&self, leaves: usize, want: &ProtoEvent) -> usize {
             let wire = self.wire.borrow();
             let start = if leaves == 0 {
                 0
@@ -1007,7 +1205,7 @@ mod release_mid_drag {
         }
 
         /// Press `b` and wait until the peer has the button-down.
-        async fn press(&self, b: u32) {
+        pub(super) async fn press(&self, b: u32) {
             let down = ProtoEvent::Input(button(b, 1));
             let before = self.count(&down);
             self.script
@@ -1019,7 +1217,7 @@ mod release_mid_drag {
         }
 
         /// Wait up to `limit` for `n` Leaves; say whether they arrived.
-        async fn leaves(&self, n: usize, limit: Duration) -> bool {
+        pub(super) async fn leaves(&self, n: usize, limit: Duration) -> bool {
             let started = tokio::time::Instant::now();
             while self.count(&ProtoEvent::Leave(0)) < n {
                 if started.elapsed() > limit {
@@ -1044,7 +1242,7 @@ mod release_mid_drag {
             })
         }
 
-        fn release_bind(&self) {
+        pub(super) fn release_bind(&self) {
             self.script
                 .push(Position::Left, key(scancode::Linux::KeyLeftCtrl, 1));
             self.script
@@ -1317,5 +1515,288 @@ mod release_mid_drag {
                 );
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod a_refused_crossing {
+    //! A crossing the other machine cannot take leaves the pointer on this
+    //! one (#115). Before, a crossing the peer never acknowledged held the
+    //! pointer until the release bind, and a crossing to a device with no
+    //! link counted as entering it.
+    //!
+    //! Driven like `release_mid_drag`: scripted capture into the real capture
+    //! task and connection. Whether the pointer is held is the scripted
+    //! backend's own state, set by the `Begin` it yields and cleared by a
+    //! release, as a real backend's grab is.
+
+    use super::release_mid_drag::{MOTION, Visit};
+    use super::*;
+    use crate::test_harness::{dialer, machine, run_local, trust, wait_until};
+    use crate::trust::Caps;
+    use futures::FutureExt;
+    use input_capture::scripted::Script;
+
+    const PATIENCE: Duration = Duration::from_secs(20);
+
+    /// What the capture task has told the service so far.
+    fn told(capture: &mut Capture) -> Vec<String> {
+        let mut told = Vec::new();
+        while let Some(event) = capture.event().now_or_never() {
+            told.push(match event {
+                ICaptureEvent::CaptureBegin(_) => "CaptureBegin".to_string(),
+                ICaptureEvent::CaptureDisabled => "CaptureDisabled".to_string(),
+                ICaptureEvent::CaptureEnabled => "CaptureEnabled".to_string(),
+                ICaptureEvent::ClientEntered(_) => "ClientEntered".to_string(),
+                ICaptureEvent::CrossingRefused { reason, .. } => {
+                    format!("CrossingRefused({reason:?})")
+                }
+            });
+        }
+        told
+    }
+
+    fn entered(told: &[String]) -> bool {
+        told.iter().any(|t| t == "ClientEntered")
+    }
+
+    fn refused(told: &[String], reason: CrossingRefusal) -> bool {
+        told.contains(&format!("CrossingRefused({reason:?})"))
+    }
+
+    /// Cross until the backend has been told to let go more than `after`
+    /// times. A Begin that lands before the capture exists is dropped.
+    async fn cross_until_let_go(script: &Script, pos: Position, after: usize) {
+        let started = tokio::time::Instant::now();
+        while script.releases() <= after {
+            assert!(
+                started.elapsed() < PATIENCE,
+                "the crossing was never let go"
+            );
+            script.push(pos, CaptureEvent::Begin);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    // LEDGER T115-1 | class B | 5 capture backend state: Script::held, crossing over loopback to a listener that never acks
+    /// The peer is connected and answers pings, but never acknowledges the
+    /// crossing. Nothing reaches it, and the pointer must not stay taken.
+    #[test]
+    fn a_crossing_the_peer_never_acknowledges_gives_the_pointer_back() {
+        run_local(async {
+            let mut v = Visit::start(false).await;
+
+            wait_until(
+                "the pointer to be given back after a crossing the peer never acknowledged",
+                PATIENCE,
+                || !v.script.held(),
+            )
+            .await;
+            assert!(
+                v.leaves(1, PATIENCE).await,
+                "the pointer was given back and the peer, which may have taken \
+                 the Enter, was never told the visit ended: {:?}",
+                v.frames()
+            );
+
+            assert!(
+                refused(&told(&mut v.capture), CrossingRefusal::Unanswered),
+                "the pointer was given back and the service was not told why"
+            );
+
+            v.capture.terminate().await;
+        });
+    }
+
+    // LEDGER T115-2 | class B | 5 capture backend state + events the capture task sends the service
+    /// The device was added and never answered: no link. Crossing to it
+    /// must not count as entering it (which runs its enter hook), and must
+    /// let the pointer go.
+    #[test]
+    fn a_crossing_to_a_device_with_no_link_enters_nothing() {
+        run_local(async {
+            let sender = machine();
+            let receiver = machine();
+            // Bound and silent: a dial to it is never answered.
+            let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("a silent port");
+            let port = silent.local_addr().expect("its address").port();
+            let crate::test_harness::Dialer {
+                conn,
+                handle,
+                notices: _notices,
+                ..
+            } = dialer(
+                &sender,
+                trust(&sender, &[&receiver], Caps::OUTBOUND),
+                port,
+                hops_ipc::Position::Left,
+            );
+            let script = Script::new();
+            let mut capture = Capture::new(
+                Some(script.backend()),
+                conn,
+                vec![scancode::Linux::KeyLeftCtrl],
+            );
+            capture.create(handle, hops_ipc::Position::Left, CaptureType::Default);
+
+            cross_until_let_go(&script, Position::Left, 0).await;
+            let told = told(&mut capture);
+            assert!(
+                !entered(&told),
+                "a crossing to a device with no link counted as entering it, \
+                 which runs its enter hook: {told:?}"
+            );
+            assert!(
+                refused(&told, CrossingRefusal::NotConnected),
+                "the pointer stayed here and the service was not told it was \
+                 because the device is not connected: {told:?}"
+            );
+
+            capture.terminate().await;
+        });
+    }
+
+    // LEDGER T115-4 | class B | 5 capture backend state + events the capture task sends the service, link up over loopback
+    /// The link is up and the gate lets the crossing through, and then the
+    /// send of its Enter is refused: this machine may no longer drive the
+    /// receiver. The crossing did not land, and the user is told why.
+    #[test]
+    fn a_crossing_to_a_receiver_this_machine_may_no_longer_drive_says_so() {
+        run_local(async {
+            let mut v = Visit::start(true).await;
+            v.release_bind();
+            assert!(v.leaves(1, PATIENCE).await, "no Leave: {:?}", v.frames());
+            let before = told(&mut v.capture);
+            assert!(
+                !before.iter().any(|t| t.starts_with("CrossingRefused")),
+                "{before:?}"
+            );
+
+            v.trust
+                .write()
+                .expect("lock")
+                .drop_capabilities(&v.receiver, Caps::OUTBOUND)
+                .expect("the receiver's lease");
+            let released = v.script.releases();
+            cross_until_let_go(&v.script, Position::Left, released).await;
+
+            let told = told(&mut v.capture);
+            assert!(
+                refused(&told, CrossingRefusal::NotPermitted),
+                "a crossing to a receiver this machine may no longer drive was \
+                 let go without saying why: {told:?}"
+            );
+            assert!(!v.script.held(), "the pointer is still held");
+
+            v.capture.terminate().await;
+        });
+    }
+
+    // LEDGER T115-5 | class B | 2 frames received by listen::LanMouseListener + 5 capture backend state
+    /// A peer that left one crossing unanswered is not given the pointer
+    /// again at once: pushing at its edge would freeze the pointer for the
+    /// whole deadline on every push. The next crossing is let go without an
+    /// Enter.
+    #[test]
+    fn after_an_unanswered_crossing_the_next_one_is_let_go_at_once() {
+        run_local(async {
+            let mut v = Visit::start(false).await;
+            wait_until("the first crossing to be given up on", PATIENCE, || {
+                !v.script.held()
+            })
+            .await;
+            let enters = v.count(&ProtoEvent::Enter(hops_proto::Position::Right));
+            let released = v.script.releases();
+
+            cross_until_let_go(&v.script, Position::Left, released).await;
+            assert_eq!(
+                v.count(&ProtoEvent::Enter(hops_proto::Position::Right)),
+                enters,
+                "a crossing to a peer that just left one unanswered took the \
+                 pointer and sent it an Enter again: {:?}",
+                v.frames()
+            );
+            assert!(!v.script.held(), "the pointer is still held");
+
+            // Input queued behind the refused crossing is the local
+            // pointer's. A Ping written after it on the same stream proves
+            // anything sent for it has arrived.
+            v.script.push(Position::Left, CaptureEvent::Input(MOTION));
+            let released = v.script.releases();
+            cross_until_let_go(&v.script, Position::Left, released).await;
+            let pings = v.count(&ProtoEvent::Ping);
+            wait_until("the next ping", PATIENCE, || {
+                v.count(&ProtoEvent::Ping) > pings
+            })
+            .await;
+            let after_leave = v.since_leave(1, &ProtoEvent::Enter(hops_proto::Position::Right))
+                + v.since_leave(1, &ProtoEvent::Input(MOTION));
+            assert_eq!(
+                after_leave,
+                0,
+                "input outside a crossing reached the peer: {:?}",
+                v.frames()
+            );
+
+            v.capture.terminate().await;
+        });
+    }
+
+    // LEDGER T115-6 | class B | 5 capture backend state + 2 frames received by listen::LanMouseListener
+    /// An acknowledged crossing is not given up on: the deadline is for the
+    /// Ack, not for the visit. Two seconds, so a slow Ack on a loaded run
+    /// does not look like a regression; watched for well past it.
+    #[test]
+    fn an_acknowledged_crossing_keeps_the_pointer_past_the_deadline() {
+        run_local(async {
+            let deadline = Duration::from_secs(2);
+            let v = Visit::start_with(true, deadline).await;
+            assert!(
+                v.script.held(),
+                "precondition: the crossing took the pointer"
+            );
+
+            tokio::time::sleep(deadline * 5 / 2).await;
+
+            assert!(
+                v.script.held() && v.count(&ProtoEvent::Leave(0)) == 0,
+                "an acknowledged crossing was given up on after the Ack deadline: {:?}",
+                v.frames()
+            );
+        });
+    }
+
+    // LEDGER T115-7 | class A | pure: Told::first
+    /// Pushing at the edge of a device that cannot take the pointer makes a
+    /// crossing per push; the user is told once, not per push.
+    #[test]
+    fn a_refusal_is_told_once_per_device_and_reason_until_it_is_old() {
+        let mut told = Told::default();
+        let t0 = Instant::now();
+        let second = Duration::from_secs(1);
+        assert!(
+            told.first(1, CrossingRefusal::NotConnected, t0),
+            "the first"
+        );
+        assert!(
+            !told.first(1, CrossingRefusal::NotConnected, t0 + second),
+            "the same refusal, a push later, was told again"
+        );
+        assert!(
+            told.first(1, CrossingRefusal::Unanswered, t0 + second),
+            "a new reason for the same device was not told"
+        );
+        assert!(
+            told.first(2, CrossingRefusal::Unanswered, t0 + second),
+            "the same reason for another device was not told"
+        );
+        assert!(
+            told.first(
+                1,
+                CrossingRefusal::Unanswered,
+                t0 + second + Told::AGAIN_AFTER
+            ),
+            "a refusal told long ago was not told again"
+        );
     }
 }

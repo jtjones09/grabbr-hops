@@ -386,6 +386,11 @@ impl LanMouseConnection {
         self.client_manager.active_addr(handle)
     }
 
+    /// Whether `handle`'s peer last said it is injecting input.
+    pub(crate) fn peer_alive(&self, handle: ClientHandle) -> bool {
+        self.client_manager.alive(handle)
+    }
+
     pub(crate) async fn send(
         &self,
         event: ProtoEvent,
