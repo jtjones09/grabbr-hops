@@ -520,7 +520,7 @@ fn adding_verdict(a: Adding) -> AddVerdict {
 /// What the person is told when a pairing ends on its own. `answered_adding`
 /// is this machine adding the other, its person having confirmed: only then
 /// can the other machine have paired alone, its answer lost on the way.
-fn ended_notice(name: &str, why: &crate::pairing::Why, answered_adding: bool) -> String {
+pub(crate) fn ended_notice(name: &str, why: &crate::pairing::Why, answered_adding: bool) -> String {
     use crate::pairing::Why;
     let stranded = if answered_adding {
         format!(" If {name} lists this machine as paired, remove it there, then add it again.")

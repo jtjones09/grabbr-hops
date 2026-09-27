@@ -565,6 +565,9 @@ fn before_number(conn: &Connection, e: CeremonyError, outranked: bool) -> Option
     }
     Some(match e {
         CeremonyError::NotSupported => Why::NoComparison,
+        // Which half had gone out decided how this ends; the person is told
+        // what failed.
+        CeremonyError::Late(e) => Why::Failed(e.to_string()),
         e => Why::Failed(e.to_string()),
     })
 }
@@ -1637,6 +1640,52 @@ mod on_the_wire {
                 "a number given up here for the one kept said why it ended, ending the \
                  approval that one carries"
             );
+        });
+    }
+
+    // LEDGER G-32 | class B | 1 PairingEvent + 1 notice text: Ended from the production dialler whose comparison failed after its nonce went out, on a connection still open; the notice the service builds from it
+    /// A comparison that failed after this machine's half went out, on a
+    /// connection still open, is told in the words of what failed. Which
+    /// half had gone out decides how the attempt ends; it is not something
+    /// the person can act on.
+    #[test]
+    fn a_comparison_failed_late_is_told_in_plain_words() {
+        run_local(async {
+            let (here, there) = (machine(), machine());
+            let receiving = raw_receiver(there, &here);
+            let mut d = dialer(
+                &here,
+                approved(&here, &receiving.me, Caps::INBOUND),
+                receiving.port,
+                Position::Left,
+            );
+            let mut events = d.conn.take_pairing_events().expect("pairing events");
+            d.conn.dial(d.handle).await;
+            let conn = receiving.next(WITHIN).await.expect("a dial");
+            // The other machine's half, with a reveal that opens nothing.
+            let (mut send, mut recv) = conn.open_bi().await.expect("the comparison stream");
+            send.write_all(&[0u8; crate::match_code::COMMIT_LEN])
+                .await
+                .expect("commitment");
+            let mut theirs = [0u8; crate::match_code::NONCE_LEN];
+            recv.read_exact(&mut theirs)
+                .await
+                .expect("the dialler's nonce");
+            send.write_all(&[0u8; crate::match_code::NONCE_LEN])
+                .await
+                .expect("the reveal");
+            let _ = send.finish();
+            let why = match next_within(&mut events, WITHIN).await {
+                Some(PairingEvent::Ended { why, .. }) => why,
+                other => panic!("a comparison that failed did not end the attempt: {other:?}"),
+            };
+            let notice = crate::service::ended_notice("\"B\"", &why, false);
+            let failed = crate::pair_ceremony::CeremonyError::CommitmentBroken.to_string();
+            assert!(
+                notice.starts_with(&format!("Pairing with \"B\" failed ({failed}), ")),
+                "the notice for a comparison that failed late: {notice:?}"
+            );
+            drop(conn);
         });
     }
 
