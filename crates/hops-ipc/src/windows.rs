@@ -465,6 +465,43 @@ pub(crate) mod testing {
         Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
     }
 
+    /// Whether the account written `a` in SDDL, an alias such as `LA` or a
+    /// full `S-1-...` string, is the account `b`. SDDL prints a well-known
+    /// account by its alias, so comparing the text fails for the built-in
+    /// Administrator, which is what a CI runner runs as.
+    pub(crate) fn same_sid(a: &str, b: &str) -> io::Result<bool> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+        use windows_sys::Win32::Security::EqualSid;
+        let sid = |s: &str| -> io::Result<*mut core::ffi::c_void> {
+            let wide: Vec<u16> = std::ffi::OsStr::new(s).encode_wide().chain([0]).collect();
+            let mut sid = std::ptr::null_mut();
+            // SAFETY: `wide` is NUL-terminated; `sid` receives a buffer freed
+            // with LocalFree below.
+            if unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut sid) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(sid)
+        };
+        let x = sid(a)?;
+        let y = match sid(b) {
+            Ok(y) => y,
+            Err(e) => {
+                // SAFETY: made by ConvertStringSidToSidW above.
+                unsafe { LocalFree(x) };
+                return Err(e);
+            }
+        };
+        // SAFETY: both are valid SIDs made above, freed right after.
+        let equal = unsafe { EqualSid(x, y) } != 0;
+        unsafe {
+            LocalFree(x);
+            LocalFree(y);
+        }
+        Ok(equal)
+    }
+
     /// The DACL of the object behind `handle`, in SDDL.
     pub(crate) fn dacl_of(handle: std::os::windows::io::RawHandle) -> io::Result<String> {
         use windows_sys::Win32::Security::Authorization::{

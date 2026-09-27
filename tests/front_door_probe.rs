@@ -148,6 +148,18 @@ async fn the_front_door_asks_the_endpoint_the_daemon_listens_on() {
         Err(e) => format!("{e:?}"),
     };
     drop(daemon);
+    // Let the endpoint go before asking again. A daemon ends by exiting, which
+    // closes everything at once; this one is dropped inside a running test,
+    // and on Windows a pipe with I/O in flight is closed only once the
+    // runtime has seen that I/O cancelled, so give it the turns to do so.
+    let gone_by = tokio::time::Instant::now() + Duration::from_secs(10);
+    while bound.answers() {
+        assert!(
+            tokio::time::Instant::now() < gone_by,
+            "the daemon's endpoint still answers 10 s after its listener was dropped"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let after = front_door();
     let _ = std::fs::remove_dir_all(&dir);
 

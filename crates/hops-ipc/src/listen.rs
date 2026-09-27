@@ -2525,12 +2525,16 @@ mod the_pipe {
             .skip(1)
             .map(|ace| ace.trim_end_matches(')'))
             .collect();
+        // The trustee is the ACE's last field, in SDDL: this user's SID, or
+        // its alias when the user is a well-known account (`LA` for the
+        // built-in Administrator, as on a CI runner).
+        let this_user_alone = aces.iter().all(|ace| {
+            let trustee = ace.rsplit(';').next().unwrap_or_default();
+            ace.starts_with("A;")
+                && crate::windows::testing::same_sid(trustee, &me).expect("a trustee SID")
+        });
         assert!(
-            dacl.starts_with("D:P")
-                && !aces.is_empty()
-                && aces
-                    .iter()
-                    .all(|ace| ace.starts_with("A;") && ace.ends_with(&format!(";{me}"))),
+            dacl.starts_with("D:P") && !aces.is_empty() && this_user_alone,
             "the daemon's pipe grants more than this user ({me}): {dacl}"
         );
     }
