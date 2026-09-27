@@ -17,7 +17,7 @@ use input_capture::scripted::Script;
 use input_capture::{CaptureEvent, Position};
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// What must happen is waited for this long at most.
 const DEADLINE: Duration = Duration::from_secs(30);
@@ -71,9 +71,35 @@ async fn daemon(tag: &str, tables: &str, script: &Script) -> (Service, Scratch) 
     (service, scratch)
 }
 
+/// An app that has made the two-way proof, which the daemon's listener
+/// answers only while it is polled, and before which it sends an app
+/// nothing. Polls the listener alone, not the loop, so nothing the loop
+/// says once it runs can come before the app is heard.
+async fn attached(service: &mut Service, scratch: &Scratch) -> Frontend {
+    use futures::StreamExt;
+    let mut app = Frontend::connect(scratch).await;
+    {
+        let proving = app.prove();
+        tokio::pin!(proving);
+        let deadline = tokio::time::sleep(DEADLINE);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                () = &mut proving => break,
+                _ = service.frontend_listener.next() => {}
+                _ = &mut deadline => panic!("the app's two-way proof was never answered"),
+            }
+        }
+    }
+    app
+}
+
 /// An app connected over the daemon's IPC socket, reading raw event lines.
 struct Frontend {
-    lines: tokio::io::Lines<BufReader<tokio::net::UnixStream>>,
+    lines: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    tx: tokio::net::unix::OwnedWriteHalf,
+    /// The token, until the proof is made on the first read.
+    unproven: Option<String>,
 }
 
 impl Frontend {
@@ -82,15 +108,24 @@ impl Frontend {
             unreachable!("a unix socket")
         };
         let token = std::fs::read_to_string(scratch.dir.join("ipc-token")).expect("the token");
-        let mut stream = tokio::net::UnixStream::connect(path)
+        let stream = tokio::net::UnixStream::connect(path)
             .await
             .expect("the daemon's socket");
-        stream
-            .write_all(format!("{}\n", token.trim()).as_bytes())
-            .await
-            .expect("the token is sent");
+        let (rx, tx) = stream.into_split();
         Self {
-            lines: BufReader::new(stream).lines(),
+            lines: BufReader::new(rx).lines(),
+            tx,
+            unproven: Some(token.trim().to_string()),
+        }
+    }
+
+    /// Make the two-way proof, the first time it is read from. The daemon
+    /// answers only while its loop runs, which it does while this is read.
+    async fn prove(&mut self) {
+        if let Some(token) = self.unproven.take() {
+            hops_ipc::prove_to_daemon(self.lines.get_mut(), &mut self.tx, &token)
+                .await
+                .expect("the two-way proof is made");
         }
     }
 
@@ -103,6 +138,7 @@ impl Frontend {
         seen: &mut Vec<String>,
         want: impl Fn(&str) -> bool,
     ) -> Option<String> {
+        self.prove().await;
         while let Ok(Some(line)) = self.lines.next_line().await {
             let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
@@ -151,7 +187,7 @@ fn a_crossing_into_a_machine_that_refuses_this_one_says_so() {
             &script,
         )
         .await;
-        let mut app = Frontend::connect(&scratch).await;
+        let mut app = attached(&mut service, &scratch).await;
 
         let crossing = async {
             loop {
@@ -243,7 +279,7 @@ fn a_crossing_whose_address_reaches_another_paired_machine_says_which() {
             &script,
         )
         .await;
-        let mut app = Frontend::connect(&scratch).await;
+        let mut app = attached(&mut service, &scratch).await;
 
         let crossing = async {
             loop {

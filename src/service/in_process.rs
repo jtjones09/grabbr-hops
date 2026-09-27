@@ -148,18 +148,19 @@ pub(crate) struct Ipc {
 }
 
 impl Ipc {
-    /// A frontend on the daemon's socket, past the token.
+    /// A frontend on the daemon's socket, past the two-way proof.
     pub(crate) async fn connect(&self) -> Frontend {
         let token = std::fs::read_to_string(self.dir.join("ipc-token")).expect("the token");
         let stream = tokio::net::UnixStream::connect(self.dir.join("s.sock"))
             .await
             .expect("the daemon's socket");
         let (rx, mut tx) = stream.into_split();
-        tx.write_all(format!("{}\n", token.trim()).as_bytes())
+        let mut rx = BufReader::new(rx);
+        hops_ipc::prove_to_daemon(&mut rx, &mut tx, token.trim())
             .await
-            .expect("the token is sent");
+            .expect("the two-way proof is made");
         Frontend {
-            lines: BufReader::new(rx).lines(),
+            lines: rx.lines(),
             tx,
             barrier: 0,
         }

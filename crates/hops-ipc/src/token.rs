@@ -4,18 +4,18 @@
 //!
 //! The frontend channel carries `FrontendRequest::AuthorizeKey` — it can write
 //! the KVM's trust store. On unix the listener is a `UnixListener` guarded by
-//! filesystem permissions, but on Windows it is a plain
-//! `TcpListener::bind("127.0.0.1:5252")` that **any local process can reach**,
-//! with no authentication at all. That made the trust store writable by anything
-//! running as the user, and plausibly by a web page: `text/plain` is
-//! CORS-safelisted, so a `fetch()` needs no preflight, and the listener's
-//! line-delimited parser previously skipped unparseable lines instead of hanging
-//! up — so an HTTP request's preamble was discarded and a request body carrying
-//! valid JSON was executed.
+//! filesystem permissions. On Windows it was a plain
+//! `TcpListener::bind("127.0.0.1:5252")` that **any local process could
+//! reach**, with no authentication at all, and plausibly a web page:
+//! `text/plain` is CORS-safelisted, so a `fetch()` needs no preflight, and the
+//! listener's line-delimited parser skipped unparseable lines instead of
+//! hanging up. It is now a named pipe that grants this user alone (#110).
 //!
-//! The token closes both. It is deliberately **not** `cfg(windows)`-only: the
-//! unix path is already permission-protected, but one code path that is compiled
-//! and tested everywhere is worth more than a Windows-only branch that no test
+//! Both ends prove they hold the token without sending it ([`crate::proof`]),
+//! so a frontend also knows it reached the daemon and not something that
+//! took the endpoint first (#96). On Windows the token also names the pipe.
+//! None of it is `cfg(windows)`-only: one code path that is compiled and
+//! tested everywhere is worth more than a Windows-only branch that no test
 //! and no non-Windows build ever exercises.
 //!
 //! # What it is not
@@ -67,7 +67,8 @@ fn config_dir() -> io::Result<PathBuf> {
     Ok(base.join("lan-mouse"))
 }
 
-/// Read the existing token, or mint one. Called by the daemon at startup.
+/// Read the existing token, or mint one. Called by the daemon at startup, and
+/// on Windows by frontends too, since the token names the daemon's pipe.
 ///
 /// The file is created `0600` on unix. On Windows it inherits the ACL of the
 /// user's `%LOCALAPPDATA%`, which is already user-scoped — the same protection
@@ -77,16 +78,21 @@ pub fn load_or_create() -> io::Result<String> {
 }
 
 /// [`load_or_create`] for the token kept at `path`.
+///
+/// Where there is no token yet, two processes may mint one at once. Only one
+/// creates the file; the other reads the token it wrote. On Windows the token
+/// names the pipe, and two tokens would put two daemons on two pipes.
 pub fn load_or_create_at(path: &std::path::Path) -> io::Result<String> {
-    if let Ok(existing) = read_at(path) {
-        let existing = existing.trim().to_string();
+    let found = read_settled(path);
+    if let Ok(existing) = &found {
+        if let Some(token) = well_formed(existing) {
+            return Ok(token);
+        }
         // a truncated or hand-mangled token would lock every frontend out with a
         // confusing failure, so replace anything that isn't well-formed
-        if existing.len() == TOKEN_CHARS && existing.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Ok(existing);
-        }
         log::warn!("{path:?}: malformed IPC token — minting a new one");
     }
+    let absent = matches!(&found, Err(e) if e.kind() == io::ErrorKind::NotFound);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -94,9 +100,47 @@ pub fn load_or_create_at(path: &std::path::Path) -> io::Result<String> {
     getrandom::fill(&mut raw)
         .map_err(|e| io::Error::other(format!("no OS randomness available: {e}")))?;
     let token: String = raw.iter().map(|b| format!("{b:02x}")).collect();
-    write_private(path, &token)?;
+    match write_private(path, &token, absent) {
+        Ok(()) => {}
+        // Another process minted it first: use theirs.
+        Err(e) if absent && e.kind() == io::ErrorKind::AlreadyExists => {
+            return well_formed(&read_settled(path)?).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{}: the token another process wrote is malformed",
+                        path.display()
+                    ),
+                )
+            });
+        }
+        Err(e) => return Err(e),
+    }
     log::info!("minted a new IPC token at {path:?}");
     Ok(token)
+}
+
+/// The file at `path`, read again for a moment while it does not hold a
+/// token: another process that has just created it may not have written it
+/// yet, and taking the empty file for a mangled one would replace the token
+/// that process is about to use.
+fn read_settled(path: &std::path::Path) -> io::Result<String> {
+    let mut text = read_at(path)?;
+    for _ in 0..20 {
+        if well_formed(&text).is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        text = read_at(path)?;
+    }
+    Ok(text)
+}
+
+/// The token in `text`, if it is one.
+fn well_formed(text: &str) -> Option<String> {
+    let text = text.trim();
+    (text.len() == TOKEN_CHARS && text.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| text.to_string())
 }
 
 /// Read the token. Called by frontends (GUI / TUI / CLI) before connecting.
@@ -127,8 +171,10 @@ fn read_at(path: &std::path::Path) -> io::Result<String> {
     std::fs::read_to_string(path)
 }
 
+/// Write `token` to `path`, readable by this user alone. With `new`, only if
+/// there is no file there yet.
 #[cfg(unix)]
-fn write_private(path: &std::path::Path, token: &str) -> io::Result<()> {
+fn write_private(path: &std::path::Path, token: &str, new: bool) -> io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     // 0600 from the moment it exists — never create-then-chmod, which leaves a
@@ -141,6 +187,7 @@ fn write_private(path: &std::path::Path, token: &str) -> io::Result<()> {
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
+        .create_new(new)
         .truncate(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
@@ -172,8 +219,15 @@ fn link_refused(path: &std::path::Path, e: io::Error) -> io::Error {
 }
 
 #[cfg(not(unix))]
-fn write_private(path: &std::path::Path, token: &str) -> io::Result<()> {
-    std::fs::write(path, token)
+fn write_private(path: &std::path::Path, token: &str, new: bool) -> io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .create_new(new)
+        .truncate(true)
+        .open(path)?;
+    f.write_all(token.as_bytes())
 }
 
 /// Constant-time comparison. The offered token arrives from an unauthenticated
@@ -244,6 +298,52 @@ mod links {
             "the refusal must say why: {refused}"
         );
         let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod minted_once {
+    //! Processes that find no token and mint one at the same moment end up
+    //! holding the same token. On Windows the token names the daemon's pipe,
+    //! and a frontend and a daemon holding two tokens look for each other on
+    //! two pipes.
+
+    use super::load_or_create_at;
+
+    // LEDGER T9609 | class B | 1 return values of token::load_or_create_at + 4 file on disk
+    #[test]
+    fn minters_racing_for_a_missing_token_all_hold_the_one_written() {
+        let dir = std::env::temp_dir().join(format!("hops-token-race-{}", std::process::id()));
+        let mut disagreed = Vec::new();
+        for round in 0..20 {
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("a scratch directory");
+            let path = dir.join("ipc-token");
+            let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let minters: Vec<_> = (0..8)
+                .map(|_| {
+                    let (path, start) = (path.clone(), start.clone());
+                    std::thread::spawn(move || {
+                        start.wait();
+                        load_or_create_at(&path).map_err(|e| e.to_string())
+                    })
+                })
+                .collect();
+            let held: Vec<_> = minters
+                .into_iter()
+                .map(|m| m.join().expect("a minter"))
+                .collect();
+            let on_disk = std::fs::read_to_string(&path).unwrap_or_default();
+            if held.iter().any(|h| h.as_deref() != Ok(on_disk.as_str())) {
+                disagreed.push((round, held, on_disk));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            disagreed.is_empty(),
+            "minters racing for a missing token came away holding tokens other \
+             than the one on disk: {disagreed:?}"
+        );
     }
 }
 

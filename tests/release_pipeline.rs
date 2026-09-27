@@ -2775,6 +2775,7 @@ fn the_notes_come_from_the_cargo_deny_the_gate_runs() {
 
 const CHECK: &str = ".github/workflows/check.yml";
 const WORKSPACE_TESTS: &str = "workspace-tests";
+const IPC_TESTS_WINDOWS: &str = "ipc-tests-windows";
 
 /// The runner labels a job runs on: its `runs-on`, or, when that is
 /// `${{ matrix.os }}`, every `os` the matrix lists or includes.
@@ -2874,6 +2875,61 @@ fn the_workspace_tests_run_on_linux_and_on_macos() {
         found,
         1,
         "{WORKSPACE_TESTS} must run `cargo test {}` once, in one step",
+        wanted.join(" ")
+    );
+}
+
+/// The Windows transport of the frontend channel, the named pipe, its DACL,
+/// the two-way proof over it and the GUI's single-instance event, is Windows
+/// code that only a Windows runner executes. The workspace tests run on
+/// Linux and macOS, and the release job on Windows tests only the root
+/// crate, so without this job none of it ever ran.
+// LEDGER T9625 | class S | parsed workflow YAML | pair T9622 (CI configuration)
+#[test]
+fn the_ipc_tests_run_on_windows() {
+    let wf = parse(CHECK);
+    let job = &wf["jobs"][IPC_TESTS_WINDOWS];
+    assert!(
+        !job.is_badvalue(),
+        "check.yml has no {IPC_TESTS_WINDOWS} job"
+    );
+    assert_eq!(
+        runners(IPC_TESTS_WINDOWS, job),
+        BTreeSet::from(["windows-latest".to_owned()]),
+        "{IPC_TESTS_WINDOWS} must run on windows-latest"
+    );
+    assert!(
+        job["if"].is_badvalue() && !may_fail(job),
+        "{IPC_TESTS_WINDOWS} is conditional or allowed to fail"
+    );
+    let wanted = ["--locked", "-p", "hops-ipc", "--all-targets"];
+    let mut found = 0;
+    for step in steps(job) {
+        let run = step["run"].as_str().unwrap_or("").replace("\\\n", " ");
+        for command in run.lines() {
+            let tokens: Vec<&str> = command.split_whitespace().collect();
+            let Some(at) = tokens.windows(2).position(|w| w == ["cargo", "test"]) else {
+                continue;
+            };
+            let mut args = tokens[at + 2..].to_vec();
+            args.sort_unstable();
+            let mut want = wanted.to_vec();
+            want.sort_unstable();
+            assert!(
+                args == want && step["if"].is_badvalue() && !may_fail(step),
+                "{IPC_TESTS_WINDOWS} runs `cargo test {}`; it must run exactly `cargo \
+                 test {}`, unconditionally: anything more runs fewer tests or hides a \
+                 failure",
+                tokens[at + 2..].join(" "),
+                wanted.join(" ")
+            );
+            found += 1;
+        }
+    }
+    assert_eq!(
+        found,
+        1,
+        "{IPC_TESTS_WINDOWS} must run `cargo test {}` once",
         wanted.join(" ")
     );
 }

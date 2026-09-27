@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// How often the scripted watch checks.
 const EVERY: Duration = Duration::from_millis(20);
@@ -189,10 +189,13 @@ impl Frontend {
         let mut stream = tokio::net::UnixStream::connect(path)
             .await
             .expect("the daemon's socket");
-        stream
-            .write_all(format!("{}\n", token.trim()).as_bytes())
-            .await
-            .expect("the token is sent");
+        {
+            let (rx, mut tx) = stream.split();
+            let mut rx = BufReader::new(rx);
+            hops_ipc::prove_to_daemon(&mut rx, &mut tx, token.trim())
+                .await
+                .expect("the two-way proof is made");
+        }
         Self {
             lines: BufReader::new(stream).lines(),
         }

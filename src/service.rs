@@ -587,8 +587,10 @@ impl Service {
     /// The claim is the single-instance check. A daemon started beside a
     /// running one, or racing another through startup, stops at it with
     /// `AlreadyRunning`, having opened only its own log and the claim's lock
-    /// file. It never reads or writes the config, the token, the identity key
-    /// or the trust store that the running daemon holds.
+    /// file. It never reads or writes the config, the identity key or the
+    /// trust store that the running daemon holds, nor on unix the token. On
+    /// Windows the token names the pipe, so `endpoint` was worked out from it
+    /// before this is called.
     pub async fn start(
         endpoint: &DaemonEndpoint,
         load_config: impl FnOnce() -> Result<Config, ConfigError>,
