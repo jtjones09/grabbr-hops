@@ -487,8 +487,9 @@ enum Instance {
 }
 
 /// Cleans up the single-instance rendezvous on drop (normal GUI exit). Only Unix
-/// leaves a filesystem artifact (the socket file); on Windows the event goes
-/// with the last handle to it, which `_event` holds.
+/// leaves a filesystem artifact (the socket file). On Windows the event lasts
+/// until the process exits: the thread that waits on it holds a handle of its
+/// own, blocked for as long as the GUI runs.
 #[cfg(any(unix, windows))]
 struct SingleInstanceGuard {
     #[cfg(unix)]

@@ -55,7 +55,8 @@ it is the previous context window's state. See `.claude/skills/handoff/`.
 - **`hops-proto`** carries `Hello`, `Capability { flags }` (append-only bits, ours — upstream
   has no capability negotiation), and the input events.
 - **`hops-ipc`** is the daemon↔frontend channel, **token-authenticated** (`0600`, beside
-  `config.toml`). On Windows it is a localhost TCP socket, so the token is load-bearing.
+  `config.toml`). On Windows it is a named pipe granted to this user alone. Each side proves
+  it holds the token without sending it, so neither trusts whatever holds the endpoint.
 
 ### Frontends
 
