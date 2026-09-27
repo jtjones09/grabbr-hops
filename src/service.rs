@@ -1779,8 +1779,12 @@ impl Service {
                 fingerprint,
                 addr,
             } => {
-                // The name it was paired under here: a refusal can arrive
-                // before the device is pinned to the machine that answered.
+                // The name it was given here, even by an approval still
+                // waiting for its number: unlike `device_name`, which will not
+                // call an unconfirmed approval a pairing, this notice is about
+                // that very approval, and the name is the one just typed. A
+                // refusal can also arrive before the device is pinned to the
+                // machine that answered.
                 let label = self.trust.read().expect("lock").label(&fingerprint);
                 let name = label
                     .filter(|l| !l.is_empty())
@@ -2323,7 +2327,7 @@ impl Service {
         let Some(c) = self.ceremonies.get_mut(&fp) else {
             self.notify_frontend(FrontendEvent::Error(format!(
                 "{}: no pairing with that device is waiting for its number.",
-                hops_ipc::GRANT_REFUSED
+                PAIRING_NOT_FINISHED
             )));
             return;
         };
@@ -2340,12 +2344,12 @@ impl Service {
                 Role::Pick => format!(
                     "{}: the number picked is not the one {name} shows, so pairing ended. \
                      Add the device again on both machines to retry.",
-                    hops_ipc::GRANT_REFUSED
+                    PAIRING_NOT_FINISHED
                 ),
                 Role::Show => format!(
                     "{}: the number confirmed is not the one shown for {name}, so pairing \
                      ended. Add the device again to retry.",
-                    hops_ipc::GRANT_REFUSED
+                    PAIRING_NOT_FINISHED
                 ),
             }));
             return;
@@ -4005,3 +4009,77 @@ mod pairing_notices {
 
 #[cfg(all(test, unix))]
 mod an_approval_before_its_number;
+
+#[cfg(all(test, unix))]
+mod a_wrong_pairing_answer_is_not_a_refused_grant {
+    //! A pairing's own notices, for a confirmation with no pairing waiting
+    //! or a wrong number, are not refusals of a grant. They go to every
+    //! frontend, and `hops cli authorize-key` reads a notice beginning with
+    //! GRANT_REFUSED as its own approval refused: a wrong pick in the app,
+    //! landing while the CLI approved another machine, made that approval
+    //! report failure.
+    use super::in_process::{Daemon, compare_number, prompt_from};
+    use crate::test_harness::{machine, run_local};
+    use hops_ipc::{FrontendEvent, FrontendRequest};
+    use input_emulation::recording::Recording;
+
+    // LEDGER GR-1 | class B | 3 process-in-test: ConfirmPairing over the daemon's IPC socket, a peer knocking over loopback QUIC
+    #[test]
+    fn a_confirmation_with_nothing_waiting_or_the_wrong_number_is_not_a_grant_refusal() {
+        run_local(async {
+            let stranger = machine();
+            let recording = Recording::new();
+            let daemon = Daemon::start("wrongpick", "", recording.backend()).await;
+            let (ours, port, ipc) = (daemon.fingerprint(), daemon.port(), daemon.ipc());
+            let fp = stranger.fingerprint.clone();
+            daemon
+                .run_while(async {
+                    use FrontendRequest as R;
+                    let mut app = ipc.connect().await;
+                    let mut said = app
+                        .exchange(&[R::ConfirmPairing {
+                            fingerprint: fp.clone(),
+                            number: "000000".into(),
+                        }])
+                        .await;
+                    app.exchange(&[R::OpenPairing]).await;
+                    prompt_from(&mut app, &stranger, port, &ours).await;
+                    app.exchange(&[R::AuthorizeKey("desk".to_owned(), fp.clone())])
+                        .await;
+                    let comparing = compare_number(&mut app, &stranger, port, &ours).await;
+                    let wrong = if comparing.number == "000000" {
+                        "000001"
+                    } else {
+                        "000000"
+                    };
+                    said.extend(
+                        app.exchange(&[R::ConfirmPairing {
+                            fingerprint: fp.clone(),
+                            number: wrong.into(),
+                        }])
+                        .await,
+                    );
+                    let errors: Vec<&str> = said
+                        .iter()
+                        .filter_map(|e| match e {
+                            FrontendEvent::Error(text) => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(
+                        errors.len(),
+                        2,
+                        "expected a notice for each answer that finished nothing: {errors:?}"
+                    );
+                    for text in errors {
+                        assert!(
+                            !text.starts_with(hops_ipc::GRANT_REFUSED)
+                                && text.starts_with(super::PAIRING_NOT_FINISHED),
+                            "a pairing's own notice reads as a refused grant to the CLI: {text:?}"
+                        );
+                    }
+                })
+                .await;
+        });
+    }
+}
