@@ -535,6 +535,35 @@ mod tests {
     }
 
     #[test]
+    fn presses_stay_refused_until_the_consumer_has_taken_everything() {
+        let (tx, mut rx) = channel(2);
+        tx.push(POS, key(30, 1));
+        tx.push(POS, key(31, 1));
+        // Full: the queue releases both keys and starts refusing.
+        tx.push(POS, scroll(120));
+        let mut taken = vec![];
+        for _ in 0..3 {
+            let Poll::Ready(Some(item)) = try_recv(&mut rx) else {
+                panic!("the backlog ended early: {taken:?}");
+            };
+            taken.push(item);
+        }
+        assert_eq!(
+            taken,
+            vec![(POS, key(30, 1)), (POS, key(31, 1)), (POS, key(30, 0))]
+        );
+
+        // Room again, but one event still waits: still refusing.
+        tx.push(POS, key(32, 1));
+        tx.push(POS, scroll(120));
+        assert_eq!(drain(&mut rx), vec![(POS, key(31, 0))]);
+
+        // Everything was taken: accepted again.
+        tx.push(POS, key(33, 1));
+        assert_eq!(drain(&mut rx), vec![(POS, key(33, 1))]);
+    }
+
+    #[test]
     fn a_release_of_something_held_is_kept_even_when_full() {
         let (tx, mut rx) = channel(2);
         tx.push(POS, button(BTN_LEFT, 1));
@@ -607,8 +636,9 @@ mod tests {
     /// Checked for every run:
     /// - after the consumer takes everything, it holds no key or button the
     ///   producer released (nothing sticks);
-    /// - the total motion taken equals the total pushed (integer deltas, as a
-    ///   hook produces, so the f64 sums are exact);
+    /// - the total motion taken toward each position equals the total pushed
+    ///   toward it (integer deltas, as a hook produces, so the f64 sums are
+    ///   exact);
     /// - a run that never overflowed delivers every non-motion event, in
     ///   order;
     /// - the queue stays bounded.
@@ -676,7 +706,16 @@ mod tests {
                     "seed {seed}: {h:?} is held on the peer after the producer released it"
                 );
             }
-            assert_eq!(total_motion(&got), total_motion(&pushed), "seed {seed}");
+            for pos in positions {
+                let at = |items: &[Item]| -> Vec<Item> {
+                    items.iter().filter(|(p, _)| *p == pos).copied().collect()
+                };
+                assert_eq!(
+                    total_motion(&at(&got)),
+                    total_motion(&at(&pushed)),
+                    "seed {seed}: motion toward {pos:?}"
+                );
+            }
             if !overflowed {
                 assert_eq!(without_motion(&got), without_motion(&pushed), "seed {seed}");
                 continue;
