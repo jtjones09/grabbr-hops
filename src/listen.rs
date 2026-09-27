@@ -441,11 +441,13 @@ impl LanMouseListener {
                                             // choose that machine to control this
                                             // one (#220): the connection the
                                             // number was compared on carries
-                                            // nothing.
+                                            // nothing. The machine that dialled
+                                            // still waits for this machine's
+                                            // confirmation, so it is sent first.
                                             log::info!(
                                                 "{addr}: paired with {fingerprint}, which does not control this machine; closing the pairing connection"
                                             );
-                                            conn.close(0u32.into(), b"paired");
+                                            answer_and_close(&conn).await;
                                             return;
                                         }
                                         if !trust.read().expect("lock").may_drive_us(&fingerprint) {
@@ -780,6 +782,34 @@ struct Admitted {
 
 /// Open the reply stream, list the connection, say it was accepted, and read
 /// its input.
+/// Answer a pairing both machines confirmed on `conn` with this machine's
+/// own confirmation, as [`admit`] does through its reply stream, then let
+/// the connection go: once the machine that dialled closes it, having read
+/// the answer, or after [`PAIRED_LINGER`]. Closing at once can discard the
+/// answer on its way, and the other machine then ends its side unpaired.
+async fn answer_and_close(conn: &quinn::Connection) {
+    let answer = async {
+        let mut send = conn.open_uni().await.ok()?;
+        crate::transport::write_frame(
+            &mut send,
+            ProtoEvent::Hello {
+                commit: crate::config::local_commit(),
+            },
+        )
+        .await
+        .ok()?;
+        send.finish().ok()
+    };
+    if answer.await.is_some() {
+        let _ = tokio::time::timeout(PAIRED_LINGER, conn.closed()).await;
+    }
+    conn.close(0u32.into(), b"paired");
+}
+
+/// How long a pairing connection that carries nothing stays open for the
+/// machine that dialled to read this machine's confirmation.
+const PAIRED_LINGER: Duration = Duration::from_secs(10);
+
 async fn admit(a: Admitted) {
     let Admitted {
         conns,

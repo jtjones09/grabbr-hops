@@ -409,36 +409,35 @@ fn a_machine_waiting_for_its_number_is_not_treated_as_paired() {
     });
 }
 
-/// Two machines adding each other can meet on two connections, and keep
-/// one (#220). The other machine giving up a connection for the other one
-/// takes its number card down and ends nothing: the approval waits for the
-/// number on the connection kept. An attempt on a connection whose number is
-/// no longer on screen ends nothing either. Only the attempt on screen ends
-/// the pairing, and forgets the approval.
+/// One approval shows one number (#220). An attempt other than the one
+/// whose number is on screen ending ends nothing: the pairing goes on there.
+/// The one on screen ending ends the pairing, however its connection closed,
+/// and forgets the approval, so a number arriving after it shows nothing.
 // LEDGER G-23 | class B | 1 events the daemon sends + 1 the trust the TLS door consults: Service::handle_pairing_event
 #[test]
-fn an_attempt_given_up_for_another_connection_ends_nothing() {
+fn one_approval_shows_one_number() {
     use crate::pairing::{PairingEvent, Role, Why};
     run_local(async {
-        let (mut service, _scratch) = daemon("moved").await;
+        let (mut service, _scratch) = daemon("once").await;
         let peer = machine().fingerprint;
         approve(&mut service, &peer, AttemptOrigin::Inbound);
-        let number = |service: &mut Service, conn: usize| {
+        let number = |service: &mut Service, attempt: u64| {
             service.handle_pairing_event(PairingEvent::Number {
                 fingerprint: peer.clone(),
                 addr: peer_addr(),
                 role: Role::Pick,
                 number: "042917".into(),
                 handle: None,
-                conn,
+                attempt,
             });
+            sent(service)
         };
-        let ended = |service: &mut Service, why: Why, conn: usize| {
+        let ended = |service: &mut Service, why: Why, attempt: u64| {
             service.handle_pairing_event(PairingEvent::Ended {
                 fingerprint: peer.clone(),
                 why,
                 handle: None,
-                conn,
+                attempt,
             });
             sent(service)
         };
@@ -448,30 +447,33 @@ fn an_attempt_given_up_for_another_connection_ends_nothing() {
                     if *fingerprint == peer)
             })
         };
+        let card_up = |events: &[FrontendEvent]| {
+            events.iter().any(|e| {
+                matches!(e, FrontendEvent::PairingCheck { fingerprint, .. }
+                    if *fingerprint == peer)
+            })
+        };
 
-        number(&mut service, 1);
-        let events = ended(&mut service, Why::Withdrawn, 1);
         assert!(
-            card_down(&events) && notices(&events).is_empty(),
-            "a connection the other machine gave up for another did not take its card \
-             down quietly: {events:?}"
+            card_up(&number(&mut service, 1)),
+            "the first number was not shown"
         );
-        assert!(
-            service.trust.read().expect("lock").is_pairing(&peer),
-            "a connection the other machine gave up for another ended the pairing"
-        );
-
-        number(&mut service, 2);
-        let events = ended(&mut service, Why::Closed, 1);
-        assert!(
-            !card_down(&events) && service.trust.read().expect("lock").is_pairing(&peer),
-            "an attempt on a connection no longer on screen ended the pairing: {events:?}"
-        );
-
         let events = ended(&mut service, Why::Closed, 2);
         assert!(
+            !card_down(&events) && service.trust.read().expect("lock").is_pairing(&peer),
+            "an attempt other than the one on screen ended the pairing: {events:?}"
+        );
+
+        let events = ended(&mut service, Why::Closed, 1);
+        assert!(
             card_down(&events) && !service.trust.read().expect("lock").is_pairing(&peer),
-            "the attempt on screen closing did not end the pairing: {events:?}"
+            "the attempt on screen closing did not end the pairing and forget the \
+             approval: {events:?}"
+        );
+        let events = number(&mut service, 3);
+        assert!(
+            !card_up(&events),
+            "a second number was shown from one approval: {events:?}"
         );
         shut_down(service).await;
     });

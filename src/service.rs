@@ -289,8 +289,8 @@ struct Incoming {
 #[derive(Debug, Clone)]
 struct Ceremony {
     role: crate::pairing::Role,
-    /// The connection the number was compared on.
-    conn: usize,
+    /// The attempt the number was compared in.
+    attempt: u64,
     /// The number this machine arrived at.
     number: String,
     /// What a machine being added offers: the number among two others.
@@ -553,10 +553,6 @@ fn ended_notice(name: &str, why: &crate::pairing::Why, answered_adding: bool) ->
         Why::Failed(e) => {
             format!("Pairing with {name} failed ({e}), so nothing was trusted.{stranded}")
         }
-        // Not an end: `Service::pairing_ended` says nothing for it.
-        Why::Withdrawn => format!(
-            "Pairing with {name} goes on over the other connection between the two machines."
-        ),
     }
 }
 
@@ -2212,15 +2208,15 @@ impl Service {
                 role,
                 number,
                 handle,
-                conn,
-            } => self.show_pairing_number(fingerprint, addr, role, number, handle, conn),
+                attempt,
+            } => self.show_pairing_number(fingerprint, addr, role, number, handle, attempt),
             PairingEvent::PeerConfirmed { fingerprint } => self.settle_pairing(fingerprint),
             PairingEvent::Ended {
                 fingerprint,
                 why,
                 handle,
-                conn,
-            } => self.pairing_ended(fingerprint, why, handle, conn),
+                attempt,
+            } => self.pairing_ended(fingerprint, why, handle, attempt),
         }
     }
 
@@ -2233,13 +2229,12 @@ impl Service {
         role: crate::pairing::Role,
         number: String,
         handle: Option<ClientHandle>,
-        conn: usize,
+        attempt: u64,
     ) {
         use crate::pairing::Role;
         // The add dial stops once the comparison started: it has its own
-        // deadline from here. The approval stays until the pairing finishes
-        // or ends: the number can move to another connection between the two
-        // machines (#220), and it is bounded by the pairing window meanwhile.
+        // deadline from here, and a number shown never moves to another
+        // connection. The approval stays until this attempt finishes or ends.
         if let Some(h) = handle {
             self.adding.remove(&h);
         }
@@ -2288,7 +2283,7 @@ impl Service {
         }
         let ceremony = Ceremony {
             role,
-            conn,
+            attempt,
             number,
             choices,
             addr,
@@ -2375,8 +2370,12 @@ impl Service {
             self.forget_pairing(&fp);
             return;
         }
-        let at = self.ceremonies.remove(&fp).map(|c| c.addr.ip());
-        self.approved.remove(&fp);
+        let shown = self.ceremonies.remove(&fp);
+        let at = shown.as_ref().map(|c| c.addr.ip());
+        let dialled_here = shown
+            .as_ref()
+            .is_some_and(|c| c.role == crate::pairing::Role::Show);
+        let approved_at = self.approved.remove(&fp).and_then(|a| a.addr);
         self.pairings_in.settled(&fp);
         self.pairings_out.settled(&fp);
         let label = self
@@ -2388,7 +2387,29 @@ impl Service {
         log::info!("paired with {}", named(&label, &fp));
         self.persist_trust(format!("pairing with {}", named(&label, &fp)));
         self.publish_trust();
-        let unreachable = self.trust.read().expect("lock").we_may_drive(&fp)
+        let we_drive = self.trust.read().expect("lock").we_may_drive(&fp);
+        // Devices here for that machine, when the person here chose not to
+        // control it (#220): nothing can drive it from here, so dialling it
+        // again stops, and the person is told why it stays unconnected.
+        let undriven = if we_drive {
+            Vec::new()
+        } else {
+            let pinned = self.client_manager.every_pinned_to(&fp);
+            let devices = self
+                .adding
+                .keys()
+                .copied()
+                .filter(|&h| {
+                    pinned.contains(&h)
+                        || approved_at.is_some_and(|a| self.client_manager.targets(h, a))
+                })
+                .collect::<Vec<_>>();
+            for h in &devices {
+                self.adding.remove(h);
+            }
+            devices
+        };
+        let unreachable = we_drive
             && self.client_manager.every_pinned_to(&fp).is_empty()
             && !self
                 .client_manager
@@ -2408,6 +2429,12 @@ impl Service {
                  device at its address."
             )));
         }
+        if !we_drive && (dialled_here || !undriven.is_empty()) {
+            self.notify_frontend(FrontendEvent::Activity(format!(
+                "Paired with {name}, which controls this machine. This machine does not \
+                 control {name}, so the device added here for it does not connect."
+            )));
+        }
     }
 
     /// An attempt ended on its own: closed, out of time, or a peer that
@@ -2418,24 +2445,18 @@ impl Service {
         fp: String,
         why: crate::pairing::Why,
         handle: Option<ClientHandle>,
-        conn: usize,
+        attempt: u64,
     ) {
-        // An attempt on a connection other than the one whose number is on
-        // screen: the pairing goes on there.
-        if self.ceremonies.get(&fp).is_some_and(|c| c.conn != conn) {
-            log::debug!("pairing with {fp}: a connection it no longer uses ended ({why:?})");
-            return;
-        }
-        // The other machine keeps the comparison on another connection
-        // between the two: nothing ended, and the approval stays for it.
-        if why == crate::pairing::Why::Withdrawn {
-            log::info!("pairing with {fp}: the other machine compares on another connection");
-            if self.ceremonies.remove(&fp).is_some() {
-                self.notify_frontend(FrontendEvent::PairingEnded {
-                    fingerprint: fp,
-                    paired: false,
-                });
-            }
+        // An attempt other than the one whose number is on screen, one that
+        // never reached a number included: the pairing goes on there. The
+        // one on screen ending ends the pairing, however its connection
+        // closed, so one approval shows one number (#220).
+        if self
+            .ceremonies
+            .get(&fp)
+            .is_some_and(|c| c.attempt != attempt)
+        {
+            log::debug!("pairing with {fp}: an attempt not on screen ended ({why:?})");
             return;
         }
         if let Some(h) = handle {

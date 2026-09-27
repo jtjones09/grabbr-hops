@@ -28,6 +28,9 @@ use hops_ipc::{
 
 /// How long anything that must happen may take, under a loaded test run.
 const WITHIN: Duration = Duration::from_secs(30);
+/// How long number cards stay unchanged before a test reads them as a
+/// person would: longer than the one second between add dials, twice over.
+const QUIET: Duration = Duration::from_secs(3);
 
 struct Daemon {
     child: Child,
@@ -707,8 +710,14 @@ fn removing_the_machine_mid_pairing_ends_it_on_both() {
         failures
     });
 }
-/// The number card each machine shows for the other.
-type Cards = (Option<PairingCheck>, Option<PairingCheck>);
+/// The number card each machine shows for the other, and how many times
+/// each changed: shown, replaced or taken down.
+#[derive(Default)]
+struct Cards {
+    a: Option<PairingCheck>,
+    b: Option<PairingCheck>,
+    changes: (usize, usize),
+}
 
 /// The latest number card each machine shows for the other, read from both
 /// frontends at once from `cards`, the ones last seen, until one shows a
@@ -723,7 +732,7 @@ async fn complementary_cards(
     let deadline = tokio::time::Instant::now() + WITHIN;
     let mut changed = tokio::time::Instant::now();
     loop {
-        let matched = match (&cards.0, &cards.1) {
+        let matched = match (&cards.a, &cards.b) {
             (Some(PairingCheck::Show(n)), Some(PairingCheck::Pick(c))) if c.contains(n) => {
                 Some((true, n.clone()))
             }
@@ -749,8 +758,8 @@ async fn complementary_cards(
             return Err(format!(
                 "the two machines never showed matching number cards (a: {:?}, b: \
                  {:?}); a's log:\n{}\nb's log:\n{}",
-                cards.0,
-                cards.1,
+                cards.a,
+                cards.b,
                 m.adding.log(),
                 m.added.log()
             ));
@@ -771,9 +780,11 @@ async fn complementary_cards(
         if let Some(card) = card {
             changed = tokio::time::Instant::now();
             if from_a {
-                cards.0 = card;
+                cards.a = card;
+                cards.changes.0 += 1;
             } else {
-                cards.1 = card;
+                cards.b = card;
+                cards.changes.1 += 1;
             }
         }
     }
@@ -782,7 +793,9 @@ async fn complementary_cards(
 // LEDGER G-20c | class B | 5 process: number cards, PairingEnded and device state from two built daemons
 /// Both machines add each other at the same time, and each approves the
 /// dial it made: the two answers make one pairing. One number is compared,
-/// on one connection, and afterwards each machine's link to the other is up.
+/// on one connection, and it stays on both screens while the people there
+/// read it: each machine goes on dialling the other meanwhile, and nothing
+/// replaces the number. Afterwards each machine's link to the other is up.
 #[test]
 fn machines_adding_each_other_pair() {
     machines("crossed", |mut m| async move {
@@ -819,11 +832,19 @@ fn machines_adding_each_other_pair() {
         ask(&mut m.ra, approval("desk b", &m.fp_b, Controller::Both)).await;
         ask(&mut m.rb, approval("desk a", &m.fp_a, Controller::Both)).await;
         let mut cards = Cards::default();
-        let (a_shows, number) = match complementary_cards(&mut m, &mut cards, Duration::ZERO).await
-        {
+        // Read as a person would: after the add dials, one a second, had
+        // time to reach the other machine again.
+        let (a_shows, number) = match complementary_cards(&mut m, &mut cards, QUIET).await {
             Ok(found) => found,
             Err(e) => return vec![e],
         };
+        if cards.changes != (1, 1) {
+            failures.push(format!(
+                "the number cards changed while the people read them (a: {} changes, b: \
+                 {}): one number card each, shown once, is what the people compare",
+                cards.changes.0, cards.changes.1
+            ));
+        }
         // The machine picking answers first, then the one showing confirms.
         let (picker, shower, picker_peer, shower_peer) = if a_shows {
             (&mut m.rb, &mut m.ra, m.fp_a.clone(), m.fp_b.clone())
@@ -886,9 +907,9 @@ fn machines_adding_each_other_pair() {
 
 // LEDGER G-20d | class B | 5 process: number cards, PairingEnded and device state from two built daemons
 /// The machine being added adds the other one too, while their number is on
-/// screen. There are then two connections between them, and each machine
-/// keeps the same one, so the pairing still finishes, both ways, and the
-/// machine that added last takes up its link.
+/// screen. Its dial is turned away while the number is compared, so the
+/// number stays, the pairing still finishes, both ways, and the machine
+/// that added last takes up its link.
 #[test]
 fn adding_back_while_the_number_is_on_screen_still_pairs() {
     machines("takeover", |mut m| async move {
@@ -923,19 +944,26 @@ fn adding_back_while_the_number_is_on_screen_still_pairs() {
         }
         ask(&mut m.rb, approval("desk a", &m.fp_a, Controller::Both)).await;
         let mut cards = Cards::default();
-        if let Err(e) = complementary_cards(&mut m, &mut cards, Duration::ZERO).await {
-            return vec![e];
-        }
+        let first = match complementary_cards(&mut m, &mut cards, Duration::ZERO).await {
+            Ok((_, number)) => number,
+            Err(e) => return vec![e],
+        };
 
         // Now the machine being added adds the other one too.
         let on_b = add_device(&mut m.fb, &mut m.rb, m.adding.port).await;
         ask(&mut m.rb, FrontendRequest::Activate(on_b, true)).await;
         // Long enough for its add dial to reach the other machine, twice.
-        let (a_shows, number) =
-            match complementary_cards(&mut m, &mut cards, Duration::from_secs(3)).await {
-                Ok(found) => found,
-                Err(e) => return vec![e],
-            };
+        let (a_shows, number) = match complementary_cards(&mut m, &mut cards, QUIET).await {
+            Ok(found) => found,
+            Err(e) => return vec![e],
+        };
+        if number != first || cards.changes != (1, 1) {
+            failures.push(format!(
+                "adding back replaced the number on screen ({first} then {number}; a: {} \
+                 changes, b: {})",
+                cards.changes.0, cards.changes.1
+            ));
+        }
         let (picker, shower, picker_peer, shower_peer) = if a_shows {
             (&mut m.rb, &mut m.ra, m.fp_a.clone(), m.fp_b.clone())
         } else {
@@ -988,6 +1016,162 @@ fn adding_back_while_the_number_is_on_screen_still_pairs() {
                  log:\n{}",
                 m.added.log()
             ));
+        }
+        failures
+    });
+}
+
+// LEDGER G-20e | class B | 5 process: number cards, PairingEnded, notices and device state from two built daemons
+/// Two machines whose people answer that one of them controls the other,
+/// adding each other: the machine that adds first is the one controlled,
+/// and the machine in control adds it back while the number is on screen.
+/// One number pairs them. The machine in control takes up its link; the
+/// connection the controlled machine dialled carries nothing and closes, its
+/// device for the other never connects, and it says why.
+#[test]
+fn opposite_answers_link_only_the_way_control_goes() {
+    machines("opposite", |mut m| async move {
+        let mut failures: Vec<String> = Vec::new();
+        ask(&mut m.ra, FrontendRequest::OpenPairing).await;
+        ask(&mut m.rb, FrontendRequest::OpenPairing).await;
+        let on_a = add_device(&mut m.fa, &mut m.ra, m.added.port).await;
+        ask(&mut m.ra, FrontendRequest::Activate(on_a, true)).await;
+        if until(
+            &mut m.fa,
+            WITHIN,
+            attempt_from(&m.fp_b, AttemptOrigin::OutboundDial),
+        )
+        .await
+        .is_none()
+        {
+            return vec!["the adding machine's dial raised no prompt".into()];
+        }
+        ask(
+            &mut m.ra,
+            approval("desk b", &m.fp_b, Controller::ThatMachine),
+        )
+        .await;
+        if until(
+            &mut m.fb,
+            WITHIN,
+            attempt_from(&m.fp_a, AttemptOrigin::Inbound),
+        )
+        .await
+        .is_none()
+        {
+            return vec![format!(
+                "the machine being added was never asked; its log:\n{}",
+                m.added.log()
+            )];
+        }
+        ask(
+            &mut m.rb,
+            approval("desk a", &m.fp_a, Controller::ThisMachine),
+        )
+        .await;
+        let mut cards = Cards::default();
+        let first = match complementary_cards(&mut m, &mut cards, Duration::ZERO).await {
+            Ok((_, number)) => number,
+            Err(e) => return vec![e],
+        };
+        let on_b = add_device(&mut m.fb, &mut m.rb, m.adding.port).await;
+        ask(&mut m.rb, FrontendRequest::Activate(on_b, true)).await;
+        let (a_shows, number) = match complementary_cards(&mut m, &mut cards, QUIET).await {
+            Ok(found) => found,
+            Err(e) => return vec![e],
+        };
+        if !a_shows || number != first || cards.changes != (1, 1) {
+            failures.push(format!(
+                "the number the machine adding first showed did not stay ({first} then \
+                 {number}, shown there: {a_shows}; a: {} changes, b: {})",
+                cards.changes.0, cards.changes.1
+            ));
+        }
+        ask(
+            &mut m.rb,
+            FrontendRequest::ConfirmPairing {
+                fingerprint: m.fp_a.clone(),
+                number: number.clone(),
+            },
+        )
+        .await;
+        ask(
+            &mut m.ra,
+            FrontendRequest::ConfirmPairing {
+                fingerprint: m.fp_b.clone(),
+                number,
+            },
+        )
+        .await;
+        let paired = |fp: String| {
+            move |e: &FrontendEvent| match e {
+                FrontendEvent::PairingEnded {
+                    fingerprint,
+                    paired,
+                } if *fingerprint == fp => Some(*paired),
+                _ => None,
+            }
+        };
+        let b_paired = until(&mut m.fb, WITHIN, paired(m.fp_a.clone())).await;
+        // a's events are read below, whole, for its link and its notice.
+        if b_paired != Some(true) {
+            failures.push(format!(
+                "the machine in control did not pair ({b_paired:?}); its log:\n{}",
+                m.added.log()
+            ));
+            return failures;
+        }
+        let linked = until(&mut m.fb, WITHIN, |e| match e {
+            FrontendEvent::State(h, _, s) if *h == on_b && s.active_addr.is_some() => Some(()),
+            _ => None,
+        })
+        .await;
+        if linked.is_none() {
+            failures.push(format!(
+                "the machine in control never took up its link to the machine it controls; \
+                 its log:\n{}",
+                m.added.log()
+            ));
+        }
+        // Everything a says until its notice, and for a while after: its
+        // device for b must never be linked in that time.
+        let (mut a_paired, mut told, mut a_linked) = (None, false, false);
+        let mut deadline = tokio::time::Instant::now() + WITHIN;
+        while let Ok(Some(event)) = tokio::time::timeout_at(deadline, m.fa.next()).await {
+            match event {
+                Ok(FrontendEvent::PairingEnded {
+                    fingerprint,
+                    paired,
+                }) if fingerprint == m.fp_b => a_paired = Some(paired),
+                Ok(FrontendEvent::State(h, _, s)) if h == on_a && s.active_addr.is_some() => {
+                    a_linked = true;
+                }
+                Ok(FrontendEvent::Activity(text)) if !told && text.contains("does not control") => {
+                    told = true;
+                    deadline = tokio::time::Instant::now() + QUIET;
+                }
+                _ => {}
+            }
+        }
+        if a_paired != Some(true) {
+            failures.push(format!(
+                "the machine controlled did not pair ({a_paired:?}); its log:\n{}",
+                m.adding.log()
+            ));
+        }
+        if a_linked {
+            failures.push(
+                "the machine controlled took up a link to the machine that controls it: its \
+                 input could reach a machine nobody chose it to control"
+                    .into(),
+            );
+        }
+        if !told {
+            failures.push(
+                "the machine controlled never said why its device for the other does not \
+                 connect"
+                    .into(),
+            );
         }
         failures
     });

@@ -8,7 +8,7 @@
 use super::in_process::{DEADLINE, Daemon, compare_number, prompt_from, trusting, until_paired};
 use crate::test_harness::{NEVER_WITHIN, approval, dialer, machine, run_local};
 use crate::trust::{Caps, Origin};
-use hops_ipc::{Controller, FrontendRequest as R, Position};
+use hops_ipc::{Controller, FrontendEvent, FrontendRequest as R, Position};
 use hops_proto::ProtoEvent;
 use input_emulation::recording::{Recorded, Recording};
 use input_event::{Event, PointerEvent};
@@ -185,6 +185,95 @@ fn a_direction_nobody_chose_is_never_granted() {
                     "a machine paired as the one this machine controls moved this \
                      machine's pointer: it was granted a direction nobody chose"
                 );
+            })
+            .await;
+    });
+}
+
+// LEDGER E2b-3 | class B | 3 process-in-test + 1 struct state + 1 handshake outcome: AuthorizeKey over the daemon's IPC socket, a peer comparing its number over loopback QUIC and closing that connection, the daemon's store, a second dial
+/// A machine the person here approved gets one number to compare (#220).
+/// Closing the connection once the number is on screen ends the pairing
+/// and forgets the approval, whatever reason it gives, including the ones
+/// two machines adding each other use: no reason keeps the approval
+/// standing, so no machine can dial again for a second number.
+#[test]
+fn a_machine_approved_here_draws_one_number_whatever_it_says_on_closing() {
+    run_local(async {
+        let (busy, superseded) = (machine(), machine());
+        let recording = Recording::new();
+        let daemon = Daemon::start("once", "", recording.backend()).await;
+        let (ours, port, trust, ipc) = (
+            daemon.fingerprint(),
+            daemon.port(),
+            daemon.trust(),
+            daemon.ipc(),
+        );
+        daemon
+            .run_while(async {
+                let mut app = ipc.connect().await;
+                app.exchange(&[R::OpenPairing]).await;
+                for (peer, reason) in [
+                    (&busy, &b"pairing busy"[..]),
+                    (&superseded, &b"pairing superseded"[..]),
+                ] {
+                    let fp = peer.fingerprint.clone();
+                    let said = String::from_utf8_lossy(reason);
+                    prompt_from(&mut app, peer, port, &ours).await;
+                    app.exchange(&[R::AuthorizeKey {
+                        label: "desk".into(),
+                        fingerprint: fp.clone(),
+                        controller: Controller::ThatMachine,
+                        clipboard: false,
+                    }])
+                    .await;
+                    let comparing = compare_number(&mut app, peer, port, &ours).await;
+                    comparing.close(reason);
+                    // The card comes down: the attempt on screen ended.
+                    let deadline = tokio::time::Instant::now() + DEADLINE;
+                    loop {
+                        let events = app.exchange(&[]).await;
+                        if events.iter().any(|e| {
+                            matches!(e, FrontendEvent::PairingEnded { fingerprint, paired: false }
+                                if *fingerprint == fp)
+                        }) {
+                            break;
+                        }
+                        assert!(
+                            tokio::time::Instant::now() < deadline,
+                            "closing the connection as {said:?} with the number on screen \
+                             never took the card down"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    assert!(
+                        !trust.read().expect("lock").is_pairing(&fp),
+                        "a machine that closed its connection as {said:?} with its number on \
+                         screen kept the approval here, so it can dial again and draw another \
+                         number"
+                    );
+                    // Dialling again reaches no second number.
+                    crate::transport::install_crypto_provider();
+                    let mut endpoint =
+                        quinn::Endpoint::client("127.0.0.1:0".parse().expect("loopback"))
+                            .expect("an endpoint");
+                    endpoint.set_default_client_config(crate::test_harness::raw_client_config(
+                        peer,
+                        trusting(peer, &ours),
+                        1 << 20,
+                    ));
+                    let at = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+                    let again = async {
+                        let conn = endpoint.connect(at, "grabbr").ok()?.await.ok()?;
+                        crate::pair_ceremony::as_initiator(&conn, &fp, &ours)
+                            .await
+                            .ok()
+                    };
+                    let again = tokio::time::timeout(DEADLINE, again).await;
+                    assert!(
+                        !matches!(again, Ok(Some(_))),
+                        "after closing as {said:?}, a second dial compared another number"
+                    );
+                }
             })
             .await;
     });
