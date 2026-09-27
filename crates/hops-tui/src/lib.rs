@@ -135,8 +135,8 @@ enum Confirm {
         pin: Option<String>,
         destructive: bool,
     },
-    /// Turn a paired device's clipboard off. Asked first, because nothing
-    /// here turns it back on (#182, #107).
+    /// Turn a paired device's clipboard off. Asked first; `c` again turns it
+    /// back on (#182).
     ClipboardOff { label: String, fp: String },
 }
 
@@ -660,8 +660,11 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                                     notice = Some((NO_SEND_NOTE.to_string(), Instant::now()));
                                 }
                             },
-                            KeyCode::Char('c') => match clipboard_off(&model, selected) {
-                                Ok(ask) => confirm = Some(ask),
+                            KeyCode::Char('c') => match clipboard_key(&model, selected) {
+                                Ok(ClipboardKey::AskOff(ask)) => confirm = Some(ask),
+                                Ok(ClipboardKey::TurnOn(request)) => {
+                                    client.request(request);
+                                }
                                 Err(why) => notice = Some((why.to_string(), Instant::now())),
                             },
                             KeyCode::Char('d') | KeyCode::Delete => match selected {
@@ -709,9 +712,7 @@ const REVOKED_NOTE: &str =
     "This device was removed. It must pair again with a new identity — there is no way back in.";
 const NO_SEND_NOTE: &str =
     "This device only connects in to you. Add it as a device to cross to it.";
-const CLIPBOARD_OFF_NOTE: &str =
-    "The clipboard is already off for this device. It cannot be turned back on from here yet.";
-const NO_CLIPBOARD_NOTE: &str = "This device is not paired, so it has no clipboard to turn off.";
+const NO_CLIPBOARD_NOTE: &str = "This device is not paired, so it has no clipboard to switch.";
 
 /// The request a confirmation answered `y` sends, if any.
 fn confirmed(confirm: Confirm) -> Option<FrontendRequest> {
@@ -737,18 +738,30 @@ fn clipboard_of(model: &AppModel, d: &Device) -> Option<Clipboard> {
     d.fingerprint.as_deref().and_then(|fp| model.clipboard(fp))
 }
 
+/// What `c` does on a paired row: the per-device clipboard switch (#182).
+enum ClipboardKey {
+    /// Ask before turning it off.
+    AskOff(Confirm),
+    /// Turn it back on, which the daemon does in the directions the pairing
+    /// drives, and refuses while a peer drives this machine (#107).
+    TurnOn(FrontendRequest),
+}
+
 /// What `c` does on the selected row: ask before turning its clipboard off,
-/// or say why there is nothing to turn off.
-fn clipboard_off(model: &AppModel, selected: Option<&Device>) -> Result<Confirm, &'static str> {
+/// turn an off one back on, or say why there is no clipboard to switch.
+fn clipboard_key(
+    model: &AppModel,
+    selected: Option<&Device>,
+) -> Result<ClipboardKey, &'static str> {
     let Some(d) = selected else {
         return Err(NO_CLIPBOARD_NOTE);
     };
     match (d.fingerprint.clone(), clipboard_of(model, d)) {
-        (Some(fp), Some(c)) if c.is_on() => Ok(Confirm::ClipboardOff {
+        (Some(fp), Some(c)) if c.is_on() => Ok(ClipboardKey::AskOff(Confirm::ClipboardOff {
             label: d.label.clone(),
             fp,
-        }),
-        (_, Some(_)) => Err(CLIPBOARD_OFF_NOTE),
+        })),
+        (Some(fp), Some(_)) => Ok(ClipboardKey::TurnOn(FrontendRequest::EnableClipboard(fp))),
         _ => Err(NO_CLIPBOARD_NOTE),
     }
 }
@@ -1320,12 +1333,7 @@ fn footer_line(
     }
     if let Some(Confirm::ClipboardOff { label, .. }) = confirm {
         return Line::from(vec![
-            Span::styled(
-                format!(
-                    "turn the clipboard off for {label}? it cannot be turned back on here yet — "
-                ),
-                warn,
-            ),
+            Span::styled(format!("turn the clipboard off for {label}? "), warn),
             Span::styled("y", key),
             Span::raw(" yes  "),
             Span::styled("n", key),
@@ -1355,9 +1363,13 @@ fn footer_line(
                     spans.push(Span::raw(label));
                 }
             }
-            if clipboard.is_some_and(Clipboard::is_on) {
+            if let Some(c) = clipboard {
                 spans.push(Span::styled("c", key));
-                spans.push(Span::raw(" clipboard off  "));
+                spans.push(Span::raw(if c.is_on() {
+                    " clipboard off  "
+                } else {
+                    " clipboard on  "
+                }));
             }
             spans.push(Span::styled("d", key));
             spans.push(Span::raw(" remove  "));
@@ -2454,12 +2466,13 @@ mod tests {
         assert!(out.contains("@?"), "unknown build must be explicit:\n{out}");
     }
     /// Each paired row says whether its clipboard is on, off included, and
-    /// `c` asks before sending the one request that turns it off. With it off,
-    /// `c` says so and asks nothing, and the keymap offers nothing: this
-    /// frontend cannot turn it back on (#182, #107).
-    // LEDGER E2A-10 | class B | 3 render + 1 return value: ui() into a TestBackend, clipboard_off, confirmed
+    /// `c` is its switch: on a row whose clipboard is on it asks before
+    /// sending the one request that turns it off, and on a row whose
+    /// clipboard is off it sends the one request that turns it back on, and
+    /// the keymap says which (#182).
+    // LEDGER E2A-10 | class B | 3 render + 2 return value: ui() into a TestBackend, clipboard_key, confirmed
     #[test]
-    fn the_clipboard_switch_turns_it_off_and_shows_it_off() {
+    fn the_clipboard_switch_turns_it_off_and_back_on() {
         use hops_frontend_core::{FrontendEvent, PeerTrust};
         const LAPTOP: &str = "2e:29:2b:3c:4d:5e:6f:70:81:92:a3:b4:c5:d6:e7:f8";
         let mut model = AppModel::default();
@@ -2510,8 +2523,13 @@ mod tests {
             on.contains("c clipboard off"),
             "the keymap does not offer to turn the clipboard off:\n{on}"
         );
-        let ask = clipboard_off(&model, devices.get(at("desk mac")))
-            .unwrap_or_else(|why| panic!("c asked nothing: {why}"));
+        let ask = match clipboard_key(&model, devices.get(at("desk mac"))) {
+            Ok(ClipboardKey::AskOff(ask)) => ask,
+            Ok(ClipboardKey::TurnOn(request)) => {
+                panic!("c on a clipboard that is on sent {request:?}")
+            }
+            Err(why) => panic!("c asked nothing: {why}"),
+        };
         let theme = theme::default_theme();
         let mut state = ListState::default();
         state.select(Some(at("desk mac")));
@@ -2541,10 +2559,12 @@ mod tests {
             })
             .collect();
         assert!(
-            asking.contains(
-                "turn the clipboard off for desk mac? it cannot be turned back on here yet"
-            ),
+            asking.contains("turn the clipboard off for desk mac? y yes"),
             "the question does not say what y does:\n{asking}"
+        );
+        assert!(
+            !asking.contains("cannot be turned back on"),
+            "the question still says the clipboard cannot be turned back on:\n{asking}"
         );
         assert_eq!(
             confirmed(ask),
@@ -2554,15 +2574,16 @@ mod tests {
 
         let off = screen(&model, at("laptop"));
         assert!(
-            !off.contains("c clipboard"),
-            "the keymap offers a clipboard key for a device whose clipboard is off:\n{off}"
+            off.contains("c clipboard on"),
+            "the keymap does not offer to turn an off clipboard back on:\n{off}"
         );
         assert!(
             matches!(
-                clipboard_off(&model, devices.get(at("laptop"))),
-                Err(CLIPBOARD_OFF_NOTE)
+                clipboard_key(&model, devices.get(at("laptop"))),
+                Ok(ClipboardKey::TurnOn(FrontendRequest::EnableClipboard(fp))) if fp == LAPTOP
             ),
-            "c on a device whose clipboard is off must say so and ask nothing"
+            "c on a device whose clipboard is off must send the request that turns \
+             that device's clipboard back on"
         );
     }
 

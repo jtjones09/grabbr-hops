@@ -32,6 +32,8 @@ use std::{
 use thiserror::Error;
 use tokio::{process::Command, sync::Notify};
 
+mod pending;
+
 #[derive(Debug, Error)]
 pub enum ServiceError {
     #[error(transparent)]
@@ -178,21 +180,14 @@ pub struct Service {
     /// Sealed persistence for the store above, and whether a change is still
     /// waiting to reach it.
     trust_saver: crate::trust_save::TrustSaver,
-    /// The prompt each fingerprint is currently waiting on: its provenance,
-    /// where it came from, and when it was admitted.
-    ///
-    /// A grant has to be shaped by HOW the peer arrived: an unsolicited knock
-    /// asks "may this machine drive mine", our own dial asks "may I drive that
-    /// machine". They are different questions and they were being answered with
-    /// the same capability, so confirming a receiver handed it control of this
-    /// machine — the exact harm the direction split exists to remove.
-    ///
-    /// Also what a frontend that attaches later is shown (#114).
-    ///
-    /// Bounded, because anyone on the network can cause an entry.
-    pending_attempts: HashMap<String, PendingAttempt>,
+    /// The pairing prompts raised and not yet answered.
+    pending_attempts: pending::PendingAttempts,
     /// Whether a pairing prompt may appear right now (#195).
     prompt_gate: crate::prompt_gate::PromptGate,
+    /// How far a test has moved the clock the pairing window is timed by, so
+    /// it can let a window close without waiting for it.
+    #[cfg(test)]
+    pairing_skew: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Devices switched on while the pairing window was open and not yet
     /// paired, dialled every second until they connect, with when that began.
     /// Without it a new device is only dialled when the pointer crosses to it.
@@ -270,36 +265,6 @@ struct Incoming {
     addr: SocketAddr,
     pos: Position,
 }
-
-/// A prompt raised and not yet answered.
-#[derive(Debug, Clone, Copy)]
-struct PendingAttempt {
-    origin: AttemptOrigin,
-    addr: Option<SocketAddr>,
-    admitted: Instant,
-}
-
-/// The held prompts a frontend attaching at `now` is shown (#114): those the
-/// gate would still allow on screen, less any from a removed device.
-fn attempts_to_replay(
-    pending: &HashMap<String, PendingAttempt>,
-    gate: &crate::prompt_gate::PromptGate,
-    removed: impl Fn(&str) -> bool,
-    now: Instant,
-) -> Vec<(String, PendingAttempt)> {
-    pending
-        .iter()
-        .filter(|(fp, a)| gate.replayable(a.admitted, now) && !removed(fp))
-        .map(|(fp, a)| (fp.clone(), *a))
-        .collect()
-}
-
-/// How many unanswered prompts are remembered at once.
-///
-/// Anyone on the network can add one by dialling with a certificate we do not
-/// recognise while add device is open. Well past any real fleet, small enough
-/// that a flood costs nothing.
-const MAX_PENDING_ATTEMPTS: usize = 32;
 
 /// When each device last had a refusal notice of each kind.
 ///
@@ -618,8 +583,10 @@ impl Service {
             discovered: Default::default(),
             trust,
             trust_saver: crate::trust_save::TrustSaver::new(trust_file),
-            pending_attempts: HashMap::new(),
+            pending_attempts: Default::default(),
             prompt_gate: crate::prompt_gate::PromptGate::new(),
+            #[cfg(test)]
+            pairing_skew: Default::default(),
             adding: HashMap::new(),
             public_key_fingerprint,
             client_manager,
@@ -818,7 +785,7 @@ impl Service {
                 self.save_config();
             }
             FrontendRequest::AuthorizeKey(desc, fp) => {
-                if self.refuse_while_remotely_driven("grant trust") {
+                if self.refuse_while_remotely_driven(hops_ipc::GRANT_REFUSED, "grant trust") {
                     return;
                 }
                 self.add_authorized_key(desc, fp);
@@ -922,7 +889,7 @@ impl Service {
             // Queued behind everything the requests before it caused.
             FrontendRequest::Barrier(n) => self.notify_frontend(FrontendEvent::Barrier(n)),
             FrontendRequest::OpenPairing => {
-                self.prompt_gate.open(Instant::now());
+                self.prompt_gate.open(self.pairing_now());
                 log::info!(
                     "add device opened: pairing requests may prompt for the next {} s",
                     crate::prompt_gate::PromptGate::WINDOW.as_secs()
@@ -933,14 +900,39 @@ impl Service {
             // takes permission away, and a peer driving this machine gains
             // nothing by clicking it.
             FrontendRequest::DisableClipboard(fp) => self.disable_clipboard(fp),
+            // Behind it, like a grant: it widens a pairing, and a peer driving
+            // this machine could click it for itself.
+            FrontendRequest::EnableClipboard(fp) => {
+                // Not said as a refused grant: `hops cli authorize-key` reads
+                // any notice that begins that way as its own grant refused.
+                if self.refuse_while_remotely_driven(
+                    "The clipboard is still off",
+                    "turn the clipboard on",
+                ) {
+                    return;
+                }
+                self.enable_clipboard(fp);
+            }
         }
+    }
+
+    /// The time the pairing window is measured against: the monotonic clock,
+    /// moved on by a test that lets a window close without waiting for it.
+    fn pairing_now(&self) -> Instant {
+        let now = Instant::now();
+        #[cfg(test)]
+        let now = now
+            + std::time::Duration::from_millis(
+                self.pairing_skew.load(std::sync::atomic::Ordering::Relaxed),
+            );
+        now
     }
 
     /// Tell every frontend how long pairing prompts may still appear here.
     fn publish_pairing_window(&mut self) {
         let seconds = self
             .prompt_gate
-            .remaining(Instant::now())
+            .remaining(self.pairing_now())
             .map_or(0, |left| left.as_secs().max(1) as u32);
         self.notify_frontend(FrontendEvent::PairingOpen { seconds });
     }
@@ -1483,8 +1475,10 @@ impl Service {
             )));
             return;
         }
-        // Shaped by how the peer arrived; see `grant_for_attempt`.
-        let origin = self.pending_attempts.remove(&fp).map(|a| a.origin);
+        // Shaped by how the peer arrived; see `grant_for_attempt`. A prompt
+        // whose pairing window has closed grants nothing.
+        let now = self.pairing_now();
+        let origin = self.pending_attempts.take(&self.prompt_gate, &fp, now);
         // The lock is taken on one line on purpose: the named-door guard scans
         // for that call, and a chain split across lines drops this door out of
         // its match set without failing anything.
@@ -1500,7 +1494,9 @@ impl Service {
             // the command tells one from any other notice.
             let why = match e {
                 GrantRefused::NoAttempt => "no pairing request from that device is waiting. \
-                     Open add device, connect from that device, then approve it."
+                     A request can be approved only until the pairing window that \
+                     admitted it closes. Open add device, connect from that device, \
+                     then approve it."
                     .to_string(),
                 GrantRefused::Store(e) => e.to_string(),
             };
@@ -1631,7 +1627,8 @@ impl Service {
             .unwrap_or_else(|| format!("device {handle}"))
     }
 
-    /// Refuse a trust GRANT while a peer is driving this machine's input.
+    /// Refuse a request that WIDENS trust, a grant or turning a clipboard on,
+    /// while a peer is driving this machine's input (#107).
     ///
     /// On a KVM the pointer is not proof of local presence: a peer that still
     /// holds control can move the cursor onto an approval button and click it,
@@ -1643,16 +1640,17 @@ impl Service {
     /// Deliberately NOT applied to revocation: refusing to let you revoke while a
     /// peer is driving you would block the one action you most need in exactly
     /// the moment you need it.
-    fn refuse_while_remotely_driven(&mut self, what: &str) -> bool {
+    ///
+    /// The notice begins with `refused`, which says what did not happen.
+    fn refuse_while_remotely_driven(&mut self, refused: &str, what: &str) -> bool {
         const QUIET: std::time::Duration = std::time::Duration::from_secs(2);
         if !self.emulation.remotely_driven_within(QUIET) {
             return false;
         }
         log::warn!("refusing to {what} — this machine is being driven by a peer right now");
         self.notify_frontend(FrontendEvent::Error(format!(
-            "{}: this machine is being controlled remotely, so it refused to \
-             {what}. Use its own keyboard and mouse, then try again.",
-            hops_ipc::GRANT_REFUSED
+            "{refused}: this machine is being controlled remotely, so it refused to \
+             {what}. Use its own keyboard and mouse, then try again."
         )));
         true
     }
@@ -1684,7 +1682,7 @@ impl Service {
             );
             return;
         }
-        let now = Instant::now();
+        let now = self.pairing_now();
         // Only a knock is counted against its address: this machine's own dial
         // is timed by the person here, not by whoever answers it.
         let from = addr
@@ -1748,8 +1746,9 @@ impl Service {
                         String::new()
                     };
                     log::info!(
-                        "pairing request from {from}, fingerprint {fingerprint}: approve it \
-                         in the app, or run `hops cli authorize-key <name> {fingerprint}`{more}"
+                        "pairing request from {from}, fingerprint {fingerprint}: before the \
+                         pairing window closes, approve it in the app or run \
+                         `hops cli authorize-key <name> {fingerprint}`{more}"
                     );
                 }
             }
@@ -1757,17 +1756,8 @@ impl Service {
         // Remembered so the grant door mints the capability that matches how
         // this peer actually arrived, rather than a fixed one, and so a frontend
         // that attaches later is shown it.
-        if self.pending_attempts.len() >= MAX_PENDING_ATTEMPTS {
-            self.pending_attempts.clear();
-        }
-        self.pending_attempts.insert(
-            fingerprint.clone(),
-            PendingAttempt {
-                origin,
-                addr,
-                admitted: now,
-            },
-        );
+        self.pending_attempts
+            .hold(&self.prompt_gate, fingerprint.clone(), origin, addr, now);
         self.notify_frontend(FrontendEvent::ConnectionAttempt {
             fingerprint,
             origin,
@@ -1782,14 +1772,11 @@ impl Service {
     /// prompts the gate admitted are held, and only those it would still allow
     /// on screen now are shown again.
     fn replay_pending_attempts(&mut self) {
+        let now = self.pairing_now();
         let replay = {
             let trust = self.trust.read().expect("lock");
-            attempts_to_replay(
-                &self.pending_attempts,
-                &self.prompt_gate,
-                |fp| trust.denial(fp).is_some(),
-                Instant::now(),
-            )
+            self.pending_attempts
+                .replay(&self.prompt_gate, |fp| trust.denial(fp).is_some(), now)
         };
         for (fingerprint, attempt) in replay {
             self.notify_frontend(FrontendEvent::ConnectionAttempt {
@@ -1971,6 +1958,46 @@ impl Service {
         self.publish_trust();
     }
 
+    /// Turn a pairing's clipboard back on (#182), in the directions the
+    /// pairing drives and no others. Saved and published as the off arm is.
+    /// The caller has already refused it while a peer drives this machine.
+    fn enable_clipboard(&mut self, fp: String) {
+        let Some(fp) = hops_ipc::pairing::canonical_fingerprint(&fp) else {
+            log::warn!("refusing to turn the clipboard on for {fp:?}: not a fingerprint");
+            return;
+        };
+        // The lock is taken on one line on purpose: the named-door guard scans
+        // for that call.
+        let changed = self.trust.write().expect("lock").enable_clipboard(&fp);
+        match changed {
+            None => {
+                log::warn!("not turning the clipboard on for {fp}: it is not a paired device");
+                self.notify_frontend(FrontendEvent::Error(
+                    "That device is not paired, so it has no clipboard to turn on.".to_string(),
+                ));
+                return;
+            }
+            // Already on: nothing to save, and every app already shows it.
+            Some(false) => {
+                log::debug!("the clipboard for {fp} is already on");
+                return;
+            }
+            Some(true) => {}
+        }
+        let label = self
+            .trust
+            .read()
+            .expect("lock")
+            .label(&fp)
+            .unwrap_or_default();
+        log::info!("clipboard on for {}", named(&label, &fp));
+        self.persist_trust(format!(
+            "turning the clipboard on for {}",
+            named(&label, &fp)
+        ));
+        self.publish_trust();
+    }
+
     /// Tell every frontend what the trust store now grants: who may drive
     /// this machine (derived from live leases only, or a frontend would claim
     /// a machine can drive you when its lease has lapsed), who was removed,
@@ -2112,7 +2139,8 @@ impl Service {
     /// crossing also activate clients, and none of them is someone adding a
     /// device.
     fn begin_adding(&mut self, handle: ClientHandle) {
-        if self.prompt_gate.remaining(Instant::now()).is_none() {
+        let now = self.pairing_now();
+        if self.prompt_gate.remaining(now).is_none() {
             return;
         }
         let paired = self
@@ -2123,7 +2151,7 @@ impl Service {
             return;
         }
         log::info!("dialling client {handle} every second while it is paired");
-        self.adding.insert(handle, Instant::now());
+        self.adding.insert(handle, now);
         self.capture.dial(handle);
     }
 
@@ -2131,7 +2159,7 @@ impl Service {
     /// for one switched off or removed, one that reached a machine another
     /// device already dials, or one out of time; the last two say why.
     fn retry_adding(&mut self) {
-        let now = Instant::now();
+        let now = self.pairing_now();
         let window_open = self.prompt_gate.remaining(now).is_some();
         let mut gave_up = Vec::new();
         let mut added_before = Vec::new();
@@ -2729,6 +2757,7 @@ mod one_trust_write_site {
         "fn handle_config_change",  // reload: the config file is a door too
         "fn new",                   // startup load
         "fn disable_clipboard",     // narrows one lease's clipboard, never widens
+        "fn enable_clipboard",      // widens one lease's clipboard to its drive bits
     ];
 
     #[test]
@@ -3166,70 +3195,101 @@ mod a_refused_crossing;
 #[cfg(all(test, unix))]
 mod refusals_and_bounds;
 
-#[cfg(test)]
-mod replay_on_attach {
-    //! A frontend that attaches late is shown the prompts it missed, but only
-    //! those the pairing window still allows (#114, #195).
-    use super::{AttemptOrigin, PendingAttempt, attempts_to_replay};
+/// The whole daemon in this process, for a test that drives it the way a
+/// frontend and a peer do.
+#[cfg(all(test, unix))]
+pub(crate) mod in_process;
+
+#[cfg(all(test, unix))]
+mod the_app_cannot_approve_a_prompt_after_its_window_closed {
+    //! The approval the app sends is honoured only while the pairing window
+    //! that admitted the prompt is still open (#107). The grant door used to
+    //! take any held prompt, so one kept past its window could be approved
+    //! at any later moment by anything holding the IPC token.
+    use super::in_process::{Daemon, prompt_from};
     use crate::prompt_gate::PromptGate;
-    use std::collections::HashMap;
-    use std::time::{Duration, Instant};
+    use crate::test_harness::{machine, run_local};
+    use crate::trust::Caps;
+    use hops_ipc::{FrontendEvent, FrontendRequest};
+    use input_emulation::recording::Recording;
 
-    const S: Duration = Duration::from_secs(1);
-
-    fn held(admitted: Instant) -> PendingAttempt {
-        PendingAttempt {
-            origin: AttemptOrigin::Inbound,
-            addr: None,
-            admitted,
-        }
+    fn refusals(events: &[FrontendEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                FrontendEvent::Error(text) if text.starts_with(hops_ipc::GRANT_REFUSED) => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect()
     }
 
-    fn replayed(
-        pending: &HashMap<String, PendingAttempt>,
-        gate: &PromptGate,
-        removed: &str,
-        now: Instant,
-    ) -> Vec<String> {
-        let mut fps: Vec<String> = attempts_to_replay(pending, gate, |fp| fp == removed, now)
-            .into_iter()
-            .map(|(fp, _)| fp)
-            .collect();
-        fps.sort();
-        fps
-    }
-
-    // LEDGER T13 | class B | 1 return value: attempts_to_replay
+    // LEDGER EN-4 | class B | 3 process-in-test + 1 struct state: AuthorizeKey over the daemon's IPC socket, peers knocking over loopback QUIC, the daemon's trust store
     #[test]
-    fn only_prompts_the_window_still_allows_are_replayed() {
-        let t0 = Instant::now();
-        let mut gate = PromptGate::new();
-        gate.open(t0);
-        let pending = HashMap::from([
-            ("aa".to_string(), held(t0 + S)),
-            ("dd".to_string(), held(t0 + S)),
-        ]);
-        assert_eq!(
-            replayed(&pending, &gate, "dd", t0 + 30 * S),
-            vec!["aa".to_string()],
-            "half a minute into the window, the live request must be replayed and \
-             the removed device's must not"
-        );
-        assert_eq!(
-            replayed(&pending, &gate, "dd", t0 + PromptGate::WINDOW + 5 * S),
-            Vec::<String>::new(),
-            "a request was replayed after the pairing window closed"
-        );
-        gate.open(t0 + 130 * S);
-        let pending = HashMap::from([
-            ("xx".to_string(), held(t0 + 100 * S)),
-            ("yy".to_string(), held(t0 + 131 * S)),
-        ]);
-        assert_eq!(
-            replayed(&pending, &gate, "dd", t0 + 135 * S),
-            vec!["yy".to_string()],
-            "add device reopened for one machine replayed another machine's \
-             request from the window before"
-        );
+    fn approving_a_prompt_after_its_pairing_window_closed_pairs_nothing() {
+        run_local(async {
+            let (early, late) = (machine(), machine());
+            let recording = Recording::new();
+            let daemon = Daemon::start("expire", "", recording.backend()).await;
+            let (ours, port, trust, ipc, clock) = (
+                daemon.fingerprint(),
+                daemon.port(),
+                daemon.trust(),
+                daemon.ipc(),
+                daemon.pairing_clock(),
+            );
+            let (early_fp, late_fp) = (early.fingerprint.clone(), late.fingerprint.clone());
+            daemon
+                .run_while(async {
+                    use FrontendRequest as R;
+                    let mut app = ipc.connect().await;
+                    app.exchange(&[R::OpenPairing]).await;
+                    prompt_from(&mut app, &early, port, &ours).await;
+                    prompt_from(&mut app, &late, port, &ours).await;
+
+                    // Inside the window, on the moved clock: approved.
+                    clock.advance(PromptGate::WINDOW / 2);
+                    app.exchange(&[R::AuthorizeKey("early".to_owned(), early_fp.clone())])
+                        .await;
+                    assert_eq!(
+                        trust
+                            .read()
+                            .expect("lock")
+                            .pairings()
+                            .into_iter()
+                            .find(|(fp, _)| *fp == early_fp)
+                            .map(|(_, caps)| caps),
+                        Some(Caps::INBOUND),
+                        "approving a prompt while its pairing window was open did not \
+                         pair the machine that knocked"
+                    );
+
+                    // Past it: refused. Opening add device again is left to
+                    // the unit test in `pending`: here a ping still in flight
+                    // from the knock would be a new request in the new window,
+                    // which may rightly be approved.
+                    clock.advance(PromptGate::WINDOW);
+                    let events = app
+                        .exchange(&[R::AuthorizeKey("late".to_owned(), late_fp.clone())])
+                        .await;
+                    assert!(
+                        !trust.read().expect("lock").is_known(&late_fp),
+                        "a prompt was approved after the pairing window that admitted \
+                         it had closed. The window is what makes a prompt answerable: \
+                         one kept past it can be approved at any later moment by \
+                         anything that can send the approval."
+                    );
+                    let refused = refusals(&events);
+                    assert!(
+                        refused.len() == 1
+                            && refused[0].contains("no pairing request")
+                            && refused[0].contains("pairing window"),
+                        "an approval after the window closed must be refused, saying no \
+                         request is waiting and why; the app was told {refused:?}"
+                    );
+                })
+                .await;
+        });
     }
 }

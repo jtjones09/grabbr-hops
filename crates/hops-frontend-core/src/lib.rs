@@ -667,7 +667,8 @@ impl PairingCard {
 /// This machine's clipboard with one paired device (#182).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Clipboard {
-    /// Neither way. There is no way to turn it on from a frontend yet.
+    /// Neither way. `EnableClipboard` turns it back on, in the directions
+    /// the pairing drives.
     Off,
     /// That device's clipboard arrives here, and nothing goes back.
     FromIt,
@@ -678,7 +679,8 @@ pub enum Clipboard {
 }
 
 impl Clipboard {
-    /// A direction is on, so the off switch has something to turn off.
+    /// A direction is on, so the switch offers to turn it off; otherwise it
+    /// offers to turn it back on.
     pub fn is_on(self) -> bool {
         self != Clipboard::Off
     }
@@ -869,7 +871,7 @@ fn display_label(hostname: Option<&str>, description: Option<&str>, fp: &str) ->
 impl AppModel {
     /// The clipboard with the paired device whose fingerprint is `fp`, or
     /// `None` when no pairing holds one, so there is nothing to show or to
-    /// switch off.
+    /// switch.
     pub fn clipboard(&self, fp: &str) -> Option<Clipboard> {
         self.trust
             .get(fp)

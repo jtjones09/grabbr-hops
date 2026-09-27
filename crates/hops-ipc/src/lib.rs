@@ -1,3 +1,30 @@
+//! The channel between the hops daemon and its frontends.
+//!
+//! # What a frontend can do to trust: a stated limit (#107)
+//!
+//! Reaching this channel takes the token beside `config.toml` ([`token`]),
+//! so any program running as the user who owns that file can send what a
+//! frontend sends. Two requests widen what a paired machine may do, and
+//! nothing else a frontend sends does:
+//!
+//! * [`FrontendRequest::AuthorizeKey`] approves a pairing prompt the daemon
+//!   raised: a machine that connected while add device was open, or one the
+//!   daemon dialled then. The grant is shaped by how that machine arrived,
+//!   and with no prompt waiting it grants nothing. A prompt is forgotten when
+//!   the pairing window closes.
+//! * [`FrontendRequest::EnableClipboard`] turns a paired machine's clipboard
+//!   back on, in the directions that pairing already drives.
+//!
+//! The daemon refuses both while a peer is driving this machine, so the
+//! machine holding the keyboard and pointer cannot click its own approval.
+//! That is the whole of the check, and it is a limit rather than a defence:
+//! a program running as the user, holding the token, can approve a pending
+//! prompt or turn a clipboard on whenever no peer is driving, and since it
+//! can also open add device and add a device to dial, it can pair a machine
+//! of its choosing. Such a program could equally re-sign the trust store on
+//! disk. A peer driving this machine can start such a program, which acts
+//! once the peer stops sending input.
+
 use std::{
     collections::{HashMap, HashSet},
     env::VarError,
@@ -568,7 +595,11 @@ pub enum FrontendRequest {
     EnableEmulation,
     /// synchronize all state
     Sync,
-    /// authorize fingerprint (description, fingerprint)
+    /// Approve the pairing prompt the daemon raised for this fingerprint:
+    /// (description, fingerprint). What it grants is shaped by how that
+    /// machine arrived, never by this request, and with no prompt waiting it
+    /// grants nothing. Refused while a peer drives this machine. One of the
+    /// two requests that widen trust; see the crate docs.
     AuthorizeKey(String, String),
     /// remove fingerprint (fingerprint)
     RemoveAuthorizedKey(String),
@@ -599,9 +630,19 @@ pub enum FrontendRequest {
     /// stays off across restarts and when the other direction is approved.
     ///
     /// Only takes permission away, so, like removal, it is honoured while a
-    /// peer drives this machine. There is deliberately no request that turns
-    /// it back on: widening a pairing is not a frontend verb (#107).
+    /// peer drives this machine. [`FrontendRequest::EnableClipboard`] turns
+    /// it back on.
     DisableClipboard(String),
+    /// Turn the clipboard back on for the paired machine with this
+    /// fingerprint: the on arm of the per-device switch (#182). Only in the
+    /// directions the pairing drives: that machine's clipboard arrives here
+    /// if it may drive this one, and this machine's goes there if this one
+    /// may drive it. Saved, like `DisableClipboard`. Never grants or changes
+    /// a direction to drive.
+    ///
+    /// Widens a pairing, so, like `AuthorizeKey`, it is refused while a peer
+    /// drives this machine. See the crate docs for the limit that states.
+    EnableClipboard(String),
     /// Answered with [`FrontendEvent::Barrier`] carrying the same number once
     /// every request sent before it on this connection has been handled.
     ///
