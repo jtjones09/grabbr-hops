@@ -120,20 +120,29 @@ pub fn load_or_create_at(path: &std::path::Path) -> io::Result<String> {
     Ok(token)
 }
 
-/// The file at `path`, read again for a moment while it does not hold a
-/// token: another process that has just created it may not have written it
-/// yet, and taking the empty file for a mangled one would replace the token
-/// that process is about to use.
+/// How long a token file that holds nothing yet, or the start of a token,
+/// is read again before it counts as mangled.
+const MINT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The file at `path`, read again while it holds nothing yet or the start
+/// of a token, for up to [`MINT_GRACE`]: another process that has just
+/// created it may not have written it yet, however long the system keeps it
+/// from running, and taking the empty file for a mangled one would replace
+/// the token that process is about to use. Anything else is read once.
 fn read_settled(path: &std::path::Path) -> io::Result<String> {
+    let deadline = std::time::Instant::now() + MINT_GRACE;
     let mut text = read_at(path)?;
-    for _ in 0..20 {
-        if well_formed(&text).is_some() {
-            break;
-        }
+    while being_written(&text) && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(5));
         text = read_at(path)?;
     }
     Ok(text)
+}
+
+/// Whether `text` is what a token file holds part-way through being
+/// written: nothing, or fewer hex digits than a token has.
+fn being_written(text: &str) -> bool {
+    text.len() < TOKEN_CHARS && text.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// The token in `text`, if it is one.
@@ -343,6 +352,39 @@ mod minted_once {
             disagreed.is_empty(),
             "minters racing for a missing token came away holding tokens other \
              than the one on disk: {disagreed:?}"
+        );
+    }
+
+    /// A minter that has created the file and is kept from writing it for a
+    /// while, as a loaded system may do, still has its token used: taken for
+    /// a mangled one, the empty file was replaced, and the two processes held
+    /// two tokens.
+    // LEDGER T9629 | class B | 1 return value of token::load_or_create_at + 4 file on disk
+    #[test]
+    fn a_token_file_not_yet_written_is_waited_for() {
+        const THEIRS: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let dir = std::env::temp_dir().join(format!("hops-token-slow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let path = dir.join("ipc-token");
+        // Created, as `create_new` leaves it, and not yet written.
+        std::fs::File::create(&path).expect("the other minter's empty file");
+        let writing = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                std::fs::write(&path, THEIRS).expect("the other minter writes");
+            })
+        };
+        let held = load_or_create_at(&path).map_err(|e| e.to_string());
+        writing.join().expect("the other minter");
+        let on_disk = std::fs::read_to_string(&path).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            (held.as_deref(), on_disk.as_str()),
+            (Ok(THEIRS), THEIRS),
+            "(the token this process holds, the token on disk). A file another \
+             minter had created and not yet written was replaced."
         );
     }
 }
