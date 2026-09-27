@@ -13,8 +13,9 @@
 //! (see [`machines`]).
 #![cfg(unix)]
 
+mod common;
+
 use std::future::Future;
-use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
@@ -58,16 +59,7 @@ impl Daemon {
         spawn(&self.dir, &self.config, &self.log)
     }
 
-    fn wait_until_running(&self) {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while !self.log().contains("service running; stops on") {
-            assert!(
-                Instant::now() < deadline,
-                "the daemon never reported its service loop running; log:\n{}",
-                self.log()
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
+    fn drain_the_watcher(&self) {
         // Let the config watcher drain what starting wrote (see tests/common).
         std::thread::sleep(Duration::from_secs(1));
     }
@@ -79,7 +71,13 @@ impl Daemon {
         self.starts += 1;
         self.log = self.dir.join(format!("daemon.{}.log", self.starts));
         self.child = self.spawn();
-        self.wait_until_running();
+        if common::wait_until_running(&mut self.child, &self.log).is_err() {
+            panic!(
+                "the daemon's port was taken while it restarted; log:\n{}",
+                self.log()
+            );
+        }
+        self.drain_the_watcher();
     }
 
     async fn attach(&self) -> (AsyncFrontendEventReader, AsyncFrontendRequestWriter) {
@@ -124,18 +122,7 @@ fn shared_config(dir: &Path) -> PathBuf {
 fn start(base: &Path, name: &str) -> Daemon {
     let dir = base.join(name);
     std::fs::create_dir_all(dir.join("Library/Caches")).expect("scratch caches");
-    let port = UdpSocket::bind("127.0.0.1:0")
-        .and_then(|s| s.local_addr())
-        .expect("a free port")
-        .port();
     let config = dir.join("config.toml");
-    std::fs::write(
-        &config,
-        format!(
-            "port = {port}\ncapture_backend = \"dummy\"\nemulation_backend = \"dummy\"\ndiscovery = false\n"
-        ),
-    )
-    .expect("a config");
     // SAFETY: the tests in this binary take turns (see `machines`), and
     // nothing else reads the environment meanwhile.
     let endpoint = unsafe {
@@ -144,8 +131,18 @@ fn start(base: &Path, name: &str) -> Daemon {
         DaemonEndpoint::of_this_platform().expect("an endpoint")
     };
     let log = dir.join("daemon.log");
+    let (child, port) = common::launch(
+        &config,
+        |port| {
+            format!(
+                "port = {port}\ncapture_backend = \"dummy\"\nemulation_backend = \"dummy\"\ndiscovery = false\n"
+            )
+        },
+        &log,
+        || spawn(&dir, &config, &log),
+    );
     let daemon = Daemon {
-        child: spawn(&dir, &config, &log),
+        child,
         log,
         dir,
         config,
@@ -153,7 +150,7 @@ fn start(base: &Path, name: &str) -> Daemon {
         endpoint,
         starts: 0,
     };
-    daemon.wait_until_running();
+    daemon.drain_the_watcher();
     daemon
 }
 

@@ -11,10 +11,12 @@
 //! macOS while the config watcher's queue is full, which is a separate defect.
 #![cfg(unix)]
 
+mod common;
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures::StreamExt;
 use hops_ipc::{AsyncFrontendEventReader, FrontendEvent, FrontendRequest};
@@ -78,47 +80,37 @@ fn scratch() -> Scratch {
 
 fn start(s: &Scratch) -> Daemon {
     let config = s.config_dir.join("config.toml");
-    let port = std::net::UdpSocket::bind("127.0.0.1:0")
-        .and_then(|s| s.local_addr())
-        .expect("a free port")
-        .port();
-    std::fs::write(
-        &config,
-        format!(
-            "port = {port}\ncapture_backend = \"dummy\"\nemulation_backend = \"dummy\"\ndiscovery = false\n"
-        ),
-    )
-    .expect("a config");
     let log = s.dir.join("daemon.log");
-    let child = Command::new(env!("CARGO_BIN_EXE_hops"))
-        .arg("--config")
-        .arg(&config)
-        .arg("--cert-path")
-        .arg(s.config_dir.join("lan-mouse.pem"))
-        .arg("daemon")
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", &s.dir)
-        .env("XDG_RUNTIME_DIR", &s.dir)
-        .env("XDG_CONFIG_HOME", s.dir.join(".config"))
-        .env("XDG_STATE_HOME", &s.dir)
-        .env("HOPS_LOG_FILE", &log)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("the hops binary starts");
-    let daemon = Daemon { child, log };
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while !daemon.log().contains("service running; stops on") {
-        assert!(
-            Instant::now() < deadline,
-            "the daemon never reported its service loop running; log:\n{}",
-            daemon.log()
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    daemon
+    let (child, _) = common::launch(
+        &config,
+        |port| {
+            format!(
+                "port = {port}\ncapture_backend = \"dummy\"\nemulation_backend = \"dummy\"\ndiscovery = false\n"
+            )
+        },
+        &log,
+        || {
+            Command::new(env!("CARGO_BIN_EXE_hops"))
+                .arg("--config")
+                .arg(&config)
+                .arg("--cert-path")
+                .arg(s.config_dir.join("lan-mouse.pem"))
+                .arg("daemon")
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("HOME", &s.dir)
+                .env("XDG_RUNTIME_DIR", &s.dir)
+                .env("XDG_CONFIG_HOME", s.dir.join(".config"))
+                .env("XDG_STATE_HOME", &s.dir)
+                .env("HOPS_LOG_FILE", &log)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("the hops binary starts")
+        },
+    );
+    Daemon { child, log }
 }
 
 /// The next `Error` notice within `within`, skipping every other event.

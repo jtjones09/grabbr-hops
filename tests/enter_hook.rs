@@ -97,20 +97,15 @@ fn start(hook: &str) -> (Daemon, PathBuf) {
     std::fs::create_dir_all(&config_dir).expect("a scratch config directory");
     std::fs::create_dir_all(dir.join("Library/Caches")).expect("scratch caches");
     std::fs::create_dir_all(&out).expect("a directory for the hook to write in");
-    let free_port = || {
-        std::net::UdpSocket::bind("127.0.0.1:0")
-            .and_then(|s| s.local_addr())
-            .expect("a free port")
-            .port()
-    };
-    let port = free_port();
     let (device_port, fp) = device();
     let hook = hook.replace("{out}", &out.display().to_string());
     let config = config_dir.join("config.toml");
-    std::fs::write(
+    let log = dir.join("daemon.log");
+    let (child, _) = common::launch(
         &config,
-        format!(
-            "port = {port}\n\
+        |port| {
+            format!(
+                "port = {port}\n\
              capture_backend = \"dummy\"\n\
              emulation_backend = \"dummy\"\n\
              discovery = false\n\
@@ -126,31 +121,33 @@ fn start(hook: &str) -> (Daemon, PathBuf) {
              fingerprint = \"{fp}\"\n\
              activate_on_startup = true\n\
              enter_hook = {}\n",
-            toml_string(&hook)
-        ),
-    )
-    .expect("a config");
-    let log = dir.join("daemon.log");
-    let child = Command::new(env!("CARGO_BIN_EXE_hops"))
-        .arg("--config")
-        .arg(&config)
-        .arg("--cert-path")
-        .arg(config_dir.join("lan-mouse.pem"))
-        .arg("daemon")
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", &dir)
-        .env("XDG_RUNTIME_DIR", &dir)
-        .env("XDG_CONFIG_HOME", dir.join(".config"))
-        .env("XDG_STATE_HOME", &dir)
-        .env("HOPS_LOG_FILE", &log)
-        // A hook that mangles a path must not leave files in the checkout.
-        .current_dir(&dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("the hops binary starts");
+                toml_string(&hook)
+            )
+        },
+        &log,
+        || {
+            Command::new(env!("CARGO_BIN_EXE_hops"))
+                .arg("--config")
+                .arg(&config)
+                .arg("--cert-path")
+                .arg(config_dir.join("lan-mouse.pem"))
+                .arg("daemon")
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("HOME", &dir)
+                .env("XDG_RUNTIME_DIR", &dir)
+                .env("XDG_CONFIG_HOME", dir.join(".config"))
+                .env("XDG_STATE_HOME", &dir)
+                .env("HOPS_LOG_FILE", &log)
+                // A hook that mangles a path must not leave files in the checkout.
+                .current_dir(&dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("the hops binary starts")
+        },
+    );
     (Daemon { child, dir, log }, out)
 }
 

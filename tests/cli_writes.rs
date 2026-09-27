@@ -8,6 +8,8 @@
 //! tests can run side by side.
 #![cfg(unix)]
 
+mod common;
+
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
@@ -46,22 +48,7 @@ fn free_port() -> u16 {
 
 impl Daemon {
     /// Start a daemon whose config is the dummy backends plus `tables`.
-    ///
-    /// A port free when it is picked can be bound by any other socket before
-    /// the daemon binds it, a dial from a test running beside this one
-    /// included. The daemon then exits at once, and is started again on
-    /// another port.
     fn start(tag: &str, tables: &str) -> Daemon {
-        for _ in 0..5 {
-            if let Some(daemon) = Self::start_once(tag, tables) {
-                return daemon;
-            }
-        }
-        panic!("every port picked for the daemon was taken before it bound it");
-    }
-
-    /// `None` when the daemon exited because its port was taken.
-    fn start_once(tag: &str, tables: &str) -> Option<Daemon> {
         // Short, for `sun_path` (about 104 bytes on macOS).
         let dir = PathBuf::from(format!("/tmp/h-cw{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -71,49 +58,34 @@ impl Daemon {
         std::fs::create_dir_all(&config_dir).expect("a scratch config directory");
         std::fs::create_dir_all(dir.join("Library/Caches")).expect("scratch caches");
         let config = config_dir.join("config.toml");
-        let port = free_port();
-        std::fs::write(
-            &config,
-            format!(
-                "port = {port}\ncapture_backend = \"dummy\"\nemulation_backend = \"dummy\"\n\
-                 discovery = false\n\n{tables}"
-            ),
-        )
-        .expect("a config");
         let log = dir.join("daemon.log");
-        let child = Self::hops(&dir, &log)
-            .arg("--config")
-            .arg(&config)
-            .arg("--cert-path")
-            .arg(config_dir.join("lan-mouse.pem"))
-            .arg("daemon")
-            .spawn()
-            .expect("the hops binary starts");
-        let mut daemon = Daemon {
+        let (child, port) = common::launch(
+            &config,
+            |port| {
+                format!(
+                    "port = {port}\ncapture_backend = \"dummy\"\nemulation_backend = \"dummy\"\n\
+                     discovery = false\n\n{tables}"
+                )
+            },
+            &log,
+            || {
+                Self::hops(&dir, &log)
+                    .arg("--config")
+                    .arg(&config)
+                    .arg("--cert-path")
+                    .arg(config_dir.join("lan-mouse.pem"))
+                    .arg("daemon")
+                    .spawn()
+                    .expect("the hops binary starts")
+            },
+        );
+        Daemon {
             child,
             dir,
             config,
             log,
             port,
-        };
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while !daemon.log().contains("service running; stops on") {
-            if let Ok(Some(status)) = daemon.child.try_wait() {
-                let log = daemon.log();
-                assert!(
-                    log.contains("Address already in use"),
-                    "the daemon exited ({status}) before its service loop ran; log:\n{log}"
-                );
-                return None;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the daemon never reported its service loop running; log:\n{}",
-                daemon.log()
-            );
-            std::thread::sleep(Duration::from_millis(50));
         }
-        Some(daemon)
     }
 
     /// The hops binary, with an environment that points only at `dir`.

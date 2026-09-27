@@ -13,6 +13,8 @@
 //! the scratch directory cannot disturb anything else.
 #![cfg(target_os = "linux")]
 
+mod common;
+
 use std::net::UdpSocket;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -44,18 +46,7 @@ fn scratch() -> Scratch {
     let _ = std::fs::remove_dir_all(&dir);
     let config_dir = dir.join(".config/lan-mouse");
     std::fs::create_dir_all(&config_dir).expect("a scratch config directory");
-    let port = UdpSocket::bind("127.0.0.1:0")
-        .and_then(|s| s.local_addr())
-        .expect("a free port")
-        .port();
     let config = config_dir.join("config.toml");
-    std::fs::write(
-        &config,
-        format!(
-            "port = {port}\ncapture_backend = \"dummy\"\nemulation_backend = \"dummy\"\ndiscovery = false\n"
-        ),
-    )
-    .expect("a config");
     // SAFETY: the only test in this binary, and it sets these before it starts
     // anything that reads the environment. The front door finds the daemon's
     // socket and token through them.
@@ -69,43 +60,43 @@ fn scratch() -> Scratch {
 }
 
 /// Start `hops daemon` the way the front door does: in a session of its own,
-/// so it has no controlling terminal. Waits until its loop runs.
+/// so it has no controlling terminal, on a port of its own. Waits until its
+/// loop runs.
 fn daemon(scratch: &Scratch, log: &Path) -> Child {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hops"));
-    command
-        .arg("--config")
-        .arg(&scratch.config)
-        .arg("daemon")
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", &scratch.dir)
-        .env("XDG_RUNTIME_DIR", &scratch.dir)
-        .env("XDG_CONFIG_HOME", scratch.dir.join(".config"))
-        .env("XDG_STATE_HOME", &scratch.dir)
-        .env("HOPS_LOG_FILE", log)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    // SAFETY: setsid is async-signal-safe and touches only the child.
-    unsafe {
-        command.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-    let child = command.spawn().expect("the hops binary starts");
-    let deadline = Instant::now() + WITHIN * 2;
-    while !std::fs::read_to_string(log)
-        .unwrap_or_default()
-        .contains("service running; stops on")
-    {
-        assert!(
-            Instant::now() < deadline,
-            "the daemon never reported its service loop running; log:\n{}",
-            std::fs::read_to_string(log).unwrap_or_default()
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let (child, _) = common::launch(
+        &scratch.config,
+        |port| {
+            format!(
+                "port = {port}\ncapture_backend = \"dummy\"\nemulation_backend = \"dummy\"\ndiscovery = false\n"
+            )
+        },
+        log,
+        || {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_hops"));
+            command
+                .arg("--config")
+                .arg(&scratch.config)
+                .arg("daemon")
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("HOME", &scratch.dir)
+                .env("XDG_RUNTIME_DIR", &scratch.dir)
+                .env("XDG_CONFIG_HOME", scratch.dir.join(".config"))
+                .env("XDG_STATE_HOME", &scratch.dir)
+                .env("HOPS_LOG_FILE", log)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            // SAFETY: setsid is async-signal-safe and touches only the child.
+            unsafe {
+                command.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+            command.spawn().expect("the hops binary starts")
+        },
+    );
     child
 }
 

@@ -40,6 +40,11 @@ mod decision_guards;
 #[cfg(test)]
 mod test_harness;
 
+/// Ports for a daemon a test starts, where no dial is given one. Shared with
+/// the tests that run the built binary.
+#[cfg(all(test, unix))]
+mod test_ports;
+
 #[cfg(test)]
 mod toolchain_pin {
     //! `rust-toolchain.toml` and the workflows must name the same compiler, and
