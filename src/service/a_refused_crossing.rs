@@ -93,13 +93,13 @@ impl Frontend {
             .await
             .expect("the daemon's socket");
         let (read, mut write) = tokio::io::split(stream);
-        write
-            .write_all(format!("{}\n", token.trim()).as_bytes())
+        let mut read = BufReader::new(read);
+        hops_ipc::prove_to_daemon(&mut read, &mut write, token.trim())
             .await
-            .expect("the token is sent");
+            .expect("the two-way proof is made");
         let mut frontend = Self {
             stream: write,
-            lines: BufReader::new(read).lines(),
+            lines: read.lines(),
         };
         let barrier = serde_json::to_string(&FrontendRequest::Barrier(115)).expect("json");
         frontend

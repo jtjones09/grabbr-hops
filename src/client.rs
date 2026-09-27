@@ -470,6 +470,18 @@ impl ClientManager {
         }
     }
 
+    /// Whether the machine `handle` is pinned to refused this machine as one
+    /// it holds no pairing with (#184). `true` when that changed.
+    pub(crate) fn set_removed_by_peer(&self, handle: ClientHandle, removed: bool) -> bool {
+        match self.clients.borrow_mut().get_mut(handle) {
+            Some((_, s)) if s.removed_by_peer != removed => {
+                s.removed_by_peer = removed;
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn set_peer_caps(&self, handle: ClientHandle, caps: Option<u32>) {
         if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle) {
             s.peer_caps = caps;

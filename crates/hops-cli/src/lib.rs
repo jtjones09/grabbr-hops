@@ -109,8 +109,9 @@ struct Answer {
     created: Vec<ClientHandle>,
     /// the devices that may drive this machine, if listed meanwhile
     trusted: Option<HashMap<String, String>>,
-    /// the revoked devices, if listed meanwhile
-    revoked: Option<HashSet<String>>,
+    /// every device the trust store holds a pairing with, approved or
+    /// confirmed, if listed meanwhile
+    paired: Option<HashSet<String>>,
     /// the devices approved here and waiting for the number to be confirmed
     /// on both machines, if listed meanwhile
     pairing: Option<HashSet<String>>,
@@ -178,12 +179,12 @@ async fn next_event(
 ///
 /// A request that has reached the socket has not been acted on. A command
 /// that exits there reports success for requests the service refused or has
-/// not read yet, and on Windows, where the endpoint is loopback TCP, closing
-/// the socket with the service's replies unread resets the connection, which
-/// can discard a request the service has not read (#6). So the requests are
-/// followed by a listing and a barrier, and everything the service sends is
-/// read until the barrier comes back. The listing just before it is the
-/// state the requests left.
+/// not read yet, and closing a connection with the service's replies unread
+/// could reset it, discarding a request the service had not read, as it did
+/// over the loopback TCP endpoint Windows used before its pipe (#6). So the
+/// requests are followed by a listing and a barrier, and everything the
+/// service sends is read until the barrier comes back. The listing just
+/// before it is the state the requests left.
 async fn send(
     rx: &mut Events,
     tx: &mut AsyncFrontendRequestWriter,
@@ -217,8 +218,8 @@ async fn read_until(
             FrontendEvent::Enumerate(devices) => answer.devices = devices,
             FrontendEvent::Created(handle, _, _) => answer.created.push(handle),
             FrontendEvent::AuthorizedUpdated(keys) => answer.trusted = Some(keys),
-            FrontendEvent::RevokedUpdated(r) => answer.revoked = Some(r.into_keys().collect()),
             FrontendEvent::TrustUpdated(t) => {
+                answer.paired = Some(t.keys().cloned().collect());
                 answer.pairing = Some(
                     t.into_iter()
                         .filter(|(_, t)| t.pending)
@@ -351,17 +352,18 @@ fn granted(answer: &Answer, before: &Answer, fp: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Whether `fp` was revoked and the revocation saved.
-fn revoked(answer: &Answer, before: &Answer, fp: &str) -> Result<(), CliError> {
-    // the spelling the service revokes under
+/// Whether `fp` was removed and the removal saved: the pairings the service
+/// listed after it no longer name it (#184).
+fn removed(answer: &Answer, before: &Answer, fp: &str) -> Result<(), CliError> {
+    // the spelling the service removes under
     let fp = canonical_fingerprint(fp).unwrap_or_else(|| fp.trim().to_lowercase());
-    let listed = answer
-        .revoked
-        .as_ref()
-        .or(before.revoked.as_ref())
-        .is_some_and(|r| r.contains(&fp));
-    if !listed {
-        return Err(CliError::NotDone(format!("{fp} was not revoked")));
+    let Some(paired) = answer.paired.as_ref().or(before.paired.as_ref()) else {
+        return Err(CliError::Unconfirmed(format!(
+            "the service did not say whether it removed {fp}"
+        )));
+    };
+    if paired.contains(&fp) {
+        return Err(CliError::NotDone(format!("{fp} was not removed")));
     }
     saved(answer, TRUST_NOT_SAVED)
 }
@@ -441,7 +443,7 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
             if answer.device(id).is_some() {
                 return Err(CliError::NotDone(format!("device {id} was not removed")));
             }
-            // removing a paired device also revokes it
+            // removing a paired device also removes its pairing
             saved(&answer, NOT_SAVED)?;
             saved(&answer, TRUST_NOT_SAVED)?;
         }
@@ -509,7 +511,7 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
             let request = FrontendRequest::RemoveAuthorizedKey(sha256_fingerprint.clone());
             let answer = send(rx, tx, [request]).await?;
             answer.tell();
-            revoked(&answer, &now, &sha256_fingerprint)?
+            removed(&answer, &now, &sha256_fingerprint)?
         }
         CliSubcommand::SaveConfig => {
             let answer = send(rx, tx, [FrontendRequest::SaveConfiguration]).await?;

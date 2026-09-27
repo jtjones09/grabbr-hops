@@ -259,7 +259,7 @@ mod tests {
         let (mut saver, mut store) = saved(&disk);
 
         disk.refuse_writes();
-        store.revoke(PEER);
+        store.forget(PEER);
         let told = saver
             .save_change(&store, "removing \"desk mac\"".into())
             .expect("a change that did not reach disk must be reported to the user");

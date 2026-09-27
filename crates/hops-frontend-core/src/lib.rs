@@ -21,7 +21,7 @@ use tokio::sync::{Notify, mpsc};
 pub use hops_ipc::{
     AttemptOrigin, Build, CaptureFault, CaptureState, ClientConfig, ClientHandle, ClientState,
     CrossingRefusal, DiscoveredDevice, FrontendEvent, FrontendRequest, PairingCheck, PeerTrust,
-    Permission, Position, RevokedEntry, Status, connect_async,
+    Permission, Position, Status, connect_async,
 };
 
 pub mod connection;
@@ -93,10 +93,6 @@ pub struct AppModel {
     pub fingerprint: Option<String>,
     /// Trusted peer fingerprints -> description.
     pub authorized: HashMap<String, String>,
-    /// Fingerprints the user deliberately revoked. Kept so a returning peer is
-    /// shown as EXPELLED rather than as a stranger, and so re-trusting it is a
-    /// distinct, user-initiated act.
-    pub revoked: HashMap<String, RevokedEntry>,
     /// What the trust store grants each paired machine, by fingerprint. Read
     /// through [`AppModel::clipboard`]. Empty from a daemon older than
     /// `FrontendEvent::TrustUpdated`.
@@ -218,12 +214,9 @@ impl Device {
     /// Should this device occupy a row in the device list?
     ///
     /// Excludes ONLY a bare inbound pairing request, which lives in the pairing
-    /// banner instead. A revoked device MUST be listable — being visible as
-    /// expelled is the entire point of persisting revocation, and it has neither
-    /// a send facet nor `receive`, so any "send or receive" test silently drops
-    /// it and the restore UI can never render.
+    /// banner instead.
     pub fn is_listable(&self) -> bool {
-        self.send.is_some() || self.receive || self.trust == TrustState::Revoked
+        self.send.is_some() || self.receive
     }
 }
 
@@ -257,7 +250,6 @@ impl AppModel {
             FrontendEvent::CaptureStatus(s) => self.capture = s,
             FrontendEvent::EmulationStatus(s) => self.emulation = s,
             FrontendEvent::PublicKeyFingerprint(fp) => self.fingerprint = Some(fp),
-            FrontendEvent::RevokedUpdated(map) => self.revoked = map,
             FrontendEvent::TrustUpdated(map) => {
                 self.trust = map;
                 // An approval here answers its request: the machine is now
@@ -827,10 +819,6 @@ pub enum TrustState {
     Trusted,
     /// An un-authorized peer awaiting the user's pairing approval.
     PendingApproval,
-    /// The user deliberately expelled this peer. Distinct from `Provisional` on
-    /// purpose: the whole point of persisting revocation is that "a device you
-    /// threw out" must never render like "a device you have not met".
-    Revoked,
 }
 
 /// The outgoing ("send input to this device") facet of a [`Device`], present
@@ -1079,36 +1067,9 @@ impl AppModel {
             }
         }
 
-        // 3. revoked devices — shown, not forgotten, so re-trust is something the
-        //    user initiates from a row they can see rather than something a
-        //    reconnecting peer provokes with a prompt.
-        for (fp, entry) in &self.revoked {
-            // Revoked OUTRANKS authorized, deliberately. The daemon refuses to
-            // re-authorize an expelled fingerprint, so both tables naming one
-            // means the config was hand-edited — and the safe reading of that is
-            // "expelled", never "trusted".
-            if is_self(fp) {
-                continue;
-            }
-            let device = by_fp.entry(fp.clone()).or_insert_with(|| Device {
-                fingerprint: Some(fp.clone()),
-                label: display_label(None, Some(&entry.label), fp),
-                trust: TrustState::Revoked,
-                connection: Connection::ServiceGone,
-                send: None,
-                receive: false,
-            });
-            // a client may still be configured to dial it; the card stays revoked
-            device.trust = TrustState::Revoked;
-            device.receive = false;
-            if device.label.is_empty() {
-                device.label = display_label(None, Some(&entry.label), fp);
-            }
-        }
-
-        // 4. a bare inbound pairing request not already represented above
+        // 3. a bare inbound pairing request not already represented above
         if let Some(fp) = self.pending_pairing.as_deref() {
-            if !self.authorized.contains_key(fp) && !is_self(fp) && !self.revoked.contains_key(fp) {
+            if !self.authorized.contains_key(fp) && !is_self(fp) {
                 by_fp.entry(fp.to_string()).or_insert_with(|| Device {
                     fingerprint: Some(fp.to_string()),
                     label: short_fingerprint(fp),
@@ -1153,7 +1114,6 @@ impl AppModel {
         use connection::{Link, Number, SendFacet, Standing};
         let fp = device.fingerprint.as_deref();
         let standing = match fp {
-            _ if device.trust == TrustState::Revoked => Standing::Removed,
             Some(fp) if self.is_pairing(fp) => Standing::Pairing(
                 match self.pairing_checks.iter().find(|c| c.fingerprint == fp) {
                     None => Number::NotYet,
@@ -1187,6 +1147,13 @@ impl AppModel {
             standing,
             send,
             inbound: fp.is_some_and(|fp| self.connected_peers.contains(fp)),
+            // The machine this one dials refused it as one it holds no
+            // pairing with (#184). The daemon clears it once a link to that
+            // machine is up again, and never sets it while adding it.
+            removed_by_peer: device
+                .send
+                .as_ref()
+                .is_some_and(|s| s.state.removed_by_peer),
         }
     }
 }
@@ -2120,13 +2087,6 @@ mod projection {
         (config, state)
     }
 
-    fn revoked(label: &str) -> super::RevokedEntry {
-        super::RevokedEntry {
-            label: label.to_string(),
-            revoked_at: 1_754_000_000,
-        }
-    }
-
     // LEDGER T501 | class B | 6 struct state: AppModel::devices()
     #[test]
     fn merges_client_and_authorized_by_fingerprint() {
@@ -2246,85 +2206,42 @@ mod projection {
         );
     }
 
-    /// A denial the trust store still holds must never render like a device
-    /// never met.
-    // LEDGER T503 | class B | 6 struct state: AppModel::devices()
+    /// A device whose machine refused this one as unknown, because it
+    /// removed this machine, keeps its card, says so, and keeps its send
+    /// facet, which is what the remove button acts on (#184). Every other
+    /// card does not say so.
+    // LEDGER R184-5 | class B | 6 struct state: AppModel::apply, AppModel::devices, Device::connection
     #[test]
-    fn a_revoked_device_is_shown_as_revoked_not_as_a_stranger() {
-        let mut m = AppModel::default();
+    fn a_device_whose_machine_removed_this_one_says_so_and_can_be_removed() {
         let fp = "aa:bb:cc:dd";
-        m.revoked.insert(fp.to_string(), revoked("old laptop"));
-        let devices = m.devices();
-        assert_eq!(devices.len(), 1, "the removed device stays visible");
-        assert_eq!(devices[0].trust, TrustState::Revoked);
-        assert_eq!(
-            devices[0].label, "old laptop",
-            "it keeps the name it was known by"
-        );
-        assert!(!devices[0].receive, "revoked means it may not drive us");
-    }
-
-    /// A revoked peer reconnecting must not surface as a pairing request.
-    // LEDGER T504 | class B | 6 struct state: AppModel::devices()
-    #[test]
-    fn a_revoked_peer_cannot_appear_as_a_pending_approval() {
-        let mut m = AppModel::default();
-        let fp = "aa:bb:cc:dd";
-        m.revoked.insert(fp.to_string(), revoked("old laptop"));
-        m.pending_pairing = Some(fp.to_string());
-        let devices = m.devices();
-        assert_eq!(devices.len(), 1);
-        assert_eq!(
-            devices[0].trust,
-            TrustState::Revoked,
-            "a reconnecting revoked peer must not be offered as a new pairing"
-        );
-    }
-
-    /// If both tables somehow name the same fingerprint, it must not render as
-    /// trusted.
-    // LEDGER T505 | class B | 6 struct state: AppModel::devices()
-    #[test]
-    fn authorized_wins_only_when_not_revoked() {
-        let mut m = AppModel::default();
-        let fp = "aa:bb:cc:dd";
-        m.authorized.insert(fp.to_string(), "old laptop".into());
+        let mut m = AppModel {
+            connected: true,
+            ..AppModel::default()
+        };
+        m.authorized.insert(fp.to_string(), "desk".into());
+        let (config, mut state) = client(Some("desk"), Some(fp));
+        state.active = true;
+        m.apply(FrontendEvent::Created(3, config.clone(), state.clone()));
         let devices = m.devices();
         assert_eq!(
-            devices[0].trust,
-            TrustState::Trusted,
-            "plain trusted device"
+            devices[0].connection,
+            super::Connection::NotConnected,
+            "a card said its machine removed this one before it was told"
         );
-
-        m.revoked.insert(fp.to_string(), revoked("old laptop"));
+        state.removed_by_peer = true;
+        m.apply(FrontendEvent::State(3, config, state));
         let devices = m.devices();
-        assert_eq!(devices.len(), 1, "still one card, not two");
+        assert_eq!(devices.len(), 1, "still one card");
         assert_eq!(
-            devices[0].trust,
-            TrustState::Revoked,
-            "revoked outranks authorized: a denied identity cannot present as trusted"
+            devices[0].connection,
+            super::Connection::NoLongerTrusts,
+            "the card does not say so"
         );
-        assert!(!devices[0].receive, "and it may not drive us");
-    }
-
-    /// Filtering on `send.is_some() || receive` drops revoked devices, so the
-    /// removed state never rendered in the real app.
-    // LEDGER T506 | class B | 1 return value: Device::is_listable over AppModel::devices()
-    #[test]
-    fn a_revoked_device_survives_the_list_filter() {
-        let mut m = AppModel::default();
-        m.revoked
-            .insert("aa:bb:cc:dd".into(), revoked("old laptop"));
-        let devices = m.devices();
-        assert_eq!(devices.len(), 1);
-        assert!(
-            devices[0].is_listable(),
-            "a revoked device must reach the device list, or nothing says it was removed"
-        );
+        assert!(devices[0].is_listable(), "the card left the list");
         assert_eq!(
-            devices.iter().filter(|d| d.is_listable()).count(),
-            1,
-            "exactly one listable row"
+            devices[0].send.as_ref().map(|s| s.handle),
+            Some(3),
+            "the card lost the handle its remove button acts on"
         );
     }
 
@@ -2417,7 +2334,6 @@ mod projection {
         let me = "de:ad:be:ef";
         m.fingerprint = Some(me.to_string());
         m.authorized.insert(me.to_string(), "myself".to_string());
-        m.revoked.insert(me.to_string(), revoked("myself"));
         m.pending_pairing = Some(me.to_string());
         assert!(m.devices().is_empty(), "never list ourselves");
     }
@@ -3263,6 +3179,59 @@ mod the_state_follows_the_events {
             state(&m),
             Connection::NotConnected,
             "a new device on a removed one's handle inherited its mark"
+        );
+    }
+
+    /// The machine this one dials removed it (#184). That machine refuses
+    /// everything this one sends, so the row says so over a link reported
+    /// up or refusing, over the switch here and over a failed crossing;
+    /// once a link to it is up again the daemon clears it and the row reads
+    /// its link.
+    // LEDGER T148-16 | class B | 6 struct state: AppModel::apply + AppModel::devices()
+    #[test]
+    fn a_machine_that_removed_this_one_outranks_its_link_and_the_switch() {
+        let removed = |s: ClientState| ClientState {
+            removed_by_peer: true,
+            ..s
+        };
+        let mut m = paired();
+        let mut refusing = linked(true, true);
+        refusing.alive = false;
+        set(&mut m, refusing.clone());
+        assert_eq!(state(&m), Connection::NotAcceptingInput, "precondition");
+        set(&mut m, removed(refusing));
+        assert_eq!(
+            state(&m),
+            Connection::NoLongerTrusts,
+            "a refusing link hid that the machine removed this one"
+        );
+        set(&mut m, removed(linked(true, true)));
+        assert_eq!(
+            state(&m),
+            Connection::NoLongerTrusts,
+            "a link up hid that the machine removed this one"
+        );
+
+        connected_in(&mut m);
+        set(&mut m, removed(linked(false, false)));
+        assert_eq!(
+            state(&m),
+            Connection::NoLongerTrusts,
+            "the switch here, or a link in, hid it"
+        );
+        set(&mut m, removed(linked(true, false)));
+        refused(&mut m);
+        assert_eq!(
+            state(&m),
+            Connection::NoLongerTrusts,
+            "a failed crossing hid it"
+        );
+
+        set(&mut m, linked(true, true));
+        assert_eq!(
+            state(&m),
+            Connection::Connected,
+            "the machine answers again and the row still says it does not"
         );
     }
 

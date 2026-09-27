@@ -137,7 +137,7 @@ async fn next_error(events: &mut AsyncFrontendEventReader, within: Duration) -> 
 async fn attached(events: &mut AsyncFrontendEventReader) {
     loop {
         match tokio::time::timeout(PATIENCE, events.next()).await {
-            Ok(Some(Ok(FrontendEvent::RevokedUpdated(_)))) => return,
+            Ok(Some(Ok(FrontendEvent::TrustUpdated(_)))) => return,
             Ok(Some(_)) => continue,
             other => panic!("the daemon never sent its state: {other:?}"),
         }

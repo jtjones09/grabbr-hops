@@ -24,7 +24,7 @@ use std::{
 use hops_frontend_core::{
     AppModel, ApprovalRefused, CaptureState, ClientHandle, Clipboard, FrontendClient,
     FrontendRequest, Launch, PairingAttempt, PairingCard, PairingCheck, Position, Status, Tone,
-    TrustState, prefs, spaced_number, theme,
+    prefs, spaced_number, theme,
 };
 use hops_ipc::{DEFAULT_PORT, Geometry};
 use slint::{ComponentHandle, ModelRc, VecModel};
@@ -231,7 +231,6 @@ fn device_rows(m: &AppModel) -> Vec<DeviceRow> {
                     .unwrap_or_default()
                     .into(),
                 trusted: d.receive,
-                revoked: d.trust == TrustState::Revoked,
                 clipboard: clipboard.map(clipboard_words).unwrap_or_default().into(),
                 clipboard_on: clipboard.is_some_and(|c| c.is_on()),
             }
@@ -475,12 +474,11 @@ fn default_canvas_pos(pos: Position) -> (f32, f32) {
 }
 
 /// Single-instance coordination result. A second `hops gui` launch signals the
-/// first (any connection to the rendezvous = "show your window") and exits, so
-/// re-launching focuses the resident menu-bar app instead of stacking duplicate
-/// tray icons. The rendezvous is a Unix-domain socket on unix (per-user, scoped
-/// by `~/.config` permissions) and a loopback `TcpListener` on Windows (no
-/// per-user filesystem socket there; a `127.0.0.1` listener is the std-only
-/// equivalent).
+/// first ("show your window") and exits, so re-launching focuses the resident
+/// menu-bar app instead of stacking duplicate tray icons. The rendezvous is a
+/// Unix-domain socket on unix (per-user, scoped by `~/.config` permissions)
+/// and, on Windows, a named event in the session's `Local\` namespace that
+/// grants this user alone ([`hops_ipc::instance`]).
 #[cfg(any(unix, windows))]
 enum Instance {
     /// We're the first instance; the guard cleans up the rendezvous on exit.
@@ -490,14 +488,15 @@ enum Instance {
 }
 
 /// Cleans up the single-instance rendezvous on drop (normal GUI exit). Only Unix
-/// leaves a filesystem artifact (the socket file); on Windows the `TcpListener`
-/// closes itself, so `path` is left empty.
+/// leaves a filesystem artifact (the socket file). On Windows the event lasts
+/// until the process exits: the thread that waits on it holds a handle of its
+/// own, blocked for as long as the GUI runs.
 #[cfg(any(unix, windows))]
 struct SingleInstanceGuard {
-    // only Drop (unix-only) reads this; on Windows there's no socket file to
-    // clean up, so the field is written-but-unread there.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg(unix)]
     path: std::path::PathBuf,
+    #[cfg(windows)]
+    _event: hops_ipc::instance::First,
 }
 
 #[cfg(any(unix, windows))]
@@ -569,41 +568,20 @@ fn acquire_single_instance(show_requested: Arc<AtomicBool>) -> Instance {
     }
 }
 
-/// Windows single-instance via a loopback `TcpListener`. Bound to `127.0.0.1`
-/// only (never `0.0.0.0`), so it's a local rendezvous — not a reachable service —
-/// and a loopback bind doesn't trip the Windows Firewall prompt. Any successful
-/// connect from a second launch flips `show_requested`; the second launch then
-/// exits. Degrades gracefully (runs without single-instance) on any bind error.
+/// Windows single-instance through [`hops_ipc::instance::claim_gui`]: only a
+/// running hops window of this user, found and asked to show, keeps this
+/// launch closed. Anything else holding the name opens the window anyway,
+/// so no other program can stop the GUI appearing (#176).
 #[cfg(windows)]
 fn acquire_single_instance(show_requested: Arc<AtomicBool>) -> Instance {
-    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-    // fixed high port below the ephemeral range (49152+) to avoid churn collisions
-    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 47842));
-    match TcpListener::bind(addr) {
-        Ok(listener) => {
-            std::thread::spawn(move || {
-                for _stream in listener.incoming() {
-                    show_requested.store(true, Ordering::SeqCst);
-                }
-            });
-            Instance::Primary(SingleInstanceGuard {
-                path: std::path::PathBuf::new(),
-            })
+    match hops_ipc::instance::claim_gui(move || show_requested.store(true, Ordering::SeqCst)) {
+        hops_ipc::instance::Found::First(first) => {
+            Instance::Primary(SingleInstanceGuard { _event: first })
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            // a live primary already owns the port; poke it to surface, then exit
-            if TcpStream::connect(addr).is_ok() {
-                Instance::Secondary
-            } else {
-                Instance::Primary(SingleInstanceGuard {
-                    path: std::path::PathBuf::new(),
-                })
-            }
+        hops_ipc::instance::Found::Running => {
+            log::info!("a hops window is already open for this user; it was asked to show");
+            Instance::Secondary
         }
-        // any other bind error → run anyway without single-instance
-        Err(_) => Instance::Primary(SingleInstanceGuard {
-            path: std::path::PathBuf::new(),
-        }),
     }
 }
 
@@ -1460,48 +1438,51 @@ mod armed_actions_follow_their_device {
 
 #[cfg(test)]
 mod destructive_actions_say_so {
-    //! The confirm text for delete and revoke must say the change is permanent.
+    //! The confirm text for delete and revoke must say what removal costs:
+    //! using the device again means pairing the two machines again (#184).
     //!
-    //! Both write a tombstone: the fingerprint can never be trusted again, and
-    //! the device has to present a NEW identity to return. The GUI said
-    //! "delete + untrust?" and "remove?", neither of which reads as irreversible
-    //! — and on 2026-08-31 both machines on the rig were permanently expelled by
-    //! accident, needing hand-edited config files to recover. The TUI had said
-    //! "permanently ... NEW identity" all along; the GUI had not (#33, #125).
+    //! It used to say the other machine needed a NEW identity, which was the
+    //! tombstone rule removal no longer follows: a removed machine keeps its
+    //! identity and pairs again in full. A confirm that still said so would
+    //! send someone to reinstall a machine for nothing.
     //!
     //! This is a source guard because Slint draws its own pixels — there is no
     //! runtime assertion that reaches this text.
 
     const APP_SLINT: &str = include_str!("../ui/app.slint");
 
-    #[test]
-    fn the_delete_confirm_says_it_is_permanent() {
-        assert!(
-            APP_SLINT.contains(r#""delete permanently?""#),
-            "the delete confirm must say `permanently`. `delete + untrust?` reads as \
-             reversible, and it is not."
-        );
+    /// The window's text, comments dropped: the guard is about what a
+    /// person reads, and a comment may name the old rule to explain it.
+    fn shown() -> String {
+        APP_SLINT
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
+    // LEDGER R184-7 | class S | source text: app.slint confirms, comments stripped
     #[test]
-    fn the_revoke_confirm_says_it_is_permanent() {
-        assert!(
-            APP_SLINT.contains(r#""remove permanently?""#),
-            "the revoke confirm must say `permanently` — it writes a tombstone"
-        );
-    }
-
-    #[test]
-    fn both_confirms_explain_the_consequence() {
-        // Saying "permanently" is not enough on its own: the user needs to know
-        // what it costs them, which is a fresh identity on the other machine.
-        let n = APP_SLINT
-            .matches("it must pair again with a NEW identity")
+    fn both_confirms_say_the_device_returns_by_pairing_again() {
+        let n = shown()
+            .matches(r#""to use it again, pair it again""#)
             .count();
         assert_eq!(
             n, 2,
-            "delete and revoke must BOTH explain the consequence; found {n} of 2"
+            "delete and revoke must BOTH say what removal costs; found {n} of 2"
         );
+    }
+
+    // LEDGER R184-8 | class S | source text: app.slint, comments stripped
+    #[test]
+    fn nothing_on_screen_teaches_the_tombstone() {
+        for old in ["NEW identity", "new identity", "permanently"] {
+            assert!(
+                !shown().contains(old),
+                "app.slint still shows `{old}`: removal forgets the device, and it \
+                 pairs again with the identity it has (#184)"
+            );
+        }
     }
 }
 
@@ -1514,7 +1495,6 @@ mod the_window_draws_the_state {
     use super::*;
     use hops_frontend_core::{
         ClientConfig, ClientState, CrossingRefusal, FrontendEvent, PairingCheck, PeerTrust,
-        RevokedEntry,
     };
     use slint::Model;
 
@@ -1591,17 +1571,15 @@ mod the_window_draws_the_state {
             check: PairingCheck::Show("042917".into()),
             answered: false,
         });
-        let mut removed = dialled(pinned(true, false, false), false);
-        removed.apply(FrontendEvent::RevokedUpdated(
-            [(
-                FP.to_string(),
-                RevokedEntry {
-                    label: "desk-mac".into(),
-                    revoked_at: 1,
-                },
-            )]
-            .into(),
-        ));
+        // Its machine refused this one's dial as one it holds no pairing
+        // with: it removed this machine (#184).
+        let removed_here = dialled(
+            ClientState {
+                removed_by_peer: true,
+                ..pinned(true, false, false)
+            },
+            true,
+        );
         let in_too = |mut m: AppModel| {
             m.apply(FrontendEvent::DeviceConnected {
                 addr: "192.0.2.5:50001".parse().expect("addr"),
@@ -1642,7 +1620,7 @@ mod the_window_draws_the_state {
             ),
             (waiting, "waiting for its approval", DotTone::Warn),
             (comparing, "compare the number", DotTone::Warn),
-            (removed, "removed", DotTone::Bad),
+            (removed_here, "it removed this machine", DotTone::Bad),
             (gone, "service not answering", DotTone::Quiet),
         ]
     }
@@ -2184,7 +2162,7 @@ mod the_repaint_gate {
     //! Drives a real `AppWindow` on Slint's headless testing backend through
     //! the functions the poll calls.
     use super::*;
-    use hops_frontend_core::{ClientConfig, ClientState, Connection, FrontendEvent, RevokedEntry};
+    use hops_frontend_core::{ClientConfig, ClientState, Connection, FrontendEvent};
     use slint::Model;
 
     const FP: &str = "1e:19:1b:2c:3d:4e:5f:60:71:82:93:a4:b5:c6:d7:e8";
@@ -2234,10 +2212,10 @@ mod the_repaint_gate {
         // emulation is off. The row's address reads the same before and after.
         m.apply(FrontendEvent::State(
             0,
-            config,
+            config.clone(),
             ClientState {
                 active_addr: Some("192.0.2.5:4242".parse().expect("addr")),
-                ..dialling
+                ..dialling.clone()
             },
         ));
         tick(&ui, &mut repaint, &m);
@@ -2247,22 +2225,20 @@ mod the_repaint_gate {
              refuses everything sent to it"
         );
 
-        // Then its identity is denied: of everything on the row, only
-        // `revoked` changes.
-        m.apply(FrontendEvent::RevokedUpdated(
-            [(
-                FP.to_owned(),
-                RevokedEntry {
-                    label: "desk mac".into(),
-                    revoked_at: 1,
-                },
-            )]
-            .into(),
+        // Then its machine refuses it as removed (#184): the row says so.
+        m.apply(FrontendEvent::State(
+            0,
+            config,
+            ClientState {
+                removed_by_peer: true,
+                ..dialling
+            },
         ));
         tick(&ui, &mut repaint, &m);
         assert!(
-            row(&ui).revoked && row(&ui).status.as_str() == Connection::Removed.words(),
-            "the window never showed the row as removed"
+            row(&ui).status.as_str() == Connection::NoLongerTrusts.words()
+                && row(&ui).tone == DotTone::Bad,
+            "the window never said the machine no longer trusts this one"
         );
     }
 

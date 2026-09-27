@@ -43,11 +43,12 @@ impl App {
             .await
             .expect("the daemon's socket");
         let (rx, mut tx) = stream.into_split();
-        tx.write_all(format!("{token}\n").as_bytes())
+        let mut rx = BufReader::new(rx);
+        hops_ipc::prove_to_daemon(&mut rx, &mut tx, &token)
             .await
-            .expect("the token is sent");
+            .expect("the two-way proof is made");
         App {
-            lines: BufReader::new(rx).lines(),
+            lines: rx.lines(),
             tx,
             seen: Vec::new(),
         }

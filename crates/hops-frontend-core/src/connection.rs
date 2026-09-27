@@ -18,8 +18,12 @@ pub enum Connection {
     /// No hops service answers this app, so nothing on the row is live: it
     /// is what was last known (#34).
     ServiceGone,
-    /// This machine removed the device; it cannot come back as itself.
-    Removed,
+    /// The device's machine refused this one's dial as a machine it holds no
+    /// pairing with: it removed this machine (#184). This machine still
+    /// holds its side until someone removes it here, so the card says so.
+    /// Nothing sent to it gets through, whatever its link or the switch here
+    /// says, so it outranks every state but [`Connection::ServiceGone`].
+    NoLongerTrusts,
     /// A pairing waits for the person here to compare its number (#167).
     ComparingNumber,
     /// This machine approved a pairing and waits for the other machine to
@@ -67,7 +71,7 @@ impl Connection {
     /// Every state, for frontends and tests that show or check them all.
     pub const ALL: [Connection; 10] = [
         Connection::ServiceGone,
-        Connection::Removed,
+        Connection::NoLongerTrusts,
         Connection::ComparingNumber,
         Connection::AwaitingOtherMachine,
         Connection::NotAcceptingInput,
@@ -84,40 +88,47 @@ impl Connection {
         use Link::{Down, Up};
         use Number::{Answered, NotYet, OnScreen};
         use SendFacet::{Off, On};
-        use Standing::{NotPaired, Paired, Pairing, Removed};
+        use Standing::{NotPaired, Paired, Pairing};
         // No `_ =>` arm: a new fact, or a new value of one, does not compile
         // until it is given a state.
         //
-        // The order, top first: this machine's own link, when it is up; then
-        // a pairing in progress; then the switch here; then a crossing that
-        // found no link; only then the inbound link. What the other machine
-        // does in its direction never hides a fact about this one (#92).
-        match (f.service, f.standing, f.send, f.inbound) {
-            (false, _, _, _) => C::ServiceGone,
-            (true, Removed, _, _) => C::Removed,
-            (true, NotPaired | Paired | Pairing(_), On(Up { accepting: false }), _) => {
-                C::NotAcceptingInput
-            }
+        // The order, top first: the other machine refusing this one; then
+        // this machine's own link, when it is up; then a pairing in progress;
+        // then the switch here; then a crossing that found no link; only then
+        // the inbound link. What the other machine does in its direction
+        // never hides a fact about this one (#92).
+        match (f.service, f.removed_by_peer, f.standing, f.send, f.inbound) {
+            (false, _, _, _, _) => C::ServiceGone,
+            // That machine refuses this one outright: no link, switch or
+            // pairing here changes that, and the card must say what does.
+            (true, true, _, _, _) => C::NoLongerTrusts,
+            (true, false, _, On(Up { accepting: false }), _) => C::NotAcceptingInput,
             // The number of a pairing in progress is on its own card; the dot
             // says whether input gets through the link that is up.
-            (true, NotPaired | Paired | Pairing(_), On(Up { accepting: true }), _) => C::Connected,
-            (true, Pairing(OnScreen), SendFacet::None | Off | On(Down { .. }), _) => {
+            (true, false, _, On(Up { accepting: true }), _) => C::Connected,
+            (true, false, Pairing(OnScreen), SendFacet::None | Off | On(Down { .. }), _) => {
                 C::ComparingNumber
             }
-            (true, Pairing(NotYet | Answered), SendFacet::None | Off | On(Down { .. }), _) => {
-                C::AwaitingOtherMachine
-            }
+            (
+                true,
+                false,
+                Pairing(NotYet | Answered),
+                SendFacet::None | Off | On(Down { .. }),
+                _,
+            ) => C::AwaitingOtherMachine,
             // A device switched off here stays connected in when its own
             // pairing lets it drive this machine; the switch is still said.
-            (true, NotPaired | Paired, Off, _) => C::Off,
+            (true, false, NotPaired | Paired, Off, _) => C::Off,
             // So is a dial that failed while the other machine's link in is
             // up: one direction can be blocked while the other gets through.
-            (true, Paired, On(Down { unanswered: true }), _) => C::Unreachable,
-            (true, NotPaired, SendFacet::None | On(Down { .. }), true) => C::Connected,
-            (true, Paired, SendFacet::None | On(Down { unanswered: false }), true) => C::Connected,
-            (true, NotPaired, On(Down { .. }), false) => C::NotPaired,
-            (true, Paired, On(Down { unanswered: false }), false) => C::NotConnected,
-            (true, NotPaired | Paired, SendFacet::None, false) => C::NotConnected,
+            (true, false, Paired, On(Down { unanswered: true }), _) => C::Unreachable,
+            (true, false, NotPaired, SendFacet::None | On(Down { .. }), true) => C::Connected,
+            (true, false, Paired, SendFacet::None | On(Down { unanswered: false }), true) => {
+                C::Connected
+            }
+            (true, false, NotPaired, On(Down { .. }), false) => C::NotPaired,
+            (true, false, Paired, On(Down { unanswered: false }), false) => C::NotConnected,
+            (true, false, NotPaired | Paired, SendFacet::None, false) => C::NotConnected,
         }
     }
 
@@ -125,7 +136,7 @@ impl Connection {
     pub fn tone(self) -> Tone {
         match self {
             Connection::Connected => Tone::Good,
-            Connection::NotAcceptingInput | Connection::Removed => Tone::Bad,
+            Connection::NotAcceptingInput | Connection::NoLongerTrusts => Tone::Bad,
             Connection::ComparingNumber
             | Connection::AwaitingOtherMachine
             | Connection::NotPaired
@@ -139,7 +150,9 @@ impl Connection {
     pub fn words(self) -> &'static str {
         match self {
             Connection::ServiceGone => "service not answering",
-            Connection::Removed => "removed",
+            // Short enough to fit beside a send row's controls in the
+            // window at its default width; the daemon's notice says the rest.
+            Connection::NoLongerTrusts => "it removed this machine",
             Connection::ComparingNumber => "compare the number",
             Connection::AwaitingOtherMachine => "waiting for its approval",
             Connection::NotAcceptingInput => "not accepting input",
@@ -164,13 +177,14 @@ pub struct Facts {
     pub send: SendFacet,
     /// The device is connected in to this machine.
     pub inbound: bool,
+    /// The device's machine refused this one as a machine it holds no
+    /// pairing with, and no link to it has come up since (#184).
+    pub removed_by_peer: bool,
 }
 
 /// Where the pairing with a device stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Standing {
-    /// This machine removed it.
-    Removed,
     /// Approved here, not yet confirmed on both machines (#167).
     Pairing(Number),
     /// A confirmed pairing, in either direction.
@@ -220,7 +234,6 @@ mod tests {
 
     fn every() -> Vec<Facts> {
         let standings = [
-            Standing::Removed,
             Standing::Pairing(Number::NotYet),
             Standing::Pairing(Number::OnScreen),
             Standing::Pairing(Number::Answered),
@@ -240,12 +253,15 @@ mod tests {
             for standing in standings {
                 for send in sends {
                     for inbound in [false, true] {
-                        all.push(Facts {
-                            service,
-                            standing,
-                            send,
-                            inbound,
-                        });
+                        for removed_by_peer in [false, true] {
+                            all.push(Facts {
+                                service,
+                                standing,
+                                send,
+                                inbound,
+                                removed_by_peer,
+                            });
+                        }
                     }
                 }
             }
@@ -261,7 +277,11 @@ mod tests {
     #[test]
     fn every_combination_of_facts_keeps_every_rule() {
         let all = every();
-        assert_eq!(all.len(), 2 * 6 * 6 * 2, "the enumeration missed a value");
+        assert_eq!(
+            all.len(),
+            2 * 5 * 6 * 2 * 2,
+            "the enumeration missed a value"
+        );
         for f in all {
             let c = Connection::of(f);
             let why = format!("{f:?} is {c:?}");
@@ -270,12 +290,16 @@ mod tests {
             if !f.service {
                 continue;
             }
+            // The other machine refusing this one is said whatever else
+            // holds, and only then (#184): a link that is up, refused or
+            // not, the switch here and a pairing in progress never hide it,
+            // since that machine refuses everything this one sends.
             assert_eq!(
-                f.standing == Standing::Removed,
-                c == Connection::Removed,
-                "removed: {why}"
+                f.removed_by_peer,
+                c == Connection::NoLongerTrusts,
+                "no longer trusts: {why}"
             );
-            if f.standing == Standing::Removed {
+            if f.removed_by_peer {
                 continue;
             }
             // A link that is up and refused reads refused, whatever the

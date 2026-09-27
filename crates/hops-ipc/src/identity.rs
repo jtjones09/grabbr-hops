@@ -16,10 +16,10 @@ const FINGERPRINT_GROUPS: usize = 32;
 ///
 /// Computed leaf-cert fingerprints are lowercase `aa:bb:..`. Two of our own
 /// hardening commits once disagreed about where that normalisation happens:
-/// `Config::authorized_fingerprints` lowercased on READ while the revocation
-/// tombstone was looked up case-SENSITIVELY, so re-authorizing an expelled
-/// fingerprint with `A-F` uppercased missed the tombstone, and the next config
-/// read folded it back to canonical form. The expelled device was trusted
+/// `Config::authorized_fingerprints` lowercased on READ while the removal
+/// record of the time was looked up case-SENSITIVELY, so re-authorizing a
+/// removed fingerprint with `A-F` uppercased missed it, and the next config
+/// read folded it back to canonical form. The removed device was trusted
 /// again. Neither commit was wrong on its own; they were wrong together
 /// (issue #67).
 ///

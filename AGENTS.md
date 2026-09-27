@@ -55,7 +55,8 @@ it is the previous context window's state. See `.claude/skills/handoff/`.
 - **`hops-proto`** carries `Hello`, `Capability { flags }` (append-only bits, ours — upstream
   has no capability negotiation), and the input events.
 - **`hops-ipc`** is the daemon↔frontend channel, **token-authenticated** (`0600`, beside
-  `config.toml`). On Windows it is a localhost TCP socket, so the token is load-bearing.
+  `config.toml`). On Windows it is a named pipe granted to this user alone. Each side proves
+  it holds the token without sending it, so neither trusts whatever holds the endpoint.
 
 ### Frontends
 
@@ -71,8 +72,12 @@ tables (`[[clients]]` + `[authorized_fingerprints]`). Frontends render `AppModel
 filtered by `is_listable()`. **Never render the two tables separately** — that is the
 double-entry bug the model exists to end.
 
-Trust is destructive by design: delete revokes, a revoked fingerprint is a permanent tombstone,
-and there is **no restore path**. Do not add one.
+Removing a device forgets it: its lease, address and identity record go, and no record of the
+removal is kept — no tombstone, no restore verb, no reset. A removed machine returns only through
+the full pairing (a prompt after someone opens add device, approval on both machines, the same
+number confirmed on both). The other machine is told: over the live link when there is one,
+otherwise by an `access_denied` refusal on its next dial, which marks its card. Guarded in
+`src/decision_guards.rs` (`removing_a_device_forgets_it`); do not bring the tombstone back.
 
 ## Hard constraints
 

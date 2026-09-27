@@ -40,7 +40,6 @@ export struct DeviceRow {
                          // rename carry, so the daemon can refuse them once
                          // the device is pinned to another machine (#94)
     trusted: bool,       // its fingerprint is in authorized_fingerprints
-    revoked: bool,       // the user expelled it; shown, not forgotten
     clipboard: string,   // which way the clipboard goes, for the edit panel,
                          // or "" when no pairing holds one (#182)
     clipboard-on: bool,  // some direction is on, so it can be switched off
@@ -880,11 +879,12 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                         overflow: elide;
                                     }
                                     // The dot alone cannot say WHY: "not
-                                    // accepting input" and "unreachable" need
-                                    // different fixes (#92, #144). One line,
-                                    // elided, NEVER wrapped: the row is a fixed
-                                    // 56px and a wrapped block overflows into
-                                    // the row below it.
+                                    // accepting input", "unreachable" and "it
+                                    // removed this machine" need different
+                                    // fixes (#92, #144, #184). One
+                                    // line, elided, NEVER wrapped: the row is a
+                                    // fixed 56px and a wrapped block overflows
+                                    // into the row below it.
                                     Text {
                                         text: d.status;
                                         color: root.tone-color(d.tone);
@@ -922,9 +922,8 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                 // the row is keyed by fingerprint instead —
                                 // without that, "edit" never rendered for an
                                 // inbound peer and it could not be named at all.
-                                // Hidden while this row is mid-confirm, and for
-                                // an expelled row, which is inert by design.
-                                if (d.has-send || d.trusted) && !d.revoked && !confirming: VerticalLayout {
+                                // Hidden while this row is mid-confirm.
+                                if (d.has-send || d.trusted) && !confirming: VerticalLayout {
                                     alignment: center;
                                     PillButton {
                                         text: "edit";
@@ -955,20 +954,16 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                 if d.has-send && root.confirm-delete-handle == d.handle: VerticalLayout {
                                     alignment: center;
                                     spacing: 1px;
-                                    // Say what this DOES. "delete + untrust" read as
-                                    // reversible; it is not — the fingerprint is
-                                    // tombstoned and that identity can never be
-                                    // trusted again. The TUI has always said so and
-                                    // the GUI did not, which is how both machines on
-                                    // the rig got permanently expelled by accident
-                                    // on 2026-08-31 (#33, #125).
+                                    // Say what this DOES: this machine forgets
+                                    // that one, and using it again means pairing
+                                    // the two machines again (#184).
                                     Text {
-                                        text: d.trusted ? "delete permanently?" : "delete?";
+                                        text: "delete?";
                                         color: Theme.c.muted;
                                         font-size: Type.small;
                                     }
                                     if d.trusted: Text {
-                                        text: "it must pair again with a NEW identity";
+                                        text: "to use it again, pair it again";
                                         color: Theme.c.error;
                                         font-size: Type.caption;
                                     }
@@ -995,19 +990,6 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                 }
 
                                 // --- receive-only facet: revoke ---
-                                // An expelled device is shown, never re-trustable.
-                                // The identity is a tombstone: re-establishing means
-                                // that machine presenting a NEW one and pairing fresh.
-                                if d.revoked: VerticalLayout {
-                                    alignment: center;
-                                    Text {
-                                        text: "removed — pair again with a new identity";
-                                        color: Theme.c.error;
-                                        font-size: Type.small;
-                                        font-weight: Type.medium;
-                                        overflow: elide;
-                                    }
-                                }
                                 // NB the handle guard must not fire on receive-only
                                 // rows, whose handle is "" — the same as the
                                 // default confirm-delete-handle, which silently hid
@@ -1027,16 +1009,16 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                 if d.trusted && revoking: VerticalLayout {
                                     alignment: center;
                                     spacing: 1px;
-                                    // Same honesty as delete: revoking writes a
-                                    // permanent tombstone, and "remove?" did not say
-                                    // that (#33, #125).
+                                    // Same words as delete: removing forgets the
+                                    // machine, and it returns only by pairing
+                                    // again (#184).
                                     Text {
-                                        text: "remove permanently?";
+                                        text: "remove?";
                                         color: Theme.c.muted;
                                         font-size: Type.small;
                                     }
                                     Text {
-                                        text: "it must pair again with a NEW identity";
+                                        text: "to use it again, pair it again";
                                         color: Theme.c.error;
                                         font-size: Type.caption;
                                     }

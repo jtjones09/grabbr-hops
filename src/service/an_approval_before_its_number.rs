@@ -22,7 +22,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// What must happen is waited for this long at most.
 const DEADLINE: Duration = Duration::from_secs(30);
@@ -158,7 +158,10 @@ async fn knock_until_asked(service: &mut Service, fp: &str) -> bool {
 
 /// A frontend connected to the daemon over its IPC socket.
 struct Frontend {
-    lines: tokio::io::Lines<BufReader<tokio::net::UnixStream>>,
+    lines: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    tx: tokio::net::unix::OwnedWriteHalf,
+    /// The token, until the proof is made on the first read.
+    unproven: Option<String>,
 }
 
 impl Frontend {
@@ -167,20 +170,30 @@ impl Frontend {
             unreachable!("a unix socket")
         };
         let token = std::fs::read_to_string(scratch.dir.join("ipc-token")).expect("the token");
-        let mut stream = tokio::net::UnixStream::connect(path)
+        let stream = tokio::net::UnixStream::connect(path)
             .await
             .expect("the daemon's socket");
-        stream
-            .write_all(format!("{}\n", token.trim()).as_bytes())
-            .await
-            .expect("the token is sent");
+        let (rx, tx) = stream.into_split();
         Self {
-            lines: BufReader::new(stream).lines(),
+            lines: BufReader::new(rx).lines(),
+            tx,
+            unproven: Some(token.trim().to_string()),
+        }
+    }
+
+    /// Make the two-way proof, the first time it is read from. The daemon
+    /// answers only while its loop runs, which it does while this is read.
+    async fn prove(&mut self) {
+        if let Some(token) = self.unproven.take() {
+            hops_ipc::prove_to_daemon(self.lines.get_mut(), &mut self.tx, &token)
+                .await
+                .expect("the two-way proof is made");
         }
     }
 
     /// The next event it is sent; `None` once the daemon hangs up.
     async fn next(&mut self) -> Option<FrontendEvent> {
+        self.prove().await;
         while let Ok(Some(line)) = self.lines.next_line().await {
             if let Ok(event) = serde_json::from_str(&line) {
                 return Some(event);
@@ -197,6 +210,29 @@ async fn serve<T>(service: &mut Service, until: impl Future<Output = T>, what: &
         found = until => found,
         _ = tokio::time::sleep(DEADLINE) => panic!("{what}"),
     }
+}
+
+/// A frontend that has made the two-way proof, which the daemon's listener
+/// answers only while it is polled, and before which it sends a frontend
+/// nothing. Polls the listener alone, not the loop, so a test can attach
+/// before it sets up what the loop will tell frontends about.
+async fn attached(service: &mut Service, scratch: &Scratch) -> Frontend {
+    use futures::StreamExt;
+    let mut frontend = Frontend::connect(scratch).await;
+    {
+        let proving = frontend.prove();
+        tokio::pin!(proving);
+        let deadline = tokio::time::sleep(DEADLINE);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                () = &mut proving => break,
+                _ = service.frontend_listener.next() => {}
+                _ = &mut deadline => panic!("the frontend's two-way proof was never answered"),
+            }
+        }
+    }
+    frontend
 }
 
 /// `at` moved back by the pairing window: as if it happened that long ago.
@@ -216,13 +252,13 @@ fn an_approval_that_shows_no_number_within_the_window_is_forgotten() {
         let (mut service, scratch) = daemon("late").await;
         let peer = machine().fingerprint;
         approve(&mut service, &peer, AttemptOrigin::Inbound);
+        let mut frontend = attached(&mut service, &scratch).await;
         let when = service
             .approved
             .get_mut(&peer)
             .expect("the approval is held");
         when.0 = a_window_before(when.0);
 
-        let mut frontend = Frontend::connect(&scratch).await;
         let told = serve(
             &mut service,
             async {
@@ -398,12 +434,12 @@ fn machines_adding_each_other_are_told_so() {
             "the same crossing was announced again: {again:?}"
         );
 
+        let mut frontend = attached(&mut service, &scratch).await;
         let started = service.adding.get_mut(&handle).expect("still adding");
         *started = a_window_before(*started);
         // The loop sets up capture for every device switched on as it starts,
         // and this one was switched on before it ran: undo that here.
         service.capture.destroy(handle);
-        let mut frontend = Frontend::connect(&scratch).await;
         let gave_up = serve(
             &mut service,
             async {
