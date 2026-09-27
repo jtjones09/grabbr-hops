@@ -9,6 +9,7 @@
 //! or trust files.
 
 use super::Service;
+use crate::listen::ListenerCreationError;
 use crate::test_harness::{Machine, dialer};
 use crate::transport::Trust;
 use crate::trust::{Caps, TrustStore};
@@ -22,6 +23,9 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 /// What must happen is waited for this long at most.
 pub(crate) const DEADLINE: Duration = Duration::from_secs(30);
+
+/// How many ports a daemon is built on before its test gives up.
+const PORT_ATTEMPTS: usize = 10;
 
 /// A daemon whose loop is not running yet.
 pub(crate) struct Daemon {
@@ -75,38 +79,64 @@ impl Daemon {
         capture: input_capture::Backend,
         emulation: input_emulation::Backend,
     ) -> Self {
+        Self::build_on(crate::test_ports::pick, tag, tables, capture, emulation).await
+    }
+
+    /// [`Daemon::build`] on the ports `port` gives. A port can be bound by
+    /// another process between being picked and the listener binding it, so
+    /// a daemon whose port is taken is built again on the next.
+    async fn build_on(
+        mut port: impl FnMut() -> u16,
+        tag: &str,
+        tables: &str,
+        capture: input_capture::Backend,
+        emulation: input_emulation::Backend,
+    ) -> Self {
         // Short, for a socket path in it (`sun_path`).
         let dir = PathBuf::from(format!("/tmp/h-ip-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a scratch directory");
-        let port = std::net::UdpSocket::bind("127.0.0.1:0")
-            .and_then(|s| s.local_addr())
-            .expect("a free port")
-            .port();
-        let config = dir.join("config.toml");
-        std::fs::write(
-            &config,
-            format!(
-                "port = {port}\ncapture_backend = \"dummy\"\nemulation_backend = \"dummy\"\n\
-                 discovery = false\n\n{tables}"
-            ),
-        )
-        .expect("a config");
-        let endpoint = DaemonEndpoint::Unix(dir.join("s.sock"));
-        let frontends =
-            AsyncFrontendListener::at_with_token_file(&endpoint, &dir.join("ipc-token"))
-                .await
-                .expect("the scratch endpoint");
-        let config = crate::config::Config::in_scratch(&config, &dir.join("hops.pem"))
-            .expect("the scratch config");
-        let service = Service::with_backends(config, frontends, Some(capture), Some(emulation))
-            .await
-            .expect("a daemon in the scratch directory");
-        Self {
-            service,
-            scratch: Scratch { dir },
-            port,
+        let scratch = Scratch { dir };
+        let dir = &scratch.dir;
+        let mut last = None;
+        for _ in 0..PORT_ATTEMPTS {
+            let port = port();
+            let config = dir.join("config.toml");
+            std::fs::write(
+                &config,
+                format!(
+                    "port = {port}\ncapture_backend = \"dummy\"\nemulation_backend = \"dummy\"\n\
+                     discovery = false\n\n{tables}"
+                ),
+            )
+            .expect("a config");
+            let endpoint = DaemonEndpoint::Unix(dir.join("s.sock"));
+            let frontends =
+                AsyncFrontendListener::at_with_token_file(&endpoint, &dir.join("ipc-token"))
+                    .await
+                    .expect("the scratch endpoint");
+            let config = crate::config::Config::in_scratch(&config, &dir.join("hops.pem"))
+                .expect("the scratch config");
+            match Service::with_backends(config, frontends, Some(capture), Some(emulation)).await {
+                Ok(service) => {
+                    return Self {
+                        service,
+                        scratch,
+                        port,
+                    };
+                }
+                Err(super::ServiceError::ListenError(ListenerCreationError::Io(e)))
+                    if e.kind() == std::io::ErrorKind::AddrInUse =>
+                {
+                    last = Some(e);
+                }
+                Err(e) => panic!("a daemon in the scratch directory: {e:?}"),
+            }
         }
+        panic!(
+            "every port picked for the daemon was taken before its listener bound it; \
+             the last: {last:?}"
+        )
     }
 
     /// This machine's fingerprint.
@@ -362,4 +392,62 @@ pub(crate) async fn until_paired(trust: &Trust, fp: &str) {
         !trust.read().expect("lock").capabilities(fp).is_empty()
     })
     .await;
+}
+
+// LEDGER T229a | class B | 1 the port the built daemon's listener holds, and the ports it was offered
+/// A port taken between being picked and the listener binding it costs a
+/// second port, not the test: the daemon is built again on another, and its
+/// listener holds that one.
+#[test]
+fn a_daemon_whose_port_was_taken_first_is_built_on_another() {
+    crate::test_harness::run_local(async {
+        let taken = crate::test_ports::pick();
+        let _holder = std::net::UdpSocket::bind(("127.0.0.1", taken)).expect("the port is held");
+        let offered = std::cell::RefCell::new(Vec::new());
+        let daemon = Daemon::build_on(
+            || {
+                let port = if offered.borrow().is_empty() {
+                    taken
+                } else {
+                    crate::test_ports::pick()
+                };
+                offered.borrow_mut().push(port);
+                port
+            },
+            "taken",
+            "",
+            input_capture::Backend::Dummy,
+            input_emulation::Backend::Dummy,
+        )
+        .await;
+        let port = daemon.port();
+        let listener_holds_it = std::net::UdpSocket::bind(("127.0.0.1", port)).is_err();
+        daemon.run_while(async {}).await;
+        assert_eq!(
+            (offered.into_inner(), listener_holds_it),
+            (vec![taken, port], true),
+            "the daemon was not built again on a second port when its first was taken"
+        );
+    });
+}
+
+// LEDGER T229i | class B | 1 how building a daemon whose every port is taken fails
+/// A daemon whose every port is taken fails its test with what the listener
+/// last failed with, so an address in use for another reason is not read as
+/// a port race alone.
+#[test]
+#[should_panic(expected = "was taken before its listener bound it; the last: Some(Os {")]
+fn a_daemon_whose_every_port_is_taken_fails_with_the_last_error() {
+    crate::test_harness::run_local(async {
+        let taken = crate::test_ports::pick();
+        let _holder = std::net::UdpSocket::bind(("127.0.0.1", taken)).expect("the port is held");
+        Daemon::build_on(
+            || taken,
+            "alltaken",
+            "",
+            input_capture::Backend::Dummy,
+            input_emulation::Backend::Dummy,
+        )
+        .await;
+    });
 }

@@ -8,8 +8,9 @@
 //! server that counts connection attempts.
 #![cfg(unix)]
 
+mod common;
+
 use std::cell::Cell;
-use std::net::UdpSocket;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
@@ -54,47 +55,38 @@ fn start() -> (Daemon, u16) {
         std::env::set_var("XDG_RUNTIME_DIR", &dir);
         std::env::set_var("XDG_CONFIG_HOME", dir.join(".config"));
     }
-    let port = UdpSocket::bind("127.0.0.1:0")
-        .and_then(|s| s.local_addr())
-        .expect("a free port")
-        .port();
     let config = config_dir.join("config.toml");
-    std::fs::write(
-        &config,
-        format!(
-            "port = {port}\ncapture_backend = \"dummy\"\nemulation_backend = \"dummy\"\ndiscovery = false\n"
-        ),
-    )
-    .expect("a config");
     let log = dir.join("daemon.log");
-    let child = Command::new(env!("CARGO_BIN_EXE_hops"))
-        .arg("--config")
-        .arg(&config)
-        .arg("--cert-path")
-        .arg(config_dir.join("lan-mouse.pem"))
-        .arg("daemon")
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", &dir)
-        .env("XDG_RUNTIME_DIR", &dir)
-        .env("XDG_CONFIG_HOME", dir.join(".config"))
-        .env("XDG_STATE_HOME", &dir)
-        .env("HOPS_LOG_FILE", &log)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("the hops binary starts");
+    let (child, port) = common::launch(
+        &config,
+        |port| {
+            format!(
+                "port = {port}\ncapture_backend = \"dummy\"\nemulation_backend = \"dummy\"\ndiscovery = false\n"
+            )
+        },
+        &log,
+        || {
+            Command::new(env!("CARGO_BIN_EXE_hops"))
+                .arg("--config")
+                .arg(&config)
+                .arg("--cert-path")
+                .arg(config_dir.join("lan-mouse.pem"))
+                .arg("daemon")
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("HOME", &dir)
+                .env("XDG_RUNTIME_DIR", &dir)
+                .env("XDG_CONFIG_HOME", dir.join(".config"))
+                .env("XDG_STATE_HOME", &dir)
+                .env("HOPS_LOG_FILE", &log)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("the hops binary starts")
+        },
+    );
     let daemon = Daemon { child, dir, log };
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while !daemon.log().contains("service running; stops on") {
-        assert!(
-            Instant::now() < deadline,
-            "the daemon never reported its service loop running; log:\n{}",
-            daemon.log()
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
     (daemon, port)
 }
 

@@ -12,12 +12,13 @@
 //! [`machines`]).
 #![cfg(unix)]
 
+mod common;
+
 use std::future::Future;
-use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures::StreamExt;
 use hops_ipc::{
@@ -54,25 +55,12 @@ impl Daemon {
     }
 
     /// Wait for the service loop; `false` when the daemon stopped because
-    /// its port was taken meanwhile, which a busy test run can do between
-    /// choosing a free port and binding it.
+    /// its port was taken meanwhile.
     fn wait_until_running(&mut self) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while !self.log().contains("service running; stops on") {
-            if self.child.try_wait().ok().flatten().is_some()
-                && self.log().contains("Address already in use")
-            {
-                return false;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the daemon never reported its service loop running; log:\n{}",
-                self.log()
-            );
-            std::thread::sleep(Duration::from_millis(50));
+        if common::wait_until_running(&mut self.child, &self.log).is_err() {
+            return false;
         }
-        // Let the config watcher drain what starting wrote (see tests/common).
-        std::thread::sleep(Duration::from_secs(1));
+        drain_the_watcher();
         true
     }
 
@@ -116,31 +104,10 @@ fn shared_config(dir: &Path) -> PathBuf {
 /// this process's `HOME` and `XDG_RUNTIME_DIR` to find its endpoint, so call
 /// it before anything runs alongside.
 fn start(base: &Path, name: &str, tables: &str) -> Daemon {
-    for _ in 0..5 {
-        if let Some(daemon) = try_start(base, name, tables) {
-            return daemon;
-        }
-    }
-    panic!("the daemon in {name} never found a free port");
-}
-
-fn try_start(base: &Path, name: &str, tables: &str) -> Option<Daemon> {
     let dir = base.join(name);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("Library/Caches")).expect("scratch caches");
-    let port = UdpSocket::bind("127.0.0.1:0")
-        .and_then(|s| s.local_addr())
-        .expect("a free port")
-        .port();
     let config = dir.join("config.toml");
-    std::fs::write(
-        &config,
-        format!(
-            "port = {port}\ncapture_backend = \"dummy\"\nemulation_backend = \"dummy\"\n\
-             discovery = false\n\n{tables}"
-        ),
-    )
-    .expect("a config");
     // SAFETY: the tests in this binary take turns (see `machines`), and
     // nothing else reads the environment meanwhile.
     let endpoint = unsafe {
@@ -149,15 +116,31 @@ fn try_start(base: &Path, name: &str, tables: &str) -> Option<Daemon> {
         DaemonEndpoint::of_this_platform().expect("an endpoint")
     };
     let log = dir.join("daemon.log");
-    let mut daemon = Daemon {
-        child: spawn(&dir, &config, &log),
+    let (child, port) = common::launch(
+        &config,
+        |port| {
+            format!(
+                "port = {port}\ncapture_backend = \"dummy\"\nemulation_backend = \"dummy\"\n\
+                 discovery = false\n\n{tables}"
+            )
+        },
+        &log,
+        || spawn(&dir, &config, &log),
+    );
+    drain_the_watcher();
+    Daemon {
+        child,
         log,
         dir,
         config,
         port,
         endpoint,
-    };
-    daemon.wait_until_running().then_some(daemon)
+    }
+}
+
+/// Let the config watcher drain what starting wrote (see tests/common).
+fn drain_the_watcher() {
+    std::thread::sleep(Duration::from_secs(1));
 }
 
 /// The first event within `within` that `pick` makes something of.

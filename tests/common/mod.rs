@@ -6,8 +6,13 @@
 // Each test binary that includes this uses part of it.
 #![allow(dead_code)]
 
-use std::net::{SocketAddr, UdpSocket};
-use std::path::PathBuf;
+/// Ports for a daemon, where no dial is given one (shared with the crate's
+/// own tests).
+#[path = "../../src/test_ports.rs"]
+pub mod ports;
+
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -40,6 +45,11 @@ impl Daemon {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
 
+    /// Whether the daemon has not exited.
+    pub fn is_running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
     /// Stop the daemon and start it again on the same files, logging to a
     /// new file, and return once it reports its service loop running.
     pub fn restart(&mut self) {
@@ -48,19 +58,16 @@ impl Daemon {
         self.starts += 1;
         self.log = self.dir.join(format!("daemon.{}.log", self.starts));
         self.child = spawn(&self.dir, &self.config, &self.log);
-        self.wait_until_running();
-    }
-
-    fn wait_until_running(&self) {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while !self.log().contains("service running; stops on") {
-            assert!(
-                Instant::now() < deadline,
-                "the daemon never reported its service loop running; log:\n{}",
+        if wait_until_running(&mut self.child, &self.log).is_err() {
+            panic!(
+                "the daemon's port was taken while it restarted; log:\n{}",
                 self.log()
             );
-            std::thread::sleep(Duration::from_millis(50));
         }
+        self.drain_the_watcher();
+    }
+
+    fn drain_the_watcher(&self) {
         // Starting writes the token, keys and trust files next to the config, and
         // the config watcher reports each. A config write while those are still
         // queued can stop the daemon on macOS (a defect of the watcher, not of
@@ -100,6 +107,11 @@ fn spawn(dir: &std::path::Path, config: &std::path::Path, log: &std::path::Path)
 /// and token. So call it once per test binary, before anything that reads
 /// the environment.
 pub fn start(tag: &str, tables: &str) -> (Daemon, u16) {
+    start_on(ports::pick, tag, tables)
+}
+
+/// [`start`] on the ports `port` gives, one per start (see [`launch_on`]).
+pub fn start_on(port: impl FnMut() -> u16, tag: &str, tables: &str) -> (Daemon, u16) {
     // Short, for `sun_path` (about 104 bytes on macOS).
     let dir = PathBuf::from(format!("/tmp/{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -113,20 +125,19 @@ pub fn start(tag: &str, tables: &str) -> (Daemon, u16) {
         std::env::set_var("XDG_RUNTIME_DIR", &dir);
         std::env::set_var("XDG_CONFIG_HOME", dir.join(".config"));
     }
-    let port = UdpSocket::bind("127.0.0.1:0")
-        .and_then(|s| s.local_addr())
-        .expect("a free port")
-        .port();
     let config = config_dir.join("config.toml");
-    std::fs::write(
-        &config,
-        format!(
-            "port = {port}\ncapture_backend = \"dummy\"\nemulation_backend = \"dummy\"\ndiscovery = false\n\n{tables}"
-        ),
-    )
-    .expect("a config");
     let log = dir.join("daemon.log");
-    let child = spawn(&dir, &config, &log);
+    let (child, port) = launch_on(
+        port,
+        &config,
+        |port| {
+            format!(
+                "port = {port}\ncapture_backend = \"dummy\"\nemulation_backend = \"dummy\"\ndiscovery = false\n\n{tables}"
+            )
+        },
+        &log,
+        || spawn(&dir, &config, &log),
+    );
     let daemon = Daemon {
         child,
         dir,
@@ -134,8 +145,105 @@ pub fn start(tag: &str, tables: &str) -> (Daemon, u16) {
         config,
         starts: 0,
     };
-    daemon.wait_until_running();
+    daemon.drain_the_watcher();
     (daemon, port)
+}
+
+/// How many ports a daemon is started on before its test gives up.
+const PORT_ATTEMPTS: usize = 10;
+
+/// The daemon's port was bound by something else before the daemon bound it;
+/// what it logged.
+#[derive(Debug)]
+pub struct PortTaken(pub String);
+
+/// Whether a daemon's log says it stopped because its port was in use.
+pub fn port_taken(log: &str) -> bool {
+    log.contains("Address already in use") || log.contains("os error 10048")
+}
+
+/// Wait until the daemon `child`, logging to `log`, reports its service loop
+/// running, or `Err(PortTaken)` once it has exited saying an address was in
+/// use. Its exiting for any other reason fails the test at once, and so
+/// does its not running within a minute, each with its log.
+pub fn wait_until_running(child: &mut Child, log: &Path) -> Result<(), PortTaken> {
+    let read = || std::fs::read_to_string(log).unwrap_or_default();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if read().contains("service running; stops on") {
+            return Ok(());
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            let text = read();
+            if text.contains("service running; stops on") {
+                return Ok(());
+            }
+            if port_taken(&text) {
+                return Err(PortTaken(text));
+            }
+            panic!("the daemon exited ({status}) before its service loop ran; log:\n{text}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the daemon never reported its service loop running; log:\n{}",
+            read()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Start a daemon on a port from [`ports::pick`], and return it, running,
+/// with that port: `config_for(port)` is written to `config`, and `spawn`
+/// starts the daemon logging to `log`.
+///
+/// Another process can bind the port between its being picked and the
+/// daemon binding it. The daemon then exits, and is started again on
+/// another port.
+pub fn launch(
+    config: &Path,
+    config_for: impl Fn(u16) -> String,
+    log: &Path,
+    spawn: impl FnMut() -> Child,
+) -> (Child, u16) {
+    launch_on(ports::pick, config, config_for, log, spawn)
+}
+
+/// [`launch`] on the ports `port` gives, one per start.
+pub fn launch_on(
+    mut port: impl FnMut() -> u16,
+    config: &Path,
+    config_for: impl Fn(u16) -> String,
+    log: &Path,
+    mut spawn: impl FnMut() -> Child,
+) -> (Child, u16) {
+    let mut last = String::new();
+    for _ in 0..PORT_ATTEMPTS {
+        let port = port();
+        std::fs::write(config, config_for(port)).expect("a config");
+        // Each start's log on its own, so an earlier start's exit is not
+        // read as this one's.
+        let _ = std::fs::remove_file(log);
+        let mut child = Reaped(Some(spawn()));
+        match wait_until_running(child.0.as_mut().expect("the child"), log) {
+            Ok(()) => return (child.0.take().expect("the child"), port),
+            Err(PortTaken(text)) => last = text,
+        }
+    }
+    // An address in use can also be something other than the port, so the
+    // last start's log goes with it.
+    panic!("every port picked for the daemon was taken before it bound it; last log:\n{last}");
+}
+
+/// A daemon killed and waited for when a start fails the test.
+struct Reaped(Option<Child>);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 /// Wait at most `within` for a frontend event `pick` accepts, and return

@@ -6,6 +6,8 @@
 //! daemon's resident memory with `ps`.
 #![cfg(unix)]
 
+mod common;
+
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
@@ -68,47 +70,38 @@ fn start(tag: &str) -> (Daemon, PathBuf) {
     let config_dir = dir.join(".config/lan-mouse");
     std::fs::create_dir_all(&config_dir).expect("a scratch config directory");
     std::fs::create_dir_all(dir.join("Library/Caches")).expect("scratch caches");
-    let port = std::net::UdpSocket::bind("127.0.0.1:0")
-        .and_then(|s| s.local_addr())
-        .expect("a free port")
-        .port();
     let config = config_dir.join("config.toml");
-    std::fs::write(
-        &config,
-        format!(
-            "port = {port}\ncapture_backend = \"dummy\"\nemulation_backend = \"dummy\"\ndiscovery = false\n"
-        ),
-    )
-    .expect("a config");
     let log = dir.join("daemon.log");
-    let child = Command::new(env!("CARGO_BIN_EXE_hops"))
-        .arg("--config")
-        .arg(&config)
-        .arg("--cert-path")
-        .arg(config_dir.join("lan-mouse.pem"))
-        .arg("daemon")
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", &dir)
-        .env("XDG_RUNTIME_DIR", &dir)
-        .env("XDG_CONFIG_HOME", dir.join(".config"))
-        .env("XDG_STATE_HOME", &dir)
-        .env("HOPS_LOG_FILE", &log)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("the hops binary starts");
+    let (child, _) = common::launch(
+        &config,
+        |port| {
+            format!(
+                "port = {port}\ncapture_backend = \"dummy\"\nemulation_backend = \"dummy\"\ndiscovery = false\n"
+            )
+        },
+        &log,
+        || {
+            Command::new(env!("CARGO_BIN_EXE_hops"))
+                .arg("--config")
+                .arg(&config)
+                .arg("--cert-path")
+                .arg(config_dir.join("lan-mouse.pem"))
+                .arg("daemon")
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("HOME", &dir)
+                .env("XDG_RUNTIME_DIR", &dir)
+                .env("XDG_CONFIG_HOME", dir.join(".config"))
+                .env("XDG_STATE_HOME", &dir)
+                .env("HOPS_LOG_FILE", &log)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("the hops binary starts")
+        },
+    );
     let daemon = Daemon { child, dir, log };
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while !daemon.log().contains("service running; stops on") {
-        assert!(
-            Instant::now() < deadline,
-            "the daemon never reported its service loop running; log:\n{}",
-            daemon.log()
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
     let socket = find_socket(&daemon.dir).expect("the daemon's frontend socket");
     (daemon, socket)
 }
