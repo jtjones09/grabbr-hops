@@ -3,7 +3,7 @@
 // fields, the two lists, and the live pairing-fp; the callbacks send FrontendRequests.
 
 import { Theme, Type, Space, Radius, Motion, Size } from "theme.slint";
-import { Card, Separator, Dot, Chip, StatChip, SectionTitle, PillButton, TextField, Toggle } from "widgets.slint";
+import { Card, Separator, Dot, Chip, StatChip, SectionTitle, PillButton, TextField, Toggle, NumberButton } from "widgets.slint";
 import { OnboardingWindow } from "onboarding.slint";
 import { LayoutCanvas, CanvasBox } from "layout_canvas.slint";
 import { HopsTray } from "tray.slint";
@@ -126,11 +126,17 @@ export component AppWindow inherits Window {
     // the address that actually answered our dial — the user typed one, and the
     // machine that replies is not always the one they meant (#93)
     in property <string> pairing-addr: "";
-    // Six digits derived from BOTH machines' fingerprints. The other machine
-    // shows the same number; the user's job is to check they match. A
-    // compromised console cannot make the far screen display a number of its
-    // choosing, which is the one property nothing else in this flow has
-    // (#61, #136).
+    // The number card (#11, #167). Both machines approved, and a person must
+    // compare the six digits they arrived at over this connection. The adding
+    // machine shows the number and confirms; the machine being added picks it
+    // from three, and a wrong pick ends the attempt. Rust fills these from the
+    // daemon's check; `in-out` so render_png can show every state.
+    in-out property <string> check-fp: "";
+    in-out property <string> check-from: "";
+    in-out property <bool> check-show: false;
+    in-out property <string> check-number: "";
+    in-out property <[string]> check-choices: [];
+    in-out property <bool> check-answered: false;
 
     // `in-out` so the render_png self-review harness can open it for a look —
     // the same reason confirm-delete-handle is. A confirm state you cannot
@@ -206,6 +212,10 @@ export component AppWindow inherits Window {
     callback enable-clipboard(string /* full fingerprint */);
     callback approve-pairing(string /* name */, string /* full fingerprint */);
     callback deny-pairing(string /* full fingerprint */);
+    // the number shown, to confirm it, or the one picked from three
+    callback confirm-pairing(string /* full fingerprint */, string /* number */);
+    // "cancel" or "none of these": end the pairing, trust nothing
+    callback cancel-pairing(string /* full fingerprint */);
     callback set-theme(int /* palette index */);
     callback create-device(string /* name */, string /* port */, string /* position */);
     // Add device was opened: pairing prompts may appear here for two minutes.
@@ -510,6 +520,82 @@ export component AppWindow inherits Window {
                             PillButton {
                                 text: "deny";
                                 clicked => { root.deny-pairing(root.pairing-fp); }
+                            }
+                        }
+                    }
+                }
+
+                // --- the number ---------------------------------------------------------
+                // After both approvals. The adding machine shows the number; the one
+                // being added asks which of three it sees. Nothing moves until both
+                // machines have answered.
+                if root.check-fp != "": Rectangle {
+                    vertical-stretch: 0;
+                    background: Theme.c.accent.transparentize(0.9);
+                    border-radius: Radius.lg;
+                    border-width: 1px;
+                    border-color: Theme.c.accent.transparentize(0.55);
+                    VerticalLayout {
+                        padding: Space.md;
+                        spacing: Space.sm;
+                        Text {
+                            text: root.check-show
+                                ? "pairing · confirm the number"
+                                : "pairing · pick the number";
+                            color: Theme.c.accent;
+                            font-size: Type.small;
+                            font-weight: Type.semibold;
+                        }
+                        Text {
+                            text: root.check-from;
+                            color: Theme.c.muted;
+                            font-family: Type.mono;
+                            font-size: Type.caption;
+                            letter-spacing: Type.mono-tracking;
+                            overflow: elide;
+                        }
+                        if root.check-show: Text {
+                            text: root.check-number;
+                            color: Theme.c.foreground;
+                            font-family: Type.mono;
+                            font-size: 32px;
+                            font-weight: Type.bold;
+                            letter-spacing: 2px;
+                            horizontal-alignment: center;
+                        }
+                        Text {
+                            text: root.check-answered
+                                ? (root.check-show
+                                    ? "Confirmed here. Waiting for the other machine to pick it."
+                                    : "Picked. Waiting for the other machine to confirm.")
+                                : (root.check-show
+                                    ? "The other machine asks which of three numbers it sees. "
+                                        + "Once this one is picked there, confirm here."
+                                    : "Which number does the other machine show? A wrong pick "
+                                        + "ends the pairing.");
+                            color: Theme.c.muted;
+                            font-size: Type.caption;
+                            wrap: word-wrap;
+                        }
+                        if !root.check-show && !root.check-answered: HorizontalLayout {
+                            spacing: Space.sm;
+                            alignment: center;
+                            for n in root.check-choices: NumberButton {
+                                text: n;
+                                clicked => { root.confirm-pairing(root.check-fp, n); }
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: Space.sm;
+                            alignment: end;
+                            if root.check-show && !root.check-answered: PillButton {
+                                text: "confirm";
+                                primary: true;
+                                clicked => { root.confirm-pairing(root.check-fp, root.check-number); }
+                            }
+                            PillButton {
+                                text: root.check-show || root.check-answered ? "cancel" : "none of these";
+                                clicked => { root.cancel-pairing(root.check-fp); }
                             }
                         }
                     }

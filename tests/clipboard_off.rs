@@ -25,6 +25,7 @@ const DESK_MAC: &str = "1e:19:1b:c4:a8:40:f5:26:37:39:9d:c7:c7:75:fe:17:\
 const OFF: PeerTrust = PeerTrust {
     clipboard_from: false,
     clipboard_to: false,
+    pending: false,
 };
 
 async fn attach() -> (AsyncFrontendEventReader, AsyncFrontendRequestWriter) {
@@ -71,6 +72,7 @@ async fn turning_the_clipboard_off_reaches_the_app_and_survives_a_restart() {
         Some(PeerTrust {
             clipboard_from: true,
             clipboard_to: false,
+            pending: false,
         }),
         "precondition: a machine paired before #182 that may drive this one sends \
          its clipboard here; log:\n{}",

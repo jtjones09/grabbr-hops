@@ -138,7 +138,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hops_ipc::RevokedEntry;
-use hops_ipc::pairing::{canonical_fingerprint, sanitize_label};
+use hops_ipc::identity::{canonical_fingerprint, sanitize_label};
 use thiserror::Error;
 
 /// How long a lease runs from the moment it is issued.
@@ -555,6 +555,16 @@ pub struct Lease {
     /// False for a pairing made before #182, whose clipboard follows the
     /// directions it drives ([`existing_pairing_clipboard`], #186).
     pub clipboard_chosen: bool,
+    /// Both machines confirmed this pairing: the person here, and the other
+    /// machine, which says so by sending its first frame on the connection
+    /// the number was compared on (#11, #167).
+    ///
+    /// An approval alone issues a lease that grants nothing
+    /// ([`effective_capabilities`]): it lets the two machines connect far
+    /// enough to compare a number, and no further. The number dies with the
+    /// connection it was made on, so a lease that never got here is dropped
+    /// when the store loads rather than asked about again.
+    pub confirmed: bool,
 }
 
 /// When a lease stops granting.
@@ -674,7 +684,32 @@ pub fn effective_capabilities(entry: &Entry, ours: &str, now: u64) -> Caps {
         return Caps::NONE;
     }
     match &entry.lease {
+        // Approved here, and the number not yet confirmed on both machines.
+        // The lease exists so the comparison can happen on a real connection;
+        // until it has, every check that asks this function refuses the peer
+        // without knowing pairing exists.
+        Some(lease) if !lease.confirmed => Caps::NONE,
         Some(lease) if lease.issued_to == ours && lease.is_valid_at(now) => lease.caps,
+        _ => Caps::NONE,
+    }
+}
+
+/// The direction an approval here granted `entry`, while the pairing waits
+/// for its number to be confirmed on both machines: its drive bits, or
+/// [`Caps::NONE`] when there is no such pairing.
+///
+/// What a TLS door admits a peer mid-pairing on, and only in the direction
+/// asked for: the listener asks about [`Caps::DRIVE_ME`], the dialler about
+/// [`Caps::I_MAY_DRIVE`]. A machine being added that dials the machine adding
+/// it holds the wrong direction on both ends, so neither door lets it in.
+pub fn awaiting_confirmation(entry: &Entry, ours: &str, now: u64) -> Caps {
+    if entry.denial.is_some() {
+        return Caps::NONE;
+    }
+    match &entry.lease {
+        Some(l) if !l.confirmed && l.issued_to == ours && l.is_valid_at(now) => {
+            l.caps.intersection(Caps::DRIVE_ME | Caps::I_MAY_DRIVE)
+        }
         _ => Caps::NONE,
     }
 }
@@ -819,6 +854,10 @@ impl TrustStore {
 
     /// Issue (or renew, or widen) a lease. The user-facing grant.
     ///
+    /// A new pairing's lease grants nothing until both machines confirm the
+    /// number compared on the connection it lets them make
+    /// ([`TrustStore::confirm`], #11, #167).
+    ///
     /// A grant to a device whose lease is in force adds the granted
     /// capabilities to that lease and keeps its name (#166): approving the
     /// second direction of a pairing leaves the first in place.
@@ -859,6 +898,8 @@ impl TrustStore {
     /// [`TrustStore::issue`] under a term of the test's choosing, so the
     /// window, the sweep and the clock floor stay tested while nothing in
     /// production can issue a term.
+    ///
+    /// Confirmed on both machines, as the pairings those tests are about are.
     #[cfg(test)]
     pub(crate) fn issue_with_term(
         &mut self,
@@ -867,7 +908,8 @@ impl TrustStore {
         caps: Caps,
         term: Term,
     ) -> Result<(), TrustError> {
-        self.issue_lease(fingerprint, label, caps, term, origin_of(caps))
+        self.issue_lease(fingerprint, label, caps, term, origin_of(caps))?;
+        self.confirm(fingerprint)
     }
 
     fn issue_lease(
@@ -888,6 +930,9 @@ impl TrustStore {
             issued_at: now,
             expiry: term.expiry_from(now),
             clipboard_chosen: false,
+            // Nobody has compared a number for it yet. A grant to a pairing
+            // in force keeps that pairing's confirmation below.
+            confirmed: false,
         }
         .canonicalized()?;
 
@@ -950,6 +995,10 @@ impl TrustStore {
                     },
                     issued_at: lease.issued_at,
                     expiry: lease.expiry,
+                    // A pairing in force was confirmed on both machines, and a
+                    // second direction does not ask for the number again: the
+                    // fingerprint it was compared against is pinned (#11).
+                    confirmed: held.confirmed,
                     ..held
                 }
             }
@@ -1038,6 +1087,97 @@ impl TrustStore {
             lease.clipboard_chosen = true;
         }
         Some(true)
+    }
+
+    /// Record that both machines confirmed the pairing with `fingerprint`
+    /// (#11, #167): the person here, and the other machine on the connection
+    /// the number was compared on. The approved lease starts granting.
+    ///
+    /// Not a second grant door. It refuses a fingerprint with no lease
+    /// rather than inserting one, and a removed one outright, so it can only
+    /// finish what an approval here began.
+    pub fn confirm(&mut self, fingerprint: &str) -> Result<(), TrustError> {
+        let fp = key(fingerprint);
+        let entry = self
+            .entries
+            .get_mut(&fp)
+            .ok_or_else(|| TrustError::Unknown(fp.clone()))?;
+        if entry.denial.is_some() {
+            return Err(TrustError::Denied(fp));
+        }
+        let lease = entry.lease.as_mut().ok_or(TrustError::Unknown(fp))?;
+        lease.confirmed = true;
+        Ok(())
+    }
+
+    /// Drop the lease an approval here issued for `fingerprint`, if the
+    /// pairing was never confirmed: a wrong pick, a pairing cancelled or cut
+    /// off, or one nobody finished in time. `true` when one was dropped.
+    ///
+    /// Narrowing only. A confirmed pairing is never touched, so an attempt
+    /// that ends cannot take away a pairing already in use.
+    pub fn forget_unconfirmed(&mut self, fingerprint: &str) -> bool {
+        let fp = key(fingerprint);
+        let Some(entry) = self.entries.get_mut(&fp) else {
+            return false;
+        };
+        if !entry.lease.as_ref().is_some_and(|l| !l.confirmed) {
+            return false;
+        }
+        entry.lease = None;
+        if entry.denial.is_none() {
+            self.entries.remove(&fp);
+        }
+        true
+    }
+
+    /// Whether `fingerprint` holds a lease approved here that waits for both
+    /// machines to confirm the number, in the direction `drive`
+    /// ([`Caps::DRIVE_ME`] or [`Caps::I_MAY_DRIVE`]).
+    ///
+    /// What a TLS door admits a peer mid-pairing on: far enough to compare a
+    /// number, and no further, since [`TrustStore::capabilities`] gives it
+    /// nothing.
+    pub fn awaits(&self, fingerprint: &str, drive: Caps) -> bool {
+        let now = self.now();
+        !drive.is_empty()
+            && self
+                .entries
+                .get(&key(fingerprint))
+                .is_some_and(|e| awaiting_confirmation(e, &self.ours, now).contains(drive))
+    }
+
+    /// Whether `fingerprint` is mid-pairing here, in either direction.
+    pub fn is_pairing(&self, fingerprint: &str) -> bool {
+        let now = self.now();
+        self.entries
+            .get(&key(fingerprint))
+            .is_some_and(|e| !awaiting_confirmation(e, &self.ours, now).is_empty())
+    }
+
+    /// The machines mid-pairing here, for telling frontends: approved, and
+    /// not yet confirmed on both machines.
+    pub fn unconfirmed(&self) -> Vec<String> {
+        let now = self.now();
+        self.entries()
+            .filter(|(_, e)| !awaiting_confirmation(e, &self.ours, now).is_empty())
+            .map(|(fp, _)| fp.to_string())
+            .collect()
+    }
+
+    /// Issue a lease and confirm it, for tests whose subject is something
+    /// other than the confirmation: direction, precedence, removal, the
+    /// clipboard. They were written when an approval alone made a usable
+    /// lease, and "given a paired machine" is what their setups mean.
+    #[cfg(test)]
+    pub(crate) fn issue_confirmed(
+        &mut self,
+        fingerprint: &str,
+        label: &str,
+        caps: Caps,
+    ) -> Result<(), TrustError> {
+        self.issue(fingerprint, label, caps)?;
+        self.confirm(fingerprint)
     }
 
     /// Turn a pairing's clipboard back on: the on arm of #182's per-device
@@ -1276,8 +1416,11 @@ impl TrustStore {
                 );
                 continue;
             }
+            // A pairing not yet confirmed on both machines is not listed: an
+            // older build reading this table as its allowlist would let that
+            // machine drive this one before anyone compared a number (#167).
             if let Some(l) = e.lease.as_ref() {
-                if l.is_valid_at(now) && l.caps.contains(Caps::DRIVE_ME) {
+                if l.confirmed && l.is_valid_at(now) && l.caps.contains(Caps::DRIVE_ME) {
                     authorized.insert(fp.to_string(), l.label.clone());
                 }
             }
@@ -1503,6 +1646,9 @@ impl TrustStore {
                 issued_at: now,
                 expiry: DEFAULT_TERM.expiry_from(now),
                 clipboard_chosen: false,
+                // A person approved each of these, before there was a number
+                // to compare; they cannot be asked about one they never saw.
+                confirmed: true,
             };
             match self.admit(lease) {
                 Ok(()) if !report.leased.contains(&fp) => report.leased.push(fp),
@@ -1579,6 +1725,78 @@ mod tests {
         TrustStore::new(&us(), T0).expect("a fingerprint and a number is the whole of it")
     }
 
+    // LEDGER G-6 | class B | 1 return value: TrustStore::config_cache, capabilities, awaits
+    /// An approval alone grants nothing and is not in the allowlist an older
+    /// build reads, until both machines confirmed the number (#167).
+    #[test]
+    fn a_pending_pairing_is_not_in_the_config_allowlist_or_authorized() {
+        let mut s = store();
+        let peer = fp(0x30);
+        s.issue(&peer, "desk mac", Caps::INBOUND).expect("approve");
+
+        let (authorized, _) = s.config_cache();
+        assert!(
+            !authorized.contains_key(&peer),
+            "a pairing nobody confirmed is in the allowlist an older build \
+             reads as trust"
+        );
+        assert_eq!(s.capabilities(&peer), Caps::NONE, "it grants something");
+        assert!(!s.may_drive_us(&peer) && !s.clipboard_from(&peer));
+        assert!(s.pairings().is_empty(), "it is listed as a pairing");
+        assert_eq!(s.unconfirmed(), vec![peer.clone()]);
+        assert!(
+            s.awaits(&peer, Caps::DRIVE_ME),
+            "no way in to compare the number"
+        );
+        assert!(
+            !s.awaits(&peer, Caps::I_MAY_DRIVE),
+            "it opens the direction nobody approved"
+        );
+
+        s.confirm(&peer).expect("confirm");
+        let (authorized, _) = s.config_cache();
+        assert_eq!(authorized.get(&peer).map(String::as_str), Some("desk mac"));
+        assert_eq!(s.capabilities(&peer), Caps::INBOUND);
+        assert!(
+            !s.awaits(&peer, Caps::DRIVE_ME),
+            "confirmed, it still awaits"
+        );
+    }
+
+    // LEDGER G-6b | class B | 1 return value: TrustStore::confirm, forget_unconfirmed
+    /// Confirming only finishes what an approval here began, and ending an
+    /// attempt never takes a confirmed pairing away.
+    #[test]
+    fn confirming_needs_an_approval_and_ending_keeps_a_confirmed_pairing() {
+        let mut s = store();
+        let (stranger, removed, kept) = (fp(0x31), fp(0x32), fp(0x33));
+        assert!(
+            s.confirm(&stranger).is_err(),
+            "confirming created trust from nothing"
+        );
+        s.issue(&removed, "gone", Caps::INBOUND).expect("approve");
+        s.revoke(&removed);
+        assert!(
+            s.confirm(&removed).is_err(),
+            "a removed device was confirmed"
+        );
+        assert_eq!(s.capabilities(&removed), Caps::NONE);
+
+        s.issue_confirmed(&kept, "kept", Caps::INBOUND)
+            .expect("pair");
+        assert!(
+            !s.forget_unconfirmed(&kept),
+            "an attempt that ended took a confirmed pairing away"
+        );
+        assert!(s.may_drive_us(&kept));
+
+        let pending = fp(0x34);
+        s.issue(&pending, "pending", Caps::OUTBOUND)
+            .expect("approve");
+        assert!(s.forget_unconfirmed(&pending));
+        assert!(!s.is_known(&pending), "an ended attempt left a record");
+    }
+
     /// Turning a clipboard off changes the lease once. Asked again, nothing
     /// changes, so the daemon neither saves nor republishes; a removed or
     /// unknown device has no clipboard to turn off (#182).
@@ -1587,8 +1805,10 @@ mod tests {
     fn turning_the_clipboard_off_again_changes_nothing() {
         let mut s = store();
         let (desk, gone) = (fp(0x10), fp(0x20));
-        s.issue(&desk, "desk mac", Caps::INBOUND).expect("issue");
-        s.issue(&gone, "old laptop", Caps::INBOUND).expect("issue");
+        s.issue_confirmed(&desk, "desk mac", Caps::INBOUND)
+            .expect("issue");
+        s.issue_confirmed(&gone, "old laptop", Caps::INBOUND)
+            .expect("issue");
         s.revoke(&gone);
 
         assert_eq!(s.disable_clipboard(&desk), Some(true), "the first time");
@@ -1621,13 +1841,16 @@ mod tests {
     fn turning_the_clipboard_on_follows_the_drive_bits_and_grants_nothing_else() {
         let mut s = store();
         let (inbound, outbound, both, gone) = (fp(0x10), fp(0x11), fp(0x12), fp(0x20));
-        s.issue(&inbound, "drives this machine", Caps::INBOUND)
+        s.issue_confirmed(&inbound, "drives this machine", Caps::INBOUND)
             .expect("issue");
-        s.issue(&outbound, "driven from here", Caps::OUTBOUND)
+        s.issue_confirmed(&outbound, "driven from here", Caps::OUTBOUND)
             .expect("issue");
-        s.issue(&both, "both ways", Caps::INBOUND).expect("issue");
-        s.issue(&both, "both ways", Caps::OUTBOUND).expect("issue");
-        s.issue(&gone, "old laptop", Caps::INBOUND).expect("issue");
+        s.issue_confirmed(&both, "both ways", Caps::INBOUND)
+            .expect("issue");
+        s.issue_confirmed(&both, "both ways", Caps::OUTBOUND)
+            .expect("issue");
+        s.issue_confirmed(&gone, "old laptop", Caps::INBOUND)
+            .expect("issue");
         for f in [&inbound, &outbound, &both, &gone] {
             assert_eq!(s.disable_clipboard(f), Some(true), "precondition: {f} off");
         }
@@ -1675,6 +1898,37 @@ mod tests {
             !s.is_known(&fp(0x30)),
             "turning the clipboard on made a record for a device never paired"
         );
+    }
+
+    // LEDGER G-6c | class B | 1 return value + 1 struct state: TrustStore::enable_clipboard on an approval not yet confirmed
+    /// An approval whose number nobody confirmed yet is not a pairing, so it
+    /// has no clipboard to turn on, and asking gives it nothing (#167, #182).
+    #[test]
+    fn a_pairing_waiting_for_its_number_has_no_clipboard_to_turn_on() {
+        let mut s = store();
+        let pending = fp(0x35);
+        s.issue(&pending, "not yet", Caps::INBOUND)
+            .expect("approve");
+        assert_eq!(
+            s.disable_clipboard(&pending),
+            Some(true),
+            "precondition: its clipboard bits are off"
+        );
+        assert_eq!(
+            s.enable_clipboard(&pending),
+            None,
+            "a pairing nobody confirmed had a clipboard turned on"
+        );
+        assert_eq!(s.capabilities(&pending), Caps::NONE);
+        assert!(
+            !s.lease(&pending)
+                .expect("still approved")
+                .caps
+                .intersects(Caps::CLIPBOARD),
+            "turning the clipboard on widened a lease that waits for its number"
+        );
+        s.confirm(&pending).expect("confirm");
+        assert_eq!(s.enable_clipboard(&pending), Some(true), "once confirmed");
     }
 
     fn allow(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -1725,7 +1979,7 @@ mod tests {
         // direction handed it the other one for free.
         let mut s = store();
         let peer = fp(0x11);
-        s.issue(&peer, "shop floor pc", Caps::DRIVE_ME)
+        s.issue_confirmed(&peer, "shop floor pc", Caps::DRIVE_ME)
             .expect("issue");
 
         assert!(s.may_drive_us(&peer));
@@ -1755,12 +2009,13 @@ mod tests {
     fn an_expelled_key_is_dead_for_good_and_a_new_one_pairs_from_scratch() {
         let mut s = store();
         let old_key = fp(0x41);
-        s.issue(&old_key, "laptop", Caps::INBOUND).expect("issue");
+        s.issue_confirmed(&old_key, "laptop", Caps::INBOUND)
+            .expect("issue");
         s.revoke(&old_key);
 
         assert!(
             matches!(
-                s.issue(&old_key, "laptop", Caps::INBOUND),
+                s.issue_confirmed(&old_key, "laptop", Caps::INBOUND),
                 Err(TrustError::Expelled { .. })
             ),
             "the expelled key must never be re-authorised, by any route"
@@ -1769,7 +2024,7 @@ mod tests {
 
         // The same machine, a new identity. This is the supported recovery.
         let new_key = fp(0x42);
-        s.issue(&new_key, "laptop", Caps::INBOUND)
+        s.issue_confirmed(&new_key, "laptop", Caps::INBOUND)
             .expect("a new identity pairs from scratch");
         assert!(
             s.may_drive_us(&new_key),
@@ -1785,7 +2040,8 @@ mod tests {
     fn an_old_removal_keeps_biting_after_its_name_is_forgotten() {
         let mut s = store();
         let gone = fp(0x31);
-        s.issue(&gone, "living room", Caps::INBOUND).expect("issue");
+        s.issue_confirmed(&gone, "living room", Caps::INBOUND)
+            .expect("issue");
         s.revoke(&gone);
 
         let far_future = s.now() + NAME_RETENTION_SECS + DAY;
@@ -1843,7 +2099,8 @@ mod tests {
     fn a_live_lease_keeps_its_name_however_old_the_store_is() {
         let mut s = store();
         let live = fp(0x33);
-        s.issue(&live, "desk mac", Caps::INBOUND).expect("issue");
+        s.issue_confirmed(&live, "desk mac", Caps::INBOUND)
+            .expect("issue");
 
         let later = s.now() + NAME_RETENTION_SECS + DAY;
         let (redacted, dropped) = s.forget_stale_names(later);
@@ -1870,6 +2127,7 @@ mod tests {
             Origin::OutboundDial,
         )
         .expect("issue");
+        s.confirm(&receiver).expect("confirm");
 
         assert!(s.we_may_drive(&receiver));
         assert!(s.clipboard_to(&receiver));
@@ -1893,6 +2151,7 @@ mod tests {
         let receiver = fp(0x13);
         s.issue_with_origin(&receiver, "den", Caps::OUTBOUND, Origin::OutboundDial)
             .expect("issue");
+        s.confirm(&receiver).expect("confirm");
 
         assert_eq!(
             s.issue_with_origin(&receiver, "den", Caps::KNOWN, Origin::OutboundDial),
@@ -1926,6 +2185,8 @@ mod tests {
 
         s.issue_with_origin(&peer, "workshop", Caps::OUTBOUND, Origin::OutboundDial)
             .expect("issue");
+
+        s.confirm(&peer).expect("confirm");
         assert_eq!(
             s.capabilities(&peer),
             Caps::OUTBOUND,
@@ -1942,11 +2203,14 @@ mod tests {
     fn an_approval_covering_the_pairing_keeps_its_own_origin() {
         let mut s = store();
         let peer = fp(0x26);
-        s.issue(&peer, "attic", Caps::INBOUND).expect("issue");
+        s.issue_confirmed(&peer, "attic", Caps::INBOUND)
+            .expect("issue");
         assert_eq!(s.lease(&peer).map(|l| l.origin), Some(Origin::Inbound));
 
         s.issue_with_origin(&peer, "attic", Caps::INBOUND, Origin::Migrated)
             .expect("issue");
+
+        s.confirm(&peer).expect("confirm");
         assert_eq!(
             s.lease(&peer).map(|l| (l.caps, l.origin)),
             Some((Caps::INBOUND, Origin::Migrated)),
@@ -1968,7 +2232,8 @@ mod tests {
     fn asking_for_a_capability_this_build_does_not_enforce_is_refused() {
         let mut s = store();
         let peer = fp(0x14);
-        s.issue(&peer, "peer", Caps::DRIVE_ME).expect("issue");
+        s.issue_confirmed(&peer, "peer", Caps::DRIVE_ME)
+            .expect("issue");
         assert!(!s.permits(&peer, Caps(0x4000)));
         assert!(!s.permits(&peer, Caps::DRIVE_ME.union(Caps(0x4000))));
     }
@@ -1990,7 +2255,7 @@ mod tests {
         assert!(Caps::from_bits_truncating(0x4000).is_empty());
         let mut s = store();
         let peer = fp(0x15);
-        s.issue(&peer, "future", Caps::DRIVE_ME.union(Caps(0x4000)))
+        s.issue_confirmed(&peer, "future", Caps::DRIVE_ME.union(Caps(0x4000)))
             .expect("issue");
         assert_eq!(
             s.lease(&peer).expect("lease").caps,
@@ -2017,9 +2282,11 @@ mod tests {
     fn a_lease_issued_today_still_grants_everything_ten_years_on() {
         let mut s = store();
         let (sender, receiver) = (fp(0x26), fp(0x27));
-        s.issue(&sender, "sender", Caps::INBOUND).expect("issue");
+        s.issue_confirmed(&sender, "sender", Caps::INBOUND)
+            .expect("issue");
         s.issue_with_origin(&receiver, "receiver", Caps::OUTBOUND, Origin::OutboundDial)
             .expect("issue");
+        s.confirm(&receiver).expect("confirm");
 
         for later in [T0 + 30 * DAY, T0 + 400 * DAY, T0 + 10 * YEAR] {
             assert!(
@@ -2086,6 +2353,7 @@ mod tests {
                 issued_at: T0,
                 expiry: Expiry::At(T0 + HOUR),
                 clipboard_chosen: false,
+                confirmed: true,
             }),
             denial: None,
         };
@@ -2220,6 +2488,7 @@ mod tests {
             issued_at: T0 - 2_000,
             expiry: Expiry::At(T0 - 500),
             clipboard_chosen: false,
+            confirmed: true,
         };
         let entry = Entry {
             lease: Some(lease),
@@ -2293,7 +2562,8 @@ mod tests {
     fn a_removal_outranks_an_unexpired_lease() {
         let mut s = store();
         let peer = fp(0x43);
-        s.issue(&peer, "kiosk", Caps::KNOWN).expect("issue");
+        s.issue_confirmed(&peer, "kiosk", Caps::KNOWN)
+            .expect("issue");
         assert_eq!(s.revoke(&peer), "kiosk", "the name comes back for the log");
 
         assert!(
@@ -2312,7 +2582,8 @@ mod tests {
         let (lapsed, expelled) = (fp(0x45), fp(0x46));
         s.issue_with_term(&lapsed, "laptop", Caps::DRIVE_ME, Term::Secs(HOUR))
             .expect("issue");
-        s.issue(&expelled, "kiosk", Caps::DRIVE_ME).expect("issue");
+        s.issue_confirmed(&expelled, "kiosk", Caps::DRIVE_ME)
+            .expect("issue");
         s.revoke(&expelled);
         s.clock().observe(T0 + DAY);
 
@@ -2332,7 +2603,8 @@ mod tests {
     fn forgetting_a_device_is_not_the_same_verb_as_removing_it() {
         let mut s = store();
         let peer = fp(0x47);
-        s.issue(&peer, "kiosk", Caps::DRIVE_ME).expect("issue");
+        s.issue_confirmed(&peer, "kiosk", Caps::DRIVE_ME)
+            .expect("issue");
         s.revoke(&peer);
         assert!(s.forget(&peer));
         assert!(
@@ -2358,6 +2630,7 @@ mod tests {
                 issued_at: T0,
                 expiry: Expiry::Never,
                 clipboard_chosen: false,
+                confirmed: true,
             }),
             denial: None,
         };
@@ -2395,6 +2668,7 @@ mod tests {
                 issued_at: T0,
                 expiry: Expiry::Never,
                 clipboard_chosen: false,
+                confirmed: true,
             })
             .expect_err("a lease naming another machine is not a lease here");
         assert!(matches!(err, TrustError::WrongMachine { .. }));
@@ -2407,7 +2681,8 @@ mod tests {
     fn turning_off_the_clipboard_leaves_input_untouched() {
         let mut s = store();
         let peer = fp(0x60);
-        s.issue(&peer, "desk mac", Caps::INBOUND).expect("issue");
+        s.issue_confirmed(&peer, "desk mac", Caps::INBOUND)
+            .expect("issue");
         assert_eq!(
             s.drop_capabilities(&peer, Caps::CLIPBOARD_FROM),
             Some(Caps::DRIVE_ME)
@@ -2425,7 +2700,7 @@ mod tests {
         // wanted to stop sending to also stopped being able to reach you.
         let mut s = store();
         let peer = fp(0x61);
-        s.issue(&peer, "both ways", Caps::INBOUND | Caps::OUTBOUND)
+        s.issue_confirmed(&peer, "both ways", Caps::INBOUND | Caps::OUTBOUND)
             .expect("issue");
         assert_eq!(
             s.drop_capabilities(&peer, Caps::OUTBOUND),
@@ -2440,7 +2715,8 @@ mod tests {
     fn narrowing_everything_ends_the_lease_without_expelling() {
         let mut s = store();
         let peer = fp(0x62);
-        s.issue(&peer, "one way", Caps::DRIVE_ME).expect("issue");
+        s.issue_confirmed(&peer, "one way", Caps::DRIVE_ME)
+            .expect("issue");
         assert_eq!(s.drop_capabilities(&peer, Caps::KNOWN), Some(Caps::NONE));
         assert!(s.lease(&peer).is_none());
         assert!(!s.is_denied(&peer));
@@ -2451,7 +2727,8 @@ mod tests {
     fn narrowing_a_removed_device_keeps_the_removal_on_file() {
         let mut s = store();
         let peer = fp(0x63);
-        s.issue(&peer, "kiosk", Caps::DRIVE_ME).expect("issue");
+        s.issue_confirmed(&peer, "kiosk", Caps::DRIVE_ME)
+            .expect("issue");
         s.revoke(&peer);
         assert_eq!(s.drop_capabilities(&peer, Caps::KNOWN), Some(Caps::NONE));
         assert!(
@@ -2472,7 +2749,8 @@ mod tests {
         // answer is a boolean denial — matching nothing there means NOT denied.
         let mut s = store();
         let peer = fp(0x70);
-        s.issue(&peer, "expelled", Caps::DRIVE_ME).expect("issue");
+        s.issue_confirmed(&peer, "expelled", Caps::DRIVE_ME)
+            .expect("issue");
         s.revoke(&peer);
 
         let shouted = peer.to_uppercase();
@@ -2500,7 +2778,7 @@ mod tests {
         // the permission it was supposed to lose.
         let mut s = store();
         let peer = fp(0x72);
-        s.issue(&peer, "both ways", Caps::INBOUND | Caps::OUTBOUND)
+        s.issue_confirmed(&peer, "both ways", Caps::INBOUND | Caps::OUTBOUND)
             .expect("issue");
         assert_eq!(
             s.drop_capabilities(&peer.to_uppercase(), Caps::OUTBOUND),
@@ -2517,7 +2795,7 @@ mod tests {
     fn one_record_answers_the_same_however_the_fingerprint_is_spelled() {
         let mut s = store();
         let peer = fp(0x73);
-        s.issue(&peer.to_uppercase(), "shouty", Caps::DRIVE_ME)
+        s.issue_confirmed(&peer.to_uppercase(), "shouty", Caps::DRIVE_ME)
             .expect("issue");
         assert_eq!(s.len(), 1, "two spellings must not become two records");
         assert!(s.may_drive_us(&peer) && s.may_drive_us(&peer.to_uppercase()));
@@ -2532,7 +2810,7 @@ mod tests {
     fn a_string_that_is_not_a_fingerprint_cannot_be_granted_anything() {
         let mut s = store();
         assert_eq!(
-            s.issue("not-a-fingerprint", "x", Caps::DRIVE_ME),
+            s.issue_confirmed("not-a-fingerprint", "x", Caps::DRIVE_ME),
             Err(TrustError::BadFingerprint("not-a-fingerprint".to_string()))
         );
         assert!(!s.permits("not-a-fingerprint", Caps::DRIVE_ME));
@@ -2567,6 +2845,7 @@ mod tests {
                 issued_at: T0,
                 expiry: Expiry::At(T0 + MAX_TERM_SECS + 1),
                 clipboard_chosen: false,
+                confirmed: true,
             })
             .expect_err("a replayed record may not exceed it either");
         assert!(matches!(err, TrustError::TermTooLong { .. }));
@@ -2591,6 +2870,7 @@ mod tests {
             issued_at: T0,
             expiry: Expiry::Never,
             clipboard_chosen: false,
+            confirmed: true,
         })
         .expect("a lease with no term must be admissible");
         assert!(s.may_drive_us(&peer));
@@ -2600,11 +2880,11 @@ mod tests {
     fn a_lease_that_permits_nothing_is_refused() {
         let mut s = store();
         assert_eq!(
-            s.issue(&fp(0x77), "", Caps::NONE),
+            s.issue_confirmed(&fp(0x77), "", Caps::NONE),
             Err(TrustError::NoCapabilities)
         );
         assert_eq!(
-            s.issue(&fp(0x77), "", Caps(0x4000)),
+            s.issue_confirmed(&fp(0x77), "", Caps(0x4000)),
             Err(TrustError::NoCapabilities),
             "a lease made only of bits this build does not enforce decides \
              nothing, and must say so rather than sit there reading as trust"
@@ -2618,7 +2898,7 @@ mod tests {
         // and both UIs. Only the rename verb cleaned it.
         let mut s = store();
         let peer = fp(0x78);
-        s.issue(&peer, "ev\u{202e}il\u{0007}\u{200b}", Caps::DRIVE_ME)
+        s.issue_confirmed(&peer, "ev\u{202e}il\u{0007}\u{200b}", Caps::DRIVE_ME)
             .expect("issue");
         assert_eq!(s.label(&peer).as_deref(), Some("evil"));
 
@@ -2648,7 +2928,8 @@ mod tests {
         );
 
         let known = fp(0x7b);
-        s.issue(&known, "old name", Caps::DRIVE_ME).expect("issue");
+        s.issue_confirmed(&known, "old name", Caps::DRIVE_ME)
+            .expect("issue");
         s.set_label(&known, "new name").expect("rename");
         assert_eq!(s.label(&known).as_deref(), Some("new name"));
         assert_eq!(s.capabilities(&known), Caps::DRIVE_ME);
@@ -2875,7 +3156,7 @@ mod tests {
 
         assert!(
             matches!(
-                s.issue(&expelled, "workshop", Caps::INBOUND),
+                s.issue_confirmed(&expelled, "workshop", Caps::INBOUND),
                 Err(TrustError::Expelled { .. })
             ),
             "a removal carried across the migration must still be permanent — \

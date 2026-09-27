@@ -211,7 +211,7 @@ impl Frontend {
 pub(crate) fn trusting(me: &Machine, daemon: &str) -> Trust {
     let mut store = TrustStore::new(&me.fingerprint, 0).expect("our fingerprint");
     store
-        .issue(daemon, "the daemon", Caps::OUTBOUND)
+        .issue_confirmed(daemon, "the daemon", Caps::OUTBOUND)
         .expect("issue");
     Arc::new(RwLock::new(store))
 }
@@ -236,4 +236,95 @@ pub(crate) async fn prompt_from(app: &mut Frontend, stranger: &Machine, port: u1
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// A pairing the daemon approved, part way (#167): the machine it approved
+/// dialled again, both arrived at a number, and the daemon put its three
+/// choices in front of the app. That machine has already sent its
+/// confirmation, which the daemon reads only once the app picks the number.
+pub(crate) struct Comparing {
+    /// The number both machines arrived at.
+    pub(crate) number: String,
+    // Held so the connection stays up while the test runs.
+    _conn: quinn::Connection,
+    _send: quinn::SendStream,
+    _endpoint: quinn::Endpoint,
+}
+
+/// Dial the daemon as `stranger` does once its knock was approved there, and
+/// compare the number: the machine that knocked is the one adding, so it
+/// shows the number, and the daemon asks the app which of three it is.
+pub(crate) async fn compare_number(
+    app: &mut Frontend,
+    stranger: &Machine,
+    port: u16,
+    daemon: &str,
+) -> Comparing {
+    crate::transport::install_crypto_provider();
+    let mut endpoint =
+        quinn::Endpoint::client("127.0.0.1:0".parse().expect("loopback")).expect("an endpoint");
+    endpoint.set_default_client_config(crate::test_harness::raw_client_config(
+        stranger,
+        trusting(stranger, daemon),
+        1 << 20,
+    ));
+    let at = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let conn = tokio::time::timeout(DEADLINE, endpoint.connect(at, "grabbr").expect("a dial"))
+        .await
+        .expect("the daemon answers in time")
+        .expect("the daemon admits a machine it approved, to compare a number");
+    let number = crate::pair_ceremony::as_initiator(&conn, &stranger.fingerprint, daemon)
+        .await
+        .expect("the two machines compare a number");
+
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    loop {
+        let events = app.exchange(&[]).await;
+        let offered = events.iter().find_map(|e| match e {
+            FrontendEvent::PairingCheck {
+                fingerprint,
+                check: hops_ipc::PairingCheck::Pick(choices),
+                ..
+            } if *fingerprint == stranger.fingerprint => Some(choices.clone()),
+            _ => None,
+        });
+        if let Some(choices) = offered {
+            assert!(
+                choices.contains(&number),
+                "the daemon offered {choices:?}, and not the number both machines \
+                 arrived at, {number}"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the daemon never asked the app which number the other machine shows"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // The machine that knocked confirms: its first frame, on its input stream.
+    let mut send = conn.open_uni().await.expect("an input stream");
+    crate::transport::write_frame(
+        &mut send,
+        ProtoEvent::Hello {
+            commit: crate::config::local_commit(),
+        },
+    )
+    .await
+    .expect("its confirmation is sent");
+    Comparing {
+        number,
+        _conn: conn,
+        _send: send,
+        _endpoint: endpoint,
+    }
+}
+
+/// Wait until the daemon's store holds a pairing for `fp`.
+pub(crate) async fn until_paired(trust: &Trust, fp: &str) {
+    crate::test_harness::wait_until("the pairing is confirmed", DEADLINE, || {
+        !trust.read().expect("lock").capabilities(fp).is_empty()
+    })
+    .await;
 }

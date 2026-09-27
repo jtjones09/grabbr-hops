@@ -386,7 +386,7 @@ impl From<TomlClient> for ConfigClient {
         // as a name given over IPC is (ClientManager::set_label)
         let label = toml
             .label
-            .map(|l| hops_ipc::pairing::sanitize_label(l.trim()))
+            .map(|l| hops_ipc::identity::sanitize_label(l.trim()))
             .filter(|l| !l.trim().is_empty());
         let enter_hook = toml.enter_hook;
         let hostname = toml.hostname;
@@ -396,7 +396,7 @@ impl From<TomlClient> for ConfigClient {
         // reject a malformed value rather than letting it reach the pin
         let fingerprint = toml
             .fingerprint
-            .filter(|fp| hops_ipc::pairing::valid_fingerprint(fp));
+            .filter(|fp| hops_ipc::identity::valid_fingerprint(fp));
         Self {
             label,
             ips,

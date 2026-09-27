@@ -229,7 +229,9 @@ mod tests {
         let (mut saver, mut store) = saved(&disk);
 
         disk.refuse_writes();
-        store.issue(PEER, "peer", Caps::INBOUND).expect("issue");
+        store
+            .issue_confirmed(PEER, "peer", Caps::INBOUND)
+            .expect("issue");
         let _ = saver.save_change(&store, "trusting \"peer\"".into());
         assert!(
             !disk.on_restart().0.contains(&PEER.to_owned()),
@@ -279,7 +281,9 @@ mod tests {
                 .is_some_and(|n| n.contains("removing \"desk mac\"")),
             "a frontend that attaches while the change is unsaved must be told which"
         );
-        store.issue(OTHER, "laptop", Caps::INBOUND).expect("issue");
+        store
+            .issue_confirmed(OTHER, "laptop", Caps::INBOUND)
+            .expect("issue");
         let told = saver
             .save_change(&store, "trusting \"laptop\"".into())
             .expect("a further change that also fails must be reported");

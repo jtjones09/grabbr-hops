@@ -65,7 +65,9 @@ pub(crate) fn machine() -> Machine {
 pub(crate) fn trust(us: &Machine, peers: &[&Machine], caps: Caps) -> Trust {
     let mut store = TrustStore::new(&us.fingerprint, 0).expect("our fingerprint");
     for peer in peers {
-        store.issue(&peer.fingerprint, "peer", caps).expect("issue");
+        store
+            .issue_confirmed(&peer.fingerprint, "peer", caps)
+            .expect("issue");
     }
     Arc::new(RwLock::new(store))
 }

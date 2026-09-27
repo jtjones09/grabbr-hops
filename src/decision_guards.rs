@@ -228,6 +228,13 @@ mod a_grant_carries_only_the_direction_that_was_approved {
         let mut store = fresh();
         grant_for_attempt(&mut store, &peer, "knocked", Some(AttemptOrigin::Inbound))
             .expect("grant");
+        assert_eq!(
+            store.capabilities(&peer),
+            Caps::NONE,
+            "an approval alone grants nothing until both machines confirm the \
+             number (#167)"
+        );
+        store.confirm(&peer).expect("confirm");
         assert!(
             store.may_drive_us(&peer) && !store.we_may_drive(&peer),
             "an approved inbound knock must grant inbound and only inbound (#130)"
@@ -241,6 +248,7 @@ mod a_grant_carries_only_the_direction_that_was_approved {
             Some(AttemptOrigin::OutboundDial),
         )
         .expect("grant");
+        store.confirm(&peer).expect("confirm");
         assert!(
             store.we_may_drive(&peer) && !store.may_drive_us(&peer),
             "an approved outbound dial must grant outbound and only outbound (#130)"
@@ -272,7 +280,7 @@ mod a_grant_carries_only_the_direction_that_was_approved {
         // A receiver we confirmed our own dial reached: outbound only.
         let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
         store
-            .issue(&peer_fp, "a receiver", Caps::OUTBOUND)
+            .issue_confirmed(&peer_fp, "a receiver", Caps::OUTBOUND)
             .expect("issue an outbound-only lease");
         let trust = Arc::new(RwLock::new(store));
 
@@ -498,7 +506,8 @@ mod pairings_made_before_182_keep_the_clipboard_direction_their_lease_grants {
     }
 
     /// Paired on a build with the trust store: each machine approved the
-    /// other's prompt once, in the direction it was asked.
+    /// other's prompt once, in the direction it was asked, and both confirmed
+    /// the number.
     fn approved(driven: &Machine, driver: &Machine) -> (TrustStore, TrustStore) {
         let mut on_driven = TrustStore::new(&driven.fingerprint, 0).expect("ours");
         grant_for_attempt(
@@ -508,6 +517,7 @@ mod pairings_made_before_182_keep_the_clipboard_direction_their_lease_grants {
             Some(AttemptOrigin::Inbound),
         )
         .expect("grant");
+        on_driven.confirm(&driver.fingerprint).expect("confirm");
         let mut on_driver = TrustStore::new(&driver.fingerprint, 0).expect("ours");
         grant_for_attempt(
             &mut on_driver,
@@ -516,6 +526,7 @@ mod pairings_made_before_182_keep_the_clipboard_direction_their_lease_grants {
             Some(AttemptOrigin::OutboundDial),
         )
         .expect("grant");
+        on_driver.confirm(&driven.fingerprint).expect("confirm");
         (on_driven, on_driver)
     }
 
@@ -731,6 +742,9 @@ mod no_pairing_expires_until_renewal_exists {
             Some(AttemptOrigin::OutboundDial),
         )
         .expect("the grant door grants an approved outbound dial");
+        // and both machines confirmed the number (#167)
+        receiving.confirm(&peer_fp).expect("confirm");
+        sending.confirm(&peer_fp).expect("confirm");
 
         let mut refused = Vec::new();
 
@@ -800,6 +814,8 @@ mod no_pairing_expires_until_renewal_exists {
                         Some(AttemptOrigin::OutboundDial),
                     )
                     .expect("grant");
+                    receiving.confirm(&peer_fp).expect("confirm");
+                    sending.confirm(&peer_fp).expect("confirm");
                 }
                 Some(term) => {
                     receiving
@@ -1291,7 +1307,7 @@ mod an_expelled_fingerprint_is_never_re_authorised {
         let peer = fp32(0x77);
         let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
         store
-            .issue(&peer, "a machine", Caps::INBOUND)
+            .issue_confirmed(&peer, "a machine", Caps::INBOUND)
             .expect("issue");
         store.revoke(&peer);
         (store, ours, peer)
@@ -1316,7 +1332,7 @@ mod an_expelled_fingerprint_is_never_re_authorised {
             (
                 "issue",
                 Box::new(|s: &mut TrustStore| {
-                    let _ = s.issue(&fp32(0x77), "back please", Caps::KNOWN);
+                    let _ = s.issue_confirmed(&fp32(0x77), "back please", Caps::KNOWN);
                 }),
             ),
             (
@@ -1360,6 +1376,7 @@ mod an_expelled_fingerprint_is_never_re_authorised {
                         issued_at: 0,
                         expiry: Expiry::Never,
                         clipboard_chosen: false,
+                        confirmed: true,
                     });
                 }),
             ),
@@ -1414,7 +1431,7 @@ mod an_expelled_fingerprint_is_never_re_authorised {
     fn granting_to_a_removed_device_fails_loudly_rather_than_quietly() {
         use crate::trust::TrustError;
         let (mut store, _, peer) = expelled_store();
-        match store.issue(&peer, "back please", Caps::INBOUND) {
+        match store.issue_confirmed(&peer, "back please", Caps::INBOUND) {
             Err(TrustError::Expelled { fingerprint }) => assert_eq!(fingerprint, peer),
             other => panic!(
                 "granting to a removed device returned {other:?}. It must return \
@@ -1573,7 +1590,7 @@ mod an_expelled_fingerprint_is_never_re_authorised {
         let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
 
         store
-            .issue(&expelled, "removed", Caps::INBOUND)
+            .issue_confirmed(&expelled, "removed", Caps::INBOUND)
             .expect("issue");
         store.revoke(&expelled);
 
@@ -1648,7 +1665,7 @@ mod taking_trust_away_is_never_gated_the_way_giving_it_is {
         let peer = fp32(0xaa);
         let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
         store
-            .issue(&peer, "driving me right now", Caps::KNOWN)
+            .issue_confirmed(&peer, "driving me right now", Caps::KNOWN)
             .expect("issue");
 
         // No Result, no authority argument, no clock argument: `revoke` returns
@@ -1710,8 +1727,9 @@ mod taking_trust_away_is_never_gated_the_way_giving_it_is {
              against state only it holds."
         );
 
-        // The arms that MUST consult the gate: they widen trust.
-        for arm in ["AuthorizeKey", "EnableClipboard"] {
+        // The arms that MUST consult the gate: they widen trust. Confirming
+        // a pairing's number is what makes an approval grant (#167).
+        for arm in ["AuthorizeKey", "EnableClipboard", "ConfirmPairing"] {
             let at = dispatch
                 .find(&format!("FrontendRequest::{arm}"))
                 .unwrap_or_else(|| panic!("{arm} must be dispatched; update this guard"));
@@ -1731,7 +1749,12 @@ mod taking_trust_away_is_never_gated_the_way_giving_it_is {
             );
         }
 
-        for arm in ["RemoveAuthorizedKey", "Delete", "DisableClipboard"] {
+        for arm in [
+            "RemoveAuthorizedKey",
+            "Delete",
+            "DisableClipboard",
+            "CancelPairing",
+        ] {
             let at = dispatch
                 .find(&format!("FrontendRequest::{arm}"))
                 .unwrap_or_else(|| panic!("{arm} must be dispatched; update this guard"));
@@ -1781,7 +1804,7 @@ mod removing_a_device_takes_its_key_and_not_merely_its_address {
         let peer = fp32(0xcc);
         let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
         store
-            .issue(&peer, "the sold laptop", Caps::KNOWN)
+            .issue_confirmed(&peer, "the sold laptop", Caps::KNOWN)
             .expect("issue");
         assert!(store.may_drive_us(&peer), "precondition: it was trusted");
 
@@ -1984,26 +2007,28 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
     //! 2026-08-30's rule that no frontend can cause a trust write, whose two
     //! guards stood red until the grant verb left the IPC channel. It stays.
     //!
-    //! **The limit.** Two frontend requests widen trust, and nothing else a
-    //! frontend can send does: `AuthorizeKey`, which approves a prompt the
+    //! **The limit.** Three frontend requests widen trust, and nothing else
+    //! a frontend can send does: `AuthorizeKey`, which approves a prompt the
     //! daemon raised for a machine that arrived while the pairing window was
-    //! open, and `EnableClipboard`, which turns a paired machine's clipboard
-    //! back on in the directions it already drives. The daemon refuses both
-    //! while a peer is driving this machine, so the machine holding the
-    //! keyboard and pointer cannot click its own approval.
+    //! open; `ConfirmPairing`, which answers the number that approval's
+    //! pairing compares, and without which the approval grants nothing
+    //! (#167); and `EnableClipboard`, which turns a paired machine's
+    //! clipboard back on in the directions it already drives. The daemon
+    //! refuses all three while a peer is driving this machine, so the machine
+    //! holding the keyboard and pointer cannot click its own approval.
     //!
     //! **Why it is a limit and not a boundary.** Anything running as the user
-    //! can read the IPC token, send both, open add device and add a device to
+    //! can read the IPC token, send all three, open add device and add a device to
     //! dial, and re-sign the trust store on disk (`src/authority.rs`). The
     //! channel cannot defend against that program, so the rule is stated
     //! where a reader finds it (the `hops_ipc` crate docs) and pinned here, so
-    //! a third widening request, or either one without the driving check,
-    //! fails a test instead of passing review.
+    //! a fourth widening request, or any of the three without the driving
+    //! check, fails a test instead of passing review.
     //!
     //! **Behavioural.** The whole daemon runs in this process with a real
     //! frontend on its IPC socket and real peers on loopback QUIC: one drives
-    //! it, one knocks while add device is open. The store read is the daemon's
-    //! own.
+    //! it, two knock while add device is open, and one of those compares its
+    //! number. The store read is the daemon's own.
     #![cfg(unix)]
 
     use std::collections::{BTreeMap, BTreeSet};
@@ -2014,7 +2039,9 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
     use input_emulation::recording::{Recorded, Recording};
     use input_event::{Event, PointerEvent};
 
-    use crate::service::in_process::{DEADLINE, Daemon, prompt_from, trusting};
+    use crate::service::in_process::{
+        DEADLINE, Daemon, compare_number, prompt_from, trusting, until_paired,
+    };
     use crate::test_harness::{dialer, machine, run_local};
     use crate::transport::Trust;
     use crate::trust::Caps;
@@ -2026,7 +2053,7 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
     fn widens(request: &FrontendRequest) -> bool {
         use FrontendRequest as R;
         match request {
-            R::AuthorizeKey(..) | R::EnableClipboard(_) => true,
+            R::AuthorizeKey(..) | R::EnableClipboard(_) | R::ConfirmPairing { .. } => true,
             R::Activate(..)
             | R::Create
             | R::ChangePort(_)
@@ -2047,6 +2074,7 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
             | R::SaveConfiguration
             | R::OpenPairing
             | R::DisableClipboard(_)
+            | R::CancelPairing(_)
             | R::Barrier(_) => false,
         }
     }
@@ -2089,6 +2117,8 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
             R::SetLabel(paired.to_owned(), "desk mac, renamed".to_owned()),
             R::DisableClipboard(paired.to_owned()),
             R::DisableClipboard(stranger.to_owned()),
+            R::CancelPairing(stranger.to_owned()),
+            R::CancelPairing(paired.to_owned()),
             R::SaveConfiguration,
             R::Barrier(u64::MAX),
             R::Activate(added, false),
@@ -2103,6 +2133,18 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
     /// What the daemon's store grants each machine it holds a pairing for.
     fn granted(trust: &Trust) -> BTreeMap<String, Caps> {
         trust.read().expect("lock").pairings().into_iter().collect()
+    }
+
+    /// The machines approved here whose number is not yet confirmed: they
+    /// are admitted at TLS, far enough to compare it (#167). A request that
+    /// adds one has widened trust as surely as one that adds a pairing.
+    fn waiting(trust: &Trust) -> BTreeSet<String> {
+        trust
+            .read()
+            .expect("lock")
+            .unconfirmed()
+            .into_iter()
+            .collect()
     }
 
     /// The notices that refused a request because this machine was driven.
@@ -2148,7 +2190,7 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
 
     // LEDGER EN-5 | class B | 1 return value: the requests the IPC decoder accepts, against the guard's own tables
     /// The sweep below proves nothing about a request it never sends. Every
-    /// request is one of the two that widen, `Create` (sent first for the
+    /// request is one of the three that widen, `Create` (sent first for the
     /// handle the others aim at), or in [`every_other_request`].
     #[test]
     fn every_request_is_sent_by_the_sweep() {
@@ -2156,6 +2198,10 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
         let fp = super::fp32(0x5f);
         let widening = [
             R::AuthorizeKey(String::new(), fp.clone()),
+            R::ConfirmPairing {
+                fingerprint: fp.clone(),
+                number: String::new(),
+            },
             R::EnableClipboard(fp.clone()),
         ];
         assert!(widening.iter().all(widens));
@@ -2176,7 +2222,7 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
     #[test]
     fn only_approving_a_prompt_or_turning_the_clipboard_on_widens_trust_and_neither_while_driven() {
         run_local(async {
-            let (desk, laptop, stranger) = (machine(), machine(), machine());
+            let (desk, laptop, stranger, newcomer) = (machine(), machine(), machine(), machine());
             let tables = format!(
                 "[authorized_fingerprints]\n\"{}\" = \"desk mac\"\n\"{}\" = \"laptop\"\n",
                 desk.fingerprint, laptop.fingerprint
@@ -2192,10 +2238,11 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
             // Held for the whole test, so nothing else can answer on it.
             let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("a silent port");
             let nowhere = silent.local_addr().expect("its address").port();
-            let (desk_fp, laptop_fp, stranger_fp) = (
+            let (desk_fp, laptop_fp, stranger_fp, newcomer_fp) = (
                 desk.fingerprint.clone(),
                 laptop.fingerprint.clone(),
                 stranger.fingerprint.clone(),
+                newcomer.fingerprint.clone(),
             );
 
             daemon
@@ -2209,16 +2256,30 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
                     ])
                     .await;
                     prompt_from(&mut app, &stranger, port, &ours).await;
+                    // A second machine is approved while nobody drives this
+                    // one, and compares its number: what is left is the answer
+                    // that makes its approval grant (#167).
+                    prompt_from(&mut app, &newcomer, port, &ours).await;
+                    app.exchange(&[R::AuthorizeKey("newcomer".to_owned(), newcomer_fp.clone())])
+                        .await;
+                    let comparing = compare_number(&mut app, &newcomer, port, &ours).await;
                     let before = granted(&trust);
+                    let waiting_before = waiting(&trust);
                     assert!(
                         !before[&desk_fp].intersects(Caps::CLIPBOARD)
-                            && !before.contains_key(&stranger_fp),
+                            && !before.contains_key(&stranger_fp)
+                            && !before.contains_key(&newcomer_fp),
                         "precondition: the paired machine's clipboard is off and the \
-                         prompting one holds nothing: {before:?}"
+                         prompting ones hold nothing: {before:?}"
+                    );
+                    assert_eq!(
+                        waiting_before,
+                        BTreeSet::from([newcomer_fp.clone()]),
+                        "precondition: only the approved machine waits for its number"
                     );
 
                     // Driven: the paired machine crosses onto this one and keeps
-                    // moving the pointer while both widening requests are sent.
+                    // moving the pointer while all three widening requests are sent.
                     let driver = dialer(&desk, trusting(&desk, &ours), port, Position::Left);
                     driver.until_alive().await;
                     driver
@@ -2246,6 +2307,10 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
                         app.exchange(&[
                             R::AuthorizeKey("new laptop".to_owned(), stranger_fp.clone()),
                             R::EnableClipboard(desk_fp.clone()),
+                            R::ConfirmPairing {
+                                fingerprint: newcomer_fp.clone(),
+                                number: comparing.number.clone(),
+                            },
                         ])
                         .await
                     };
@@ -2262,15 +2327,22 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
                          and click, manufacturing its own consent. Refusals: {:?}",
                         refusals(&events)
                     );
+                    assert_eq!(
+                        waiting(&trust),
+                        waiting_before,
+                        "a request sent while a peer drove this machine approved a machine \
+                         to compare a number. Refusals: {:?}",
+                        refusals(&events)
+                    );
                     let refused = refusals(&events);
                     let grants = refused
                         .iter()
                         .filter(|r| r.starts_with(hops_ipc::GRANT_REFUSED))
                         .count();
                     assert!(
-                        refused.len() == 2 && grants == 1,
-                        "both widening requests must be refused, each saying why, while a \
-                         peer drives this machine, and only the grant's refusal may begin \
+                        refused.len() == 3 && grants == 1,
+                        "all three widening requests must be refused, each saying why, while \
+                         a peer drives this machine, and only the grant's refusal may begin \
                          as a refused grant: `hops cli authorize-key` reads any notice \
                          that does as its own grant refused. The app was told {refused:?}"
                     );
@@ -2287,7 +2359,16 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
                         tokio::time::sleep(Duration::from_millis(250)).await;
                         app.exchange(&[R::EnableClipboard(laptop_fp.clone())]).await;
                     }
+                    // Long enough for a confirmation that was honoured to have
+                    // finished the pairing: the other machine's answer is read
+                    // after the request is handled, not before.
+                    assert!(
+                        !granted(&trust).contains_key(&newcomer_fp),
+                        "the number answered while a peer drove this machine finished \
+                         the pairing"
+                    );
                     let before = granted(&trust);
+                    let waiting_before = waiting(&trust);
 
                     // Everything else, aimed where a widening would show.
                     let created = app.exchange(&[R::Create]).await;
@@ -2313,6 +2394,15 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
                     // narrows must not hide an earlier one that widened.
                     for request in unpaired.into_iter().chain(others) {
                         app.exchange(std::slice::from_ref(&request)).await;
+                        let admitted: Vec<_> = waiting(&trust)
+                            .difference(&waiting_before)
+                            .cloned()
+                            .collect();
+                        assert!(
+                            admitted.is_empty(),
+                            "{request:?} approved {admitted:?} to compare a number. Only \
+                             approving a prompt may."
+                        );
                         let after = granted(&trust);
                         let widened: Vec<_> = after
                             .iter()
@@ -2323,25 +2413,44 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
                         assert!(
                             widened.is_empty(),
                             "{request:?} widened trust: {widened:?} (before: {before:?}). \
-                             Only approving a prompt, and turning on the clipboard of a \
-                             paired machine, may. \
+                             Only approving a prompt, confirming its number, and turning \
+                             on the clipboard of a paired machine, may. \
                              A same-user program holding the IPC token can send any of \
-                             them, and the stated limit is that it can do exactly two \
-                             things to trust, neither while this machine is driven. A \
-                             third is a new verb for that program; if one is genuinely \
+                             them, and the stated limit is that it can do exactly those \
+                             things to trust, none while this machine is driven. Another \
+                             is a new verb for that program; if one is genuinely \
                              needed, it goes through the driving check and into the \
                              stated limit in the same change."
                         );
                     }
 
-                    // And the two that widen, do: the steps above could have
-                    // seen a widening.
+                    // And the three that widen, do: the steps above could have
+                    // seen a widening. An approval pairs once both machines
+                    // confirm its number (#167).
                     app.exchange(&[
                         R::AuthorizeKey("new laptop".to_owned(), stranger_fp.clone()),
                         R::EnableClipboard(desk_fp.clone()),
+                        R::ConfirmPairing {
+                            fingerprint: newcomer_fp.clone(),
+                            number: comparing.number.clone(),
+                        },
                     ])
                     .await;
+                    let knocked = compare_number(&mut app, &stranger, port, &ours).await;
+                    app.exchange(&[R::ConfirmPairing {
+                        fingerprint: stranger_fp.clone(),
+                        number: knocked.number.clone(),
+                    }])
+                    .await;
+                    until_paired(&trust, &stranger_fp).await;
+                    until_paired(&trust, &newcomer_fp).await;
                     let now = granted(&trust);
+                    assert_eq!(
+                        now.get(&newcomer_fp).copied(),
+                        Some(Caps::INBOUND),
+                        "confirming the number of an approval made while nobody drove \
+                         this machine must pair the machine that knocked"
+                    );
                     assert_eq!(
                         (now.get(&stranger_fp).copied(), now.get(&desk_fp).copied()),
                         (
@@ -2391,6 +2500,13 @@ mod every_trust_mutation_happens_at_a_named_door {
         // Added with the clipboard off switch (#182, #187). It narrows only,
         // dropping the clipboard bits of one lease, and needs no authority.
         "fn disable_clipboard",
+        // Added with pick-the-number pairing (#11, #167). The one door that
+        // makes an approval grant: both machines confirmed the number. It
+        // cannot create a lease, only confirm one an approval here issued.
+        "fn settle_pairing",
+        // Drops a lease an approval here issued that was never confirmed:
+        // a wrong pick, a cancel, a close, or no number in time. Narrows only.
+        "fn forget_pairing",
         // Added with the on arm (#182, #107). It widens one lease's clipboard
         // to what its drive bits allow, and its caller refuses it while a peer
         // drives this machine.
@@ -2564,20 +2680,21 @@ mod discovery_can_fail_without_taking_anything_with_it {
 
 mod typing_an_address_still_pairs_a_device {
     //! **Decided 2026-09-01.** Typing a peer's address remains a working way to
-    //! pair a device, and no discovery or pairing-code work removes it or puts
-    //! a precondition in front of it.
+    //! pair a device, and no discovery work removes it or puts a precondition
+    //! in front of it.
     //!
     //! **Why, with the measurement.** The "easy" path measured harder than the
-    //! fallback: the pairing code is 228-415 characters and needs a text
-    //! channel between two machines that do not yet share a keyboard — which is
-    //! the thing being set up. Typing an address is 15 characters. User flows
-    //! are a fallback ladder, and the bottom rung is the one that always works.
+    //! fallback: the pairing code, since retired (#14), was 228-415 characters
+    //! and needed a text channel between two machines that do not yet share a
+    //! keyboard — which is the thing being set up. Typing an address is 15
+    //! characters. User flows are a fallback ladder, and the bottom rung is the
+    //! one that always works.
 
     use crate::client::ClientManager;
     use hops_ipc::Position;
 
     /// Calls the client model with nothing but a typed address — no discovery
-    /// result, no pairing code, no fingerprint known in advance — and checks a
+    /// result, no fingerprint known in advance — and checks a
     /// dialable client comes out the far side.
     #[test]
     fn a_client_can_be_created_from_a_typed_address_alone() {
@@ -2802,13 +2919,13 @@ mod the_wire_contract_is_frozen {
             // refuse the handshake is the protocol name.
             let server_trust = {
                 let mut s = crate::trust::TrustStore::new(&server_fp, 0).expect("ours");
-                s.issue(&client_fp, "peer", crate::trust::Caps::KNOWN)
+                s.issue_confirmed(&client_fp, "peer", crate::trust::Caps::KNOWN)
                     .expect("issue");
                 Arc::new(RwLock::new(s))
             };
             let client_trust = {
                 let mut s = crate::trust::TrustStore::new(&client_fp, 0).expect("ours");
-                s.issue(&server_fp, "peer", crate::trust::Caps::KNOWN)
+                s.issue_confirmed(&server_fp, "peer", crate::trust::Caps::KNOWN)
                     .expect("issue");
                 Arc::new(RwLock::new(s))
             };

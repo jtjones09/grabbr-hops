@@ -256,7 +256,9 @@ mod clipboard_follows_the_pairing {
     /// `me`'s store, granting `peer` exactly `caps`.
     fn store(me: &Machine, peer: &Machine, caps: Caps) -> TrustStore {
         let mut store = TrustStore::new(&me.fingerprint, 0).expect("ours");
-        store.issue(&peer.fingerprint, "peer", caps).expect("issue");
+        store
+            .issue_confirmed(&peer.fingerprint, "peer", caps)
+            .expect("issue");
         store
     }
 
@@ -533,7 +535,7 @@ mod clipboard_follows_the_switch {
     fn both_ways(me: &Machine, peer: &Machine) -> TrustStore {
         let mut store = TrustStore::new(&me.fingerprint, 0).expect("ours");
         store
-            .issue(&peer.fingerprint, "peer", Caps::KNOWN)
+            .issue_confirmed(&peer.fingerprint, "peer", Caps::KNOWN)
             .expect("issue");
         store
     }
@@ -772,7 +774,7 @@ mod clipboard_follows_the_switch {
             self.trust
                 .write()
                 .expect("lock")
-                .issue(&peer.fingerprint, "peer", Caps::KNOWN)
+                .issue_confirmed(&peer.fingerprint, "peer", Caps::KNOWN)
                 .expect("issue");
             let device = self.entry_for(peer);
             let d = self

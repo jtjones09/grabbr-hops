@@ -23,8 +23,8 @@ use std::{
 
 use hops_frontend_core::{
     AppModel, ApprovalRefused, CaptureState, ClientHandle, Clipboard, FrontendClient,
-    FrontendRequest, Launch, PairingAttempt, PairingCard, Position, Status, TrustState, prefs,
-    theme,
+    FrontendRequest, Launch, PairingAttempt, PairingCard, PairingCheck, Position, Status,
+    TrustState, prefs, spaced_number, theme,
 };
 use hops_ipc::{DEFAULT_PORT, Geometry};
 use slint::{ComponentHandle, ModelRc, VecModel};
@@ -83,6 +83,8 @@ struct PolledUi {
     free_position: String,
     /// Seconds left in the pairing window, 0 when closed (#195).
     pairing_seconds: i32,
+    /// The number card (#11, #167), empty fingerprint when there is none.
+    check: CheckUi,
     notice: String,
     notice_seq: i32,
     /// What is wrong with the service, from `AppModel::service_problem`, or
@@ -91,6 +93,66 @@ struct PolledUi {
     /// The rows exactly as the window gets them, so the gate compares every
     /// field a row shows and cannot drift from it (#172).
     devices: Vec<DeviceRow>,
+}
+
+/// The number card as the window gets it.
+#[derive(Debug, Default, PartialEq)]
+struct CheckUi {
+    fp: String,
+    from: String,
+    /// This machine shows the number and confirms; otherwise it picks.
+    show: bool,
+    number: String,
+    choices: Vec<String>,
+    answered: bool,
+}
+
+/// The number card for the oldest open check in `m`, if any.
+fn check_ui(m: &AppModel) -> CheckUi {
+    let Some(card) = m.pairing_check() else {
+        return CheckUi::default();
+    };
+    let (show, number, choices) = match &card.check {
+        PairingCheck::Show(n) => (true, spaced_number(n), Vec::new()),
+        PairingCheck::Pick(c) => (
+            false,
+            String::new(),
+            c.iter().map(|n| spaced_number(n)).collect(),
+        ),
+    };
+    CheckUi {
+        fp: card.fingerprint.clone(),
+        from: card.from(),
+        show,
+        number,
+        choices,
+        answered: card.answered,
+    }
+}
+
+/// Put the number card in the window.
+fn show_check(ui: &AppWindow, check: &CheckUi) {
+    ui.set_check_fp(check.fp.as_str().into());
+    ui.set_check_from(check.from.as_str().into());
+    ui.set_check_show(check.show);
+    ui.set_check_number(check.number.as_str().into());
+    ui.set_check_choices(ModelRc::new(VecModel::from(
+        check
+            .choices
+            .iter()
+            .map(|n| slint::SharedString::from(n.as_str()))
+            .collect::<Vec<_>>(),
+    )));
+    ui.set_check_answered(check.answered);
+}
+
+/// The request answering the number card on screen for `fingerprint` with
+/// `number`, if that card is still the one the model holds.
+fn check_answer(m: &AppModel, fingerprint: &str, number: &str) -> Option<FrontendRequest> {
+    m.pairing_checks
+        .iter()
+        .find(|c| c.fingerprint == fingerprint && !c.answered)
+        .map(|c| c.answer(number))
 }
 
 /// Whether an action armed on `handle` (as the UI holds it) with `pin` no
@@ -256,6 +318,7 @@ fn polled_ui(m: &AppModel, shown: Option<&PairingAttempt>, now: Instant) -> Poll
         pairing_seconds: m
             .pairing_seconds_left(now)
             .map_or(0, |s| s.min(i32::MAX as u64) as i32),
+        check: check_ui(m),
         // Errors only: the activity log also records a cursor entering, and
         // the banner is red (#150).
         notice: m.latest_error().unwrap_or_default().to_string(),
@@ -304,6 +367,7 @@ impl Repaint {
         ui.set_pairing_from_our_dial(snap.pairing_from_our_dial);
         ui.set_pairing_addr(snap.pairing_addr.as_str().into());
         ui.set_pairing_seconds(snap.pairing_seconds);
+        show_check(ui, &snap.check);
         // Every tick that changed, not only one with a new notice: the free
         // edge follows the devices, and a new device placed on an edge in use
         // switches the other one off (#32).
@@ -930,6 +994,22 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
                 }
                 Err(refused) => notice(refused.notice()),
             }
+        });
+    }
+    {
+        // The number shown, or the one picked, for the card on screen. The
+        // daemon compares it with the number it arrived at.
+        let c = client.clone();
+        ui.on_confirm_pairing(move |fp, number| {
+            if let Some(request) = check_answer(&c.snapshot(), fp.as_str(), number.as_str()) {
+                c.request(request);
+            }
+        });
+    }
+    {
+        let c = client.clone();
+        ui.on_cancel_pairing(move |fp| {
+            c.request(FrontendRequest::CancelPairing(fp.to_string()));
         });
     }
     {

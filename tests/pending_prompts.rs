@@ -305,7 +305,8 @@ async fn an_admitted_pairing_request_names_its_address_is_logged_and_survives_a_
     }
 
     // T6: another machine knocks before the approval lands. The approval names
-    // the first; only the first is trusted (#168).
+    // the first; only the first is approved (#168). An approval alone trusts
+    // nothing: the first becomes a pairing waiting for the number (#167).
     let other = stranger();
     other.knock(port).await;
     let _ = events_for(&mut first, Duration::from_secs(2)).await;
@@ -317,19 +318,19 @@ async fn an_admitted_pairing_request_names_its_address_is_logged_and_survives_a_
         .await
         .expect("approval sent");
     let after_approval = events_for(&mut first, Duration::from_secs(3)).await;
-    let trusted: Option<HashMap<String, String>> = after_approval
+    let approved: Option<HashMap<String, hops_ipc::PeerTrust>> = after_approval
         .iter()
         .filter_map(|e| match e {
-            FrontendEvent::AuthorizedUpdated(map) => Some(map.clone()),
+            FrontendEvent::TrustUpdated(map) => Some(map.clone()),
             _ => None,
         })
         .next_back();
-    match trusted {
+    match approved {
         Some(map)
-            if map.get(&laptop.fingerprint).map(String::as_str) == Some("laptop")
+            if map.get(&laptop.fingerprint).is_some_and(|t| t.pending)
                 && !map.contains_key(&other.fingerprint) => {}
         other_state => failures.push(format!(
-            "T6: approving {} as \"laptop\" left the trusted set as {other_state:?}",
+            "T6: approving {} as \"laptop\" left the pairings as {other_state:?}",
             laptop.fingerprint
         )),
     }

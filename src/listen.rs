@@ -2,7 +2,7 @@ use futures::{Stream, StreamExt};
 use hops_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender, channel};
 use quinn::crypto::rustls::QuicServerConfig;
-use quinn::{Connection, Endpoint, SendStream, TransportConfig};
+use quinn::{Connection, Endpoint, RecvStream, SendStream, TransportConfig};
 use rustls::pki_types::CertificateDer;
 use std::{
     cell::RefCell,
@@ -240,6 +240,10 @@ pub(crate) struct LanMouseListener {
     port_changed: Receiver<Result<u16, ListenerCreationError>>,
     /// Asked before this machine's clipboard goes to a peer.
     trust: Trust,
+    /// Connections from machines mid-pairing, held until both confirm (#167).
+    pairings: crate::pairing::Pairings,
+    /// What those attempts tell the service, until it takes it.
+    pairing_events: Option<Receiver<crate::pairing::PairingEvent>>,
     /// Where the first endpoint bound, so a test that asked for port 0 can dial it.
     #[cfg(test)]
     local_addr: SocketAddr,
@@ -248,7 +252,7 @@ pub(crate) struct LanMouseListener {
 /// `refused` is where the verifier puts a certificate it turns away. Every
 /// connection is accepted with a config of its own (see the accept loop), so
 /// the slot belongs to exactly one connection.
-fn server_config(
+pub(crate) fn server_config(
     identity: &Identity,
     trust: Trust,
     refused: Arc<StdMutex<Option<String>>>,
@@ -334,10 +338,15 @@ impl LanMouseListener {
         let clipboard_trust = trust.clone();
         let pressure: Rc<InputPressure> = Default::default();
         let pressure_clone = pressure.clone();
+        let (pairings, pairing_events) = crate::pairing::Pairings::new();
+        // Half of what a pairing number is built from. The peer's half is
+        // read off each connection, never from what it advertised.
+        let ours: Rc<str> = Rc::from(transport::fingerprint_of(&identity.cert).as_str());
 
         let listen_task: JoinHandle<()> = {
             let listen_tx = listen_tx.clone();
             let authorized_accept = trust.clone();
+            let pairings = pairings.clone();
             let failures: Rc<RefCell<HandshakeFailures>> = Default::default();
             spawn_local(async move {
                 loop {
@@ -375,6 +384,8 @@ impl LanMouseListener {
                             let listen_tx = listen_tx.clone();
                             let clipboard_in = clipboard_in.clone();
                             let trust = authorized_accept.clone();
+                            let pairings = pairings.clone();
+                            let ours = ours.clone();
                             let failures = failures.clone();
                             spawn_local(async move {
                                 match connecting.await {
@@ -399,45 +410,55 @@ impl LanMouseListener {
                                         // lapsed between the TLS check and here
                                         // is refused, which is why the check is
                                         // repeated rather than assumed.
-                                        if !trust
-                                            .read()
-                                            .expect("lock")
-                                            .may_drive_us(&fingerprint)
-                                        {
+                                        let (drives, pairing) = {
+                                            let t = trust.read().expect("lock");
+                                            (
+                                                t.may_drive_us(&fingerprint),
+                                                t.awaits(&fingerprint, crate::trust::Caps::DRIVE_ME),
+                                            )
+                                        };
+                                        let mut first = None;
+                                        if !drives && pairing {
+                                            // Approved here and not yet confirmed
+                                            // on both machines: held for the
+                                            // number, out of every list, and
+                                            // nothing it sends is read until both
+                                            // confirm (#167).
+                                            first = crate::pairing::as_added(
+                                                &pairings,
+                                                &conn,
+                                                &ours,
+                                                &fingerprint,
+                                                addr,
+                                            )
+                                            .await;
+                                            if first.is_none() {
+                                                return;
+                                            }
+                                        }
+                                        if !trust.read().expect("lock").may_drive_us(&fingerprint) {
                                             log::warn!(
                                                 "{addr}: rejecting {fingerprint} — no live lease permits it to drive this machine"
                                             );
                                             conn.close(0u32.into(), b"unauthorized");
-                                            let _ = listen_tx
-                                                .send(ListenEvent::Rejected { fingerprint, addr });
+                                            if !pairing {
+                                                let _ = listen_tx
+                                                    .send(ListenEvent::Rejected { fingerprint, addr });
+                                            }
                                             return;
                                         }
-                                        let send = match conn.open_uni().await {
-                                            Ok(s) => s,
-                                            Err(e) => {
-                                                log::warn!("{addr}: opening reply stream failed: {e}");
-                                                return;
-                                            }
-                                        };
-                                        let replies: Rc<RefCell<PendingReplies>> = Default::default();
-                                        let ready = Rc::new(Notify::new());
-                                        spawn_local(reply_loop(addr, replies.clone(), ready.clone(), send));
-                                        conns.lock().await.push(ConnEntry {
+                                        admit(Admitted {
+                                            conns,
                                             addr,
-                                            conn: conn.clone(),
-                                            replies: replies.clone(),
-                                            ready: ready.clone(),
-                                            fingerprint: fingerprint.clone(),
-                                        });
-                                        let closer = ReplyQueueGuard { replies, ready };
-                                        let clipboard = ClipboardInlet {
-                                            from: fingerprint.clone(),
-                                            dialled_for: None,
-                                            trust: trust.clone(),
-                                            tx: clipboard_in,
-                                        };
-                                        let _ = listen_tx.send(ListenEvent::Accept { addr, fingerprint });
-                                        spawn_local(read_loop(conns.clone(), addr, conn, listen_tx.clone(), clipboard, closer, pressure));
+                                            conn,
+                                            fingerprint,
+                                            listen_tx,
+                                            clipboard_in,
+                                            trust,
+                                            pressure,
+                                            first,
+                                        })
+                                        .await;
                                     }
                                     Err(e) => {
                                         failures.borrow_mut().note(remote, &e, Instant::now());
@@ -490,9 +511,22 @@ impl LanMouseListener {
             port_changed,
             request_port_change,
             trust: clipboard_trust,
+            pairings,
+            pairing_events: Some(pairing_events),
             #[cfg(test)]
             local_addr,
         })
+    }
+
+    /// The attempts this listener holds for machines mid-pairing, for the
+    /// service to answer. Grabbed before the listener moves into `Emulation`.
+    pub(crate) fn pairings(&self) -> crate::pairing::Pairings {
+        self.pairings.clone()
+    }
+
+    /// What those attempts tell the service. Once: `None` after the first.
+    pub(crate) fn take_pairing_events(&mut self) -> Option<Receiver<crate::pairing::PairingEvent>> {
+        self.pairing_events.take()
     }
 
     /// A listener on 127.0.0.1 at a port the OS picks, and that port.
@@ -717,6 +751,73 @@ async fn remove_conn(
     }
 }
 
+/// A connection let in: one whose peer may drive this machine.
+struct Admitted {
+    conns: Rc<AsyncMutex<Vec<ConnEntry>>>,
+    addr: SocketAddr,
+    conn: Connection,
+    fingerprint: String,
+    listen_tx: Sender<ListenEvent>,
+    clipboard_in: Sender<PeerClipboard>,
+    trust: Trust,
+    pressure: Rc<InputPressure>,
+    /// For a connection that paired: its input stream, already accepted, and
+    /// the first frame read from it.
+    first: Option<(RecvStream, ProtoEvent)>,
+}
+
+/// Open the reply stream, list the connection, say it was accepted, and read
+/// its input.
+async fn admit(a: Admitted) {
+    let Admitted {
+        conns,
+        addr,
+        conn,
+        fingerprint,
+        listen_tx,
+        clipboard_in,
+        trust,
+        pressure,
+        first,
+    } = a;
+    let send = match conn.open_uni().await {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("{addr}: opening reply stream failed: {e}");
+            return;
+        }
+    };
+    let replies: Rc<RefCell<PendingReplies>> = Default::default();
+    let ready = Rc::new(Notify::new());
+    spawn_local(reply_loop(addr, replies.clone(), ready.clone(), send));
+    conns.lock().await.push(ConnEntry {
+        addr,
+        conn: conn.clone(),
+        replies: replies.clone(),
+        ready: ready.clone(),
+        fingerprint: fingerprint.clone(),
+    });
+    let closer = ReplyQueueGuard { replies, ready };
+    let clipboard = ClipboardInlet {
+        from: fingerprint.clone(),
+        dialled_for: None,
+        trust: trust.clone(),
+        tx: clipboard_in,
+    };
+    let _ = listen_tx.send(ListenEvent::Accept { addr, fingerprint });
+    spawn_local(read_loop(
+        conns.clone(),
+        addr,
+        conn,
+        listen_tx.clone(),
+        clipboard,
+        closer,
+        pressure,
+        first,
+    ));
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn read_loop(
     conns: Rc<AsyncMutex<Vec<ConnEntry>>>,
     addr: SocketAddr,
@@ -726,15 +827,23 @@ async fn read_loop(
     // Dropped when this loop ends, which ends the connection's writer task.
     _replies: ReplyQueueGuard,
     pressure: Rc<InputPressure>,
+    first: Option<(RecvStream, ProtoEvent)>,
 ) {
-    // the peer's reliable inbound stream (their uni stream to us)
-    let mut recv = match conn.accept_uni().await {
-        Ok(recv) => recv,
-        Err(e) => {
-            log::info!("{addr}: no inbound stream: {e}");
-            remove_conn(&conns, addr, &listen_tx).await;
-            return;
+    // the peer's reliable inbound stream (their uni stream to us), unless the
+    // pairing already read its first frame from it
+    let mut recv = match first {
+        Some((recv, event)) => {
+            let _ = listen_tx.send(ListenEvent::Msg { event, addr });
+            recv
         }
+        None => match conn.accept_uni().await {
+            Ok(recv) => recv,
+            Err(e) => {
+                log::info!("{addr}: no inbound stream: {e}");
+                remove_conn(&conns, addr, &listen_tx).await;
+                return;
+            }
+        },
     };
     // The input stream above is accepted first (opened at connection setup);
     // clipboard transfers ride the subsequent uni streams on this connection.
@@ -802,7 +911,7 @@ mod tests {
         let mut store = crate::trust::TrustStore::new(us, 0).expect("our fingerprint");
         for f in fps {
             store
-                .issue(f, "peer", crate::trust::Caps::INBOUND)
+                .issue_confirmed(f, "peer", crate::trust::Caps::INBOUND)
                 .expect("issue");
         }
         Arc::new(RwLock::new(store))
@@ -815,7 +924,7 @@ mod tests {
         let mut store = crate::trust::TrustStore::new(us, 0).expect("our fingerprint");
         for f in fps {
             store
-                .issue(f, "peer", crate::trust::Caps::OUTBOUND)
+                .issue_confirmed(f, "peer", crate::trust::Caps::OUTBOUND)
                 .expect("issue");
         }
         Arc::new(RwLock::new(store))

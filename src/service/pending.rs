@@ -66,15 +66,16 @@ impl PendingAttempts {
     }
 
     /// The held prompt from `fingerprint`, taken for a grant: its
-    /// provenance, or `None` when there is none or its window has closed.
+    /// provenance and where it came from, or `None` when there is none or
+    /// its window has closed.
     pub(super) fn take(
         &mut self,
         gate: &PromptGate,
         fingerprint: &str,
         now: Instant,
-    ) -> Option<AttemptOrigin> {
+    ) -> Option<PendingAttempt> {
         self.expire(gate, now);
-        self.held.remove(fingerprint).map(|a| a.origin)
+        self.held.remove(fingerprint)
     }
 
     /// The held prompts a frontend attaching at `now` is shown, less any
@@ -237,7 +238,9 @@ mod a_prompt_expires_with_its_pairing_window {
         let mut pending = held(knocked);
         gate.open(t0 + 60 * S);
         assert_eq!(
-            pending.take(&gate, &fp(0xa0), t0 + 100 * S),
+            pending
+                .take(&gate, &fp(0xa0), t0 + 100 * S)
+                .map(|a| a.origin),
             Some(AttemptOrigin::Inbound),
             "add device opened again while its window was still open ended a \
              prompt that was on screen"
@@ -246,7 +249,7 @@ mod a_prompt_expires_with_its_pairing_window {
         let closed = t0 + 60 * S + PromptGate::WINDOW;
         let mut pending = held(knocked);
         assert_eq!(
-            pending.take(&gate, &fp(0xa0), closed),
+            pending.take(&gate, &fp(0xa0), closed).map(|a| a.origin),
             None,
             "a prompt could still be approved after its pairing window closed"
         );
@@ -258,7 +261,9 @@ mod a_prompt_expires_with_its_pairing_window {
 
         let mut pending = held(knocked);
         gate.open(closed + 10 * S);
-        let origin = pending.take(&gate, &fp(0xb0), closed + 11 * S);
+        let origin = pending
+            .take(&gate, &fp(0xb0), closed + 11 * S)
+            .map(|a| a.origin);
         let mut store = TrustStore::new(&fp(0x01), 0).expect("our fingerprint");
         assert_eq!(
             grant_for_attempt(&mut store, &fp(0xb0), "a stranger", origin),

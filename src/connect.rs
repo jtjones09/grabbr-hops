@@ -6,7 +6,7 @@ use hops_ipc::{ClientHandle, DEFAULT_PORT};
 use hops_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender, channel};
 use quinn::crypto::rustls::QuicClientConfig;
-use quinn::{ClientConfig, Connection, Endpoint, SendStream, TransportConfig};
+use quinn::{ClientConfig, Connection, Endpoint, RecvStream, SendStream, TransportConfig};
 use rustls::pki_types::CertificateDer;
 use std::{
     cell::RefCell,
@@ -155,6 +155,19 @@ fn peer_fingerprint(conn: &Connection) -> Option<String> {
     certs.first().map(transport::fingerprint_of)
 }
 
+/// What a dial reached.
+enum Landed {
+    /// A receiver this machine may drive: its link, with the input stream open.
+    Link(PeerLink),
+    /// A receiver this machine approved driving and has not yet compared a
+    /// number with (#167). No stream is opened on it until both machines
+    /// confirm.
+    Pairing {
+        conn: Connection,
+        fingerprint: String,
+    },
+}
+
 async fn connect(
     endpoint: Endpoint,
     cfg: ClientConfig,
@@ -162,7 +175,7 @@ async fn connect(
     expected_fp: Option<String>,
     trust: Trust,
     handle: ClientHandle,
-) -> Result<(PeerLink, SocketAddr), (SocketAddr, LanMouseConnectionError)> {
+) -> Result<(Landed, SocketAddr), (SocketAddr, LanMouseConnectionError)> {
     log::info!("connecting to {addr} ...");
     // server_name is the SNI label; trust is by fingerprint, so it is not
     // trust-relevant — a fixed label is fine.
@@ -176,7 +189,7 @@ async fn connect(
     };
     // Fail-closed fingerprint pin. `FpServerVerifier` only proves the receiver
     // is *some* allowlisted peer; when this client's identity is already known
-    // (a prior handshake, or later a pairing code), the raced address MUST
+    // (a prior handshake, or discovery), the raced address MUST
     // present that exact leaf-cert fingerprint — otherwise a poisoned or
     // ambiguous address that completes an allowlisted handshake could win the
     // race and receive input meant for a different machine.
@@ -197,7 +210,17 @@ async fn connect(
         conn.close(0u32.into(), b"no certificate");
         return Err((addr, LanMouseConnectionError::NotPermitted));
     };
-    if !trust.read().expect("lock").we_may_drive(&fingerprint) {
+    let (drive, pairing) = {
+        let t = trust.read().expect("lock");
+        (
+            t.we_may_drive(&fingerprint),
+            t.awaits(&fingerprint, crate::trust::Caps::I_MAY_DRIVE),
+        )
+    };
+    if !drive && pairing {
+        return Ok((Landed::Pairing { conn, fingerprint }, addr));
+    }
+    if !drive {
         log::warn!("{addr}: permission to drive {fingerprint} was withdrawn during the handshake");
         conn.close(0u32.into(), b"not permitted");
         return Err((addr, LanMouseConnectionError::NotPermitted));
@@ -211,12 +234,12 @@ async fn connect(
         (addr, e)
     })?;
     Ok((
-        PeerLink {
+        Landed::Link(PeerLink {
             conn,
             send: Arc::new(Mutex::new(send)),
             fingerprint,
             handle,
-        },
+        }),
         addr,
     ))
 }
@@ -295,7 +318,7 @@ async fn connect_any(
     expected_fp: Option<String>,
     trust: &Trust,
     handle: ClientHandle,
-) -> Result<(PeerLink, SocketAddr), LanMouseConnectionError> {
+) -> Result<(Landed, SocketAddr), LanMouseConnectionError> {
     let addrs: Vec<SocketAddr> = dials.iter().map(|d| d.addr).collect();
     let mut joinset = JoinSet::new();
     for d in dials {
@@ -377,6 +400,12 @@ pub(crate) struct LanMouseConnection {
     /// channel nothing republishes a client after its first publication, so the
     /// sender keeps showing whatever was true when the link was first made.
     state_tx: Sender<ClientHandle>,
+    /// Dials that reached a machine mid-pairing, held until both confirm
+    /// (#167). The dial stays in `connecting` meanwhile, so a crossing opens
+    /// no second connection.
+    pairings: crate::pairing::Pairings,
+    /// What those attempts tell the service, until it takes it.
+    pairing_events: Option<Receiver<crate::pairing::PairingEvent>>,
 }
 
 impl LanMouseConnection {
@@ -394,7 +423,10 @@ impl LanMouseConnection {
         // deliberately NO set_default_client_config — every dial builds its own so
         // each carries a private observed-fingerprint slot (see the field docs).
         let (recv_tx, recv_rx) = channel();
+        let (pairings, pairing_events) = crate::pairing::Pairings::new();
         Ok(Self {
+            pairings,
+            pairing_events: Some(pairing_events),
             endpoint,
             client_manager,
             conns: Default::default(),
@@ -409,6 +441,17 @@ impl LanMouseConnection {
             persist_tx,
             state_tx,
         })
+    }
+
+    /// The attempts this connection holds for machines mid-pairing, for the
+    /// service to answer. Grabbed before the connection moves into `Capture`.
+    pub(crate) fn pairings(&self) -> crate::pairing::Pairings {
+        self.pairings.clone()
+    }
+
+    /// What those attempts tell the service. Once: `None` after the first.
+    pub(crate) fn take_pairing_events(&mut self) -> Option<Receiver<crate::pairing::PairingEvent>> {
+        self.pairing_events.take()
     }
 
     pub(crate) async fn recv(&mut self) -> (ClientHandle, ProtoEvent) {
@@ -555,6 +598,7 @@ impl LanMouseConnection {
                 self.refusals.clone(),
                 self.persist_tx.clone(),
                 self.state_tx.clone(),
+                self.pairings.clone(),
             ));
         }
     }
@@ -762,6 +806,7 @@ async fn connect_to_handle(
     refusals: Sender<DialRefusal>,
     persist_tx: Sender<ClientHandle>,
     state_tx: Sender<ClientHandle>,
+    pairings: crate::pairing::Pairings,
 ) -> Result<(), LanMouseConnectionError> {
     log::info!("client {handle} connecting ...");
     // Swap in a fresh UDP socket before every (re)connect so a sleep/wake or
@@ -796,7 +841,8 @@ async fn connect_to_handle(
                 }
             })
             .collect();
-        let (link, addr) = match connect_any(&endpoint, &dials, expected_fp, &trust, handle).await {
+        let (landed, addr) = match connect_any(&endpoint, &dials, expected_fp, &trust, handle).await
+        {
             Ok(c) => c,
             Err(e) => {
                 connecting.lock().await.remove(&handle);
@@ -874,6 +920,56 @@ async fn connect_to_handle(
                 return Err(e);
             }
         };
+        // A machine mid-pairing: compare the number on this connection, and
+        // take it as the link only once both machines confirmed. Nothing is
+        // opened, listed or read before that, and the dial stays in
+        // `connecting`, so a crossing meanwhile opens no second connection.
+        let (link, greeted) = match landed {
+            Landed::Link(link) => (link, None),
+            Landed::Pairing { conn, fingerprint } => {
+                let ours = transport::fingerprint_of(&identity.cert);
+                let confirmed =
+                    if client_manager.targets(handle, addr) && client_manager.is_on(handle) {
+                        crate::pairing::as_adding(
+                            &pairings,
+                            &conn,
+                            &ours,
+                            &fingerprint,
+                            addr,
+                            handle,
+                            &client_manager,
+                        )
+                        .await
+                    } else {
+                        conn.close(0u32.into(), b"stale dial");
+                        None
+                    };
+                let Some(confirmed) = confirmed else {
+                    connecting.lock().await.remove(&handle);
+                    // The receiver checks our certificate after our half of
+                    // the handshake, so a machine that has not approved this
+                    // one ends the connection before any number, as it ends a
+                    // link that looked open (#171).
+                    if conn.close_reason().as_ref().is_some_and(refused_by_peer) {
+                        log::warn!("client {handle}: {addr} ({fingerprint}) refused this machine");
+                        let _ = refusals.send(DialRefusal::RefusedByPeer {
+                            handle,
+                            fingerprint,
+                            addr,
+                        });
+                        return Err(LanMouseConnectionError::RefusedByPeer);
+                    }
+                    return Err(LanMouseConnectionError::NotConnected);
+                };
+                let link = PeerLink {
+                    conn,
+                    send: Arc::new(Mutex::new(confirmed.send)),
+                    fingerprint,
+                    handle,
+                };
+                (link, Some((confirmed.recv, confirmed.commit)))
+            }
+        };
         // The device can have been deleted, re-addressed or replaced by a
         // reload while the handshake ran. Then this link is not its link, and
         // what it proved is not its identity: write nothing, keep nothing.
@@ -944,8 +1040,17 @@ async fn connect_to_handle(
         // Best-effort version + capability handshake (see ProtoEvent::Hello and
         // ProtoEvent::Capability docs). Both writes share the one send guard so
         // the ping_pong task (spawned just below) can't wedge a Ping between
-        // them — the peer observes Hello then Capability, in order.
-        {
+        // them — the peer observes Hello then Capability, in order. A link that
+        // paired sent both as its confirmation, and has the answer's build.
+        let recv = match greeted {
+            Some((recv, commit)) => {
+                client_manager.set_peer_commit(handle, Some(commit));
+                let _ = state_tx.send(handle);
+                Some(recv)
+            }
+            None => None,
+        };
+        if recv.is_none() {
             let mut send = link.send.lock().await;
             if let Err(e) = transport::write_frame(
                 &mut send,
@@ -994,6 +1099,7 @@ async fn connect_to_handle(
             ping_response.clone(),
             clipboard,
             state_tx,
+            recv,
             refusals,
         ));
         return Ok(());
@@ -1060,10 +1166,16 @@ async fn receive_loop(
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
     clipboard: ClipboardInlet,
     state_tx: Sender<ClientHandle>,
+    // The receiver's stream, when pairing already accepted it.
+    recv: Option<RecvStream>,
     refusals: Sender<DialRefusal>,
 ) {
     // the peer's reliable inbound stream (their uni stream to us)
-    let mut recv = match link.conn.accept_uni().await {
+    let accepted = match recv {
+        Some(recv) => Ok(recv),
+        None => link.conn.accept_uni().await,
+    };
+    let mut recv = match accepted {
         Ok(recv) => recv,
         Err(e) => {
             log::warn!("{addr}: no inbound stream: {e}");
@@ -1501,7 +1613,7 @@ mod tests {
                 let mut st =
                     crate::trust::TrustStore::new(&transport::fingerprint_of(&client.cert), 0)
                         .expect("our fingerprint");
-                st.issue(
+                st.issue_confirmed(
                     &transport::fingerprint_of(&server.cert),
                     "hostile",
                     crate::trust::Caps::OUTBOUND,
@@ -1671,7 +1783,7 @@ mod tests {
         let trust: Trust = Arc::new(RwLock::new({
             let mut st = crate::trust::TrustStore::new(&transport::fingerprint_of(&client.cert), 0)
                 .expect("our fingerprint");
-            st.issue(&receiver, "receiver", crate::trust::Caps::OUTBOUND)
+            st.issue_confirmed(&receiver, "receiver", crate::trust::Caps::OUTBOUND)
                 .expect("issue");
             st
         }));
@@ -1701,6 +1813,9 @@ mod tests {
         )
         .await
         .expect("a permitted receiver is dialled");
+        let Landed::Link(link) = link else {
+            panic!("a receiver this machine may drive landed as a pairing");
+        };
         conn.conns.lock().await.insert(addr, link);
         conn.client_manager.set_active_addr(handle, Some(addr));
         conn.client_manager.set_alive(handle, true);
@@ -1818,7 +1933,7 @@ mod tests {
             // What the verifier saw during the handshake...
             let then: Trust = Arc::new(RwLock::new({
                 let mut st = store();
-                st.issue(&receiver, "receiver", crate::trust::Caps::OUTBOUND)
+                st.issue_confirmed(&receiver, "receiver", crate::trust::Caps::OUTBOUND)
                     .expect("issue");
                 st
             }));
@@ -2018,7 +2133,7 @@ mod tests {
                 let mut st =
                     crate::trust::TrustStore::new(&transport::fingerprint_of(&client.cert), 0)
                         .expect("our fingerprint");
-                st.issue(&server_fp, "receiver", crate::trust::Caps::OUTBOUND)
+                st.issue_confirmed(&server_fp, "receiver", crate::trust::Caps::OUTBOUND)
                     .expect("issue");
                 st
             }));

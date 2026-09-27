@@ -145,6 +145,40 @@ export component PillButton inherits Rectangle {
     }
 }
 
+// One of the three numbers a machine being added offers (#11): large mono
+// digits in an outlined box, so the three read as a choice and not as text.
+export component NumberButton inherits Rectangle {
+    in property <string> text;
+    callback clicked;
+
+    horizontal-stretch: 0;
+    height: 44px;
+    min-width: 112px;
+    border-radius: Radius.md;
+    border-width: 1px;
+    border-color: ta.has-hover ? Theme.c.accent : Theme.c.border;
+    background: ta.pressed
+        ? Theme.c.surface-raised.darker(0.1)
+        : (ta.has-hover ? Theme.c.surface-raised : Theme.c.surface);
+    animate background, border-color { duration: Motion.fast; }
+
+    Text {
+        text: root.text;
+        color: Theme.c.foreground;
+        font-family: Type.mono;
+        font-size: 20px;
+        font-weight: Type.bold;
+        letter-spacing: 1px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
 // An iOS-style toggle switch. Track lights green when on; the knob slides.
 export component Toggle inherits Rectangle {
     in property <bool> checked;

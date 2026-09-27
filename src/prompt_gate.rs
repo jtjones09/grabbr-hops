@@ -196,7 +196,10 @@ impl RecentPrompts {
     }
 
     /// True if `fingerprint` raised a prompt within the suppression window.
-    /// Records it either way.
+    /// Records it only when it raises one: a refresh on every knock kept a
+    /// machine that knocks every second suppressed for good, so its card went
+    /// stale on screen while it was still asking, and a machine added again
+    /// soon after an attempt ended was never asked about at all.
     fn seen_recently(&mut self, fingerprint: &str, now: Instant) -> bool {
         if self.seen.len() >= Self::PRUNE_AT {
             self.seen
@@ -209,9 +212,12 @@ impl RecentPrompts {
                 self.seen.clear();
             }
         }
-        match self.seen.insert(fingerprint.to_owned(), now) {
-            None => false,
-            Some(at) => now.saturating_duration_since(at) < Self::WINDOW,
+        match self.seen.get(fingerprint) {
+            Some(at) if now.saturating_duration_since(*at) < Self::WINDOW => true,
+            _ => {
+                self.seen.insert(fingerprint.to_owned(), now);
+                false
+            }
         }
     }
 }
@@ -500,6 +506,29 @@ mod tests {
                 "a peer retrying inside the window must not raise a second prompt"
             );
         }
+    }
+
+    // LEDGER G-17 | class B | 1 return value: RecentPrompts::seen_recently
+    /// A machine that keeps knocking once a second, as the add dial does, is
+    /// prompted for again once the window since its last prompt has passed:
+    /// its card stays live while it asks, and adding it again soon after an
+    /// attempt ended still asks the person here (#167).
+    #[test]
+    fn a_peer_still_knocking_is_prompted_again_after_the_window() {
+        let mut recent = RecentPrompts::new();
+        let t0 = Instant::now();
+        assert!(!recent.seen_recently("aa:bb:cc", t0));
+        let mut prompted = 0;
+        for s in 1..=6 {
+            if !recent.seen_recently("aa:bb:cc", t0 + Duration::from_secs(s)) {
+                prompted += 1;
+            }
+        }
+        assert!(
+            prompted >= 2,
+            "a machine knocking every second for six seconds was prompted for {prompted} \
+             more time(s): the suppression never lets it through again"
+        );
     }
 
     /// A frontend that attaches while add device is open is shown what was

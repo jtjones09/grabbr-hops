@@ -25,6 +25,7 @@ const DESK_MAC: &str = "2d:18:1a:c4:a8:40:f5:26:37:39:9d:c7:c7:75:fe:17:\
 const OFF: PeerTrust = PeerTrust {
     clipboard_from: false,
     clipboard_to: false,
+    pending: false,
 };
 
 /// What a machine that may drive this one, and that this one does not
@@ -32,6 +33,7 @@ const OFF: PeerTrust = PeerTrust {
 const FROM_IT: PeerTrust = PeerTrust {
     clipboard_from: true,
     clipboard_to: false,
+    pending: false,
 };
 
 async fn attach() -> (AsyncFrontendEventReader, AsyncFrontendRequestWriter) {

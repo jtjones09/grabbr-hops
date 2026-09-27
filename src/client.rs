@@ -283,7 +283,7 @@ impl ClientManager {
     /// as they are (#13). Returns whether the name changed.
     pub(crate) fn set_label(&self, handle: ClientHandle, label: Option<String>) -> bool {
         let label = label
-            .map(|l| hops_ipc::pairing::sanitize_label(l.trim()))
+            .map(|l| hops_ipc::identity::sanitize_label(l.trim()))
             .filter(|l| !l.trim().is_empty());
         match self.clients.borrow_mut().get_mut(handle) {
             Some((c, _)) if c.label != label => {

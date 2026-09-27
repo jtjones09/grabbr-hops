@@ -18,7 +18,7 @@ use thiserror::Error;
 use hops_ipc::{
     AsyncFrontendRequestWriter, ClientConfig, ClientHandle, ClientState, ConnectionError,
     FrontendEvent, FrontendRequest, GRANT_REFUSED, IpcError, NOT_SAVED, Position, TRUST_NOT_SAVED,
-    connect_async, pairing::canonical_fingerprint,
+    connect_async, identity::canonical_fingerprint,
 };
 
 #[derive(Debug, Error)]
@@ -111,6 +111,9 @@ struct Answer {
     trusted: Option<HashMap<String, String>>,
     /// the revoked devices, if listed meanwhile
     revoked: Option<HashSet<String>>,
+    /// the devices approved here and waiting for the number to be confirmed
+    /// on both machines, if listed meanwhile
+    pairing: Option<HashSet<String>>,
     /// what the service reported meanwhile: refusals, and notices
     errors: Vec<String>,
 }
@@ -215,6 +218,14 @@ async fn read_until(
             FrontendEvent::Created(handle, _, _) => answer.created.push(handle),
             FrontendEvent::AuthorizedUpdated(keys) => answer.trusted = Some(keys),
             FrontendEvent::RevokedUpdated(r) => answer.revoked = Some(r.into_keys().collect()),
+            FrontendEvent::TrustUpdated(t) => {
+                answer.pairing = Some(
+                    t.into_iter()
+                        .filter(|(_, t)| t.pending)
+                        .map(|(fp, _)| fp)
+                        .collect(),
+                )
+            }
             FrontendEvent::Error(e) => answer.errors.push(e),
             _ => {}
         }
@@ -326,7 +337,17 @@ fn granted(answer: &Answer, before: &Answer, fp: &str) -> Result<(), CliError> {
         }
     }
     saved(answer, TRUST_NOT_SAVED)?;
-    println!("trusted {fp}");
+    // A new pairing is approved, not trusted: it grants nothing until the
+    // number is confirmed on both machines, in the hops app (#167).
+    let pending = answer.pairing.as_ref().is_some_and(|p| p.contains(&fp));
+    if pending {
+        println!(
+            "approved {fp}: pairing finishes once the number is confirmed in the hops \
+             app on both machines"
+        );
+    } else {
+        println!("trusted {fp}");
+    }
     Ok(())
 }
 
