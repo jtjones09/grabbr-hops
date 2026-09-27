@@ -293,9 +293,16 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
     match std::env::args().nth(5).as_deref() {
         Some("settings") => ui.set_show_settings(true),
         Some("add-device") => ui.set_show_add_device(true),
-        Some("edit-device") => ui.set_editing_device("1".into()), // matches the mock studio-pc handle
+        // matches the mock studio-pc handle: paired, so its address carries its pin
+        Some("edit-device") => {
+            ui.set_editing_device("1".into());
+            ui.set_editing_pin("1e:19:1b:c4:a8:44".into());
+            ui.set_editing_send(true);
+        }
         Some("clipboard-confirm") => {
             ui.set_editing_device("1".into());
+            ui.set_editing_pin("1e:19:1b:c4:a8:44".into());
+            ui.set_editing_send(true);
             ui.set_confirm_clipboard_off(true);
         }
         // laptop-air: a receive-only row, keyed by fingerprint, clipboard off
@@ -307,7 +314,10 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             ui.set_confirm_clipboard_off(true);
         }
         // media-rig: never connected, so no pairing and no clipboard to show
-        Some("edit-unpaired") => ui.set_editing_device("2".into()),
+        Some("edit-unpaired") => {
+            ui.set_editing_device("2".into());
+            ui.set_editing_send(true);
+        }
         Some("delete-confirm") => ui.set_confirm_delete_handle("1".into()),
         // b7:2a:55 is the mock windows-pc — a trusted, receive-capable peer
         Some("revoke-confirm") => ui.set_confirm_revoke_fp("b7:2a:55:e1:90:33".into()),

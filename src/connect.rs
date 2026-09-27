@@ -903,28 +903,39 @@ async fn connect_to_handle(
             connecting.lock().await.remove(&handle);
             return Err(LanMouseConnectionError::NotConnected);
         }
-        log::info!("client ({handle}) connected @ {addr}");
         // Stamp the receiver's leaf-cert fingerprint from THIS connection — the
         // pin identity + the key the frontend uses to correlate this client with
         // its authorized_fingerprints entry. Only overwrite on a real read: a
         // None from an accepted handshake (shouldn't happen) must NOT wipe a good
         // prior pin — that would fail OPEN on the next dial.
         match peer_fingerprint(&link.conn) {
-            Some(fp) => {
-                let is_new =
-                    client_manager.peer_fingerprint(handle).as_deref() != Some(fp.as_str());
-                log::info!("client {handle} receiver fingerprint: {fp}");
-                client_manager.set_peer_fingerprint(handle, Some(fp));
-                // persist it so the device view can join from a cold start
-                if is_new {
-                    let _ = persist_tx.send(handle);
+            Some(fp) => match client_manager.pin(handle, fp.clone()) {
+                Ok(is_new) => {
+                    log::info!("client {handle} receiver fingerprint: {fp}");
+                    // persist it so the device view can join from a cold start
+                    if is_new {
+                        let _ = persist_tx.send(handle);
+                    }
                 }
-            }
+                // One device per machine (#12): this machine is another
+                // device's, so this device pins nothing and keeps no link.
+                Err(other) => {
+                    drop(open);
+                    log::warn!(
+                        "client {handle}: {addr} is {fp}, the machine client {other} \
+                         already dials; closing this link"
+                    );
+                    link.conn.close(0u32.into(), b"already added");
+                    connecting.lock().await.remove(&handle);
+                    return Err(LanMouseConnectionError::NotConnected);
+                }
+            },
             None => log::warn!(
                 "client {handle}: connected but could not read the receiver's \
                  leaf-cert fingerprint; keeping any prior pin"
             ),
         }
+        log::info!("client ({handle}) connected @ {addr}");
         client_manager.set_active_addr(handle, Some(addr));
         open.insert(addr, link.clone());
         drop(open);
@@ -1180,8 +1191,8 @@ impl OutboundRevoker {
     /// to. Returns how many.
     ///
     /// Both, because renaming or re-addressing a device while its link is up
-    /// clears its pin and, until the next answer, its address, and leaves the
-    /// link open (#218).
+    /// clears its address until the next answer and leaves the link open
+    /// (#218), and a device whose machine was revoked has no pin.
     pub(crate) async fn close_device(&self, handle: ClientHandle, pin: Option<&str>) -> usize {
         let addrs: Vec<SocketAddr> = self
             .conns
@@ -1281,9 +1292,9 @@ async fn disconnect(
     client_manager.set_peer_caps(handle, None);
     // NB: peer_fingerprint is deliberately NOT cleared here — it's the client's
     // last-known identity (process-local), used to pin the reconnect dial + join
-    // the device view, not a per-connection value. It's cleared only when the
-    // target address config changes (set_hostname / set_fix_ips) or trust in it
-    // is revoked (remove_authorized_key).
+    // the device view, not a per-connection value. It's cleared only when trust
+    // in it is revoked (remove_authorized_key): a new address or hostname keeps
+    // it (#99).
     //
     // Clearing is not enough: the frontend shows the state it was last sent,
     // so a link that went down without a word kept its dot green (#34). Not

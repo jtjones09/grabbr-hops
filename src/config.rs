@@ -143,6 +143,10 @@ struct TomlClient {
     /// fingerprint must already be in the allowlist for a dial to succeed.
     #[serde(default)]
     fingerprint: Option<String>,
+    /// What the device is called, apart from where it is dialled (#13).
+    /// Last, as a config may list a device's fields in order.
+    #[serde(default)]
+    label: Option<String>,
 }
 
 impl ConfigToml {
@@ -366,6 +370,7 @@ pub struct Config {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConfigClient {
+    pub label: Option<String>,
     pub ips: HashSet<IpAddr>,
     pub hostname: Option<String>,
     pub port: u16,
@@ -378,6 +383,11 @@ pub struct ConfigClient {
 impl From<TomlClient> for ConfigClient {
     fn from(toml: TomlClient) -> Self {
         let active = toml.activate_on_startup.unwrap_or(false);
+        // as a name given over IPC is (ClientManager::set_label)
+        let label = toml
+            .label
+            .map(|l| hops_ipc::pairing::sanitize_label(l.trim()))
+            .filter(|l| !l.trim().is_empty());
         let enter_hook = toml.enter_hook;
         let hostname = toml.hostname;
         let ips = HashSet::from_iter(toml.ips.into_iter().flatten());
@@ -388,6 +398,7 @@ impl From<TomlClient> for ConfigClient {
             .fingerprint
             .filter(|fp| hops_ipc::pairing::valid_fingerprint(fp));
         Self {
+            label,
             ips,
             hostname,
             port,
@@ -401,6 +412,7 @@ impl From<TomlClient> for ConfigClient {
 
 impl From<ConfigClient> for TomlClient {
     fn from(client: ConfigClient) -> Self {
+        let label = client.label;
         let hostname = client.hostname;
         let host_name = None;
         let mut ips = client.ips.into_iter().collect::<Vec<_>>();
@@ -416,6 +428,7 @@ impl From<ConfigClient> for TomlClient {
         let enter_hook = client.enter_hook;
         let fingerprint = client.fingerprint;
         Self {
+            label,
             hostname,
             host_name,
             ips,
@@ -1627,6 +1640,18 @@ mod saves_keep_what_they_did_not_set {
         (Scratch { dir, path }, config)
     }
 
+    /// The config in `s` as the next start loads it.
+    fn restarted(s: &Scratch) -> Config {
+        let args = Args::parse_from([
+            "hops".as_ref(),
+            "--config".as_ref(),
+            s.path.as_os_str(),
+            "--cert-path".as_ref(),
+            s.dir.join("cert.pem").as_os_str(),
+        ]);
+        Config::with_args(args).expect("the saved config loads")
+    }
+
     fn on_disk(s: &Scratch) -> DocumentMut {
         fs::read_to_string(&s.path)
             .expect("the config")
@@ -1781,6 +1806,7 @@ position = \"right\"
         let mut clients = config.clients();
         clients.remove(0);
         clients.push(ConfigClient {
+            label: None,
             ips: HashSet::from(["192.0.2.12".parse().expect("ip")]),
             hostname: None,
             port: DEFAULT_PORT,
@@ -1960,9 +1986,8 @@ aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
     // LEDGER T15 | class B | 4 file on disk written by Config::write_back
     #[test]
     fn renaming_or_readdressing_a_paired_device_changes_its_entry_in_place() {
-        // A new name or address makes the daemon forget the pin until the next
-        // handshake (ClientManager::set_hostname, set_fix_ips), so memory
-        // differs from the file in the pin as well as in what was changed.
+        // A new name or address keeps the pin (#99), so the entry is found by
+        // it, and the pin is saved with the change.
         let (s, mut config) = scratch(
             "pinrename",
             &format!(
@@ -1973,7 +1998,6 @@ aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
         );
         let mut clients = config.clients();
         clients[0].hostname = Some("den".to_string());
-        clients[0].fingerprint = None;
         config.set_clients(clients);
         config.write_back().expect("the save");
         let doc = on_disk(&s);
@@ -1981,6 +2005,11 @@ aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
             text(entry(&doc, 0), "hostname"),
             "\"den\"",
             "the renamed paired device's entry is not where it was:\n{doc}"
+        );
+        assert_eq!(
+            text(entry(&doc, 0), "fingerprint"),
+            format!("\"{DESK}\""),
+            "the renamed paired device's pin was not saved with it:\n{doc}"
         );
         assert_eq!(
             text(entry(&doc, 0), "future_client_key"),
@@ -2002,7 +2031,6 @@ aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
         fs::write(&s.path, text_before.replace("\"left\"", "\"top\"")).expect("the hand edit");
         let mut clients = config.clients();
         clients[0].ips = HashSet::from(["192.0.2.20".parse().expect("ip")]);
-        clients[0].fingerprint = None;
         config.set_clients(clients);
         config.write_back().expect("the save");
         let doc = on_disk(&s);
@@ -2012,10 +2040,135 @@ aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
             "the new address was not saved:\n{doc}"
         );
         assert_eq!(
+            text(entry(&doc, 0), "fingerprint"),
+            format!("\"{DESK}\""),
+            "the re-addressed paired device's pin was not saved with it:\n{doc}"
+        );
+        assert_eq!(
             text(entry(&doc, 0), "position"),
             "\"top\"",
             "a new address for a paired device put back the position edited by \
              hand:\n{doc}"
+        );
+    }
+
+    // LEDGER T9901 | class B | 1 return value: ClientManager::switch_allows_clipboard, 4 file on disk written by Config::write_back and loaded by the next start
+    /// A device renamed, re-addressed and switched off stops clipboard with
+    /// its machine after a restart as it did before one (#218). The switch
+    /// names the machine by the device's pin, and the saved entry lost the pin
+    /// with every new name or address, so the next start found an entry that
+    /// was off and named no machine.
+    #[test]
+    fn a_device_edited_and_switched_off_still_stops_clipboard_after_a_restart() {
+        use crate::client::{ClientManager, config_entry};
+        let (s, mut config) = scratch(
+            "editedoff",
+            &format!(
+                "[[clients]]\nhostname = \"desk-mac\"\nips = [\"192.0.2.10\"]\n\
+                 position = \"left\"\nactivate_on_startup = true\nfingerprint = \"{DESK}\"\n"
+            ),
+        );
+        let running = ClientManager::default();
+        let desk = running.add_with_config(config.clients().remove(0));
+        running.set_hostname(desk, Some("den".to_string()));
+        running.set_fix_ips(desk, vec!["192.0.2.20".parse().expect("ip")]);
+        assert!(running.deactivate_client(desk), "precondition");
+        assert!(
+            !running.switch_allows_clipboard(DESK, None),
+            "precondition: switched off, the device stops clipboard"
+        );
+        // as Service::save_config saves it
+        let entries = running
+            .clients()
+            .iter()
+            .map(|(c, st)| config_entry(c, st))
+            .collect();
+        config.set_clients(entries);
+        config.write_back().expect("the save");
+
+        let loaded = restarted(&s).clients();
+        let fresh = ClientManager::default();
+        for entry in loaded.iter().cloned() {
+            fresh.add_with_config(entry);
+        }
+        assert!(
+            !fresh.switch_allows_clipboard(DESK, None),
+            "a device renamed, re-addressed and switched off let clipboard with \
+             its machine through after a restart: the saved entry no longer \
+             names the machine. Saved:\n{}",
+            fs::read_to_string(&s.path).expect("the config")
+        );
+        assert_eq!(
+            loaded
+                .iter()
+                .map(|c| (c.hostname.as_deref(), c.active, c.fingerprint.as_deref()))
+                .collect::<Vec<_>>(),
+            [(Some("den"), false, Some(DESK))],
+            "the edit, the switch and the pin did not all survive the restart"
+        );
+    }
+
+    // LEDGER T9909 | class B | 4 file on disk written by Config::write_back and loaded by the next start
+    /// Naming a paired device saves the name in its own key, leaves where it
+    /// is dialled and its pin as they were, and the next start reads it back
+    /// (#13). The name used to be the hostname.
+    #[test]
+    fn naming_a_paired_device_saves_its_name_apart_from_its_address() {
+        use crate::client::{ClientManager, config_entry};
+        let (s, mut config) = scratch(
+            "label",
+            &format!(
+                "[[clients]]\nhostname = \"desk-mac.local\" # where it is\n\
+                 fingerprint = \"{DESK}\"\n\n[[clients]]\nhostname = \"laptop\"\n"
+            ),
+        );
+        let running = ClientManager::default();
+        let handles: Vec<_> = config
+            .clients()
+            .into_iter()
+            .map(|c| running.add_with_config(c))
+            .collect();
+        assert!(running.set_label(handles[0], Some(" den ".to_string())));
+        let entries = running
+            .clients()
+            .iter()
+            .map(|(c, st)| config_entry(c, st))
+            .collect();
+        config.set_clients(entries);
+        config.write_back().expect("the save");
+        let doc = on_disk(&s);
+        assert_eq!(
+            [
+                text(entry(&doc, 0), "label"),
+                text(entry(&doc, 0), "hostname"),
+                text(entry(&doc, 0), "fingerprint"),
+            ],
+            [
+                "\"den\"".to_string(),
+                "\"desk-mac.local\"".to_string(),
+                format!("\"{DESK}\""),
+            ],
+            "(label, hostname, pin) of the named device as saved:\n{doc}"
+        );
+        assert!(
+            doc.to_string().contains("# where it is"),
+            "naming the device dropped the comment on its hostname:\n{doc}"
+        );
+        let loaded = restarted(&s).clients();
+        assert_eq!(
+            loaded
+                .iter()
+                .map(|c| (
+                    c.label.as_deref(),
+                    c.hostname.as_deref(),
+                    c.fingerprint.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (Some("den"), Some("desk-mac.local"), Some(DESK)),
+                (None, Some("laptop"), None)
+            ],
+            "the name, the address and the pin did not all survive the restart"
         );
     }
 
@@ -2252,7 +2405,7 @@ aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
                  hostname = \"garage-pc\" # after the name\n\
                  # keep it on the left\nposition = \"top\"\n",
             ),
-            // a rename forgets the pin until the next handshake, so its line goes
+            // revoking the machine forgets the pin, so its line goes
             (
                 "pinned",
                 &pinned,
@@ -2340,6 +2493,7 @@ aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
                 |c| {
                     let mut clients = c.clients();
                     clients.push(ConfigClient {
+                        label: None,
                         ips: HashSet::new(),
                         hostname: Some("desk-mac".to_string()),
                         port: DEFAULT_PORT,

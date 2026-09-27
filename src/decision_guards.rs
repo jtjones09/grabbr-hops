@@ -1833,6 +1833,146 @@ mod removing_a_device_takes_its_key_and_not_merely_its_address {
     }
 }
 
+mod an_edited_device_still_dials_only_the_machine_it_is_pinned_to {
+    //! **Decided 2026-09-26 (#99).** Editing a device's address or hostname
+    //! keeps its fingerprint pin. The machine answering at the new address
+    //! has to present the same fingerprint; a different machine is refused.
+    //! This reverses the clearing that went with #22.
+    //!
+    //! **Why.** The pin is the only thing that says "this device is that
+    //! machine". Without it a dial accepts any machine this one may drive, so
+    //! clearing it on an edit widened the check from one machine to all of
+    //! them, and the dial then pinned and saved whichever answered, with no
+    //! prompt and the old name still on the card. An address says where to
+    //! dial, never who is trusted there.
+
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        time::Duration,
+    };
+
+    use hops_ipc::Position;
+    use hops_proto::ProtoEvent;
+
+    use crate::client::ClientManager;
+    use crate::test_harness::{Dialer, Door, Machine, dialer, door, machine, run_local, trust};
+    use crate::trust::Caps;
+
+    use super::fp32;
+
+    const PATIENCE: Duration = Duration::from_secs(10);
+
+    /// Somewhere nothing answers (TEST-NET-1), where the device was before.
+    const OLD_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+
+    /// A device pinned to `pinned`, at [`OLD_ADDRESS`] on `door`'s port, then
+    /// moved to the address `door` answers on, and dialled.
+    async fn moved_to(
+        door: &Door,
+        sender: &Machine,
+        pinned: &Machine,
+        known: &[&Machine],
+    ) -> Dialer {
+        let d = dialer(
+            sender,
+            trust(sender, known, Caps::OUTBOUND),
+            door.port,
+            Position::Left,
+        );
+        d.clients.set_fix_ips(d.handle, vec![OLD_ADDRESS]);
+        d.clients
+            .set_peer_fingerprint(d.handle, Some(pinned.fingerprint.clone()));
+        d.clients
+            .set_fix_ips(d.handle, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+        let _ = d.conn.send(ProtoEvent::Ping, d.handle).await;
+        let started = tokio::time::Instant::now();
+        while door.closed() == 0
+            && d.conn.active_addr(d.handle).is_none()
+            && started.elapsed() < PATIENCE
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        d
+    }
+
+    /// The rule itself, for both edits, at the one place that holds the pin.
+    #[test]
+    fn a_new_address_or_name_leaves_the_pin_where_it_was() {
+        let clients = ClientManager::default();
+        let handle = clients.add_client();
+        let pin = fp32(0xd1);
+        clients.set_peer_fingerprint(handle, Some(pin.clone()));
+
+        clients.set_fix_ips(handle, vec![OLD_ADDRESS]);
+        assert_eq!(
+            clients.peer_fingerprint(handle),
+            Some(pin.clone()),
+            "a new address cleared the device's pin, so its next dial accepts any \
+             machine this one may drive and pins whichever answers (#99)"
+        );
+        clients.set_hostname(handle, Some("desk mac.invalid".into()));
+        assert_eq!(
+            clients.peer_fingerprint(handle),
+            Some(pin),
+            "a new hostname cleared the device's pin, so its next dial accepts \
+             any machine this one may drive and pins whichever answers (#99)"
+        );
+    }
+
+    /// A different machine answering at the new address is refused, though
+    /// this machine may drive it.
+    #[test]
+    fn another_machine_at_the_new_address_is_refused() {
+        run_local(async {
+            let (sender, desk, other) = (machine(), machine(), machine());
+            let answering = door(&other);
+            answering.open();
+            let d = moved_to(&answering, &sender, &desk, &[&desk, &other]).await;
+
+            assert_eq!(
+                (
+                    d.conn.active_addr(d.handle).is_some(),
+                    d.clients.peer_fingerprint(d.handle) == Some(desk.fingerprint.clone()),
+                    answering.streams(),
+                ),
+                (false, true, 0),
+                "(linked, still pinned to the desk, streams opened): the device \
+                 was pinned to the desk and moved to an address where another \
+                 machine this one may drive answers. That machine has to be \
+                 refused and the pin kept (#99); a link or a new pin means input \
+                 meant for the desk goes to it."
+            );
+            assert!(
+                answering.closed() > 0,
+                "the other machine's connection was left open"
+            );
+        });
+    }
+
+    /// The same machine at its new address is still reached: keeping the pin
+    /// does not stop an address edit from working.
+    #[test]
+    fn the_same_machine_at_the_new_address_is_reached() {
+        run_local(async {
+            let (sender, desk) = (machine(), machine());
+            let answering = door(&desk);
+            answering.open();
+            let d = moved_to(&answering, &sender, &desk, &[&desk]).await;
+
+            assert!(
+                d.conn.active_addr(d.handle).is_some(),
+                "the device was moved to the address its own machine answers on, \
+                 and no link came up"
+            );
+            assert_eq!(
+                d.clients.peer_fingerprint(d.handle),
+                Some(desk.fingerprint),
+                "the device's pin changed on reaching its own machine"
+            );
+        });
+    }
+}
+
 // ---------------------------------------------------------------------------
 // no UI is trusted; nothing reaches a shell
 // ---------------------------------------------------------------------------

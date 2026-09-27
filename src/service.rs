@@ -337,11 +337,11 @@ impl RecentNotices {
 /// allowlist.
 ///
 /// Such a pin can never let anyone in — the outbound dial is fail-closed against
-/// it — but it CAN silently brick a client: hand-editing `hostname` to retarget a
-/// device while leaving the old `fingerprint = ...` behind makes every dial fail
-/// identity verification with no visible cause. Dropping it lets the client
-/// re-learn the identity on its next successful handshake, which is exactly what
-/// a never-connected client does.
+/// it — but it CAN silently brick a client: no machine can satisfy it, so every
+/// dial fails identity verification with no visible cause. Dropping it lets the
+/// client re-learn the identity on its next successful handshake, which is
+/// exactly what a never-connected client does. A pin the trust store knows is
+/// kept through any edit to the device's hostname or address (#99).
 fn drop_untrusted_pins(
     client_manager: &ClientManager,
     trust: &crate::trust::TrustStore,
@@ -849,13 +849,27 @@ impl Service {
                 // Deliberately here and NOT in remove_client(): that is also
                 // called by handle_config_change, which removes clients it
                 // replaces, so revoking there would drop trust on a reload.
+                //
+                // A config saved before #12 can hold a second device pinned
+                // to the same machine, folded into this one's card. It goes
+                // too: left behind, the revocation clears its pin and it
+                // dials whatever answers at its address.
+                let mut gone = vec![handle];
                 if let Some(fp) = self.client_manager.peer_fingerprint(handle) {
+                    gone.extend(
+                        self.client_manager
+                            .every_pinned_to(&fp)
+                            .into_iter()
+                            .filter(|&h| h != handle),
+                    );
                     if self.trust.read().expect("lock").is_known(&fp) {
                         log::warn!("deleting client {handle}: also revoking its trust ({fp})");
                         self.remove_authorized_key(fp);
                     }
                 }
-                self.remove_client(handle);
+                for handle in gone {
+                    self.remove_client(handle);
+                }
                 self.save_config();
             }
             FrontendRequest::EnableCapture => self.capture.reenable(),
@@ -864,6 +878,12 @@ impl Service {
             FrontendRequest::UpdateFixIps(handle, fix_ips) => {
                 self.update_fix_ips(handle, fix_ips);
                 self.save_config();
+            }
+            FrontendRequest::UpdateLabel(handle, label) => {
+                if self.client_manager.set_label(handle, label) {
+                    self.broadcast_client(handle);
+                    self.save_config();
+                }
             }
             FrontendRequest::UpdateHostname {
                 handle,
@@ -1596,9 +1616,15 @@ impl Service {
         let Some((config, state)) = self.client_manager.get_state(handle) else {
             return format!("device {handle}");
         };
-        state
-            .peer_fingerprint
-            .and_then(|fp| self.trust.read().expect("lock").label(&fp))
+        // The name the user gave it (#13), then the paired machine's label,
+        // then where it is dialled.
+        self.client_manager
+            .get_label(handle)
+            .or_else(|| {
+                state
+                    .peer_fingerprint
+                    .and_then(|fp| self.trust.read().expect("lock").label(&fp))
+            })
             .filter(|l| !l.is_empty())
             .or(config.hostname)
             .or_else(|| config.fix_ips.first().map(|ip| ip.to_string()))
@@ -2065,9 +2091,9 @@ impl Service {
         // By the link's own record, never the address: a link outlives a
         // change of the device's address, and an address can be another
         // machine's by now. The links dialled for it, and every link to the
-        // machine it is pinned to; a rename or a new address clears the pin
-        // and leaves its link up. A dial still out when this runs is closed
-        // by the dialler when it lands.
+        // machine it is pinned to, which a rename or a new address keeps
+        // (#99). A dial still out when this runs is closed by the dialler
+        // when it lands.
         let pin = self.client_manager.peer_fingerprint(handle);
         let outbound = self.revoke_conn.clone();
         tokio::task::spawn_local(async move {
@@ -2102,17 +2128,22 @@ impl Service {
     }
 
     /// Dial again every device still being added whose link is down. Stops
-    /// for one switched off or removed, or out of time; out of time with no
-    /// link, it says why.
+    /// for one switched off or removed, one that reached a machine another
+    /// device already dials, or one out of time; the last two say why.
     fn retry_adding(&mut self) {
         let now = Instant::now();
         let window_open = self.prompt_gate.remaining(now).is_some();
         let mut gave_up = Vec::new();
+        let mut added_before = Vec::new();
         self.adding.retain(|&handle, &mut started| {
             let Some((_, state)) = self.client_manager.get_state(handle) else {
                 return false;
             };
             if !state.active {
+                return false;
+            }
+            if let Some(other) = self.client_manager.same_machine_as(handle) {
+                added_before.push((handle, other));
                 return false;
             }
             // A link that looks open may not be: a machine that has not
@@ -2132,11 +2163,16 @@ impl Service {
             }
             true
         });
+        for (handle, other) in added_before {
+            let (name, other) = (self.device_name(handle), self.device_name(other));
+            log::info!("stopped dialling {name}: it is {other}, which is already added");
+            self.notify_frontend(FrontendEvent::Error(format!(
+                "{name} is the same machine as {other}, which is already added. \
+                 Remove {name}."
+            )));
+        }
         for handle in gave_up {
-            let name = self
-                .client_manager
-                .get_hostname(handle)
-                .unwrap_or_else(|| format!("device {handle}"));
+            let name = self.device_name(handle);
             log::info!("stopped dialling {name}: pairing did not finish in time");
             self.notify_frontend(FrontendEvent::Error(format!(
                 "Pairing with {name} did not finish in two minutes. Open add device on \
@@ -2145,6 +2181,7 @@ impl Service {
         }
     }
 
+    /// What the user calls the device at `handle`.
     fn deactivate_client(&mut self, handle: ClientHandle) {
         log::debug!("deactivating client {handle}");
         if self.client_manager.deactivate_client(handle) {

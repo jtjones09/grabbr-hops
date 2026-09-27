@@ -1540,6 +1540,7 @@ mod release_mid_drag {
             let (config, state) = v.clients.remove_client(v.handle).expect("precondition");
             v.capture.destroy(v.handle);
             let handle = v.clients.add_with_config(crate::config::ConfigClient {
+                label: None,
                 ips: config.fix_ips.iter().copied().collect(),
                 hostname: config.hostname,
                 port: config.port,

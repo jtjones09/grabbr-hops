@@ -26,14 +26,14 @@ pub struct ClientManager {
 struct Clients {
     next: ClientHandle,
     entries: BTreeMap<ClientHandle, (ClientConfig, ClientState)>,
-    /// Each device's last pin, kept when an edit to its address or name
-    /// clears the pin and replaced only by the next pin. The device switch
-    /// gates the machine it names (#218), so an edit cannot lift the switch.
-    last_pins: BTreeMap<ClientHandle, String>,
     /// Devices whose peer has answered a ping on the link it has now. Until
     /// it has, `alive` false says only that it has not answered yet, not
     /// that it refuses input.
     answered: BTreeSet<ClientHandle>,
+    /// The machine a device's dial reached when another device already
+    /// dialled it, so the service can say which (#12). Dropped when the
+    /// device is pinned, pointed elsewhere or removed.
+    refused_as: BTreeMap<ClientHandle, String>,
 }
 
 impl Clients {
@@ -53,6 +53,18 @@ impl Clients {
         &mut self,
     ) -> impl Iterator<Item = (ClientHandle, &mut (ClientConfig, ClientState))> {
         self.entries.iter_mut().map(|(h, c)| (*h, c))
+    }
+
+    /// The device that dials the machine `fingerprint`: of the devices
+    /// pinned to it, the one added first.
+    fn dialler_of(&self, fingerprint: &str) -> Option<ClientHandle> {
+        self.iter()
+            .find(|(_, (_, s))| {
+                s.peer_fingerprint
+                    .as_deref()
+                    .is_some_and(|pin| pin.eq_ignore_ascii_case(fingerprint))
+            })
+            .map(|(h, _)| h)
     }
 }
 
@@ -76,6 +88,7 @@ impl ClientManager {
 
     pub fn add_with_config(&self, config_client: ConfigClient) -> ClientHandle {
         let config = ClientConfig {
+            label: config_client.label,
             hostname: config_client.hostname,
             fix_ips: config_client.ips.into_iter().collect(),
             port: config_client.port,
@@ -116,13 +129,8 @@ impl ClientManager {
 
     /// set the state of the given client
     pub fn set_state(&self, handle: ClientHandle, state: ClientState) {
-        let mut clients = self.clients.borrow_mut();
-        let pin = state.peer_fingerprint.clone();
-        if let Some((_, s)) = clients.get_mut(handle) {
+        if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle) {
             *s = state;
-            if let Some(pin) = pin {
-                clients.last_pins.insert(handle, pin);
-            }
         }
     }
 
@@ -190,8 +198,8 @@ impl ClientManager {
     /// remove a client from the list
     pub fn remove_client(&self, client: ClientHandle) -> Option<(ClientConfig, ClientState)> {
         let mut clients = self.clients.borrow_mut();
-        clients.last_pins.remove(&client);
         clients.answered.remove(&client);
+        clients.refused_as.remove(&client);
         clients.entries.remove(&client)
     }
 
@@ -209,17 +217,20 @@ impl ClientManager {
             .collect()
     }
 
-    /// update the fix ips of the client
+    /// Set the addresses the device is dialled at.
+    ///
+    /// The pin stays (#99): an address says where to dial, not which machine
+    /// is trusted there. The machine answering at the new address has to
+    /// present the pinned fingerprint, and any other is refused at the dial.
     pub fn set_fix_ips(&self, handle: ClientHandle, fix_ips: Vec<IpAddr>) {
-        if let Some((c, s)) = self.clients.borrow_mut().get_mut(handle) {
-            // only forget the learned identity if the target set actually changed
-            // — an additive/no-op re-push shouldn't drop a good pin and re-open
-            // the unpinned race. A fresh handshake re-learns + re-pins it.
+        let mut clients = self.clients.borrow_mut();
+        if let Some((c, _)) = clients.get_mut(handle) {
             if c.fix_ips != fix_ips {
-                s.peer_fingerprint = None;
+                c.fix_ips = fix_ips;
+                clients.refused_as.remove(&handle);
             }
-            c.fix_ips = fix_ips;
         }
+        drop(clients);
         self.update_ips(handle);
     }
 
@@ -242,8 +253,11 @@ impl ClientManager {
         }
     }
 
-    /// update the hostname of the given client
-    /// this automatically clears the active ip address and ips from dns
+    /// Set the hostname the device is dialled at, which clears the active
+    /// address and the addresses resolved for the old name.
+    ///
+    /// The pin stays (#99), as for [`Self::set_fix_ips`]: a new name that
+    /// resolves to another machine reaches nothing.
     pub fn set_hostname(&self, handle: ClientHandle, hostname: Option<String>) -> bool {
         let mut clients = self.clients.borrow_mut();
         let Some((c, s)) = clients.get_mut(handle) else {
@@ -255,15 +269,37 @@ impl ClientManager {
             c.hostname = hostname;
             s.active_addr = None;
             s.dns_ips.clear();
-            // a new hostname may resolve to a different machine — forget the
-            // learned identity so the pin re-learns it on the next handshake.
-            s.peer_fingerprint = None;
+            clients.refused_as.remove(&handle);
             drop(clients);
             self.update_ips(handle);
             true
         } else {
             false
         }
+    }
+
+    /// Name the device, or clear its name with `None` or a blank one. Only
+    /// the name: where it is dialled and which machine it is pinned to stay
+    /// as they are (#13). Returns whether the name changed.
+    pub(crate) fn set_label(&self, handle: ClientHandle, label: Option<String>) -> bool {
+        let label = label
+            .map(|l| hops_ipc::pairing::sanitize_label(l.trim()))
+            .filter(|l| !l.trim().is_empty());
+        match self.clients.borrow_mut().get_mut(handle) {
+            Some((c, _)) if c.label != label => {
+                c.label = label;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The device's name, if it was given one.
+    pub(crate) fn get_label(&self, handle: ClientHandle) -> Option<String> {
+        self.clients
+            .borrow()
+            .get(handle)
+            .and_then(|(c, _)| c.label.clone())
     }
 
     /// update the port of the client
@@ -440,20 +476,77 @@ impl ClientManager {
         }
     }
 
+    /// Set the pin outright. A dial pins through [`Self::pin`].
+    #[cfg(test)]
     pub(crate) fn set_peer_fingerprint(&self, handle: ClientHandle, fingerprint: Option<String>) {
         let mut clients = self.clients.borrow_mut();
+        clients.refused_as.remove(&handle);
         if let Some((_, s)) = clients.get_mut(handle) {
-            s.peer_fingerprint = fingerprint.clone();
-            if let Some(pin) = fingerprint {
-                clients.last_pins.insert(handle, pin);
-            }
+            s.peer_fingerprint = fingerprint;
         }
     }
 
-    /// The receiver's last-known leaf-cert fingerprint for this client
-    /// (process-local; learned at handshake, not persisted), or `None` if it has
-    /// never connected this run or the target address / trust changed since.
-    /// Used to pin the outbound dial (fail closed).
+    /// Pin `handle` to the machine that proved `fingerprint` on its dial,
+    /// unless another device already dials that machine: then nothing is
+    /// pinned, and that device is returned. Otherwise returns whether the pin
+    /// is new.
+    ///
+    /// One device per machine. The same machine added twice, once by name
+    /// and once by address, made one card whose name came from one entry and
+    /// whose buttons acted on the other (#12). A config saved before this can
+    /// still hold two devices pinned to one machine: only the one added
+    /// first dials it.
+    pub(crate) fn pin(
+        &self,
+        handle: ClientHandle,
+        fingerprint: String,
+    ) -> Result<bool, ClientHandle> {
+        let mut clients = self.clients.borrow_mut();
+        if let Some(first) = clients.dialler_of(&fingerprint).filter(|&h| h != handle) {
+            if clients.entries.contains_key(&handle) {
+                clients.refused_as.insert(handle, fingerprint);
+            }
+            return Err(first);
+        }
+        clients.refused_as.remove(&handle);
+        Ok(clients.get_mut(handle).is_some_and(|(_, s)| {
+            let new = s.peer_fingerprint.as_deref() != Some(fingerprint.as_str());
+            s.peer_fingerprint = Some(fingerprint);
+            new
+        }))
+    }
+
+    /// The device that dials the machine `handle` reached, when that is
+    /// another device (#12).
+    pub(crate) fn same_machine_as(&self, handle: ClientHandle) -> Option<ClientHandle> {
+        let clients = self.clients.borrow();
+        let (_, s) = clients.get(handle)?;
+        let machine = s
+            .peer_fingerprint
+            .as_ref()
+            .or_else(|| clients.refused_as.get(&handle))?;
+        clients.dialler_of(machine).filter(|&h| h != handle)
+    }
+
+    /// Every device pinned to the machine `fingerprint`, switched on or off.
+    /// [`Self::pinned_to`] is the switched-on ones a connection speaks for.
+    pub(crate) fn every_pinned_to(&self, fingerprint: &str) -> Vec<ClientHandle> {
+        self.clients
+            .borrow()
+            .iter()
+            .filter(|(_, (_, s))| {
+                s.peer_fingerprint
+                    .as_deref()
+                    .is_some_and(|pin| pin.eq_ignore_ascii_case(fingerprint))
+            })
+            .map(|(h, _)| h)
+            .collect()
+    }
+
+    /// The receiver's leaf-cert fingerprint for this client: learned at the
+    /// first handshake and saved with the device, or `None` if it has never
+    /// connected or trust in its machine was revoked since. A new hostname or
+    /// address keeps it (#99). Used to pin the outbound dial (fail closed).
     pub(crate) fn peer_fingerprint(&self, handle: ClientHandle) -> Option<String> {
         self.clients
             .borrow()
@@ -468,28 +561,26 @@ impl ClientManager {
     /// peer opened.
     ///
     /// Not over a link dialled for a device that is switched off or gone:
-    /// renaming or re-addressing a device clears its pin, and its link is
-    /// still its link. Not when any device switched off is, or was last,
-    /// pinned to that fingerprint, even if another entry for the same machine
-    /// is on: off fails closed, and an edit that clears the pin, before the
-    /// switch or while it is off, leaves the machine switched off. A device
-    /// never pinned names no machine for links it did not dial. The
-    /// pairing's own clipboard grant is a separate check, and both have to
-    /// allow.
+    /// its link is its link, whatever its pin says now. Not when any device
+    /// switched off is pinned to that fingerprint, even if another entry for
+    /// the same machine is on: off fails closed. A rename or a new address
+    /// keeps the pin (#99), and the pin is saved with the device, so neither
+    /// an edit nor a restart lifts the switch. A device with no pin names no
+    /// machine for links it did not dial. The pairing's own clipboard grant
+    /// is a separate check, and both have to allow.
     pub(crate) fn switch_allows_clipboard(
         &self,
         fingerprint: &str,
         dialled_for: Option<ClientHandle>,
     ) -> bool {
-        let clients = self.clients.borrow();
         let names =
             |pin: Option<&str>| pin.is_some_and(|pin| pin.eq_ignore_ascii_case(fingerprint));
         dialled_for.is_none_or(|handle| self.is_on(handle))
-            && !clients.iter().any(|(h, (_, s))| {
-                !s.active
-                    && (names(s.peer_fingerprint.as_deref())
-                        || names(clients.last_pins.get(&h).map(String::as_str)))
-            })
+            && !self
+                .clients
+                .borrow()
+                .iter()
+                .any(|(_, (_, s))| !s.active && names(s.peer_fingerprint.as_deref()))
     }
 
     /// Clear the pin on any client currently pinned to `fingerprint`, so its
@@ -553,6 +644,7 @@ impl ClientManager {
 /// what a reload compares the file against.
 pub(crate) fn config_entry(config: &ClientConfig, state: &ClientState) -> ConfigClient {
     ConfigClient {
+        label: config.label.clone(),
         ips: HashSet::from_iter(config.fix_ips.iter().copied()),
         hostname: config.hostname.clone(),
         port: config.port,
@@ -586,6 +678,7 @@ mod reload_permutation {
 
     fn entry(name: &str) -> ConfigClient {
         ConfigClient {
+            label: None,
             ips: HashSet::new(),
             hostname: Some(name.to_string()),
             port: hops_ipc::DEFAULT_PORT,
@@ -819,6 +912,7 @@ mod the_switch_gates_clipboard_by_fingerprint {
 
     fn device(m: &ClientManager, pin: Option<&str>, on: bool) -> ClientHandle {
         m.add_with_config(ConfigClient {
+            label: None,
             ips: HashSet::new(),
             hostname: None,
             port: hops_ipc::DEFAULT_PORT,
@@ -860,7 +954,7 @@ mod the_switch_gates_clipboard_by_fingerprint {
         );
 
         // A device with no pin names no machine, except over a link dialled
-        // for it: an edit that cleared its pin left that link up.
+        // for it, which is its link whatever its pin says.
         const C: &str = "cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc";
         let unpinned = device(&m, None, false);
         m.activate_client(a);
@@ -883,5 +977,115 @@ mod the_switch_gates_clipboard_by_fingerprint {
             !m.switch_allows_clipboard(C, Some(unpinned)),
             "clipboard moved over a link dialled for a device that is gone"
         );
+    }
+}
+
+#[cfg(test)]
+mod one_device_dials_each_machine {
+    //! The same machine added twice made one card whose name came from one
+    //! entry and whose buttons acted on the other (#12). A dial that reaches
+    //! a machine another device already dials now pins nothing and closes,
+    //! so the card, its switch and its delete all name one entry.
+
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        time::Duration,
+    };
+
+    use hops_proto::ProtoEvent;
+
+    use super::*;
+    use crate::test_harness::{Dialer, Door, dialer, door, machine, run_local, trust, wait_until};
+    use crate::trust::Caps;
+
+    const PATIENCE: Duration = Duration::from_secs(10);
+
+    /// Dial `handle` and wait until its link is up or `door` saw a
+    /// connection closed.
+    async fn dialled(d: &Dialer, door: &Door, handle: ClientHandle) {
+        let closed = door.closed();
+        let _ = d.conn.send(ProtoEvent::Ping, handle).await;
+        let started = tokio::time::Instant::now();
+        while door.closed() == closed
+            && d.conn.active_addr(handle).is_none()
+            && started.elapsed() < PATIENCE
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Another device at the address the dialer's device dials.
+    fn another_entry(d: &Dialer, door: &Door, pin: Option<String>) -> ClientHandle {
+        let handle = d.clients.add_with_config(ConfigClient {
+            label: None,
+            ips: HashSet::from([IpAddr::V4(Ipv4Addr::LOCALHOST)]),
+            hostname: Some("desk mac".into()),
+            port: door.port,
+            pos: Position::Right,
+            active: true,
+            enter_hook: None,
+            fingerprint: pin,
+        });
+        assert!(d.clients.is_on(handle), "precondition");
+        handle
+    }
+
+    // LEDGER T9903 | class B | 6 struct state: ClientManager after LanMouseConnection::send's dial, 2 connection closed at a real QUIC receiver
+    #[test]
+    fn a_second_device_for_a_machine_already_dialled_pins_nothing_and_keeps_no_link() {
+        run_local(async {
+            let (sender, desk) = (machine(), machine());
+            let answering = door(&desk);
+            answering.open();
+            let d = dialer(
+                &sender,
+                trust(&sender, &[&desk], Caps::OUTBOUND),
+                answering.port,
+                Position::Left,
+            );
+            dialled(&d, &answering, d.handle).await;
+            assert_eq!(
+                (
+                    d.clients.peer_fingerprint(d.handle),
+                    d.conn.active_addr(d.handle).is_some()
+                ),
+                (Some(desk.fingerprint.clone()), true),
+                "precondition: the first device is linked and pinned to the desk"
+            );
+
+            // Added again by address, and never connected: no pin yet.
+            let again = another_entry(&d, &answering, None);
+            dialled(&d, &answering, again).await;
+            assert_eq!(
+                (
+                    d.clients.peer_fingerprint(again),
+                    d.conn.active_addr(again).is_some(),
+                    d.clients.same_machine_as(again),
+                ),
+                (None, false, Some(d.handle)),
+                "(pin, linked, the device already dialling that machine): the desk \
+                 was added a second time. The second device has to pin nothing and \
+                 keep no link, or one card shows the name of one and acts on the \
+                 other (#12)"
+            );
+
+            // A config saved before this carries both pins. Only the device
+            // added first dials the machine.
+            let saved = another_entry(&d, &answering, Some(desk.fingerprint.clone()));
+            dialled(&d, &answering, saved).await;
+            assert_eq!(
+                (
+                    d.conn.active_addr(saved).is_some(),
+                    d.clients.same_machine_as(saved)
+                ),
+                (false, Some(d.handle)),
+                "(linked, the device already dialling that machine): two saved \
+                 devices pinned to one machine both dialled it"
+            );
+            wait_until("the first device to stay linked", PATIENCE, || {
+                d.conn.active_addr(d.handle).is_some()
+            })
+            .await;
+        });
     }
 }
