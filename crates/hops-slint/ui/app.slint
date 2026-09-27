@@ -572,6 +572,13 @@ export component AppWindow inherits Window {
                                 clicked => { root.deny-pairing(root.pairing-fp); }
                             }
                         }
+                        // Says why "trust & name" waits, as the TUI does.
+                        if root.pairing-controller < 0: Text {
+                            text: "Choose which machine is in control to trust it.";
+                            color: Theme.c.muted;
+                            font-size: Type.small;
+                            wrap: word-wrap;
+                        }
                     }
                 }
 

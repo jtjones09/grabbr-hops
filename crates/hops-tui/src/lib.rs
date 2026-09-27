@@ -2079,7 +2079,7 @@ mod tests {
         model.apply(FrontendEvent::ConnectionAttempt {
             fingerprint: FP.into(),
             origin: AttemptOrigin::Inbound,
-            addr: Some("10.0.0.7:51234".parse().expect("addr")),
+            addr: Some("192.0.2.7:51234".parse().expect("addr")),
         });
         let t0 = Instant::now();
         let mut card = PairingCard::default();
