@@ -285,7 +285,7 @@ mod clipboard_follows_the_pairing {
                  the sender's own fingerprint"
             );
             let gone = pair.driven.fingerprint.clone();
-            pair.driver_trust.write().expect("lock").revoke(&gone);
+            pair.driver_trust.write().expect("lock").forget(&gone);
             pair.driver_sends.broadcast("after".into()).await;
             assert_eq!(
                 text(heard_within(&mut pair.driven_heard, NEVER_WITHIN).await),
@@ -308,7 +308,7 @@ mod clipboard_follows_the_pairing {
                 "the driver never got text a both-ways pairing grants"
             );
             let gone = pair.driver.fingerprint.clone();
-            pair.driven_trust.write().expect("lock").revoke(&gone);
+            pair.driven_trust.write().expect("lock").forget(&gone);
             pair.driven_sends.broadcast("after".into()).await;
             assert_eq!(
                 text(heard_within(&mut pair.dialer.notices.clipboard, NEVER_WITHIN).await),
@@ -435,7 +435,7 @@ mod clipboard_follows_the_pairing {
             // the pairing still grants it.
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             let gone = raw.driver.fingerprint.clone();
-            raw.driven_trust.write().expect("lock").revoke(&gone);
+            raw.driven_trust.write().expect("lock").forget(&gone);
             send.write_all(b"the text").await.expect("write");
             send.finish().expect("finish");
             assert_eq!(
@@ -472,7 +472,7 @@ mod clipboard_follows_the_pairing {
             queue
                 .send(from_peer("queued, then removed"))
                 .expect("queue");
-            trust.write().expect("lock").revoke(&peer.fingerprint);
+            trust.write().expect("lock").forget(&peer.fingerprint);
             assert_eq!(
                 applied_within(&mut inbox, NEVER_WITHIN).await,
                 None,

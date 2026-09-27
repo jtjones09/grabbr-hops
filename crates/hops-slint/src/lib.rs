@@ -23,8 +23,8 @@ use std::{
 
 use hops_frontend_core::{
     AppModel, ApprovalRefused, CaptureState, ClientHandle, Clipboard, FrontendClient,
-    FrontendRequest, Launch, PairingAttempt, PairingCard, PairingCheck, Position, Status,
-    TrustState, prefs, spaced_number, theme,
+    FrontendRequest, Launch, PairingAttempt, PairingCard, PairingCheck, Position, Status, prefs,
+    spaced_number, theme,
 };
 use hops_ipc::{DEFAULT_PORT, Geometry};
 use slint::{ComponentHandle, ModelRc, VecModel};
@@ -240,7 +240,7 @@ fn device_rows(m: &AppModel) -> Vec<DeviceRow> {
                     .into(),
                 online: d.online,
                 trusted: d.receive,
-                revoked: d.trust == TrustState::Revoked,
+                removed_by_peer: d.removed_by_peer(),
                 clipboard: clipboard.map(clipboard_words).unwrap_or_default().into(),
                 clipboard_on: clipboard.is_some_and(|c| c.is_on()),
             }
@@ -1458,48 +1458,51 @@ mod armed_actions_follow_their_device {
 
 #[cfg(test)]
 mod destructive_actions_say_so {
-    //! The confirm text for delete and revoke must say the change is permanent.
+    //! The confirm text for delete and revoke must say what removal costs:
+    //! using the device again means pairing the two machines again (#184).
     //!
-    //! Both write a tombstone: the fingerprint can never be trusted again, and
-    //! the device has to present a NEW identity to return. The GUI said
-    //! "delete + untrust?" and "remove?", neither of which reads as irreversible
-    //! — and on 2026-08-31 both machines on the rig were permanently expelled by
-    //! accident, needing hand-edited config files to recover. The TUI had said
-    //! "permanently ... NEW identity" all along; the GUI had not (#33, #125).
+    //! It used to say the other machine needed a NEW identity, which was the
+    //! tombstone rule removal no longer follows: a removed machine keeps its
+    //! identity and pairs again in full. A confirm that still said so would
+    //! send someone to reinstall a machine for nothing.
     //!
     //! This is a source guard because Slint draws its own pixels — there is no
     //! runtime assertion that reaches this text.
 
     const APP_SLINT: &str = include_str!("../ui/app.slint");
 
-    #[test]
-    fn the_delete_confirm_says_it_is_permanent() {
-        assert!(
-            APP_SLINT.contains(r#""delete permanently?""#),
-            "the delete confirm must say `permanently`. `delete + untrust?` reads as \
-             reversible, and it is not."
-        );
+    /// The window's text, comments dropped: the guard is about what a
+    /// person reads, and a comment may name the old rule to explain it.
+    fn shown() -> String {
+        APP_SLINT
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
+    // LEDGER R184-7 | class S | source text: app.slint confirms, comments stripped
     #[test]
-    fn the_revoke_confirm_says_it_is_permanent() {
-        assert!(
-            APP_SLINT.contains(r#""remove permanently?""#),
-            "the revoke confirm must say `permanently` — it writes a tombstone"
-        );
-    }
-
-    #[test]
-    fn both_confirms_explain_the_consequence() {
-        // Saying "permanently" is not enough on its own: the user needs to know
-        // what it costs them, which is a fresh identity on the other machine.
-        let n = APP_SLINT
-            .matches("it must pair again with a NEW identity")
+    fn both_confirms_say_the_device_returns_by_pairing_again() {
+        let n = shown()
+            .matches(r#""to use it again, pair it again""#)
             .count();
         assert_eq!(
             n, 2,
-            "delete and revoke must BOTH explain the consequence; found {n} of 2"
+            "delete and revoke must BOTH say what removal costs; found {n} of 2"
         );
+    }
+
+    // LEDGER R184-8 | class S | source text: app.slint, comments stripped
+    #[test]
+    fn nothing_on_screen_teaches_the_tombstone() {
+        for old in ["NEW identity", "new identity", "permanently"] {
+            assert!(
+                !shown().contains(old),
+                "app.slint still shows `{old}`: removal forgets the device, and it \
+                 pairs again with the identity it has (#184)"
+            );
+        }
     }
 }
 
@@ -2047,7 +2050,7 @@ mod the_repaint_gate {
     //! Drives a real `AppWindow` on Slint's headless testing backend through
     //! the functions the poll calls.
     use super::*;
-    use hops_frontend_core::{ClientConfig, ClientState, FrontendEvent, RevokedEntry};
+    use hops_frontend_core::{ClientConfig, ClientState, FrontendEvent};
     use slint::Model;
 
     const FP: &str = "1e:19:1b:2c:3d:4e:5f:60:71:82:93:a4:b5:c6:d7:e8";
@@ -2095,10 +2098,10 @@ mod the_repaint_gate {
         // emulation is off. The row's address reads the same before and after.
         m.apply(FrontendEvent::State(
             0,
-            config,
+            config.clone(),
             ClientState {
                 active_addr: Some("192.0.2.5:4242".parse().expect("addr")),
-                ..dialling
+                ..dialling.clone()
             },
         ));
         tick(&ui, &mut repaint, &m);
@@ -2108,22 +2111,19 @@ mod the_repaint_gate {
              refuses everything sent to it"
         );
 
-        // Then its identity is denied: of everything on the row, only
-        // `revoked` changes.
-        m.apply(FrontendEvent::RevokedUpdated(
-            [(
-                FP.to_owned(),
-                RevokedEntry {
-                    label: "desk mac".into(),
-                    revoked_at: 1,
-                },
-            )]
-            .into(),
+        // Then its machine refuses it as removed (#184): the row says so.
+        m.apply(FrontendEvent::State(
+            0,
+            config,
+            ClientState {
+                removed_by_peer: true,
+                ..dialling
+            },
         ));
         tick(&ui, &mut repaint, &m);
         assert!(
-            row(&ui).revoked,
-            "the window never showed the row as removed"
+            row(&ui).removed_by_peer,
+            "the window never said the machine no longer trusts this one"
         );
     }
 

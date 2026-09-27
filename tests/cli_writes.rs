@@ -309,6 +309,10 @@ fn value(entry: &toml_edit::Table, key: &str) -> String {
 
 const ONE_DEVICE: &str = "[[clients]]\nips = [\"127.0.0.1\"]\nport = {dead}\nposition = \"left\"\n";
 
+/// A machine paired with the daemon's before it started.
+const PAIRED: &str = "cd:cd:cd:cd:cd:cd:cd:cd:cd:cd:cd:cd:cd:cd:cd:cd:\
+cd:cd:cd:cd:cd:cd:cd:cd:cd:cd:cd:cd:cd:cd:cd:cd";
+
 fn one_device() -> String {
     ONE_DEVICE.replace("{dead}", &free_port().to_string())
 }
@@ -358,11 +362,14 @@ fn a_grant_nobody_asked_for_fails_with_the_reason() {
         said(&out)
     );
 
-    // refused for another reason: an identity removed for good, and a
-    // fingerprint that is not one
+    // refused for another reason: a fingerprint that is not one. A device
+    // removed here is a stranger again, refused like the one above (#184).
     let gone = ["ef"; 32].join(":");
     ok(&d, &["remove-authorized-key", &gone]);
-    for (why, fp) in [("removed", gone.as_str()), ("valid", "not-a-fingerprint")] {
+    for (why, fp) in [
+        ("no pairing request", gone.as_str()),
+        ("valid", "not-a-fingerprint"),
+    ] {
         let out = d.cli(&["authorize-key", "desk mac", fp]);
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(
@@ -381,7 +388,17 @@ fn a_grant_nobody_asked_for_fails_with_the_reason() {
 // LEDGER T3 | class B | 4 config file written by the hops daemon, read the moment hops cli exits 0
 #[test]
 fn each_write_verb_is_saved_by_the_time_it_returns() {
-    let d = Daemon::start("saved", &one_device());
+    let d = Daemon::start(
+        "saved",
+        &format!(
+            "{}\n[authorized_fingerprints]\n\"{PAIRED}\" = \"desk mac\"\n",
+            one_device()
+        ),
+    );
+    assert!(
+        d.saved_text().contains(PAIRED),
+        "precondition: the paired machine is listed"
+    );
     // Checked with no wait at all: a command that returned before the daemon
     // acted leaves the old file here.
     for round in 0..5 {
@@ -432,11 +449,11 @@ fn each_write_verb_is_saved_by_the_time_it_returns() {
         "remove-client returned before the removal was saved"
     );
 
-    let fp = ["cd"; 32].join(":");
-    ok(&d, &["remove-authorized-key", &fp]);
+    // Paired at start, from the table a build before the trust store read.
+    ok(&d, &["remove-authorized-key", PAIRED]);
     assert!(
-        d.saved_text().contains(&fp),
-        "remove-authorized-key returned before the revocation was saved:\n{}",
+        !d.saved_text().contains(PAIRED),
+        "remove-authorized-key returned before the removal was saved:\n{}",
         d.saved_text()
     );
 

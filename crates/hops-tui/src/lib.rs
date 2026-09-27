@@ -20,15 +20,13 @@
 //! selected row — a receive-only peer has no edge to cross and nothing to
 //! toggle. An untrusted peer that connects raises an approve/deny prompt.
 //!
-//! # Removal is permanent
+//! # Removal forgets
 //!
-//! `d` expels a peer: its fingerprint is tombstoned and the daemon refuses to
-//! re-authorize it, so the machine must present a *new* identity to come back.
-//! There is deliberately no restore key and no reconnect affordance — a
-//! "re-trust" path is exactly the thing an attacker who has already been thrown
-//! out would try to provoke. Expelled rows stay visible (greyed, marked
-//! `removed`) so a Linux/TUI-only user can see what they expelled; they are not
-//! actionable.
+//! `d` removes a device: this machine keeps no record of it, and it comes back
+//! only by pairing the two machines again (#184). There is no restore key and
+//! no reconnect affordance, because there is nothing to restore. A row whose
+//! machine removed this one says `no longer trusts this machine`, and `d`
+//! removes it here too.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -143,11 +141,11 @@ impl Input {
 
 /// A pending yes/no confirmation.
 enum Confirm {
-    /// Remove a device. `handle` deletes the outgoing client (which the daemon
-    /// also tombstones by fingerprint); `fp` alone revokes a receive-only peer.
-    /// `destructive` distinguishes "burns an identity" from "drops a config
-    /// entry for a machine we never actually met", so the prompt can tell the
-    /// truth about which one is happening.
+    /// Remove a device. `handle` deletes the outgoing client (and the daemon
+    /// forgets the pairing with the machine it is pinned to); `fp` alone
+    /// removes a receive-only peer. `destructive` distinguishes "ends a
+    /// pairing" from "drops a config entry for a machine we never actually
+    /// met", so the prompt can tell the truth about which one is happening.
     Remove {
         label: String,
         handle: Option<ClientHandle>,
@@ -172,7 +170,7 @@ fn name_request(handle: ClientHandle, buf: &str) -> FrontendRequest {
     FrontendRequest::UpdateLabel(handle, (!name.is_empty()).then(|| name.to_string()))
 }
 
-/// What `n` opens on the row `d`, which is not revoked.
+/// What `n` opens on the row `d`.
 fn name_input(d: &Device) -> Option<Input> {
     match (&d.send, &d.fingerprint) {
         // a device this machine dials has a name of its own, apart from the
@@ -638,22 +636,13 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                                 input = Some(Input::Add { buf: String::new() });
                             }
                             // ---- actions on the selected device ----
-                            KeyCode::Char('n') => match selected {
-                                Some(d) if d.trust == TrustState::Revoked => {
-                                    notice = Some((REVOKED_NOTE.to_string(), Instant::now()));
+                            KeyCode::Char('n') => {
+                                if let Some(open) = selected.and_then(name_input) {
+                                    input = Some(open);
                                 }
-                                Some(d) => {
-                                    if let Some(open) = name_input(d) {
-                                        input = Some(open);
-                                    }
-                                }
-                                None => {}
-                            },
+                            }
                             // where a device this machine dials is dialled
                             KeyCode::Char('h') => match selected {
-                                Some(d) if d.trust == TrustState::Revoked => {
-                                    notice = Some((REVOKED_NOTE.to_string(), Instant::now()));
-                                }
                                 Some(Device { send: Some(s), .. }) => {
                                     input = Some(Input::Hostname {
                                         handle: s.handle,
@@ -694,13 +683,8 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                                 }
                                 Err(why) => notice = Some((why.to_string(), Instant::now())),
                             },
-                            KeyCode::Char('d') | KeyCode::Delete => match selected {
-                                // already expelled — there is nothing left to do
-                                // to it, and offering one would imply a way back
-                                Some(d) if d.trust == TrustState::Revoked => {
-                                    notice = Some((REVOKED_NOTE.to_string(), Instant::now()));
-                                }
-                                Some(d) => {
+                            KeyCode::Char('d') | KeyCode::Delete => {
+                                if let Some(d) = selected {
                                     let handle = d.send.as_ref().map(|s| s.handle);
                                     let pin = d
                                         .send
@@ -712,13 +696,12 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                                         handle,
                                         fp: fp.clone(),
                                         pin,
-                                        // nothing is burned if we never learned
+                                        // no pairing ends if we never learned
                                         // who this machine is
                                         destructive: fp.is_some(),
                                     });
                                 }
-                                None => {}
-                            },
+                            }
                             _ => {}
                         }
                     }
@@ -735,8 +718,6 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
 }
 
 /// Shown when a key is pressed on a row it cannot apply to.
-const REVOKED_NOTE: &str =
-    "This device was removed. It must pair again with a new identity — there is no way back in.";
 const NO_SEND_NOTE: &str =
     "This device only connects in to you. Add it as a device to cross to it.";
 const NO_CLIPBOARD_NOTE: &str = "This device is not paired, so it has no clipboard to switch.";
@@ -745,8 +726,8 @@ const NO_CLIPBOARD_NOTE: &str = "This device is not paired, so it has no clipboa
 fn confirmed(confirm: Confirm) -> Option<FrontendRequest> {
     match confirm {
         // Deleting the outgoing client is the whole removal: the daemon
-        // tombstones the pinned fingerprint with it. Only a peer we have no
-        // client for needs the allowlist request.
+        // forgets the pinned fingerprint's pairing with it. Only a peer we have
+        // no client for needs the allowlist request.
         Confirm::Remove {
             handle: Some(h),
             pin,
@@ -972,11 +953,8 @@ fn device_row(
     live: bool,
 ) -> ListItem<'static> {
     let muted = Style::default().fg(col(theme.muted));
-    let revoked = d.trust == TrustState::Revoked;
 
-    let dot = if revoked {
-        Span::styled("⊘", Style::default().fg(col(theme.error)))
-    } else if d.refuses_our_input() {
+    let dot = if d.refuses_our_input() {
         // Checked BEFORE the green arm. `online` is about the inbound
         // direction and must not mask a device that will refuse our input
         // (#92).
@@ -1000,7 +978,6 @@ fn device_row(
         TrustState::Trusted => ("trusted", Style::default().fg(col(theme.success))),
         TrustState::Provisional => ("unverified", Style::default().fg(col(theme.warn))),
         TrustState::PendingApproval => ("pending", Style::default().fg(col(theme.warn))),
-        TrustState::Revoked => ("removed", Style::default().fg(col(theme.error))),
     };
 
     let mut spans = vec![
@@ -1008,25 +985,11 @@ fn device_row(
         Span::raw(" "),
         Span::styled(
             format!("{:<18}", trunc(&d.label, 18)),
-            if revoked {
-                muted
-            } else {
-                Style::default().fg(col(theme.foreground))
-            },
+            Style::default().fg(col(theme.foreground)),
         ),
         Span::styled(format!("{dir} "), Style::default().fg(col(theme.accent))),
         Span::styled(format!("{trust_text:<11}"), trust_style),
     ];
-
-    if revoked {
-        // no address, no edge, no toggle — say what the row means instead of
-        // showing stale connection details for a machine that cannot return
-        spans.push(Span::styled(
-            "pair again with a new identity to come back",
-            muted,
-        ));
-        return row_item(spans, live, theme);
-    }
 
     spans.push(Span::styled(
         match &d.fingerprint {
@@ -1044,7 +1007,12 @@ fn device_row(
             Style::default().fg(col(theme.accent)),
         ));
         spans.push(Span::styled(
-            if d.refuses_our_input() {
+            if d.removed_by_peer() {
+                // That machine removed this one (#184). The pairing here stays
+                // until `d` removes it: a row that asks is easier to make sense
+                // of than one that vanished.
+                " no longer trusts this machine"
+            } else if d.refuses_our_input() {
                 // The dot alone cannot say WHY. This is the fact the user needs:
                 // the far end is up and refusing, not unreachable (#92).
                 " not accepting input"
@@ -1053,7 +1021,7 @@ fn device_row(
             } else {
                 " off"
             },
-            if d.refuses_our_input() {
+            if d.removed_by_peer() || d.refuses_our_input() {
                 Style::default().fg(col(theme.error))
             } else if s.state.active {
                 Style::default().fg(col(theme.foreground))
@@ -1347,11 +1315,12 @@ fn footer_line(
         label, destructive, ..
     }) = confirm
     {
-        // Tell the truth about which removal this is. Expelling a peer we have
-        // identified burns that identity permanently; dropping a card for a
-        // machine we never reached costs nothing and is worth not overstating.
+        // Tell the truth about which removal this is. Removing a peer we have
+        // identified ends the pairing, and it returns only by pairing again;
+        // dropping a card for a machine we never reached costs nothing and is
+        // worth not overstating.
         let question = if *destructive {
-            format!("remove {label} permanently? it must pair again with a NEW identity — ")
+            format!("remove {label}? to use it again, pair it again — ")
         } else {
             format!("remove {label}? ")
         };
@@ -1377,36 +1346,29 @@ fn footer_line(
     }
 
     let mut spans = vec![Span::styled("a", key), Span::raw(" add  ")];
-    match selected {
-        // an expelled row is inert on purpose — no rename, no restore
-        Some(d) if d.trust == TrustState::Revoked => {
-            spans.push(Span::styled("(removed — no way back in)  ", muted));
+    if let Some(d) = selected {
+        spans.push(Span::styled("n", key));
+        spans.push(Span::raw(if d.send.is_some() {
+            " name  "
+        } else {
+            " rename  "
+        }));
+        if d.send.is_some() {
+            for (k, label) in [("h", " address  "), ("p", " pos  "), ("spc", " on/off  ")] {
+                spans.push(Span::styled(k, key));
+                spans.push(Span::raw(label));
+            }
         }
-        Some(d) => {
-            spans.push(Span::styled("n", key));
-            spans.push(Span::raw(if d.send.is_some() {
-                " name  "
+        if let Some(c) = clipboard {
+            spans.push(Span::styled("c", key));
+            spans.push(Span::raw(if c.is_on() {
+                " clipboard off  "
             } else {
-                " rename  "
+                " clipboard on  "
             }));
-            if d.send.is_some() {
-                for (k, label) in [("h", " address  "), ("p", " pos  "), ("spc", " on/off  ")] {
-                    spans.push(Span::styled(k, key));
-                    spans.push(Span::raw(label));
-                }
-            }
-            if let Some(c) = clipboard {
-                spans.push(Span::styled("c", key));
-                spans.push(Span::raw(if c.is_on() {
-                    " clipboard off  "
-                } else {
-                    " clipboard on  "
-                }));
-            }
-            spans.push(Span::styled("d", key));
-            spans.push(Span::raw(" remove  "));
         }
-        None => {}
+        spans.push(Span::styled("d", key));
+        spans.push(Span::raw(" remove  "));
     }
     for (k, label) in [
         ("l", " log  "),
@@ -1679,7 +1641,7 @@ fn short_fp(fp: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hops_frontend_core::{ClientConfig, ClientState, FrontendEvent, RevokedEntry};
+    use hops_frontend_core::{ClientConfig, ClientState, FrontendEvent};
     use ratatui::{Terminal, backend::TestBackend};
 
     const FP: &str = "1e:19:1b:2c:3d:4e:5f:60:71:82:93:a4:b5:c6:d7:e8";
@@ -2299,72 +2261,45 @@ mod tests {
         );
     }
 
-    /// Revoked devices must be VISIBLE. On a TUI-only Linux box an invisible
-    /// revocation makes the feature unusable: there is no other surface.
+    /// A device whose machine removed this one says so on its row, keeps its
+    /// row, and offers `d` to remove it here too (#184). Nothing on it teaches
+    /// the tombstone the removal no longer writes.
+    // LEDGER R184-6 | class B | 3 rendered terminal buffer: device_row, footer
     #[test]
-    fn a_revoked_device_is_visible_and_says_it_cannot_return() {
+    fn a_device_whose_machine_removed_this_one_says_so() {
         let mut model = AppModel::default();
-        model.revoked.insert(
-            FP.into(),
-            RevokedEntry {
-                label: "old-laptop".into(),
-                revoked_at: 0,
-            },
+        model.clients.insert(
+            0,
+            (
+                ClientConfig {
+                    hostname: Some("old-laptop".into()),
+                    ..Default::default()
+                },
+                ClientState {
+                    peer_fingerprint: Some(FP.into()),
+                    active: true,
+                    removed_by_peer: true,
+                    ..Default::default()
+                },
+            ),
         );
+        model.authorized.insert(FP.into(), "old-laptop".into());
         let out = screen(&model, 0);
-        assert!(out.contains("old-laptop"), "expelled row missing:\n{out}");
-        assert!(out.contains("removed"), "not marked as removed:\n{out}");
+        assert!(out.contains("old-laptop"), "the row is gone:\n{out}");
         assert!(
-            out.contains("pair again"),
-            "must say how it could come back:\n{out}"
+            out.contains("no longer trusts this machine"),
+            "the row does not say the other machine removed this one:\n{out}"
         );
-    }
-
-    /// Removal is permanent by design. The footer must not advertise a restore,
-    /// and there is no key bound to one — a "re-trust" affordance is exactly
-    /// what an expelled attacker would try to provoke.
-    #[test]
-    fn a_revoked_row_offers_no_way_back_in() {
-        let mut model = AppModel::default();
-        model.revoked.insert(
-            FP.into(),
-            RevokedEntry {
-                label: "old-laptop".into(),
-                revoked_at: 0,
-            },
-        );
-        let out = screen(&model, 0);
         assert!(
-            out.contains("no way back in"),
-            "footer should state the row is inert:\n{out}"
+            out.contains("d remove") || out.contains("d delete"),
+            "no key offered to remove it:\n{out}"
         );
-        for forbidden in ["restore", "re-trust", "reconnect", "trust again"] {
+        for old in ["new identity", "no way back in", "permanently"] {
             assert!(
-                !out.to_lowercase().contains(forbidden),
-                "footer must not offer {forbidden:?}:\n{out}"
+                !out.to_lowercase().contains(old),
+                "the screen still teaches the tombstone ({old:?}):\n{out}"
             );
         }
-    }
-
-    /// Revoked outranks authorized: a hand-edited config naming a fingerprint in
-    /// both tables must read as expelled, never as trusted.
-    #[test]
-    fn revoked_wins_over_a_stale_authorized_entry() {
-        let mut model = AppModel::default();
-        model.authorized.insert(FP.into(), "ghost".into());
-        model.revoked.insert(
-            FP.into(),
-            RevokedEntry {
-                label: "ghost".into(),
-                revoked_at: 0,
-            },
-        );
-        let out = screen(&model, 0);
-        assert!(out.contains("removed"), "should read as expelled:\n{out}");
-        assert!(
-            !out.contains("trusted"),
-            "must never render as trusted:\n{out}"
-        );
     }
 
     /// The keymap is per-row: a peer with no send facet has no edge to cycle and

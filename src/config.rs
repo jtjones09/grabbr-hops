@@ -106,9 +106,10 @@ struct ConfigToml {
     cert_path: Option<PathBuf>,
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
-    /// Fingerprints the user expelled. Persisted so revocation survives a
-    /// restart — otherwise a revoked peer is a stranger again on next boot and
-    /// can raise the approval prompt exactly as before.
+    /// Fingerprints a build before the trust store removed. Read once, when
+    /// the store is first made, so a device removed then is not carried
+    /// forward; never written again, since removing a device now forgets it
+    /// (#184). The daemon's next save drops the table.
     #[serde(default)]
     revoked_fingerprints: Option<HashMap<String, RevokedEntry>>,
     /// Announce this machine on the local network over mDNS, and look for
@@ -526,7 +527,7 @@ fn harden_existing(config_dir: &Path, config_path: &Path) {
 #[cfg(not(unix))]
 fn harden_existing(_config_dir: &Path, _config_path: &Path) {}
 
-/// Subtract the tombstones from the allowlist. Pure, so the rule can be tested
+/// Subtract the removals from the allowlist. Pure, so the rule can be tested
 /// without standing up a `Config`; see [`Config::effective_allowlist`], which is
 /// the only caller and the only door.
 ///
@@ -760,12 +761,12 @@ impl Config {
         &self.config_path
     }
 
-    /// fingerprints the user deliberately revoked
+    /// Fingerprints a build before the trust store removed (#184).
     ///
     /// Keys are lowercased on read for exactly the same reason
     /// [`Self::authorized_fingerprints`] does it: the two tables are compared
     /// against each other, and normalising only one of them is what let an
-    /// expelled fingerprint be re-authorized in uppercase (issue #67).
+    /// removed fingerprint be re-authorized in uppercase (issue #67).
     pub fn revoked_fingerprints(&self) -> HashMap<String, RevokedEntry> {
         self.config_toml
             .as_ref()
@@ -791,6 +792,15 @@ impl Config {
         subtract_revoked(self.authorized_fingerprints(), &self.revoked_fingerprints())
     }
 
+    /// Drop the `[revoked_fingerprints]` table at the next write: removing a
+    /// device forgets it, so no record of the removal is kept anywhere (#184).
+    pub fn clear_revoked_fingerprints(&mut self) {
+        if let Some(c) = self.config_toml.as_mut() {
+            c.revoked_fingerprints = None;
+        }
+    }
+
+    #[cfg(test)]
     pub fn set_revoked_fingerprints(&mut self, revoked: HashMap<String, RevokedEntry>) {
         self.config_toml
             .get_or_insert_with(Default::default)
@@ -1246,7 +1256,7 @@ mod effective_allowlist_tests {
                 (
                     k.to_lowercase(),
                     RevokedEntry {
-                        label: "expelled".into(),
+                        label: "removed".into(),
                         revoked_at: 0,
                     },
                 )
@@ -1269,8 +1279,8 @@ mod effective_allowlist_tests {
     }
 
     #[test]
-    fn case_does_not_launder_a_tombstone() {
-        // The exact shape of issue #67: expelled in lowercase, re-added upper.
+    fn case_does_not_launder_a_removal() {
+        // The exact shape of issue #67: removed in lowercase, re-added upper.
         let (a, refused) =
             subtract_revoked(allow(&[(&A.to_uppercase(), "attacker")]), &revoked(&[A]));
         assert!(
@@ -1281,7 +1291,7 @@ mod effective_allowlist_tests {
     }
 
     #[test]
-    fn a_tombstone_written_in_uppercase_still_bites() {
+    fn a_removal_written_in_uppercase_still_bites() {
         let (a, _) = subtract_revoked(allow(&[(A, "attacker")]), &revoked(&[&A.to_uppercase()]));
         assert!(
             a.is_empty(),
