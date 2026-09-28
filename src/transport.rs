@@ -13,6 +13,7 @@
 //! signature proves the peer holds the matching private key. Skipping that
 //! delegation would reopen the MITM hole this migration closes.
 
+use std::cell::Cell;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, Once, RwLock};
@@ -680,6 +681,58 @@ pub(crate) struct PeerClipboard {
     /// peer opened.
     pub(crate) dialled_for: Option<ClientHandle>,
     pub(crate) text: String,
+    /// Its share of the link's queue, given back when this is dropped: once
+    /// the text is applied or refused. `None` for text that came off no link.
+    pub(crate) _place: Option<Place>,
+}
+
+/// At most this many transfers from one link wait here to be applied, ...
+pub(crate) const QUEUED_PER_LINK: usize = 4;
+/// ... holding at most this many bytes between them. A transfer past either
+/// is dropped: only the latest copy matters, and a peer that sends faster
+/// than they are applied must not grow this machine's memory without end.
+pub(crate) const QUEUED_BYTES_PER_LINK: usize = 2 * MAX_CLIPBOARD_BYTES;
+
+/// What one link has waiting to be applied.
+#[derive(Default)]
+struct Waiting {
+    transfers: Cell<usize>,
+    bytes: Cell<usize>,
+}
+
+impl Waiting {
+    /// No room even for an empty transfer.
+    fn full(&self) -> bool {
+        self.transfers.get() >= QUEUED_PER_LINK || self.bytes.get() >= QUEUED_BYTES_PER_LINK
+    }
+
+    /// A place for a transfer of `bytes`, if the link has room for it.
+    fn take(self: &Rc<Self>, bytes: usize) -> Option<Place> {
+        let (transfers, held) = (self.transfers.get() + 1, self.bytes.get() + bytes);
+        if transfers > QUEUED_PER_LINK || held > QUEUED_BYTES_PER_LINK {
+            return None;
+        }
+        self.transfers.set(transfers);
+        self.bytes.set(held);
+        Some(Place {
+            waiting: self.clone(),
+            bytes,
+        })
+    }
+}
+
+/// One transfer's share of its link's queue.
+pub(crate) struct Place {
+    waiting: Rc<Waiting>,
+    bytes: usize,
+}
+
+impl Drop for Place {
+    fn drop(&mut self) {
+        let waiting = &self.waiting;
+        waiting.transfers.set(waiting.transfers.get() - 1);
+        waiting.bytes.set(waiting.bytes.get() - self.bytes);
+    }
 }
 
 /// Where one connection's clipboard transfers go, and whose connection it is.
@@ -702,6 +755,26 @@ impl ClipboardInlet {
 
 /// The stop code a peer sees when this machine refuses its clipboard.
 pub(crate) const CLIPBOARD_REFUSED: u32 = 1;
+/// The stop code a peer sees when the link already has as much clipboard
+/// waiting here as it may.
+pub(crate) const CLIPBOARD_BUSY: u32 = 2;
+
+const CLIP_BUSY_LOG_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(60);
+thread_local! {
+    static PREV_CLIP_BUSY_LOG: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn clipboard_busy(addr: SocketAddr) {
+    crate::debounce!(
+        PREV_CLIP_BUSY_LOG,
+        CLIP_BUSY_LOG_DEBOUNCE,
+        log::warn!(
+            "{addr}: clipboard text dropped: {QUEUED_PER_LINK} transfers or \
+             {QUEUED_BYTES_PER_LINK} bytes from this peer are already waiting to be applied"
+        )
+    );
+}
 
 const CLIP_REFUSED_LOG_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(60);
 thread_local! {
@@ -738,6 +811,7 @@ pub(crate) async fn clipboard_accept_loop(
     inlet: ClipboardInlet,
 ) {
     let inlet = Rc::new(inlet);
+    let waiting = Rc::new(Waiting::default());
     // `while let` rather than `loop`+`match`: the error arm is only ever
     // "connection closed", handled by the input loop, so there is nothing to
     // distinguish.
@@ -747,16 +821,29 @@ pub(crate) async fn clipboard_accept_loop(
             clipboard_refused(addr);
             continue;
         }
-        let inlet = inlet.clone();
+        // Stopped before it is read: the peer stops sending what would only
+        // be dropped.
+        if waiting.full() {
+            let _ = recv.stop(CLIPBOARD_BUSY.into());
+            clipboard_busy(addr);
+            continue;
+        }
+        let (inlet, waiting) = (inlet.clone(), waiting.clone());
         tokio::task::spawn_local(async move {
             match tokio::time::timeout(CLIPBOARD_IO_TIMEOUT, recv_clipboard(recv)).await {
-                Ok(Ok(text)) if inlet.permits() => {
-                    let _ = inlet.tx.send(PeerClipboard {
-                        from: inlet.from.clone(),
-                        dialled_for: inlet.dialled_for,
-                        text,
-                    });
-                }
+                // Asked again at the end: transfers read side by side can
+                // each have found room when they started.
+                Ok(Ok(text)) if inlet.permits() => match waiting.take(text.len()) {
+                    Some(place) => {
+                        let _ = inlet.tx.send(PeerClipboard {
+                            from: inlet.from.clone(),
+                            dialled_for: inlet.dialled_for,
+                            text,
+                            _place: Some(place),
+                        });
+                    }
+                    None => clipboard_busy(addr),
+                },
                 Ok(Ok(_)) => clipboard_refused(addr),
                 Ok(Err(e)) => log::debug!("{addr}: bad clipboard transfer: {e}"),
                 // dropping the recv future on timeout stops the stream
@@ -764,5 +851,44 @@ pub(crate) async fn clipboard_accept_loop(
                 Err(_) => log::debug!("{addr}: clipboard transfer timed out"),
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod a_link_holds_a_bounded_share_of_the_clipboard_queue {
+    use std::rc::Rc;
+
+    use super::{MAX_CLIPBOARD_BYTES, QUEUED_BYTES_PER_LINK, QUEUED_PER_LINK, Waiting};
+
+    // LEDGER T22422 | class B | 1 return value: Waiting::take, Waiting::full; 6 struct state after Place is dropped
+    #[test]
+    fn a_transfer_past_the_count_or_the_bytes_finds_no_room_until_one_is_applied() {
+        let waiting = Rc::new(Waiting::default());
+        let mut held: Vec<_> = (0..QUEUED_PER_LINK)
+            .map(|_| waiting.take(1).expect("room"))
+            .collect();
+        assert!(waiting.full());
+        assert!(
+            waiting.take(1).is_none(),
+            "a transfer past {QUEUED_PER_LINK} waiting found room"
+        );
+        held.pop();
+        assert!(!waiting.full(), "an applied transfer gave back no room");
+        assert!(waiting.take(1).is_some());
+
+        let waiting = Rc::new(Waiting::default());
+        let big = waiting.take(MAX_CLIPBOARD_BYTES).expect("room");
+        assert!(
+            waiting
+                .take(QUEUED_BYTES_PER_LINK - MAX_CLIPBOARD_BYTES + 1)
+                .is_none(),
+            "transfers holding more than {QUEUED_BYTES_PER_LINK} bytes found room"
+        );
+        let _rest = waiting
+            .take(QUEUED_BYTES_PER_LINK - MAX_CLIPBOARD_BYTES)
+            .expect("room");
+        assert!(waiting.full());
+        drop(big);
+        assert!(waiting.take(MAX_CLIPBOARD_BYTES).is_some());
     }
 }
