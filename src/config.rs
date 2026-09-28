@@ -372,6 +372,8 @@ pub struct Config {
     watcher: Watching,
     // channel for filesystem events
     watch_rx: tokio::sync::mpsc::Receiver<Result<notify::Event, notify::Error>>,
+    // the watcher's thread is gone, and that was reported
+    watch_stopped: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -744,6 +746,7 @@ impl Config {
             synced: vec![],
             watcher,
             watch_rx,
+            watch_stopped: false,
         };
         config.synced = config.clients();
         Ok(config)
@@ -761,8 +764,13 @@ impl Config {
 
     pub async fn changed(&mut self) -> Result<(), notify::Error> {
         loop {
+            if self.watch_stopped {
+                return std::future::pending().await;
+            }
             let Some(event) = self.watch_rx.recv().await else {
                 // The watcher's thread is gone, and with it every event.
+                // Said once: the daemon asks again on every pass of its loop.
+                self.watch_stopped = true;
                 log::error!(
                     "the config watcher stopped: edits to {:?} are read again \
                      only when hops restarts",
@@ -1877,6 +1885,88 @@ mod a_save_never_waits_for_the_watcher {
             Some(&Arm::On),
             "a save that failed left the config watcher disarmed, so edits are never \
              read again: {calls:?}"
+        );
+    }
+
+    /// A watcher that cannot watch anything.
+    struct RefusingWatcher;
+
+    impl Watcher for RefusingWatcher {
+        fn new<F: notify::EventHandler>(_: F, _: notify::Config) -> notify::Result<Self> {
+            Ok(RefusingWatcher)
+        }
+        fn watch(&mut self, _: &Path, _: notify::RecursiveMode) -> notify::Result<()> {
+            Err(notify::Error::generic("this directory cannot be watched"))
+        }
+        fn unwatch(&mut self, _: &Path) -> notify::Result<()> {
+            Ok(())
+        }
+        fn kind() -> notify::WatcherKind {
+            notify::WatcherKind::NullWatcher
+        }
+    }
+
+    // LEDGER W3 | class B | 1 return value: Config::with_args_watched with a watcher that refuses the config directory
+    /// The first arming stays on the caller: a config directory that cannot
+    /// be watched fails the start, rather than a daemon coming up that
+    /// never reads an edit.
+    #[test]
+    fn a_directory_that_cannot_be_watched_fails_the_start() {
+        let dir = std::env::temp_dir().join(format!("hops-watch-refused-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("a scratch directory");
+        let path = dir.join("config.toml");
+        fs::write(&path, "port = 4343\n").expect("a config");
+        let args = Args::parse_from([
+            "hops".as_ref(),
+            "--config".as_ref(),
+            path.as_os_str(),
+            "--cert-path".as_ref(),
+            dir.join("cert.pem").as_os_str(),
+        ]);
+        let started = Config::with_args_watched(args, |_| Ok(Box::new(RefusingWatcher)));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            started.is_err(),
+            "a config directory that cannot be watched still started the daemon, which \
+             would never read an edit"
+        );
+    }
+
+    // LEDGER W4 | class B | 1 log record count: Config::changed asked again after the watcher's thread is gone
+    /// Once the watcher's thread is gone, [`Config::changed`] says so once
+    /// and waits for good. The daemon asks it again on every pass of its
+    /// loop, so saying it on every ask fills the log for the rest of the run.
+    #[test]
+    fn a_stopped_watcher_is_reported_once() {
+        // This watcher drops the handler it is given: no event ever comes.
+        let (dir, _path, mut config, busy) = watched("stopped");
+        busy.set_open(true);
+        let logs = crate::test_harness::logs::capture();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        for _ in 0..3 {
+            let waited = rt.block_on(async {
+                tokio::time::timeout(Duration::from_millis(20), config.changed()).await
+            });
+            assert!(
+                waited.is_err(),
+                "changed() returned with no watcher: {waited:?}"
+            );
+        }
+        let said = logs
+            .lines()
+            .iter()
+            .filter(|l| l.text.contains("the config watcher stopped"))
+            .count();
+        drop(config);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            said, 1,
+            "the stopped config watcher was reported {said} times over three asks, once \
+             per pass of the daemon loop"
         );
     }
 }
