@@ -202,6 +202,10 @@ struct PeerLink {
     serial: u64,
 }
 
+/// An event a peer sent: the device it came from, the event, and the
+/// serial of the link it arrived on.
+pub(crate) type Heard = (ClientHandle, ProtoEvent, u64);
+
 /// A serial no link made before it has.
 fn next_link_serial() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -474,8 +478,8 @@ pub(crate) struct LanMouseConnection {
     client_manager: ClientManager,
     conns: Rc<Mutex<HashMap<SocketAddr, PeerLink>>>,
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
-    recv_rx: Receiver<(ClientHandle, ProtoEvent)>,
-    recv_tx: Sender<(ClientHandle, ProtoEvent)>,
+    recv_rx: Receiver<Heard>,
+    recv_tx: Sender<Heard>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
     /// Material for building a FRESH client config per dial. The observed-
     /// fingerprint slot MUST NOT be shared: it is written by the TLS verifier and
@@ -569,7 +573,9 @@ impl LanMouseConnection {
         self.pairing_events = None;
     }
 
-    pub(crate) async fn recv(&mut self) -> (ClientHandle, ProtoEvent) {
+    /// The next event a peer sent, with the device it came from and the
+    /// link it arrived on ([`Self::link_serial`]).
+    pub(crate) async fn recv(&mut self) -> Heard {
         self.recv_rx.recv().await.expect("channel closed")
     }
 
@@ -1027,7 +1033,7 @@ async fn connect_to_handle(
     handle: ClientHandle,
     conns: Rc<Mutex<HashMap<SocketAddr, PeerLink>>>,
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
-    tx: Sender<(ClientHandle, ProtoEvent)>,
+    tx: Sender<Heard>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
     identity: Arc<Identity>,
     trust: Trust,
@@ -1367,7 +1373,7 @@ async fn connect_to_handle(
 struct Session {
     client_manager: ClientManager,
     conns: Rc<Mutex<HashMap<SocketAddr, PeerLink>>>,
-    recv_tx: Sender<(ClientHandle, ProtoEvent)>,
+    recv_tx: Sender<Heard>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
     trust: Trust,
     clipboard_in: Sender<PeerClipboard>,
@@ -1518,7 +1524,7 @@ async fn receive_loop(
     addr: SocketAddr,
     link: PeerLink,
     conns: Rc<Mutex<HashMap<SocketAddr, PeerLink>>>,
-    tx: Sender<(ClientHandle, ProtoEvent)>,
+    tx: Sender<Heard>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
     clipboard: ClipboardInlet,
     state_tx: Sender<ClientHandle>,
@@ -1586,7 +1592,7 @@ async fn receive_loop(
                         let _ = state_tx.send(handle);
                     }
                     event => {
-                        let _ = tx.send((handle, event));
+                        let _ = tx.send((handle, event, link.serial));
                     }
                 }
             }

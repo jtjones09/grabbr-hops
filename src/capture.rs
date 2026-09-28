@@ -478,7 +478,7 @@ impl CaptureTask {
                     Some(event) => self.handle_capture_event(capture, event?).await?,
                     None => return Ok(()),
                 },
-                (handle, event) = self.conn.recv() => {
+                (handle, event, link) = self.conn.recv() => {
                     if let Some(active) = self.active_client {
                         if handle != active {
                             // we only care about events coming from the client we are currently connected to
@@ -505,7 +505,10 @@ impl CaptureTask {
                                 self.told.forget(handle);
                                 self.acked_at =
                                     self.conn.active_addr(handle).map(|addr| (handle, addr));
-                                self.acked_link = self.conn.link_serial(handle).await;
+                                // The link the Ack came on, not the one the
+                                // device is on now: a redial in between
+                                // leaves the new link uncrossed.
+                                self.acked_link = Some(link);
                             }
                         }
                         // client disconnected
@@ -587,11 +590,9 @@ impl CaptureTask {
         if self.state != State::Sending || self.active_client != Some(handle) {
             return false;
         }
-        let Some(acked) = self.acked_link else {
-            return false;
-        };
+        // A crossing with no link known to have taken it is made again.
         match self.conn.link_serial(handle).await {
-            Some(now) if now != acked => {
+            Some(now) if self.acked_link != Some(now) => {
                 log::info!(
                     "client {handle} is on another link than the one it took the crossing on: \
                      crossing again"
@@ -1170,6 +1171,12 @@ mod release_mid_drag {
         pub(super) trust: crate::transport::Trust,
         /// The receiver's fingerprint.
         pub(super) receiver: String,
+        /// The sender's fingerprint.
+        sender: String,
+        /// Whether the receiver acknowledges a crossing, from now on.
+        acks: Rc<std::cell::Cell<bool>>,
+        /// Closes the receiver's end of a link.
+        revoker: crate::listen::ConnRevoker,
         _notices: Notices,
     }
 
@@ -1226,6 +1233,9 @@ mod release_mid_drag {
             .expect("listener");
             let wire: Rc<RefCell<Vec<ProtoEvent>>> = Default::default();
             let received = wire.clone();
+            let acks = Rc::new(std::cell::Cell::new(answers.ack));
+            let acking = acks.clone();
+            let revoker = listener.revoker();
             spawn_local(async move {
                 while let Some(event) = listener.next().await {
                     let ListenEvent::Msg { event, addr } = event else {
@@ -1238,7 +1248,7 @@ mod release_mid_drag {
                                 listener.reply(addr, ProtoEvent::Pong(alive)).await
                             }
                         }
-                        ProtoEvent::Enter(_) if answers.ack => {
+                        ProtoEvent::Enter(_) if acking.get() => {
                             listener.reply(addr, ProtoEvent::Ack(0)).await
                         }
                         _ => {}
@@ -1290,6 +1300,9 @@ mod release_mid_drag {
                 clients,
                 trust: sender_trust,
                 receiver: receiver.fingerprint.clone(),
+                sender: sender.fingerprint.clone(),
+                acks,
+                revoker,
                 _notices: notices,
             }
         }
@@ -1349,6 +1362,23 @@ mod release_mid_drag {
                 self.script.push(Position::Left, event);
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+        }
+
+        /// The receiver closes the link and the sender dials it again,
+        /// with no event captured in between. The receiver then acknowledges
+        /// a crossing only if `acks`.
+        pub(super) async fn relink(&self, acks: bool) {
+            self.acks.set(acks);
+            assert_eq!(self.revoker.close_fingerprint(&self.sender).await, 1);
+            wait_until("the link to drop", PATIENCE, || {
+                self.clients.active_addr(self.handle).is_none()
+            })
+            .await;
+            self.capture.dial(self.handle);
+            wait_until("the link to be made again", PATIENCE, || {
+                self.clients.active_addr(self.handle).is_some()
+            })
+            .await;
         }
 
         pub(super) fn frames(&self) -> Vec<ProtoEvent> {
@@ -1786,6 +1816,43 @@ mod a_refused_crossing {
                 "the pointer was given back and the service was not told why"
             );
 
+            v.capture.terminate().await;
+        });
+    }
+
+    // LEDGER T115-13 | class B | 5 capture backend state + 2 frames received by listen::LanMouseListener
+    /// The link drops while the pointer is across and is made again. The
+    /// receiver took the crossing on the old link only, so it is made again
+    /// on the new one; the receiver does not answer it, and the pointer is
+    /// given back as after any unanswered crossing, rather than held with
+    /// its input going where nothing takes it.
+    #[test]
+    fn a_crossing_made_again_on_a_new_link_and_never_answered_gives_the_pointer_back() {
+        run_local(async {
+            let mut v = Visit::start_with(true, REAL_DEADLINE).await;
+            v.relink(false).await;
+            assert!(
+                v.script.held(),
+                "precondition: the pointer was given back when the link dropped"
+            );
+            let enters = v.count(&ProtoEvent::Enter(hops_proto::Position::Right));
+            let started = tokio::time::Instant::now();
+            while v.script.held() {
+                assert!(
+                    started.elapsed() < PATIENCE,
+                    "a crossing made again that the receiver never answered kept the \
+                     pointer: {:?}",
+                    v.frames()
+                );
+                v.script.push(Position::Left, CaptureEvent::Input(MOTION));
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                v.count(&ProtoEvent::Enter(hops_proto::Position::Right)) > enters,
+                "the pointer was given back without the crossing being made again \
+                 on the new link: {:?}",
+                v.frames()
+            );
             v.capture.terminate().await;
         });
     }
