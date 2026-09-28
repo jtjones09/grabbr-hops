@@ -6,7 +6,7 @@ use std::{
 
 use input_event::{Event, KeyboardEvent, PointerEvent};
 
-pub use self::error::{EmulationCreationError, EmulationError, InputEmulationError};
+pub use self::error::{EmulationCreationError, EmulationError, InputEmulationError, Permission};
 
 #[cfg(windows)]
 mod windows;
@@ -127,6 +127,11 @@ pub struct InputEmulation {
     pressed_buttons: HashMap<EmulationHandle, HashSet<u32>>,
     /// The backend's own answer, read once: it does not change.
     button_scope: ButtonScope,
+    /// What the system withheld from a backend tried before this one, when
+    /// that is why it failed. A fall to `dummy` from a Mac without
+    /// Accessibility keeps the reason, so a caller that refuses the fall can
+    /// name the permission rather than only that input would be discarded.
+    withheld: &'static [Permission],
 }
 
 impl InputEmulation {
@@ -155,6 +160,7 @@ impl InputEmulation {
             handles: HashSet::new(),
             pressed_keys: HashMap::new(),
             pressed_buttons: HashMap::new(),
+            withheld: &[],
         })
     }
 
@@ -162,6 +168,12 @@ impl InputEmulation {
     /// accepted and thrown away.
     pub fn backend(&self) -> Backend {
         self.backend
+    }
+
+    /// The permissions the system withheld from a backend tried before this
+    /// one, when that is why it failed; empty otherwise.
+    pub fn withheld_permissions(&self) -> &'static [Permission] {
+        self.withheld
     }
 
     pub async fn new(backend: Option<Backend>) -> Result<InputEmulation, EmulationCreationError> {
@@ -173,7 +185,7 @@ impl InputEmulation {
             return b;
         }
 
-        for backend in [
+        Self::first_that_starts([
             #[cfg(wlroots)]
             Backend::Wlroots,
             #[cfg(libei)]
@@ -187,14 +199,30 @@ impl InputEmulation {
             #[cfg(target_os = "macos")]
             Backend::MacOs,
             Backend::Dummy,
-        ] {
+        ])
+        .await
+    }
+
+    /// The first of `backends` that starts, in order. What the system
+    /// withheld from one that failed before it is kept on it.
+    pub async fn first_that_starts(
+        backends: impl IntoIterator<Item = Backend>,
+    ) -> Result<InputEmulation, EmulationCreationError> {
+        let mut withheld: &'static [Permission] = &[];
+        for backend in backends {
             match Self::with_backend(backend).await {
-                Ok(b) => {
+                Ok(mut b) => {
                     log::info!("using emulation backend: {backend}");
+                    b.withheld = withheld;
                     return Ok(b);
                 }
                 Err(e) if e.cancelled_by_user() => return Err(e),
-                Err(e) => log::warn!("{e}"),
+                Err(e) => {
+                    if withheld.is_empty() {
+                        withheld = e.missing_permissions().unwrap_or_default();
+                    }
+                    log::warn!("{e}");
+                }
             }
         }
 

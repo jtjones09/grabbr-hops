@@ -36,9 +36,9 @@ use std::{
 
 use hops_frontend_core::{
     AppModel, ApprovalRefused, AttemptOrigin, CaptureState, ClientHandle, Clipboard, Connection,
-    Controller, Device, DeviceSend, FrontendClient, FrontendRequest, Launch, PairingAnswers,
-    PairingAttempt, PairingCard, PairingCheck, PairingCheckCard, Position, Status, Tone,
-    TrustState,
+    Controller, Device, DeviceSend, EmulationState, FrontendClient, FrontendRequest, Launch,
+    PairingAnswers, PairingAttempt, PairingCard, PairingCheck, PairingCheckCard, Position, Status,
+    Tone, TrustState,
     prefs::Frontend,
     spaced_number,
     theme::{self, Rgb, Theme},
@@ -87,6 +87,22 @@ fn approve_prompt(
         grant: answers.controller.map(|c| (c, answers.clipboard)),
     })
 }
+
+/// The port edit `o` opens, or why there is none: a machine that only
+/// dials out listens on no port (#15), and changing the one it would use
+/// starts no listener.
+fn port_input(model: &AppModel) -> Result<Input, &'static str> {
+    if model.dials_out_only {
+        return Err(DIALS_OUT_ONLY_NOTE);
+    }
+    Ok(Input::Port {
+        buf: model.port.map(|p| p.to_string()).unwrap_or_default(),
+    })
+}
+
+/// Shown for `o` on a machine that listens on no port.
+const DIALS_OUT_ONLY_NOTE: &str =
+    "This machine only dials out and listens on no port (listen = false in its config).";
 
 /// A key on the pairing prompt that answers one of its questions (#220,
 /// #182): `1` this machine controls that one, `2` that one controls this
@@ -208,9 +224,9 @@ fn name_input(d: &Device) -> Option<Input> {
             handle: s.handle,
             buf: d.label.clone(),
         }),
-        // receive-only: re-authorizing the same fingerprint with a new
-        // description IS the rename
-        (None, Some(fp)) if d.receive => Some(Input::TrustedName {
+        // a pairing with no device here, whichever way control goes: the
+        // pairing's own name is renamed
+        (None, Some(fp)) if d.paired => Some(Input::TrustedName {
             fp: fp.clone(),
             buf: d.label.clone(),
             grant: None,
@@ -606,11 +622,10 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                                 theme::save_name(&themes[theme_idx].name);
                             }
                             KeyCode::Char('l') => show_log = true,
-                            KeyCode::Char('o') => {
-                                input = Some(Input::Port {
-                                    buf: model.port.map(|p| p.to_string()).unwrap_or_default(),
-                                });
-                            }
+                            KeyCode::Char('o') => match port_input(&model) {
+                                Ok(i) => input = Some(i),
+                                Err(note) => notice = Some((note.to_string(), Instant::now())),
+                            },
                             KeyCode::Char('g') if hops_frontend_core::prefs::CAN_SWITCH => {
                                 ratatui::restore();
                                 let err = hops_frontend_core::prefs::switch_to(Frontend::Gui);
@@ -641,7 +656,7 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                                     });
                                 }
                                 _ => {
-                                    notice = Some((NO_SEND_NOTE.to_string(), Instant::now()));
+                                    notice = Some((no_send_note(selected).to_string(), Instant::now()));
                                 }
                             },
                             KeyCode::Char('p') => match selected.and_then(|d| d.send.as_ref()) {
@@ -652,7 +667,7 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                                     ));
                                 }
                                 None => {
-                                    notice = Some((NO_SEND_NOTE.to_string(), Instant::now()));
+                                    notice = Some((no_send_note(selected).to_string(), Instant::now()));
                                 }
                             },
                             KeyCode::Char(' ') => match selected.and_then(|d| d.send.as_ref()) {
@@ -663,7 +678,7 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                                     ));
                                 }
                                 None => {
-                                    notice = Some((NO_SEND_NOTE.to_string(), Instant::now()));
+                                    notice = Some((no_send_note(selected).to_string(), Instant::now()));
                                 }
                             },
                             KeyCode::Char('c') => match clipboard_key(&model, selected) {
@@ -710,6 +725,19 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
 /// Shown when a key is pressed on a row it cannot apply to.
 const NO_SEND_NOTE: &str =
     "This device only connects in to you. Add it as a device to cross to it.";
+/// Shown for the same keys on a pairing this machine controls that has no
+/// device yet: the device appears once that machine dials in (#15).
+const NOT_DIALLED_YET_NOTE: &str =
+    "This machine controls that one once it dials in, and its device appears then.";
+
+/// What a key that needs a device this machine dials says on row `d`.
+fn no_send_note(d: Option<&Device>) -> &'static str {
+    if d.is_some_and(|d| d.controls) {
+        NOT_DIALLED_YET_NOTE
+    } else {
+        NO_SEND_NOTE
+    }
+}
 const NO_CLIPBOARD_NOTE: &str = "This device is not paired, so it has no clipboard to switch.";
 
 /// The request a confirmation answered `y` sends, if any.
@@ -953,7 +981,7 @@ fn device_row(d: &Device, clipboard: Option<Clipboard>, theme: &Theme) -> ListIt
     let state = Style::default().fg(tone_colour(d.connection.tone(), theme));
     let dot = Span::styled(dot_glyph(d.connection), state);
 
-    let dir = match (d.send.is_some(), d.receive) {
+    let dir = match (d.send.is_some() || d.controls, d.receive) {
         (true, true) => "⇄",
         (true, false) => "→",
         (false, true) => "←",
@@ -992,6 +1020,10 @@ fn device_row(d: &Device, clipboard: Option<Clipboard>, theme: &Theme) -> ListIt
             format!("({}) ", s.config.pos),
             Style::default().fg(col(theme.accent)),
         ));
+    } else if d.controls {
+        // Paired for this machine to control it, and no device for it yet:
+        // it gets one when it dials in (#15).
+        spans.push(Span::styled("dials in  ", muted));
     } else {
         spans.push(Span::styled("connects in only  ", muted));
     }
@@ -1111,23 +1143,19 @@ fn ui(
         Span::raw("   capture: "),
         capture_span(&model.capture, theme),
         Span::raw("   emulation: "),
-        status_span(model.emulation, theme),
-        Span::styled(
-            format!(
-                "   port: {}",
-                model
-                    .port
-                    .map(|p| p.to_string())
-                    .unwrap_or_else(|| "—".into())
-            ),
-            muted,
-        ),
+        emulation_span(&model.emulation, theme),
+        Span::styled(format!("   port: {}", model.port_words()), muted),
     ]);
     // What is wrong with the service: a start that did not come up, or a
     // daemon of another build. Wrapped under the status line.
     let mut header = vec![status];
     // Why capture, which should run, does not (#91).
-    if let Some(problem) = model.capture_problem() {
+    // Why emulation, which should run, does not: on a Mac that is only
+    // controlled, the permission it lacks.
+    for problem in [model.capture_problem(), model.emulation_problem()]
+        .into_iter()
+        .flatten()
+    {
         header.push(Line::from(Span::styled(
             problem,
             Style::default().fg(col(theme.warn)),
@@ -1687,6 +1715,15 @@ fn capture_span(s: &CaptureState, theme: &Theme) -> Span<'static> {
     }
 }
 
+/// Emulation's state as the header reads it: failed is not off.
+fn emulation_span(s: &EmulationState, theme: &Theme) -> Span<'static> {
+    match s {
+        EmulationState::Enabled => status_span(Status::Enabled, theme),
+        EmulationState::Disabled => status_span(Status::Disabled, theme),
+        EmulationState::Failed(_) => Span::styled("failed", Style::default().fg(col(theme.error))),
+    }
+}
+
 fn status_span(s: Status, theme: &Theme) -> Span<'static> {
     match s {
         Status::Enabled => Span::styled("enabled", Style::default().fg(col(theme.success))),
@@ -1811,6 +1848,66 @@ mod tests {
 
     fn screen(model: &AppModel, sel: usize) -> String {
         render(model, sel).join("\n")
+    }
+
+    /// A machine that only dials out offers no port to edit, and says why;
+    /// one that listens opens the edit on its port.
+    // LEDGER L-2 | class B | 1 return value: port_input over a model built from daemon events
+    #[test]
+    fn a_machine_that_only_dials_out_has_no_port_to_edit() {
+        let mut model = AppModel::default();
+        model.connected = true;
+        model.apply(FrontendEvent::PortChanged(4722, None));
+        let listens = matches!(port_input(&model), Ok(Input::Port { buf }) if buf == "4722");
+        model.apply(FrontendEvent::Listening(false));
+        assert_eq!(
+            (listens, port_input(&model).err()),
+            (true, Some(DIALS_OUT_ONLY_NOTE)),
+            "(a listening machine edits its port, one that only dials out is told why not)"
+        );
+    }
+
+    /// A pairing this machine only controls, with no device pinned to it,
+    /// is a row, named as it was paired, and the header of a machine that
+    /// only dials out, whose emulation lacks Accessibility, says both.
+    // LEDGER B8-5 | class B | 3 widget tree: ui() rendered to a test terminal
+    #[test]
+    fn a_controlled_pairing_is_a_row_and_the_header_says_what_this_machine_lacks() {
+        use hops_frontend_core::{EmulationFault, PeerTrust, Permission};
+        let mut model = AppModel::default();
+        model.connected = true;
+        model.apply(FrontendEvent::TrustUpdated(
+            [(
+                "2d:18:1a:c4".to_string(),
+                PeerTrust {
+                    label: "desk mac".into(),
+                    we_may_drive: true,
+                    ..Default::default()
+                },
+            )]
+            .into(),
+        ));
+        model.apply(FrontendEvent::Listening(false));
+        model.apply(FrontendEvent::PortChanged(4722, None));
+        model.apply(FrontendEvent::EmulationStatus(EmulationState::Failed(
+            EmulationFault::Missing(vec![Permission::Accessibility]),
+        )));
+        let lines = render_at(&model, 0, 160, 24);
+        let screen = lines.join("\n");
+        assert!(
+            lines.iter().any(|l| l.contains("desk mac")
+                && l.contains('→')
+                && l.contains("waiting for it to dial")
+                && !l.contains("connects in only")),
+            "no row for the pairing this machine controls:\n{screen}"
+        );
+        assert!(
+            screen.contains("emulation: failed")
+                && screen.contains("port: dials out only")
+                && screen.contains("Accessibility"),
+            "the header must say emulation failed, name what it lacks, and that \
+             this machine listens on no port:\n{screen}"
+        );
     }
 
     /// With no daemon connected the rows are what was last known, and are
@@ -2752,6 +2849,7 @@ mod tests {
                         clipboard_from: true,
                         clipboard_to: false,
                         pending: false,
+                        ..Default::default()
                     },
                 ),
                 (LAPTOP.to_owned(), PeerTrust::default()),
@@ -3130,6 +3228,7 @@ mod every_state_on_a_row {
                     clipboard_from: true,
                     clipboard_to: true,
                     pending: false,
+                    ..Default::default()
                 },
             )])));
         }
@@ -3304,6 +3403,8 @@ mod every_state_on_a_row {
                     state: pinned(true, true, true),
                 }),
                 receive: true,
+                paired: true,
+                controls: true,
             };
             let mut term = Terminal::new(TestBackend::new(160, 3)).expect("test terminal");
             term.draw(|f| f.render_widget(List::new(vec![device_row(&d, None, &theme)]), f.area()))
@@ -3348,6 +3449,8 @@ mod every_state_on_a_row {
                 },
             }),
             receive: true,
+            paired: true,
+            controls: true,
         };
         let mut term = Terminal::new(TestBackend::new(100, 3)).expect("test terminal");
         term.draw(|f| f.render_widget(List::new(vec![device_row(&d, None, &theme)]), f.area()))

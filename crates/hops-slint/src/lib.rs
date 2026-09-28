@@ -22,9 +22,9 @@ use std::{
 };
 
 use hops_frontend_core::{
-    AppModel, ApprovalRefused, CaptureState, ClientHandle, Clipboard, FrontendClient,
-    FrontendRequest, Launch, PairingAttempt, PairingCard, PairingCheck, Position, Status, Tone,
-    prefs, spaced_number, theme,
+    AppModel, ApprovalRefused, CaptureState, ClientHandle, Clipboard, EmulationState,
+    FrontendClient, FrontendRequest, Launch, PairingAttempt, PairingCard, PairingCheck, Position,
+    Status, Tone, prefs, spaced_number, theme,
 };
 use hops_ipc::{DEFAULT_PORT, Geometry};
 use slint::{ComponentHandle, ModelRc, VecModel};
@@ -64,7 +64,14 @@ struct PolledUi {
     /// Whether the window offers the setting that mends it (#169).
     capture_settings: bool,
     emulation: String,
+    /// Why emulation, which should run, does not, from
+    /// `AppModel::emulation_problem`, or empty.
+    emulation_problem: String,
+    /// Whether the window offers the setting that mends it.
+    emulation_settings: bool,
     port: String,
+    /// The daemon listens on no port: it only dials out (#15).
+    dials_out_only: bool,
     fingerprint: String,
     pairing: String,
     /// Machines announcing themselves on the LAN that are not already added or
@@ -241,7 +248,7 @@ fn device_rows(m: &AppModel) -> Vec<DeviceRow> {
                     .and_then(|s| s.state.peer_fingerprint.clone())
                     .unwrap_or_default()
                     .into(),
-                trusted: d.receive,
+                trusted: d.paired,
                 clipboard: clipboard.map(clipboard_words).unwrap_or_default().into(),
                 clipboard_on: clipboard.is_some_and(|c| c.is_on()),
             }
@@ -280,11 +287,12 @@ fn polled_ui(m: &AppModel, shown: Option<&PairingAttempt>, now: Instant) -> Poll
         capture: capture_text(&m.capture).to_string(),
         capture_problem: m.capture_problem().unwrap_or_default(),
         capture_settings: cfg!(target_os = "macos") && privacy::for_capture(&m.capture).is_some(),
-        emulation: status_text(m.emulation).to_string(),
-        port: m
-            .port
-            .map(|p| p.to_string())
-            .unwrap_or_else(|| "—".to_string()),
+        emulation: emulation_text(&m.emulation).to_string(),
+        emulation_problem: m.emulation_problem().unwrap_or_default(),
+        emulation_settings: cfg!(target_os = "macos")
+            && privacy::for_emulation(&m.emulation).is_some(),
+        port: m.port_words(),
+        dials_out_only: m.dials_out_only,
         fingerprint: m.fingerprint.clone().unwrap_or_else(|| "—".to_string()),
         pairing,
         discovery_active: m.discovery_active,
@@ -375,7 +383,10 @@ impl Repaint {
         ui.set_capture_problem(snap.capture_problem.as_str().into());
         ui.set_capture_settings(snap.capture_settings);
         ui.set_emulation(snap.emulation.as_str().into());
+        ui.set_emulation_problem(snap.emulation_problem.as_str().into());
+        ui.set_emulation_settings(snap.emulation_settings);
         ui.set_port(snap.port.as_str().into());
+        ui.set_dials_out_only(snap.dials_out_only);
         ui.set_fingerprint(snap.fingerprint.as_str().into());
         show_pairing_card(ui, &snap.pairing);
         ui.set_discovered(ModelRc::new(VecModel::from(snap.discovered.clone())));
@@ -425,6 +436,15 @@ fn capture_text(s: &CaptureState) -> &'static str {
         CaptureState::Enabled => status_text(Status::Enabled),
         CaptureState::Disabled => status_text(Status::Disabled),
         CaptureState::Failed(_) => "failed",
+    }
+}
+
+/// Emulation's state as the window reads it: failed is not off.
+fn emulation_text(s: &EmulationState) -> &'static str {
+    match s {
+        EmulationState::Enabled => status_text(Status::Enabled),
+        EmulationState::Disabled => status_text(Status::Disabled),
+        EmulationState::Failed(_) => "failed",
     }
 }
 
@@ -861,6 +881,8 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
             if let Some(ask) = privacy::for_capture(&c.snapshot().capture) {
                 privacy::act(ask, false);
             }
+            // Emulation's permission has no prompt of its own to raise: its
+            // setting is opened from the banner that names it.
             c.request(FrontendRequest::EnableCapture);
             c.request(FrontendRequest::EnableEmulation);
         });
@@ -871,6 +893,16 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
         ui.on_open_capture_settings(move || {
             #[cfg(target_os = "macos")]
             if let Some(ask) = privacy::for_capture(&c.snapshot().capture) {
+                privacy::act(ask, true);
+            }
+        });
+    }
+    {
+        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+        let c = client.clone();
+        ui.on_open_emulation_settings(move || {
+            #[cfg(target_os = "macos")]
+            if let Some(ask) = privacy::for_emulation(&c.snapshot().emulation) {
                 privacy::act(ask, true);
             }
         });
@@ -1447,6 +1479,7 @@ mod the_window_draws_the_state {
                         clipboard_from: true,
                         clipboard_to: true,
                         pending: false,
+                        ..Default::default()
                     },
                 )]
                 .into(),
@@ -2528,6 +2561,78 @@ mod a_rename_names_and_changes_nothing_else {
             (None, None),
             "(a blank address, a row this machine does not dial): neither may \
              change where anything is dialled"
+        );
+    }
+}
+
+#[cfg(test)]
+mod every_pairing_has_a_row {
+    //! A pairing this machine only controls, with no device pinned to it,
+    //! had no row, so a lost machine could not be removed from the window.
+    use super::*;
+    use hops_frontend_core::{EmulationFault, FrontendEvent, PeerTrust, Permission};
+
+    const MAC: &str = "2d:18:1a:c4:a8:40:f5:26:37:39:9d:c7:c7:75:fe:17";
+
+    // LEDGER B8-4 | class B | 1 return value: device_rows over a model built from daemon events
+    /// The row is there, named as it was paired, and it carries the
+    /// fingerprint the remove button sends, with `trusted` set, which is
+    /// what draws that button.
+    #[test]
+    fn a_pairing_this_machine_only_controls_is_a_removable_row() {
+        let mut m = AppModel::default();
+        m.connected = true;
+        m.apply(FrontendEvent::TrustUpdated(
+            [(
+                MAC.to_string(),
+                PeerTrust {
+                    label: "desk mac".into(),
+                    we_may_drive: true,
+                    ..Default::default()
+                },
+            )]
+            .into(),
+        ));
+        let rows: Vec<(String, String, bool, bool)> = device_rows(&m)
+            .into_iter()
+            .map(|r| (r.name.into(), r.fp_full.into(), r.trusted, r.has_send))
+            .collect();
+        assert_eq!(
+            rows,
+            [("desk mac".to_string(), MAC.to_string(), true, false)],
+            "(name, the fingerprint remove sends, removable, dialled from here)"
+        );
+    }
+
+    // LEDGER G2-3 | class B | 1 return value: polled_ui, privacy::for_emulation
+    /// Emulation refused Accessibility reads as failed, with the problem
+    /// named, and the setting the banner opens is Accessibility, with no
+    /// Input Monitoring prompt, which emulation never needs.
+    #[test]
+    fn emulation_refused_its_permission_is_shown_with_its_setting() {
+        let mut m = AppModel::default();
+        m.connected = true;
+        let failed =
+            EmulationState::Failed(EmulationFault::Missing(vec![Permission::Accessibility]));
+        m.apply(FrontendEvent::EmulationStatus(failed.clone()));
+        let ui = polled_ui(&m, None, Instant::now());
+        assert_eq!(ui.emulation, "failed");
+        assert!(
+            ui.emulation_problem.contains("Accessibility"),
+            "{}",
+            ui.emulation_problem
+        );
+        assert_eq!(
+            privacy::for_emulation(&failed),
+            Some(privacy::Ask {
+                input_monitoring: false,
+                pane: Permission::Accessibility
+            })
+        );
+        assert_eq!(
+            privacy::for_emulation(&EmulationState::Failed(EmulationFault::Backend("x".into()))),
+            None,
+            "nothing to open for a failure that is not a permission"
         );
     }
 }

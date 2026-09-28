@@ -49,6 +49,8 @@ pub enum Connection {
     Unreachable,
     /// Paired, and the device's machine dials this one to be controlled from
     /// here (#15): this machine never dials it, and waits for it to connect.
+    /// Also a pairing this machine controls and holds no device for, which
+    /// gets one when it dials in.
     AwaitingItsDial,
     /// Paired, and no link either way, with nothing wrong known: this
     /// machine dials it when the pointer crosses to it, or waits for it to
@@ -146,6 +148,9 @@ impl Connection {
                 C::AwaitingItsDial
             }
             (true, false, Paired, On(Down { unanswered: false }), false, false) => C::NotConnected,
+            // A pairing this machine controls and holds no device for: the
+            // device appears when that machine dials in (#15).
+            (true, false, Paired, SendFacet::None, false, true) => C::AwaitingItsDial,
             (true, false, NotPaired | Paired, SendFacet::None, false, _) => C::NotConnected,
         }
     }
@@ -398,6 +403,11 @@ mod tests {
                     (_, _, true) => Connection::Connected,
                     (Standing::NotPaired, SendFacet::On(_), _) => Connection::NotPaired,
                     (Standing::Paired, SendFacet::On(Link::Down { .. }), false) if f.dials_us => {
+                        Connection::AwaitingItsDial
+                    }
+                    // A pairing this machine controls with no device here
+                    // yet: its device appears when it dials in.
+                    (Standing::Paired, SendFacet::None, false) if f.dials_us => {
                         Connection::AwaitingItsDial
                     }
                     _ => Connection::NotConnected,

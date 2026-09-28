@@ -60,6 +60,9 @@ pub(crate) enum EmulationEvent {
     EmulationDisabled,
     /// emulation was enabled
     EmulationEnabled,
+    /// Emulation could not start, or stopped with an error: why, and the
+    /// permission to grant when that is why.
+    EmulationFailed(hops_ipc::EmulationFault),
     /// capture should be released
     ReleaseNotify,
     /// the remote-controlled cursor was deliberately pushed past a screen
@@ -772,11 +775,51 @@ impl PeerQueues {
     }
 }
 
+/// Why a fall to `dummy` is refused, or `None` when it runs: asked for, or
+/// overridden. A real backend the system withheld a permission from is
+/// named, so the person is told what to grant rather than only that input
+/// would be discarded; the override still runs `dummy` in its place.
+fn refuse_the_fall(
+    asked_for_dummy: bool,
+    overridden: bool,
+    withheld: &[input_emulation::Permission],
+) -> Option<InputEmulationError> {
+    if asked_for_dummy || overridden {
+        return None;
+    }
+    Some(if withheld.is_empty() {
+        InputEmulationError::NoUsableBackend
+    } else {
+        InputEmulationError::Withheld(withheld.to_vec())
+    })
+}
+
+/// What to tell the user about emulation that ended with `e`: the settings
+/// to change when a permission is missing, and the error otherwise.
+fn fault_of(e: &InputEmulationError) -> hops_ipc::EmulationFault {
+    match e.missing_permissions() {
+        Some(missing) if !missing.is_empty() => hops_ipc::EmulationFault::Missing(
+            missing
+                .iter()
+                .map(|p| match p {
+                    input_emulation::Permission::Accessibility => {
+                        hops_ipc::Permission::Accessibility
+                    }
+                })
+                .collect(),
+        ),
+        _ => hops_ipc::EmulationFault::Backend(e.to_string()),
+    }
+}
+
 impl EmulationTask {
     async fn run(mut self) {
         loop {
             if let Err(e) = self.do_emulation().await {
                 log::warn!("input emulation exited: {e}");
+                let _ = self
+                    .event_tx
+                    .send(EmulationEvent::EmulationFailed(fault_of(&e)));
             }
             if self.exit_requested.get() {
                 break;
@@ -816,12 +859,16 @@ impl EmulationTask {
             let _ = self.event_tx.send(EmulationEvent::BackendDegraded(
                 emulation.backend().to_string(),
             ));
-            if !asked_for_dummy && !overridden {
+            if let Some(refusal) = refuse_the_fall(
+                asked_for_dummy,
+                overridden,
+                emulation.withheld_permissions(),
+            ) {
                 log::error!(
                     "input emulation fell back to `dummy` — all input would be silently \
                      discarded. Refusing. Set HOPS_ALLOW_DUMMY=1 to override."
                 );
-                return Err(InputEmulationError::NoUsableBackend);
+                return Err(refusal);
             }
         }
 
@@ -2842,5 +2889,43 @@ mod a_pairing_approved_both_ways {
             )
             .await;
         });
+    }
+}
+
+#[cfg(test)]
+mod a_fall_to_dummy_names_what_was_withheld {
+    //! A Mac without Accessibility falls past its real backend to `dummy`,
+    //! which is refused. The refusal names the permission, so the app can
+    //! say what to grant; the override still runs `dummy`.
+
+    use super::{InputEmulationError, fault_of, refuse_the_fall};
+    use hops_ipc::{EmulationFault, Permission};
+    use input_emulation::Permission as Withheld;
+
+    // LEDGER G2-4 | class B | 1 return value: refuse_the_fall folded by fault_of
+    #[test]
+    fn the_refusal_names_the_permission_and_the_override_still_runs() {
+        let told = |asked: bool, overridden: bool, withheld: &[Withheld]| {
+            refuse_the_fall(asked, overridden, withheld).map(|e| fault_of(&e))
+        };
+        let access = [Withheld::Accessibility];
+        assert_eq!(
+            told(false, false, &access),
+            Some(EmulationFault::Missing(vec![Permission::Accessibility])),
+            "a fall past a backend refused Accessibility must name it"
+        );
+        assert!(
+            matches!(told(false, false, &[]), Some(EmulationFault::Backend(_))),
+            "a fall past backends that failed otherwise names no permission"
+        );
+        assert_eq!(
+            (told(true, false, &access), told(false, true, &access)),
+            (None, None),
+            "(dummy asked for, HOPS_ALLOW_DUMMY set): both run dummy"
+        );
+        assert!(matches!(
+            refuse_the_fall(false, false, &[]),
+            Some(InputEmulationError::NoUsableBackend)
+        ));
     }
 }

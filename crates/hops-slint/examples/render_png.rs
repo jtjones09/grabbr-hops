@@ -81,6 +81,20 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
     }
     ui.set_emulation("enabled".into());
     ui.set_port("4722".into());
+    // PREVIEW_CONTROLLED_MAC=1 shows a Mac that is only controlled: it only
+    // dials out, and macOS has not granted hops Accessibility, so emulation
+    // cannot run.
+    if std::env::var_os("PREVIEW_CONTROLLED_MAC").is_some() {
+        ui.set_emulation("failed".into());
+        ui.set_emulation_problem(
+            "Input emulation cannot run: macOS does not grant hops Accessibility, which \
+             this Mac needs to be controlled from other machines. Turn hops on under \
+             System Settings → Privacy & Security → Accessibility."
+                .into(),
+        );
+        ui.set_emulation_settings(true);
+        ui.set_dials_out_only(true);
+    }
     ui.set_fingerprint("73:90:2a:3c:9d:e5:18:52:7c:aa:c3:de:de:04:cd:ec".into());
     let first_run = std::env::var_os("PREVIEW_FIRST_RUN").is_some();
     ui.set_discovery_active(std::env::var("PREVIEW_DISCOVERY").as_deref() != Ok("off"));
@@ -250,6 +264,24 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             fingerprint: "5d:81:e2".into(),
             fp_full: "5d:81:e2:07:bb:19".into(),
             pin: "5d:81:e2:07:bb:19".into(),
+            trusted: true,
+            clipboard: "goes from here to this device".into(),
+            clipboard_on: true,
+        },
+        // a pairing this machine only controls, with no device for it yet:
+        // listed, and removable, before that machine first dials in
+        DeviceRow {
+            handle: "".into(),
+            name: "desk mac".into(),
+            addr: "".into(),
+            pos: "".into(),
+            active: false,
+            tone: DotTone::Quiet,
+            status: Connection::AwaitingItsDial.words().into(),
+            has_send: false,
+            fingerprint: "2d:18:1a".into(),
+            fp_full: "2d:18:1a:c4:a8:40".into(),
+            pin: "".into(),
             trusted: true,
             clipboard: "goes from here to this device".into(),
             clipboard_on: true,

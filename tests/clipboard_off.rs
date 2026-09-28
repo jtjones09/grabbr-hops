@@ -26,6 +26,8 @@ const OFF: PeerTrust = PeerTrust {
     clipboard_from: false,
     clipboard_to: false,
     pending: false,
+    label: String::new(),
+    we_may_drive: false,
 };
 
 async fn attach() -> (AsyncFrontendEventReader, AsyncFrontendRequestWriter) {
@@ -39,6 +41,16 @@ async fn attach() -> (AsyncFrontendEventReader, AsyncFrontendRequestWriter) {
     (events, requests)
 }
 
+/// What a report says of the clipboard, and nothing else it carries.
+fn clipboard_only(t: &PeerTrust) -> PeerTrust {
+    PeerTrust {
+        clipboard_from: t.clipboard_from,
+        clipboard_to: t.clipboard_to,
+        pending: t.pending,
+        ..PeerTrust::default()
+    }
+}
+
 /// The next clipboard the daemon reports for the paired machine that `want`
 /// accepts, or the last one it reported if none is accepted in time.
 async fn reported(
@@ -48,8 +60,8 @@ async fn reported(
     let mut last = None;
     common::next_matching(events, WAIT, |e| match e {
         FrontendEvent::TrustUpdated(map) => {
-            last = map.get(DESK_MAC).copied();
-            last.filter(|t| want(*t))
+            last = map.get(DESK_MAC).map(clipboard_only);
+            last.clone().filter(|t| want(t.clone()))
         }
         _ => None,
     })
@@ -73,6 +85,7 @@ async fn turning_the_clipboard_off_reaches_the_app_and_survives_a_restart() {
             clipboard_from: true,
             clipboard_to: false,
             pending: false,
+            ..PeerTrust::default()
         }),
         "precondition: a machine paired before #182 that may drive this one sends \
          its clipboard here; log:\n{}",
@@ -129,7 +142,7 @@ async fn turning_the_clipboard_off_reaches_the_app_and_survives_a_restart() {
             still_drives = map.contains_key(DESK_MAC);
             None
         }
-        FrontendEvent::TrustUpdated(map) => Some(map.get(DESK_MAC).copied()),
+        FrontendEvent::TrustUpdated(map) => Some(map.get(DESK_MAC).map(clipboard_only)),
         _ => None,
     })
     .await

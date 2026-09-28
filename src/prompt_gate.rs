@@ -119,6 +119,7 @@ impl PromptGate {
             count,
             fingerprint: fingerprint.to_owned(),
             from,
+            paired: None,
         })
     }
 
@@ -274,6 +275,21 @@ pub(crate) struct Refused {
     pub(crate) fingerprint: String,
     /// Where the latest knock came from.
     pub(crate) from: Option<SocketAddr>,
+    /// What this machine holds for the latest knock's machine, when it holds
+    /// a pairing with it: set by the caller, which holds the trust store and
+    /// the devices.
+    pub(crate) paired: Option<PairedHere>,
+}
+
+/// A refused machine this machine is paired with, in the terms the app's
+/// line uses.
+pub(crate) struct PairedHere {
+    /// The name it was paired under.
+    pub(crate) name: String,
+    /// This machine may control it.
+    pub(crate) controlled_from_here: bool,
+    /// Every device here for it is switched off.
+    pub(crate) switched_off: bool,
 }
 
 impl Refused {
@@ -297,9 +313,15 @@ impl Refused {
     /// The app's line: activity, not an error. Nobody at this machine asked
     /// for it, and a stranger can cause it whenever it likes (#150).
     ///
-    /// Worded to hold for every machine refused here: a stranger, a machine
-    /// paired only the other way, and one this machine has removed.
+    /// Worded to hold for every machine refused here: a stranger and one
+    /// this machine has removed. A machine paired with this one is named,
+    /// and not told to open add device, which does nothing for it; its
+    /// device here being switched off is said, since that is what the person
+    /// here chose.
     pub(crate) fn notice(&self) -> String {
+        if let Some(paired) = &self.paired {
+            return paired.notice(self.count);
+        }
         let from = self
             .from
             .map_or_else(|| "a machine".to_owned(), |a| a.ip().to_string());
@@ -315,6 +337,28 @@ impl Refused {
                 self.count
             )
         }
+    }
+}
+
+impl PairedHere {
+    fn notice(&self, count: u32) -> String {
+        let name = &self.name;
+        let refused = if count == 1 {
+            format!("Refused a connection from {name}")
+        } else {
+            format!("Refused {count} connections, the latest from {name}")
+        };
+        let why = if self.controlled_from_here {
+            "this machine controls it, and it may not control this one"
+        } else {
+            "its pairing does not let it control this machine"
+        };
+        let off = if self.switched_off {
+            format!(" Its device here is switched off; switch {name} on to use it.")
+        } else {
+            String::new()
+        };
+        format!("{refused}: {why}.{off}")
     }
 }
 

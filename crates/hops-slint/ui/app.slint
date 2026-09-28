@@ -39,7 +39,8 @@ export struct DeviceRow {
     pin: string,         // the send facet's pin, "" if none: what delete and
                          // rename carry, so the daemon can refuse them once
                          // the device is pinned to another machine (#94)
-    trusted: bool,       // its fingerprint is in authorized_fingerprints
+    trusted: bool,       // this machine holds a pairing with it, either way:
+                         // it can be renamed and removed by fingerprint
     clipboard: string,   // which way the clipboard goes, for the edit panel,
                          // or "" when no pairing holds one (#182)
     clipboard-on: bool,  // some direction is on, so it can be switched off
@@ -55,6 +56,40 @@ export struct DiscoveredRow {
     ips: string,          // comma-separated addresses, for the add callback
     addr-summary: string, // "10.0.0.5 +2 more" for display
     port: string,
+}
+
+// Something that should run and cannot, and what to change: capture (#91)
+// and emulation each have one. Stays while it is true; not dismissible.
+component ProblemBanner inherits Rectangle {
+    in property <string> text;
+    // Whether this Mac can take the user to the setting that mends it: the
+    // problem is a missing permission (#169).
+    in property <bool> settings;
+    callback open-settings();
+    vertical-stretch: 0;
+    background: Theme.c.warn.transparentize(0.9);
+    border-radius: Radius.lg;
+    border-width: 1px;
+    border-color: Theme.c.warn.transparentize(0.55);
+    HorizontalLayout {
+        padding: Space.md;
+        spacing: Space.md;
+        Text {
+            horizontal-stretch: 1;
+            text: root.text;
+            color: Theme.c.foreground;
+            font-size: Type.small;
+            wrap: word-wrap;
+            vertical-alignment: center;
+        }
+        if root.settings: VerticalLayout {
+            alignment: center;
+            PillButton {
+                text: "open settings";
+                clicked => { root.open-settings(); }
+            }
+        }
+    }
 }
 
 export component AppWindow inherits Window {
@@ -109,7 +144,13 @@ export component AppWindow inherits Window {
     // problem is a missing permission (#169).
     in property <bool> capture-settings: false;
     in property <string> emulation: "—";
+    // Why emulation, which should run, does not, or empty: on a Mac that is
+    // only controlled, the permission it lacks.
+    in property <string> emulation-problem: "";
+    in property <bool> emulation-settings: false;
     in property <string> port: "—";
+    // This machine listens on no port: it only dials out (#15).
+    in property <bool> dials-out-only: false;
     in property <string> fingerprint: "—";
     in property <[DeviceRow]> devices: [];
     in property <string> pairing-fp: "";
@@ -228,6 +269,7 @@ export component AppWindow inherits Window {
 
     callback enable-input();
     callback open-capture-settings();
+    callback open-emulation-settings();
     callback activate-device(string /* handle */, bool /* active */);
     callback reposition-device(string /* handle */, string /* new position */);
     callback rename-device(string /* handle */, string /* pin */, string /* new name */);
@@ -314,14 +356,23 @@ export component AppWindow inherits Window {
             HorizontalLayout {
                 spacing: 5px;
                 Text { text: "emulation"; color: Theme.c.muted; font-size: Type.small; }
+                // Failed is not off, as for capture.
                 Text {
-                    text: root.emulation == "enabled" ? "on" : "off";
-                    color: root.emulation == "enabled" ? Theme.c.success : Theme.c.muted;
+                    text: root.emulation == "enabled" ? "on" : (root.emulation == "failed" ? "failed" : "off");
+                    color: root.emulation == "enabled" ? Theme.c.success : (root.emulation == "failed" ? Theme.c.warn : Theme.c.muted);
                     font-size: Type.small;
                     font-weight: Type.semibold;
                 }
             }
-            HorizontalLayout {
+            // A machine that only dials out listens on no port (#15): its
+            // configured port is not one anything can reach.
+            if root.dials-out-only: Text {
+                text: "dials out only";
+                color: Theme.c.muted;
+                font-size: Type.small;
+                font-weight: Type.semibold;
+            }
+            if !root.dials-out-only: HorizontalLayout {
                 spacing: 5px;
                 Text { text: "port"; color: Theme.c.muted; font-size: Type.small; }
                 Text {
@@ -342,31 +393,15 @@ export component AppWindow inherits Window {
         }
 
         // --- capture that should run and cannot, and what to change (#91) ------
-        if root.capture-problem != "": Rectangle {
-            vertical-stretch: 0;
-            background: Theme.c.warn.transparentize(0.9);
-            border-radius: Radius.lg;
-            border-width: 1px;
-            border-color: Theme.c.warn.transparentize(0.55);
-            HorizontalLayout {
-                padding: Space.md;
-                spacing: Space.md;
-                Text {
-                    horizontal-stretch: 1;
-                    text: root.capture-problem;
-                    color: Theme.c.foreground;
-                    font-size: Type.small;
-                    wrap: word-wrap;
-                    vertical-alignment: center;
-                }
-                if root.capture-settings: VerticalLayout {
-                    alignment: center;
-                    PillButton {
-                        text: "open settings";
-                        clicked => { root.open-capture-settings(); }
-                    }
-                }
-            }
+        if root.capture-problem != "": ProblemBanner {
+            text: root.capture-problem;
+            settings: root.capture-settings;
+            open-settings => { root.open-capture-settings(); }
+        }
+        if root.emulation-problem != "": ProblemBanner {
+            text: root.emulation-problem;
+            settings: root.emulation-settings;
+            open-settings => { root.open-emulation-settings(); }
         }
 
         // --- the service: a start that did not come up, or another build ------

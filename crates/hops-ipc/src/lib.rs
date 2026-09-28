@@ -459,8 +459,8 @@ pub enum FrontendEvent {
     Activity(String),
     /// Whether input capture runs, and why not when it should (#91).
     CaptureStatus(CaptureState),
-    /// emulation status
-    EmulationStatus(Status),
+    /// Whether input emulation runs, and why not when it should.
+    EmulationStatus(EmulationState),
     /// authorized public key fingerprints have been updated
     AuthorizedUpdated(HashMap<String, String>),
     /// What the trust store grants each paired machine, by fingerprint: sent
@@ -472,6 +472,12 @@ pub enum FrontendEvent {
     TrustUpdated(HashMap<String, PeerTrust>),
     /// public key fingerprint of this device
     PublicKeyFingerprint(String),
+    /// Whether this machine listens on its port. `false` for a machine that
+    /// only dials out, which binds no port (#15), so its port is not one any
+    /// machine can reach.
+    ///
+    /// Newer than `PortChanged`; older frontends skip it.
+    Listening(bool),
     /// new device connected
     DeviceConnected {
         addr: SocketAddr,
@@ -592,7 +598,11 @@ impl Display for CrossingRefusal {
 
 /// What this machine's trust store grants one paired machine, beyond the
 /// allowlist `FrontendEvent::AuthorizedUpdated` carries.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// That allowlist names only the machines that may drive this one. A
+/// pairing this machine only controls is here and nowhere else, so this is
+/// what a frontend lists it from.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerTrust {
     /// This machine accepts that machine's clipboard.
     pub clipboard_from: bool,
@@ -603,6 +613,12 @@ pub struct PeerTrust {
     /// state.
     #[serde(default)]
     pub pending: bool,
+    /// The name the pairing was made under. Empty from an older daemon.
+    #[serde(default)]
+    pub label: String,
+    /// This machine may control that one. False from an older daemon.
+    #[serde(default)]
+    pub we_may_drive: bool,
 }
 
 /// Which way control goes between two paired machines, as the person
@@ -860,6 +876,37 @@ impl CaptureState {
     pub fn is_enabled(&self) -> bool {
         matches!(self, Self::Enabled)
     }
+}
+
+/// Whether input emulation runs, written on the wire as [`Status`] writes
+/// its two states, and a third for emulation that should run and cannot. A
+/// Mac that is only ever controlled needs Accessibility for it, and a bare
+/// "off" did not say so.
+///
+/// A frontend older than this skips a `Failed` it cannot read.
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum EmulationState {
+    /// Not running, and nothing is wrong: not started yet, or ended.
+    #[default]
+    Disabled,
+    Enabled,
+    /// It could not start, or it stopped.
+    Failed(EmulationFault),
+}
+
+impl EmulationState {
+    pub fn is_enabled(&self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
+/// Why emulation could not start, or stopped.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum EmulationFault {
+    /// macOS does not grant hops these permissions.
+    Missing(Vec<Permission>),
+    /// Any other failure, as the backend reported it.
+    Backend(String),
 }
 
 /// Why capture could not start, or stopped.
