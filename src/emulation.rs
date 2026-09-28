@@ -1735,16 +1735,18 @@ mod held_input_is_released {
         }
     }
 
-    // LEDGER T1 | class B | 6 struct state: Recording::calls() after the ListenTask watchdog
+    // LEDGER T1 | class B | 6 struct state: Recording::calls() and the driven state after the ListenTask watchdog
     /// The case the watchdog is still for: no Leave and no close. The peer
     /// sends nothing more while its connection stays up, as when the link
     /// stalls or the other machine hangs. Only the watchdog can notice, 10-15 s
     /// later, and whatever was held must come up then. A link that closes is
-    /// released at once (T60).
+    /// released at once (T60). The peer's crossing ends with it, or the
+    /// requests that widen trust stay refused until the link closes (#107).
     #[test]
     fn a_peer_that_vanishes_mid_drag_leaves_no_button_held() {
         run_local(async {
-            let s = session().await;
+            // The raw peer is the only one crossed in.
+            let s = connected(0, ButtonScope::Machine, true).await;
             let peer = RawPeer::new(&s);
             let (conn, mut input) = peer.connect().await;
             let handle = s.inject_on(&mut input, button(BTN_LEFT, 1)).await;
@@ -1762,10 +1764,64 @@ mod held_input_is_released {
                 "held keys must still be released: {:?}",
                 s.recording.calls()
             );
+            wait_until(
+                "the watchdog to end the quiet peer's crossing",
+                Duration::from_secs(10),
+                || !s.emulation.remotely_driven_within(Duration::ZERO),
+            )
+            .await;
             assert!(
                 conn.close_reason().is_none(),
                 "the link closed, so this did not exercise the watchdog: {:?}",
                 conn.close_reason()
+            );
+        });
+    }
+
+    // LEDGER DR-8 | class B | 5 process-in-test + 1 struct state: a second connection from one address over loopback QUIC, the driven state
+    /// A new connection from a peer's address is a new session, not yet
+    /// crossed in. The old session's crossing ends there, and the quiet
+    /// window runs from then; left set, the requests that widen trust stay
+    /// refused until the old link closes (#107).
+    #[test]
+    fn a_new_connection_from_a_crossed_peers_address_ends_its_crossing() {
+        run_local(async {
+            let s = connected(0, ButtonScope::Machine, true).await;
+            // One socket, so both connections come from one address.
+            let peer = RawPeer::new(&s);
+            let (_older, mut older_input) = peer.connect().await;
+            wait_until(
+                "the crossing to mark this machine as driven",
+                Duration::from_secs(20),
+                || s.emulation.remotely_driven_within(Duration::ZERO),
+            )
+            .await;
+
+            let reconnecting = Instant::now();
+            let _newer = peer
+                .endpoint
+                .connect(peer.at, "grabbr")
+                .expect("dial")
+                .await
+                .expect("handshake");
+            // The old link keeps answering, so the watchdog, which would also
+            // end the crossing, never fires for it.
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while s.emulation.remotely_driven_within(Duration::ZERO) {
+                assert!(
+                    Instant::now() < deadline,
+                    "a new connection came from a crossed peer's address, and the \
+                     old session still reads as crossed in 20s later"
+                );
+                crate::transport::write_frame(&mut older_input, ProtoEvent::Ping)
+                    .await
+                    .expect("ping");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(
+                s.emulation.remotely_driven_within(reconnecting.elapsed()),
+                "the crossing ended at the new connection, and the quiet window \
+                 did not run from then"
             );
         });
     }
