@@ -262,19 +262,19 @@ fn the_controlled_machine_dials_again_until_its_link_is_taken() {
             };
             let handle = until(&mut app, "the mac's link", || {}, up).await;
 
-            app.exchange(&[R::Activate(handle, false)]).await;
-            let waiting = until(
-                &mut app,
-                "the link closing",
-                || {},
-                |e| match e {
-                    FrontendEvent::State(h, _, s) if *h == handle && s.active_addr.is_none() => {
-                        Some(s.dials_us)
-                    }
-                    _ => None,
-                },
-            )
-            .await;
+            let closing = |e: &FrontendEvent| match e {
+                FrontendEvent::State(h, _, s) if *h == handle && s.active_addr.is_none() => {
+                    Some(s.dials_us)
+                }
+                _ => None,
+            };
+            // The state that says the link closed can come back with the
+            // request that switched the device off, so look there first.
+            let answered = app.exchange(&[R::Activate(handle, false)]).await;
+            let waiting = match answered.iter().find_map(closing) {
+                Some(waiting) => waiting,
+                None => until(&mut app, "the link closing", || {}, closing).await,
+            };
             assert!(
                 waiting,
                 "the pc's card for the mac does not say the mac dials it"
