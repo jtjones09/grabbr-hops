@@ -1548,6 +1548,7 @@ mod release_mid_drag {
                 active: true,
                 enter_hook: config.cmd,
                 fingerprint: state.peer_fingerprint,
+                geometry: None,
             });
             v.clients.deactivate_client(handle);
             assert!(v.clients.activate_client(handle), "precondition");

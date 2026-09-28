@@ -1,11 +1,8 @@
-// hops — the drag-to-arrange spatial layout canvas. Lets you position
-// each device relative to "this Mac" by dragging; the result persists as a
-// Geometry rect per device (UpdateGeometry). STORAGE ONLY for now — nothing
-// reads these rects to change how crossing actually behaves yet. That's a
-// separate, deliberately deferred step: crossing behavior needs A/B hardware
-// testing before it can trust computed geometry (see the project's own
-// behavioral-bugs-need-runtime-test lesson — spatial crossing has been
-// misdiagnosed from code alone before).
+// hops — the drag-to-arrange layout canvas. Each device is dragged to where
+// it sits relative to this machine; the drop sends a Geometry rect
+// (UpdateGeometry), which the daemon saves in the device's config entry, so
+// the picture survives a restart (#174). Crossing still happens at the edge
+// each device is set to (`position`): the drawn spot does not change it.
 //
 // Box positions are intentionally NOT re-pushed by the ~250ms poll timer
 // while the canvas is open (see AppWindow.open-layout-canvas in app.slint) —
@@ -122,7 +119,7 @@ export component LayoutCanvas inherits Rectangle {
             }
         }
         Text {
-            text: "drag a device relative to this Mac — purely visual for now, doesn't change crossing yet";
+            text: "drag each device to where it sits — the layout is saved. The pointer still crosses at each device's position setting.";
             color: Theme.c.muted;
             font-size: Type.caption;
             wrap: word-wrap;
