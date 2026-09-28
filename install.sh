@@ -11,8 +11,19 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")" && pwd)"
 BIN="$REPO/target/release/hops"
 
+# The feature sets the releases build (.github/workflows/release.yml). On
+# macOS the input backends come with the platform; on Linux they are cargo
+# features, and a build without them connects but can neither capture nor
+# inject (#74).
+MACOS_FEATURES="tui slint"
+LINUX_FEATURES="tui libei_capture libei_emulation layer_shell_capture wlroots_emulation x11_capture x11_emulation rdp_emulation"
+case "$(uname -s)" in
+  Darwin) FEATURES="$MACOS_FEATURES" ;;
+  *) FEATURES="$LINUX_FEATURES" ;;
+esac
+
 echo "==> Building hops (first build takes a couple of minutes)…"
-( cd "$REPO" && cargo build --release --no-default-features --features "tui slint" )
+( cd "$REPO" && cargo build --release --no-default-features --features "$FEATURES" )
 
 case "$(uname -s)" in
   Darwin)
@@ -20,12 +31,14 @@ case "$(uname -s)" in
     # reads what hops may do from the bundle's Info.plist: a bare binary
     # declares no Bonjour service, so its discovery is blocked with no prompt
     # and no error (#149).
+    #
+    # --sign: with a signing identity from the keychain (or DEVELOPER_ID),
+    # under the identifier com.grabbr.hops, so the Accessibility and Input
+    # Monitoring grants survive a rebuild. An ad hoc signature is a new
+    # identity every time, and is used only when there is no identity (#78).
     VERSION="$(grep -m1 '^version' "$REPO/Cargo.toml" | sed -E 's/.*"(.*)".*/\1/')"
     APP="$REPO/target/release/hops.app"
-    "$REPO/scripts/macos-app-bundle.sh" "$BIN" "$VERSION" "$APP" >/dev/null
-    # Seal the Info.plist into the bundle. Ad hoc: a local build has no
-    # Developer ID, so macOS grants still end with each rebuild.
-    codesign --force --deep --identifier com.grabbr.hops --sign - "$APP" >/dev/null 2>&1 || true
+    "$REPO/scripts/macos-app-bundle.sh" "$BIN" "$VERSION" "$APP" "" --sign >/dev/null
     BIN="$APP/Contents/MacOS/hops"
     echo "==> Setting up login agents: background receiver + menu-bar tray…"
     mkdir -p "$HOME/hops/logs" "$HOME/Library/LaunchAgents"

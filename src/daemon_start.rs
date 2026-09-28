@@ -1370,6 +1370,35 @@ fn write_agent(path: &Path, plist: &Plist) -> io::Result<()> {
     std::fs::rename(&staged, path).map_err(fail)
 }
 
+/// Where `exe` runs from that a LaunchAgent must not name, if it does: a
+/// mounted volume such as the disk image hops ships in, or the copy macOS
+/// makes to run a quarantined app from (App Translocation). The image cannot
+/// be ejected while the daemon runs from it, and after it is, or after the
+/// copy is cleared, nothing starts at login.
+///
+/// The path is judged where it leads: `/Volumes` also holds a link to the
+/// startup disk, and a binary reached through it is installed.
+#[cfg_attr(
+    not(all(target_os = "macos", any(feature = "tui", feature = "slint"))),
+    allow(dead_code)
+)]
+fn not_installed(exe: &Path) -> Option<&'static str> {
+    use std::path::Component;
+    let resolved = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    let parts: Vec<Component> = resolved.components().collect();
+    if matches!(parts.as_slice(), [Component::RootDir, Component::Normal(v), ..] if *v == "Volumes")
+    {
+        return Some("a mounted disk image or volume");
+    }
+    if parts
+        .iter()
+        .any(|c| matches!(c, Component::Normal(n) if *n == "AppTranslocation"))
+    {
+        return Some("a temporary copy macOS made to run it from");
+    }
+    None
+}
+
 /// Make the plist at `path` run `exe` as the daemon: write it when it is
 /// missing or unreadable, change it when it runs another binary or would not
 /// be restarted after a failure, and leave it alone otherwise.
@@ -1378,6 +1407,17 @@ fn write_agent(path: &Path, plist: &Plist) -> io::Result<()> {
     allow(dead_code)
 )]
 fn point_agent_at(path: &Path, exe: &Path, log: &Path) -> io::Result<AgentFile> {
+    if let Some(place) = not_installed(exe) {
+        log::warn!(
+            "not pointing {} at {}, which is on {place}",
+            path.display(),
+            exe.display()
+        );
+        return Err(io::Error::other(format!(
+            "hops is running from {place}, so it cannot be started at login from \
+             there. Quit it, move hops to Applications and open it from there"
+        )));
+    }
     let exe_text = exe.to_str().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -3383,5 +3423,86 @@ mod the_launch_agent_on_disk {
             dir.read().get("ProgramArguments"),
             Some(&serde_json::json!([exe.to_str().expect("utf-8"), "daemon"]))
         );
+    }
+}
+
+#[cfg(test)]
+mod a_launch_agent_is_never_pointed_at_a_disk_image {
+    //! Opened from the mounted disk image, or from the copy macOS runs a
+    //! quarantined app from, hops wrote its LaunchAgent to start that path at
+    //! every login: the image could not be ejected while the daemon ran from
+    //! it, and once it was, or the copy was cleared, nothing started at login.
+
+    use super::point_agent_at;
+    use std::path::PathBuf;
+
+    // LEDGER T8 | class B | 1 error + 4 file on disk: point_agent_at
+    #[test]
+    fn a_binary_on_a_disk_image_or_a_translocated_copy_is_refused_and_nothing_is_written() {
+        let dir = std::env::temp_dir().join(format!("hops-agent-dmg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let plist = dir.join("com.grabbr.hops.plist");
+        let log = dir.join("daemon.log");
+        let installed = b"the plist of the copy in Applications";
+
+        for exe in [
+            "/Volumes/hops/hops.app/Contents/MacOS/hops",
+            "/private/var/folders/xy/abc/T/AppTranslocation/1F2E3D4C/d/hops.app/Contents/MacOS/hops",
+        ] {
+            let exe = PathBuf::from(exe);
+
+            let _ = std::fs::remove_file(&plist);
+            let refused = point_agent_at(&plist, &exe, &log)
+                .expect_err("a LaunchAgent was pointed at a disk image");
+            let why = refused.to_string();
+            assert!(
+                why.contains("move hops to Applications"),
+                "the refusal must say what to do: {why}"
+            );
+            assert!(!plist.exists(), "a plist was written for {}", exe.display());
+
+            // The agent of the copy in Applications stays as it was.
+            std::fs::write(&plist, installed).expect("an installed plist");
+            assert!(point_agent_at(&plist, &exe, &log).is_err());
+            assert_eq!(
+                std::fs::read(&plist).expect("read"),
+                installed,
+                "the installed agent was changed to run {}",
+                exe.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // LEDGER T8b | class B | 4 file on disk: point_agent_at through a link in /Volumes
+    #[test]
+    fn a_binary_reached_through_the_startup_disks_link_in_volumes_is_installed() {
+        // macOS keeps a link to the startup disk in /Volumes. Without one
+        // (another system) there is nothing to observe.
+        let Some(link) = std::fs::read_dir("/Volumes").ok().and_then(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .find(|p| std::fs::canonicalize(p).is_ok_and(|to| to == std::path::Path::new("/")))
+        }) else {
+            eprintln!("no link to / in /Volumes here; nothing to check");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("hops-agent-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let real = dir.join("hops");
+        std::fs::write(&real, b"a binary").expect("a binary");
+        let through = link.join(real.strip_prefix("/").expect("an absolute path"));
+        let plist = dir.join("com.grabbr.hops.plist");
+
+        let pointed = point_agent_at(&plist, &through, &dir.join("daemon.log"));
+        assert!(
+            pointed.is_ok() && plist.exists(),
+            "{} is on the startup disk, and was refused: {pointed:?}",
+            through.display()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

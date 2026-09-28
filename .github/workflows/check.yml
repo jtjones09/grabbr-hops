@@ -63,7 +63,10 @@ jobs:
         include:
           - { os: macos-latest,   features: "tui slint" }
           - { os: windows-latest, features: "tui slint" }
-          - { os: ubuntu-latest,  features: "tui" }
+          # Linux's backends are features: "tui" alone has none, and no longer
+          # compiles (src/lib.rs). tests/launcher_features.rs holds these
+          # three to release.yml's.
+          - { os: ubuntu-latest,  features: "tui libei_capture libei_emulation layer_shell_capture wlroots_emulation x11_capture x11_emulation rdp_emulation" }
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -82,6 +85,19 @@ jobs:
         run: cargo check --locked --no-default-features --features "${{ matrix.features }}" --all-targets
       - name: test
         run: cargo test --locked --no-default-features --features "${{ matrix.features }}"
+      # The guard in src/lib.rs, observed: a Linux build with no capture or
+      # no emulation backend must fail to compile, and say why. x11 capture is a
+      # stub, so it does not count as a capture backend.
+      - name: a Linux build with no input backend does not compile
+        if: runner.os == 'Linux'
+        run: |
+          for features in "tui" "tui libei_capture" "tui libei_emulation" "tui x11_capture x11_emulation"; do
+            if out="$(cargo check --locked --no-default-features --features "$features" 2>&1)"; then
+              echo "::error::--features \"$features\" compiled, with no input backend of one kind"
+              exit 1
+            fi
+            grep -q "this build has no input" <<<"$out" || { echo "$out" | tail -20; exit 1; }
+          done
 
   # The trust tests are the ones that must never silently stop running: each was
   # written to fail without its fix, and several guard a shipped vulnerability.
@@ -169,7 +185,7 @@ jobs:
           sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev \
             libxtst-dev pkg-config libfontconfig1-dev
       - name: nothing shipped opens a raw input device or tells anyone to
-        run: cargo test --locked --no-default-features --test no_raw_input_devices
+        run: cargo test --locked --test no_raw_input_devices
 
   # A build script runs on the HOST. `cfg!(unix)` / `cfg!(target_os = ...)` inside
   # one therefore describes the build machine, not the target — which silently

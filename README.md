@@ -83,7 +83,10 @@ On **Windows**: `powershell -ExecutionPolicy Bypass -File .\install.ps1`
 That builds hops and starts it in your menu bar / system tray at login. Or just
 build and run the binary directly:
 ```sh
+# macOS / Windows
 cargo build --release --no-default-features --features "tui slint"
+# Linux: the input backends are features, so name them (or keep the defaults)
+cargo build --release --no-default-features --features "tui libei_capture libei_emulation layer_shell_capture wlroots_emulation x11_capture x11_emulation rdp_emulation"
 ./target/release/hops           # hops.exe on Windows
 ```
 </details>
@@ -106,8 +109,8 @@ cargo build --release --no-default-features --features "tui slint"
 ## Other ways to run it
 
 - **Terminal UI** (keyboard-driven, great over SSH): `hops tui`.
-- **Headless / servers** (no GUI, controlled over the network): build with
-  `--no-default-features` and use the service units + guide in
+- **Headless / servers** (no GUI, controlled over the network): build without
+  `slint` and use the service units + guide in
   [service/README.md](service/README.md).
 - **Linux backends / advanced:** input capture & emulation backends are cargo
   features (`layer_shell_capture`, `x11_capture`, `libei_*`, …) — see `Cargo.toml`.

@@ -13,14 +13,16 @@ remotely. This directory holds the autostart units for each OS.
 
 ## 1. Build without a GUI
 
-The default build pulls in a desktop toolkit. For a server, build daemon-only —
-optionally with the terminal UI so you can configure it over SSH:
+The default build has the terminal UI and no desktop toolkit, which is what a
+server wants: `hops tui` configures it over SSH. On Linux the input backends are
+cargo features, and a build without a capture and an emulation backend does not
+compile, since it could neither send nor receive input:
 
 ```sh
-# daemon only (smallest)
-cargo build --release --no-default-features
+# Linux: the defaults (terminal UI + every backend)
+cargo build --release
 
-# daemon + terminal UI (recommended for headless — lets you run `hops tui` over SSH)
+# macOS / Windows: the backends come with the platform
 cargo build --release --no-default-features --features tui
 ```
 

@@ -87,12 +87,29 @@ plutil -lint "$APP/Contents/Info.plist" >/dev/null
 # The identifier is NOT optional: TCC's designated requirement includes it, so a
 # differently-identified bundle is a different app and the Accessibility and
 # Input Monitoring grants do not apply. Matches the bare-binary signing exactly.
+#
+# The identity: DEVELOPER_ID when set; else, from the keychain, the project's
+# Developer ID, any Developer ID, then an Apple Development certificate, each
+# by its hash. A signature from any of these names the same app after every
+# rebuild. Naming an identity the keychain does not hold fails the build, so
+# nothing is named that was not found there.
+PROJECT_ID="Developer ID Application: Hotash Studios LLC (9V42Q953X9)"
 if [ "$SIGN" = "--sign" ]; then
-  if security find-identity -v -p codesigning 2>/dev/null | grep -q "Developer ID Application"; then
-    codesign --force --deep --identifier com.grabbr.hops \
-      --sign "Developer ID Application: Hotash Studios LLC (9V42Q953X9)" "$APP" >/dev/null
+  IDENTITY="${DEVELOPER_ID:-}"
+  if [ -z "$IDENTITY" ]; then
+    FOUND="$(security find-identity -v -p codesigning 2>/dev/null || true)"
+    for want in "\"$PROJECT_ID\"" '"Developer ID Application: ' '"Apple Development: '; do
+      IDENTITY="$(printf '%s\n' "$FOUND" | grep -F -- "$want" | awk 'NR == 1 { print $2 }' || true)"
+      if [ -n "$IDENTITY" ]; then break; fi
+    done
+  fi
+  if [ -n "$IDENTITY" ]; then
+    codesign --force --deep --identifier com.grabbr.hops --sign "$IDENTITY" "$APP" >/dev/null
   else
-    echo "warn: no Developer ID identity — bundle unsigned, macOS grants will not apply" >&2
+    # Still sealed, so the Info.plist is bound to the bundle.
+    echo "warn: no code-signing identity; signing ad hoc. macOS will ask for" \
+      "Accessibility and Input Monitoring again after every rebuild." >&2
+    codesign --force --deep --identifier com.grabbr.hops --sign - "$APP" >/dev/null
   fi
 fi
 

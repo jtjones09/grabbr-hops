@@ -1,3 +1,36 @@
+// On Linux and the BSDs the input backends are cargo features; on macOS and
+// Windows they come with the platform. A build with no backend of one kind
+// compiled cleanly, connected, authenticated its peers, and could neither
+// capture nor inject (#47, #74, #76). The x11 capture backend does not count:
+// it returns NotImplemented. CI checks that these fire (check.yml).
+#[cfg(all(
+    unix,
+    not(target_os = "macos"),
+    not(any(feature = "libei_capture", feature = "layer_shell_capture"))
+))]
+compile_error!(
+    "this build has no input capture backend. On Linux the backends are cargo \
+     features: build with the default features, or with the Linux release set \
+     --no-default-features --features \"tui libei_capture libei_emulation \
+     layer_shell_capture wlroots_emulation x11_capture x11_emulation rdp_emulation\""
+);
+#[cfg(all(
+    unix,
+    not(target_os = "macos"),
+    not(any(
+        feature = "libei_emulation",
+        feature = "wlroots_emulation",
+        feature = "x11_emulation",
+        feature = "rdp_emulation"
+    ))
+))]
+compile_error!(
+    "this build has no input emulation backend. On Linux the backends are cargo \
+     features: build with the default features, or with the Linux release set \
+     --no-default-features --features \"tui libei_capture libei_emulation \
+     layer_shell_capture wlroots_emulation x11_capture x11_emulation rdp_emulation\""
+);
+
 pub mod authority;
 pub mod build_check;
 mod capture;

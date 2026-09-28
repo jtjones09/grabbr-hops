@@ -108,6 +108,8 @@ otherwise by an `access_denied` refusal on its next dial, which marks its card. 
 ```sh
 # what CI actually builds
 cargo check --workspace --all-targets
+# macOS/Windows. On Linux "tui slint" has no input backend and does not compile
+# (src/lib.rs): use the Linux release set from release.yml, or the defaults.
 RUSTFLAGS="-D warnings" cargo check --workspace --all-targets --no-default-features --features "tui slint"
 cargo test --workspace --no-default-features --features "tui slint"
 cargo fmt --all --check

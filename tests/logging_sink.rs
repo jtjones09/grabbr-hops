@@ -12,6 +12,7 @@
 
 use std::io::Read;
 
+// LEDGER T7b | class B | 4 file on disk: logging::init opens its own file, mode read back
 #[test]
 fn a_line_reaches_the_file_with_no_help_from_whoever_launched_us() {
     let path = std::env::temp_dir().join(format!("hops-sink-{}.log", std::process::id()));
@@ -51,5 +52,16 @@ fn a_line_reaches_the_file_with_no_help_from_whoever_launched_us() {
         "a bare `debug` must not turn on every dependency. One of them logs \
          each mDNS packet, which is how a log file reached 5.2 GB. Got: {written:?}"
     );
+    // What a process logs names its peers, addresses and paths: the file is
+    // this user's alone, whatever the umask.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the log was created {mode:o}, readable by other accounts"
+        );
+    }
     let _ = std::fs::remove_file(&path);
 }
