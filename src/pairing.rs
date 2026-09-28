@@ -205,7 +205,10 @@ struct Held {
 struct Arriving {
     preferred: usize,
     other: usize,
-    /// One of them sent this machine's half: no other may.
+    /// One of them sent this machine's half: no other may, for as long as
+    /// any comparison with that machine is under way. It stays set once
+    /// that one holds, ends or is cancelled, so the rule does not rest on
+    /// the order the tasks happen to run in.
     sent: bool,
     /// One of them ended with the service told, which forgets the approval:
     /// no other may send its half.
@@ -371,7 +374,6 @@ impl Pairings {
             fingerprint: theirs.to_string(),
             preferred,
             attempt: board.attempts,
-            sent: std::cell::Cell::new(false),
         })
     }
 }
@@ -383,24 +385,14 @@ struct Arrival {
     fingerprint: String,
     preferred: bool,
     attempt: u64,
-    /// This one sent this machine's half.
-    sent: std::cell::Cell<bool>,
 }
 
 impl Drop for Arrival {
     fn drop(&mut self) {
         let mut board = self.pairings.board.borrow_mut();
-        let held = board.held.contains_key(&self.fingerprint);
         if let Some(arriving) = board.arriving.get_mut(&self.fingerprint) {
             let count = arriving.count(self.preferred);
             *count = count.saturating_sub(1);
-            if self.sent.get() {
-                // Held by now, which keeps every other from sending its
-                // half. Not held, it ended after the other machine may have
-                // learned its number: none other may send either.
-                arriving.sent = false;
-                arriving.told |= !held;
-            }
             arriving.wake.notify_waiters();
             if arriving.preferred == 0 && arriving.other == 0 {
                 board.arriving.remove(&self.fingerprint);
@@ -422,7 +414,7 @@ impl Arrival {
     ///   then goes on.
     ///
     /// `false` when it gives up, with nothing sent, or its connection closes
-    /// meanwhile. `true` marks it as the one that sent.
+    /// meanwhile. `true` marks the half as sent.
     async fn may_send(&self, conn: &Connection) -> bool {
         loop {
             let wake = {
@@ -436,7 +428,6 @@ impl Arrival {
                 }
                 if self.preferred || arriving.preferred == 0 {
                     arriving.sent = true;
-                    self.sent.set(true);
                     arriving.wake.notify_waiters();
                     return true;
                 }
@@ -2027,6 +2018,185 @@ mod on_the_wire {
             assert!(
                 matches!(held_back.await.expect("task"), Err((_, None))),
                 "the comparison held back ended the approval the kept one carries"
+            );
+        });
+    }
+
+    /// Wait until `pairings` counts a comparison with `fingerprint` under way
+    /// on a connection the machine sorting first did not dial.
+    async fn arriving_other(pairings: &Pairings, fingerprint: &str) {
+        let deadline = tokio::time::Instant::now() + WITHIN;
+        while !pairings
+            .board
+            .borrow()
+            .arriving
+            .get(fingerprint)
+            .is_some_and(|a| a.other > 0)
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no comparison here began on the connection not kept"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    // LEDGER G-36 | class B | 2 wire bytes + 1 return value: what the other machine reads on this machine's own dial, held back while the kept comparison is under way or reaching its point of sending only after the kept one reached its number and was let go, and reach_number at both of this machine's ends
+    /// The same as [`the_other_machine_learns_no_number_from_a_comparison_held_back`]
+    /// for the machine sorting last, whose half on its own dial, which
+    /// neither keeps, is its nonce. Whether that comparison reaches the
+    /// point of sending while the kept one is under way, or only once the
+    /// kept one reached its number and let it go at once, the kept one's
+    /// half went out, so this one sends nothing (#220).
+    #[test]
+    fn the_machine_sorting_last_sends_no_nonce_on_its_own_dial_held_back() {
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        enum Commitment {
+            /// Arrives on this machine's dial while the kept one is under way.
+            First,
+            /// Arrives only once the kept comparison is over here.
+            Last,
+        }
+        /// The other machine's commitment on this machine's dial, and what
+        /// it reads there after.
+        async fn commit_and_read(
+            conn: quinn::Connection,
+        ) -> (
+            quinn::SendStream,
+            Result<[u8; crate::match_code::NONCE_LEN], String>,
+        ) {
+            let (mut send, mut recv) = conn.open_bi().await.expect("the stream");
+            send.write_all(&[0u8; crate::match_code::COMMIT_LEN])
+                .await
+                .expect("commitment");
+            let mut nonce = [0u8; crate::match_code::NONCE_LEN];
+            let learned = recv
+                .read_exact(&mut nonce)
+                .await
+                .map(|()| nonce)
+                .map_err(|e| e.to_string());
+            (send, learned)
+        }
+        run_local(async {
+            for commitment in [Commitment::First, Commitment::Last] {
+                let c = crossed().await;
+                let (here, _events) = Pairings::new();
+                let at = SocketAddr::from(([127, 0, 0, 1], 4242));
+                let (p, h, l, z) = (here.clone(), c.hf.clone(), c.lf.clone(), c.z.1.clone());
+                let kept = tokio::task::spawn_local(async move {
+                    // The ticket is let go the moment the number is reached.
+                    reach_number(&p, &z, Role::Pick, &h, &l, at, None)
+                        .await
+                        .map(|(_, n)| n)
+                });
+                arriving_preferred(&here, &c.lf).await;
+                let (p, h, l, x) = (here.clone(), c.hf.clone(), c.lf.clone(), c.x.1.clone());
+                let held_back = tokio::task::spawn_local(async move {
+                    reach_number(&p, &x, Role::Show, &h, &l, at, None)
+                        .await
+                        .map(|(_, n)| n)
+                });
+                arriving_other(&here, &c.lf).await;
+
+                // The other machine's commitment on this machine's dial, and
+                // what it reads there after.
+                let early = if commitment == Commitment::First {
+                    let read = tokio::task::spawn_local(commit_and_read(c.x.0.clone()));
+                    held_back_here(&here, &c.lf).await;
+                    Some(read)
+                } else {
+                    None
+                };
+
+                let theirs = crate::pair_ceremony::as_initiator(&c.z.0, &c.lf, &c.hf)
+                    .await
+                    .expect("the number on the dial both keep");
+                let ours = kept
+                    .await
+                    .expect("task")
+                    .expect("this machine reaches the number on the dial both keep");
+                assert_eq!(
+                    ours, theirs,
+                    "{commitment:?}: the two machines hold different numbers"
+                );
+
+                let (_send, learned) = match early {
+                    Some(read) => read.await.expect("task"),
+                    None => commit_and_read(c.x.0.clone()).await,
+                };
+                assert!(
+                    learned.is_err(),
+                    "{commitment:?}: the other machine read this machine's nonce on its own \
+                     dial held back, and the kept comparison's half went out too: {learned:?}"
+                );
+                assert!(
+                    matches!(held_back.await.expect("task"), Err((_, None))),
+                    "{commitment:?}: the comparison held back ended the approval the kept \
+                     one carries"
+                );
+            }
+        });
+    }
+
+    // LEDGER G-37 | class B | 2 wire bytes: what the other machine reads on this machine's own dial after the comparison kept was cancelled here once its half went out
+    /// A comparison cancelled here once this machine's half went out on it,
+    /// as when its task is stopped, may have let the other machine know its
+    /// number. The comparison held back still sends nothing after it (#220).
+    #[test]
+    fn a_comparison_cancelled_after_its_half_keeps_the_one_held_back_silent() {
+        run_local(async {
+            let c = crossed().await;
+            let (here, _events) = Pairings::new();
+            let at = SocketAddr::from(([127, 0, 0, 1], 4242));
+            let (p, h, l, z) = (here.clone(), c.hf.clone(), c.lf.clone(), c.z.1.clone());
+            let kept = tokio::task::spawn_local(async move {
+                reach_number(&p, &z, Role::Pick, &h, &l, at, None)
+                    .await
+                    .map(|(_, n)| n)
+            });
+            arriving_preferred(&here, &c.lf).await;
+            let (p, h, l, x) = (here.clone(), c.hf.clone(), c.lf.clone(), c.x.1.clone());
+            let held_back = tokio::task::spawn_local(async move {
+                reach_number(&p, &x, Role::Show, &h, &l, at, None)
+                    .await
+                    .map(|(_, n)| n)
+            });
+            arriving_other(&here, &c.lf).await;
+
+            // The other machine reads this machine's reveal on the dial both
+            // keep, and sends nothing after its nonce: the comparison waits
+            // for its answer, and is cancelled there.
+            let (mut send, mut recv) = c.z.0.accept_bi().await.expect("the comparison stream");
+            let mut commitment = [0u8; crate::match_code::COMMIT_LEN];
+            recv.read_exact(&mut commitment).await.expect("commitment");
+            send.write_all(&[7u8; crate::match_code::NONCE_LEN])
+                .await
+                .expect("nonce");
+            read_reveal(recv).await.expect("this machine's reveal");
+            kept.abort();
+            assert!(
+                kept.await.is_err_and(|e| e.is_cancelled()),
+                "the kept comparison was not cancelled"
+            );
+
+            let (mut send, mut recv) = c.x.0.open_bi().await.expect("the comparison stream");
+            send.write_all(&[0u8; crate::match_code::COMMIT_LEN])
+                .await
+                .expect("commitment");
+            let mut nonce = [0u8; crate::match_code::NONCE_LEN];
+            let learned = recv
+                .read_exact(&mut nonce)
+                .await
+                .map(|()| nonce)
+                .map_err(|e| e.to_string());
+            assert!(
+                learned.is_err(),
+                "the other machine read this machine's nonce on its own dial after \
+                 the kept comparison, whose half went out, was cancelled: {learned:?}"
+            );
+            assert!(
+                matches!(held_back.await.expect("task"), Err((_, None))),
+                "the comparison held back ended the approval itself"
             );
         });
     }
