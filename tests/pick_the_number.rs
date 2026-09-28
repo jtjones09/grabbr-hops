@@ -327,21 +327,37 @@ async fn both_approve(m: &mut Machines) -> Result<u64, String> {
     Ok(handle)
 }
 
+/// What a failure to see the adding machine's prompt says: both logs, which
+/// hold every dial and what answered it.
+fn no_prompt(m: &Machines) -> String {
+    format!(
+        "the adding machine's dial raised no prompt; adding log:\n{}\nadded log:\n{}",
+        m.adding.log(),
+        m.added.log()
+    )
+}
+
 /// Each machine approves the other once its prompt appears: the adding
 /// machine the dial it made, then the one being added the knock it got.
 async fn approve_both(m: &mut Machines) -> Result<(), String> {
+    approve_both_as(m, Controller::ThisMachine, Controller::ThatMachine).await
+}
+
+/// [`approve_both`], each card answered as given: `on_a` on the adding
+/// machine, `on_b` on the one being added.
+async fn approve_both_as(
+    m: &mut Machines,
+    on_a: Controller,
+    on_b: Controller,
+) -> Result<(), String> {
     until(
         &mut m.fa,
         WITHIN,
         attempt_from(&m.fp_b, AttemptOrigin::OutboundDial),
     )
     .await
-    .ok_or("the adding machine's dial raised no prompt")?;
-    ask(
-        &mut m.ra,
-        approval("desk b", &m.fp_b, Controller::ThisMachine),
-    )
-    .await;
+    .ok_or_else(|| no_prompt(m))?;
+    ask(&mut m.ra, approval("desk b", &m.fp_b, on_a)).await;
     until(
         &mut m.fb,
         WITHIN,
@@ -354,11 +370,7 @@ async fn approve_both(m: &mut Machines) -> Result<(), String> {
             m.added.log()
         )
     })?;
-    ask(
-        &mut m.rb,
-        approval("desk a", &m.fp_a, Controller::ThatMachine),
-    )
-    .await;
+    ask(&mut m.rb, approval("desk a", &m.fp_a, on_b)).await;
     Ok(())
 }
 
@@ -417,7 +429,7 @@ fn a_receiver_that_approves_second_still_reaches_the_number() {
         .await
         .is_none()
         {
-            return vec!["the adding machine's dial raised no prompt".into()];
+            return vec![no_prompt(&m)];
         }
         ask(
             &mut m.ra,
@@ -578,6 +590,84 @@ fn a_wrong_pick_ends_the_attempt_and_keeps_no_lease() {
             failures.push(format!("adding again after a wrong pick: {e}"));
         } else if let Err(e) = the_number(&mut m).await {
             failures.push(format!("adding again after a wrong pick: {e}"));
+        }
+        failures
+    });
+}
+
+/// How the attempt with `fp` ended, whether a notice containing `said`
+/// came, and whether the pairing was still listed after: read until all
+/// three are known or [`WITHIN`] passes.
+async fn ended_told_and_kept(
+    events: &mut AsyncFrontendEventReader,
+    fp: &str,
+    said: &str,
+) -> (Option<bool>, bool, bool) {
+    let (mut ended, mut told, mut kept) = (None, false, true);
+    until(events, WITHIN, |e| {
+        match e {
+            FrontendEvent::PairingEnded {
+                fingerprint,
+                paired,
+            } if fingerprint == fp => ended = Some(*paired),
+            FrontendEvent::Error(notice) if notice.contains(said) => told = true,
+            FrontendEvent::TrustUpdated(map) => kept = map.contains_key(fp),
+            _ => {}
+        }
+        (ended.is_some() && told && !kept).then_some(())
+    })
+    .await;
+    (ended, told, kept)
+}
+
+// LEDGER G-34 | class B | 5 process: PairingEnded, notices and TrustUpdated from two built daemons
+/// Two people who answer the pairing cards so that neither machine may
+/// control the other, each saying its own machine is in control, still
+/// compare the number and confirm it. The pairing then ends on both
+/// machines with a notice naming the two answers, and neither keeps
+/// anything, rather than both saying "Paired" and the first dial being
+/// refused (#220).
+#[test]
+fn answers_that_let_neither_machine_control_end_the_pairing_and_say_so() {
+    machines("disagree", |mut m| async move {
+        let mut failures: Vec<String> = Vec::new();
+        ask(&mut m.ra, FrontendRequest::OpenPairing).await;
+        ask(&mut m.rb, FrontendRequest::OpenPairing).await;
+        let handle = add_device(&mut m.fa, &mut m.ra, m.added.port).await;
+        ask(&mut m.ra, FrontendRequest::Activate(handle, true)).await;
+        if let Err(e) =
+            approve_both_as(&mut m, Controller::ThisMachine, Controller::ThisMachine).await
+        {
+            return vec![e];
+        }
+        let (shown, _) = match the_number(&mut m).await {
+            Ok(n) => n,
+            Err(e) => return vec![e],
+        };
+        for (requests, fp) in [(&mut m.rb, m.fp_a.clone()), (&mut m.ra, m.fp_b.clone())] {
+            ask(
+                requests,
+                FrontendRequest::ConfirmPairing {
+                    fingerprint: fp,
+                    number: shown.clone(),
+                },
+            )
+            .await;
+        }
+        const SAID: &str = "neither machine could control the other";
+        for (events, fp, which, daemon) in [
+            (&mut m.fa, m.fp_b.clone(), "adding", &m.adding),
+            (&mut m.fb, m.fp_a.clone(), "added", &m.added),
+        ] {
+            let (ended, told, kept) = ended_told_and_kept(events, &fp, SAID).await;
+            if ended != Some(false) || !told || kept {
+                failures.push(format!(
+                    "the {which} machine, after answers that let neither machine control \
+                     the other: pairing ended {ended:?} (Some(false) wanted), told of the \
+                     answers: {told}, still listed: {kept}; its log:\n{}",
+                    daemon.log()
+                ));
+            }
         }
         failures
     });
@@ -917,7 +1007,7 @@ fn adding_back_while_the_number_is_on_screen_still_pairs() {
         .await
         .is_none()
         {
-            return vec!["the adding machine's dial raised no prompt".into()];
+            return vec![no_prompt(&m)];
         }
         ask(&mut m.ra, approval("desk b", &m.fp_b, Controller::Both)).await;
         if until(
@@ -1036,7 +1126,7 @@ fn opposite_answers_link_only_the_way_control_goes() {
         .await
         .is_none()
         {
-            return vec!["the adding machine's dial raised no prompt".into()];
+            return vec![no_prompt(&m)];
         }
         ask(
             &mut m.ra,

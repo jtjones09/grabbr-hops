@@ -23,6 +23,21 @@
 //! be claimed is a role an attacker claims — being the initiator is the
 //! privileged seat here, since it speaks second.
 //!
+//! # A half held back is a half never sent
+//!
+//! The caller decides, just before this machine's own half goes out (the
+//! dialler's nonce, or the reveal), whether it goes out at all: two machines
+//! adding each other compare on two connections, and only one of them may
+//! ever tell the other machine a number (see [`crate::pairing`]). A half
+//! held back is never sent, so the other machine learns nothing from it.
+//!
+//! # Each machine's answer rides along
+//!
+//! After its half, each machine may send one more byte: which way the person
+//! there said control goes (#220), for the other to compare once its own
+//! person has answered. It carries no part of the number, and a peer that
+//! sends none is compared with nothing.
+//!
 //! # Failure shows no number
 //!
 //! Every error path returns without a code. A number from a ceremony that did
@@ -61,6 +76,9 @@ pub(crate) enum CeremonyError {
     /// indistinguishable from here and both mean the same thing: show nothing.
     CommitmentBroken,
     Io(String),
+    /// This machine's half was held back for another comparison with the
+    /// same machine and was never sent: the other machine learned nothing.
+    HeldBack,
     /// Failed after this machine's own half went out: the dialler's nonce,
     /// or the reveal. From then on the other machine may hold the number,
     /// so the attempt cannot end as if nothing was compared.
@@ -90,6 +108,10 @@ impl std::fmt::Display for CeremonyError {
                 "the revealed nonce did not open the commitment — no number can be shown"
             ),
             Self::Io(e) => write!(f, "{e}"),
+            Self::HeldBack => write!(
+                f,
+                "this machine's half was held back for another comparison with the same machine"
+            ),
             Self::Late(e) => write!(f, "{e}, after this machine's half was sent"),
         }
     }
@@ -131,11 +153,28 @@ async fn with_timeout<T>(
 }
 
 /// The side that ACCEPTED the connection. Commits, then reveals.
+#[cfg(test)]
 pub(crate) async fn as_responder(
     conn: &Connection,
     my_fp: &str,
     peer_fp: &str,
 ) -> Result<String, CeremonyError> {
+    as_responder_when(conn, my_fp, peer_fp, None, async { true })
+        .await
+        .map(|(number, _)| number)
+}
+
+/// [`as_responder`], revealing only if `go` says so once the dialler's nonce
+/// is in: [`CeremonyError::HeldBack`], with nothing revealed, if not. Sends
+/// `answer` after the reveal, and returns with the number the byte the
+/// dialler sent after its nonce, if it sent one.
+pub(crate) async fn as_responder_when(
+    conn: &Connection,
+    my_fp: &str,
+    peer_fp: &str,
+    answer: Option<u8>,
+    go: impl std::future::Future<Output = bool>,
+) -> Result<(String, Option<u8>), CeremonyError> {
     let x = exporter(conn)?;
     let n_r = nonce()?;
     let commitment = match_code::commitment(&x, my_fp, peer_fp, &n_r);
@@ -160,6 +199,9 @@ pub(crate) async fn as_responder(
         Ok(Ok(())) => {}
         Ok(Err(_)) | Err(_) => return Err(CeremonyError::NotSupported),
     }
+    if !go.await {
+        return Err(CeremonyError::HeldBack);
+    }
 
     // Only now is the nonce revealed, and by now it is already committed to.
     // Any of it that arrives narrows the number down for the initiator.
@@ -171,18 +213,59 @@ pub(crate) async fn as_responder(
         })
         .await,
     )?;
+    send_answer(&mut send, answer).await;
     let _ = send.finish();
+    let theirs = read_answer(&mut recv).await;
 
-    Ok(match_code::code(&x, my_fp, peer_fp, &n_i, &n_r))
+    Ok((match_code::code(&x, my_fp, peer_fp, &n_i, &n_r), theirs))
+}
+
+/// This machine's answer, after its half. Nothing of the number is in it,
+/// so a failure here only leaves the other machine with nothing to compare.
+async fn send_answer(send: &mut quinn::SendStream, answer: Option<u8>) {
+    if let Some(answer) = answer {
+        let _ = with_timeout("the answer to flush", async {
+            send.write_all(&[answer])
+                .await
+                .map_err(|e| CeremonyError::Io(e.to_string()))
+        })
+        .await;
+    }
+}
+
+/// The other machine's answer, if it sent one after its half.
+async fn read_answer(recv: &mut quinn::RecvStream) -> Option<u8> {
+    let mut answer = [0u8; 1];
+    match tokio::time::timeout(STEP_TIMEOUT, recv.read_exact(&mut answer)).await {
+        Ok(Ok(())) => Some(answer[0]),
+        _ => None,
+    }
 }
 
 /// The side that DIALLED. Receives the commitment, answers, then checks the
 /// reveal opens it.
+#[cfg(test)]
 pub(crate) async fn as_initiator(
     conn: &Connection,
     my_fp: &str,
     peer_fp: &str,
 ) -> Result<String, CeremonyError> {
+    as_initiator_when(conn, my_fp, peer_fp, None, async { true })
+        .await
+        .map(|(number, _)| number)
+}
+
+/// [`as_initiator`], sending this machine's nonce only if `go` says so once
+/// the commitment is in: [`CeremonyError::HeldBack`], with nothing sent, if
+/// not. Sends `answer` after the nonce, and returns with the number the
+/// byte the other machine sent after its reveal, if it sent one.
+pub(crate) async fn as_initiator_when(
+    conn: &Connection,
+    my_fp: &str,
+    peer_fp: &str,
+    answer: Option<u8>,
+    go: impl std::future::Future<Output = bool>,
+) -> Result<(String, Option<u8>), CeremonyError> {
     let x = exporter(conn)?;
 
     // A receiver that never opens the stream within the step is one that does
@@ -200,6 +283,9 @@ pub(crate) async fn as_initiator(
             .map_err(|_| CeremonyError::NotSupported)
     })
     .await?;
+    if !go.await {
+        return Err(CeremonyError::HeldBack);
+    }
 
     let n_i = nonce()?;
     // From the first byte of our nonce on, the responder, which already has
@@ -212,6 +298,7 @@ pub(crate) async fn as_initiator(
         })
         .await,
     )?;
+    send_answer(&mut send, answer).await;
     let _ = send.finish();
 
     let mut n_r = [0u8; NONCE_LEN];
@@ -229,8 +316,9 @@ pub(crate) async fn as_initiator(
     if !match_code::opens(&commitment, &x, my_fp, peer_fp, &n_r) {
         return late(Err(CeremonyError::CommitmentBroken));
     }
+    let theirs = read_answer(&mut recv).await;
 
-    Ok(match_code::code(&x, my_fp, peer_fp, &n_i, &n_r))
+    Ok((match_code::code(&x, my_fp, peer_fp, &n_i, &n_r), theirs))
 }
 
 #[cfg(test)]
@@ -287,6 +375,7 @@ mod tests {
             CeremonyError::NoRandomness,
             CeremonyError::CommitmentBroken,
             CeremonyError::Io("x".into()),
+            CeremonyError::HeldBack,
             CeremonyError::Late(Box::new(CeremonyError::Io("x".into()))),
         ] {
             let s = e.to_string();
