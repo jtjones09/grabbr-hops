@@ -105,6 +105,12 @@ pub(crate) enum DialRefusal {
         handle: ClientHandle,
         addr: SocketAddr,
     },
+    /// This machine dials the device to be driven by it (#15), and its
+    /// hostname resolves to no address, with no other address to dial.
+    NotResolved {
+        handle: ClientHandle,
+        hostname: String,
+    },
     /// Nothing answered at the device's port, and a hops of this version
     /// answered at `addr`, the port hops listened on before v0.13: its
     /// config still names that port (#16).
@@ -191,6 +197,15 @@ struct PeerLink {
     /// The machine at the other end dialled it, to be driven by this one
     /// (#15), rather than this machine dialling it.
     dialled_in: bool,
+    /// This link and no other, even one to the same address before or
+    /// after it: the machine at the other end takes a crossing per link.
+    serial: u64,
+}
+
+/// A serial no link made before it has.
+fn next_link_serial() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn client_config(
@@ -324,6 +339,7 @@ async fn connect(
             fingerprint,
             handle,
             dialled_in: false,
+            serial: next_link_serial(),
         }),
         addr,
     ))
@@ -610,6 +626,14 @@ impl LanMouseConnection {
         self.client_manager.active_addr(handle)
     }
 
+    /// Which link `handle` is on now, if it has one. A crossing its peer
+    /// took on one link is not taken on the next: the peer drops what
+    /// arrives on a link no Enter crossed (#212).
+    pub(crate) async fn link_serial(&self, handle: ClientHandle) -> Option<u64> {
+        let addr = self.client_manager.active_addr(handle)?;
+        self.conns.lock().await.get(&addr).map(|link| link.serial)
+    }
+
     /// Whether `handle`'s peer last said it is injecting input.
     pub(crate) fn peer_alive(&self, handle: ClientHandle) -> bool {
         self.client_manager.alive(handle)
@@ -860,6 +884,7 @@ impl Adopter {
             fingerprint: fingerprint.clone(),
             handle,
             dialled_in: true,
+            serial: next_link_serial(),
         };
         let mut open = s.conns.lock().await;
         if let Some(current) = s.client_manager.active_addr(handle) {
@@ -1209,6 +1234,7 @@ async fn connect_to_handle(
                     fingerprint,
                     handle,
                     dialled_in: false,
+                    serial: next_link_serial(),
                 };
                 (link, Some((confirmed.recv, confirmed.commit)))
             }

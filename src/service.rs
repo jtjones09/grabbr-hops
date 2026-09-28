@@ -1902,6 +1902,17 @@ impl Service {
                     hops_ipc::DEFAULT_PORT
                 )));
             }
+            DialRefusal::NotResolved { handle, hostname } => {
+                if !self.refusal_notices.due(handle, "not-resolved", now) {
+                    return;
+                }
+                let name = self.device_name(handle);
+                log::warn!("{name}: {hostname} resolves to no address to dial");
+                self.notify_frontend(FrontendEvent::Error(format!(
+                    "Could not find \"{hostname}\" on the network, so this machine cannot dial \
+                     {name}. hops keeps looking. Check the spelling, or use its IP address."
+                )));
+            }
             DialRefusal::OldPort { handle, addr } => {
                 if !self.refusal_notices.due(handle, "old-port", now) {
                     return;

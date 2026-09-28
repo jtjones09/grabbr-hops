@@ -12,32 +12,54 @@ use crate::trust::Caps;
 use hops_ipc::{ClientHandle, FrontendEvent, FrontendRequest};
 use input_capture::{CaptureEvent, Position, scripted::Script};
 use input_emulation::recording::{Recorded, Recording};
-use input_event::{Event, KeyboardEvent};
+use input_event::{Event, KeyboardEvent, PointerEvent};
 use std::time::Duration;
 
-/// Ask `app` for nothing until an event `pick` makes something of arrives,
-/// running `nudge` between asks; panic naming `what` if none does in time.
-async fn until<T>(
-    app: &mut Frontend,
-    what: &str,
-    mut nudge: impl FnMut(),
-    mut pick: impl FnMut(&FrontendEvent) -> Option<T>,
-) -> T {
-    let deadline = tokio::time::Instant::now() + DEADLINE;
-    let mut seen = Vec::new();
-    loop {
-        nudge();
-        for event in app.exchange(&[]).await {
-            if let Some(found) = pick(&event) {
-                return found;
-            }
-            seen.push(event);
+/// An app's events not yet looked at, oldest first. Every event an
+/// exchange returns is kept, and a wait takes only up to the one it wanted,
+/// so no wait misses an event an earlier exchange or wait already read.
+struct Heard {
+    app: Frontend,
+    backlog: std::collections::VecDeque<FrontendEvent>,
+}
+
+impl Heard {
+    fn new(app: Frontend) -> Self {
+        Self {
+            app,
+            backlog: Default::default(),
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "{what} did not happen within {DEADLINE:?}; the app was told {seen:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    /// Send `requests`, keeping every event they caused.
+    async fn exchange(&mut self, requests: &[FrontendRequest]) {
+        let events = self.app.exchange(requests).await;
+        self.backlog.extend(events);
+    }
+
+    /// The first event `pick` makes something of, from those kept and then
+    /// those still to come; panic naming `what` if none does in time.
+    async fn until<T>(
+        &mut self,
+        what: &str,
+        mut pick: impl FnMut(&FrontendEvent) -> Option<T>,
+    ) -> T {
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        let mut seen = Vec::new();
+        loop {
+            while let Some(event) = self.backlog.pop_front() {
+                if let Some(found) = pick(&event) {
+                    return found;
+                }
+                seen.push(event);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what} did not happen within {DEADLINE:?}; the app was told {seen:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            self.exchange(&[]).await;
+        }
     }
 }
 
@@ -54,6 +76,26 @@ fn consumed(recording: &Recording, key: u32) -> bool {
         matches!(c, Recorded::Consume(Event::Keyboard(KeyboardEvent::Key { key: k, .. }), _)
             if *k == key)
     })
+}
+
+fn motion(dx: f64) -> CaptureEvent {
+    CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
+        time: 0,
+        dx,
+        dy: 0.0,
+    }))
+}
+
+/// How far each motion the recording injected moved, across.
+fn motions(recording: &Recording) -> Vec<f64> {
+    recording
+        .calls()
+        .iter()
+        .filter_map(|c| match c {
+            Recorded::Consume(Event::Pointer(PointerEvent::Motion { dx, .. }), _) => Some(*dx),
+            _ => None,
+        })
+        .collect()
 }
 
 fn capture_pos(pos: hops_ipc::Position) -> Position {
@@ -114,23 +156,22 @@ fn the_controlled_machine_dials_out_and_is_driven_over_its_own_link() {
             .expect("issue");
 
         let body = async {
-            let mut on_pc_app = pc_ipc.connect().await;
-            let (handle, pos) = until(
-                &mut on_pc_app,
-                "a live device on the pc for the mac that dialled it",
-                || {},
-                |e| match e {
-                    FrontendEvent::State(h, c, s) | FrontendEvent::Created(h, c, s)
-                        if s.peer_fingerprint.as_deref() == Some(mac_fp.as_str())
-                            && s.active_addr.is_some()
-                            && s.alive =>
-                    {
-                        Some((*h, c.pos))
-                    }
-                    _ => None,
-                },
-            )
-            .await;
+            let mut on_pc_app = Heard::new(pc_ipc.connect().await);
+            let (handle, pos) = on_pc_app
+                .until(
+                    "a live device on the pc for the mac that dialled it",
+                    |e| match e {
+                        FrontendEvent::State(h, c, s) | FrontendEvent::Created(h, c, s)
+                            if s.peer_fingerprint.as_deref() == Some(mac_fp.as_str())
+                                && s.active_addr.is_some()
+                                && s.alive =>
+                        {
+                            Some((*h, c.pos))
+                        }
+                        _ => None,
+                    },
+                )
+                .await;
             let _: ClientHandle = handle;
 
             let pos = capture_pos(pos);
@@ -174,18 +215,170 @@ fn the_controlled_machine_dials_out_and_is_driven_over_its_own_link() {
             on_mac_app
                 .exchange(&[FrontendRequest::Activate(pc_on_mac, false)])
                 .await;
-            until(
-                &mut on_pc_app,
-                "the link closing once the mac switched the pc off",
-                || {},
-                |e| match e {
+            on_pc_app
+                .until(
+                    "the link closing once the mac switched the pc off",
+                    |e| match e {
+                        FrontendEvent::State(h, _, s)
+                            if *h == handle && s.active_addr.is_none() =>
+                        {
+                            Some(())
+                        }
+                        _ => None,
+                    },
+                )
+                .await;
+        };
+        pc.run_while(mac.run_while(body)).await;
+    });
+}
+
+/// The mac's device for the pc, as the mac's app lists it.
+async fn device_for(app: &mut Frontend, fp: &str) -> ClientHandle {
+    app.exchange(&[FrontendRequest::Enumerate()])
+        .await
+        .into_iter()
+        .find_map(|e| match e {
+            FrontendEvent::Enumerate(all) => all
+                .into_iter()
+                .find(|(_, _, s)| s.peer_fingerprint.as_deref() == Some(fp))
+                .map(|(h, _, _)| h),
+            _ => None,
+        })
+        .expect("the mac's device for the pc")
+}
+
+// LEDGER T30 | class B | 6 struct state: Recording::calls() on the dialling daemon and Script::held() on the controlling one, two whole daemons in-process
+/// The link the mac dialled drops while the pc's pointer is on the mac,
+/// as it does when the mac sleeps or its network reconnects, and the mac
+/// dials again. The crossing was acknowledged on the old link; the new one
+/// has crossed nothing, so the mac drops what arrives on it until an Enter
+/// does. The pc's next input either lands on the mac, the crossing made
+/// again over the new link, or the pc gets its pointer back. It is never
+/// held with everything typed on it thrown away. A crossing made again
+/// moves the mac's pointer by what the pc moves after it, not by what it
+/// moved before the link dropped.
+#[test]
+fn a_redial_while_the_pointer_is_across_lands_its_input_or_gives_it_back() {
+    run_local(async {
+        let (pc_script, mac_script) = (Script::new(), Script::new());
+        let (on_pc, on_mac) = (Recording::new(), Recording::new());
+        let pc = Daemon::start_capturing("rd-pc", "", pc_script.backend(), on_pc.backend()).await;
+        let (pc_fp, pc_port, pc_trust, pc_ipc) =
+            (pc.fingerprint(), pc.port(), pc.trust(), pc.ipc());
+        let mac = Daemon::start_capturing(
+            "rd-mac",
+            &dials_out_to(&pc_fp, pc_port),
+            mac_script.backend(),
+            on_mac.backend(),
+        )
+        .await;
+        let (mac_fp, mac_trust, mac_ipc) = (mac.fingerprint(), mac.trust(), mac.ipc());
+        mac_trust
+            .write()
+            .expect("lock")
+            .drop_capabilities(&pc_fp, Caps::I_MAY_DRIVE);
+        pc_trust
+            .write()
+            .expect("lock")
+            .issue_confirmed(&mac_fp, "desk mac", Caps::OUTBOUND)
+            .expect("issue");
+
+        let body = async {
+            let mut on_pc_app = Heard::new(pc_ipc.connect().await);
+            let live = |e: &FrontendEvent| match e {
+                FrontendEvent::State(h, c, s) | FrontendEvent::Created(h, c, s)
+                    if s.peer_fingerprint.as_deref() == Some(mac_fp.as_str())
+                        && s.active_addr.is_some()
+                        && s.alive =>
+                {
+                    Some((*h, c.pos))
+                }
+                _ => None,
+            };
+            let (handle, pos) = on_pc_app.until("the mac's link", live).await;
+            let pos = capture_pos(pos);
+            let deadline = tokio::time::Instant::now() + DEADLINE;
+            while !consumed(&on_mac, 30) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "precondition: the pc's key never reached the mac: {:?}",
+                    on_mac.calls()
+                );
+                pc_script.push(pos, CaptureEvent::Begin);
+                pc_script.push(pos, key(30));
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            // Far across the mac, so a crossing made again from where this
+            // one left off would show as a jump.
+            while motions(&on_mac).is_empty() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "precondition: the pc's motion never reached the mac: {:?}",
+                    on_mac.calls()
+                );
+                pc_script.push(pos, motion(400.0));
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            // The mac's link drops and the mac dials again. The pc hears
+            // only that the link closed and that another was dialled in.
+            let mut on_mac_app = mac_ipc.connect().await;
+            let pc_on_mac = device_for(&mut on_mac_app, &pc_fp).await;
+            on_mac_app
+                .exchange(&[FrontendRequest::Activate(pc_on_mac, false)])
+                .await;
+            on_pc_app
+                .until("the link closing", |e| match e {
                     FrontendEvent::State(h, _, s) if *h == handle && s.active_addr.is_none() => {
                         Some(())
                     }
                     _ => None,
-                },
-            )
-            .await;
+                })
+                .await;
+            on_mac_app
+                .exchange(&[FrontendRequest::Activate(pc_on_mac, true)])
+                .await;
+            on_pc_app.until("the mac's link again", live).await;
+            assert!(
+                pc_script.held(),
+                "precondition: the pc let go of the pointer when the link dropped"
+            );
+
+            // Only input now, as a person typing on the pc: the pointer is
+            // held, so the backend yields no new Begin.
+            let deadline = tokio::time::Instant::now() + DEADLINE;
+            while !consumed(&on_mac, 31) && pc_script.held() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "after the mac dialled again the pc still holds the pointer, and none of \
+                     its input reached the mac: {:?}",
+                    on_mac.calls()
+                );
+                pc_script.push(pos, key(31));
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if !consumed(&on_mac, 31) {
+                return;
+            }
+
+            // Made again, the crossing moves the mac's pointer from where the
+            // mac anchors it on the new Enter, by what the pc moves now.
+            let before = motions(&on_mac).len();
+            let deadline = tokio::time::Instant::now() + DEADLINE;
+            while motions(&on_mac).len() == before {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "motion after the crossing was made again never reached the mac"
+                );
+                pc_script.push(pos, motion(3.0));
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let after = motions(&on_mac).split_off(before);
+            assert!(
+                after.iter().all(|dx| dx.abs() <= 10.0),
+                "the mac's pointer jumped by what the pc moved before the link dropped: {after:?}"
+            );
         };
         pc.run_while(mac.run_while(body)).await;
     });
@@ -250,7 +443,7 @@ fn the_controlled_machine_dials_again_until_its_link_is_taken() {
 
         let body = async {
             use FrontendRequest as R;
-            let mut app = pc_ipc.connect().await;
+            let mut app = Heard::new(pc_ipc.connect().await);
             let up = |e: &FrontendEvent| match e {
                 FrontendEvent::State(h, _, s) | FrontendEvent::Created(h, _, s)
                     if s.peer_fingerprint.as_deref() == Some(mac_fp.as_str())
@@ -260,30 +453,89 @@ fn the_controlled_machine_dials_again_until_its_link_is_taken() {
                 }
                 _ => None,
             };
-            let handle = until(&mut app, "the mac's link", || {}, up).await;
+            let handle = app.until("the mac's link", up).await;
 
             app.exchange(&[R::Activate(handle, false)]).await;
-            let waiting = until(
-                &mut app,
-                "the link closing",
-                || {},
-                |e| match e {
+            let waiting = app
+                .until("the link closing", |e| match e {
                     FrontendEvent::State(h, _, s) if *h == handle && s.active_addr.is_none() => {
                         Some(s.dials_us)
                     }
                     _ => None,
-                },
-            )
-            .await;
+                })
+                .await;
             assert!(
                 waiting,
                 "the pc's card for the mac does not say the mac dials it"
             );
 
             app.exchange(&[R::Activate(handle, true)]).await;
-            let again = until(&mut app, "the mac's link again", || {}, up).await;
+            let again = app.until("the mac's link again", up).await;
             assert_eq!(again, handle, "the mac's link went to another device");
         };
         pc.run_while(mac.run_while(body)).await;
+    });
+}
+
+// LEDGER T32 | class B | 2 bytes: FrontendEvent::Enumerate and Error over the dialling daemon's IPC socket
+/// The mac dials the pc's address and something that holds no key of the
+/// pc's answers there, refusing with the alert the pc refuses a removed
+/// machine with. The mac's card does not say the pc removed it, and the
+/// person is not told to remove the pc: nothing proved the pc refused.
+#[test]
+fn a_keyless_endpoint_at_the_controllers_address_does_not_say_it_removed_this_machine() {
+    run_local(async {
+        let pc = crate::test_harness::machine();
+        let (_keyless, port, answered) = crate::test_harness::keyless_listener();
+        let mac = Daemon::start(
+            "keyless-mac",
+            &dials_out_to(&pc.fingerprint, port),
+            input_emulation::Backend::Dummy,
+        )
+        .await;
+        let mac_ipc = mac.ipc();
+        let body = async {
+            let mut app = Heard::new(mac_ipc.connect().await);
+            let deadline = tokio::time::Instant::now() + DEADLINE;
+            // Two dials, each from a socket of its own: the first one's
+            // refusal reached the service a retry's wait before the second
+            // began.
+            while answered.borrow().len() < 2 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "precondition: the mac never dialled the pc's address twice"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            // The answer to this Enumerate, not the one sent on connecting.
+            app.exchange(&[FrontendRequest::Enumerate()]).await;
+            let cards = app
+                .backlog
+                .iter()
+                .rev()
+                .find_map(|e| match e {
+                    FrontendEvent::Enumerate(all) => Some(all.clone()),
+                    _ => None,
+                })
+                .expect("the mac's devices");
+            let removed: Vec<_> = cards
+                .iter()
+                .filter(|(_, _, s)| s.peer_fingerprint.as_deref() == Some(pc.fingerprint.as_str()))
+                .map(|(_, _, s)| s.removed_by_peer)
+                .collect();
+            assert_eq!(
+                removed,
+                vec![false],
+                "the mac's card for the pc says the pc removed it, on a refusal from a machine \
+                 with no key"
+            );
+            let told: Vec<_> = app
+                .backlog
+                .iter()
+                .filter(|e| matches!(e, FrontendEvent::Error(m) if m.contains("no longer trusts")))
+                .collect();
+            assert!(told.is_empty(), "the person was told: {told:?}");
+        };
+        mac.run_while(body).await;
     });
 }

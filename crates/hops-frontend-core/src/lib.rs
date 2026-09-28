@@ -1008,11 +1008,12 @@ pub struct Device {
 /// (Bonjour on macOS, Avahi via nsswitch on Linux), which `src/dns.rs` uses
 /// deliberately for exactly this.
 ///
-/// This is what makes a discovered device **self-healing**. The addresses
-/// pinned at add-time are a snapshot: if the peer's DHCP lease changes, they go
-/// stale. hops dials the union of pinned and freshly-resolved addresses on
-/// every reconnect, so a resolvable `.local` name keeps the device working
-/// after every address it was added with has changed.
+/// The addresses pinned at add-time are a snapshot: if the peer's DHCP lease
+/// changes, they go stale. hops dials them together with the addresses the
+/// name resolves to, looked up when the device is switched on or renamed and,
+/// on a machine that dials out to be driven, again after every dial that
+/// reaches nothing. A machine that dials to drive the peer does not look the
+/// name up again by itself; switching the device off and on does.
 ///
 /// A label that already contains a dot is left alone — it is either already
 /// qualified or something the user typed.
@@ -1958,9 +1959,10 @@ mod discovered_hostnames {
     //! back on wi-fi should still be the same device, not a new one to pair
     //! again — a failure people hit on comparable tools. hops races every known
     //! address and keys trust on the fingerprint rather than the address, so a
-    //! path change is not a new device. The remaining gap was that addresses
-    //! pinned at add-time are a snapshot — a `.local` name closes it, because
-    //! the resolved set is refreshed on every reconnect.
+    //! path change is not a new device. Addresses pinned at add-time are a
+    //! snapshot; a `.local` name is looked up again when the device is
+    //! switched on, and by a machine that dials out after a dial that
+    //! reaches nothing.
     use super::discovered_hostname;
 
     #[test]

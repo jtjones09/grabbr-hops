@@ -30,7 +30,10 @@
 //!
 //! The link is held: dialled again when it drops or cannot be made, after
 //! [`FIRST_RETRY`], doubling to [`LAST_RETRY`]. A link that stayed up that
-//! long starts the wait over.
+//! long starts the wait over. A dial that reached nothing looks the
+//! device's hostname up again before the next one, so a machine whose
+//! address changed, or whose name did not resolve when this one started, is
+//! found again without anyone switching the device off and on.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -59,6 +62,8 @@ pub(crate) const LAST_RETRY: Duration = Duration::from_secs(30);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the machine that answered has to send its first frame.
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long looking the device's hostname up again may take.
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Why a dial to be driven made no link.
 #[derive(Debug)]
@@ -131,6 +136,26 @@ fn refusal_of(e: &quinn::ConnectionError, addr: SocketAddr) -> DialBackError {
     }
 }
 
+/// What a handshake that failed says about the machine at `addr`: nothing
+/// that machine said, bar that it is an older hops.
+///
+/// The machine this one is pinned to refuses this machine's certificate
+/// only once it has it, after this side's half of the handshake, and by
+/// then the connection is made here: its refusal lands on that connection,
+/// after the pin check ([`attempt`]). What ends the handshake itself can
+/// come from anything at the address or on the path, a machine that holds
+/// no key at all or a forged close, and believed it would tell the person
+/// that the machine this one is paired with removed or refused it. An
+/// older hops refuses the protocol before any certificate, so that alone
+/// is told apart, and saying so asks nothing destructive.
+fn refusal_in_handshake(e: &quinn::ConnectionError, addr: SocketAddr) -> DialBackError {
+    if transport::refused_protocol(e) {
+        DialBackError::OlderVersion(addr)
+    } else {
+        DialBackError::NotAnswered
+    }
+}
+
 /// One address: the handshake, the pin, and the first frame.
 async fn attempt(
     identity: Arc<Identity>,
@@ -150,7 +175,7 @@ async fn attempt(
         .map_err(|_| DialBackError::NotAnswered)?;
     let conn = match tokio::time::timeout(DIAL_TIMEOUT, connecting).await {
         Err(_) => return Err(DialBackError::NotAnswered),
-        Ok(Err(e)) => return Err(refusal_of(&e, addr)),
+        Ok(Err(e)) => return Err(refusal_in_handshake(&e, addr)),
         Ok(Ok(conn)) => conn,
     };
     // Fail closed: the machine this device is pinned to, and no other.
@@ -543,6 +568,47 @@ fn addresses(clients: &ClientManager, handle: ClientHandle) -> (Vec<SocketAddr>,
     (addrs, port)
 }
 
+/// Look `handle`'s hostname up again, if it has one, for the next dial.
+///
+/// Addresses found replace those found before; a lookup that fails keeps
+/// them, since a name that does not resolve for a moment says nothing about
+/// whether they still reach the machine. With none at all to dial, the
+/// person is told the name was not found, and it is looked up again after
+/// the next dial.
+async fn look_up_again(context: &Context, handle: ClientHandle) {
+    let Some(hostname) = context.clients.get_hostname(handle) else {
+        return;
+    };
+    let found = tokio::time::timeout(LOOKUP_TIMEOUT, crate::dns::resolve_hostname(&hostname))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .filter(|ips| !ips.is_empty());
+    match found {
+        Some(ips) => {
+            let known = context
+                .clients
+                .get_state(handle)
+                .map(|(_, s)| s.dns_ips)
+                .unwrap_or_default();
+            let changed = ips.len() != known.len() || ips.iter().any(|ip| !known.contains(ip));
+            if changed {
+                log::info!("client {handle}: {hostname} is now at {ips:?}");
+                context.clients.set_dns_ips(handle, ips);
+                let _ = context.state_tx.send(handle);
+            }
+        }
+        None => {
+            log::debug!("client {handle}: {hostname} did not resolve");
+            if addresses(&context.clients, handle).0.is_empty() {
+                let _ = context
+                    .refusals
+                    .send(DialRefusal::NotResolved { handle, hostname });
+            }
+        }
+    }
+}
+
 /// Hold a link to `handle`'s machine, dialled to be driven by it, until
 /// stopped.
 async fn hold(
@@ -602,6 +668,9 @@ async fn hold(
                 if let Some(refusal) = refusal {
                     let _ = context.refusals.send(refusal);
                 }
+                if matches!(e, DialBackError::NoAddress | DialBackError::NotAnswered) {
+                    look_up_again(&context, handle).await;
+                }
             }
         }
         tokio::time::sleep(wait).await;
@@ -622,8 +691,8 @@ mod tests {
     use crate::emulation::Emulation;
     use crate::listen::{DialledIn, LanMouseListener};
     use crate::test_harness::{
-        ARRIVES_WITHIN, Dialer, Machine, NEVER_WITHIN, dialer, heard_within, machine, run_local,
-        trust, wait_until,
+        ARRIVES_WITHIN, Dialer, Machine, NEVER_WITHIN, dialer, heard_within, machine, next_within,
+        run_local, trust, wait_until,
     };
     use crate::trust::Caps;
     use hops_proto::Position;
@@ -826,6 +895,121 @@ mod tests {
                 "{:?}",
                 other_way.err()
             );
+        });
+    }
+
+    /// How long a held link may take to come up in the tests below: a
+    /// dial that reaches nothing, a lookup, and the waits between them.
+    const HELD_WITHIN: Duration = Duration::from_secs(30);
+
+    /// The controlled machine `c`, holding a device for the controlling
+    /// machine `k` at `hostname` and the port `k` listens on, pinned to it,
+    /// with the addresses `resolved` as the name's last lookup found. Its
+    /// held links, and what it tells the service.
+    async fn holding(
+        c: &Machine,
+        k: &Machine,
+        port: u16,
+        hostname: &str,
+        resolved: Vec<IpAddr>,
+    ) -> (DialBack, Receiver<DialRefusal>, LanMouseListener) {
+        let c_trust = trust(c, &[k], Caps::INBOUND);
+        let clients = ClientManager::default();
+        let handle = clients.add_client();
+        clients.set_hostname(handle, Some(hostname.to_string()));
+        clients.set_dns_ips(handle, resolved);
+        clients.set_port(handle, port);
+        clients.set_peer_fingerprint(handle, Some(k.fingerprint.clone()));
+        clients.activate_client(handle);
+        let (clipboard_tx, _) = channel();
+        let listener =
+            LanMouseListener::dial_only(c.identity.clone(), c_trust.clone(), clipboard_tx)
+                .await
+                .expect("a listener on no port");
+        let (refusals_tx, refusals) = channel();
+        let (state_tx, _) = channel();
+        let dial_back = DialBack::new(
+            c.identity.clone(),
+            c_trust,
+            clients,
+            listener.admitter(),
+            refusals_tx,
+            state_tx,
+        );
+        (dial_back, refusals, listener)
+    }
+
+    // LEDGER T33 | class B | 6 struct state: the controlling machine's Adopter::adopt results for links DialBack::reconcile's held dial makes
+    /// The controlled machine could not look the controlling one's name up
+    /// when it started, so it holds no address for it, and later the name
+    /// resolves; or the name's address changed since it was looked up. Either
+    /// way the held link looks the name up again and comes up, with no one
+    /// switching the device off and on.
+    #[test]
+    fn a_held_link_looks_its_hostname_up_again_until_it_reaches_the_machine() {
+        run_local(async {
+            let not_yet: Vec<IpAddr> = Vec::new();
+            let moved = vec![IpAddr::from([127, 0, 0, 2])];
+            for (case, resolved) in [
+                ("a link to the machine whose name never resolved", not_yet),
+                ("a link to the machine whose address moved", moved),
+            ] {
+                let (k_m, c_m) = (machine(), machine());
+                let k =
+                    controller(&k_m, trust(&k_m, &[&c_m], Caps::OUTBOUND), &c_m.fingerprint).await;
+                let (mut dial_back, _refusals, _listener) =
+                    holding(&c_m, &k_m, k.port, "localhost", resolved).await;
+                dial_back.reconcile(false);
+                wait_until(case, HELD_WITHIN, || k.adopted.borrow().contains(&true)).await;
+                dial_back.stop_all();
+            }
+        });
+    }
+
+    // LEDGER T34 | class B | 6 struct state: the DialRefusal DialBack's held dial sends the service
+    /// A name that resolves to nothing, with no other address to dial: the
+    /// person is told the name was not found, rather than the device
+    /// waiting, silent, for an address it will never have.
+    #[test]
+    fn a_held_link_whose_hostname_resolves_to_nothing_says_so() {
+        run_local(async {
+            let (k, c) = (machine(), machine());
+            let (mut dial_back, mut refusals, _listener) =
+                holding(&c, &k, 9, "no-such-machine.invalid", Vec::new()).await;
+            dial_back.reconcile(false);
+            let told = next_within(&mut refusals, HELD_WITHIN).await;
+            assert!(
+                matches!(&told, Some(DialRefusal::NotResolved { hostname, .. })
+                    if hostname == "no-such-machine.invalid"),
+                "the person was not told the name resolves to nothing: {told:?}"
+            );
+            dial_back.stop_all();
+        });
+    }
+
+    // LEDGER T31 | class B | 1 return value: dial_to_be_driven's error and told()'s notice for a keyless endpoint
+    /// A machine that holds no key, or a close forged on the path, ends the
+    /// handshake with the same alert the pinned machine refuses a removed
+    /// machine with. Nothing proved it is the pinned machine, so the dial
+    /// says nothing answered, and the person is told nothing about it.
+    #[test]
+    fn a_refusal_from_a_machine_that_showed_no_certificate_is_not_believed() {
+        run_local(async {
+            let (k, c) = (machine(), machine());
+            let (_keyless, port, answered) = crate::test_harness::keyless_listener();
+            let c_trust = trust(&c, &[&k], Caps::INBOUND);
+            let at = SocketAddr::from(([127, 0, 0, 1], port));
+            let got = dial_to_be_driven(&c.identity, &c_trust, &[at], &k.fingerprint).await;
+            assert!(
+                !answered.borrow().is_empty(),
+                "precondition: the keyless endpoint never answered"
+            );
+            let e = got.err().expect("no link to a machine with no key");
+            assert!(
+                matches!(e, DialBackError::NotAnswered),
+                "a refusal nothing proved came from the pinned machine was believed: {e:?}"
+            );
+            assert!(told(7, &k.fingerprint, &e).is_none());
         });
     }
 

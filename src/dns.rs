@@ -121,7 +121,7 @@ impl DnsTask {
 /// Port `0` is a placeholder — `lookup_host` requires `host:port` but we
 /// only care about the IPs at this stage; the actual port is appended at
 /// connection time.
-async fn resolve_hostname(hostname: &str) -> io::Result<Vec<IpAddr>> {
+pub(crate) async fn resolve_hostname(hostname: &str) -> io::Result<Vec<IpAddr>> {
     let addrs = lookup_host((hostname, 0)).await?;
     Ok(addrs.map(|sa| sa.ip()).collect())
 }

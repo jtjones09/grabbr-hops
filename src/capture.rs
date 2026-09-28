@@ -131,6 +131,7 @@ impl Capture {
             buttons_down_on_peer: Default::default(),
             active_client: None,
             acked_at: None,
+            acked_link: None,
             timing,
             awaiting_ack: None,
             unanswered: Default::default(),
@@ -271,6 +272,11 @@ struct CaptureTask {
     /// client list before capture hears of it; looking the handle up then
     /// finds nothing, or a new client not yet connected.
     acked_at: Option<(CaptureHandle, SocketAddr)>,
+    /// The link the crossing was acknowledged on
+    /// ([`LanMouseConnection::link_serial`]). The peer takes a crossing per
+    /// link, so once its device is on another link, a machine that dialled
+    /// again after its link dropped, the crossing is made again there.
+    acked_link: Option<u64>,
     /// How long a crossing waits for the peer's Ack, and how long a peer
     /// that left one unanswered is refused crossings.
     timing: Timing,
@@ -499,6 +505,7 @@ impl CaptureTask {
                                 self.told.forget(handle);
                                 self.acked_at =
                                     self.conn.active_addr(handle).map(|addr| (handle, addr));
+                                self.acked_link = self.conn.link_serial(handle).await;
                             }
                         }
                         // client disconnected
@@ -561,7 +568,45 @@ impl CaptureTask {
         let Some(handle) = self.active_client else {
             return Ok(());
         };
+        if self.cross_again_if_relinked(handle).await {
+            return Ok(());
+        }
         self.send_motion(capture, handle, dx, dy).await
+    }
+
+    /// Whether the crossing to `handle` was acknowledged on a link that is
+    /// no longer its link, and so must be made again. Its peer drops what
+    /// arrives on a link no Enter crossed, so input sent there is lost
+    /// while this machine holds the pointer. The crossing then waits for an
+    /// Ack again, which the next event asks for with an Enter, and is given
+    /// up on if none comes, as a new one is. Motion not sent yet belonged
+    /// to the crossing on the old link and is dropped, and absolute motion
+    /// starts again from the origin, where the peer anchors it on that
+    /// Enter.
+    async fn cross_again_if_relinked(&mut self, handle: CaptureHandle) -> bool {
+        if self.state != State::Sending || self.active_client != Some(handle) {
+            return false;
+        }
+        let Some(acked) = self.acked_link else {
+            return false;
+        };
+        match self.conn.link_serial(handle).await {
+            Some(now) if now != acked => {
+                log::info!(
+                    "client {handle} is on another link than the one it took the crossing on: \
+                     crossing again"
+                );
+                self.state = State::WaitingForAck;
+                self.awaiting_ack = Some(tokio::time::Instant::now() + self.timing.ack_deadline);
+                self.acked_link = None;
+                self.pending_motion = None;
+                self.abs_vx = 0.0;
+                self.abs_vy = 0.0;
+                self.abs_seq = 0;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Emit a pointer-motion delta to `handle`. When the peer negotiated
@@ -623,6 +668,8 @@ impl CaptureTask {
             log::info!("releasing capture: release-bind pressed");
             return self.release_capture(capture).await;
         }
+
+        self.cross_again_if_relinked(handle).await;
 
         // Motion coalescing: while Sending, sum consecutive Motion deltas into the
         // dirty slot and let the flush timer emit them as one event; any other
@@ -843,6 +890,7 @@ impl CaptureTask {
         self.awaiting_ack = None;
         let buttons = std::mem::take(&mut self.buttons_down_on_peer);
         let acked_at = self.acked_at.take();
+        self.acked_link = None;
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
             let addr = acked_at
