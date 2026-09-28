@@ -225,3 +225,31 @@ pub enum MacOSEmulationCreationError {
 #[cfg(windows)]
 #[derive(Debug, Error)]
 pub enum WindowsEmulationCreationError {}
+
+#[cfg(all(test, target_os = "macos"))]
+mod a_mac_refused_its_permission {
+    use super::{EmulationCreationError, MacOSEmulationCreationError, Permission};
+
+    // LEDGER G2-5 | class B | 1 return value: EmulationCreationError::missing_permissions
+    /// Both ways macOS refuses to let hops post events are Accessibility in
+    /// System Settings, so both are named as it; a backend that failed
+    /// otherwise names nothing.
+    #[test]
+    fn both_refusals_name_accessibility() {
+        let named =
+            |e: MacOSEmulationCreationError| EmulationCreationError::MacOs(e).missing_permissions();
+        assert_eq!(
+            (
+                named(MacOSEmulationCreationError::AccessibilityPermission),
+                named(MacOSEmulationCreationError::InputControlPermission),
+                named(MacOSEmulationCreationError::EventSourceCreation),
+            ),
+            (
+                Some(&[Permission::Accessibility][..]),
+                Some(&[Permission::Accessibility][..]),
+                None,
+            ),
+            "(no Accessibility, no input control, no event source)"
+        );
+    }
+}

@@ -1950,7 +1950,10 @@ mod capture_state_on_the_wire {
     //! have, so a frontend and a daemon of different builds still agree on
     //! them (#91).
 
-    use super::{CaptureFault, CaptureState, FrontendEvent, Permission, Status};
+    use super::{
+        CaptureFault, CaptureState, EmulationFault, EmulationState, FrontendEvent, Permission,
+        Status,
+    };
 
     fn wire(event: &FrontendEvent) -> String {
         serde_json::to_string(event).expect("serializes")
@@ -1982,6 +1985,36 @@ mod capture_state_on_the_wire {
                     if m == &[Permission::InputMonitoring]
             ),
             "a failed capture must arrive naming what is missing: {}",
+            wire(&failed)
+        );
+    }
+
+    // LEDGER G2-6 | class B | 2 bytes: serde_json of FrontendEvent::EmulationStatus
+    #[test]
+    fn emulation_on_and_off_are_written_as_status_writes_them() {
+        let old = |s: Status| {
+            serde_json::to_string(&serde_json::json!({ "EmulationStatus": s })).expect("json")
+        };
+        assert_eq!(
+            (
+                wire(&FrontendEvent::EmulationStatus(EmulationState::Enabled)),
+                wire(&FrontendEvent::EmulationStatus(EmulationState::Disabled)),
+            ),
+            (old(Status::Enabled), old(Status::Disabled)),
+            "an older frontend reads emulation's state as a Status"
+        );
+        let failed =
+            FrontendEvent::EmulationStatus(EmulationState::Failed(EmulationFault::Missing(vec![
+                Permission::Accessibility,
+            ])));
+        let read: FrontendEvent = serde_json::from_str(&wire(&failed)).expect("reads back");
+        assert!(
+            matches!(
+                read,
+                FrontendEvent::EmulationStatus(EmulationState::Failed(EmulationFault::Missing(ref m)))
+                    if m == &[Permission::Accessibility]
+            ),
+            "a failed emulation must arrive naming what is missing: {}",
             wire(&failed)
         );
     }

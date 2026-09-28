@@ -775,18 +775,21 @@ impl PeerQueues {
     }
 }
 
-/// Why a fall to `dummy` is refused, or `None` when it runs: asked for, or
-/// overridden. A real backend the system withheld a permission from is
-/// named, so the person is told what to grant rather than only that input
-/// would be discarded; the override still runs `dummy` in its place.
+/// Why `emulation` may not run, or `None` when it may: a real backend, or
+/// `dummy` asked for (`asked`) or overridden. A real backend the system
+/// withheld a permission from on the way down to `dummy` is named, so the
+/// person is told what to grant rather than only that input would be
+/// discarded; the override still runs `dummy` in its place.
 fn refuse_the_fall(
-    asked_for_dummy: bool,
+    emulation: &InputEmulation,
+    asked: Option<input_emulation::Backend>,
     overridden: bool,
-    withheld: &[input_emulation::Permission],
 ) -> Option<InputEmulationError> {
-    if asked_for_dummy || overridden {
+    let dummy = input_emulation::Backend::Dummy;
+    if emulation.backend() != dummy || asked == Some(dummy) || overridden {
         return None;
     }
+    let withheld = emulation.withheld_permissions();
     Some(if withheld.is_empty() {
         InputEmulationError::NoUsableBackend
     } else {
@@ -854,22 +857,17 @@ impl EmulationTask {
         // The Linux release shipped exactly this for months (#47) — built with
         // no backend features at all, so selection had nowhere to go.
         if emulation.backend() == input_emulation::Backend::Dummy {
-            let asked_for_dummy = self.backend == Some(input_emulation::Backend::Dummy);
-            let overridden = std::env::var("HOPS_ALLOW_DUMMY").is_ok_and(|v| v != "0");
             let _ = self.event_tx.send(EmulationEvent::BackendDegraded(
                 emulation.backend().to_string(),
             ));
-            if let Some(refusal) = refuse_the_fall(
-                asked_for_dummy,
-                overridden,
-                emulation.withheld_permissions(),
-            ) {
-                log::error!(
-                    "input emulation fell back to `dummy` — all input would be silently \
-                     discarded. Refusing. Set HOPS_ALLOW_DUMMY=1 to override."
-                );
-                return Err(refusal);
-            }
+        }
+        let overridden = std::env::var("HOPS_ALLOW_DUMMY").is_ok_and(|v| v != "0");
+        if let Some(refusal) = refuse_the_fall(&emulation, self.backend, overridden) {
+            log::error!(
+                "input emulation fell back to `dummy` — all input would be silently \
+                 discarded. Refusing. Set HOPS_ALLOW_DUMMY=1 to override."
+            );
+            return Err(refusal);
         }
 
         // used to send enabled and disabled events
@@ -2897,35 +2895,62 @@ mod a_fall_to_dummy_names_what_was_withheld {
     //! A Mac without Accessibility falls past its real backend to `dummy`,
     //! which is refused. The refusal names the permission, so the app can
     //! say what to grant; the override still runs `dummy`.
+    //!
+    //! The emulations here are chosen the way a Mac chooses its own, with
+    //! no backend configured: the recording stand-in refused its permission,
+    //! then `dummy`.
 
     use super::{InputEmulationError, fault_of, refuse_the_fall};
+    use crate::test_harness::run_local;
     use hops_ipc::{EmulationFault, Permission};
-    use input_emulation::Permission as Withheld;
+    use input_emulation::recording::Recording;
+    use input_emulation::{Backend, InputEmulation};
 
-    // LEDGER G2-4 | class B | 1 return value: refuse_the_fall folded by fault_of
+    async fn chosen(backends: impl IntoIterator<Item = Backend>) -> InputEmulation {
+        InputEmulation::first_that_starts(backends)
+            .await
+            .expect("dummy always starts")
+    }
+
+    // LEDGER G2-4 | class B | 1 return value: refuse_the_fall over emulations from first_that_starts, folded by fault_of
     #[test]
     fn the_refusal_names_the_permission_and_the_override_still_runs() {
-        let told = |asked: bool, overridden: bool, withheld: &[Withheld]| {
-            refuse_the_fall(asked, overridden, withheld).map(|e| fault_of(&e))
-        };
-        let access = [Withheld::Accessibility];
-        assert_eq!(
-            told(false, false, &access),
-            Some(EmulationFault::Missing(vec![Permission::Accessibility])),
-            "a fall past a backend refused Accessibility must name it"
-        );
-        assert!(
-            matches!(told(false, false, &[]), Some(EmulationFault::Backend(_))),
-            "a fall past backends that failed otherwise names no permission"
-        );
-        assert_eq!(
-            (told(true, false, &access), told(false, true, &access)),
-            (None, None),
-            "(dummy asked for, HOPS_ALLOW_DUMMY set): both run dummy"
-        );
-        assert!(matches!(
-            refuse_the_fall(false, false, &[]),
-            Some(InputEmulationError::NoUsableBackend)
-        ));
+        run_local(async {
+            let refused = Recording::new();
+            refused.refuse_permission();
+            let fell_past_refusal = chosen([refused.backend(), Backend::Dummy]).await;
+            let gone = Recording::new().backend();
+            let fell_past_failure = chosen([gone, Backend::Dummy]).await;
+            let working = Recording::new();
+            let real = chosen([working.backend(), Backend::Dummy]).await;
+            let told = |e: &InputEmulation, asked: Option<Backend>, overridden: bool| {
+                refuse_the_fall(e, asked, overridden).map(|e| fault_of(&e))
+            };
+            assert_eq!(
+                told(&fell_past_refusal, None, false),
+                Some(EmulationFault::Missing(vec![Permission::Accessibility])),
+                "a fall past a backend refused Accessibility must name it"
+            );
+            assert!(
+                matches!(
+                    refuse_the_fall(&fell_past_failure, None, false),
+                    Some(InputEmulationError::NoUsableBackend)
+                ),
+                "a fall past backends that failed otherwise names no permission"
+            );
+            assert_eq!(
+                (
+                    told(&fell_past_refusal, Some(Backend::Dummy), false),
+                    told(&fell_past_refusal, None, true),
+                    told(&real, None, false),
+                ),
+                (None, None, None),
+                "(dummy asked for, HOPS_ALLOW_DUMMY set, a real backend): each runs"
+            );
+            for e in [fell_past_refusal, fell_past_failure, real] {
+                let mut e = e;
+                e.terminate().await;
+            }
+        });
     }
 }
