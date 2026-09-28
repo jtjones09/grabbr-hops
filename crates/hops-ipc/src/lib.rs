@@ -113,6 +113,18 @@ pub enum IpcListenerCreationError {
         endpoint: DaemonEndpoint,
         source: io::Error,
     },
+    /// A hops daemon from before the named pipe answers where such daemons
+    /// listened ([`DaemonEndpoint::of_older_builds`]). It does not hold this
+    /// build's endpoint, so without this check a second daemon would start
+    /// beside it, with the same identity and config.
+    #[error(
+        "an older hops daemon, from before 0.13, answers on {endpoint}, so this one does not start beside it. {hint}"
+    )]
+    Older {
+        endpoint: DaemonEndpoint,
+        /// What to do about it, in words.
+        hint: String,
+    },
     /// The lock that stops a second daemon starting could not be taken, for a
     /// reason other than another daemon holding it.
     #[error("could not lock {}: {source}. {hint}", .path.display())]
@@ -942,7 +954,8 @@ pub enum DaemonEndpoint {
     /// No daemon listens on one: on Windows the daemon listened on
     /// 127.0.0.1:5252 until it moved to a named pipe, which unlike a port
     /// can say which users may open it (#110). The asks below still reach
-    /// a port, so a test can stand something up on one and ask it.
+    /// a port: to find a daemon of such a build ([`Self::of_older_builds`]),
+    /// and so a test can stand something up on one and ask it.
     Tcp(SocketAddr),
 }
 
@@ -978,6 +991,23 @@ impl DaemonEndpoint {
         {
             let token = token::load_or_create().map_err(SocketPathError::Token)?;
             Ok(Self::Pipe(proof::pipe_name(&token)))
+        }
+    }
+
+    /// Where a daemon of an older build of hops listens that this build's
+    /// endpoint does not reach, on this platform.
+    ///
+    /// On Windows, hops 0.12 and earlier listened on 127.0.0.1:5252, and this
+    /// build on a pipe, so a daemon of either does not see the other. On
+    /// macOS and Linux every build has used the same socket. `None` there.
+    pub fn of_older_builds() -> Option<Self> {
+        #[cfg(windows)]
+        {
+            Some(Self::Tcp(SocketAddr::from(([127, 0, 0, 1], 5252))))
+        }
+        #[cfg(not(windows))]
+        {
+            None
         }
     }
 

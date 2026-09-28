@@ -80,6 +80,16 @@ folder you can write hands administrator to anything that can replace the file.
 The cost is that hops cannot type or click into an elevated window. An enter
 hook set in `config.toml` does not run if hops is started elevated.
 
+Upgrading from hops 0.12 or older: the old daemon listens where this version
+does not look for one, and this version will not start beside it. Stop it and
+run this version from the same task:
+
+```powershell
+Stop-ScheduledTask -TaskName hops-daemon
+.\install-hops-daemon.ps1 -HopsPath 'C:\path\to\new\hops.exe'
+Start-ScheduledTask -TaskName hops-daemon
+```
+
 ## 3. Configure over SSH
 
 The daemon writes a default config on first run and watches it for changes. Three

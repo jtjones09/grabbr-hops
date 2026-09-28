@@ -122,8 +122,15 @@ fn runs_the_daemon(command: Option<Command>) -> bool {
     }
 }
 
-/// Run the daemon (the receiver service). A redundant instance self-exits.
+/// Run the daemon (the receiver service). A redundant instance self-exits,
+/// and so does one beside a daemon of an older build that listens where this
+/// build's claim cannot see it (on Windows, hops 0.12 and older).
 fn run_daemon() -> Result<(), HopsError> {
+    if let Err(e) =
+        hops::daemon_start::refuse_beside_older(DaemonEndpoint::of_older_builds().as_ref())
+    {
+        return daemon_ended(Err(HopsError::Service(ServiceError::IpcListen(e))));
+    }
     daemon_ended(run_async(run_service()))
 }
 
@@ -418,6 +425,19 @@ mod a_daemon_ended_for_a_grant_exits_unsuccessfully {
             ),
             "a daemon that ended for a grant must exit 1, or launchd leaves it down \
              until the next login: {granted:?}"
+        );
+        let older = daemon_ended(Err(HopsError::Service(ServiceError::IpcListen(
+            IpcListenerCreationError::Older {
+                endpoint: hops_ipc::DaemonEndpoint::Tcp(
+                    "127.0.0.1:5252".parse().expect("an address"),
+                ),
+                hint: String::new(),
+            },
+        ))));
+        assert!(
+            older.is_err(),
+            "a daemon that did not start beside an older build's must exit 1 with \
+             the reason, not as if a daemon of this build were running: {older:?}"
         );
         assert!(beside.is_ok(), "{beside:?}");
         assert!(

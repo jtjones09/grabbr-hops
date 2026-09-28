@@ -33,7 +33,9 @@ and how to recover. How to report a vulnerability is in
   hops from starting instead of being trusted. This covers the trust file
   only: when it is missing, hops rebuilds it from the list of machines in
   `config.toml`, so a `config.toml` copied or edited while the trust file
-  is gone is trusted.
+  is gone is trusted. While the trust file is there, a machine removed from
+  that list, by hand or by an older version of hops, is removed from the
+  trust file too, and one added to it is not trusted.
 
 ## What it cannot protect against
 
