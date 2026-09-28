@@ -629,7 +629,33 @@ async fn ended_told_and_kept(
 /// refused (#220).
 #[test]
 fn answers_that_let_neither_machine_control_end_the_pairing_and_say_so() {
-    machines("disagree", |mut m| async move {
+    machines("disagree", |m| neither_may_control(m, Confirming::Both));
+}
+
+// LEDGER G-38 | class B | 5 process: PairingEnded, notices and TrustUpdated from two built daemons, with only the added machine's person confirming
+/// As [`answers_that_let_neither_machine_control_end_the_pairing_and_say_so`],
+/// with only the person at the machine being added confirming. The adding
+/// machine, whose person has not answered yet, learns of the answers from
+/// the other machine, and says so rather than only that the pairing ended.
+#[test]
+fn answers_that_let_neither_machine_control_are_named_where_nobody_confirmed_yet() {
+    machines("disagree-one", |m| {
+        neither_may_control(m, Confirming::AddedOnly)
+    });
+}
+
+/// Whose people confirm the number in [`neither_may_control`].
+#[derive(Clone, Copy, PartialEq)]
+enum Confirming {
+    Both,
+    AddedOnly,
+}
+
+/// Both people answer that their own machine is in control, compare the
+/// number, and `confirming` confirm it: both machines end the pairing with
+/// a notice naming the answers, and neither keeps anything.
+async fn neither_may_control(mut m: Machines, confirming: Confirming) -> Vec<String> {
+    {
         let mut failures: Vec<String> = Vec::new();
         ask(&mut m.ra, FrontendRequest::OpenPairing).await;
         ask(&mut m.rb, FrontendRequest::OpenPairing).await;
@@ -644,7 +670,11 @@ fn answers_that_let_neither_machine_control_end_the_pairing_and_say_so() {
             Ok(n) => n,
             Err(e) => return vec![e],
         };
-        for (requests, fp) in [(&mut m.rb, m.fp_a.clone()), (&mut m.ra, m.fp_b.clone())] {
+        let confirm = match confirming {
+            Confirming::Both => vec![(&mut m.rb, m.fp_a.clone()), (&mut m.ra, m.fp_b.clone())],
+            Confirming::AddedOnly => vec![(&mut m.rb, m.fp_a.clone())],
+        };
+        for (requests, fp) in confirm {
             ask(
                 requests,
                 FrontendRequest::ConfirmPairing {
@@ -670,7 +700,7 @@ fn answers_that_let_neither_machine_control_end_the_pairing_and_say_so() {
             }
         }
         failures
-    });
+    }
 }
 
 // LEDGER G-16 | class B | 5 process: both daemons paired, the link up, and paired after a restart
