@@ -2366,9 +2366,30 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
                         refusals(&events)
                     );
 
+                    // Let go, with the pointer left here and idle past the
+                    // quiet window: still crossed in, so still driving. The
+                    // local mouse is refused too, so the notice has to say
+                    // what ends it.
+                    driver.send(ProtoEvent::Input(key(0))).await;
+                    wait_until("the key is let go", DEADLINE, injected(key(0))).await;
+                    tokio::time::sleep(QUIET + Duration::from_millis(500)).await;
+                    let events = app.exchange(&enable).await;
+                    let told = refusals(&events);
+                    assert!(
+                        !clipboard_on() && told.len() == 1,
+                        "a peer crossed in with its pointer idle here turned a \
+                         clipboard on: the app was told {told:?}"
+                    );
+                    assert!(
+                        told[0].contains("pointer back"),
+                        "refused while a peer is crossed in, and the notice does not \
+                         say to move the pointer back to the machine controlling \
+                         this one, the only thing that ends the refusal: {:?}",
+                        told[0]
+                    );
+
                     // Pressed over the approval, held past the quiet window,
                     // then let go by the peer leaving.
-                    driver.send(ProtoEvent::Input(key(0))).await;
                     driver.send(ProtoEvent::Input(button(1))).await;
                     wait_until("the button goes down", DEADLINE, injected(button(1))).await;
                     tokio::time::sleep(QUIET + Duration::from_millis(500)).await;
@@ -2376,10 +2397,18 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
                     wait_until("the button is let go", DEADLINE, injected(button(0))).await;
                     let let_go = tokio::time::Instant::now();
                     let events = app.exchange(&enable).await;
-                    // Only a request handled inside the window after the let-go
-                    // says anything; a machine too loaded for that is not a
-                    // failure of the check.
-                    if let_go.elapsed() < QUIET {
+                    // The Leave and the button-up it lets go of both count as
+                    // the peer's input, so this cannot tell them apart; the
+                    // emulation tests do (DR-5, DR-7). Only a request handled
+                    // inside the window after them says anything, and a
+                    // machine too loaded for that skips the check, saying so.
+                    if let_go.elapsed() >= QUIET {
+                        eprintln!(
+                            "skipped: the request after the let-go was handled \
+                             {:?} later, outside the quiet window",
+                            let_go.elapsed()
+                        );
+                    } else {
                         assert!(
                             !clipboard_on() && refusals(&events).len() == 1,
                             "the button a peer held came up as it left, completing a \

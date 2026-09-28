@@ -2044,7 +2044,10 @@ impl Service {
     /// peer is driving you would block the one action you most need in exactly
     /// the moment you need it.
     ///
-    /// The notice begins with `refused`, which says what did not happen.
+    /// The notice begins with `refused`, which says what did not happen, and
+    /// says what ends the refusal: a peer crossed in keeps it however long it
+    /// sits idle, so this machine's own mouse is refused too until the pointer
+    /// goes back.
     fn refuse_while_remotely_driven(&mut self, refused: &str, what: &str) -> bool {
         const QUIET: std::time::Duration = std::time::Duration::from_secs(2);
         if !self.emulation.remotely_driven_within(QUIET) {
@@ -2053,7 +2056,8 @@ impl Service {
         log::warn!("refusing to {what} — this machine is being driven by a peer right now");
         self.notify_frontend(FrontendEvent::Error(format!(
             "{refused}: this machine is being controlled remotely, so it refused to \
-             {what}. Use its own keyboard and mouse, then try again."
+             {what}. Move the pointer back to the machine controlling it, then try \
+             again with this machine's own keyboard and mouse."
         )));
         true
     }

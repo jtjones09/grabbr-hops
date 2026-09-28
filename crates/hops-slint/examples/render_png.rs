@@ -150,8 +150,9 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
     ui.set_pairing_clipboard(std::env::var_os("PREVIEW_CLIPBOARD").is_some());
     // the notice banner — the daemon's only "that didn't work" channel
     ui.set_notice(
-        "Refused to grant trust: this machine is being controlled remotely. \
-         Use its own keyboard and mouse, then try again."
+        "Nothing was trusted: this machine is being controlled remotely, so it \
+         refused to grant trust. Move the pointer back to the machine controlling \
+         it, then try again with this machine's own keyboard and mouse."
             .into(),
     );
     ui.set_notice_seq(1);
