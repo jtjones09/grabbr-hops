@@ -110,6 +110,9 @@ const HASH_OTHER_DEV_ID: &str = "1111111111111111111111111111111111111111";
 const HASH_APPLE_DEV: &str = "2222222222222222222222222222222222222222";
 const OTHER_DEV_ID: &str = "Developer ID Application: Example Maker (EXAMPLE123)";
 const APPLE_DEV: &str = "Apple Development: Example Maker (EXAMPLE456)";
+const HASH_PROJECT_ID: &str = "3333333333333333333333333333333333333333";
+/// The identity the project's releases, and so its users' grants, are bound to.
+const PROJECT_ID: &str = "Developer ID Application: Hotash Studios LLC (9V42Q953X9)";
 
 /// What `codesign` was asked to do, one line per call.
 fn codesign_calls(log: &Path) -> Vec<String> {
@@ -178,6 +181,29 @@ fn a_local_bundle_is_signed_with_the_identity_the_keychain_holds_under_the_hops_
             && calls[0].contains(&format!("[--sign] [{HASH_OTHER_DEV_ID}]")),
         "the bundle must be signed with the Developer ID the keychain holds and \
          the hops identifier, which the macOS grants are bound to: {calls:?}"
+    );
+    // Whichever certificate is chosen puts its maker's name on the app.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(OTHER_DEV_ID),
+        "the identity chosen must be named: {stderr}"
+    );
+
+    // The project's own Developer ID, listed after another: the project's.
+    // The grants already given are bound to it.
+    let (out, calls) = bundle(
+        "project",
+        &[
+            (HASH_OTHER_DEV_ID, OTHER_DEV_ID),
+            (HASH_PROJECT_ID, PROJECT_ID),
+        ],
+        &[],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        calls.len() == 1 && calls[0].contains(&format!("[--sign] [{HASH_PROJECT_ID}]")),
+        "the project's Developer ID must win over any other the keychain \
+         holds: {calls:?}"
     );
 
     // Only a development certificate: still a stable identity.
@@ -399,7 +425,7 @@ fn the_installer_builds_and_signs_what_the_release_ships() {
     // macOS, with a Developer ID in the keychain: the app is signed with it,
     // under the identifier the Accessibility grant is bound to. An ad hoc
     // signature is a new identity with every rebuild.
-    let (out, calls, _s) = install("macos", "Darwin", &[(HASH_OTHER_DEV_ID, OTHER_DEV_ID)]);
+    let (out, calls, s) = install("macos", "Darwin", &[(HASH_OTHER_DEV_ID, OTHER_DEV_ID)]);
     assert!(out.status.success(), "{}\n{calls}", text(&out));
     let builds: Vec<&str> = calls.lines().filter(|l| l.starts_with("cargo ")).collect();
     assert_eq!(builds.len(), 1, "{calls}");
@@ -422,4 +448,14 @@ fn the_installer_builds_and_signs_what_the_release_ships() {
          identifier: {signs:?}"
     );
     assert!(calls.contains("launchctl [bootstrap]"), "{calls}");
+
+    // launchd creates each job's output file with its own umask; the
+    // installer creates them first, readable by this user alone.
+    for log in ["daemon.log", "gui.log"] {
+        let path = s.path().join("home/hops/logs").join(log);
+        let mode = std::fs::metadata(&path)
+            .map(|m| m.permissions().mode() & 0o777)
+            .unwrap_or_else(|e| panic!("the installer left no {log}: {e}"));
+        assert_eq!(mode, 0o600, "the installer left {log} {mode:o}");
+    }
 }

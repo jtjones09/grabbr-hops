@@ -78,6 +78,10 @@ case "$(uname -s)" in
   <key>StandardErrorPath</key><string>${HOME}/hops/logs/${log}</string>
 </dict></plist>
 PLIST
+      # launchd creates a missing output file with its own umask, readable
+      # by every account. Create it first, readable by this user alone.
+      : >> "$HOME/hops/logs/${log}"
+      chmod 600 "$HOME/hops/logs/${log}"
       launchctl bootout "gui/${uid}/${label}" 2>/dev/null || true
       launchctl bootstrap "gui/${uid}" "$plist"
     done

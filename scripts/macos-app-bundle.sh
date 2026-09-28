@@ -96,14 +96,19 @@ plutil -lint "$APP/Contents/Info.plist" >/dev/null
 PROJECT_ID="Developer ID Application: Hotash Studios LLC (9V42Q953X9)"
 if [ "$SIGN" = "--sign" ]; then
   IDENTITY="${DEVELOPER_ID:-}"
+  NAME="$IDENTITY"
   if [ -z "$IDENTITY" ]; then
     FOUND="$(security find-identity -v -p codesigning 2>/dev/null || true)"
     for want in "\"$PROJECT_ID\"" '"Developer ID Application: ' '"Apple Development: '; do
-      IDENTITY="$(printf '%s\n' "$FOUND" | grep -F -- "$want" | awk 'NR == 1 { print $2 }' || true)"
+      LINE="$(printf '%s\n' "$FOUND" | grep -F -- "$want" | awk 'NR == 1' || true)"
+      IDENTITY="$(printf '%s\n' "$LINE" | awk '{ print $2 }')"
+      NAME="$(printf '%s\n' "$LINE" | awk -F '"' '{ print $2 }')"
       if [ -n "$IDENTITY" ]; then break; fi
     done
   fi
   if [ -n "$IDENTITY" ]; then
+    # Whose name the bundle carries, where the builder can see it.
+    echo "signing ${APP##*/} as: $NAME" >&2
     codesign --force --deep --identifier com.grabbr.hops --sign "$IDENTITY" "$APP" >/dev/null
   else
     # Still sealed, so the Info.plist is bound to the bundle.

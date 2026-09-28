@@ -1370,11 +1370,11 @@ fn write_agent(path: &Path, plist: &Plist) -> io::Result<()> {
     std::fs::rename(&staged, path).map_err(fail)
 }
 
-/// Where `exe` runs from that a LaunchAgent must not name, if it does: a
-/// mounted volume such as the disk image hops ships in, or the copy macOS
-/// makes to run a quarantined app from (App Translocation). The image cannot
-/// be ejected while the daemon runs from it, and after it is, or after the
-/// copy is cleared, nothing starts at login.
+/// Where `exe` runs from that a LaunchAgent must not name, if it does: the
+/// disk image hops ships in, or the copy macOS makes to run a quarantined
+/// app from (App Translocation). The image cannot be ejected while the
+/// daemon runs from it, and after it is, or after the copy is cleared,
+/// nothing starts at login.
 ///
 /// The path is judged where it leads: `/Volumes` also holds a link to the
 /// startup disk, and a binary reached through it is installed.
@@ -1383,12 +1383,27 @@ fn write_agent(path: &Path, plist: &Plist) -> io::Result<()> {
     allow(dead_code)
 )]
 fn not_installed(exe: &Path) -> Option<&'static str> {
-    use std::path::Component;
     let resolved = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    place_of(&resolved, mounted_read_only)
+}
+
+/// [`not_installed`] for a path already resolved, with `read_only` saying
+/// whether the file system holding a path is mounted read-only.
+///
+/// A volume under `/Volumes` counts as the disk image only when it is
+/// read-only, as a mounted image is: a second disk that holds someone's
+/// Applications folder is mounted there too, and an app on it is installed.
+#[cfg_attr(
+    not(all(target_os = "macos", any(feature = "tui", feature = "slint"))),
+    allow(dead_code)
+)]
+fn place_of(resolved: &Path, read_only: impl Fn(&Path) -> bool) -> Option<&'static str> {
+    use std::path::Component;
     let parts: Vec<Component> = resolved.components().collect();
     if matches!(parts.as_slice(), [Component::RootDir, Component::Normal(v), ..] if *v == "Volumes")
+        && read_only(resolved)
     {
-        return Some("a mounted disk image or volume");
+        return Some("a mounted disk image");
     }
     if parts
         .iter()
@@ -1397,6 +1412,38 @@ fn not_installed(exe: &Path) -> Option<&'static str> {
         return Some("a temporary copy macOS made to run it from");
     }
     None
+}
+
+/// Whether the file system holding `path` is mounted read-only. A path that
+/// cannot be examined counts as read-only: the binary running is always
+/// there, so this is not a case a user meets, and moving hops to
+/// Applications is what the refusal asks for either way.
+#[cfg_attr(
+    not(all(target_os = "macos", any(feature = "tui", feature = "slint"))),
+    allow(dead_code)
+)]
+fn mounted_read_only(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return true;
+        };
+        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: `c_path` is a NUL-terminated string that outlives the call,
+        // and `stat` is only read after the call reports that it filled it.
+        if unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+            return true;
+        }
+        // SAFETY: statvfs returned 0, so it wrote the whole struct.
+        let stat = unsafe { stat.assume_init() };
+        stat.f_flag & libc::ST_RDONLY != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        true
+    }
 }
 
 /// Make the plist at `path` run `exe` as the daemon: write it when it is
@@ -1429,34 +1476,64 @@ fn point_agent_at(path: &Path, exe: &Path, log: &Path) -> io::Result<AgentFile> 
         rewritten,
     };
     let fresh = || fresh_agent(exe_text, &log.to_string_lossy());
-    match read_agent(path)? {
+    let (pointed, plist) = match read_agent(path)? {
         OnDisk::Missing => {
             log::info!("writing {} to run {exe_text}", path.display());
-            write_agent(path, &fresh())?;
-            Ok(written(true))
+            let plist = fresh();
+            write_agent(path, &plist)?;
+            (written(true), plist)
         }
         OnDisk::Unreadable(why) => {
             log::warn!(
                 "{} could not be read ({why}); writing it again to run {exe_text}",
                 path.display()
             );
-            write_agent(path, &fresh())?;
-            Ok(written(true))
+            let plist = fresh();
+            write_agent(path, &plist)?;
+            (written(true), plist)
         }
         OnDisk::Found(mut plist) => {
             let wrong = repoint(&mut plist, exe, exe_text);
             if wrong.is_empty() {
-                return Ok(written(false));
+                (written(false), plist)
+            } else {
+                let wrong = wrong.join(", and ");
+                log::info!("{}: {wrong}; changing it to run {exe_text}", path.display());
+                write_agent(path, &plist).map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!("{} is out of date ({wrong}): {e}", path.display()),
+                    )
+                })?;
+                (written(true), plist)
             }
-            let wrong = wrong.join(", and ");
-            log::info!("{}: {wrong}; changing it to run {exe_text}", path.display());
-            write_agent(path, &plist).map_err(|e| {
-                io::Error::new(
-                    e.kind(),
-                    format!("{} is out of date ({wrong}): {e}", path.display()),
-                )
-            })?;
-            Ok(written(true))
+        }
+    };
+    keep_output_private(&plist);
+    Ok(pointed)
+}
+
+/// Create, or narrow, the files the job's output is sent to, before launchd
+/// opens them. launchd creates a missing one with its own umask, readable by
+/// every account, and what lands there is what the daemon printed before its
+/// logger started. Best effort: a file that cannot be opened is launchd's to
+/// report, and no directory is created for one.
+#[cfg_attr(
+    not(all(target_os = "macos", any(feature = "tui", feature = "slint"))),
+    allow(dead_code)
+)]
+fn keep_output_private(plist: &Plist) {
+    for key in ["StandardOutPath", "StandardErrorPath"] {
+        let Some(file) = plist.get(key).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // A device or a pipe is left alone, and opening a pipe with no
+        // reader would wait for one.
+        if std::fs::metadata(file).is_ok_and(|m| !m.is_file()) {
+            continue;
+        }
+        if let Err(e) = crate::logging::open_private(Path::new(file)) {
+            log::warn!("the daemon's output file {file} was left as it was: {e}");
         }
     }
 }
@@ -3424,6 +3501,39 @@ mod the_launch_agent_on_disk {
             Some(&serde_json::json!([exe.to_str().expect("utf-8"), "daemon"]))
         );
     }
+
+    /// launchd creates the job's output file with its own umask, readable by
+    /// every account, and it holds what the daemon printed before its logger
+    /// started and any abort message.
+    // LEDGER T67 | class B | 4 file on disk: point_agent_at, the output file's mode read back
+    #[test]
+    fn the_file_launchd_sends_the_daemons_output_to_is_this_users_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| {
+            std::fs::metadata(p)
+                .expect("the output file exists")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        let dir = Scratch::new("outmode");
+        let exe = dir.exe();
+
+        // A new agent: the file is there before launchd opens it.
+        point_agent_at(&dir.plist(), &exe, &dir.log()).expect("written");
+        assert_eq!(mode(&dir.log()), 0o600, "a new output file was left open");
+
+        // A current agent, with the file an earlier start left readable.
+        std::fs::set_permissions(dir.log(), std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let again = point_agent_at(&dir.plist(), &exe, &dir.log()).expect("read");
+        assert!(!again.rewritten, "{:?}", dir.read());
+        assert_eq!(
+            mode(&dir.log()),
+            0o600,
+            "an old output file was left {:o}",
+            mode(&dir.log())
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3473,6 +3583,35 @@ mod a_launch_agent_is_never_pointed_at_a_disk_image {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // LEDGER T8c | class B | 1 the verdict, for a volume each way, and the probe on real mounts
+    #[test]
+    fn an_app_on_a_writable_volume_is_installed_and_one_on_a_read_only_image_is_not() {
+        // Some keep Applications on a second disk, which is mounted under
+        // /Volumes too; what marks the disk image hops ships in is that it
+        // is mounted read-only.
+        let exe =
+            std::path::Path::new("/Volumes/Apps Disk/Applications/hops.app/Contents/MacOS/hops");
+        assert_eq!(
+            super::place_of(exe, |_| false),
+            None,
+            "an app on a writable volume was refused"
+        );
+        assert!(
+            super::place_of(exe, |_| true).is_some(),
+            "an app on a read-only image was accepted"
+        );
+
+        // The probe itself: a scratch directory is writable, and on macOS the
+        // system volume is mounted read-only, as a disk image is.
+        assert!(!super::mounted_read_only(&std::env::temp_dir()));
+        if cfg!(target_os = "macos") {
+            assert!(
+                super::mounted_read_only(std::path::Path::new("/usr/bin")),
+                "the read-only system volume read as writable"
+            );
+        }
     }
 
     // LEDGER T8b | class B | 4 file on disk: point_agent_at through a link in /Volumes

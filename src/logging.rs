@@ -183,6 +183,10 @@ fn default_path(role: &str) -> Option<PathBuf> {
 /// was readable by every account on the machine. A file an earlier build
 /// created that way is narrowed too, since the mode given at creation does
 /// nothing for a file that already exists.
+///
+/// Only a regular file is narrowed: `HOPS_LOG_FILE` may name a device, which
+/// other accounts need as it is. A file that cannot be narrowed is still
+/// written, and said so, rather than losing the log.
 fn open_log(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.create(true).append(true);
@@ -191,13 +195,28 @@ fn open_log(path: &Path) -> std::io::Result<File> {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         options.mode(0o600);
         let file = options.open(path)?;
-        if file.metadata()?.permissions().mode() & 0o077 != 0 {
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        let open_to_others = file
+            .metadata()
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o077 != 0);
+        if open_to_others {
+            if let Err(e) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
+                eprintln!(
+                    "hops: {} is readable by other accounts and could not be made \
+                     private ({e})",
+                    path.display()
+                );
+            }
         }
         Ok(file)
     }
     #[cfg(not(unix))]
     options.open(path)
+}
+
+/// Create `path` readable by this user alone, or narrow it if it is a regular
+/// file that is not, for output another process will write there.
+pub fn open_private(path: &Path) -> std::io::Result<()> {
+    open_log(path).map(drop)
 }
 
 /// Rename the current file aside once it is too big, keeping one generation.
@@ -513,6 +532,51 @@ mod tests {
             0o600,
             "a rotated log was created {:o}",
             mode(&rot)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // LEDGER T7c | class B | 4 file on disk: open_log on a device, mode read back
+    #[cfg(unix)]
+    #[test]
+    fn a_log_named_at_a_device_still_opens_and_the_device_is_left_as_it_was() {
+        // `HOPS_LOG_FILE` may name a device. Narrowing it fails for an
+        // account that does not own it, which lost the log, and for one that
+        // does it would cut every other account off from the device.
+        use std::os::unix::fs::PermissionsExt;
+        let null = Path::new("/dev/null");
+        let before = fs::metadata(null).expect("stat").permissions().mode() & 0o777;
+        let opened = open_log(null);
+        let after = fs::metadata(null).expect("stat").permissions().mode() & 0o777;
+        assert!(
+            opened.is_ok(),
+            "a log at /dev/null did not open: {opened:?}"
+        );
+        assert_eq!(after, before, "/dev/null was changed to {after:o}");
+
+        // One this account owns, which it could narrow: a pipe, with a reader
+        // so that opening it to write does not wait.
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!("hops-log-fifo-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("a scratch directory");
+        let fifo = dir.join("pipe");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("no NUL");
+        // SAFETY: `c_path` is NUL-terminated and outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0, "mkfifo");
+        fs::set_permissions(&fifo, fs::Permissions::from_mode(0o644)).expect("chmod");
+        let _reader = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .expect("a reader");
+        let opened = open_log(&fifo);
+        let mode = fs::metadata(&fifo).expect("stat").permissions().mode() & 0o777;
+        assert!(opened.is_ok(), "a log at a pipe did not open: {opened:?}");
+        assert_eq!(
+            mode, 0o644,
+            "a pipe this account owns was changed to {mode:o}"
         );
         let _ = fs::remove_dir_all(&dir);
     }

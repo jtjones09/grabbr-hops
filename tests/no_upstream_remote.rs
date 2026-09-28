@@ -8,7 +8,9 @@
 //! This reads the scripts because what they would contact is not observable
 //! without running them against a network. It reads every tracked script
 //! outside a `tests` directory, skipping comment lines, so the prose that
-//! explains the rule is not read as breaking it.
+//! explains the rule is not read as breaking it, and reads a command continued
+//! with a backslash as one line. `git fetch --all` and `git remote update`
+//! count as contact: on a clone with an upstream remote, they reach it.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -101,6 +103,14 @@ fn contacts_upstream(line: &str) -> Option<&'static str> {
         if rest.iter().any(|w| CONTACT.contains(w)) && rest.iter().any(|w| names_upstream(w)) {
             return Some("a git command that reaches the upstream project");
         }
+        let every_remote = rest.iter().any(|w| *w == "--all" || *w == "--multiple")
+            && rest.iter().any(|w| *w == "fetch" || *w == "pull");
+        let update = rest
+            .windows(2)
+            .any(|pair| pair[0] == "remote" && pair[1] == "update");
+        if every_remote || update {
+            return Some("a git command that reaches every remote, an upstream one included");
+        }
     }
     let lower = line.to_ascii_lowercase();
     if (lower.contains("uses:") || lower.contains("repository:"))
@@ -109,6 +119,33 @@ fn contacts_upstream(line: &str) -> Option<&'static str> {
         return Some("a workflow step that checks out the upstream project");
     }
     None
+}
+
+/// The commands in `text` with the line each starts on, a line ending in a
+/// backslash joined to the next, and comment lines left out.
+fn commands(text: &str) -> Vec<(usize, String)> {
+    let mut out: Vec<(usize, String)> = Vec::new();
+    let mut open: Option<(usize, String)> = None;
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim_end_matches('\r');
+        let (start, mut command) = match open.take() {
+            Some((start, so_far)) => (start, so_far + " "),
+            None if is_comment(line) => continue,
+            None => (n + 1, String::new()),
+        };
+        match line.strip_suffix('\\') {
+            Some(cut) => {
+                command.push_str(cut);
+                open = Some((start, command));
+            }
+            None => {
+                command.push_str(line);
+                out.push((start, command));
+            }
+        }
+    }
+    out.extend(open);
+    out
 }
 
 // LEDGER T4a | class S | the recogniser below, on sample lines | pair NONE (test code)
@@ -122,9 +159,22 @@ fn the_check_recognises_contact_and_nothing_else() {
         "git clone https://github.com/feschber/lan-mouse.git",
         "  - uses: actions/checkout@v4 # repository: feschber/lan-mouse",
         "        repository: feschber/lan-mouse",
+        // Every remote, so the upstream one on a clone that has it.
+        "git fetch --all --quiet 2>/dev/null || true",
+        "git -C \"$repo\" pull --all",
+        "git fetch --multiple origin other",
+        "git remote update",
     ] {
         assert!(contacts_upstream(line).is_some(), "missed: {line}");
     }
+    // A command continued onto the next line is read as one.
+    assert_eq!(
+        commands("git fetch \\\n  upstream --quiet\necho done"),
+        vec![
+            (1, "git fetch    upstream --quiet".to_owned()),
+            (3, "echo done".to_owned())
+        ]
+    );
     for line in [
         "BASE=$(git merge-base HEAD upstream/main)",
         "git -C \"$repo\" fetch --quiet",
@@ -152,12 +202,9 @@ fn no_tracked_script_contacts_the_upstream_project() {
             continue;
         }
         read += 1;
-        for (n, line) in text.lines().enumerate() {
-            if is_comment(line) {
-                continue;
-            }
-            if let Some(why) = contacts_upstream(line) {
-                found.push(format!("{path}:{}: {why}: {}", n + 1, line.trim()));
+        for (n, command) in commands(&text) {
+            if let Some(why) = contacts_upstream(&command) {
+                found.push(format!("{path}:{n}: {why}: {}", command.trim()));
             }
         }
     }
