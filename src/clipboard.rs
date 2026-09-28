@@ -16,7 +16,9 @@
 //! takes it ([`clipboard_is_taken`]); a machine whose pairings take no
 //! clipboard from it never looks at it. A copy the app that made it marked
 //! concealed or transient, as password managers do, is not read and never
-//! sent.
+//! sent. A copy is sent only once two polls in a row find the same text at
+//! the same count of copies, unmarked: an app may add its mark after the
+//! text, and on macOS that does not move the count.
 //!
 //! Wired into the service: local changes are broadcast over dedicated
 //! ephemeral clipboard QUIC streams to the peers the pairing shares them with,
@@ -35,8 +37,9 @@ use tokio::sync::Notify;
 use tokio::task::{JoinHandle, spawn_local};
 use tokio::time::{MissedTickBehavior, interval};
 
-/// How often the local clipboard is polled for changes. 500 ms is well below
-/// human copy→switch-window→paste latency while costing one cheap read/sec.
+/// How often the local clipboard is polled for changes. A copy is sent on
+/// the second poll that finds it, so 0.5 to 1 s after it is made: below the
+/// time it takes a person to copy, move to the other machine and paste.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// A change observed on the *local* clipboard, to be forwarded to the peer.
@@ -47,7 +50,8 @@ pub(crate) enum ClipboardEvent {
 
 /// What one read found on the machine's clipboard.
 pub(crate) enum Copied {
-    Text(String),
+    /// Text, with the count of copies it was read at.
+    Text(String, Option<i64>),
     /// A copy the app that made it marked as not to be shared: concealed or
     /// transient, as password managers mark theirs. Its text is not read.
     Private,
@@ -87,7 +91,7 @@ fn read(clipboard: &mut dyn SystemClipboard) -> Copied {
     if clipboard.generation() != before {
         return Copied::Changing;
     }
-    text.map_or(Copied::Nothing, Copied::Text)
+    text.map_or(Copied::Nothing, |text| Copied::Text(text, before))
 }
 
 /// Asked before every read: may the clipboard be read now?
@@ -188,6 +192,11 @@ impl Clipboard {
             // Whether the last poll read the clipboard. Until one does, `last`
             // says nothing about what is there now.
             let mut reading = false;
+            // Text the last poll found unmarked, with its count of copies. It
+            // is sent only when the next poll finds the same, still unmarked:
+            // an app writes its types one at a time, and may mark the copy
+            // private after the text is already there.
+            let mut settling: Option<(Option<i64>, String)> = None;
 
             let mut poll = interval(every);
             poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -200,6 +209,7 @@ impl Clipboard {
                                 log::info!("clipboard no longer read: no pairing takes it");
                             }
                             reading = false;
+                            settling = None;
                             continue;
                         }
                         let copied = read(clipboard.as_mut());
@@ -212,25 +222,35 @@ impl Clipboard {
                             log::info!("clipboard read: a pairing takes it");
                             reading = true;
                             last = match copied {
-                                Copied::Text(text) => Some(text),
+                                Copied::Text(text, _) => Some(text),
                                 _ => None,
                             };
                             continue;
                         }
                         match copied {
-                            Copied::Text(text) => {
-                                if last.as_deref() != Some(text.as_str()) {
-                                    last = Some(text.clone());
-                                    // Receiver gone => service shutting down.
-                                    if event_tx.send(ClipboardEvent::Changed(text)).is_err() {
-                                        break;
-                                    }
+                            Copied::Text(text, generation) => {
+                                if last.as_deref() == Some(text.as_str()) {
+                                    settling = None;
+                                    continue;
+                                }
+                                let seen = (generation, text);
+                                if settling.as_ref() != Some(&seen) {
+                                    settling = Some(seen);
+                                    continue;
+                                }
+                                settling = None;
+                                let text = seen.1;
+                                last = Some(text.clone());
+                                // Receiver gone => service shutting down.
+                                if event_tx.send(ClipboardEvent::Changed(text)).is_err() {
+                                    break;
                                 }
                             }
                             Copied::Private => {
                                 // Forget the baseline so the next ordinary copy is
                                 // sent even when it repeats the one before.
                                 last = None;
+                                settling = None;
                                 crate::debounce!(
                                     PREV_PRIVATE_COPY_LOG,
                                     PRIVATE_COPY_LOG_DEBOUNCE,
@@ -244,8 +264,11 @@ impl Clipboard {
                             // the baseline so re-copying the SAME text after an
                             // intervening empty/non-text state is still seen as a
                             // change (leaving `last` set would suppress it).
-                            Copied::Nothing => last = None,
-                            Copied::Changing => {}
+                            Copied::Nothing => {
+                                last = None;
+                                settling = None;
+                            }
+                            Copied::Changing => settling = None,
                         }
                     }
                     _ = inbox.ready.notified() => {
@@ -1510,6 +1533,9 @@ mod the_clipboard_is_read_only_when_it_may_be {
         generation: i64,
         /// A copy lands while the text is being read, once.
         copied_while_read: Option<String>,
+        /// Once the text is read, the app that copied it marks it private,
+        /// as it adds its next type: the count of copies does not move.
+        marked_after_read: bool,
         texts_read: usize,
         written: Vec<String>,
     }
@@ -1540,6 +1566,9 @@ mod the_clipboard_is_read_only_when_it_may_be {
             let text = board.text.clone();
             if let Some(next) = board.copied_while_read.take() {
                 board.copy(&next, true);
+            }
+            if std::mem::take(&mut board.marked_after_read) {
+                board.private = true;
             }
             text
         }
@@ -1668,6 +1697,39 @@ mod the_clipboard_is_read_only_when_it_may_be {
                 sent_within(&mut clipboard, ARRIVES_WITHIN).await.as_deref(),
                 Some("the same text"),
                 "an ordinary copy after a concealed one was not sent"
+            );
+        });
+    }
+
+    // LEDGER T22425 | class B | 1 return value: Clipboard::changed, driven by Clipboard::spawn's poll over a stand-in clipboard
+    #[test]
+    fn a_copy_marked_after_its_text_is_written_is_not_sent() {
+        run_local(async {
+            let board = Rc::new(RefCell::new(Board::default()));
+            let wanted = Rc::new(Cell::new(true));
+            let (mut clipboard, asked) = task(&board, &wanted);
+            polls(&asked, 2).await;
+
+            // The text lands first and the mark after it, as one app writes
+            // them; a poll between the two sees the text unmarked.
+            {
+                let mut board = board.borrow_mut();
+                board.copy("a password", false);
+                board.marked_after_read = true;
+            }
+            polls(&asked, 5).await;
+            assert!(board.borrow().private, "the mark never landed");
+            assert_eq!(
+                sent_within(&mut clipboard, NEVER_WITHIN).await,
+                None,
+                "a copy marked after its text was read was sent"
+            );
+
+            board.borrow_mut().copy("ordinary", false);
+            assert_eq!(
+                sent_within(&mut clipboard, ARRIVES_WITHIN).await.as_deref(),
+                Some("ordinary"),
+                "an ordinary copy was not sent"
             );
         });
     }
