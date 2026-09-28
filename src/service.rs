@@ -387,7 +387,7 @@ fn drop_untrusted_pins(
                 // `is_known`, not `has_live_lease`: a lapsed lease must keep
                 // its pin, or a device that only needed renewing is stranded on
                 // an address we forgot.
-                .filter(|fp| !trust.is_known(fp))
+                .filter(|fp| !trust.has_live_lease(fp))
                 .map(|fp| (h, fp))
         })
         .collect();
@@ -2070,11 +2070,13 @@ impl Service {
     }
 
     /// What this machine holds for `fp`, for a line about refusing it, when
-    /// it holds a pairing with it.
+    /// it holds a pairing in force with it. One whose pairing lapsed knocks
+    /// as a stranger and pairs again through add device, so it is told as
+    /// one.
     fn paired_here(&self, fp: &str) -> Option<crate::prompt_gate::PairedHere> {
         let (name, controlled_from_here) = {
             let trust = self.trust.read().expect("lock");
-            if !trust.is_known(fp) {
+            if !trust.has_live_lease(fp) {
                 return None;
             }
             (trust.label(fp).unwrap_or_default(), trust.we_may_drive(fp))
