@@ -362,16 +362,14 @@ pub struct Config {
     cert_path: PathBuf,
     /// path to the config file used
     config_path: PathBuf,
-    /// path to config directory (parent of above)
-    config_dir: PathBuf,
     /// the (optional) toml config and it's path
     config_toml: Option<ConfigToml>,
     /// `[[clients]]` as this process last read them from the file or wrote
     /// them to it: what a save compares memory against to find what the
     /// daemon changed, which is all it may write (#7).
     synced: Vec<ConfigClient>,
-    // filesystem watcher
-    watcher: notify::RecommendedWatcher,
+    // filesystem watcher, on a thread of its own
+    watcher: Watching,
     // channel for filesystem events
     watch_rx: tokio::sync::mpsc::Receiver<Result<notify::Event, notify::Error>>,
 }
@@ -667,6 +665,20 @@ impl Config {
     }
 
     fn with_args(args: Args) -> Result<Self, ConfigError> {
+        Self::with_args_watched(args, |on_event| {
+            Ok(Box::new(RecommendedWatcher::new(
+                on_event,
+                notify::Config::default(),
+            )?))
+        })
+    }
+
+    /// [`Self::with_args`], watching with the watcher `watcher` makes from
+    /// the handler it is given.
+    fn with_args_watched(
+        args: Args,
+        watcher: impl FnOnce(OnEvent) -> Result<Box<dyn Watcher + Send>, notify::Error>,
+    ) -> Result<Self, ConfigError> {
         // --config <file> overrules default location
         let config_path = args
             .config
@@ -719,39 +731,45 @@ impl Config {
 
         let (tx, watch_rx) = tokio::sync::mpsc::channel(16);
         let watched = config_path.clone();
-        let watcher = RecommendedWatcher::new(
-            move |res| forward_watch_event(&tx, &watched, res),
-            notify::Config::default(),
-        )?;
+        let mut watcher = watcher(Box::new(move |res| forward_watch_event(&tx, &watched, res)))?;
+        // Armed here the first time, so a directory that cannot be watched
+        // fails the start; the thread takes every later order.
+        watcher.watch(&config_dir, notify::RecursiveMode::NonRecursive)?;
+        let watcher = Watching::keep(watcher, config_dir)?;
         let mut config = Config {
             args,
             cert_path,
             config_path,
-            config_dir,
             config_toml,
             synced: vec![],
             watcher,
             watch_rx,
         };
         config.synced = config.clients();
-        config.watch()?;
         Ok(config)
     }
 
+    /// Order the watcher armed. Returns at once: the watcher's thread does it.
     fn watch(&mut self) -> Result<(), notify::Error> {
-        self.watcher
-            .watch(&self.config_dir, notify::RecursiveMode::NonRecursive)?;
-        Ok(())
+        self.watcher.order(Arm::On)
     }
 
+    /// Order the watcher disarmed. Returns at once, like [`Self::watch`].
     fn unwatch(&mut self) -> Result<(), notify::Error> {
-        self.watcher.unwatch(&self.config_dir)?;
-        Ok(())
+        self.watcher.order(Arm::Off)
     }
 
     pub async fn changed(&mut self) -> Result<(), notify::Error> {
         loop {
-            let event = self.watch_rx.recv().await.expect("channel closed");
+            let Some(event) = self.watch_rx.recv().await else {
+                // The watcher's thread is gone, and with it every event.
+                log::error!(
+                    "the config watcher stopped: edits to {:?} are read again \
+                     only when hops restarts",
+                    self.config_path
+                );
+                return std::future::pending().await;
+            };
             let event = match event {
                 Ok(event) => event,
                 Err(e) => {
@@ -997,6 +1015,13 @@ impl Config {
         // process ("4 reloads before, 0 after"), and the fix at the time added
         // the re-arm to the write-error path only. The `?` on create_dir_all
         // above it still returned early with the watcher off.
+        //
+        // Both are orders to the watcher's thread and return at once: done
+        // here, on macOS they waited on the system's file-event service,
+        // which under load held the daemon loop for seconds per save. So the
+        // unwatch no longer lands before the write, and the daemon can read
+        // its own save back: it reads the same config, or one that also holds
+        // an edit not yet read, which a reload then takes in.
         let _ = self.unwatch();
         let result = self.write_config_file(&ours);
         let _ = self.watch();
@@ -1040,6 +1065,59 @@ impl Config {
     }
 }
 
+/// What a watcher is handed to pass each event on to the daemon loop.
+type OnEvent = Box<dyn FnMut(notify::Result<notify::Event>) + Send>;
+
+/// What [`Config::watch`] and [`Config::unwatch`] order the watcher to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Arm {
+    On,
+    Off,
+}
+
+/// The config directory's watcher, kept on a thread of its own so that no
+/// order to it waits: arming or disarming it asks the operating system,
+/// which can take seconds, and the daemon loop that saves the config also
+/// carries the input.
+#[derive(Debug)]
+struct Watching {
+    orders: std::sync::mpsc::Sender<Arm>,
+}
+
+impl Watching {
+    /// Keep `watcher`, armed on `dir`, on a new thread that carries out
+    /// each order in turn. The thread ends, dropping the watcher there too,
+    /// when this is dropped.
+    fn keep(mut watcher: Box<dyn Watcher + Send>, dir: PathBuf) -> io::Result<Watching> {
+        let (orders, taken) = std::sync::mpsc::channel::<Arm>();
+        std::thread::Builder::new()
+            .name("hops config watcher".to_string())
+            .spawn(move || {
+                for arm in taken {
+                    match arm {
+                        Arm::On => {
+                            if let Err(e) = watcher.watch(&dir, notify::RecursiveMode::NonRecursive)
+                            {
+                                log::warn!("the config watcher could not watch {dir:?}: {e}");
+                            }
+                        }
+                        Arm::Off => {
+                            let _ = watcher.unwatch(&dir);
+                        }
+                    }
+                }
+            })?;
+        Ok(Watching { orders })
+    }
+
+    /// Hand `arm` to the watcher's thread, never waiting for it.
+    fn order(&self, arm: Arm) -> Result<(), notify::Error> {
+        self.orders
+            .send(arm)
+            .map_err(|_| notify::Error::generic("the config watcher's thread is gone"))
+    }
+}
+
 /// Whether `event` can mean the config file at `config` was replaced, written
 /// or removed.
 fn changes_config(event: &notify::Event, config: &Path) -> bool {
@@ -1052,9 +1130,10 @@ fn changes_config(event: &notify::Event, config: &Path) -> bool {
 
 /// Hand a watcher event to the daemon loop. Runs on the watcher's thread.
 ///
-/// It must never wait for the loop: the loop calls `unwatch` around every
+/// It must never wait for the loop: `unwatch` is ordered around every
 /// config write, and on Linux `unwatch` waits for this thread, so a thread
-/// blocked on a full channel stopped the daemon for good (#227). Only events
+/// blocked on a full channel once stopped the daemon for good (#227), and
+/// would now leave the watcher dead. Only events
 /// that can change the config take a slot, and when the channel is full the
 /// event is dropped: every event already queued re-reads the file when it is
 /// handled, so the latest content is still picked up. Errors are passed on
@@ -1480,8 +1559,8 @@ mod fail_closed_tests {
 mod watcher_rearm_tests {
     //! A failed write must never leave the config watcher dead.
     //!
-    //! #85/#90: the watcher is unwatched for the duration of a `write_back` so
-    //! hops does not react to its own write. If the write fails, the re-arm has
+    //! #85/#90: the watcher is unwatched around a `write_back`, once so hops
+    //! did not react to its own write. If the write fails, the re-arm has
     //! to happen anyway — otherwise the daemon stops noticing hand-edits for the
     //! rest of the process's life. That was measured once as "4 reloads before,
     //! 0 after", followed by the daemon overwriting three hand-edits from stale
@@ -1555,7 +1634,7 @@ mod watcher_rearm_tests {
 #[cfg(test)]
 mod the_watcher_never_blocks {
     //! The watcher thread hands events to the daemon loop, and `unwatch`, which
-    //! the loop calls around every config write, waits for that thread. So the
+    //! is ordered around every config write, waits for that thread. So the
     //! thread must never wait for the loop: a burst of other files written in
     //! the config directory once filled the channel, blocked the thread, and
     //! with it the daemon, for good (#227).
@@ -1639,6 +1718,166 @@ mod the_watcher_never_blocks {
             event(EventKind::Create(CreateKind::File), &config),
         );
         assert!(rx.try_recv().is_ok(), "a new config file was not passed on");
+    }
+}
+
+#[cfg(test)]
+mod a_save_never_waits_for_the_watcher {
+    //! Arming or disarming the watcher asks the operating system, and on
+    //! macOS under load each call took seconds. Every save disarmed and
+    //! re-armed it on the daemon loop, which also carries the input and the
+    //! pairing comparison, so one save could hold both past the comparison's
+    //! ten second step.
+    use super::*;
+    use std::sync::{Arc, Condvar, Mutex, mpsc};
+    use std::time::{Duration, Instant};
+
+    /// Far longer than a save takes, however loaded the run.
+    const DEADLINE: Duration = Duration::from_secs(30);
+
+    #[derive(Default)]
+    struct Gate {
+        open: bool,
+        calls: Vec<Arm>,
+    }
+
+    /// The calls a watcher took, each held until the gate is open.
+    #[derive(Clone, Default)]
+    struct Busy(Arc<(Mutex<Gate>, Condvar)>);
+
+    impl Busy {
+        fn call(&self, arm: Arm) {
+            let (gate, changed) = &*self.0;
+            let mut g = gate.lock().expect("gate");
+            g.calls.push(arm);
+            changed.notify_all();
+            while !g.open {
+                g = changed.wait(g).expect("gate");
+            }
+        }
+
+        fn set_open(&self, open: bool) {
+            let (gate, changed) = &*self.0;
+            gate.lock().expect("gate").open = open;
+            changed.notify_all();
+        }
+
+        /// The calls taken once there are `n`, or at the deadline.
+        fn calls(&self, n: usize) -> Vec<Arm> {
+            let (gate, changed) = &*self.0;
+            let end = Instant::now() + DEADLINE;
+            let mut g = gate.lock().expect("gate");
+            while g.calls.len() < n && Instant::now() < end {
+                g = changed
+                    .wait_timeout(g, end.saturating_duration_since(Instant::now()))
+                    .expect("gate")
+                    .0;
+            }
+            g.calls.clone()
+        }
+    }
+
+    struct BusyWatcher(Busy);
+
+    impl Watcher for BusyWatcher {
+        fn new<F: notify::EventHandler>(_: F, _: notify::Config) -> notify::Result<Self> {
+            Err(notify::Error::generic("made by the test"))
+        }
+        fn watch(&mut self, _: &Path, _: notify::RecursiveMode) -> notify::Result<()> {
+            self.0.call(Arm::On);
+            Ok(())
+        }
+        fn unwatch(&mut self, _: &Path) -> notify::Result<()> {
+            self.0.call(Arm::Off);
+            Ok(())
+        }
+        fn kind() -> notify::WatcherKind {
+            notify::WatcherKind::NullWatcher
+        }
+    }
+
+    /// A config in a scratch directory, watched by a [`BusyWatcher`] whose
+    /// gate is open for the first arming and closed after it.
+    fn watched(tag: &str) -> (PathBuf, PathBuf, Config, Busy) {
+        let dir = std::env::temp_dir().join(format!("hops-watch-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("a scratch directory");
+        let path = dir.join("config.toml");
+        fs::write(&path, "port = 4343\n").expect("a config");
+        let args = Args::parse_from([
+            "hops".as_ref(),
+            "--config".as_ref(),
+            path.as_os_str(),
+            "--cert-path".as_ref(),
+            dir.join("cert.pem").as_os_str(),
+        ]);
+        let busy = Busy::default();
+        busy.set_open(true);
+        let watcher = busy.clone();
+        let config = Config::with_args_watched(args, move |_| Ok(Box::new(BusyWatcher(watcher))))
+            .expect("the config loads");
+        busy.set_open(false);
+        (dir, path, config, busy)
+    }
+
+    /// Save on a thread of its own; what the save returned, or `None` if it
+    /// had not returned by the deadline.
+    fn saved(mut config: Config) -> Option<Result<(), io::Error>> {
+        let (done, returned) = mpsc::channel();
+        std::thread::spawn(move || {
+            let r = config.write_back();
+            let _ = done.send(r);
+            // Dropped here, with the watcher's thread left to end.
+        });
+        returned.recv_timeout(DEADLINE).ok()
+    }
+
+    // LEDGER W1 | class B | 2 thread + struct state: Config::write_back against a watcher that does not answer
+    #[test]
+    fn a_save_returns_while_the_watcher_is_still_busy() {
+        let (dir, path, config, busy) = watched("busy");
+        let returned = saved(config);
+        busy.set_open(true);
+        let calls = busy.calls(3);
+        let written = fs::read_to_string(&path).unwrap_or_default();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            returned.is_some(),
+            "a config save waited for the file watcher, which can take seconds: \
+             the daemon loop that saves also carries the input"
+        );
+        assert!(
+            matches!(returned, Some(Ok(()))) && written.contains("4343"),
+            "the save failed: {returned:?}, file: {written:?}"
+        );
+        assert_eq!(
+            calls,
+            [Arm::On, Arm::Off, Arm::On],
+            "the watcher was not disarmed and re-armed, in that order, once the save \
+             was done"
+        );
+    }
+
+    // LEDGER W2 | class B | 2 thread + struct state: the watcher's calls after a save that failed
+    #[test]
+    fn a_save_that_fails_leaves_the_watcher_armed() {
+        let (dir, path, config, busy) = watched("failed");
+        busy.set_open(true);
+        // Not a config: the save leaves it as it is and fails (#85, #90).
+        fs::write(&path, "port = [\n").expect("a broken config");
+        let returned = saved(config);
+        let calls = busy.calls(3);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            matches!(returned, Some(Err(_))),
+            "precondition: the save of a broken config fails: {returned:?}"
+        );
+        assert_eq!(
+            calls.last(),
+            Some(&Arm::On),
+            "a save that failed left the config watcher disarmed, so edits are never \
+             read again: {calls:?}"
+        );
     }
 }
 
