@@ -443,6 +443,22 @@ impl InputEmulation {
             .is_some_and(|p| !p.is_empty())
     }
 
+    /// Whether `handle` holds a key or a button down on this machine.
+    pub fn holds(&self, handle: EmulationHandle) -> bool {
+        self.has_pressed_keys(handle)
+            || self
+                .pressed_buttons
+                .get(&handle)
+                .is_some_and(|p| !p.is_empty())
+    }
+
+    /// Whether any handle holds a key or a button down on this machine. While
+    /// one does, the backend may repeat the key with no event arriving.
+    pub fn holds_anything(&self) -> bool {
+        self.pressed_keys.values().any(|p| !p.is_empty())
+            || self.pressed_buttons.values().any(|p| !p.is_empty())
+    }
+
     /// update the pressed_keys for the given handle
     /// returns whether the event should be processed
     fn update_pressed_keys(&mut self, handle: EmulationHandle, key: u32, state: u8) -> bool {

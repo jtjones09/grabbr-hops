@@ -2058,7 +2058,10 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
     //! (#167); and `EnableClipboard`, which turns a paired machine's
     //! clipboard back on in the directions it already drives. The daemon
     //! refuses all three while a peer is driving this machine, so the machine
-    //! holding the keyboard and pointer cannot click its own approval.
+    //! holding the keyboard and pointer cannot click its own approval. Driven
+    //! means crossed onto this machine or holding a key or button down here,
+    //! and for a quiet window after the peer's last input, which includes a
+    //! button let go for it when its session ends: that up completes a click.
     //!
     //! **Why it is a limit and not a boundary.** Anything running as the user
     //! can read the IPC token, send all three, open add device and add a device to
@@ -2080,7 +2083,7 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
     use hops_ipc::{ClientHandle, FrontendEvent, FrontendRequest, Position};
     use hops_proto::ProtoEvent;
     use input_emulation::recording::{Recorded, Recording};
-    use input_event::{Event, PointerEvent};
+    use input_event::{BTN_LEFT, Event, KeyboardEvent, PointerEvent, scancode};
 
     use crate::service::in_process::{
         DEADLINE, Daemon, compare_number, prompt_from, trusting, until_paired,
@@ -2272,6 +2275,137 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
         );
     }
 
+    /// The daemon's quiet window: requests are refused for this long after
+    /// a peer's last input.
+    const QUIET: Duration = Duration::from_secs(2);
+
+    // LEDGER DR-1 | class B | 5 process-in-test + 1 struct state: FrontendRequest over the daemon's IPC socket, a peer holding a key and then a button over loopback QUIC, the daemon's trust store
+    /// A peer that holds a key or a button is driving this machine however
+    /// long ago it last sent anything. A held key repeats here with nothing
+    /// more sent; a held button comes up when the peer leaves, completing a
+    /// click on whatever it was pressed over. Both keep turning a clipboard on
+    /// refused, and so the other two widening requests, which share the check.
+    #[test]
+    fn a_held_key_or_a_button_let_go_as_the_peer_leaves_keeps_widening_refused() {
+        run_local(async {
+            let (desk, laptop) = (machine(), machine());
+            let tables = format!(
+                "[authorized_fingerprints]\n\"{}\" = \"desk mac\"\n\"{}\" = \"laptop\"\n",
+                desk.fingerprint, laptop.fingerprint
+            );
+            let recording = Recording::new();
+            let daemon = Daemon::start("held", &tables, recording.backend()).await;
+            let (ours, port, trust, ipc) = (
+                daemon.fingerprint(),
+                daemon.port(),
+                daemon.trust(),
+                daemon.ipc(),
+            );
+            let laptop_fp = laptop.fingerprint.clone();
+            let recording = &recording;
+            let injected = |event: Event| {
+                move || {
+                    recording
+                        .calls()
+                        .iter()
+                        .any(|c| matches!(c, Recorded::Consume(e, _) if *e == event))
+                }
+            };
+            let key = |state| {
+                Event::Keyboard(KeyboardEvent::Key {
+                    time: 0,
+                    key: scancode::Linux::KeyA as u32,
+                    state,
+                })
+            };
+            let button = |state| {
+                Event::Pointer(PointerEvent::Button {
+                    time: 0,
+                    button: BTN_LEFT,
+                    state,
+                })
+            };
+
+            daemon
+                .run_while(async {
+                    use crate::test_harness::wait_until;
+                    use FrontendRequest as R;
+                    let mut app = ipc.connect().await;
+                    app.exchange(&[R::DisableClipboard(laptop_fp.clone())])
+                        .await;
+                    let enable = [R::EnableClipboard(laptop_fp.clone())];
+                    let clipboard_on = || trust.read().expect("lock").clipboard_from(&laptop_fp);
+                    assert!(!clipboard_on(), "precondition: the clipboard is off");
+
+                    let driver = dialer(&desk, trusting(&desk, &ours), port, Position::Left);
+                    driver.until_alive().await;
+                    driver
+                        .send(ProtoEvent::Enter(hops_proto::Position::Right))
+                        .await;
+                    // Input sent before the crossing lands is dropped, so the
+                    // key goes down again until it is injected.
+                    let deadline = tokio::time::Instant::now() + DEADLINE;
+                    while !injected(key(1))() {
+                        assert!(
+                            tokio::time::Instant::now() < deadline,
+                            "the key-down was never injected"
+                        );
+                        driver.send(ProtoEvent::Input(key(1))).await;
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+
+                    // Held past the quiet window, with nothing more sent.
+                    tokio::time::sleep(QUIET + Duration::from_millis(500)).await;
+                    let events = app.exchange(&enable).await;
+                    assert!(
+                        !clipboard_on() && refusals(&events).len() == 1,
+                        "a peer holding a key down here turned a clipboard on once \
+                         its last event was older than the quiet window. The key \
+                         repeats here with nothing more sent; the peer is still \
+                         driving. The app was told {:?}",
+                        refusals(&events)
+                    );
+
+                    // Pressed over the approval, held past the quiet window,
+                    // then let go by the peer leaving.
+                    driver.send(ProtoEvent::Input(key(0))).await;
+                    driver.send(ProtoEvent::Input(button(1))).await;
+                    wait_until("the button goes down", DEADLINE, injected(button(1))).await;
+                    tokio::time::sleep(QUIET + Duration::from_millis(500)).await;
+                    driver.send(ProtoEvent::Leave(0)).await;
+                    wait_until("the button is let go", DEADLINE, injected(button(0))).await;
+                    let let_go = tokio::time::Instant::now();
+                    let events = app.exchange(&enable).await;
+                    // Only a request handled inside the window after the let-go
+                    // says anything; a machine too loaded for that is not a
+                    // failure of the check.
+                    if let_go.elapsed() < QUIET {
+                        assert!(
+                            !clipboard_on() && refusals(&events).len() == 1,
+                            "the button a peer held came up as it left, completing a \
+                             click, and a clipboard was turned on right after it: the \
+                             let-go was not counted as the peer's input. The app was \
+                             told {:?}",
+                            refusals(&events)
+                        );
+                    }
+
+                    // And once the quiet window has passed, it is honoured.
+                    let deadline = tokio::time::Instant::now() + DEADLINE;
+                    while !clipboard_on() {
+                        assert!(
+                            tokio::time::Instant::now() < deadline,
+                            "turning a clipboard on was still refused long after the \
+                             peer left and let go of everything"
+                        );
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        app.exchange(&enable).await;
+                    }
+                })
+                .await;
+        });
+    }
+
     // LEDGER EN-3 | class B | 5 process-in-test + 1 struct state: FrontendRequest over the daemon's IPC socket, a peer driving it over loopback QUIC, the daemon's trust store
     #[test]
     fn only_approving_a_prompt_or_turning_the_clipboard_on_widens_trust_and_neither_while_driven() {
@@ -2410,8 +2544,11 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
                          that does as its own grant refused. The app was told {refused:?}"
                     );
 
-                    // No longer driven: once the quiet window has passed, a
-                    // widening request on a third pairing is honoured.
+                    // No longer driven: once the peer has left and the quiet
+                    // window has passed, a widening request on a third pairing
+                    // is honoured. A peer crossed onto this machine drives it
+                    // until it leaves, however long it is still.
+                    driver.send(ProtoEvent::Leave(0)).await;
                     let deadline = tokio::time::Instant::now() + DEADLINE;
                     while !trust.read().expect("lock").clipboard_from(&laptop_fp) {
                         assert!(

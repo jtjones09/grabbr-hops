@@ -2033,6 +2033,13 @@ impl Service {
     /// the only usable check is one this machine makes against state only it
     /// holds — and it already knows when it is being driven.
     ///
+    /// Driven means a peer is crossed onto this machine or holds a key or
+    /// button down here, and for `QUIET` after its last input, after what it
+    /// held was let go, or after it left. Its last event alone is not enough:
+    /// a held key repeats here with nothing more sent, and a held button comes
+    /// up at the end of its session, completing a click (see
+    /// `emulation::Driven`).
+    ///
     /// Deliberately NOT applied to revocation: refusing to let you revoke while a
     /// peer is driving you would block the one action you most need in exactly
     /// the moment you need it.

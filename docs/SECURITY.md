@@ -45,10 +45,11 @@ and how to recover. How to report a vulnerability is in
   machine's clipboard on, and open add device and add a machine itself, so it
   can pair a machine of its choosing. It can also read the keys and re-sign
   the trust file. hops refuses to approve, answer a number or turn a
-  clipboard on while another machine is controlling this one, and for two
-  seconds after its last input, so that machine cannot click its own
-  approval. That machine can still start such a program, which acts once it
-  stops sending input.
+  clipboard on while another machine is controlling this one or holds a key
+  or button down on it, and for two seconds after its last input or after it
+  leaves, counting a button let go as it leaves as its input, so that
+  machine cannot click its own approval. That machine can still start such a program, which acts
+  once it has left.
 - **Adding the wrong machine.** The number proves that the two screens are
   connected to each other, not that the other machine is the one meant.
   Check the name and address on the request before approving.
