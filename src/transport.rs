@@ -686,7 +686,8 @@ pub(crate) struct PeerClipboard {
     pub(crate) _place: Option<Place>,
 }
 
-/// At most this many transfers from one link wait here to be applied, ...
+/// At most this many transfers from one link wait here to be applied (per
+/// link: a peer linked more than once holds this on each), ...
 pub(crate) const QUEUED_PER_LINK: usize = 4;
 /// ... holding at most this many bytes between them. A transfer past either
 /// is dropped: only the latest copy matters, and a peer that sends faster

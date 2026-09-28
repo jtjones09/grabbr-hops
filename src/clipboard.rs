@@ -97,9 +97,21 @@ fn read(clipboard: &mut dyn SystemClipboard) -> Copied {
 /// Asked before every read: may the clipboard be read now?
 type Wanted = Box<dyn Fn() -> bool>;
 
+/// A daemon's [`Wanted`]: some pairing in `trust`, switched on in `clients`,
+/// takes the clipboard.
+fn taken_by(trust: Trust, clients: ClientManager) -> Wanted {
+    Box::new(move || clipboard_is_taken(&trust, &clients))
+}
+
 /// Whether some paired device, switched on here, takes this machine's
 /// clipboard: its lease grants clipboard-to now, and no device entry pinned to
 /// it is switched off. Nothing else would ever be sent what a read finds.
+///
+/// No link is named here: a switched-off entry not pinned to the pairing
+/// does not stop the read, while the send, which also checks the entry each
+/// link was dialled for, may then send what was read to no one. That is
+/// intended: reading a little too often is harmless, sending too widely is
+/// not.
 pub(crate) fn clipboard_is_taken(trust: &Trust, clients: &ClientManager) -> bool {
     let pairings = trust.read().expect("lock").pairings();
     pairings.iter().any(|(fp, caps)| {
@@ -141,7 +153,7 @@ impl Clipboard {
     /// The clipboard is read only while [`clipboard_is_taken`] holds for
     /// `trust` and `clients`.
     pub(crate) fn new(trust: Trust, clients: ClientManager) -> Self {
-        Self::for_pairings(trust, clients, POLL_INTERVAL, || {
+        Self::spawn(taken_by(trust, clients), POLL_INTERVAL, || {
             // A daemon a test runs in-process leaves the user's clipboard
             // alone, as one on a system without a clipboard does. AppKit's
             // cannot be read from tests running side by side either.
@@ -157,19 +169,6 @@ impl Clipboard {
                 }
             }
         })
-    }
-
-    /// The clipboard task on the clipboard `open` gives it, polled every
-    /// `every` while some pairing in `trust`, switched on in `clients`,
-    /// takes it.
-    fn for_pairings(
-        trust: Trust,
-        clients: ClientManager,
-        every: Duration,
-        open: impl FnOnce() -> Option<Box<dyn SystemClipboard>> + 'static,
-    ) -> Self {
-        let wanted = move || clipboard_is_taken(&trust, &clients);
-        Self::spawn(Box::new(wanted), every, open)
     }
 
     /// The clipboard task on the clipboard `open` gives it, polled every
@@ -1507,7 +1506,7 @@ mod clipboard_follows_the_switch {
 mod the_clipboard_is_read_only_when_it_may_be {
     //! The clipboard task on a stand-in clipboard: it reads nothing while no
     //! pairing takes the clipboard, and a copy its app marked as not to be
-    //! shared is neither read nor handed on (G8).
+    //! shared is neither read nor handed on.
 
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
@@ -1519,7 +1518,9 @@ mod the_clipboard_is_read_only_when_it_may_be {
     };
     use crate::trust::Caps;
 
-    use super::{Clipboard, ClipboardEvent, Copied, SystemClipboard, clipboard_is_taken, read};
+    use super::{
+        Clipboard, ClipboardEvent, Copied, SystemClipboard, clipboard_is_taken, read, taken_by,
+    };
 
     const EVERY: Duration = Duration::from_millis(5);
 
@@ -1659,6 +1660,16 @@ mod the_clipboard_is_read_only_when_it_may_be {
                 reads,
                 "the clipboard was still read after the last pairing stopped taking it"
             );
+
+            // What was copied while none took it is not sent once one does.
+            board.borrow_mut().copy("copied while off", false);
+            wanted.set(true);
+            polls(&asked, 5).await;
+            assert_eq!(
+                sent_within(&mut clipboard, NEVER_WITHIN).await,
+                None,
+                "a copy made while no pairing took the clipboard was sent when one did again"
+            );
         });
     }
 
@@ -1779,7 +1790,7 @@ mod the_clipboard_is_read_only_when_it_may_be {
         });
     }
 
-    // LEDGER T22424 | class B | 6 struct state: the stand-in clipboard's read count, driven by Clipboard::for_pairings over a real TrustStore and ClientManager; 1 return value: Clipboard::changed
+    // LEDGER T22424 | class B | 6 struct state: the stand-in clipboard's read count, driven by Clipboard::spawn on the daemon's gate (taken_by) over a real TrustStore and ClientManager; 1 return value: Clipboard::changed
     #[test]
     fn a_daemons_clipboard_is_read_once_a_pairing_takes_it_and_not_before() {
         run_local(async {
@@ -1787,20 +1798,26 @@ mod the_clipboard_is_read_only_when_it_may_be {
             let trust = trust(&me, &[&peer], Caps::OUTBOUND);
             let board = Rc::new(RefCell::new(Board::default()));
             let fake = Fake(board.clone());
-            let mut clipboard = Clipboard::for_pairings(
-                trust.clone(),
-                ClientManager::default(),
+            let gate = taken_by(trust.clone(), ClientManager::default());
+            let asked = Rc::new(Cell::new(0));
+            let counted = asked.clone();
+            let mut clipboard = Clipboard::spawn(
+                Box::new(move || {
+                    counted.set(counted.get() + 1);
+                    gate()
+                }),
                 EVERY,
                 move || Some(Box::new(fake) as Box<dyn SystemClipboard>),
             );
 
             board.borrow_mut().copy("copied with no clipboard", false);
-            assert_eq!(sent_within(&mut clipboard, NEVER_WITHIN).await, None);
+            polls(&asked, 5).await;
             assert_eq!(
                 board.borrow().texts_read,
                 0,
                 "the clipboard was read while the only pairing takes none"
             );
+            assert_eq!(sent_within(&mut clipboard, NEVER_WITHIN).await, None);
 
             let on = trust
                 .write()
@@ -1875,7 +1892,13 @@ mod the_marks_on_a_macos_copy {
             // SAFETY: a private pasteboard made above, released once.
             unsafe { objc2::msg_send![&*pasteboard, releaseGlobally] }
             if !written {
-                eprintln!("[clipboard] no pasteboard server (headless?)");
+                // Where there is no pasteboard to write to, nothing here is
+                // checked: CI must say so rather than pass.
+                assert!(
+                    std::env::var_os("CI").is_none(),
+                    "no pasteboard to write to: the marks were not checked"
+                );
+                eprintln!("[clipboard] no pasteboard server (headless?): marks not checked");
                 return;
             }
             assert_eq!(marked, private, "a copy with the type {kind}");

@@ -713,7 +713,9 @@ impl Service {
         // payloads into, each with its sender's fingerprint, plus the local
         // monitor/apply backend. Only a peer whose lease carries clipboard-from
         // reaches the channel, and each link holds a bounded share of it
-        // (transport::QUEUED_PER_LINK). The backend reads the clipboard only
+        // (transport::QUEUED_PER_LINK). The bound is per link, not per peer:
+        // a peer linked more than once holds a share on each. The backend
+        // reads the clipboard only
         // while some pairing, switched on, takes it.
         let (clipboard_in_tx, clipboard_in) = channel();
         let (refusals_tx, dial_refusals) = channel();
