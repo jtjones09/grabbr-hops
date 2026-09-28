@@ -668,7 +668,16 @@ async fn hold(
                 if let Some(refusal) = refusal {
                     let _ = context.refusals.send(refusal);
                 }
-                if matches!(e, DialBackError::NoAddress | DialBackError::NotAnswered) {
+                // Only the pinned machine, proven, answering at an address
+                // says the addresses are right. Anything else at them, even
+                // another hops, may hold an address the machine moved from.
+                let reached = matches!(
+                    e,
+                    DialBackError::Forgotten(_)
+                        | DialBackError::Refused(_)
+                        | DialBackError::NotTaken
+                );
+                if !reached {
                     look_up_again(&context, handle).await;
                 }
             }
@@ -727,11 +736,24 @@ mod tests {
     }
 
     async fn controller(me: &Machine, trust: Trust, controlled: &str) -> Controller {
+        let at = SocketAddr::from(([127, 0, 0, 1], 0));
+        controller_at(me, trust, controlled, at)
+            .await
+            .expect("listener")
+    }
+
+    /// A controlling machine as [`controller`] makes, listening at `at`.
+    async fn controller_at(
+        me: &Machine,
+        trust: Trust,
+        controlled: &str,
+        at: SocketAddr,
+    ) -> Option<Controller> {
         let (clipboard_tx, _) = channel();
         let (mut listener, port) =
-            LanMouseListener::bind_loopback(me.identity.clone(), trust.clone(), clipboard_tx)
+            LanMouseListener::bind_at(at, me.identity.clone(), trust.clone(), clipboard_tx)
                 .await
-                .expect("listener");
+                .ok()?;
         let mut dialled_in: Receiver<DialledIn> = listener.take_dialled_in().expect("once");
         // Never dialled by this machine: nothing listens at port 9.
         let dialer = dialer(me, trust, 9, hops_ipc::Position::Right);
@@ -748,12 +770,12 @@ mod tests {
                 seen.borrow_mut().push(taken);
             }
         });
-        Controller {
+        Some(Controller {
             port,
             dialer,
             adopted,
             _listener: listener,
-        }
+        })
     }
 
     impl Controller {
@@ -904,16 +926,19 @@ mod tests {
 
     /// The controlled machine `c`, holding a device for the controlling
     /// machine `k` at `hostname` and the port `k` listens on, pinned to it,
-    /// with the addresses `resolved` as the name's last lookup found. Its
-    /// held links, and what it tells the service.
+    /// with the addresses `resolved` as the name's last lookup found, and
+    /// letting `k` and each of `also` drive it. Its held links, and what it
+    /// tells the service.
     async fn holding(
         c: &Machine,
         k: &Machine,
+        also: &[&Machine],
         port: u16,
         hostname: &str,
         resolved: Vec<IpAddr>,
     ) -> (DialBack, Receiver<DialRefusal>, LanMouseListener) {
-        let c_trust = trust(c, &[k], Caps::INBOUND);
+        let drivers: Vec<&Machine> = std::iter::once(k).chain(also.iter().copied()).collect();
+        let c_trust = trust(c, &drivers, Caps::INBOUND);
         let clients = ClientManager::default();
         let handle = clients.add_client();
         clients.set_hostname(handle, Some(hostname.to_string()));
@@ -958,11 +983,88 @@ mod tests {
                 let k =
                     controller(&k_m, trust(&k_m, &[&c_m], Caps::OUTBOUND), &c_m.fingerprint).await;
                 let (mut dial_back, _refusals, _listener) =
-                    holding(&c_m, &k_m, k.port, "localhost", resolved).await;
+                    holding(&c_m, &k_m, &[], k.port, "localhost", resolved).await;
                 dial_back.reconcile(false);
                 wait_until(case, HELD_WITHIN, || k.adopted.borrow().contains(&true)).await;
                 dial_back.stop_all();
             }
+
+            // The address it moved from now answers as another machine this
+            // one lets drive it. That proves only that the pinned machine is
+            // not there, so the name is looked up again all the same.
+            let (k_m, other_m, c_m) = (machine(), machine(), machine());
+            let k = controller(&k_m, trust(&k_m, &[&c_m], Caps::OUTBOUND), &c_m.fingerprint).await;
+            let (_other, stale) = elsewhere_on_loopback(&other_m, &c_m, k.port).await;
+            let (mut dial_back, mut refusals, _listener) =
+                holding(&c_m, &k_m, &[&other_m], k.port, "127.0.0.1", vec![stale]).await;
+            dial_back.reconcile(false);
+            let told = next_within(&mut refusals, HELD_WITHIN).await;
+            assert!(
+                matches!(&told, Some(DialRefusal::NotThePinnedMachine { seen, .. })
+                    if seen.iter().all(|(_, fp)| *fp == other_m.fingerprint)),
+                "precondition: the old address did not answer as the other machine: {told:?}"
+            );
+            wait_until(
+                "a link to the machine whose old address another machine took",
+                HELD_WITHIN,
+                || k.adopted.borrow().contains(&true),
+            )
+            .await;
+            dial_back.stop_all();
+        });
+    }
+
+    /// Another controlling machine, `me`, listening at `port` on a loopback
+    /// address other than 127.0.0.1, and that address: `::1`, or
+    /// 127.0.0.2 on a host with no IPv6 loopback.
+    async fn elsewhere_on_loopback(
+        me: &Machine,
+        controlled: &Machine,
+        port: u16,
+    ) -> (Controller, IpAddr) {
+        for ip in [
+            IpAddr::from(std::net::Ipv6Addr::LOCALHOST),
+            IpAddr::from([127, 0, 0, 2]),
+        ] {
+            let store = trust(me, &[controlled], Caps::OUTBOUND);
+            let at = SocketAddr::new(ip, port);
+            if let Some(it) = controller_at(me, store, &controlled.fingerprint, at).await {
+                return (it, ip);
+            }
+        }
+        panic!("precondition: no loopback address but 127.0.0.1 to listen on");
+    }
+
+    // LEDGER T35 | class B | 6 struct state: the DialRefusal DialBack's held dial sends the service
+    /// A name that does not resolve for a while says nothing while the
+    /// addresses found before are still there to dial: only a device with
+    /// none at all cannot be dialled.
+    #[test]
+    fn a_name_that_does_not_resolve_says_nothing_while_there_is_an_address_to_dial() {
+        run_local(async {
+            // The address answers as another machine, so each dial fails and
+            // is told, and the name is looked up again after each.
+            let (k, other_m, c) = (machine(), machine(), machine());
+            let (_other, port) = {
+                let store = trust(&other_m, &[&c], Caps::OUTBOUND);
+                let other = controller(&other_m, store, &c.fingerprint).await;
+                let port = other.port;
+                (other, port)
+            };
+            let at = vec![IpAddr::from([127, 0, 0, 1])];
+            let (mut dial_back, mut refusals, _listener) =
+                holding(&c, &k, &[&other_m], port, "no-such-machine.invalid", at).await;
+            dial_back.reconcile(false);
+            // Two dials, and the lookup after the first between them.
+            for dial in ["first", "second"] {
+                let told = next_within(&mut refusals, HELD_WITHIN).await;
+                assert!(
+                    matches!(&told, Some(DialRefusal::NotThePinnedMachine { .. })),
+                    "after the {dial} dial, with an address still to dial, the person was told: \
+                     {told:?}"
+                );
+            }
+            dial_back.stop_all();
         });
     }
 
@@ -975,7 +1077,7 @@ mod tests {
         run_local(async {
             let (k, c) = (machine(), machine());
             let (mut dial_back, mut refusals, _listener) =
-                holding(&c, &k, 9, "no-such-machine.invalid", Vec::new()).await;
+                holding(&c, &k, &[], 9, "no-such-machine.invalid", Vec::new()).await;
             dial_back.reconcile(false);
             let told = next_within(&mut refusals, HELD_WITHIN).await;
             assert!(

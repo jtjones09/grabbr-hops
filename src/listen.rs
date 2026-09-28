@@ -667,6 +667,17 @@ impl LanMouseListener {
         clipboard_in: Sender<PeerClipboard>,
     ) -> Result<(Self, u16), ListenerCreationError> {
         let addr = SocketAddr::new("127.0.0.1".parse().expect("loopback"), 0);
+        Self::bind_at(addr, identity, trust, clipboard_in).await
+    }
+
+    /// A listener at `addr`, and the port it bound.
+    #[cfg(test)]
+    pub(crate) async fn bind_at(
+        addr: SocketAddr,
+        identity: Arc<Identity>,
+        trust: Trust,
+        clipboard_in: Sender<PeerClipboard>,
+    ) -> Result<(Self, u16), ListenerCreationError> {
         let listener = Self::bind(Some(addr), identity, trust, clipboard_in).await?;
         let port = listener.local_addr.map_or(0, |a| a.port());
         Ok((listener, port))

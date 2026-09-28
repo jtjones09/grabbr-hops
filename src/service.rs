@@ -364,7 +364,18 @@ impl RecentNotices {
             }
         }
     }
+
+    /// Let the next notice of `kind` about `handle` be shown at once: what
+    /// it would be about has changed.
+    fn forget(&mut self, handle: ClientHandle, kind: &'static str) {
+        self.shown.remove(&(handle, kind));
+    }
 }
+
+/// The notice that a device's hostname resolves to nothing. The lookup made
+/// as a device is switched on or renamed and the ones a dial-out makes after
+/// each dial share it, so the person is told once, not once by each.
+const NOT_RESOLVED: &str = "not-resolved";
 
 /// Drop any persisted client pin naming a fingerprint that is not in the
 /// allowlist.
@@ -1537,10 +1548,15 @@ impl Service {
                     // name left the card reading "unresolved" forever with the
                     // reason visible only in the log, so the user's model was
                     // "hops is still thinking about it".
-                    self.notify_frontend(FrontendEvent::Error(format!(
-                        "Could not find \"{hostname}\" on the network. \
-                         Check the spelling, or use its IP address."
-                    )));
+                    if self
+                        .refusal_notices
+                        .due(handle, NOT_RESOLVED, Instant::now())
+                    {
+                        self.notify_frontend(FrontendEvent::Error(format!(
+                            "Could not find \"{hostname}\" on the network. \
+                             Check the spelling, or use its IP address."
+                        )));
+                    }
                 }
                 let ips = ips.unwrap_or_default();
                 self.client_manager.set_dns_ips(handle, ips);
@@ -1903,7 +1919,7 @@ impl Service {
                 )));
             }
             DialRefusal::NotResolved { handle, hostname } => {
-                if !self.refusal_notices.due(handle, "not-resolved", now) {
+                if !self.refusal_notices.due(handle, NOT_RESOLVED, now) {
                     return;
                 }
                 let name = self.device_name(handle);
@@ -3208,6 +3224,7 @@ impl Service {
     fn update_hostname(&mut self, handle: ClientHandle, hostname: Option<String>) {
         log::info!("hostname changed: {hostname:?}");
         if self.client_manager.set_hostname(handle, hostname.clone()) {
+            self.refusal_notices.forget(handle, NOT_RESOLVED);
             self.resolve(handle);
         }
         self.broadcast_client(handle);

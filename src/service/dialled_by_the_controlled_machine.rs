@@ -481,7 +481,7 @@ fn the_controlled_machine_dials_again_until_its_link_is_taken() {
 /// The mac dials the pc's address and something that holds no key of the
 /// pc's answers there, refusing with the alert the pc refuses a removed
 /// machine with. The mac's card does not say the pc removed it, and the
-/// person is not told to remove the pc: nothing proved the pc refused.
+/// person is told nothing about the pc: nothing proved the pc refused.
 #[test]
 fn a_keyless_endpoint_at_the_controllers_address_does_not_say_it_removed_this_machine() {
     run_local(async {
@@ -529,12 +529,73 @@ fn a_keyless_endpoint_at_the_controllers_address_does_not_say_it_removed_this_ma
                 "the mac's card for the pc says the pc removed it, on a refusal from a machine \
                  with no key"
             );
+            // Not that the pc removed this machine, refused it, or runs an
+            // older hops: nothing at all, since nothing proved the pc spoke.
             let told: Vec<_> = app
                 .backlog
                 .iter()
-                .filter(|e| matches!(e, FrontendEvent::Error(m) if m.contains("no longer trusts")))
+                .filter(|e| matches!(e, FrontendEvent::Error(_)))
                 .collect();
             assert!(told.is_empty(), "the person was told: {told:?}");
+        };
+        mac.run_while(body).await;
+    });
+}
+
+// LEDGER T36 | class B | 2 bytes: FrontendEvent::Error over the dialling daemon's IPC socket; the absence is over a fixed window, a regression check only
+/// The mac only dials out, and the pc's name resolves to nothing. The
+/// lookup made as the device is switched on and the ones its dial-out
+/// makes after each dial say so once between them, not once each. A new
+/// name is looked up, and a failure told about, afresh.
+#[test]
+fn a_name_that_resolves_to_nothing_is_told_once_until_it_changes() {
+    run_local(async {
+        let pc = crate::test_harness::machine();
+        let config = format!(
+            "listen = false\n\n[authorized_fingerprints]\n\"{fp}\" = \"desk pc\"\n\n\
+             [[clients]]\nposition = \"left\"\nhostname = \"no-such-machine.invalid\"\n\
+             port = 9\nactivate_on_startup = false\nfingerprint = \"{fp}\"\n",
+            fp = pc.fingerprint
+        );
+        let mac = Daemon::start("unresolved-mac", &config, input_emulation::Backend::Dummy).await;
+        let mac_ipc = mac.ipc();
+        let body = async {
+            let not_found = |name: &'static str| {
+                move |e: &FrontendEvent| match e {
+                    FrontendEvent::Error(m) if m.contains(name) => Some(m.clone()),
+                    _ => None,
+                }
+            };
+            let handle = device_for(&mut mac_ipc.connect().await, &pc.fingerprint).await;
+            let mut app = Heard::new(mac_ipc.connect().await);
+            app.exchange(&[FrontendRequest::Activate(handle, true)])
+                .await;
+            app.until("the name not found", not_found("no-such-machine.invalid"))
+                .await;
+            // Past the dial-out's first dials, each followed by a lookup.
+            tokio::time::sleep(crate::dial_back::FIRST_RETRY * 3).await;
+            app.exchange(&[]).await;
+            let again: Vec<_> = app
+                .backlog
+                .iter()
+                .filter_map(not_found("no-such-machine.invalid"))
+                .collect();
+            assert!(
+                again.is_empty(),
+                "the person was told the name was not found more than once: {again:?}"
+            );
+
+            app.exchange(&[FrontendRequest::UpdateHostname {
+                handle,
+                hostname: Some("another-missing-machine.invalid".to_string()),
+                fingerprint: Some(pc.fingerprint.clone()),
+            }])
+            .await;
+            app.until(
+                "the new name not found",
+                not_found("another-missing-machine.invalid"),
+            )
+            .await;
         };
         mac.run_while(body).await;
     });
