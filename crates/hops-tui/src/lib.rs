@@ -1365,10 +1365,15 @@ fn footer_line(
     }
 
     let mut spans = vec![Span::styled("a", key), Span::raw(" add  ")];
-    if selected.is_some_and(|d| d.pair_again) {
+    if let Some(d) = selected.filter(|d| d.pair_again) {
         // Paired with an older version (#231): add it again, choosing
-        // which way control goes, or remove it. Nothing else applies.
+        // which way control goes, or remove it. A device folded into it can
+        // also be switched off, so the pointer stops crossing to it.
         spans = vec![Span::styled("a", key), Span::raw(" add it again  ")];
+        if d.send.is_some() {
+            spans.push(Span::styled("spc", key));
+            spans.push(Span::raw(" on/off  "));
+        }
         spans.push(Span::styled("d", key));
         spans.push(Span::raw(" remove  "));
     } else if let Some(d) = selected {

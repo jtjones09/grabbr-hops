@@ -82,11 +82,16 @@ machine controls which. A pairing that goes one way is the better choice
 for a machine managed by someone else, such as a work laptop. Remove the
 card for a machine no longer used.
 
-A device hops 0.12 dialled is shown as a card of its own until hops 0.13
-first reaches that machine at the device's address, because hops 0.12 did
-not record which machine answers there. Once that machine proves its key
-there, the device joins its card. That records which machine the address
-reached and grants nothing.
+A device hops 0.12 dialled is shown as a card of its own until this
+machine first dials it, as crossing to it does, because hops 0.12 did not
+record which machine answers at its address. When a listed machine proves
+its key there, the device joins that machine's card. That records which
+machine the address reached and grants nothing. A knock from the other
+machine proves nothing and joins nothing.
+
+If the address now reaches a different listed machine, such as after an
+address change, the device is shown under that machine's card instead. It
+still grants nothing, and pairing it again still needs the number.
 
 hops 0.13 drops the old list from `config.toml` the next time it saves its
 settings. A machine moved back to hops 0.12 after the upgrade has to be

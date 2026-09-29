@@ -420,6 +420,23 @@ fn drop_untrusted_pins(
     stale.into_iter().map(|(h, _)| h).collect()
 }
 
+/// Whether device `handle` may be pinned to `fp`, a machine that proved its
+/// key at `addr` when the device was dialled (#231): `fp` is still listed to
+/// pair again, the device is still pinned to no machine, and it still dials
+/// `addr`. A device whose address changed while the dial ran is not the
+/// device that address answered for.
+fn may_pin_to_listed(
+    clients: &ClientManager,
+    trust: &crate::trust::TrustStore,
+    handle: ClientHandle,
+    fp: &str,
+    addr: SocketAddr,
+) -> bool {
+    trust.to_pair_again(fp).is_some()
+        && clients.peer_fingerprint(handle).is_none()
+        && clients.targets(handle, addr)
+}
+
 /// Why an approved prompt granted nothing.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub(crate) enum GrantRefused {
@@ -1358,7 +1375,6 @@ impl Service {
                 )));
             }
             EmulationEvent::ConnectionAttempt { fingerprint, addr } => {
-                self.measure_devices_at(&fingerprint, addr);
                 self.raise_connection_attempt(fingerprint, AttemptOrigin::Inbound, Some(addr));
             }
             EmulationEvent::Entered {
@@ -2183,10 +2199,14 @@ impl Service {
     /// address reached, and the dial checks it, failing closed. Pairing it
     /// again through the card grants what the pairing card asks.
     fn pin_to_listed(&mut self, handle: ClientHandle, fp: &str, addr: SocketAddr) {
-        if self.trust.read().expect("lock").to_pair_again(fp).is_none()
-            || self.client_manager.peer_fingerprint(handle).is_some()
-            || !self.client_manager.targets(handle, addr)
-        {
+        let may = may_pin_to_listed(
+            &self.client_manager,
+            &self.trust.read().expect("lock"),
+            handle,
+            fp,
+            addr,
+        );
+        if !may {
             return;
         }
         match self.client_manager.pin(handle, fp.to_string()) {
@@ -2202,39 +2222,6 @@ impl Service {
             Err(other) => log::info!(
                 "client {handle}: {addr} is {fp}, which client {other} is already pinned to"
             ),
-        }
-    }
-
-    /// A machine listed to pair again knocked from `addr` (#231). Each device
-    /// switched on and pinned to no machine that names that address is
-    /// dialled, so that its own dial measures which machine answers there
-    /// and pins it ([`Self::pin_to_listed`]). The knock proves nothing by
-    /// itself: it was refused before the knocking machine signed anything.
-    /// So it only starts the measurement, once a minute per device at most.
-    fn measure_devices_at(&mut self, fp: &str, addr: SocketAddr) {
-        if self.trust.read().expect("lock").to_pair_again(fp).is_none()
-            || !self.client_manager.every_pinned_to(fp).is_empty()
-        {
-            return;
-        }
-        let now = Instant::now();
-        let at: Vec<ClientHandle> = self
-            .client_manager
-            .get_client_states()
-            .into_iter()
-            .filter(|(_, _, s)| {
-                s.active && s.peer_fingerprint.is_none() && s.ips.contains(&addr.ip())
-            })
-            .map(|(h, _, _)| h)
-            .collect();
-        for handle in at {
-            if self.refusal_notices.due(handle, "measure", now) {
-                log::info!(
-                    "{fp}, listed to pair again, knocked from {addr}: dialling client {handle} \
-                     there to learn which machine it is"
-                );
-                self.capture.dial(handle);
-            }
         }
     }
 
@@ -4691,6 +4678,48 @@ mod a_pin_outlives_its_lease {
         let h = m.add_client();
         m.set_peer_fingerprint(h, Some(fingerprint.to_string()));
         h
+    }
+
+    // LEDGER R231-15 | class B | 1 return value: service::may_pin_to_listed on a real ClientManager and TrustStore
+    /// A device is pinned to a listed machine that proved its key at an
+    /// address only while it still dials that address, is still pinned to
+    /// no machine, and the machine is still listed (#231).
+    #[test]
+    fn a_device_is_pinned_only_to_what_answered_at_its_own_address() {
+        use super::may_pin_to_listed;
+        use std::net::SocketAddr;
+        let mut trust = TrustStore::new(&fp(0x01), T0).expect("ours");
+        let (listed, other) = (fp(0xa0), fp(0xc0));
+        trust
+            .list_to_pair_again(&listed, "iridium", T0)
+            .expect("listed");
+        let m = ClientManager::default();
+        let h = m.add_client();
+        let port = m.get_port(h).expect("a port");
+        let at: SocketAddr = ([192, 0, 2, 156], port).into();
+        let elsewhere: SocketAddr = ([192, 0, 2, 157], port).into();
+        m.set_fix_ips(h, vec![at.ip()]);
+        assert!(
+            may_pin_to_listed(&m, &trust, h, &listed, at),
+            "precondition: a device with no pin, dialled at its own address, where a \
+             listed machine proved its key, is pinned to it"
+        );
+        let refused = [
+            ("its address changed while the dial ran", &listed, elsewhere),
+            ("the machine is not listed to pair again", &other, at),
+        ];
+        for (why, machine, addr) in refused {
+            assert!(
+                !may_pin_to_listed(&m, &trust, h, machine, addr),
+                "a device was pinned though {why}: the pin would name a machine its \
+                 address did not answer as"
+            );
+        }
+        m.set_peer_fingerprint(h, Some(other.clone()));
+        assert!(
+            !may_pin_to_listed(&m, &trust, h, &listed, at),
+            "a device already pinned to a machine was pinned to another"
+        );
     }
 
     #[test]

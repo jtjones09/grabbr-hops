@@ -991,9 +991,10 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                 }
 
                                 // --- send facet: position + active toggle + edit/delete ---
-                                // Not on a machine to pair again (#231): it is
-                                // neither crossed to nor dialled for anything
-                                // until then, and the room is its status's.
+                                // No edge on a machine to pair again (#231):
+                                // nothing crosses to it until then, and the
+                                // room is its status's. Its switch stays, so
+                                // crossing to it can be stopped.
                                 if d.has-send && !d.pair-again && !confirming: VerticalLayout {
                                     alignment: center;
                                     Chip {
@@ -1010,7 +1011,7 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                         }
                                     }
                                 }
-                                if d.has-send && !d.pair-again && !confirming: VerticalLayout {
+                                if d.has-send && !confirming: VerticalLayout {
                                     alignment: center;
                                     Toggle {
                                         checked: d.active;

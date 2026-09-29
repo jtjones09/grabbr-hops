@@ -98,7 +98,7 @@ fn cards(model: &hops_frontend_core::AppModel) -> Vec<Card> {
 }
 
 /// What the app lists for iridium once its device and its listing are one
-/// card, folded by the first handshake with iridium's address (#231).
+/// card, folded by the first crossing to it (#231).
 fn folded(iridium: &Machine) -> Vec<Card> {
     vec![
         (
@@ -152,11 +152,13 @@ type AppModelNow = hops_frontend_core::AppModel;
 /// nothing from it, in either direction, and the app lists the machine
 /// once, as one to pair again, which removing forgets.
 ///
-/// Once, from the first handshake with the machine's address. Before it
-/// there are two cards for iridium, and that cannot be avoided: v0.12.0
-/// wrote no fingerprint on a `[[clients]]` entry, so nothing says which
-/// machine answers at the device's address until one proves its key there,
-/// and folding the two by name would be a guess about identity.
+/// Once, from the first crossing to the device: the first dial this
+/// machine makes to its address. Before it there are two cards for
+/// iridium, and that cannot be avoided: v0.12.0 wrote no fingerprint on a
+/// `[[clients]]` entry, so nothing says which machine answers at the
+/// device's address until one proves its key there, folding the two by
+/// name would be a guess about identity, and a knock from iridium proves
+/// nothing (`a_knock_from_a_listed_machine_folds_nothing_and_the_first_crossing_does`).
 #[test]
 fn a_v0_12_pairing_grants_nothing_after_the_upgrade() {
     run_local(async {
@@ -239,7 +241,7 @@ fn a_v0_12_pairing_grants_nothing_after_the_upgrade() {
         };
         daemon.run_while(body).await;
 
-        // The first handshake: the same config, with iridium a machine whose
+        // The first crossing: the same config, with iridium a machine whose
         // key this test holds, answering at the device's address. Crossing
         // to it folds the two cards into one, and grants nothing.
         let iridium = machine();
@@ -263,7 +265,7 @@ fn a_v0_12_pairing_grants_nothing_after_the_upgrade() {
             assert_eq!(
                 cards(&model),
                 folded(&iridium),
-                "after the first handshake the machine v0.12.0 paired must be one card, \
+                "after the first crossing the machine v0.12.0 paired must be one card, \
                  to pair again, holding its device (#231)"
             );
         };
@@ -448,22 +450,23 @@ fn a_device_folded_into_its_listing_gains_nothing_and_is_added_again_as_one_card
     });
 }
 
-// LEDGER R231-13 | class B | 2 bytes + 1 struct state: a knock over loopback QUIC from a machine listed to pair again, the model AppModel::apply folds from the real IPC socket, and Delete over it
-/// The other order: the listed machine knocks first, from the address a
-/// device pinned to no machine names. The knock proves nothing by itself,
-/// so it has this machine dial that device, and the dial measures which
-/// machine answers there. The two cards fold into one, and deleting that
+// LEDGER R231-13 | class B | 2 bytes + 1 struct state: knocks and a crossing over loopback QUIC, the model AppModel::apply folds from the real IPC socket, and Delete over it
+/// The other order: the listed machine knocks first. A knock is refused
+/// before the knocking machine signs anything, so it proves nothing and
+/// folds nothing; the two cards stay two. The first crossing to the
+/// device, a dial this machine makes anyway, folds them, and deleting that
 /// card removes both.
 #[test]
-fn a_listed_machine_that_knocks_first_is_folded_into_its_device() {
+fn a_knock_from_a_listed_machine_folds_nothing_and_the_first_crossing_does() {
     run_local(async {
         let iridium = machine();
         let receiver: Door = door(&iridium);
         receiver.open();
+        let script = Script::new();
         let daemon = Daemon::upgraded_with(
             "v012k2",
             &v0_12_0_config_for(&iridium, receiver.port),
-            input_capture::Backend::Dummy,
+            script.backend(),
             input_emulation::Backend::Dummy,
         )
         .await;
@@ -477,19 +480,31 @@ fn a_listed_machine_that_knocks_first_is_folded_into_its_device() {
         let body = async {
             let mut app = ipc.connect().await;
             let knocker = dialer(&iridium, trusting(&iridium, &ours), port, Position::Left);
-            let knocking = tokio::task::spawn_local(async move {
-                loop {
-                    let _ = knocker.conn.send(ProtoEvent::Ping, knocker.handle).await;
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                }
-            });
-            let model = until_folded(&mut app, &fp, || {}).await;
-            knocking.abort();
+            until_knock_told(&mut app, &knocker).await;
+            let model = synced(&mut app).await;
+            assert_eq!(
+                (
+                    model
+                        .devices()
+                        .iter()
+                        .any(|d| d.fingerprint.as_deref() == Some(fp.as_str()) && d.send.is_some()),
+                    receiver.knocks()
+                ),
+                (false, 0),
+                "a knock from the listed machine folded its device's card, or made \
+                 this machine dial the device's address: (folded, dials there). A knock \
+                 proves nothing and must start nothing (#231). The app lists {:?}",
+                cards(&model)
+            );
+
+            let model = until_folded(&mut app, &fp, || {
+                script.push(input_capture::Position::Right, CaptureEvent::Begin)
+            })
+            .await;
             assert_eq!(
                 cards(&model),
                 folded(&iridium),
-                "a knock from the listed machine did not fold its device's card into \
-                 its listing"
+                "the first crossing did not fold the device's card into its listing"
             );
             assert_eq!(receiver.streams(), 0, "a stream was opened to iridium");
 
@@ -516,6 +531,106 @@ fn a_listed_machine_that_knocks_first_is_folded_into_its_device() {
             );
         };
         daemon.run_while(body).await;
+    });
+}
+
+/// Knock as `knocker` until the app has been told of it, as a refused
+/// knock from a machine to pair again, or as a prompt while add device is
+/// open: the knock reached the daemon, and was handled.
+async fn until_knock_told(app: &mut Frontend, knocker: &crate::test_harness::Dialer) {
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    loop {
+        let _ = knocker.conn.send(ProtoEvent::Ping, knocker.handle).await;
+        let told = app.exchange(&[]).await.into_iter().any(|e| match e {
+            FrontendEvent::Activity(t) => t.contains("paired with an older version"),
+            FrontendEvent::ConnectionAttempt { origin, .. } => {
+                origin == hops_ipc::AttemptOrigin::Inbound
+            }
+            _ => false,
+        });
+        if told {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the knock from the listed machine was never told about"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+// LEDGER R231-16 | class B | 2 bytes + 1 handshake count: knocks over loopback QUIC, every FrontendEvent the app is sent, and the dials a loopback receiver at the device's address sees
+/// A knock from a listed machine is refused and told as before, and
+/// nothing more: this machine dials nothing because of it, and raises no
+/// banner and no prompt of its own dial, whoever answers at the address a
+/// v0.12 device names (#231, #150, #171, #61). Certificates are public, so
+/// a knock presenting a listed machine's is anyone's to make.
+#[test]
+fn a_knock_from_a_listed_machine_dials_nothing_and_tells_nothing_of_a_dial() {
+    run_local(async {
+        let iridium = machine();
+        let stranger = machine();
+        for (tag, add_open, answers) in [
+            ("v012n1", false, &stranger),
+            ("v012n2", true, &stranger),
+            ("v012n3", true, &iridium),
+        ] {
+            let receiver: Door = door(answers);
+            receiver.open();
+            let daemon = Daemon::upgraded_with(
+                tag,
+                &v0_12_0_config_for(&iridium, receiver.port),
+                input_capture::Backend::Dummy,
+                input_emulation::Backend::Dummy,
+            )
+            .await;
+            let (ours, port, ipc) = (daemon.fingerprint(), daemon.port(), daemon.ipc());
+            let body = async {
+                let mut app = ipc.connect().await;
+                if add_open {
+                    app.exchange(&[FrontendRequest::OpenPairing]).await;
+                }
+                let knocker = dialer(&iridium, trusting(&iridium, &ours), port, Position::Left);
+                until_knock_told(&mut app, &knocker).await;
+                let mut told = Vec::new();
+                let deadline = tokio::time::Instant::now() + NEVER_WITHIN * 3;
+                while tokio::time::Instant::now() < deadline {
+                    let _ = knocker.conn.send(ProtoEvent::Ping, knocker.handle).await;
+                    for e in app.exchange(&[]).await {
+                        match e {
+                            FrontendEvent::Error(t) => told.push(format!("banner: {t}")),
+                            FrontendEvent::ConnectionAttempt {
+                                fingerprint,
+                                origin,
+                                addr,
+                            } if origin != hops_ipc::AttemptOrigin::Inbound
+                                || fingerprint != iridium.fingerprint =>
+                            {
+                                told.push(format!("prompt: {fingerprint} {origin:?} {addr:?}"))
+                            }
+                            _ => {}
+                        }
+                    }
+                    tokio::time::sleep(NEVER_WITHIN / 4).await;
+                }
+                (told, receiver.knocks())
+            };
+            let (told, dialled) = daemon.run_while(body).await;
+            let who = if std::ptr::eq(answers, &stranger) {
+                "a stranger"
+            } else {
+                "the listed machine"
+            };
+            assert_eq!(
+                (told, dialled),
+                (Vec::<String>::new(), 0),
+                "with add device {} and {who} answering at the device's address, a knock \
+                 presenting the listed machine's certificate made this machine (tell, \
+                 dial there). A knock must start no dial, and nothing it causes may be \
+                 told as this machine's own dial (#231, #150, #171, #61)",
+                if add_open { "open" } else { "closed" },
+            );
+        }
     });
 }
 
