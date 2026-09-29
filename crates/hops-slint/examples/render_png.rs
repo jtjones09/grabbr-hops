@@ -478,8 +478,9 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
         // -89 and hanging the overlay off all four edges.
         // PREVIEW_CANVAS picks the arrangement: unset, two devices on two
         // edges; "full", one on each edge and two switched off beside
-        // others; "unplaced", a paired machine with no device here;
-        // "pc", this machine as a Windows PC with a long name.
+        // others; "crowded", four on the left and three on top;
+        // "unplaced", a paired machine with no device here; "pc", this
+        // machine as a Windows PC with a long name.
         Some("layout-canvas") => {
             use hops_frontend_core::{
                 AppModel, ClientConfig, ClientState, FrontendEvent, PeerTrust,
@@ -508,6 +509,16 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
                 add(4, "old-laptop", Position::Bottom, true);
                 add(5, "spare-mini", Position::Right, false);
                 add(6, "test-box", Position::Top, false);
+            }
+            if scenario == "crowded" {
+                add(3, "lab-linux", Position::Right, true);
+                add(4, "old-laptop", Position::Bottom, true);
+                add(5, "spare-mini", Position::Right, false);
+                add(6, "test-box", Position::Top, false);
+                add(7, "left-2", Position::Left, false);
+                add(8, "left-3", Position::Left, false);
+                add(9, "left-4", Position::Left, false);
+                add(10, "top-3", Position::Top, false);
             }
             if scenario == "unplaced" {
                 let trust = [(

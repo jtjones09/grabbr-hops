@@ -25,12 +25,18 @@ const MARGIN: f32 = 16.0;
 /// How far a box's top-left corner can be from this machine's, across and
 /// down: a box anywhere on the canvas is within these.
 const REACH: (f32, f32) = (HOME.0, HOME.1);
-/// Offsets along a side, one per box drawn there. Only one device per edge
-/// is switched on; the others there are switched off and drawn beside it,
-/// clear of it, and still reached through that side's edge by
-/// [`drop_edge`].
-const ALONG_LEFT_RIGHT: [f32; 3] = [0.0, -72.0, 72.0];
-const ALONG_TOP_BOTTOM: [f32; 3] = [0.0, -104.0, 104.0];
+/// The space kept between two boxes that do not overlap.
+const GAP: f32 = 8.0;
+/// The range a box's top-left corner is spread over along each side. The
+/// left and right sides take the whole height, corners included; the top
+/// and bottom take what lies between those two columns. So a box on one
+/// side never overlaps a box on another, and every spot in these ranges is
+/// reached through its own side's edge by [`drop_edge`].
+const SPAN_LEFT_RIGHT: (f32, f32) = (MARGIN, CANVAS_H - BOX_H - MARGIN);
+const SPAN_TOP_BOTTOM: (f32, f32) = (
+    MARGIN + BOX_W + GAP,
+    CANVAS_W - MARGIN - BOX_W - GAP - BOX_W,
+);
 
 /// The edge of this machine a box dropped with its top-left corner at
 /// `(x, y)` is reached through. The canvas's two diagonals, which cross at
@@ -59,33 +65,72 @@ pub(crate) fn drop_edge(x: f32, y: f32) -> Option<Position> {
     })
 }
 
-/// Where the canvas draws the `k`th box on the `pos` side: the first
-/// centred on that side of this machine, the rest beside it.
-pub(crate) fn edge_spot(pos: Position, k: usize) -> (f32, f32) {
-    let lr = ALONG_LEFT_RIGHT[k % ALONG_LEFT_RIGHT.len()];
-    let tb = ALONG_TOP_BOTTOM[k % ALONG_TOP_BOTTOM.len()];
+/// Where the canvas draws the `k`th of `n` boxes on the `pos` side. They
+/// are spread along the side, centred on this machine: clear of each other
+/// while they fit, closer together when more share the side, so every box
+/// keeps a strip in view to be seen and dragged by. The first takes the
+/// middle spot, and the rest count outward from it, so a box drawn after
+/// the ones further out covers only their inner part.
+pub(crate) fn edge_spot(pos: Position, k: usize, n: usize) -> (f32, f32) {
+    let ((lo, hi), apart, centre) = match pos {
+        Position::Left | Position::Right => (SPAN_LEFT_RIGHT, BOX_H + GAP, HOME.1),
+        Position::Top | Position::Bottom => (SPAN_TOP_BOTTOM, BOX_W + GAP, HOME.0),
+    };
+    let n = n.max(1);
+    let step = match n {
+        1 => 0.0,
+        n => apart.min((hi - lo) / (n - 1) as f32),
+    };
+    // the n slots, nearest the middle first
+    let mid = (n - 1) as f32 / 2.0;
+    let mut slots: Vec<usize> = (0..n).collect();
+    slots.sort_by(|&a, &b| {
+        let (da, db) = ((a as f32 - mid).abs(), (b as f32 - mid).abs());
+        da.total_cmp(&db).then(a.cmp(&b))
+    });
+    let slot = slots[k.min(n - 1)];
+    let along = centre + (slot as f32 - mid) * step;
     match pos {
-        Position::Left => (MARGIN, HOME.1 + lr),
-        Position::Right => (CANVAS_W - BOX_W - MARGIN, HOME.1 + lr),
-        Position::Top => (HOME.0 + tb, MARGIN),
-        Position::Bottom => (HOME.0 + tb, CANVAS_H - BOX_H - MARGIN),
+        Position::Left => (MARGIN, along),
+        Position::Right => (CANVAS_W - BOX_W - MARGIN, along),
+        Position::Top => (along, MARGIN),
+        Position::Bottom => (along, CANVAS_H - BOX_H - MARGIN),
     }
 }
 
 /// The boxes the canvas draws for `m`'s devices, with `moved` (a device
-/// and the edge it was just dropped on) drawn there already. Per side, the
-/// switched-on device takes the middle spot; the switched-off ones are
-/// drawn before it, so it is on top where they overlap.
+/// and the edge it was just dropped on) drawn there already, and any
+/// device it trades edges with drawn on the edge it left. Per side, the
+/// switched-on device takes the middle spot and the switched-off ones are
+/// spread beside it; boxes further out are drawn first, so the switched-on
+/// one is on top where they overlap.
 pub(crate) fn canvas_boxes(
     m: &AppModel,
     moved: Option<(ClientHandle, Position)>,
 ) -> Vec<CanvasBox> {
+    let side = |pos: Position| match pos {
+        Position::Left => 0,
+        Position::Right => 1,
+        Position::Top => 2,
+        Position::Bottom => 3,
+    };
+    // A switched-on device dropped on the edge another switched-on device
+    // uses trades edges with it, as the daemon will.
+    let traded = moved.and_then(|(mover, to)| {
+        let (cfg, state) = m.clients.get(&mover)?;
+        let holder = m
+            .clients
+            .iter()
+            .find_map(|(&h, (c, s))| (h != mover && s.active && c.pos == to).then_some(h))?;
+        (state.active && cfg.pos != to).then_some((holder, cfg.pos))
+    });
     let mut devices: Vec<(ClientHandle, String, Position, bool)> = m
         .clients
         .iter()
         .map(|(&h, (cfg, state))| {
-            let pos = match moved {
-                Some((m, to)) if m == h => to,
+            let pos = match (moved, traded) {
+                (Some((m, to)), _) if m == h => to,
+                (_, Some((holder, to))) if holder == h => to,
                 _ => cfg.pos,
             };
             let name = cfg
@@ -98,18 +143,17 @@ pub(crate) fn canvas_boxes(
         .collect();
     // switched on first, then by handle: the order spots are handed out in
     devices.sort_by_key(|&(h, _, _, active)| (!active, h));
+    let mut count = [0usize; 4];
+    for d in &devices {
+        count[side(d.2)] += 1;
+    }
     let mut taken = [0usize; 4];
-    let mut boxes: Vec<(bool, CanvasBox)> = devices
+    let mut boxes: Vec<(usize, CanvasBox)> = devices
         .into_iter()
         .map(|(h, name, pos, active)| {
-            let side = match pos {
-                Position::Left => 0,
-                Position::Right => 1,
-                Position::Top => 2,
-                Position::Bottom => 3,
-            };
-            let (x, y) = edge_spot(pos, taken[side]);
-            taken[side] += 1;
+            let k = taken[side(pos)];
+            taken[side(pos)] += 1;
+            let (x, y) = edge_spot(pos, k, count[side(pos)]);
             let b = CanvasBox {
                 handle: h.to_string().into(),
                 name: name.into(),
@@ -117,18 +161,20 @@ pub(crate) fn canvas_boxes(
                 y,
                 active,
             };
-            (active, b)
+            (k, b)
         })
         .collect();
-    // drawn in order: switched off first, so the switched-on one is on top
-    boxes.sort_by_key(|(active, b)| (*active, b.handle.parse::<u64>().unwrap_or(0)));
+    // drawn in order: furthest from the middle of its side first, so the
+    // switched-on one, in the middle, is drawn over the rest
+    boxes.sort_by_key(|(k, b)| (std::cmp::Reverse(*k), b.handle.parse::<u64>().unwrap_or(0)));
     boxes.into_iter().map(|(_, b)| b).collect()
 }
 
 /// What dropping device `handle`'s box with its top-left corner at `(x, y)`
 /// asks the daemon for: the edge the drop lies on, if that changed, and the
-/// clean spot on that side as its saved geometry. Nothing for a drop
-/// squarely on this machine, or for a device the model does not hold.
+/// middle spot on that side as its saved geometry, sent again with a new
+/// edge since the daemon clears it then. Nothing for a drop squarely on
+/// this machine, or for a device the model does not hold.
 pub(crate) fn drop_requests(
     m: &AppModel,
     handle: ClientHandle,
@@ -138,7 +184,7 @@ pub(crate) fn drop_requests(
     let (Some((cfg, _)), Some(edge)) = (m.clients.get(&handle), drop_edge(x, y)) else {
         return Vec::new();
     };
-    let (sx, sy) = edge_spot(edge, 0);
+    let (sx, sy) = edge_spot(edge, 0, 1);
     let spot = Geometry {
         x: sx as i32,
         y: sy as i32,
@@ -149,7 +195,7 @@ pub(crate) fn drop_requests(
     if cfg.pos != edge {
         out.push(FrontendRequest::UpdatePosition(handle, edge));
     }
-    if cfg.geometry != Some(spot) {
+    if cfg.pos != edge || cfg.geometry != Some(spot) {
         out.push(FrontendRequest::UpdateGeometry(handle, Some(spot)));
     }
     out
@@ -334,32 +380,80 @@ mod tests {
     }
 
     // LEDGER T174f2 | class B | 1 return value: edge_spot through drop_edge
-    /// Every spot a device is drawn at is reached through its own edge and
-    /// lies on the canvas, and the spots on one side keep clear of each
-    /// other: the picture never shows a place the crossing does not honour.
+    /// Every spot a device is drawn at, for up to six devices on a side, is
+    /// reached through its own edge, lies on the canvas and clear of this
+    /// machine, and never overlaps a box on another side. On one side, the
+    /// boxes keep clear of each other while they fit (three beside, two
+    /// above or below), and past that each keeps a strip in view: the
+    /// picture never shows a place the crossing does not honour, nor hides
+    /// a device.
     #[test]
-    fn every_spot_drawn_is_on_its_own_edge() {
-        for pos in [
-            Position::Left,
-            Position::Right,
-            Position::Top,
-            Position::Bottom,
-        ] {
-            for k in 0..6 {
-                let (x, y) = edge_spot(pos, k);
-                assert_eq!(drop_edge(x, y), Some(pos), "spot {k} on the {pos} side");
-                assert!(
-                    (0.0..=CANVAS_W - BOX_W).contains(&x) && (0.0..=CANVAS_H - BOX_H).contains(&y),
-                    "spot {k} on the {pos} side, ({x}, {y}), is off the canvas"
-                );
-            }
-            let spots: Vec<_> = (0..3).map(|k| edge_spot(pos, k)).collect();
-            for (i, a) in spots.iter().enumerate() {
-                for b in &spots[i + 1..] {
-                    let apart = (a.0 - b.0).abs() >= BOX_W || (a.1 - b.1).abs() >= BOX_H;
-                    assert!(apart, "two boxes on the {pos} side overlap: {a:?} {b:?}");
+    fn every_spot_drawn_is_on_its_own_edge_and_in_view() {
+        use Position::*;
+        let overlap =
+            |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).abs() < BOX_W && (a.1 - b.1).abs() < BOX_H;
+        let spots = |pos: Position, n: usize| -> Vec<(f32, f32)> {
+            (0..n).map(|k| edge_spot(pos, k, n)).collect()
+        };
+        for pos in [Left, Right, Top, Bottom] {
+            for n in 1..=6 {
+                let here = spots(pos, n);
+                for (k, &(x, y)) in here.iter().enumerate() {
+                    let at = format!("spot {k} of {n} on the {pos} side, ({x}, {y})");
+                    assert_eq!(drop_edge(x, y), Some(pos), "{at}");
+                    assert!(
+                        (0.0..=CANVAS_W - BOX_W).contains(&x)
+                            && (0.0..=CANVAS_H - BOX_H).contains(&y),
+                        "{at} is off the canvas"
+                    );
+                    assert!(!overlap((x, y), HOME), "{at} overlaps this machine");
+                }
+                let fit = if matches!(pos, Left | Right) { 3 } else { 2 };
+                let mut along: Vec<f32> = here
+                    .iter()
+                    .map(|&(x, y)| if matches!(pos, Left | Right) { y } else { x })
+                    .collect();
+                along.sort_by(f32::total_cmp);
+                for w in along.windows(2) {
+                    let (need, what) = if n <= fit {
+                        (
+                            if matches!(pos, Left | Right) {
+                                BOX_H
+                            } else {
+                                BOX_W
+                            },
+                            "clear of",
+                        )
+                    } else {
+                        (16.0, "a 16 px strip out from under")
+                    };
+                    assert!(
+                        w[1] - w[0] >= need,
+                        "with {n} on the {pos} side, a box is not {what} the next: {along:?}"
+                    );
+                }
+                for other in [Left, Right, Top, Bottom] {
+                    if other == pos {
+                        continue;
+                    }
+                    for m in 1..=6 {
+                        for &a in &here {
+                            for &b in &spots(other, m) {
+                                assert!(
+                                    !overlap(a, b),
+                                    "{n} on the {pos} side and {m} on the {other} side \
+                                     overlap: {a:?} {b:?}"
+                                );
+                            }
+                        }
+                    }
                 }
             }
+            assert_eq!(
+                edge_spot(pos, 0, 1),
+                edge_spot(pos, 0, 3),
+                "the switched-on device on the {pos} side is not in the middle"
+            );
         }
     }
 
@@ -402,6 +496,20 @@ mod tests {
             [],
             "a device not in the model"
         );
+        // The daemon clears a saved spot when the edge changes, so a new edge
+        // always comes with its spot, even one the model already holds.
+        let mut m = m;
+        let (mut c, st) = device("desk-pc", Position::Left, true);
+        c.geometry = Some(right_spot);
+        m.apply(FrontendEvent::State(0, c, st));
+        assert_eq!(
+            drop_requests(&m, 0, 360.0, 150.0),
+            [
+                FrontendRequest::UpdatePosition(0, Position::Right),
+                FrontendRequest::UpdateGeometry(0, Some(right_spot)),
+            ],
+            "the desk pc, with the right spot saved, dropped on the right"
+        );
     }
 
     /// What the wired canvas sent the daemon.
@@ -430,8 +538,8 @@ mod tests {
 
     // LEDGER T174h | class B | 3 widget tree: a drag dispatched to AppWindow's canvas, the requests its callback sends, canvas-boxes
     /// The desk pc's box is dragged from the left of this machine to the
-    /// right: the window asks for the right edge and draws the box at its
-    /// spot there at once.
+    /// right, where the media rig is: the window asks for the right edge and
+    /// draws the box at its spot there at once, and the rig on the left.
     #[test]
     fn dragging_a_box_across_moves_its_device_to_that_edge() {
         let model = Rc::new(RefCell::new(two_devices()));
@@ -440,7 +548,7 @@ mod tests {
         assert!(ui.get_show_layout_canvas(), "the canvas did not open");
         let desk = i_slint_backend_testing::ElementHandle::find_by_accessible_label(&ui, "desk-pc")
             .next()
-            .expect("the desk pc's box");
+            .expect("the desk pc's box (found in a debug build only: build.rs)");
         let (at, size) = (desk.absolute_position(), desk.size());
         // its centre, moved from the left spot to the right one
         let to =
@@ -453,11 +561,11 @@ mod tests {
             "the drag did not ask for the right edge: {:?}",
             sent.borrow()
         );
-        let desk_now = drawn(&ui).into_iter().find(|b| b.0 == "0");
         assert_eq!(
-            desk_now,
-            Some(("0".into(), 368.0, 108.0)),
-            "the desk pc is not drawn at its spot on the right"
+            drawn(&ui),
+            [("0".into(), 368.0, 108.0), ("1".into(), 16.0, 108.0)],
+            "the desk pc is not drawn at its spot on the right, with the media \
+             rig it trades edges with on the left"
         );
         // Until the daemon answers, the poll must not draw it back.
         canvas.borrow_mut().tick(&ui, &model.borrow());
@@ -509,6 +617,77 @@ mod tests {
             drawn(&ui).is_empty(),
             "a poll that changed nothing redrew the canvas"
         );
+    }
+
+    // LEDGER T174m | class B | 1 return value: canvas_boxes
+    /// Three devices on the left, the switched-on one with the highest
+    /// handle: it takes the middle spot and is drawn last, over the two
+    /// switched-off ones spread above and below it.
+    #[test]
+    fn the_switched_on_device_takes_the_middle_of_its_side() {
+        let mut m = AppModel::default();
+        for (h, (c, s)) in [
+            (0, device("old-laptop", Position::Left, false)),
+            (1, device("spare-mini", Position::Left, false)),
+            (2, device("desk-pc", Position::Left, true)),
+        ] {
+            m.apply(FrontendEvent::Created(h, c, s));
+        }
+        let boxes: Vec<_> = canvas_boxes(&m, None)
+            .into_iter()
+            .map(|b| (b.handle.to_string(), b.x, b.y))
+            .collect();
+        assert_eq!(
+            boxes,
+            [
+                ("1".into(), 16.0, 180.0),
+                ("0".into(), 16.0, 36.0),
+                ("2".into(), 16.0, 108.0),
+            ],
+            "(handle, x, y) in the order drawn"
+        );
+    }
+
+    // LEDGER T174n | class B | 3 widget tree: a drag dispatched to AppWindow's canvas, where the box is after the drop
+    /// A drop that asks the daemon for nothing still snaps the box back to
+    /// its spot: one dropped on this machine, and one dropped on its own
+    /// side when that side's spot is already saved for it.
+    #[test]
+    fn a_drop_that_changes_nothing_snaps_the_box_back() {
+        let mut m = two_devices();
+        let (mut c, s) = device("desk-pc", Position::Left, true);
+        c.geometry = Some(Geometry {
+            x: 16,
+            y: 108,
+            width: 96,
+            height: 64,
+        });
+        m.apply(FrontendEvent::State(0, c, s));
+        let (ui, _canvas, sent) = wired(Rc::new(RefCell::new(m)));
+        ui.invoke_open_layout_canvas();
+        let desk = || {
+            i_slint_backend_testing::ElementHandle::find_by_accessible_label(&ui, "desk-pc")
+                .next()
+                .expect("the desk pc's box (found in a debug build only: build.rs)")
+        };
+        let home = desk().absolute_position();
+        for (what, by) in [
+            ("on this machine", (176.0, 0.0)),
+            ("higher on its side", (0.0, -60.0)),
+        ] {
+            let (at, size) = (desk().absolute_position(), desk().size());
+            let to = slint::LogicalPosition::new(
+                at.x + size.width / 2.0 + by.0,
+                at.y + size.height / 2.0 + by.1,
+            );
+            desk().mock_drag(to, slint::platform::PointerEventButton::Left);
+            let now = desk().absolute_position();
+            assert_eq!(
+                (now.x, now.y, sent.borrow().len()),
+                (home.x, home.y, 0),
+                "(x, y, requests sent) after a drop {what}"
+            );
+        }
     }
 
     // LEDGER T174j | class B | 1 return value + 3 widget tree: unplaced, canvas-unplaced after open
