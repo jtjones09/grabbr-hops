@@ -34,6 +34,14 @@ and how to recover. How to report a vulnerability is in
   missing, the machines listed in `config.toml` are shown as needing to be
   paired again and are trusted with nothing, so a `config.toml` copied or
   edited while the trust file is gone grants nothing.
+- **Reaching a machine that cannot be dialled.** A machine dials each
+  machine allowed to control it, as well as waiting to be dialled, so one
+  behind a VPN or security client that drops incoming connections is still
+  controlled over the connection it opens. It dials only machines paired
+  with it whose pairing lets them control it, checks that the machine that
+  answers has that pairing's key before sending anything, opens no port to
+  do so, and raises no pairing request on the machine it dials. A device
+  switched off or removed is not dialled.
 
 ## What it cannot protect against
 
@@ -120,7 +128,7 @@ again.
 | waiting for its approval | That machine has not approved the pairing or picked its number yet. Open add device on it and finish there. |
 | not accepting input | hops runs there but cannot inject input. It may lack a permission, such as Accessibility on macOS. |
 | paired with an older version: add it again | It was paired by hops 0.12 and is trusted with nothing. Add it again with add device open on both machines, and choose which machine controls which. |
-| unreachable | Check that hops runs on both machines and that a firewall lets UDP in on the port hops listens on (`port` in `config.toml`, or `o` in the terminal UI). |
+| unreachable | Check that hops runs on both machines. One of the two must accept UDP on the port hops listens on (`port` in `config.toml`, or `o` in the terminal UI): a machine that cannot accept it is reached through the connection it opens to each machine allowed to control it. |
 
 A notice can say more:
 

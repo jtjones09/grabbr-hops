@@ -11,10 +11,19 @@
 //! Decided by the lease, never by the address. This machine holds a standing
 //! link to a device, dialled to be driven by it, when the device is switched
 //! on, has an address, is pinned to its machine, and the lease with that
-//! machine lets it drive this one ([`crate::trust::Caps::DRIVE_ME`]) and
-//! either does not let this machine drive it, or this machine does not
-//! listen. A lease that goes both ways, on a machine that listens, is dialled
-//! as before: each machine dials the other to drive it.
+//! machine lets it drive this one ([`crate::trust::Caps::DRIVE_ME`]). That
+//! holds whether or not the lease also lets this machine drive that one, and
+//! whether or not this machine listens (#232): a machine that cannot be
+//! dialled, behind a VPN or security client that drops incoming connections,
+//! is still reached through the link it opens, with no setting to find.
+//! `listen = false` means only that no port is opened.
+//!
+//! When both machines dial for one direction, one link carries it. A link
+//! the controlling machine dialled in is up, so this machine waits rather
+//! than dialling; the controlling machine takes a link dialled to it only
+//! while its own is not up, and closes its own dial if one dialled to it
+//! came up first (`connect::Adopter::adopt`). The first link up is kept, and
+//! the other attempt stops without either being closed in turn.
 //!
 //! # Admission, both ends
 //!
@@ -477,7 +486,7 @@ impl DialBack {
 
     /// The devices this machine should dial to be driven by, and the
     /// machine each is pinned to. See the module docs for the rule.
-    pub(crate) fn wanted(&self, listening: bool) -> HashMap<ClientHandle, String> {
+    pub(crate) fn wanted(&self) -> HashMap<ClientHandle, String> {
         let trust = self.context.trust.read().expect("lock");
         self.context
             .clients
@@ -486,10 +495,7 @@ impl DialBack {
             .filter_map(|(handle, config, state)| {
                 let fp = state.peer_fingerprint?;
                 let has_address = config.hostname.is_some() || !config.fix_ips.is_empty();
-                let wanted = state.active
-                    && has_address
-                    && trust.may_drive_us(&fp)
-                    && (!trust.we_may_drive(&fp) || !listening);
+                let wanted = state.active && has_address && trust.may_drive_us(&fp);
                 wanted.then_some((handle, fp))
             })
             .collect()
@@ -497,8 +503,8 @@ impl DialBack {
 
     /// Start a held link for each device wanted and not yet held, and stop
     /// each one held that is no longer wanted, closing its link.
-    pub(crate) fn reconcile(&mut self, listening: bool) {
-        let wanted = self.wanted(listening);
+    pub(crate) fn reconcile(&mut self) {
+        let wanted = self.wanted();
         let stale: Vec<ClientHandle> = self
             .held
             .iter()
@@ -545,6 +551,13 @@ impl DialBack {
                 conn.close(0u32.into(), reason);
             }
         }
+    }
+
+    /// The listener's door for the links this machine dials, for a test to
+    /// count the links in it holds.
+    #[cfg(all(test, unix))]
+    pub(crate) fn admitter(&self) -> Admitter {
+        self.context.admitter.clone()
     }
 
     /// Stop every held link.
@@ -619,6 +632,16 @@ async fn hold(
 ) {
     let mut wait = FIRST_RETRY;
     loop {
+        // The machine that drives this one dialled it, and that link is up:
+        // it carries this direction, so nothing is dialled until it drops
+        // (#232). Asked before every dial, so a link dialled here and one
+        // dialled in are never both kept, and neither is closed for the
+        // other.
+        if context.admitter.links_from(&fingerprint).await > 0 {
+            wait = FIRST_RETRY;
+            tokio::time::sleep(FIRST_RETRY).await;
+            continue;
+        }
         let (addrs, port) = addresses(&context.clients, handle);
         match dial_to_be_driven(&context.identity, &context.trust, &addrs, &fingerprint).await {
             Ok(up) => {
@@ -984,7 +1007,7 @@ mod tests {
                     controller(&k_m, trust(&k_m, &[&c_m], Caps::OUTBOUND), &c_m.fingerprint).await;
                 let (mut dial_back, _refusals, _listener) =
                     holding(&c_m, &k_m, &[], k.port, "localhost", resolved).await;
-                dial_back.reconcile(false);
+                dial_back.reconcile();
                 wait_until(case, HELD_WITHIN, || k.adopted.borrow().contains(&true)).await;
                 dial_back.stop_all();
             }
@@ -997,7 +1020,7 @@ mod tests {
             let (_other, stale) = elsewhere_on_loopback(&other_m, &c_m, k.port).await;
             let (mut dial_back, mut refusals, _listener) =
                 holding(&c_m, &k_m, &[&other_m], k.port, "127.0.0.1", vec![stale]).await;
-            dial_back.reconcile(false);
+            dial_back.reconcile();
             let told = next_within(&mut refusals, HELD_WITHIN).await;
             assert!(
                 matches!(&told, Some(DialRefusal::NotThePinnedMachine { seen, .. })
@@ -1054,7 +1077,7 @@ mod tests {
             let at = vec![IpAddr::from([127, 0, 0, 1])];
             let (mut dial_back, mut refusals, _listener) =
                 holding(&c, &k, &[&other_m], port, "no-such-machine.invalid", at).await;
-            dial_back.reconcile(false);
+            dial_back.reconcile();
             // Two dials, and the lookup after the first between them.
             for dial in ["first", "second"] {
                 let told = next_within(&mut refusals, HELD_WITHIN).await;
@@ -1078,7 +1101,7 @@ mod tests {
             let (k, c) = (machine(), machine());
             let (mut dial_back, mut refusals, _listener) =
                 holding(&c, &k, &[], 9, "no-such-machine.invalid", Vec::new()).await;
-            dial_back.reconcile(false);
+            dial_back.reconcile();
             let told = next_within(&mut refusals, HELD_WITHIN).await;
             assert!(
                 matches!(&told, Some(DialRefusal::NotResolved { hostname, .. })

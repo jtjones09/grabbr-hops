@@ -7,10 +7,10 @@ release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
 # machine still set to 4242 is not reached by one that dials 4722)
 # port = 4722
 
-# optional: set to false on a machine that should only dial out, such as
-# one behind a VPN or security client that drops incoming connections. It
-# then listens on no port and is controlled over the connection it opens to
-# each machine that controls it.
+# optional: set to false so that this machine listens on no port. It is
+# controlled over the connection it opens to each machine that controls
+# it, which it does whether or not it listens, so a machine behind a VPN
+# or security client that drops incoming connections works either way.
 # listen = false
 
 # the machines paired with this one, written by hops as a record. Editing

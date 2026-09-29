@@ -944,7 +944,7 @@ impl Service {
         loop {
             tokio::select! {
                 _ = lease_sweep.tick() => self.sweep_lapsed_leases(),
-                _ = dial_back.tick() => self.dial_back.reconcile(self.listening),
+                _ = dial_back.tick() => self.dial_back.reconcile(),
                 dialled = next_or_never(&mut self.dialled_in) => self.handle_dialled_in(dialled),
                 _ = add_dials.tick(), if !self.adding.is_empty() || !self.approved.is_empty() => {
                     self.retry_adding();
@@ -4279,6 +4279,9 @@ mod adding_a_device;
 
 #[cfg(all(test, unix))]
 mod dialled_by_the_controlled_machine;
+
+#[cfg(all(test, unix))]
+mod each_controls_the_other;
 
 #[cfg(all(test, unix, any(feature = "tui", feature = "slint")))]
 mod every_pairing_is_listed;

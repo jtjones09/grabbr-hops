@@ -231,6 +231,16 @@ impl Daemon {
         self.service.trust.clone()
     }
 
+    /// Its devices, to add one before its loop runs.
+    pub(crate) fn clients(&self) -> crate::client::ClientManager {
+        self.service.client_manager.clone()
+    }
+
+    /// Its listener's links in, to count them while its loop runs.
+    pub(crate) fn links_in(&self) -> crate::listen::Admitter {
+        self.service.dial_back.admitter()
+    }
+
     /// The port its listener is on, on loopback.
     pub(crate) fn port(&self) -> u16 {
         self.port

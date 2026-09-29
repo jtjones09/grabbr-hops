@@ -765,6 +765,18 @@ pub(crate) struct Admitter {
 }
 
 impl Admitter {
+    /// How many links in are up from the machine that proved `fingerprint`,
+    /// each a link over which it drives this one: one it dialled, and one
+    /// this machine dialled to be driven by it and admitted here.
+    pub(crate) async fn links_from(&self, fingerprint: &str) -> usize {
+        self.conns
+            .lock()
+            .await
+            .iter()
+            .filter(|e| e.fingerprint == fingerprint && e.conn.close_reason().is_none())
+            .count()
+    }
+
     /// Read `conn`, whose peer proved `fingerprint`, as a link in from a
     /// machine that drives this one: its input reaches emulation through the
     /// same checks as any other, each event asked again whether that machine
