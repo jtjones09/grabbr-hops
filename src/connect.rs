@@ -845,6 +845,12 @@ pub(crate) struct Adopter {
 }
 
 impl Adopter {
+    /// Hand capture `heard` as if a link had.
+    #[cfg(test)]
+    pub(crate) fn inject_heard(&self, heard: Heard) {
+        let _ = self.session.recv_tx.send(heard);
+    }
+
     /// Take `dialled` as `handle`'s link. Refused, and closed, unless this
     /// machine still may drive the machine that dialled, `handle` is pinned
     /// to it and is switched on, and no link this machine dialled to it is
@@ -1578,6 +1584,7 @@ async fn receive_loop(
                 match event {
                     ProtoEvent::Pong(b) => {
                         client_manager.set_active_addr(handle, Some(addr));
+                        let first = !client_manager.answered(handle);
                         // Only on a change: pongs are about 2/s per client, and
                         // the frontend needs to hear when the answer differs,
                         // not that it was asked again.
@@ -1585,6 +1592,11 @@ async fn receive_loop(
                             let _ = state_tx.send(handle);
                         }
                         ping_response.borrow_mut().insert(addr);
+                        // The first answer on this link is the one a
+                        // crossing may be waiting for (capture).
+                        if first {
+                            let _ = tx.send((handle, ProtoEvent::Pong(b), link.serial));
+                        }
                     }
                     ProtoEvent::Hello { commit } => {
                         client_manager.set_peer_commit(handle, Some(commit));
