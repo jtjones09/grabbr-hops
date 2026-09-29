@@ -7,6 +7,17 @@
 # (see the README "Quick start").
 
 $ErrorActionPreference = 'Stop'
+
+# Refuse to go on elevated, before building, writing or starting anything:
+# hops is never elevated, and hops.exe refuses to run so. Under UAC the token
+# is in the Administrators role only when it is elevated.
+$me = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+if ($me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Error ("This PowerShell is elevated. hops runs as you and is never " +
+        "elevated. Open a new, normal PowerShell and run this script again.") -ErrorAction Continue
+    exit 1
+}
+
 $repo = $PSScriptRoot
 $bin  = Join-Path $repo 'target\release\hops.exe'
 

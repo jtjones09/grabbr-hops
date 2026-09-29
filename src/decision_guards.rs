@@ -4598,14 +4598,15 @@ mod the_windows_daemon_is_never_installed_elevated {
     //! user can write hands administrator to anything that can replace the
     //! file, and its enter hook comes from a config file the user can write.
     //!
-    //! The enforcement is in code, tested by calling it: on Windows the daemon
-    //! refuses to run in an elevated process, and a front door that is
-    //! elevated starts none and says why (`crate::elevation`, `main.rs`
-    //! `unless_elevated`, `daemon_start::as_the_user`); the enter hook is
-    //! refused in any elevated process (`crate::enter_hook`). The install
-    //! script refuses an elevated shell before it registers anything, which
-    //! the test below requires of its text, since no CI runner registers a
-    //! Windows scheduled task.
+    //! The reason holds for every hops process, so the enforcement is in code
+    //! and covers every command: on Windows `main` refuses an elevated
+    //! process before it parses an argument, daemon, app, tray, TUI and CLI
+    //! alike (`crate::elevation`, tested by calling `main.rs`
+    //! `unless_elevated`; that `main` goes through it is guarded below). The
+    //! enter hook is refused in any elevated process (`crate::enter_hook`).
+    //! Both install scripts refuse an elevated shell before they do anything
+    //! else, which the test below requires of their text, since no CI runner
+    //! runs them.
     //!
     //! The README scan below is a lint for honest mistakes. A scan of prose
     //! cannot be complete: a lookalike letter, or wording it has not seen,
@@ -4619,6 +4620,7 @@ mod the_windows_daemon_is_never_installed_elevated {
     //! `gsudo`.
 
     const SCRIPT: &str = include_str!("../service/windows/install-hops-daemon.ps1");
+    const INSTALLER: &str = include_str!("../install.ps1");
     const README: &str = include_str!("../service/README.md");
 
     /// PowerShell with `#` comments removed, lower-cased, since PowerShell
@@ -4648,26 +4650,32 @@ mod the_windows_daemon_is_never_installed_elevated {
              file the user can write."
         );
 
-        let refusal = refuses_elevation_before_registering(&code);
-        assert!(
-            refusal.is_ok(),
-            "install-hops-daemon.ps1 does not refuse an elevated shell before it \
-             registers anything: {}. It must test the current token with \
-             `IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)` \
-             and `exit` non-zero, ahead of `Register-ScheduledTask`.",
-            refusal.err().unwrap_or_default()
-        );
+        for (name, source) in [
+            ("install-hops-daemon.ps1", SCRIPT),
+            ("install.ps1", INSTALLER),
+        ] {
+            let refusal = refuses_elevation_first(&powershell_code(source));
+            assert!(
+                refusal.is_ok(),
+                "{name} does not refuse an elevated shell before it does anything \
+                 else: {}. It must test the current token with \
+                 `IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)` \
+                 and `exit` non-zero, with only its parameters, \
+                 `$ErrorActionPreference = 'Stop'` and the token read ahead of it.",
+                refusal.err().unwrap_or_default()
+            );
 
-        let script = words(SCRIPT);
-        let asks: Vec<&str> = SCRIPT_ASKS
-            .into_iter()
-            .filter(|phrase| script.contains(phrase))
-            .collect();
-        assert!(
-            asks.is_empty(),
-            "install-hops-daemon.ps1 asks for elevation: {asks:?}. The daemon runs \
-             as the user, so its install needs no administrator."
-        );
+            let script = words(source);
+            let asks: Vec<&str> = SCRIPT_ASKS
+                .into_iter()
+                .filter(|phrase| script.contains(phrase))
+                .collect();
+            assert!(
+                asks.is_empty(),
+                "{name} asks for elevation: {asks:?}. hops runs as the user, so its \
+                 install needs no administrator."
+            );
+        }
 
         let (beyond, elevated_blocks) = elevated_beyond_removal(README);
         assert!(
@@ -4688,25 +4696,16 @@ mod the_windows_daemon_is_never_installed_elevated {
         );
     }
 
-    /// Whether the install script, as [`powershell_code`], refuses an
-    /// elevated shell before it registers anything: an `if` on the current
-    /// token being in the Administrators role, which under UAC it is only
-    /// when elevated, whose block exits non-zero, all ahead of the first
-    /// `Register-ScheduledTask`.
-    fn refuses_elevation_before_registering(code: &str) -> Result<(), String> {
+    /// Whether an install script, as [`powershell_code`], refuses an elevated
+    /// shell before it does anything else: an `if` on the current token being
+    /// in the Administrators role, which under UAC it is only when elevated,
+    /// whose block exits non-zero. Only the script's parameters,
+    /// `$ErrorActionPreference = 'Stop'` and the token read come before it.
+    fn refuses_elevation_first(code: &str) -> Result<(), String> {
         const ROLE: &str = "isinrole([security.principal.windowsbuiltinrole]::administrator)";
+        const TOKEN: &str = "$me = [security.principal.windowsprincipal]\
+                             [security.principal.windowsidentity]::getcurrent()";
         let lines: Vec<&str> = code.lines().map(str::trim).collect();
-        let registers = |l: &str| {
-            l.match_indices("register-scheduledtask")
-                .any(|(at, _)| !l[..at].ends_with("un"))
-        };
-        let register = lines
-            .iter()
-            .position(|l| registers(l))
-            .ok_or("it registers no task")?;
-        if !code.contains("[security.principal.windowsidentity]::getcurrent()") {
-            return Err("it does not read the current token".into());
-        }
         let check = lines
             .iter()
             .position(|l| {
@@ -4729,10 +4728,66 @@ mod the_windows_daemon_is_never_installed_elevated {
         if !exits {
             return Err("its `if` block does not `exit` non-zero".into());
         }
-        if end > register {
-            return Err("it registers the task before the refusal".into());
+        let mut params = false;
+        let mut read = false;
+        for line in &lines[..check] {
+            if params {
+                params = *line != ")";
+            } else if line.starts_with("param(") {
+                params = !line.ends_with(')');
+            } else if *line == TOKEN {
+                read = true;
+            } else if !line.is_empty() && *line != "$erroractionpreference = 'stop'" {
+                return Err(format!("`{line}` comes before the refusal"));
+            }
+        }
+        if !read {
+            return Err("it does not read the current token just before the refusal".into());
         }
         Ok(())
+    }
+
+    /// A backstop, as source text, for what [`crate::elevation`]'s and
+    /// `main.rs`'s tests cannot call: `main` itself, whose commands would
+    /// start a daemon or open a window. Every command goes through
+    /// `unless_elevated` with the process's own answer, and `main` does
+    /// nothing before it but set up its log.
+    // LEDGER T1094 | class S | source text | pair T1091, T1093, T1095
+    #[test]
+    fn every_command_goes_through_the_refusal_first() {
+        const SEAM: &str = "unless_elevated(hops::elevation::refused_here(), dispatch)";
+        let code = super::scan::without_comments(include_str!("main.rs"));
+        let seam = code.find(SEAM);
+        let main = code.find("fn main() {");
+        let before: String = match (main, seam) {
+            (Some(main), Some(seam)) if main < seam => code[main..seam]
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect(),
+            _ => String::new(),
+        };
+        assert_eq!(
+            before,
+            "fnmain(){hops::logging::init(hops::logging::role_from_argv());\
+             install_panic_logger();match",
+            "src/main.rs: `main` must open with its log and then match on `{SEAM}`. \
+             A command run before it, or around it, runs elevated."
+        );
+        let calls = |name: &str| -> Vec<String> {
+            code.match_indices(name)
+                .filter(|(at, _)| {
+                    let prev = code[..*at].chars().next_back().unwrap_or(' ');
+                    !(prev.is_alphanumeric() || matches!(prev, '_' | ':' | '.'))
+                        && !code[..*at].ends_with("fn ")
+                })
+                .map(|(at, _)| super::scan::enclosing_fn(&code, at))
+                .collect()
+        };
+        assert_eq!(
+            (calls("dispatch"), calls("run()")),
+            (vec!["fn main".to_string()], vec!["fn dispatch".to_string()]),
+            "src/main.rs reaches `dispatch` or `run` other than through `{SEAM}`"
+        );
     }
 
     /// What asks, in the install script, for an elevated shell, lower-cased.

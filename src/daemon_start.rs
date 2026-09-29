@@ -476,7 +476,6 @@ impl StartReport {
                 log("If this stays, its log may say why")
             )),
             DaemonStart::StartFailed => {
-                let why = why.trim_end_matches('.');
                 Some(format!("The hops service could not be started: {why}."))
             }
             DaemonStart::CannotProbe => Some(format!(
@@ -814,36 +813,17 @@ pub fn ensure_running_reported_with(
 ///
 /// A daemon of this build is left alone whoever started it. On macOS that
 /// also means no LaunchAgent is installed beside it to race it at the next
-/// login. On Windows a front door that is elevated starts nothing, and the
-/// report says why ([`as_the_user`]).
+/// login.
 #[cfg(any(feature = "tui", feature = "slint"))]
 pub fn ensure_running() -> StartReport {
     start_or_restart_beside_older(
         DaemonEndpoint::of_this_platform(),
         DaemonEndpoint::of_older_builds(),
         &crate::config::this_build(),
-        as_the_user(
-            crate::elevation::daemon_process_is_elevated(),
-            launch_platform_daemon,
-        ),
+        launch_platform_daemon,
         &mut ThisMachine,
         START_WAIT,
     )
-}
-
-/// `launch`, unless this process is `elevated`: a daemon it started would be
-/// elevated too, and hops runs as the user, never elevated (#109). The
-/// refusal is a failed start, so the app shows why
-/// ([`StartReport::problem`]) instead of opening onto no service.
-pub fn as_the_user(
-    elevated: bool,
-    launch: impl FnOnce(Launch) -> io::Result<u32>,
-) -> impl FnOnce(Launch) -> io::Result<u32> {
-    move |how| {
-        crate::elevation::daemon_may_run(elevated)
-            .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
-        launch(how)
-    }
 }
 
 /// Start the daemon the way this platform runs it: the GRANTED launchd service
@@ -1978,43 +1958,6 @@ mod a_daemon_of_hops_0_12_on_its_old_endpoint {
             Duration::from_secs(5),
         );
         (report, launched)
-    }
-
-    // LEDGER T1092 | class B | 1 return value + launches asked for: the front door in an elevated process
-    #[test]
-    fn an_elevated_front_door_starts_no_daemon_and_says_why() {
-        let this = Build {
-            version: "0.13.0".into(),
-            commit: "abcdef1".into(),
-        };
-        let open = |elevated: bool| {
-            let mut launched = Vec::new();
-            let report = start_or_restart_beside_older(
-                Ok(nothing_listening()),
-                None,
-                &this,
-                super::as_the_user(elevated, |launch| {
-                    launched.push(launch);
-                    Ok(4711)
-                }),
-                &mut Serves,
-                Duration::from_secs(5),
-            );
-            (report, launched)
-        };
-        let (report, launched) = open(true);
-        let said = report.problem().unwrap_or_default();
-        assert_eq!(
-            (report.outcome, launched, said.contains("never elevated")),
-            (DaemonStart::StartFailed, vec![], true),
-            "an elevated front door started a daemon, which runs elevated too, or \
-             did not say why it started none: {said}"
-        );
-        assert_eq!(
-            open(false).1,
-            vec![Launch::Start],
-            "a front door that is not elevated did not start the daemon"
-        );
     }
 
     // LEDGER T2260 | class B | 1 return value + launches asked for, against a stand-in 0.12 daemon on a real port

@@ -1,13 +1,14 @@
 //! hops runs as the user and is never elevated (#109).
 //!
 //! An administrator process started from a folder the user can write hands
-//! administrator to anything that can replace the file, and hops reads its
-//! enter hook from a config file the user can write. So on Windows the
-//! daemon refuses to run in an elevated process, and the front door that
-//! finds itself elevated starts no daemon and says why. The enter hook is
-//! refused in any elevated process (`crate::enter_hook`).
+//! administrator to anything that can replace the file, whichever hops
+//! command it runs, and hops reads its enter hook from a config file the
+//! user can write. So on Windows every hops command refuses to run in an
+//! elevated process: `main` asks [`may_run`] before it parses a single
+//! argument. The enter hook is also refused in any elevated process
+//! (`crate::enter_hook`).
 //!
-//! The decisions take `elevated` as a value, so they are tested on every
+//! The decision takes `elevated` as a value, so it is tested on every
 //! system; [`this_process_is_elevated`] is the only part that asks the OS.
 
 use std::fmt;
@@ -20,7 +21,7 @@ pub const RUNS_AS_THE_USER: &str = "hops is running elevated, as an administrato
      started at sign-in from the task hops 0.12 registered, remove that task as \
      service/README.md says under \"Upgrading from hops 0.12 or older\".";
 
-/// Why the daemon did not run: this process is elevated.
+/// Why hops did not run: this process is elevated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Elevated;
 
@@ -32,17 +33,43 @@ impl fmt::Display for Elevated {
 
 impl std::error::Error for Elevated {}
 
-/// Whether a hops daemon may run, or be started, from a process that is
-/// `elevated`. A daemon started from an elevated process is elevated too.
-pub fn daemon_may_run(elevated: bool) -> Result<(), Elevated> {
+/// Whether hops may run in a process that is `elevated`. Anything it
+/// started would be elevated too.
+pub fn may_run(elevated: bool) -> Result<(), Elevated> {
     if elevated { Err(Elevated) } else { Ok(()) }
 }
 
-/// Whether this process is elevated in the sense the daemon refuses: on
-/// Windows, an elevated token. Elsewhere the daemon runs as whoever starts
-/// it, so this is `false` without asking.
-pub fn daemon_process_is_elevated() -> bool {
+/// Whether this process is elevated in the sense hops refuses: on Windows,
+/// an elevated token. Elsewhere hops runs as whoever starts it, so this is
+/// `false` without asking.
+pub fn refused_here() -> bool {
     cfg!(windows) && this_process_is_elevated()
+}
+
+/// Show `refused` where it is seen. At a terminal the log has already put it
+/// on stderr; with none, as for the tray or a task at sign-in, it goes in a
+/// message box on Windows, so hops never ends without a word.
+pub fn tell(refused: &Elevated) {
+    use std::io::IsTerminal;
+    if std::io::stderr().is_terminal() {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+        use windows::core::HSTRING;
+        // SAFETY: both strings outlive the call, and no owner window is named.
+        let _ = unsafe {
+            MessageBoxW(
+                None,
+                &HSTRING::from(refused.to_string()),
+                &HSTRING::from("hops"),
+                MB_OK | MB_ICONERROR,
+            )
+        };
+    }
+    #[cfg(not(windows))]
+    eprintln!("{refused}");
 }
 
 /// Whether this process runs with more privilege than the user who started
@@ -60,8 +87,8 @@ pub fn this_process_is_elevated() -> bool {
 /// Whether this process's token is elevated: started from an administrator
 /// shell, or by a scheduled task with the highest run level.
 ///
-/// When the token cannot be read the answer is yes, so nothing that is
-/// refused elevated runs with privilege nobody checked.
+/// When the token cannot be read the answer is yes, so hops does not run
+/// with privilege nobody checked.
 #[cfg(windows)]
 pub fn this_process_is_elevated() -> bool {
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -147,11 +174,21 @@ mod tests {
         );
     }
 
-    // LEDGER T1091 | class B | 1 return value / error: daemon_may_run
+    // LEDGER T1095 | class B | 1 return value: refused_here
     #[test]
-    fn a_daemon_runs_only_in_a_process_that_is_not_elevated() {
+    fn hops_refuses_exactly_an_elevated_windows_process() {
         assert_eq!(
-            (daemon_may_run(true), daemon_may_run(false)),
+            refused_here(),
+            cfg!(windows) && elevated_by_the_os(),
+            "hops would refuse to run where it may, or run elevated on Windows"
+        );
+    }
+
+    // LEDGER T1091 | class B | 1 return value / error: may_run
+    #[test]
+    fn hops_runs_only_in_a_process_that_is_not_elevated() {
+        assert_eq!(
+            (may_run(true), may_run(false)),
             (Err(Elevated), Ok(())),
             "hops runs as the user and is never elevated (#109)"
         );
