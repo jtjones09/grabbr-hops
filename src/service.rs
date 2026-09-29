@@ -387,7 +387,7 @@ fn drop_untrusted_pins(
                 // `is_known`, not `has_live_lease`: a lapsed lease must keep
                 // its pin, or a device that only needed renewing is stranded on
                 // an address we forgot.
-                .filter(|fp| !trust.has_live_lease(fp))
+                .filter(|fp| !trust.is_known(fp))
                 .map(|fp| (h, fp))
         })
         .collect();
@@ -4415,5 +4415,71 @@ mod a_wrong_pairing_answer_is_not_a_refused_grant {
                 })
                 .await;
         });
+    }
+}
+
+#[cfg(test)]
+mod a_pin_outlives_its_lease {
+    //! `drop_untrusted_pins` runs at start and on every config reload. It may
+    //! drop only a pin the trust store has no record of: a device whose lease
+    //! lapsed, or whose pairing still waits for its number, keeps its pin.
+
+    use super::drop_untrusted_pins;
+    use crate::client::ClientManager;
+    use crate::trust::{Caps, Term, TrustStore};
+
+    const T0: u64 = 4_000_000_000;
+    const HOUR: u64 = 3_600;
+
+    fn fp(tag: u8) -> String {
+        (0u8..32)
+            .map(|i| format!("{:02x}", tag.wrapping_add(i)))
+            .collect::<Vec<_>>()
+            .join(":")
+    }
+
+    fn pinned_to(m: &ClientManager, fingerprint: &str) -> hops_ipc::ClientHandle {
+        let h = m.add_client();
+        m.set_peer_fingerprint(h, Some(fingerprint.to_string()));
+        h
+    }
+
+    #[test]
+    fn only_a_pin_the_trust_store_never_heard_of_is_dropped() {
+        let mut trust = TrustStore::new(&fp(0x01), T0).expect("ours");
+        let (lapsed, pending, stranger) = (fp(0x40), fp(0x60), fp(0x80));
+        trust
+            .issue_with_term(&lapsed, "lapsed", Caps::OUTBOUND, Term::Secs(HOUR))
+            .expect("issue");
+        trust.sweep(T0 + 2 * HOUR);
+        trust
+            .issue(&pending, "pending", Caps::OUTBOUND)
+            .expect("issue");
+        assert!(
+            !trust.has_live_lease(&lapsed) && !trust.has_live_lease(&pending),
+            "precondition: neither holds a lease in force"
+        );
+
+        let m = ClientManager::default();
+        let (a, b, c) = (
+            pinned_to(&m, &lapsed),
+            pinned_to(&m, &pending),
+            pinned_to(&m, &stranger),
+        );
+
+        let dropped = drop_untrusted_pins(&m, &trust);
+
+        assert_eq!(
+            dropped,
+            vec![c],
+            "only the pin nothing records may go, and it must: dropped {dropped:?}"
+        );
+        assert_eq!(m.peer_fingerprint(a), Some(lapsed));
+        assert_eq!(m.peer_fingerprint(b), Some(pending));
+        assert_eq!(
+            m.peer_fingerprint(c),
+            None,
+            "a pin nothing vouches for is dropped"
+        );
     }
 }
