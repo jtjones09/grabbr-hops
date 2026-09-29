@@ -536,20 +536,27 @@ fn a_knock_from_a_listed_machine_folds_nothing_and_the_first_crossing_does() {
 
 /// Knock as `knocker` until the app has been told of it, as a refused
 /// knock from a machine to pair again, or as a prompt while add device is
-/// open: the knock reached the daemon, and was handled.
-async fn until_knock_told(app: &mut Frontend, knocker: &crate::test_harness::Dialer) {
+/// open: the knock reached the daemon, and was handled. Every event the
+/// app was sent until then is returned, the notice's own batch included,
+/// so that what came with the notice is not lost to the caller.
+async fn until_knock_told(
+    app: &mut Frontend,
+    knocker: &crate::test_harness::Dialer,
+) -> Vec<FrontendEvent> {
     let deadline = tokio::time::Instant::now() + DEADLINE;
+    let mut seen = Vec::new();
     loop {
         let _ = knocker.conn.send(ProtoEvent::Ping, knocker.handle).await;
-        let told = app.exchange(&[]).await.into_iter().any(|e| match e {
+        seen.extend(app.exchange(&[]).await);
+        let told = seen.iter().any(|e| match e {
             FrontendEvent::Activity(t) => t.contains("paired with an older version"),
             FrontendEvent::ConnectionAttempt { origin, .. } => {
-                origin == hops_ipc::AttemptOrigin::Inbound
+                *origin == hops_ipc::AttemptOrigin::Inbound
             }
             _ => false,
         });
         if told {
-            return;
+            return seen;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -570,6 +577,7 @@ fn a_knock_from_a_listed_machine_dials_nothing_and_tells_nothing_of_a_dial() {
     run_local(async {
         let iridium = machine();
         let stranger = machine();
+        let mut outcomes = Vec::new();
         for (tag, add_open, answers) in [
             ("v012n1", false, &stranger),
             ("v012n2", true, &stranger),
@@ -585,32 +593,35 @@ fn a_knock_from_a_listed_machine_dials_nothing_and_tells_nothing_of_a_dial() {
             )
             .await;
             let (ours, port, ipc) = (daemon.fingerprint(), daemon.port(), daemon.ipc());
+            // A banner, or any prompt but the knocking machine's own.
+            let of_a_dial = |e: FrontendEvent| match e {
+                FrontendEvent::Error(t) => Some(format!("banner: {t}")),
+                FrontendEvent::ConnectionAttempt {
+                    fingerprint,
+                    origin,
+                    addr,
+                } if origin != hops_ipc::AttemptOrigin::Inbound
+                    || fingerprint != iridium.fingerprint =>
+                {
+                    Some(format!("prompt: {fingerprint} {origin:?} {addr:?}"))
+                }
+                _ => None,
+            };
             let body = async {
                 let mut app = ipc.connect().await;
                 if add_open {
                     app.exchange(&[FrontendRequest::OpenPairing]).await;
                 }
                 let knocker = dialer(&iridium, trusting(&iridium, &ours), port, Position::Left);
-                until_knock_told(&mut app, &knocker).await;
-                let mut told = Vec::new();
+                let mut told: Vec<String> = until_knock_told(&mut app, &knocker)
+                    .await
+                    .into_iter()
+                    .filter_map(of_a_dial)
+                    .collect();
                 let deadline = tokio::time::Instant::now() + NEVER_WITHIN * 3;
                 while tokio::time::Instant::now() < deadline {
                     let _ = knocker.conn.send(ProtoEvent::Ping, knocker.handle).await;
-                    for e in app.exchange(&[]).await {
-                        match e {
-                            FrontendEvent::Error(t) => told.push(format!("banner: {t}")),
-                            FrontendEvent::ConnectionAttempt {
-                                fingerprint,
-                                origin,
-                                addr,
-                            } if origin != hops_ipc::AttemptOrigin::Inbound
-                                || fingerprint != iridium.fingerprint =>
-                            {
-                                told.push(format!("prompt: {fingerprint} {origin:?} {addr:?}"))
-                            }
-                            _ => {}
-                        }
-                    }
+                    told.extend(app.exchange(&[]).await.into_iter().filter_map(of_a_dial));
                     tokio::time::sleep(NEVER_WITHIN / 4).await;
                 }
                 (told, receiver.knocks())
@@ -621,16 +632,20 @@ fn a_knock_from_a_listed_machine_dials_nothing_and_tells_nothing_of_a_dial() {
             } else {
                 "the listed machine"
             };
-            assert_eq!(
-                (told, dialled),
-                (Vec::<String>::new(), 0),
-                "with add device {} and {who} answering at the device's address, a knock \
-                 presenting the listed machine's certificate made this machine (tell, \
-                 dial there). A knock must start no dial, and nothing it causes may be \
-                 told as this machine's own dial (#231, #150, #171, #61)",
-                if add_open { "open" } else { "closed" },
-            );
+            let add = if add_open { "open" } else { "closed" };
+            outcomes.push((format!("add device {add}, {who} answering"), told, dialled));
         }
+        let wrong: Vec<_> = outcomes
+            .into_iter()
+            .filter(|(_, told, dialled)| !told.is_empty() || *dialled != 0)
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "a knock presenting the listed machine's certificate made this machine tell \
+             something, or dial the address a v0.12 device names: (case, told, dials \
+             there) {wrong:?}. A knock must start no dial, and must raise no banner and \
+             no prompt but its own (#231, #150, #171, #61)"
+        );
     });
 }
 
