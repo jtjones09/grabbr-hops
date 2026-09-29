@@ -4,14 +4,16 @@
 //! administrator to anything that can replace the file, whichever hops
 //! command it runs, and hops reads its enter hook from a config file the
 //! user can write. So on Windows every hops command refuses to run in an
-//! elevated process: `main` asks [`may_run`] before it parses a single
-//! argument. The enter hook is also refused in any elevated process
-//! (`crate::enter_hook`).
+//! elevated process: `main` asks [`may_run`] before it opens its log or
+//! parses a single argument, and a refused process touches no file. The
+//! enter hook is also refused in any elevated process (`crate::enter_hook`).
 //!
-//! The decision takes `elevated` as a value, so it is tested on every
-//! system; [`this_process_is_elevated`] is the only part that asks the OS.
+//! The decisions take their inputs as values, so they are tested on every
+//! system; [`this_process_is_elevated`], [`this_stderr`] and
+//! [`alone_on_its_console`] are the only parts that ask the OS.
 
 use std::fmt;
+use std::io::Write;
 
 /// What hops says when it finds itself elevated, and how to put it right.
 pub const RUNS_AS_THE_USER: &str = "hops is running elevated, as an administrator, and it \
@@ -19,7 +21,9 @@ pub const RUNS_AS_THE_USER: &str = "hops is running elevated, as an administrato
      the user can write hands administrator to anything that can replace the file. Start \
      hops from a normal PowerShell, or open it without \"Run as administrator\". If it \
      started at sign-in from the task hops 0.12 registered, remove that task as \
-     service/README.md says under \"Upgrading from hops 0.12 or older\".";
+     service/README.md says under \"Upgrading from hops 0.12 or older\". If User Account \
+     Control is turned off for your account, everything you start is elevated and hops \
+     cannot run for it: use a standard account, or turn User Account Control on.";
 
 /// Why hops did not run: this process is elevated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,21 +43,135 @@ pub fn may_run(elevated: bool) -> Result<(), Elevated> {
     if elevated { Err(Elevated) } else { Ok(()) }
 }
 
+/// A debug build made for GitHub's Windows runners, which run every job as
+/// an administrator with User Account Control off, so that the tests which
+/// start hops can run there. Only the `elevated_ci_runner` feature turns it
+/// on, only in a build with debug assertions, and a release build with the
+/// feature does not compile. No release feature set names it
+/// (`decision_guards`), and the same runner tests the refusal in a build
+/// without it.
+pub const ELEVATED_CI_RUNNER: bool = cfg!(all(feature = "elevated_ci_runner", debug_assertions));
+
+#[cfg(all(feature = "elevated_ci_runner", not(debug_assertions)))]
+compile_error!(
+    "`elevated_ci_runner` lets hops run elevated, for Windows CI's test builds only; \
+     a release build must never have it"
+);
+
 /// Whether this process is elevated in the sense hops refuses: on Windows,
 /// an elevated token. Elsewhere hops runs as whoever starts it, so this is
 /// `false` without asking.
 pub fn refused_here() -> bool {
-    cfg!(windows) && this_process_is_elevated()
+    cfg!(windows) && !ELEVATED_CI_RUNNER && this_process_is_elevated()
 }
 
-/// Show `refused` where it is seen. At a terminal the log has already put it
-/// on stderr; with none, as for the tray or a task at sign-in, it goes in a
-/// message box on Windows, so hops never ends without a word.
-pub fn tell(refused: &Elevated) {
-    use std::io::IsTerminal;
-    if std::io::stderr().is_terminal() {
-        return;
+/// Where this process's stderr goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stderr {
+    /// A console, which stays on screen only while a process shares it.
+    Terminal,
+    /// A file or a pipe: whoever redirected it keeps what is written.
+    Redirected,
+    /// No handle at all: what is written is lost.
+    Nowhere,
+}
+
+/// How an elevated hops ends: its exit code, the text, and whether a
+/// message box shows it as well as stderr.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub exit_code: i32,
+    pub text: String,
+    pub message_box: bool,
+}
+
+/// How `refused` is reported. It always goes to stderr and the exit code is
+/// always 1. On Windows it also goes in a message box whenever nothing
+/// would keep stderr on screen: a console this process has to itself, as
+/// from a double-click, "Run as administrator" or the tray's hidden
+/// launcher, closes when it exits, and a stderr with no handle goes
+/// nowhere. One redirected is kept by whoever redirected it, and a box
+/// there would wait for a click nobody sees.
+pub fn refusal(
+    refused: &Elevated,
+    on_windows: bool,
+    stderr: Stderr,
+    alone_on_its_console: bool,
+) -> Refusal {
+    let lost = match stderr {
+        Stderr::Terminal => alone_on_its_console,
+        Stderr::Redirected => false,
+        Stderr::Nowhere => true,
+    };
+    Refusal {
+        exit_code: 1,
+        text: refused.to_string(),
+        message_box: on_windows && lost,
     }
+}
+
+/// Write `refusal` to `stderr`, and to `show_box` when it asks for a box;
+/// then the exit code it asks for.
+pub fn tell(refusal: &Refusal, stderr: &mut impl Write, show_box: impl FnOnce(&str)) -> i32 {
+    let _ = writeln!(stderr, "{}", refusal.text);
+    let _ = stderr.flush();
+    if refusal.message_box {
+        show_box(&refusal.text);
+    }
+    refusal.exit_code
+}
+
+/// Report `refused` where it is seen, from this process, and return the code
+/// to exit with. Creates, opens and changes no file.
+pub fn refuse(refused: &Elevated) -> i32 {
+    let refusal = refusal(
+        refused,
+        cfg!(windows),
+        this_stderr(),
+        alone_on_its_console(),
+    );
+    tell(&refusal, &mut std::io::stderr(), message_box)
+}
+
+/// Where this process's stderr goes.
+pub fn this_stderr() -> Stderr {
+    use std::io::IsTerminal;
+    let stderr = std::io::stderr();
+    if stderr.is_terminal() {
+        return Stderr::Terminal;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        let handle = stderr.as_raw_handle();
+        // GetStdHandle's two answers for a process given no stderr.
+        if handle.is_null() || handle as isize == -1 {
+            return Stderr::Nowhere;
+        }
+    }
+    Stderr::Redirected
+}
+
+/// Whether no other process shares this process's console, or it has none:
+/// then no shell is left to show what it wrote once it exits.
+#[cfg(windows)]
+pub fn alone_on_its_console() -> bool {
+    use windows::Win32::System::Console::GetConsoleProcessList;
+    let mut ids = [0u32; 2];
+    // SAFETY: the call writes at most `ids.len()` ids into `ids`, and
+    // returns how many processes share the console, 0 when there is none.
+    let sharing = unsafe { GetConsoleProcessList(&mut ids) };
+    sharing <= 1
+}
+
+/// Elsewhere a terminal outlives the process that writes to it.
+#[cfg(not(windows))]
+pub fn alone_on_its_console() -> bool {
+    false
+}
+
+/// A message box with `text`, on Windows; elsewhere there is none to show.
+fn message_box(text: &str) {
     #[cfg(windows)]
     {
         use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
@@ -62,14 +180,14 @@ pub fn tell(refused: &Elevated) {
         let _ = unsafe {
             MessageBoxW(
                 None,
-                &HSTRING::from(refused.to_string()),
+                &HSTRING::from(text),
                 &HSTRING::from("hops"),
                 MB_OK | MB_ICONERROR,
             )
         };
     }
     #[cfg(not(windows))]
-    eprintln!("{refused}");
+    let _ = text;
 }
 
 /// Whether this process runs with more privilege than the user who started
@@ -174,14 +292,91 @@ mod tests {
         );
     }
 
+    /// Set by the Windows CI step that runs these tests elevated in a build
+    /// without `elevated_ci_runner`, so that a runner which stopped being
+    /// elevated fails the step instead of proving nothing. Tests read it;
+    /// hops never does.
+    const RUNNER_IS_ELEVATED: &str = "HOPS_TEST_RUNNER_IS_ELEVATED";
+
     // LEDGER T1095 | class B | 1 return value: refused_here
     #[test]
     fn hops_refuses_exactly_an_elevated_windows_process() {
+        if std::env::var_os(RUNNER_IS_ELEVATED).is_some() {
+            assert!(
+                cfg!(windows) && elevated_by_the_os() && !ELEVATED_CI_RUNNER,
+                "{RUNNER_IS_ELEVATED} says this run tests the refusal on an elevated \
+                 Windows runner, in a build without `elevated_ci_runner`, and it is \
+                 not one: windows {}, elevated {}, test build {}",
+                cfg!(windows),
+                elevated_by_the_os(),
+                ELEVATED_CI_RUNNER
+            );
+        }
         assert_eq!(
             refused_here(),
-            cfg!(windows) && elevated_by_the_os(),
+            cfg!(windows) && !ELEVATED_CI_RUNNER && elevated_by_the_os(),
             "hops would refuse to run where it may, or run elevated on Windows"
         );
+    }
+
+    // LEDGER T1096 | class B | 1 return value: refusal, over every input
+    #[test]
+    fn a_refusal_exits_1_and_shows_a_box_where_nothing_keeps_stderr() {
+        for on_windows in [false, true] {
+            for stderr in [Stderr::Terminal, Stderr::Redirected, Stderr::Nowhere] {
+                for alone in [false, true] {
+                    let got = refusal(&Elevated, on_windows, stderr, alone);
+                    let lost = match stderr {
+                        Stderr::Terminal => alone,
+                        Stderr::Redirected => false,
+                        Stderr::Nowhere => true,
+                    };
+                    assert_eq!(
+                        got,
+                        Refusal {
+                            exit_code: 1,
+                            text: RUNS_AS_THE_USER.to_string(),
+                            message_box: on_windows && lost,
+                        },
+                        "windows {on_windows}, stderr {stderr:?}, alone on its console \
+                         {alone}. A refusal exits 1 with the fix; on Windows it is also \
+                         in a box when its console closes with it or stderr goes \
+                         nowhere, and never where a box would wait on a script"
+                    );
+                }
+            }
+        }
+        // The cases that were silent: a double-click, "Run as administrator"
+        // and the tray's hidden launcher each give hops a console of its own.
+        assert!(
+            refusal(&Elevated, true, Stderr::Terminal, true).message_box,
+            "an elevated hops with a console of its own ends without a word on \
+             screen: the console closes with it"
+        );
+    }
+
+    // LEDGER T1097 | class B | 1 bytes written + whether a box was asked for + code
+    #[test]
+    fn a_refusal_is_written_to_stderr_and_to_a_box_when_it_asks() {
+        for message_box in [false, true] {
+            let refusal = Refusal {
+                exit_code: 1,
+                text: RUNS_AS_THE_USER.to_string(),
+                message_box,
+            };
+            let mut stderr = Vec::new();
+            let mut boxed = None;
+            let code = tell(&refusal, &mut stderr, |text| boxed = Some(text.to_string()));
+            let written = String::from_utf8_lossy(&stderr);
+            assert!(
+                code == 1
+                    && written.trim_end() == RUNS_AS_THE_USER
+                    && boxed.as_deref() == message_box.then_some(RUNS_AS_THE_USER),
+                "a refusal must exit 1, always write its text to stderr, and show \
+                 it in a box exactly when asked: code {code}, stderr {written:?}, \
+                 box {boxed:?}"
+            );
+        }
     }
 
     // LEDGER T1091 | class B | 1 return value / error: may_run
@@ -198,6 +393,8 @@ mod tests {
             "normal PowerShell",
             "hops 0.12",
             "service/README.md",
+            "User Account Control is turned off",
+            "use a standard account, or turn User Account Control on",
         ] {
             assert!(
                 said.contains(needed),

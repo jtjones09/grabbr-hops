@@ -40,26 +40,18 @@ enum HopsError {
 }
 
 fn main() {
-    // Logging first, before anything that can fail: a config parse error is
-    // one of the things most worth having in the log.
-    hops::logging::init(hops::logging::role_from_argv());
-    install_panic_logger();
-
-    // Before anything else, every command included: hops runs as the user,
-    // never elevated (#109).
-    match unless_elevated(hops::elevation::refused_here(), dispatch) {
+    // First, every command included: hops runs as the user, never elevated
+    // (#109). A refused process opens no log, since an elevated process that
+    // creates, opens or rotates a file where the user can write is the very
+    // hazard, and reports on stderr and, where nothing keeps that on screen,
+    // in a message box.
+    match unless_elevated(hops::elevation::refused_here(), start) {
         Ok(()) => {}
+        Err(HopsError::Elevated(e)) => process::exit(hops::elevation::refuse(&e)),
         // A `hops cli` command answers whoever ran it, a script as much as a
         // terminal, and the log reaches stderr only at a terminal.
         Err(HopsError::Cli(e)) => {
             eprintln!("{e}");
-            process::exit(1);
-        }
-        // Said where it is seen: at a terminal on stderr, and otherwise, as
-        // for the tray or a task at sign-in, in a message box.
-        Err(HopsError::Elevated(e)) => {
-            log::error!("{e}");
-            hops::elevation::tell(&e);
             process::exit(1);
         }
         Err(e) => {
@@ -70,7 +62,8 @@ fn main() {
 }
 
 /// `command`, unless this process is `elevated`: then nothing of hops runs,
-/// not even an argument parse, and the error says why and what to do.
+/// not its log and not an argument parse, and the error says why and what
+/// to do.
 ///
 /// No command is exempt. `build-check` runs git in a checkout the user can
 /// write, whose config can name programs for git to run, and `--help` and
@@ -83,7 +76,16 @@ fn unless_elevated(
     command()
 }
 
-/// Every command, once this process may run.
+/// hops, once this process may run.
+fn start() -> Result<(), HopsError> {
+    // Logging first, before anything that can fail: a config parse error is
+    // one of the things most worth having in the log.
+    hops::logging::init(hops::logging::role_from_argv());
+    install_panic_logger();
+    dispatch()
+}
+
+/// Every command, once the log is open.
 fn dispatch() -> Result<(), HopsError> {
     // Before anything that reads the config. This is the command someone runs
     // to find out why the others are failing, so it must not need them to work.

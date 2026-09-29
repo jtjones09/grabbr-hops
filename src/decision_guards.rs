@@ -4600,8 +4600,8 @@ mod the_windows_daemon_is_never_installed_elevated {
     //!
     //! The reason holds for every hops process, so the enforcement is in code
     //! and covers every command: on Windows `main` refuses an elevated
-    //! process before it parses an argument, daemon, app, tray, TUI and CLI
-    //! alike (`crate::elevation`, tested by calling `main.rs`
+    //! process before it opens its log or parses an argument, daemon, app,
+    //! tray, TUI and CLI alike (`crate::elevation`, tested by calling `main.rs`
     //! `unless_elevated`; that `main` goes through it is guarded below). The
     //! enter hook is refused in any elevated process (`crate::enter_hook`).
     //! Both install scripts refuse an elevated shell before they do anything
@@ -4749,44 +4749,76 @@ mod the_windows_daemon_is_never_installed_elevated {
 
     /// A backstop, as source text, for what [`crate::elevation`]'s and
     /// `main.rs`'s tests cannot call: `main` itself, whose commands would
-    /// start a daemon or open a window. Every command goes through
-    /// `unless_elevated` with the process's own answer, and `main` does
-    /// nothing before it but set up its log.
-    // LEDGER T1094 | class S | source text | pair T1091, T1093, T1095
+    /// start a daemon or open a window. `main` does nothing before it asks
+    /// `unless_elevated` with the process's own answer; the log is opened
+    /// only after, in `start`, so a refused process creates, opens and
+    /// rotates no file; every command goes through `start`; and a refusal
+    /// exits with what [`crate::elevation::refuse`] returns.
+    // LEDGER T1094 | class S | source text | pair T1091, T1093, T1095, T1096, T1097, T1098
     #[test]
     fn every_command_goes_through_the_refusal_first() {
-        const SEAM: &str = "unless_elevated(hops::elevation::refused_here(), dispatch)";
-        let code = super::scan::without_comments(include_str!("main.rs"));
-        let seam = code.find(SEAM);
-        let main = code.find("fn main() {");
-        let before: String = match (main, seam) {
-            (Some(main), Some(seam)) if main < seam => code[main..seam]
+        const SEAM: &str = "unless_elevated(hops::elevation::refused_here(), start)";
+        let code = super::scan::code_only(include_str!("main.rs"));
+        let squeezed = |from: &str, to: &str| -> String {
+            let at = code.find(from).unwrap_or(code.len());
+            let end = code[at..].find(to).map_or(code.len(), |i| at + i);
+            code[at..end]
                 .chars()
                 .filter(|c| !c.is_whitespace())
-                .collect(),
-            _ => String::new(),
+                .collect()
         };
         assert_eq!(
-            before,
-            "fnmain(){hops::logging::init(hops::logging::role_from_argv());\
-             install_panic_logger();match",
-            "src/main.rs: `main` must open with its log and then match on `{SEAM}`. \
-             A command run before it, or around it, runs elevated."
+            squeezed("fn main() {", SEAM),
+            "fnmain(){match",
+            "src/main.rs: `main` must open with a match on `{SEAM}`. Anything \
+             before it runs elevated: the log, for one, creates and rotates files \
+             in a folder the user can write."
+        );
+        let main = squeezed("fn main() {", "\n}\n");
+        assert!(
+            main.contains(
+                "Err(HopsError::Elevated(e))=>process::exit(hops::elevation::refuse(&e)),"
+            ),
+            "src/main.rs: an elevated process must exit with what \
+             `hops::elevation::refuse` returns, which says why where it is seen \
+             and is 1 (T1096, T1097); `main` does something else"
+        );
+        assert_eq!(
+            squeezed("fn start() -> Result<(), HopsError> {", "\n}\n"),
+            "fnstart()->Result<(),HopsError>{hops::logging::init(hops::logging::role_from_argv());\
+             install_panic_logger();dispatch()",
+            "src/main.rs: `start` must open the log, install the panic logger and \
+             dispatch, and nothing else"
         );
         let calls = |name: &str| -> Vec<String> {
             code.match_indices(name)
                 .filter(|(at, _)| {
                     let prev = code[..*at].chars().next_back().unwrap_or(' ');
+                    let next = code[at + name.len()..].chars().next().unwrap_or(' ');
                     !(prev.is_alphanumeric() || matches!(prev, '_' | ':' | '.'))
+                        && !(next.is_alphanumeric() || next == '_')
                         && !code[..*at].ends_with("fn ")
                 })
                 .map(|(at, _)| super::scan::enclosing_fn(&code, at))
                 .collect()
         };
         assert_eq!(
-            (calls("dispatch"), calls("run()")),
-            (vec!["fn main".to_string()], vec!["fn dispatch".to_string()]),
-            "src/main.rs reaches `dispatch` or `run` other than through `{SEAM}`"
+            (
+                calls("start"),
+                calls("hops::logging::init"),
+                calls("install_panic_logger"),
+                calls("dispatch"),
+                calls("run()"),
+            ),
+            (
+                vec!["fn main".to_string()],
+                vec!["fn start".to_string()],
+                vec!["fn start".to_string()],
+                vec!["fn start".to_string()],
+                vec!["fn dispatch".to_string()],
+            ),
+            "src/main.rs opens the log, or reaches `start`, `dispatch` or `run`, \
+             other than through `{SEAM}`"
         );
     }
 

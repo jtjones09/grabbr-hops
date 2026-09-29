@@ -2933,3 +2933,191 @@ fn the_ipc_tests_run_on_windows() {
         wanted.join(" ")
     );
 }
+
+// ---------------------------------------------------------------------------
+// check.yml: GitHub's Windows runners run every job as an administrator with
+// User Account Control off, and hops refuses to run elevated (#109). The
+// `elevated_ci_runner` feature lets a debug build run there, so the tests that
+// start hops still run; it must never reach anything that ships, and the same
+// runner must test the refusal itself in a build without it.
+// ---------------------------------------------------------------------------
+
+const ELEVATED_CI_RUNNER: &str = "elevated_ci_runner";
+const RELEASE_FEATURES: &str = "release-features";
+const REFUSAL_TEST: &str = "elevated_refusal";
+const RUNNER_IS_ELEVATED: &str = "HOPS_TEST_RUNNER_IS_ELEVATED";
+const WINDOWS_ONLY: &str = "runner.os == 'Windows'";
+
+/// Every file under `rel`, recursively, as a path relative to the repository.
+fn files_under(rel: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut dirs = vec![repo().join(rel)];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{dir:?}: {e}")) {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                let rel = path.strip_prefix(repo()).expect("under the repository");
+                found.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    found
+}
+
+/// The commands of `step` that run cargo, one a line, as tokens.
+fn cargo_commands(step: &Yaml) -> Vec<Vec<String>> {
+    let run = step["run"].as_str().unwrap_or("").replace("\\\n", " ");
+    run.lines()
+        .map(|l| l.split_whitespace().map(str::to_owned).collect::<Vec<_>>())
+        .filter(|t| t.iter().any(|t| t == "cargo"))
+        .collect()
+}
+
+/// Whether `command` is `cargo test` with the adjacent `pair` among its tokens.
+fn cargo_test_with(command: &[String], pair: [&str; 2]) -> bool {
+    command.windows(2).any(|w| w == ["cargo", "test"]) && command.windows(2).any(|w| w == pair)
+}
+
+// LEDGER T1099 | class S | parsed workflow YAML + manifest + source text | pair T1098, T1095
+#[test]
+fn only_windows_ci_test_builds_may_run_elevated() {
+    // The manifest: defined once, forwarded by no feature and not in
+    // `default`, and no profile turns debug assertions on, which is what
+    // keeps a release build with it from compiling.
+    let manifest: String = read("Cargo.toml")
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let named: Vec<&str> = manifest
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.contains(ELEVATED_CI_RUNNER))
+        .collect();
+    assert_eq!(
+        named,
+        vec![format!("{ELEVATED_CI_RUNNER} = []")],
+        "Cargo.toml must define `{ELEVATED_CI_RUNNER}` as an empty feature and name \
+         it nowhere else: in `default` or forwarded by another feature, every build \
+         with that feature could run elevated"
+    );
+    assert!(
+        !manifest.contains("debug-assertions"),
+        "Cargo.toml sets debug-assertions; a release profile with them on compiles \
+         `{ELEVATED_CI_RUNNER}` into a release"
+    );
+
+    // The code: only src/elevation.rs reads the feature, and only in a build
+    // with debug assertions; without them it does not compile.
+    let elevation = read("src/elevation.rs").replace("\r\n", "\n");
+    for needed in [
+        "pub const ELEVATED_CI_RUNNER: bool = cfg!(all(feature = \"elevated_ci_runner\", \
+         debug_assertions));",
+        "#[cfg(all(feature = \"elevated_ci_runner\", not(debug_assertions)))]\ncompile_error!(",
+        "cfg!(windows) && !ELEVATED_CI_RUNNER && this_process_is_elevated()",
+    ] {
+        assert!(
+            elevation.contains(needed),
+            "src/elevation.rs no longer has `{needed}`"
+        );
+    }
+    let mut readers: Vec<String> = files_under("src")
+        .into_iter()
+        .chain(files_under("crates"))
+        .filter(|f| f.ends_with(".rs"))
+        .filter(|f| read(f).contains(ELEVATED_CI_RUNNER))
+        .collect();
+    readers.sort();
+    assert_eq!(
+        readers,
+        vec!["src/elevation.rs".to_owned()],
+        "only src/elevation.rs may read `{ELEVATED_CI_RUNNER}`"
+    );
+    // The variable CI sets for the refusal's tests only makes them stricter;
+    // hops itself never reads it, or it would be a way round the refusal.
+    let hops_reads: Vec<String> = files_under("src")
+        .into_iter()
+        .chain(files_under("crates"))
+        .filter(|f| f.ends_with(".rs"))
+        .filter(|f| {
+            let text = read(f);
+            let code = text.split("\n#[cfg(test)]").next().unwrap_or(&text);
+            code.contains(RUNNER_IS_ELEVATED)
+        })
+        .collect();
+    assert!(
+        hops_reads.is_empty(),
+        "{hops_reads:?} read {RUNNER_IS_ELEVATED} outside tests"
+    );
+
+    // Nothing that builds a release, installs or launches hops names it.
+    let mut shipping: Vec<String> = files_under("service");
+    shipping.extend([RELEASE.to_owned(), "install.ps1".to_owned()]);
+    for rel in &shipping {
+        let text = read(rel);
+        assert!(
+            !text.contains(ELEVATED_CI_RUNNER) && !text.contains("DEBUG_ASSERTIONS"),
+            "{rel} names `{ELEVATED_CI_RUNNER}` or debug assertions; nothing that \
+             builds what ships may let hops run elevated"
+        );
+    }
+
+    // check.yml: only `cargo test` names it, in a debug build on Windows.
+    let wf = parse(CHECK);
+    let jobs = wf["jobs"].as_hash().expect("check.yml has jobs");
+    let mut with_it = 0;
+    for (id, job) in jobs {
+        let id = id.as_str().unwrap_or("?");
+        for step in steps(job) {
+            for command in cargo_commands(step) {
+                if !command.iter().any(|t| t.contains(ELEVATED_CI_RUNNER)) {
+                    continue;
+                }
+                assert!(
+                    command.windows(2).any(|w| w == ["cargo", "test"])
+                        && !command.iter().any(|t| t == "--release" || t == "-r")
+                        && id == RELEASE_FEATURES
+                        && step["if"].as_str() == Some(WINDOWS_ONLY),
+                    "check.yml/{id} runs `{}`; `{ELEVATED_CI_RUNNER}` belongs only to \
+                     `cargo test` in a debug build, on the Windows runner of \
+                     {RELEASE_FEATURES}",
+                    command.join(" ")
+                );
+                with_it += 1;
+            }
+        }
+    }
+    assert_eq!(
+        with_it, 1,
+        "check.yml must run the Windows tests once with `{ELEVATED_CI_RUNNER}`"
+    );
+
+    // And the same runner tests the refusal itself, in the build that ships.
+    let job = &wf["jobs"][RELEASE_FEATURES];
+    assert!(
+        runners(RELEASE_FEATURES, job).contains("windows-latest"),
+        "{RELEASE_FEATURES} no longer runs on windows-latest"
+    );
+    let refusal: Vec<&Yaml> = steps(job)
+        .iter()
+        .filter(|step| {
+            cargo_commands(step).iter().any(|c| {
+                cargo_test_with(c, ["--test", REFUSAL_TEST])
+                    && c.iter().any(|t| t == "--lib")
+                    && !c.iter().any(|t| t.contains(ELEVATED_CI_RUNNER))
+            })
+        })
+        .collect();
+    assert!(
+        refusal.len() == 1
+            && refusal[0]["if"].as_str() == Some(WINDOWS_ONLY)
+            && !refusal[0]["env"][RUNNER_IS_ELEVATED].is_badvalue()
+            && !may_fail(refusal[0]),
+        "{RELEASE_FEATURES} must run, on Windows, the library's tests and `--test \
+         {REFUSAL_TEST}` without `{ELEVATED_CI_RUNNER}` and with {RUNNER_IS_ELEVATED} \
+         set, and may not let that fail, so the elevated runner tests the refusal \
+         itself"
+    );
+}

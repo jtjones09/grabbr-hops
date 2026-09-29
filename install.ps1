@@ -14,7 +14,10 @@ $ErrorActionPreference = 'Stop'
 $me = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
 if ($me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Error ("This PowerShell is elevated. hops runs as you and is never " +
-        "elevated. Open a new, normal PowerShell and run this script again.") -ErrorAction Continue
+        "elevated. Open a new, normal PowerShell and run this script again. " +
+        "If User Account Control is turned off for your account, every " +
+        "PowerShell is elevated: use a standard account, or turn User " +
+        "Account Control on.") -ErrorAction Continue
     exit 1
 }
 
