@@ -251,6 +251,9 @@ pub struct Service {
     /// whether the clipboard backend is still running (false once it stops, so
     /// the run loop does not busy-poll a closed channel)
     clipboard_alive: bool,
+    /// The power assertion that keeps this machine awake while a paired
+    /// device that may control it is switched on; settled after every event.
+    keep_awake: crate::keep_awake::KeepAwake,
     /// inbound clipboard text received from peers, applied to the local
     /// clipboard if the pairing still takes it from its sender
     clipboard_in: ClipboardInbox,
@@ -898,6 +901,7 @@ impl Service {
             next_trigger_handle: 0,
             clipboard,
             clipboard_alive: true,
+            keep_awake: crate::keep_awake::KeepAwake::for_this_machine(),
             clipboard_in,
             dial_refusals,
             refusal_notices: RecentNotices::default(),
@@ -948,6 +952,7 @@ impl Service {
         log::info!("service running; stops on {}", StopRequests::DESCRIPTION);
         let mut restart_for = None;
 
+        self.settle_keep_awake();
         loop {
             tokio::select! {
                 _ = lease_sweep.tick() => self.sweep_lapsed_leases(),
@@ -1011,9 +1016,14 @@ impl Service {
                     break;
                 }
             }
+            // After every event rather than where trust or a switch changes:
+            // those are many places, and one missed would keep the machine
+            // awake, or let it sleep, until the next.
+            self.settle_keep_awake();
         }
 
         log::info!("terminating service ...");
+        self.keep_awake.set(false);
         self.dial_back.stop_all();
         log::debug!("terminating capture ...");
         self.capture.terminate().await;
@@ -1030,6 +1040,13 @@ impl Service {
             Some(granted) => Err(ServiceError::PermissionGranted(granted)),
             None => Ok(()),
         }
+    }
+
+    /// Hold the power assertion while some paired device that may control
+    /// this machine is switched on here, and only then.
+    fn settle_keep_awake(&mut self) {
+        let wanted = crate::keep_awake::wanted(&self.trust, &self.client_manager);
+        self.keep_awake.set(wanted);
     }
 
     /// A macOS permission capture or emulation was missing is now granted
@@ -4240,6 +4257,9 @@ mod adding_a_device;
 
 #[cfg(all(test, unix))]
 mod dialled_by_the_controlled_machine;
+
+#[cfg(all(test, unix))]
+mod kept_awake;
 
 #[cfg(all(test, unix, any(feature = "tui", feature = "slint")))]
 mod every_pairing_is_listed;
