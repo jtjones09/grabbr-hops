@@ -162,9 +162,10 @@ struct TomlClient {
 }
 
 impl ConfigToml {
-    fn new(path: &Path) -> Result<ConfigToml, ConfigError> {
-        let config = fs::read_to_string(path)?;
-        Ok(toml_edit::de::from_str::<_>(&config)?)
+    /// The config at `path`, and the text it was parsed from.
+    fn read(path: &Path) -> Result<(ConfigToml, String), ConfigError> {
+        let text = fs::read_to_string(path)?;
+        Ok((toml_edit::de::from_str::<_>(&text)?, text))
     }
 }
 
@@ -373,7 +374,8 @@ pub struct Config {
     /// daemon changed, which is all it may write (#7).
     synced: Vec<ConfigClient>,
     /// The file's text as this process last read or wrote it: one that
-    /// still reads the same holds no edit to take in.
+    /// still reads the same holds no edit to take in. `None` after a save
+    /// that kept an edit not yet read, so the next read takes it in.
     seen: Option<String>,
     // filesystem watcher, on a thread of its own
     watcher: Watching,
@@ -742,7 +744,7 @@ impl Config {
         // revocations they performed were still in force. Neither was true.
         //
         // An absent file legitimately means defaults. A corrupt one never does.
-        let config_toml = match ConfigToml::new(&config_path) {
+        let (config_toml, seen) = match ConfigToml::read(&config_path) {
             Err(e) => {
                 log::error!(
                     "{config_path:?} exists but could not be parsed: {e}\n\
@@ -752,7 +754,8 @@ impl Config {
                 );
                 return Err(e);
             }
-            Ok(c) => Some(c),
+            // The text as read, so a first save is not read back as an edit.
+            Ok((c, text)) => (Some(c), Some(text)),
         };
 
         // --cert-path <file> overrules default location
@@ -781,7 +784,7 @@ impl Config {
             config_path,
             config_toml,
             synced: vec![],
-            seen: None,
+            seen,
             watcher,
             watch_rx,
             watch_stopped: false,
@@ -823,8 +826,15 @@ impl Config {
                     continue;
                 }
             };
-            if changes_config(&event, &self.config_path) && self.read_if_edited()? {
-                return Ok(());
+            if !changes_config(&event, &self.config_path) {
+                continue;
+            }
+            // A read that fails changed nothing in memory: reported, it
+            // would have the daemon reload every device for no edit.
+            match self.read_if_edited() {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(e) => log::warn!("could not read {:?}: {e}", self.config_path),
             }
         }
     }
@@ -1126,13 +1136,19 @@ impl Config {
         if let Some(p) = self.config_path().parent() {
             fs::create_dir_all(p)?;
         }
+        // Whether the file holds an edit not yet read, which the merge
+        // keeps in what it writes.
+        let mut unread = false;
         let new_config = match fs::read_to_string(self.config_path()) {
-            Ok(disk) => merge::merge(&disk, &self.synced, ours).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{} was left as it is: {e}", self.config_path.display()),
-                )
-            })?,
+            Ok(disk) => {
+                unread = self.seen.as_deref() != Some(disk.as_str());
+                merge::merge(&disk, &self.synced, ours).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{} was left as it is: {e}", self.config_path.display()),
+                    )
+                })?
+            }
             // nothing on disk to keep
             Err(e) if e.kind() == io::ErrorKind::NotFound => merge::render(ours)
                 .map(|doc| doc.to_string())
@@ -1151,7 +1167,9 @@ impl Config {
         // or the whole new one, never a truncated one.
         write_atomically(self.config_path(), new_config.as_bytes())?;
         self.synced = self.clients();
-        self.seen = Some(new_config);
+        // What this wrote is no edit to read, unless it kept one: then the
+        // next read takes the file in, and the edit with it.
+        self.seen = (!unread).then_some(new_config);
         Ok(())
     }
 }
@@ -1426,7 +1444,7 @@ mod the_default_config_never_replaces_one {
         let p = d.join("config.toml");
 
         let first = write_default_config(&p);
-        let default_parses = ConfigToml::new(&p).is_ok();
+        let default_parses = ConfigToml::read(&p).is_ok();
         // What the daemon saved after this process found no config.
         let saved = "port = 4343\n\n[authorized_fingerprints]\n\"aa:bb\" = \"laptop\"\n";
         fs::write(&p, saved).expect("the daemon's save");
@@ -1560,7 +1578,7 @@ mod fail_closed_tests {
         let p = d.join("config.toml");
         // The exact shape from the issue: a type error, not a syntax error.
         fs::write(&p, b"port = \"4242\"\n").expect("seed");
-        let err = ConfigToml::new(&p).expect_err("a type error must not parse");
+        let err = ConfigToml::read(&p).expect_err("a type error must not parse");
         assert!(
             format!("{err}").contains("4242") || format!("{err}").contains("invalid type"),
             "unexpected error: {err}"
@@ -1575,11 +1593,11 @@ mod fail_closed_tests {
         // parse failure takes.
         let src = include_str!("config.rs");
         let start = src
-            .find("let config_toml = match ConfigToml::new(&config_path)")
+            .find("let (config_toml, seen) = match ConfigToml::read(&config_path)")
             .expect("the parse site must exist; if it moved, update this guard");
         let arm = &src[start..start + 900];
         let err_arm = arm.split("Err(e) =>").nth(1).expect("an Err arm");
-        let err_arm = &err_arm[..err_arm.find("Ok(c)").unwrap_or(err_arm.len())];
+        let err_arm = &err_arm[..err_arm.find("Ok((c").unwrap_or(err_arm.len())];
         assert!(
             err_arm.contains("return Err"),
             "a config that exists but does not parse must abort startup. Falling \
@@ -2139,6 +2157,140 @@ mod a_save_never_waits_for_the_watcher {
         assert!(
             read.is_none(),
             "hops' own save was read back as an edit to its config: {read:?}"
+        );
+    }
+
+    /// Wait until `config` holds what `done` says it should, reading every
+    /// notice passed on; the deadline, or what a read returned, otherwise.
+    fn read_until(
+        config: &mut Config,
+        done: impl Fn(&Config) -> bool,
+    ) -> Result<Result<(), notify::Error>, tokio::time::error::Elapsed> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            tokio::time::timeout(DEADLINE, async {
+                while !done(config) {
+                    config.changed().await?;
+                }
+                Ok::<(), notify::Error>(())
+            })
+            .await
+        })
+    }
+
+    /// Replace the config by rename, as an editor saves it.
+    fn edit(dir: &Path, path: &Path, text: &str) {
+        let saving = dir.join("config.toml.saving");
+        fs::write(&saving, text).expect("the edit");
+        fs::rename(&saving, path).expect("renamed over the config");
+    }
+
+    // LEDGER W9 | class B | 1 return value + 2 struct state: Config::changed after a save that merged onto a hand edit not yet read
+    /// A save merges the daemon's changes onto the file as it is on disk,
+    /// so an edit not yet read is kept in what it writes. What it wrote is
+    /// then no edit to read, but the edit it kept still is: a device
+    /// removed by hand just before hops saved stayed in memory, with the
+    /// file saying it was gone, until hops restarted.
+    #[test]
+    fn a_hand_edit_kept_by_a_save_is_still_read() {
+        let (dir, path, mut config, busy) = watched_by("folded", true);
+        busy.set_open(true);
+        let two = "port = 4343\n\
+                   [[clients]]\nhostname = \"desk-mac\"\nposition = \"left\"\n\
+                   [[clients]]\nhostname = \"garage-pc\"\nposition = \"top\"\n";
+        edit(&dir, &path, two);
+        config.read_from_disk().expect("the two devices");
+        let before = config.clients().len();
+        edit(
+            &dir,
+            &path,
+            "port = 4343\n[[clients]]\nhostname = \"desk-mac\"\nposition = \"left\"\n",
+        );
+        // Saved before the edit is read, as when a peer's fingerprint is
+        // learned or a frontend asks for a change.
+        config.write_back().expect("the save");
+        let read = read_until(&mut config, |c| c.clients().len() == 1);
+        let on_disk = fs::read_to_string(&path).unwrap_or_default();
+        let after = config.clients().len();
+        drop(config);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(before, 2, "precondition: both devices were read");
+        assert!(
+            !on_disk.contains("garage-pc"),
+            "precondition: the save kept the removal on disk: {on_disk:?}"
+        );
+        assert!(
+            matches!(read, Ok(Ok(()))) && after == 1,
+            "a device removed by hand just before hops saved stays in memory: \
+             {read:?}, {after} devices"
+        );
+    }
+
+    // LEDGER W10 | class B | 1 return value + 1 struct state: Config::changed after two saves with an edit between them, before either re-arm
+    /// Saves come in bursts, and each one's re-arm can take seconds. An
+    /// edit made while the first save's re-arm was still pending, then
+    /// kept by the second save, was never read.
+    #[test]
+    fn an_edit_between_two_saves_is_read() {
+        let (dir, path, mut config, busy) = watched_by("burst", true);
+        config.write_back().expect("the first save");
+        // The first save's re-arm is held, so nothing is read yet.
+        let calls = busy.calls(3);
+        edit(&dir, &path, "port = 4444\n");
+        config.write_back().expect("the second save");
+        busy.set_open(true);
+        let read = read_until(&mut config, |c| c.port() == 4444);
+        let on_disk = fs::read_to_string(&path).unwrap_or_default();
+        let port = config.port();
+        drop(config);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            calls,
+            [Arm::On, Arm::Off, Arm::On],
+            "precondition: the edit was made while the first save's re-arm was pending"
+        );
+        assert!(
+            on_disk.contains("4444"),
+            "precondition: the second save kept the edit on disk: {on_disk:?}"
+        );
+        assert!(
+            matches!(read, Ok(Ok(()))) && port == 4444,
+            "an edit made between two of hops' own saves was never read: \
+             {read:?}, port {port}"
+        );
+    }
+
+    // LEDGER W11 | class B | 1 return value: Config::changed on a rescan notice when the config cannot be read
+    /// A read that fails is no change to report: reported, the daemon
+    /// reloads every device from a config that did not change.
+    #[test]
+    fn a_config_that_cannot_be_read_is_not_reported_as_changed() {
+        let (dir, path, mut config, busy) = watched_by("unreadable", true);
+        busy.set_open(true);
+        fs::remove_file(&path).expect("the config moved away");
+        // Armed again: the thread has the file read once more. Taken only
+        // once that read has been asked for.
+        let _ = config.watch();
+        let _ = config.unwatch();
+        let calls = busy.calls(3);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let read = rt.block_on(async { futures::FutureExt::now_or_never(config.changed()) });
+        drop(config);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            calls,
+            [Arm::On, Arm::On, Arm::Off],
+            "precondition: the watcher was armed again with no config to read"
+        );
+        assert!(
+            read.is_none(),
+            "a config that could not be read was reported as changed: {read:?}"
         );
     }
 
