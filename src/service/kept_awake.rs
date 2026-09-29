@@ -7,11 +7,11 @@
 //! only after settling the assertion for every request before, so an empty
 //! exchange is a barrier and each check waits on the daemon, not a clock.
 
-use super::in_process::{DEADLINE, Daemon, Frontend, trusting};
+use super::in_process::{DEADLINE, Daemon, Frontend, compare_number, prompt_from, trusting};
 use crate::keep_awake::recording::{Recording, Seen};
 use crate::test_harness::{NEVER_WITHIN, dialer, machine, run_local, wait_until};
 use crate::trust::Caps;
-use hops_ipc::{FrontendEvent, FrontendRequest as R, Position};
+use hops_ipc::{Controller, FrontendEvent, FrontendRequest as R, Position};
 use hops_proto::ProtoEvent;
 use input_emulation::recording::{Recorded, Recording as Emulation};
 use input_event::{Event, PointerEvent};
@@ -195,6 +195,92 @@ fn a_controlling_machine_switched_off_still_keeps_the_mac_awake() {
                 settled(&mut app, &seen).await,
                 (false, 1, 1),
                 "(held, takes, releases) once the pc may no longer control the mac"
+            );
+        };
+        mac.run_while(body).await;
+    });
+}
+
+// LEDGER KA-7 | class B | 3 PowerAssertion calls made by a running daemon, a peer pairing with it over loopback QUIC, AuthorizeKey and ConfirmPairing over its IPC socket
+/// A pairing is complete only when the pc's confirmation is read, which
+/// happens after the app picked the number and with no request from the
+/// app: the mac is kept awake then, not at the app's next request.
+#[test]
+fn a_pairing_confirmed_by_the_other_machine_keeps_the_mac_awake() {
+    run_local(async {
+        let mut mac = Daemon::start("awake-pair-mac", "", input_emulation::Backend::Dummy).await;
+        let seen = Rc::new(Seen::default());
+        mac.keep_awake_through(Box::new(Recording(seen.clone())));
+        let (ours, port, trust, ipc) = (mac.fingerprint(), mac.port(), mac.trust(), mac.ipc());
+        let pc = machine();
+
+        let body = async {
+            let mut app = ipc.connect().await;
+            app.exchange(&[R::OpenPairing]).await;
+            prompt_from(&mut app, &pc, port, &ours).await;
+            app.exchange(&[R::AuthorizeKey {
+                label: "desk pc".into(),
+                fingerprint: pc.fingerprint.clone(),
+                controller: Controller::ThatMachine,
+                clipboard: false,
+            }])
+            .await;
+            let comparing = compare_number(&mut app, &pc, port, &ours).await;
+            assert_eq!(
+                settled(&mut app, &seen).await,
+                (false, 0, 0),
+                "(held, takes, releases) before the number was picked"
+            );
+            app.exchange(&[R::ConfirmPairing {
+                fingerprint: pc.fingerprint.clone(),
+                number: comparing.number.clone(),
+            }])
+            .await;
+            // No request from the app from here on.
+            wait_until("the mac is kept awake for the pc", DEADLINE, || {
+                seen.get().0
+            })
+            .await;
+            assert!(
+                trust.read().expect("lock").may_drive_us(&pc.fingerprint),
+                "precondition: the pairing lets the pc control the mac"
+            );
+            assert_eq!(
+                seen.get(),
+                (true, 1, 0),
+                "(held, takes, releases) once paired"
+            );
+        };
+        mac.run_while(body).await;
+    });
+}
+
+// LEDGER KA-8 | class B | 2 PowerAssertion calls made by a running daemon whose first take the system refuses
+/// The system refuses the mac's first take; the daemon tries again at its
+/// lease sweep, whose first tick comes as it starts, rather than waiting
+/// for the pairing to change.
+#[test]
+fn a_refused_assertion_is_taken_at_the_next_sweep() {
+    run_local(async {
+        let pc = machine();
+        let mut mac = Daemon::start(
+            "awake-refused-mac",
+            &device_for(&pc.fingerprint),
+            input_emulation::Backend::Dummy,
+        )
+        .await;
+        let seen = Rc::new(Seen::default());
+        seen.refusals.set(1);
+        mac.keep_awake_through(Box::new(Recording(seen.clone())));
+        let body = async {
+            wait_until("the refused assertion is taken again", DEADLINE, || {
+                seen.get().0
+            })
+            .await;
+            assert_eq!(
+                (seen.get(), seen.refusals.get()),
+                ((true, 1, 0), 0),
+                "((held, takes, releases), refusals left) once retried"
             );
         };
         mac.run_while(body).await;

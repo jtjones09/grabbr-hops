@@ -44,6 +44,15 @@ pub(crate) enum Mode {
     Display,
 }
 
+/// Which assertion to hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kind {
+    /// `PreventUserIdleSystemSleep`.
+    System,
+    /// `PreventUserIdleDisplaySleep`.
+    Display,
+}
+
 impl Mode {
     /// The mode a value of `GRABBR_KEEP_AWAKE` asks for. Anything but `off`
     /// and `display`, and no value, is the default.
@@ -55,8 +64,18 @@ impl Mode {
         }
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn from_env() -> Mode {
         Mode::from_value(std::env::var("GRABBR_KEEP_AWAKE").ok().as_deref())
+    }
+
+    /// The assertion this mode holds while wanted; none for `off`.
+    pub(crate) fn kind(self) -> Option<Kind> {
+        match self {
+            Mode::Off => None,
+            Mode::System => Some(Kind::System),
+            Mode::Display => Some(Kind::Display),
+        }
     }
 }
 
@@ -82,30 +101,39 @@ impl KeepAwake {
     /// This machine's: on macOS the real assertion of the kind
     /// `GRABBR_KEEP_AWAKE` asks for, elsewhere none.
     ///
-    /// A daemon a test runs in-process takes none, so a test run leaves the
-    /// machine's sleep alone; a test that wants the real one builds it.
+    /// A daemon a test runs in-process takes none, and the tests that run
+    /// the hops binary start it with `GRABBR_KEEP_AWAKE=off`, so a test run
+    /// leaves the machine's sleep alone; a test that wants the real one
+    /// builds it.
     pub(crate) fn for_this_machine() -> Self {
-        let mode = Mode::from_env();
         if cfg!(test) {
             return Self::without_power();
         }
         #[cfg(target_os = "macos")]
         {
-            match mode {
-                Mode::Off => {
-                    log::info!(
-                        "GRABBR_KEEP_AWAKE=off: holding no power assertion; the Mac may \
-                         sleep while another machine controls it"
-                    );
-                    Self::without_power()
-                }
-                Mode::System | Mode::Display => Self::with(Box::new(macos::Assertion::new(mode))),
-            }
+            Self::for_mode(Mode::from_env(), |kind| {
+                Box::new(macos::Assertion::new(kind))
+            })
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = mode;
             Self::without_power()
+        }
+    }
+
+    /// Holding the assertion `mode` asks for, made by `make`; none for
+    /// `off`.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn for_mode(mode: Mode, make: impl FnOnce(Kind) -> Box<dyn PowerAssertion>) -> Self {
+        match mode.kind() {
+            Some(kind) => Self::with(make(kind)),
+            None => {
+                log::info!(
+                    "GRABBR_KEEP_AWAKE=off: holding no power assertion; this machine \
+                     may sleep while another machine controls it"
+                );
+                Self::without_power()
+            }
         }
     }
 
@@ -130,26 +158,57 @@ impl KeepAwake {
     /// Take the assertion when it becomes wanted, release it when it stops
     /// being wanted. Nothing happens while `wanted` is unchanged, so this is
     /// cheap to call after every event; an assertion the system refused is
-    /// tried again the next time it becomes wanted.
+    /// tried again by [`KeepAwake::retry_refused`].
     pub(crate) fn set(&mut self, wanted: bool) {
         if wanted == self.wanted {
             return;
         }
         self.wanted = wanted;
-        let Some(power) = self.power.as_mut() else {
-            return;
-        };
         if wanted {
+            self.take();
+        } else if self.release() {
+            log::info!("released the power assertion: no paired device may control this machine");
+        }
+    }
+
+    /// Try again to take an assertion that is wanted but was refused. Not
+    /// on every event: a refusal is a system call that failed, and the
+    /// caller paces this.
+    pub(crate) fn retry_refused(&mut self) {
+        if self.wanted && !self.held {
+            self.take();
+        }
+    }
+
+    /// Let the assertion go because the daemon is stopping.
+    pub(crate) fn release_for_exit(&mut self) {
+        self.wanted = false;
+        if self.release() {
+            log::info!("released the power assertion: the daemon is stopping");
+        }
+    }
+
+    fn take(&mut self) {
+        if let Some(power) = self.power.as_mut() {
             self.held = power.take();
-        } else if std::mem::take(&mut self.held) {
-            power.release();
+        }
+    }
+
+    /// Whether there was one to release.
+    fn release(&mut self) -> bool {
+        match self.power.as_mut() {
+            Some(power) if std::mem::take(&mut self.held) => {
+                power.release();
+                true
+            }
+            _ => false,
         }
     }
 }
 
 impl Drop for KeepAwake {
     fn drop(&mut self) {
-        self.set(false);
+        self.release_for_exit();
     }
 }
 
@@ -157,7 +216,7 @@ impl Drop for KeepAwake {
 pub(crate) mod macos {
     //! The real assertion, through `input_emulation::macos_keep_awake`.
 
-    use super::{Mode, PowerAssertion};
+    use super::{Kind, PowerAssertion};
     use input_emulation::macos_keep_awake::{self as iopm, AssertionKind};
 
     pub(crate) struct Assertion {
@@ -166,10 +225,10 @@ pub(crate) mod macos {
     }
 
     impl Assertion {
-        pub(crate) fn new(mode: Mode) -> Self {
-            let kind = match mode {
-                Mode::Display => AssertionKind::Display,
-                Mode::System | Mode::Off => AssertionKind::System,
+        pub(crate) fn new(kind: Kind) -> Self {
+            let kind = match kind {
+                Kind::System => AssertionKind::System,
+                Kind::Display => AssertionKind::Display,
             };
             Self { kind, held: None }
         }
@@ -190,7 +249,8 @@ pub(crate) mod macos {
                 Err(code) => {
                     log::warn!(
                         "could not hold a power assertion ({kind}, {code:#x}); this Mac \
-                         may sleep and become unreachable while another machine controls it"
+                         may sleep and become unreachable while another machine controls \
+                         it; trying again at the next lease sweep"
                     );
                     false
                 }
@@ -198,12 +258,7 @@ pub(crate) mod macos {
         }
 
         fn release(&mut self) {
-            if self.held.take().is_some() {
-                log::info!(
-                    "released the power assertion: no paired device may control this \
-                     Mac"
-                );
-            }
+            self.held = None;
         }
     }
 }
@@ -222,6 +277,8 @@ pub(crate) mod recording {
         pub(crate) held: Cell<bool>,
         pub(crate) takes: Cell<u32>,
         pub(crate) releases: Cell<u32>,
+        /// How many more takes the system refuses.
+        pub(crate) refusals: Cell<u32>,
     }
 
     impl Seen {
@@ -239,6 +296,10 @@ pub(crate) mod recording {
                 !self.0.held.get(),
                 "an assertion already held was taken again"
             );
+            if self.0.refusals.get() > 0 {
+                self.0.refusals.set(self.0.refusals.get() - 1);
+                return false;
+            }
             self.0.held.set(true);
             self.0.takes.set(self.0.takes.get() + 1);
             true
@@ -358,6 +419,35 @@ mod held_only_while_a_controller_may_drive {
         );
     }
 
+    // LEDGER KA-2b | class B | 1 calls made through the PowerAssertion seam by KeepAwake::set and retry_refused
+    #[test]
+    fn a_refused_assertion_is_tried_again_only_when_retried() {
+        let seen = Rc::new(Seen::default());
+        seen.refusals.set(1);
+        let mut awake = KeepAwake::with(Box::new(Recording(seen.clone())));
+        awake.set(true);
+        awake.set(true);
+        assert_eq!(
+            seen.get(),
+            (false, 0, 0),
+            "(held, takes, releases) once the system refused it"
+        );
+        awake.retry_refused();
+        awake.retry_refused();
+        assert_eq!(
+            seen.get(),
+            (true, 1, 0),
+            "(held, takes, releases) once retried"
+        );
+        awake.set(false);
+        awake.retry_refused();
+        assert_eq!(
+            seen.get(),
+            (false, 1, 1),
+            "(held, takes, releases): retried while unwanted"
+        );
+    }
+
     // LEDGER KA-3 | class B | 1 return value: Mode::from_value
     #[test]
     fn the_switch_keeps_its_meaning() {
@@ -374,9 +464,32 @@ mod held_only_while_a_controller_may_drive {
         );
     }
 
+    // LEDGER KA-3b | class B | 1 the kind KeepAwake::for_mode asks its maker for, and the calls made through what it made
+    #[test]
+    fn each_mode_holds_its_own_assertion_and_off_holds_none() {
+        for (mode, kind) in [
+            (Mode::System, Some(Kind::System)),
+            (Mode::Display, Some(Kind::Display)),
+            (Mode::Off, None),
+        ] {
+            let seen = Rc::new(Seen::default());
+            let mut asked = None;
+            let mut awake = KeepAwake::for_mode(mode, |k| {
+                asked = Some(k);
+                Box::new(Recording(seen.clone()))
+            });
+            awake.set(true);
+            assert_eq!(
+                (asked, seen.get().0),
+                (kind, kind.is_some()),
+                "(kind made, held while wanted) for {mode:?}"
+            );
+        }
+    }
+
     // LEDGER KA-4 | class B | 2 IOPMCopyAssertionsByProcess for this process, what `pmset -g assertions` lists
-    /// The real assertion, taken and released through the seam: this
-    /// process holds it only between the two, as `pmset -g assertions`
+    /// The real assertion of each kind, taken and released through the seam:
+    /// this process holds it only between the two, as `pmset -g assertions`
     /// shows. No daemon a test runs takes one, so any found is this test's.
     #[cfg(target_os = "macos")]
     #[test]
@@ -390,18 +503,19 @@ mod held_only_while_a_controller_may_drive {
                 .collect::<Vec<_>>()
         };
         assert_eq!(ours(), Vec::<String>::new(), "precondition: none held");
-        let mut awake = KeepAwake::with(Box::new(macos::Assertion::new(Mode::System)));
-        assert_eq!(ours(), Vec::<String>::new(), "held before it was wanted");
-        awake.set(true);
-        assert_eq!(
-            ours(),
-            ["PreventUserIdleSystemSleep"],
-            "not held while wanted"
-        );
-        awake.set(false);
-        assert_eq!(ours(), Vec::<String>::new(), "still held once unwanted");
-        awake.set(true);
-        drop(awake);
-        assert_eq!(ours(), Vec::<String>::new(), "still held once dropped");
+        for (kind, listed) in [
+            (Kind::System, "PreventUserIdleSystemSleep"),
+            (Kind::Display, "PreventUserIdleDisplaySleep"),
+        ] {
+            let mut awake = KeepAwake::with(Box::new(macos::Assertion::new(kind)));
+            assert_eq!(ours(), Vec::<String>::new(), "held before it was wanted");
+            awake.set(true);
+            assert_eq!(ours(), [listed], "not held while wanted ({kind:?})");
+            awake.set(false);
+            assert_eq!(ours(), Vec::<String>::new(), "still held once unwanted");
+            awake.set(true);
+            drop(awake);
+            assert_eq!(ours(), Vec::<String>::new(), "still held once dropped");
+        }
     }
 }

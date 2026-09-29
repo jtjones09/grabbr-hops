@@ -134,6 +134,8 @@ fn start(hook: &str) -> (Daemon, PathBuf) {
                 .arg("daemon")
                 .env_clear()
                 .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                // A test daemon holds no real power assertion.
+                .env("GRABBR_KEEP_AWAKE", "off")
                 .env("HOME", &dir)
                 .env("XDG_RUNTIME_DIR", &dir)
                 .env("XDG_CONFIG_HOME", dir.join(".config"))

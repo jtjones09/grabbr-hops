@@ -955,7 +955,13 @@ impl Service {
         self.settle_keep_awake();
         loop {
             tokio::select! {
-                _ = lease_sweep.tick() => self.sweep_lapsed_leases(),
+                _ = lease_sweep.tick() => {
+                    self.sweep_lapsed_leases();
+                    // A power assertion the system refused is tried again at
+                    // this pace, not after every event.
+                    self.settle_keep_awake();
+                    self.keep_awake.retry_refused();
+                }
                 _ = dial_back.tick() => self.dial_back.reconcile(self.listening),
                 dialled = next_or_never(&mut self.dialled_in) => self.handle_dialled_in(dialled),
                 _ = add_dials.tick(), if !self.adding.is_empty() || !self.approved.is_empty() => {
@@ -1023,7 +1029,7 @@ impl Service {
         }
 
         log::info!("terminating service ...");
-        self.keep_awake.set(false);
+        self.keep_awake.release_for_exit();
         self.dial_back.stop_all();
         log::debug!("terminating capture ...");
         self.capture.terminate().await;
