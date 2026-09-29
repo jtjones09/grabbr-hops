@@ -128,15 +128,19 @@ shlex = "1.3"
 
 [target.'cfg(windows)'.dependencies]
 # OpenProcess and GetExitCodeProcess, to tell whether a process has ended, and
-# OpenProcessToken and GetTokenInformation, to tell whether it is elevated.
+# OpenProcessToken and GetTokenInformation, to tell whether it is elevated,
+# and GetConsoleProcessList and MessageBoxW, to say so where it is seen when
+# hops refuses to run elevated.
 # The clipboard formats that mark a copy as not to be shared.
 # The same version the input crates already build.
 windows = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_System_Console",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
     "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
@@ -180,6 +184,11 @@ x11_capture = ["input-capture/x11"]
 # there is no unlimited mode, and the output goes to its own 0600 file rather than
 # the daemon log. Guarded by a test in src/main.rs. See #117.
 keylog = ["input-event/keylog"]
+# Lets a debug build run elevated, for GitHub's Windows runners only, which run
+# every job as an administrator. NOT IN `default` AND NOT IN ANY RELEASE FEATURE
+# SET, and a build without debug assertions refuses to compile with it: hops
+# never runs elevated (#109). Guarded in src/decision_guards.rs.
+elevated_ci_runner = []
 libei_capture = ["input-event/libei", "input-capture/libei"]
 libei_emulation = ["input-event/libei", "input-emulation/libei"]
 wlroots_emulation = ["input-emulation/wlroots"]

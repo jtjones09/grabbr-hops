@@ -127,7 +127,10 @@ fn every_port_the_docs_give_is_one_hops_uses() {
                 for port in numbers_in(line) {
                     let known = port == u32::from(DEFAULT_PORT)
                         || port == u32::from(MDNS_PORT)
-                        || (port == u32::from(PORT_BEFORE_V013) && old_port_said_old);
+                        || (port == u32::from(PORT_BEFORE_V013) && old_port_said_old)
+                        // The local port a 0.12 daemon answers on, which the
+                        // Windows upgrade steps look for.
+                        || port == u32::from(crate::daemon_start::OLDER_PORT);
                     if !known {
                         wrong.push(format!("{rel}:{}: {port} in {line:?}", start + n + 1));
                     }

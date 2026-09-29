@@ -64,7 +64,7 @@ pub(crate) struct Invocation {
 
 /// What the enter hook `line` runs in this process, or why it may not run.
 pub(crate) fn invocation(line: &str) -> Result<Invocation, Refused> {
-    invocation_as(line, this_process_is_elevated())
+    invocation_as(line, crate::elevation::this_process_is_elevated())
 }
 
 /// [`invocation`], for a process that is `elevated` or not.
@@ -116,94 +116,11 @@ fn split_program(line: &str) -> Result<(&str, &str), Refused> {
     Ok((program, rest.trim_start_matches(BLANK)))
 }
 
-/// Whether this process runs with more privilege than the user who started
-/// it: as root, or set-uid to another user.
-///
-/// A process whose ids cannot differ from its user's cannot be elevated, so
-/// there is nothing here that can fail.
-#[cfg(unix)]
-pub(crate) fn this_process_is_elevated() -> bool {
-    // SAFETY: both calls only read this process's credentials.
-    let (effective, real) = unsafe { (libc::geteuid(), libc::getuid()) };
-    effective == 0 || effective != real
-}
-
-/// Whether this process's token is elevated: started from an administrator
-/// shell, or by a scheduled task with the highest run level.
-///
-/// When the token cannot be read the answer is yes, so the hook is refused
-/// rather than run with privilege nobody checked.
-#[cfg(windows)]
-pub(crate) fn this_process_is_elevated() -> bool {
-    use windows::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows::Win32::Security::{
-        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
-    };
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-
-    let mut token = HANDLE::default();
-    // SAFETY: the pseudo-handle GetCurrentProcess returns needs no closing,
-    // and `token` is written only when the call succeeds.
-    if let Err(e) = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } {
-        log::warn!("could not open this process's token ({e}); treating it as elevated");
-        return true;
-    }
-    let mut elevation = TOKEN_ELEVATION::default();
-    let mut written = 0u32;
-    // SAFETY: `elevation` is a TOKEN_ELEVATION and the length passed is its size.
-    let read = unsafe {
-        GetTokenInformation(
-            token,
-            TokenElevation,
-            Some(std::ptr::from_mut(&mut elevation).cast()),
-            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-            &mut written,
-        )
-    };
-    // SAFETY: `token` was opened above and is closed once.
-    let _ = unsafe { CloseHandle(token) };
-    match read {
-        Ok(()) => elevation.TokenIsElevated != 0,
-        Err(e) => {
-            log::warn!(
-                "could not read whether this process is elevated ({e}); treating it \
-                 as elevated"
-            );
-            true
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Whether this process is elevated, as the operating system's own tools
-    /// report it.
-    fn elevated_by_the_os() -> bool {
-        #[cfg(unix)]
-        {
-            let id = |flags: &[&str]| {
-                let out = std::process::Command::new("id")
-                    .args(flags)
-                    .output()
-                    .expect("id runs");
-                String::from_utf8_lossy(&out.stdout).trim().to_string()
-            };
-            let (effective, real) = (id(&["-u"]), id(&["-r", "-u"]));
-            effective == "0" || effective != real
-        }
-        #[cfg(windows)]
-        {
-            // High and System mandatory levels: an elevated token has one.
-            let out = std::process::Command::new("whoami")
-                .arg("/groups")
-                .output()
-                .expect("whoami runs");
-            let groups = String::from_utf8_lossy(&out.stdout);
-            groups.contains("S-1-16-12288") || groups.contains("S-1-16-16384")
-        }
-    }
+    use crate::elevation::elevated_by_the_os;
 
     // LEDGER T65 | class B | 1 return value / error
     #[test]
@@ -219,18 +136,6 @@ mod tests {
         assert!(
             invocation_as(hook, false).is_ok(),
             "a hook was refused in a process that is not elevated"
-        );
-    }
-
-    // LEDGER T66 | class B | 1 return value / error
-    #[test]
-    fn this_process_is_elevated_agrees_with_the_os() {
-        assert_eq!(
-            this_process_is_elevated(),
-            elevated_by_the_os(),
-            "hops and the operating system disagree about whether this process is \
-             elevated. Wrong one way, an elevated hops runs the enter hook; wrong \
-             the other, the hook never runs for anyone."
         );
     }
 

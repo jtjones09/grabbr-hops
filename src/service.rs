@@ -190,6 +190,19 @@ pub struct Service {
     /// Sealed persistence for the store above, and whether a change is still
     /// waiting to reach it.
     trust_saver: crate::trust_save::TrustSaver,
+    /// The devices the `[authorized_fingerprints]` cache has listed, so one
+    /// removed from it is known to have been removed there.
+    cache_listed: crate::cache_listed::Listed,
+    /// What every app that attaches is told about devices forgotten at start
+    /// because the cache no longer listed them. Not only the first: the front
+    /// door's build probe attaches too, before the app it opens, and hangs up.
+    forgotten_at_start: Option<String>,
+    /// When to read config.toml again to confirm what the last reload found
+    /// removed from the cache ([`crate::cache_listed::SETTLE`]).
+    removal_check: Option<tokio::time::Instant>,
+    /// Raised as the config is reloaded and as a removal check ends.
+    #[cfg(test)]
+    config_signals: std::sync::Arc<ConfigSignals>,
     /// The pairing prompts raised and not yet answered.
     pending_attempts: pending::PendingAttempts,
     /// Whether a pairing prompt may appear right now (#195).
@@ -633,6 +646,72 @@ async fn claim_then_read_config<L, C>(
     Ok((claimed, config))
 }
 
+/// Forget each device the trust store holds that the `[authorized_fingerprints]`
+/// cache in `config` listed before and no longer lists: an older build, or a
+/// person, removed it there (see `crate::cache_listed`). A removal found is
+/// confirmed by reading the file again once it has settled. Returns the
+/// store, what the cache has listed, the names of the devices forgotten, and
+/// whether the two reads disagreed, when the first read is not to be recorded
+/// in place of what was.
+async fn forget_removed_from_cache(
+    mut store: crate::trust::TrustStore,
+    config: &Config,
+    config_dir: &std::path::Path,
+) -> (
+    crate::trust::TrustStore,
+    crate::cache_listed::Listed,
+    Vec<String>,
+    bool,
+) {
+    let listed = crate::cache_listed::Listed::read(config_dir);
+    let mut removed = listed.removed(&store.config_cache(), config.listed_as_trusted().as_ref());
+    let mut disagreed = false;
+    if !removed.is_empty() {
+        // Only when something reads as removed, so a start pays nothing.
+        tokio::time::sleep(crate::cache_listed::SETTLE).await;
+        let found = removed.len();
+        removed = crate::cache_listed::confirmed(removed, config.listed_on_disk().as_ref());
+        disagreed = removed.len() != found;
+    }
+    let mut names = Vec::new();
+    for fp in removed {
+        let name = named(&store.label(&fp).unwrap_or_default(), &fp);
+        store.forget(&fp);
+        log::warn!(
+            "forgot {name} ({fp}): config.toml no longer lists it, so it was removed there, \
+             by hand or by an older build"
+        );
+        names.push(name);
+    }
+    (store, listed, names, disagreed)
+}
+
+/// Record, of what the `[authorized_fingerprints]` cache in `config` lists,
+/// the devices `store` trusts: removing one of them from the file later is a
+/// removal. While `keep`, what was recorded is kept as well.
+fn record_listed(
+    listed: &mut crate::cache_listed::Listed,
+    store: &crate::trust::TrustStore,
+    config: &Config,
+    keep: bool,
+) {
+    let granted: std::collections::HashSet<String> = store
+        .config_cache()
+        .keys()
+        .map(|fp| crate::cache_listed::canonical(fp))
+        .collect();
+    let now: Vec<String> = config
+        .listed_as_trusted()
+        .unwrap_or_default()
+        .keys()
+        .map(|fp| crate::cache_listed::canonical(fp))
+        .filter(|fp| granted.contains(fp))
+        .collect();
+    if let Err(e) = listed.record_keeping(now, keep) {
+        log::warn!("could not record which devices config.toml lists: {e}");
+    }
+}
+
 impl Service {
     /// Start the daemon on `endpoint`: claim it, then read the config, then
     /// everything else.
@@ -765,6 +844,28 @@ impl Service {
             }
         };
 
+        let (store, mut cache_listed, forgotten, disagreed) =
+            forget_removed_from_cache(store, &config, &config_dir).await;
+        let mut trust_saver = crate::trust_save::TrustSaver::new(trust_file);
+        if !forgotten.is_empty() {
+            // Through the saver, so a save that fails is retried every minute
+            // and every app that attaches is told, as for any trust change.
+            let unsaved =
+                trust_saver.save_change(&store, format!("removing {}", forgotten.join(", ")));
+            if let Some(unsaved) = unsaved {
+                log::error!("{unsaved}");
+            }
+        }
+        // A device forgotten but not yet off disk stays recorded, or the next
+        // start would trust it again from the store on disk. So does one the
+        // first read lacked and the second did not: that read was of a save
+        // part done, and a removal of the device later must still read as one.
+        // A file with no table at all lists nothing and removes nothing, so
+        // it leaves the record as it was.
+        let keep = trust_saver.is_pending() || disagreed || config.listed_as_trusted().is_none();
+        record_listed(&mut cache_listed, &store, &config, keep);
+        let forgotten_at_start =
+            (!forgotten.is_empty()).then(|| crate::cache_listed::notice(&forgotten));
         drop_untrusted_pins(&client_manager, &store);
         let trust: crate::transport::Trust = Arc::new(RwLock::new(store));
 
@@ -874,7 +975,12 @@ impl Service {
             discovery_quiet: false,
             discovered: Default::default(),
             trust,
-            trust_saver: crate::trust_save::TrustSaver::new(trust_file),
+            trust_saver,
+            cache_listed,
+            removal_check: None,
+            #[cfg(test)]
+            config_signals: Default::default(),
+            forgotten_at_start,
             pending_attempts: Default::default(),
             prompt_gate: crate::prompt_gate::PromptGate::new(),
             #[cfg(test)]
@@ -1011,6 +1117,9 @@ impl Service {
                     }
                 }
                 _ = self.config.changed() => self.handle_config_change(),
+                _ = tokio::time::sleep_until(
+                    self.removal_check.unwrap_or_else(tokio::time::Instant::now)
+                ), if self.removal_check.is_some() => self.check_removals(),
                 after = self.permission_watch.granted() => {
                     if let Some(granted) = self.after_permission_granted(after) {
                         restart_for = Some(granted);
@@ -1294,11 +1403,23 @@ impl Service {
         // older build, or a human reading the file, still sees who is trusted —
         // but the daemon answers every trust question from the sealed store.
         let cache = self.trust.read().expect("lock").config_cache();
+        let written: Vec<String> = cache.keys().cloned().collect();
         self.config.set_authorized_keys(cache);
         // Removing a device forgets it: the table an earlier build kept its
         // removals in goes at the first save (#184).
         self.config.clear_revoked_fingerprints();
-        if let Err(e) = self.config.write_back() {
+        let saved = self.config.write_back();
+        if saved.is_ok() {
+            // Recorded only once the file lists them: a device the cache
+            // does not list cannot be removed from it. While a trust change
+            // waits to reach disk, a device forgotten in memory may still be
+            // trusted there, so nothing recorded is dropped until it lands.
+            let unsaved = self.trust_saver.is_pending();
+            if let Err(e) = self.cache_listed.record_keeping(written, unsaved) {
+                log::warn!("could not record which devices config.toml lists: {e}");
+            }
+        }
+        if let Err(e) = saved {
             log::warn!("failed to write config: {e}");
             // The change is in memory only, for one when the file does not
             // parse and is left as it is: say so, or it looks saved until the
@@ -1343,7 +1464,8 @@ impl Service {
         // as the user, was a permanent trust grant with no dialog and no IPC
         // token. Trust no longer lives here: `[authorized_fingerprints]` is a
         // cache this daemon writes and never reads, and the sealed store is the
-        // only authority. A config change is no longer a trust change.
+        // only authority. A config change grants nothing; what it can do is
+        // take a device away, below.
         //
         // A hand-edited config is still exactly where a stale outbound pin gets
         // reintroduced, so that check stays — against the store.
@@ -1354,7 +1476,45 @@ impl Service {
         for h in stale {
             self.broadcast_client(h);
         }
+        // A device removed from the cache in the file, by hand or by an older
+        // build, is removed here too, once the file has settled: each reload
+        // moves the check on, so it reads the file after the last write.
+        self.removal_check = Some(tokio::time::Instant::now() + crate::cache_listed::SETTLE);
         self.sync_frontend();
+        #[cfg(test)]
+        self.config_signals.reloaded.notify_one();
+    }
+
+    /// Forget each device removed from the cache in config.toml, as both the
+    /// last reload and a read of the file now find it. A line added there
+    /// grants nothing.
+    fn check_removals(&mut self) {
+        self.removal_check = None;
+        let removed = {
+            let granted = self.trust.read().expect("lock").config_cache();
+            self.cache_listed
+                .removed(&granted, self.config.listed_as_trusted().as_ref())
+        };
+        let removed = if removed.is_empty() {
+            removed
+        } else {
+            crate::cache_listed::confirmed(removed, self.config.listed_on_disk().as_ref())
+        };
+        if !removed.is_empty() {
+            let names: Vec<String> = {
+                let trust = self.trust.read().expect("lock");
+                removed
+                    .iter()
+                    .map(|fp| named(&trust.label(fp).unwrap_or_default(), fp))
+                    .collect()
+            };
+            for fp in removed {
+                self.remove_authorized_key(fp);
+            }
+            self.notify_frontend(FrontendEvent::Error(crate::cache_listed::notice(&names)));
+        }
+        #[cfg(test)]
+        self.config_signals.checked.notify_one();
     }
 
     async fn handle_frontend_pending(&mut self) {
@@ -1685,6 +1845,9 @@ impl Service {
         // told, or the only notice went to no one.
         let unsaved = self.trust_saver.pending_notice();
         self.tell_trust_saved(unsaved);
+        if let Some(forgotten) = self.forgotten_at_start.clone() {
+            self.notify_frontend(FrontendEvent::Error(forgotten));
+        }
         self.notify_frontend(FrontendEvent::PublicKeyFingerprint(
             self.public_key_fingerprint.clone(),
         ));
@@ -4253,6 +4416,9 @@ mod a_mac_missing_a_permission;
 mod a_refused_crossing;
 
 #[cfg(all(test, unix))]
+mod a_removal_in_the_config_file;
+
+#[cfg(all(test, unix))]
 mod refusals_and_bounds;
 
 #[cfg(all(test, unix))]
@@ -4624,4 +4790,14 @@ mod a_pin_outlives_its_lease {
             "a pin nothing vouches for is dropped"
         );
     }
+}
+
+/// What a test waits on to know the daemon read its config.
+#[cfg(test)]
+#[derive(Default)]
+struct ConfigSignals {
+    /// A change to config.toml was read.
+    reloaded: tokio::sync::Notify,
+    /// The check for devices removed from it that the read scheduled ran.
+    checked: tokio::sync::Notify,
 }

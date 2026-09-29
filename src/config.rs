@@ -610,6 +610,25 @@ fn subtract_revoked(
     (authorized, refused)
 }
 
+/// What the `[authorized_fingerprints]` table of `config` lists, keys
+/// lowercased, less anything `[revoked_fingerprints]` lists; `None` when it
+/// has no such table.
+fn listed_in(config: &ConfigToml) -> Option<HashMap<String, String>> {
+    let listed = config
+        .authorized_fingerprints
+        .as_ref()?
+        .iter()
+        .map(|(k, v)| (k.to_lowercase(), v.clone()))
+        .collect();
+    let revoked = config
+        .revoked_fingerprints
+        .iter()
+        .flatten()
+        .map(|(k, v)| (k.to_lowercase(), v.clone()))
+        .collect();
+    Some(subtract_revoked(listed, &revoked).0)
+}
+
 /// Make sure a config is at `path`, writing the default when none is, after
 /// removing what an earlier process that ended part-way through writing one
 /// left beside it.
@@ -838,6 +857,27 @@ impl Config {
     /// the system and it was the one that failed open (issue #66).
     pub fn effective_allowlist(&self) -> (HashMap<String, String>, Vec<String>) {
         subtract_revoked(self.authorized_fingerprints(), &self.revoked_fingerprints())
+    }
+
+    /// What the `[authorized_fingerprints]` table lists now, less anything
+    /// `[revoked_fingerprints]` lists; `None` when the file has no such table.
+    /// Read only to find devices removed from it (`crate::cache_listed`): the
+    /// table grants nothing.
+    pub fn listed_as_trusted(&self) -> Option<HashMap<String, String>> {
+        listed_in(self.config_toml.as_ref()?)
+    }
+
+    /// [`Self::listed_as_trusted`], read from the file on disk now rather
+    /// than from the config last read. `None` when the file cannot be read,
+    /// is empty or does not parse: a file being written says nothing about
+    /// which devices it lists.
+    pub fn listed_on_disk(&self) -> Option<HashMap<String, String>> {
+        let text = fs::read_to_string(&self.config_path).ok()?;
+        if text.trim().is_empty() {
+            return None;
+        }
+        let document = text.parse::<DocumentMut>().ok()?;
+        listed_in(&toml_edit::de::from_document::<ConfigToml>(document).ok()?)
     }
 
     /// Drop the `[revoked_fingerprints]` table at the next write: removing a
@@ -1138,11 +1178,16 @@ impl Watching {
 
 /// Whether `event` can mean the config file at `config` was replaced, written
 /// or removed.
+///
+/// A save that writes a new file and renames it over the config, as editors
+/// and tools do, is reported as a rename, not as a create or a write.
 fn changes_config(event: &notify::Event, config: &Path) -> bool {
     event.paths.iter().any(|p| p == config)
         && matches!(
             event.kind,
-            EventKind::Create(_) | EventKind::Modify(ModifyKind::Data(_)) | EventKind::Remove(_)
+            EventKind::Create(_)
+                | EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Name(_))
+                | EventKind::Remove(_)
         )
 }
 
@@ -2019,6 +2064,56 @@ mod a_file_being_written_is_not_read_as_empty {
             !changed && kept == 1,
             "an empty config file, which a save in place passes through, was \
              read as a config with no devices (changed: {changed}, devices: {kept})"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod a_save_by_rename_is_read {
+    //! Editors and tools save by writing a new file beside the config and
+    //! renaming it over the old one. The watcher reports that as a rename,
+    //! which on Linux is neither a create nor a write, and a daemon that
+    //! waited for one of those never read the edit.
+    use super::*;
+    use std::time::Duration;
+
+    // LEDGER T31 | class B | 1 return value + 6 struct state: Config::changed over a real watcher
+    #[test]
+    fn a_config_renamed_into_place_is_read() {
+        let dir = std::env::temp_dir().join(format!("hops-rename-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("a scratch directory");
+        // As the watcher reports it: on macOS the temporary directory is
+        // reached through a link, and events name the path it links to.
+        let dir = dir
+            .canonicalize()
+            .expect("the scratch directory's real path");
+        let path = dir.join("config.toml");
+        fs::write(&path, "port = 4343\n").expect("a config");
+        let args = Args::parse_from([
+            "hops".as_ref(),
+            "--config".as_ref(),
+            path.as_os_str(),
+            "--cert-path".as_ref(),
+            dir.join("cert.pem").as_os_str(),
+        ]);
+        let mut config = Config::with_args(args).expect("the config loads");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let saved = dir.join("config.toml.saving");
+        fs::write(&saved, "port = 4444\n").expect("the new version");
+        fs::rename(&saved, &path).expect("renamed over the config");
+        let read = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(20), config.changed()).await
+        });
+        let port = config.port();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            matches!(read, Ok(Ok(()))) && port == 4444,
+            "a config saved by renaming a new file over it was not read: {read:?}, \
+             port {port}"
         );
     }
 }

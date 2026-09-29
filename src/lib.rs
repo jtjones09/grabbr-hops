@@ -33,6 +33,7 @@ compile_error!(
 
 pub mod authority;
 pub mod build_check;
+mod cache_listed;
 mod capture;
 pub mod capture_test;
 pub mod client;
@@ -44,6 +45,7 @@ pub mod daemon_start;
 mod dial_back;
 pub mod discovery;
 mod dns;
+pub mod elevation;
 mod emulation;
 pub mod emulation_test;
 pub(crate) mod enter_hook;
