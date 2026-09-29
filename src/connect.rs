@@ -845,6 +845,12 @@ pub(crate) struct Adopter {
 }
 
 impl Adopter {
+    /// Hand capture `heard` as if a link had.
+    #[cfg(test)]
+    pub(crate) fn inject_heard(&self, heard: Heard) {
+        let _ = self.session.recv_tx.send(heard);
+    }
+
     /// Take `dialled` as `handle`'s link. Refused, and closed, unless this
     /// machine still may drive the machine that dialled, `handle` is pinned
     /// to it and is switched on, and no link this machine dialled to it is

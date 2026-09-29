@@ -517,7 +517,9 @@ impl CaptureTask {
                         }
                         // The peer's first answer on its link, which an
                         // Enter may be waiting for.
-                        ProtoEvent::Pong(_) => self.send_waiting_enter(capture, handle).await?,
+                        ProtoEvent::Pong(_) => {
+                            self.send_waiting_enter(capture, handle, link).await?
+                        }
                         // client disconnected
                         ProtoEvent::Leave(_) => {
                             log::info!("releasing capture: left remote client device region");
@@ -849,17 +851,25 @@ impl CaptureTask {
     /// it, if one did. Otherwise the crossing would wait on the user's next
     /// input, and with none, be given up on as unanswered by a peer that
     /// answered.
+    ///
+    /// Only an answer on the link `handle` is on now: a first answer on a
+    /// link since replaced, still on its way here, says nothing about the
+    /// new one, and an Enter sent on it is refused as if its peer took no
+    /// input.
     async fn send_waiting_enter(
         &mut self,
         capture: &mut InputCapture,
         handle: CaptureHandle,
+        link: u64,
     ) -> Result<(), CaptureError> {
-        if !std::mem::take(&mut self.enter_waits)
+        if !self.enter_waits
             || self.active_client != Some(handle)
             || self.state != State::WaitingForAck
+            || self.conn.link_serial(handle).await != Some(link)
         {
             return Ok(());
         }
+        self.enter_waits = false;
         let enter = ProtoEvent::Enter(to_proto_pos(self.get_pos(handle).opposite()));
         if let Err(e) = self.conn.send(enter, handle).await {
             log::warn!("releasing capture: {e}");
@@ -1236,6 +1246,8 @@ mod release_mid_drag {
         pongs: Rc<std::cell::Cell<Option<bool>>>,
         /// Closes the receiver's end of a link.
         revoker: crate::listen::ConnRevoker,
+        /// Hands capture what the sender's links heard.
+        adopter: crate::connect::Adopter,
         _notices: Notices,
     }
 
@@ -1351,6 +1363,7 @@ mod release_mid_drag {
 
             let script = Script::new();
             let bind = vec![scancode::Linux::KeyLeftCtrl, scancode::Linux::KeyLeftShift];
+            let adopter = conn.adopter();
             let capture = Capture::with_timing(Some(script.backend()), conn, bind, timing);
             capture.create(handle, hops_ipc::Position::Left, CaptureType::Default);
             Visit {
@@ -1365,6 +1378,7 @@ mod release_mid_drag {
                 acks,
                 pongs,
                 revoker,
+                adopter,
                 _notices: notices,
             }
         }
@@ -1463,6 +1477,11 @@ mod release_mid_drag {
         /// Whether the sender has heard the receiver answer on its link.
         pub(super) fn answered(&self) -> bool {
             self.clients.answered(self.handle)
+        }
+
+        /// Capture hears `event` as if it came on the link numbered `link`.
+        pub(super) fn heard(&self, event: ProtoEvent, link: u64) {
+            self.adopter.inject_heard((self.handle, event, link));
         }
 
         /// The receiver answers pings with `pong` from now on.
@@ -2109,6 +2128,44 @@ mod a_refused_crossing {
             assert!(
                 !told.iter().any(|t| t.starts_with("CrossingRefused")),
                 "a crossing the receiver took was refused: {told:?}"
+            );
+            v.capture.terminate().await;
+        });
+    }
+
+    // LEDGER TR-7 | class B | 2 frames received by listen::LanMouseListener + 5 Script::held + events the capture task sends the service
+    /// The Enter waits for the new link's first answer, and a first answer
+    /// from a link already replaced reaches capture late. It says nothing
+    /// about the new link: the Enter keeps waiting rather than going out
+    /// there, where it is refused as if the receiver took no input. The
+    /// new link's own answer then sends it.
+    #[test]
+    fn a_first_answer_from_a_replaced_link_does_not_send_the_waiting_enter() {
+        run_local(async {
+            let mut v = Visit::start(true).await;
+            let relinked = relink_and_wait(&v, true).await;
+            // No link is numbered 0: this answer came on none the device is on.
+            v.heard(ProtoEvent::Pong(true), 0);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let told_stale = told(&mut v.capture);
+            assert!(
+                v.script.held()
+                    && v.since(relinked, &ProtoEvent::Enter(hops_proto::Position::Right)) == 0
+                    && !told_stale.iter().any(|t| t.starts_with("CrossingRefused")),
+                "an answer from a replaced link sent the waiting Enter: told {told_stale:?}, \
+                 frames since the relink {:?}",
+                &v.frames()[relinked..]
+            );
+
+            v.pong(Some(true));
+            wait_until("an Enter on the new link once it answers", PATIENCE, || {
+                v.since(relinked, &ProtoEvent::Enter(hops_proto::Position::Right)) > 0
+            })
+            .await;
+            assert!(
+                v.script.held(),
+                "the pointer was given back: {:?}",
+                v.frames()
             );
             v.capture.terminate().await;
         });
