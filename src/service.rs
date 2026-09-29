@@ -3744,10 +3744,45 @@ impl Service {
         self.broadcast_client(handle);
     }
 
+    /// Move the device at `handle` to the `pos` edge. A switched-on device
+    /// moved onto an edge another switched-on device uses trades edges with
+    /// it, so both keep working (#174): activation would otherwise switch
+    /// the other one off, and the arrange canvas moves devices by dropping
+    /// them. The other device moves without being touched, so the user is
+    /// told, as for a switch-off. A device that changes edge loses its
+    /// saved canvas spot, which was on the side it left.
     fn update_pos(&mut self, handle: ClientHandle, pos: Position) {
+        let from = self.client_manager.get_pos(handle);
+        let holder = self
+            .client_manager
+            .client_at(pos)
+            .filter(|&other| other != handle);
+        if from.is_some_and(|from| from != pos) {
+            self.client_manager.set_geometry(handle, None);
+        }
         // update state in event input emulator & input capture
         if self.client_manager.set_pos(handle, pos) {
             self.deactivate_client(handle);
+            if let (Some(other), Some(from)) = (holder, from) {
+                if self.client_manager.set_pos(other, from) {
+                    self.client_manager.set_geometry(other, None);
+                    self.deactivate_client(other);
+                    self.activate_client(other);
+                    let name = |h: ClientHandle| {
+                        self.client_manager
+                            .get_hostname(h)
+                            .unwrap_or_else(|| format!("device {h}"))
+                    };
+                    let (moved, mover) = (name(other), name(handle));
+                    // A trade is a move that worked, so it is told as activity,
+                    // not in the error banner.
+                    self.notify_frontend(FrontendEvent::Activity(format!(
+                        "Moved \"{moved}\" to the {from} edge — \"{mover}\" now uses \
+                         the {pos} edge, and two devices cannot share one edge."
+                    )));
+                }
+                self.broadcast_client(other);
+            }
             self.activate_client(handle);
         }
         self.broadcast_client(handle);
@@ -4608,6 +4643,9 @@ mod each_controls_the_other;
 
 #[cfg(all(test, unix))]
 mod kept_awake;
+
+#[cfg(all(test, unix))]
+mod a_move_onto_a_taken_edge;
 
 #[cfg(all(test, unix, any(feature = "tui", feature = "slint")))]
 mod every_pairing_is_listed;

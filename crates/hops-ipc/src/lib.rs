@@ -763,10 +763,13 @@ pub enum FrontendRequest {
     },
     /// update port
     UpdatePort(ClientHandle, u16),
-    /// update position
+    /// Move a device to another edge. A switched-on device moved onto an
+    /// edge another switched-on device uses trades edges with it (#174).
     UpdatePosition(ClientHandle, Position),
-    /// update spatial layout rect (the drag-to-arrange canvas). Storage only —
-    /// coordinate-based crossing is a separate, not-yet-built behavior change.
+    /// The middle spot on the arrange canvas of the side a device was last
+    /// dropped on. Storage only, for a later layout: nothing reads it, the
+    /// canvas draws each device from its edge, and the edge the pointer
+    /// crosses at is set by `UpdatePosition`, which clears it.
     UpdateGeometry(ClientHandle, Option<Geometry>),
     /// update fix-ips
     UpdateFixIps(ClientHandle, Vec<IpAddr>),

@@ -16,6 +16,7 @@ hops-ipc = { path = "../hops-ipc", version = "0.3.0" }
 tokio = { version = "1.32", features = ["rt", "sync", "macros", "time"] }
 thiserror = "2.0"
 log = "0.4"
+hostname = "0.4"
 
 [build-dependencies]
 slint-build = "1.17"

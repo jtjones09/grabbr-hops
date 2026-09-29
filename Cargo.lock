@@ -2408,6 +2408,7 @@ version = "0.1.0"
 dependencies = [
  "hops-frontend-core",
  "hops-ipc",
+ "hostname",
  "i-slint-backend-testing",
  "image",
  "log",

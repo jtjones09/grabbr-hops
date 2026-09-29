@@ -26,12 +26,13 @@ use hops_frontend_core::{
     FrontendClient, FrontendRequest, Launch, PairingAttempt, PairingCard, PairingCheck, Position,
     Status, Tone, prefs, spaced_number, theme,
 };
-use hops_ipc::{DEFAULT_PORT, Geometry};
+use hops_ipc::DEFAULT_PORT;
 use slint::{ComponentHandle, ModelRc, VecModel};
 use thiserror::Error;
 
 slint::include_modules!();
 
+mod canvas;
 #[cfg(target_os = "macos")]
 mod macos_app;
 mod privacy;
@@ -497,34 +498,11 @@ fn short_fp(fp: &str) -> String {
     format!("{head}…")
 }
 
-/// A starting position for a device with no stored geometry yet, placed just
-/// outside the "this Mac" anchor on its edge — matches layout_canvas.slint's
-/// `CanvasSize` global (480x280 canvas, 96x64 boxes, Mac centered) so a
-/// freshly opened canvas looks intentional rather than dumping everything at
-/// the origin. Only ever a starting point — dragging overrides it immediately.
-fn default_canvas_pos(pos: Position) -> (f32, f32) {
-    match pos {
-        Position::Left => (20.0, 108.0),
-        Position::Right => (364.0, 108.0),
-        Position::Top => (192.0, 16.0),
-        Position::Bottom => (192.0, 200.0),
-    }
-}
-
-/// Where the canvas draws a device: where it was saved (#174), else beside
-/// the anchor on its edge. A saved spot is kept inside the canvas, so one
-/// edited into the file by hand, or saved by a canvas of another size, can
-/// still be seen and dragged back. Matches `CanvasSize` in layout_canvas.slint.
-fn canvas_spot(cfg: &hops_ipc::ClientConfig) -> (f32, f32) {
-    const MAX_X: f32 = 480.0 - 96.0;
-    const MAX_Y: f32 = 280.0 - 64.0;
-    match cfg.geometry {
-        Some(g) => (
-            (g.x as f32).clamp(0.0, MAX_X),
-            (g.y as f32).clamp(0.0, MAX_Y),
-        ),
-        None => default_canvas_pos(cfg.pos),
-    }
+/// Open the arrange canvas on `m`'s devices exactly as the app does, for
+/// the headless render harness (`examples/render_png.rs`).
+#[doc(hidden)]
+pub fn open_canvas_for_preview(ui: &AppWindow, m: &AppModel) {
+    canvas::Canvas::default().open(ui, m);
 }
 
 /// Single-instance coordination result. A second `hops gui` launch signals the
@@ -795,6 +773,11 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
 
     let ui = AppWindow::new()?;
     show_opening_info(&ui, opening_info.as_deref());
+    // This machine's box on the arrange canvas: its own name and kind.
+    let host = hostname::get().ok().and_then(|h| h.into_string().ok());
+    let (name, kind) = canvas::this_machine(host.as_deref(), std::env::consts::OS);
+    ui.set_this_machine_name(name.into());
+    ui.set_this_machine_kind(kind.into());
     // The pairing card's answers, in the words every frontend uses (#220).
     ui.set_controller_choices(ModelRc::new(VecModel::from(
         hops_frontend_core::Controller::ALL
@@ -1122,51 +1105,18 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
             }
         });
     }
-    {
-        // Snapshot device positions into canvas-boxes ONCE, here, rather than
-        // feeding them from the regular poll loop — see layout_canvas.slint's
-        // header note on why a live-updated model would fight an in-progress drag.
-        let c = client.clone();
-        let weak = ui.as_weak();
-        ui.on_open_layout_canvas(move || {
-            let Some(ui) = weak.upgrade() else { return };
-            let m = c.snapshot();
-            let boxes: Vec<CanvasBox> = m
-                .clients
-                .iter()
-                .map(|(h, (cfg, _))| {
-                    let (x, y) = canvas_spot(cfg);
-                    CanvasBox {
-                        handle: h.to_string().into(),
-                        name: cfg
-                            .label
-                            .clone()
-                            .or_else(|| cfg.hostname.clone())
-                            .unwrap_or_else(|| "unnamed".into())
-                            .into(),
-                        x,
-                        y,
-                    }
-                })
-                .collect();
-            ui.set_canvas_boxes(ModelRc::new(VecModel::from(boxes)));
-            ui.set_show_layout_canvas(true);
-        });
-    }
-    {
-        let c = client.clone();
-        ui.on_update_device_geometry(move |handle, x, y| {
-            if let Ok(h) = handle.as_str().parse::<u64>() {
-                let geometry = Geometry {
-                    x: x.round() as i32,
-                    y: y.round() as i32,
-                    width: 96,
-                    height: 64,
-                };
-                c.request(FrontendRequest::UpdateGeometry(h, Some(geometry)));
-            }
-        });
-    }
+    // The arrange canvas (#174): a drop sets the edge the device is reached
+    // through, and the open canvas follows the model.
+    let canvas = {
+        let (snap, send) = (client.clone(), client.clone());
+        canvas::wire(
+            &ui,
+            move || snap.snapshot(),
+            move |r| {
+                send.request(r);
+            },
+        )
+    };
 
     // poll the model ~4x/sec and push it into the window — but only when it
     // actually changed since last tick (see PolledUi: a constant repaint flickers
@@ -1197,6 +1147,7 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
             }
 
             let m = client.snapshot();
+            canvas.borrow_mut().tick(&ui, &m);
 
             // An armed delete or an open rename names a device by handle and
             // the pin it had. Once that device is gone or pinned to another
@@ -1351,36 +1302,6 @@ pub fn run_onboarding() -> Result<Option<hops_frontend_core::prefs::Frontend>, S
     ui.run()?;
     let picked = *choice.borrow();
     Ok(picked)
-}
-
-#[cfg(test)]
-mod the_canvas_draws_a_device_where_it_was_saved {
-    use super::{canvas_spot, default_canvas_pos};
-    use hops_ipc::{ClientConfig, Geometry, Position};
-
-    // LEDGER T174c | class B | 1 return value: canvas_spot over a device's config
-    #[test]
-    fn a_saved_spot_is_drawn_there_and_kept_inside_the_canvas() {
-        let at = |x, y| ClientConfig {
-            pos: Position::Left,
-            geometry: Some(Geometry {
-                x,
-                y,
-                width: 96,
-                height: 64,
-            }),
-            ..Default::default()
-        };
-        let cases = [
-            (at(364, 16), (364.0, 16.0)),
-            (at(-50, 9000), (0.0, 216.0)),
-            (at(i32::MAX, i32::MIN), (384.0, 0.0)),
-            (ClientConfig::default(), default_canvas_pos(Position::Left)),
-        ];
-        for (cfg, spot) in cases {
-            assert_eq!(canvas_spot(&cfg), spot, "{:?}", cfg.geometry);
-        }
-    }
 }
 
 #[cfg(test)]

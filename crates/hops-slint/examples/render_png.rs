@@ -23,7 +23,7 @@ use slint::{ComponentHandle, Model, ModelRc, PhysicalSize, VecModel};
 // distinct set of Rust types, incompatible with the lib's (e.g. two different
 // `ThemeColors` structs), even though they look identical.
 use hops_frontend_core::Connection;
-use hops_slint::{AppWindow, CanvasBox, DeviceRow, DiscoveredRow, DotTone, Theme, theme_colors};
+use hops_slint::{AppWindow, DeviceRow, DiscoveredRow, DotTone, Theme, theme_colors};
 
 /// Headless platform: every window is a MinimalSoftwareWindow (CPU renderer, no OS window).
 struct HeadlessPlatform {
@@ -476,22 +476,69 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
         // (parent.width - 560)/2. Render it at the window's MINIMUM: before the
         // ScrollView floor the window could open 381px wide, making that offset
         // -89 and hanging the overlay off all four edges.
+        // PREVIEW_CANVAS picks the arrangement: unset, two devices on two
+        // edges; "full", one on each edge and two switched off beside
+        // others; "crowded", four on the left and three on top;
+        // "unplaced", a paired machine with no device here; "pc", this
+        // machine as a Windows PC with a long name.
         Some("layout-canvas") => {
-            ui.set_canvas_boxes(ModelRc::new(VecModel::from(vec![
-                CanvasBox {
-                    handle: "1".into(),
-                    name: "studio-pc".into(),
-                    x: 20.0,
-                    y: 108.0,
-                },
-                CanvasBox {
-                    handle: "2".into(),
-                    name: "media-rig".into(),
-                    x: 192.0,
-                    y: 16.0,
-                },
-            ])));
-            ui.set_show_layout_canvas(true);
+            use hops_frontend_core::{
+                AppModel, ClientConfig, ClientState, FrontendEvent, PeerTrust,
+            };
+            use hops_ipc::Position;
+            let scenario = std::env::var("PREVIEW_CANVAS").unwrap_or_default();
+            let mut m = AppModel::default();
+            let mut add = |h: u64, name: &str, pos: Position, active: bool| {
+                m.apply(FrontendEvent::Created(
+                    h,
+                    ClientConfig {
+                        hostname: Some(name.into()),
+                        pos,
+                        ..Default::default()
+                    },
+                    ClientState {
+                        active,
+                        ..Default::default()
+                    },
+                ));
+            };
+            add(1, "studio-pc", Position::Left, true);
+            add(2, "media-rig", Position::Top, true);
+            if scenario == "full" {
+                add(3, "lab-linux", Position::Right, true);
+                add(4, "old-laptop", Position::Bottom, true);
+                add(5, "spare-mini", Position::Right, false);
+                add(6, "test-box", Position::Top, false);
+            }
+            if scenario == "crowded" {
+                add(3, "lab-linux", Position::Right, true);
+                add(4, "old-laptop", Position::Bottom, true);
+                add(5, "spare-mini", Position::Right, false);
+                add(6, "test-box", Position::Top, false);
+                add(7, "left-2", Position::Left, false);
+                add(8, "left-3", Position::Left, false);
+                add(9, "left-4", Position::Left, false);
+                add(10, "top-3", Position::Top, false);
+            }
+            if scenario == "unplaced" {
+                let trust = [(
+                    "c3:5e:aa:10:44:9b:21:07".to_string(),
+                    PeerTrust {
+                        label: "office laptop".into(),
+                        we_may_drive: true,
+                        ..Default::default()
+                    },
+                )];
+                m.apply(FrontendEvent::TrustUpdated(trust.into_iter().collect()));
+            }
+            if scenario == "pc" {
+                ui.set_this_machine_name("gaming-tower-upstairs-2".into());
+                ui.set_this_machine_kind("this PC".into());
+            } else {
+                ui.set_this_machine_name("desk-mac".into());
+                ui.set_this_machine_kind("this Mac".into());
+            }
+            hops_slint::open_canvas_for_preview(&ui, &m);
         }
         _ => {}
     }
