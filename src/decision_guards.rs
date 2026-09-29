@@ -529,6 +529,14 @@ mod pairings_made_before_182_keep_the_clipboard_direction_their_lease_grants {
     //! the on arm of the per-device switch also turns a clipboard back on by, and
     //! this runs both machines' real transports over loopback, so swapping the
     //! direction there fails here.
+    //!
+    //! **Narrowed 2026-09-29 (#231).** A pairing carried forward from a v0.12
+    //! config was one of these, and no longer is: the #231 decision grants such
+    //! a pairing nothing, the clipboard included, until it is paired again.
+    //! Its cases left this guard with that decision. A v0.12 pairing granting
+    //! a clipboard is caught by
+    //! `an_upgrade_mints_no_permission_the_old_config_never_granted` and by
+    //! `service::upgraded_from_v0_12`.
 
     use crate::test_harness::{
         ARRIVES_WITHIN, Machine, NEVER_WITHIN, applied_within, clipboard_pair, machine, run_local,
@@ -575,14 +583,16 @@ mod pairings_made_before_182_keep_the_clipboard_direction_their_lease_grants {
         )
     }
 
-    // LEDGER T1861 | class B | 1 return value: ClipboardInbox::next over the queue transport::clipboard_accept_loop fills; ClipboardSender::broadcast, ClipboardSenderListen::broadcast, grant_for_attempt, migrate_from_config, trust_file::rebuild
+    // LEDGER T1861 | class B | 1 return value: ClipboardInbox::next over the queue transport::clipboard_accept_loop fills; ClipboardSender::broadcast, ClipboardSenderListen::broadcast, grant_for_attempt, trust_file::rebuild
+    /// A pairing approved before #182 keeps its clipboard the way control
+    /// goes, and only that way, in the run that approved it and at every
+    /// later start (#186). Pairings carried forward from a v0.12 config are
+    /// not among them since #231, which grants those nothing until they are
+    /// paired again; the guards named in this module's docs hold that.
     #[test]
     fn existing_pairings_keep_their_clipboard_direction() {
         run_local(async {
             type Pairing = fn(&Machine, &Machine) -> (TrustStore, TrustStore);
-            // A pairing carried forward from a v0.12 config was a case here.
-            // It grants nothing now, the clipboard included, and is paired
-            // again (#231): `an_upgrade_mints_no_permission_the_old_config_never_granted`.
             let pairings: [(&str, Pairing, bool); 2] = [
                 ("approved, in the run that approved it", approved, false),
                 ("approved, loaded at a later start", approved, true),
