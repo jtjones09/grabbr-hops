@@ -102,10 +102,14 @@ user account or a deleted directory gives the machine a new key. The other
 machines then no longer recognise it: remove its old card on each and pair
 again.
 
-**A device no longer connects.** Its card says where it stands:
+**A device no longer connects.** Its card says where it stands. Every
+state other than "connected" is here:
 
 | The card says | What to do |
 | --- | --- |
+| not connected | The two are paired and no link is up either way, with nothing known to be wrong. Move the pointer to it. If the card then says something else, see that row. |
+| off | It is switched off on this machine. Switch it on. |
+| compare the number | Pairing is under way and the number is on this screen. Pick the same number on the other machine. |
 | it removed this machine | Remove it here, then pair again. |
 | waiting for its approval | That machine has not approved the pairing or picked its number yet. Open add device on it and finish there. |
 | not accepting input | hops runs there but cannot inject input. It may lack a permission, such as Accessibility on macOS. |

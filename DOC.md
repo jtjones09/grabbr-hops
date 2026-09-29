@@ -34,9 +34,12 @@ The ALPN says which way control goes on a link:
 
 - `grabbr-hop/1`: the machine that dialled controls the one it reached.
 - `grabbr-hop/1-driven`: the machine that dialled is controlled by the one
-  it reached. A machine behind a VPN or security client that drops
-  unsolicited inbound connections is controlled this way, with
-  `listen = false` (`src/dial_back.rs`).
+  it reached. A machine dials this way when the other may control it and
+  it may not control the other, or when `listen = false` stops it
+  listening (`src/dial_back.rs`). A machine behind a VPN or security
+  client that drops unsolicited inbound connections is controlled this
+  way; it needs `listen = false` only if control goes both ways, or to
+  stop it listening at all.
 
 Which machine dials is decided by the pairing, not by the address. The
 ports and directions are listed in [docs/NETWORK.md](docs/NETWORK.md).

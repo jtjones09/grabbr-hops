@@ -80,7 +80,10 @@ Since 0.12.0. No advisory was published for these.
 ### Release
 
 - Dependencies with published advisories were updated, among them rustls
-  (RUSTSEC-2026-0285), and every build fails on a newly published one.
+  (RUSTSEC-2026-0285). A newly published vulnerability or unsoundness
+  advisory against any dependency fails the build unless `deny.toml`
+  ignores it with a reason; the release notes list every advisory let
+  through, and why.
 - Each release carries SHA-256 checksums, a build-provenance attestation,
   and an SBOM per target. The macOS signing keys are used only by a job
   that builds nothing.
