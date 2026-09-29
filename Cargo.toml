@@ -139,6 +139,11 @@ windows = { version = "0.61.2", features = [
     "Win32_System_Threading",
 ] }
 
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+# Lists the targets a copy offers on X11, to find the one that marks it as
+# not to be shared. The version arboard already builds.
+x11rb = "0.13"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # The pasteboard types that mark a copy as not to be shared. The versions
 # arboard already builds.
