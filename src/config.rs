@@ -372,6 +372,9 @@ pub struct Config {
     /// them to it: what a save compares memory against to find what the
     /// daemon changed, which is all it may write (#7).
     synced: Vec<ConfigClient>,
+    /// The file's text as this process last read or wrote it: one that
+    /// still reads the same holds no edit to take in.
+    seen: Option<String>,
     // filesystem watcher, on a thread of its own
     watcher: Watching,
     // channel for filesystem events
@@ -760,18 +763,25 @@ impl Config {
             .unwrap_or(default_path()?.join(CERT_FILE_NAME));
 
         let (tx, watch_rx) = tokio::sync::mpsc::channel(16);
+        // Weak, so the channel still closes when the watcher is gone.
+        let rearmed = tx.downgrade();
         let watched = config_path.clone();
         let mut watcher = watcher(Box::new(move |res| forward_watch_event(&tx, &watched, res)))?;
         // Armed here the first time, so a directory that cannot be watched
         // fails the start; the thread takes every later order.
         watcher.watch(&config_dir, notify::RecursiveMode::NonRecursive)?;
-        let watcher = Watching::keep(watcher, config_dir)?;
+        let watcher = Watching::keep(watcher, config_dir, move || {
+            if let Some(tx) = rearmed.upgrade() {
+                let _ = tx.try_send(Ok(read_again()));
+            }
+        })?;
         let mut config = Config {
             args,
             cert_path,
             config_path,
             config_toml,
             synced: vec![],
+            seen: None,
             watcher,
             watch_rx,
             watch_stopped: false,
@@ -813,7 +823,7 @@ impl Config {
                     continue;
                 }
             };
-            if changes_config(&event, &self.config_path) && self.read_from_disk()? {
+            if changes_config(&event, &self.config_path) && self.read_if_edited()? {
                 return Ok(());
             }
         }
@@ -1002,21 +1012,39 @@ impl Config {
     }
 
     pub fn read_from_disk(&mut self) -> Result<bool, io::Error> {
+        let text = fs::read_to_string(&self.config_path)?;
+        self.take_in(text)
+    }
+
+    /// [`Self::read_from_disk`], unless the file reads as this process last
+    /// read or wrote it. Every save has the file read once more when the
+    /// watcher is armed again, and a save seldom reads back exactly as the
+    /// config it was made from (an empty table is left out), so without
+    /// this each save would be taken in as an edit.
+    fn read_if_edited(&mut self) -> Result<bool, io::Error> {
+        let text = fs::read_to_string(&self.config_path)?;
+        if self.seen.as_deref() == Some(text.as_str()) {
+            return Ok(false);
+        }
+        self.take_in(text)
+    }
+
+    /// Take in `text`, read from the file, as the config.
+    fn take_in(&mut self, text: String) -> Result<bool, io::Error> {
         log::info!("reading config from {:?}", self.config_path);
 
-        let current_config = fs::read_to_string(&self.config_path)?;
         // Saving in place truncates the file, then writes it, and the watcher
         // can report the empty file between the two. Read as a config it has
         // no devices, so every device would be dropped until the next read:
         // an empty file is taken as a save still in progress.
-        if current_config.trim().is_empty() {
+        if text.trim().is_empty() {
             log::info!(
                 "{:?} is empty, as while a save is being written; keeping the config as it was",
                 self.config_path
             );
             return Ok(false);
         }
-        let current_config = match current_config.parse::<DocumentMut>() {
+        let current_config = match text.parse::<DocumentMut>() {
             Ok(c) => c,
             Err(e) => {
                 log::warn!("{:?} {e}", self.config_path());
@@ -1032,6 +1060,7 @@ impl Config {
                     .is_none_or(|c| c != &current_config);
                 self.config_toml.replace(current_config);
                 self.synced = self.clients();
+                self.seen = Some(text);
             }
             Err(e) => log::warn!("{:?} {e}", self.config_path()),
         };
@@ -1078,7 +1107,10 @@ impl Config {
         // which under load held the daemon loop for seconds per save. So the
         // unwatch no longer lands before the write, and the daemon can read
         // its own save back: it reads the same config, or one that also holds
-        // an edit not yet read, which a reload then takes in.
+        // an edit not yet read, which a reload then takes in. Armed again,
+        // the watcher reports only what happens from then on, so the thread
+        // has the file read once more after each re-arm: an edit saved while
+        // it was disarmed, which on macOS is seconds under load, is read too.
         let _ = self.unwatch();
         let result = self.write_config_file(&ours);
         let _ = self.watch();
@@ -1119,6 +1151,7 @@ impl Config {
         // or the whole new one, never a truncated one.
         write_atomically(self.config_path(), new_config.as_bytes())?;
         self.synced = self.clients();
+        self.seen = Some(new_config);
         Ok(())
     }
 }
@@ -1144,9 +1177,15 @@ struct Watching {
 
 impl Watching {
     /// Keep `watcher`, armed on `dir`, on a new thread that carries out
-    /// each order in turn. The thread ends, dropping the watcher there too,
-    /// when this is dropped.
-    fn keep(mut watcher: Box<dyn Watcher + Send>, dir: PathBuf) -> io::Result<Watching> {
+    /// each order in turn, calling `rearmed` after each order to arm it:
+    /// it then reports only what happens from then on, so what happened
+    /// while it was disarmed is for `rearmed` to catch. The thread ends,
+    /// dropping the watcher there too, when this is dropped.
+    fn keep(
+        mut watcher: Box<dyn Watcher + Send>,
+        dir: PathBuf,
+        rearmed: impl Fn() + Send + 'static,
+    ) -> io::Result<Watching> {
         let (orders, taken) = std::sync::mpsc::channel::<Arm>();
         std::thread::Builder::new()
             .name("hops config watcher".to_string())
@@ -1158,6 +1197,7 @@ impl Watching {
                             {
                                 log::warn!("the config watcher could not watch {dir:?}: {e}");
                             }
+                            rearmed();
                         }
                         Arm::Off => {
                             let _ = watcher.unwatch(&dir);
@@ -1180,15 +1220,25 @@ impl Watching {
 /// or removed.
 ///
 /// A save that writes a new file and renames it over the config, as editors
-/// and tools do, is reported as a rename, not as a create or a write.
+/// and tools do, is reported as a rename, not as a create or a write. A
+/// rescan notice names no file and can mean any of them: the system sends
+/// one when it dropped events, and the watcher's thread one when it was
+/// armed again ([`read_again`]).
 fn changes_config(event: &notify::Event, config: &Path) -> bool {
-    event.paths.iter().any(|p| p == config)
-        && matches!(
-            event.kind,
-            EventKind::Create(_)
-                | EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Name(_))
-                | EventKind::Remove(_)
-        )
+    event.need_rescan()
+        || event.paths.iter().any(|p| p == config)
+            && matches!(
+                event.kind,
+                EventKind::Create(_)
+                    | EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Name(_))
+                    | EventKind::Remove(_)
+            )
+}
+
+/// The notice the watcher's thread passes on each time it is armed again:
+/// read the file once more, for any edit made while it was disarmed.
+fn read_again() -> notify::Event {
+    notify::Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan)
 }
 
 /// Hand a watcher event to the daemon loop. Runs on the watcher's thread.
@@ -1755,6 +1805,25 @@ mod the_watcher_never_blocks {
         );
     }
 
+    // LEDGER W6 | class B | 1 return value: forward_watch_event with a rescan notice
+    /// When the system drops events it says so with a rescan notice, which
+    /// names no file: whatever it dropped may have been an edit.
+    #[test]
+    fn a_rescan_notice_takes_a_slot() {
+        let config = PathBuf::from("/nonexistent-hops-config/config.toml");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        forward_watch_event(
+            &tx,
+            &config,
+            Ok(notify::Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan)),
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "a notice that events were dropped was filtered out, so an edit among them \
+             is never read"
+        );
+    }
+
     // LEDGER T2 | class B | 1 return value: forward_watch_event filtering
     #[test]
     fn only_a_change_to_the_config_file_takes_a_slot() {
@@ -1819,6 +1888,13 @@ mod a_save_never_waits_for_the_watcher {
             }
         }
 
+        /// Take `arm` without waiting at the gate.
+        fn record(&self, arm: Arm) {
+            let (gate, changed) = &*self.0;
+            gate.lock().expect("gate").calls.push(arm);
+            changed.notify_all();
+        }
+
         fn set_open(&self, open: bool) {
             let (gate, changed) = &*self.0;
             gate.lock().expect("gate").open = open;
@@ -1859,9 +1935,39 @@ mod a_save_never_waits_for_the_watcher {
         }
     }
 
+    /// A watcher that is slow only to arm, as on macOS, and reports nothing,
+    /// as a watcher armed after an edit never reports it. It keeps the
+    /// handler it is given, so it is never taken for a watcher that is gone.
+    struct ArmingWatcher {
+        busy: Busy,
+        _events: OnEvent,
+    }
+
+    impl Watcher for ArmingWatcher {
+        fn new<F: notify::EventHandler>(_: F, _: notify::Config) -> notify::Result<Self> {
+            Err(notify::Error::generic("made by the test"))
+        }
+        fn watch(&mut self, _: &Path, _: notify::RecursiveMode) -> notify::Result<()> {
+            self.busy.call(Arm::On);
+            Ok(())
+        }
+        fn unwatch(&mut self, _: &Path) -> notify::Result<()> {
+            self.busy.record(Arm::Off);
+            Ok(())
+        }
+        fn kind() -> notify::WatcherKind {
+            notify::WatcherKind::NullWatcher
+        }
+    }
+
     /// A config in a scratch directory, watched by a [`BusyWatcher`] whose
     /// gate is open for the first arming and closed after it.
     fn watched(tag: &str) -> (PathBuf, PathBuf, Config, Busy) {
+        watched_by(tag, false)
+    }
+
+    /// [`watched`], by an [`ArmingWatcher`] when `arming` is true.
+    fn watched_by(tag: &str, arming: bool) -> (PathBuf, PathBuf, Config, Busy) {
         let dir = std::env::temp_dir().join(format!("hops-watch-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("a scratch directory");
@@ -1877,8 +1983,17 @@ mod a_save_never_waits_for_the_watcher {
         let busy = Busy::default();
         busy.set_open(true);
         let watcher = busy.clone();
-        let config = Config::with_args_watched(args, move |_| Ok(Box::new(BusyWatcher(watcher))))
-            .expect("the config loads");
+        let config = Config::with_args_watched(args, move |on_event| {
+            Ok(if arming {
+                Box::new(ArmingWatcher {
+                    busy: watcher,
+                    _events: on_event,
+                })
+            } else {
+                Box::new(BusyWatcher(watcher))
+            })
+        })
+        .expect("the config loads");
         busy.set_open(false);
         (dir, path, config, busy)
     }
@@ -1940,6 +2055,90 @@ mod a_save_never_waits_for_the_watcher {
             Some(&Arm::On),
             "a save that failed left the config watcher disarmed, so edits are never \
              read again: {calls:?}"
+        );
+    }
+
+    // LEDGER W5 | class B | 1 return value + 2 struct state: Config::changed after a save, with an edit made while the watcher was disarmed
+    /// A save disarms the watcher and arms it again. Armed again, a watcher
+    /// reports only what happens from then on: on macOS arming takes a
+    /// second or more, and under load many, so an edit saved by hand in
+    /// that time was never reported, and never read until hops restarted.
+    #[test]
+    fn an_edit_made_while_the_watcher_is_rearmed_is_read() {
+        let (dir, path, mut config, busy) = watched_by("rearm", true);
+        config.write_back().expect("the save");
+        // Held arming again: the edit lands before the watcher reports
+        // anything, and so is never reported.
+        let calls = busy.calls(3);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        // The daemon reads whatever is already passed on, as its loop does
+        // at any moment: a read before the edit does not read the edit.
+        let early = rt.block_on(async { futures::FutureExt::now_or_never(config.changed()) });
+        let saving = dir.join("config.toml.saving");
+        fs::write(&saving, "port = 4444\n").expect("the edit");
+        fs::rename(&saving, &path).expect("renamed over the config");
+        busy.set_open(true);
+        let read = rt.block_on(async {
+            tokio::time::timeout(DEADLINE, async {
+                while config.port() != 4444 {
+                    config.changed().await?;
+                }
+                Ok::<(), notify::Error>(())
+            })
+            .await
+        });
+        let port = config.port();
+        drop(config);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            calls,
+            [Arm::On, Arm::Off, Arm::On],
+            "precondition: the edit was made while the watcher was armed again after the save"
+        );
+        assert!(
+            early.is_none(),
+            "precondition: nothing changed before the edit: {early:?}"
+        );
+        assert!(
+            matches!(read, Ok(Ok(()))) && port == 4444,
+            "an edit saved while hops' own save had the config watcher disarmed was \
+             never read: {read:?}, port {port}"
+        );
+    }
+
+    // LEDGER W8 | class B | 1 return value: Config::changed after a save with no edit, once the watcher is armed again
+    /// Armed again after a save, the watcher has the file read once more.
+    /// What hops wrote is not an edit: taken in as one, every save would
+    /// be followed by a reload of every device and a check for removals.
+    #[test]
+    fn a_save_is_not_read_back_as_an_edit() {
+        let (dir, _path, mut config, busy) = watched_by("own", true);
+        busy.set_open(true);
+        // As the daemon saves: an empty list in memory, which the file
+        // leaves out, so the file does not read back as the same config.
+        config.set_clients(vec![]);
+        config.write_back().expect("the save");
+        // Taken only after the re-arm and the read it asks for.
+        let _ = config.unwatch();
+        let calls = busy.calls(4);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let read = rt.block_on(async { futures::FutureExt::now_or_never(config.changed()) });
+        drop(config);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            calls,
+            [Arm::On, Arm::Off, Arm::On, Arm::Off],
+            "precondition: the watcher was armed again after the save"
+        );
+        assert!(
+            read.is_none(),
+            "hops' own save was read back as an edit to its config: {read:?}"
         );
     }
 
@@ -2114,6 +2313,63 @@ mod a_save_by_rename_is_read {
             matches!(read, Ok(Ok(()))) && port == 4444,
             "a config saved by renaming a new file over it was not read: {read:?}, \
              port {port}"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod an_edit_right_after_a_save_is_read {
+    //! The same over the system's own watcher: an edit saved while hops'
+    //! save is still arming the watcher again.
+    use super::*;
+    use std::time::Duration;
+
+    // LEDGER W7 | class B | 1 return value + 1 struct state: Config::changed over a real watcher, an edit made as a save returns
+    #[test]
+    fn an_edit_saved_as_a_save_returns_is_read() {
+        let dir = std::env::temp_dir().join(format!("hops-after-save-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("a scratch directory");
+        // As the watcher reports it (see a_config_renamed_into_place_is_read).
+        let dir = dir
+            .canonicalize()
+            .expect("the scratch directory's real path");
+        let path = dir.join("config.toml");
+        fs::write(&path, "port = 4343\n").expect("a config");
+        let args = Args::parse_from([
+            "hops".as_ref(),
+            "--config".as_ref(),
+            path.as_os_str(),
+            "--cert-path".as_ref(),
+            dir.join("cert.pem").as_os_str(),
+        ]);
+        let mut config = Config::with_args(args).expect("the config loads");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        config.write_back().expect("the save");
+        let saving = dir.join("config.toml.saving");
+        fs::write(&saving, "port = 4444\n").expect("the edit");
+        fs::rename(&saving, &path).expect("renamed over the config");
+        // Arming asks the system, which takes each request in turn: in a
+        // full test run, with every other test's watcher, it has taken over
+        // thirty seconds.
+        let read = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(120), async {
+                while config.port() != 4444 {
+                    config.changed().await?;
+                }
+                Ok::<(), notify::Error>(())
+            })
+            .await
+        });
+        let port = config.port();
+        drop(config);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            matches!(read, Ok(Ok(()))) && port == 4444,
+            "an edit saved just after hops' own save was never read: {read:?}, port {port}"
         );
     }
 }
