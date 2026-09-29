@@ -693,12 +693,21 @@ fn name_held(store: &crate::trust::TrustStore, fp: &str) -> String {
     named(&label, fp)
 }
 
+/// `fp` as a notice of its removal from config.toml tells it: by its name,
+/// and whether it held only a listing to be paired again (#231).
+fn forgotten_as(store: &crate::trust::TrustStore, fp: &str) -> crate::cache_listed::Forgotten {
+    crate::cache_listed::Forgotten {
+        name: name_held(store, fp),
+        to_pair_again: store.to_pair_again(fp).is_some(),
+    }
+}
+
 /// Forget each device the trust store holds that the `[authorized_fingerprints]`
 /// cache in `config` listed before and no longer lists: an older build, or a
 /// person, removed it there (see `crate::cache_listed`). A machine listed to
 /// be paired again (#231) is forgotten the same way. A removal found is
 /// confirmed by reading the file again once it has settled. Returns the
-/// store, what the cache has listed, the names of the devices forgotten, and
+/// store, what the cache has listed, the devices forgotten, and
 /// whether the two reads disagreed, when the first read is not to be recorded
 /// in place of what was.
 async fn forget_removed_from_cache(
@@ -708,7 +717,7 @@ async fn forget_removed_from_cache(
 ) -> (
     crate::trust::TrustStore,
     crate::cache_listed::Listed,
-    Vec<String>,
+    Vec<crate::cache_listed::Forgotten>,
     bool,
 ) {
     let listed = crate::cache_listed::Listed::read(config_dir);
@@ -724,17 +733,18 @@ async fn forget_removed_from_cache(
         removed = crate::cache_listed::confirmed(removed, config.listed_on_disk().as_ref());
         disagreed = removed.len() != found;
     }
-    let mut names = Vec::new();
+    let mut forgotten = Vec::new();
     for fp in removed {
-        let name = name_held(&store, &fp);
+        let told = forgotten_as(&store, &fp);
         store.forget(&fp);
         log::warn!(
-            "forgot {name} ({fp}): config.toml no longer lists it, so it was removed there, \
-             by hand or by an older build"
+            "forgot {} ({fp}): config.toml no longer lists it, so it was removed there, \
+             by hand or by an older build",
+            told.name
         );
-        names.push(name);
+        forgotten.push(told);
     }
-    (store, listed, names, disagreed)
+    (store, listed, forgotten, disagreed)
 }
 
 /// Record, of what the `[authorized_fingerprints]` cache in `config` lists,
@@ -894,8 +904,8 @@ impl Service {
         if !forgotten.is_empty() {
             // Through the saver, so a save that fails is retried every minute
             // and every app that attaches is told, as for any trust change.
-            let unsaved =
-                trust_saver.save_change(&store, format!("removing {}", forgotten.join(", ")));
+            let names: Vec<&str> = forgotten.iter().map(|f| f.name.as_str()).collect();
+            let unsaved = trust_saver.save_change(&store, format!("removing {}", names.join(", ")));
             if let Some(unsaved) = unsaved {
                 log::error!("{unsaved}");
             }
@@ -1565,14 +1575,16 @@ impl Service {
             crate::cache_listed::confirmed(removed, self.config.listed_on_disk().as_ref())
         };
         if !removed.is_empty() {
-            let names: Vec<String> = {
+            let forgotten: Vec<crate::cache_listed::Forgotten> = {
                 let trust = self.trust.read().expect("lock");
-                removed.iter().map(|fp| name_held(&trust, fp)).collect()
+                removed.iter().map(|fp| forgotten_as(&trust, fp)).collect()
             };
             for fp in removed {
                 self.remove_authorized_key(fp);
             }
-            self.notify_frontend(FrontendEvent::Error(crate::cache_listed::notice(&names)));
+            self.notify_frontend(FrontendEvent::Error(crate::cache_listed::notice(
+                &forgotten,
+            )));
         }
         #[cfg(test)]
         self.config_signals.checked.notify_one();

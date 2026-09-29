@@ -156,18 +156,60 @@ pub fn confirmed(removed: Vec<String>, again: Option<&HashMap<String, String>>) 
         .collect()
 }
 
-/// What the app is told of devices forgotten because the cache no longer
-/// lists them, named as `names`.
-pub fn notice(names: &[String]) -> String {
-    let (who, its) = match names {
-        [one] => (format!("{one} was"), "its pairing is"),
-        _ => (format!("{} were", names.join(", ")), "their pairings are"),
+/// A device forgotten because the cache no longer lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Forgotten {
+    /// How a notice names it.
+    pub name: String,
+    /// It held no pairing here, only a listing to be paired again, left by
+    /// an older build's list (#231).
+    pub to_pair_again: bool,
+}
+
+/// What the app is told of `forgotten`, the devices forgotten because the
+/// cache no longer lists them. A pairing removed is told as one; a machine
+/// only listed to be paired again had no pairing to remove (#231).
+pub fn notice(forgotten: &[Forgotten]) -> String {
+    let names = |to_pair_again: bool| -> Vec<&str> {
+        forgotten
+            .iter()
+            .filter(|f| f.to_pair_again == to_pair_again)
+            .map(|f| f.name.as_str())
+            .collect()
     };
-    format!(
-        "{who} removed from the trusted devices in config.toml, by hand or by an older \
-         version of hops, so {its} removed here too. To use it again, pair the two \
-         machines again."
-    )
+    let mut told = Vec::new();
+    match names(false).as_slice() {
+        [] => {}
+        [one] => told.push(format!(
+            "{one} was removed from the trusted devices in config.toml, by hand or by an \
+             older version of hops, so its pairing is removed here too."
+        )),
+        many => told.push(format!(
+            "{} were removed from the trusted devices in config.toml, by hand or by an \
+             older version of hops, so their pairings are removed here too.",
+            many.join(", ")
+        )),
+    }
+    match names(true).as_slice() {
+        [] => {}
+        [one] => told.push(format!(
+            "{one} was removed from the list an older version of hops wrote in \
+             config.toml, by hand or by that version, so it is no longer shown here as \
+             one to pair again."
+        )),
+        many => told.push(format!(
+            "{} were removed from the list an older version of hops wrote in \
+             config.toml, by hand or by that version, so they are no longer shown here \
+             as ones to pair again.",
+            many.join(", ")
+        )),
+    }
+    told.push(if forgotten.len() == 1 {
+        "To use it again, pair the two machines again.".to_string()
+    } else {
+        "To use one again, pair the two machines again.".to_string()
+    });
+    told.join(" ")
 }
 
 #[cfg(test)]

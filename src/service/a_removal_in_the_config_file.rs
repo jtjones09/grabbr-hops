@@ -793,13 +793,22 @@ fn with_a_device_for_the_laptop(trusted: &[(&str, &str)]) -> String {
     )
 }
 
-// LEDGER R231-16 | class B | 6 trust store state across three starts and a reload through the config watcher
+/// What a notice of `laptop`'s removal must say when the laptop held only a
+/// listing to be paired again: it had no pairing to remove (#231).
+fn told_as_a_listing(told: &str) -> bool {
+    told.contains("\"laptop\" was removed from the list an older version of hops wrote")
+        && told.contains("no longer shown here as one to pair again")
+        && !told.contains("pairing is removed")
+}
+
+// LEDGER R231-20 | class B | 6 trust store state across three starts and a reload through the config watcher
 /// `[authorized_fingerprints]` in config.toml grants nothing, whether or not
 /// the trust file is there (#231). With no trust file, as at the upgrade
 /// from 0.12 or once the file is lost, each machine the table names is
 /// listed to be paired again. With the trust file there, a line added while
 /// the daemon is stopped, or while it runs, grants nothing and lists
-/// nothing.
+/// nothing. A device pinned to a listed machine, as a device an older build
+/// dialled is, makes no difference: it grants neither direction.
 #[test]
 fn the_list_in_the_config_file_grants_nothing_with_or_without_the_trust_file() {
     run_local(async {
@@ -814,13 +823,18 @@ fn the_list_in_the_config_file_grants_nothing_with_or_without_the_trust_file() {
         let seen = |trust: &Trust| (granted(trust, &fps), listed_again(trust, &fps));
 
         // No trust file: the first start after the upgrade from 0.12.
-        std::fs::write(s.0.join("config.toml"), config_listing(&all[..2])).expect("a config");
+        std::fs::write(
+            s.0.join("config.toml"),
+            with_a_device_for_the_laptop(&all[..2]),
+        )
+        .expect("a config");
         let (first, _) = start(&s.0, 1).await;
         let upgraded = seen(&first.trust);
+        let pinned_at_upgrade = pinned(&first, LAPTOP);
         stop(first).await;
 
         // The trust file there: a line added while the daemon is stopped ...
-        save_config(&s.0, &config_listing(&all[..3]));
+        save_config(&s.0, &with_a_device_for_the_laptop(&all[..3]));
         let (mut second, _) = start(&s.0, 2).await;
         let added_while_stopped = seen(&second.trust);
         // ... and one added while it runs.
@@ -828,7 +842,7 @@ fn the_list_in_the_config_file_grants_nothing_with_or_without_the_trust_file() {
         run_until(
             &mut second,
             Signal::Checked,
-            move || save_config(&dir, &config_listing(&all)),
+            move || save_config(&dir, &with_a_device_for_the_laptop(&all)),
             |service| service.config.listed_as_trusted().map(|t| t.len()) == Some(4),
         )
         .await;
@@ -839,8 +853,14 @@ fn the_list_in_the_config_file_grants_nothing_with_or_without_the_trust_file() {
         std::fs::remove_file(s.0.join(crate::trust_file::TRUST_FILE_NAME)).expect("the trust file");
         let (third, _) = start(&s.0, 3).await;
         let rebuilt = seen(&third.trust);
+        let pinned_when_rebuilt = pinned(&third, LAPTOP);
         stop(third).await;
 
+        assert!(
+            pinned_at_upgrade && pinned_when_rebuilt,
+            "precondition: a device is pinned to the laptop at both starts with no trust \
+             file (at the upgrade {pinned_at_upgrade}, once rebuilt {pinned_when_rebuilt})"
+        );
         let none = Vec::<String>::new;
         let names = |fps: &[&str]| fps.iter().map(|fp| fp.to_string()).collect::<Vec<_>>();
         assert_eq!(
@@ -860,7 +880,7 @@ fn the_list_in_the_config_file_grants_nothing_with_or_without_the_trust_file() {
     });
 }
 
-// LEDGER R231-17 | class B | 6 trust store state and client pins across two starts + 2 event over the real IPC socket
+// LEDGER R231-21 | class B | 6 trust store state and client pins across two starts + 2 event over the real IPC socket
 /// The upgrade case of a removal in the file: the store holds what the 0.12
 /// list named only to be paired again (#231). An older build removes the
 /// laptop's line, and at the next start its listing goes, and so does the
@@ -899,13 +919,15 @@ fn a_machine_to_pair_again_removed_from_the_file_is_forgotten() {
              listing, or the pin of the device folded into it, was kept (#231)"
         );
         assert!(
-            told.iter().any(|said| said.contains("\"laptop\"")),
-            "the app was not told the laptop was removed, by its name: {told:?}"
+            told.iter().any(|said| told_as_a_listing(said)),
+            "the app was not told, by the laptop's name, that its listing to pair again \
+             was removed, or was told a pairing was removed that it never held (#231): \
+             {told:?}"
         );
     });
 }
 
-// LEDGER R231-18 | class B | 6 trust store state and client pins + 2 event over the real IPC socket, through the config watcher
+// LEDGER R231-22 | class B | 6 trust store state and client pins + 2 event over the real IPC socket, through the config watcher
 /// A person removes, while the daemon runs, the line of a machine the store
 /// lists to be paired again (#231): its listing goes, and so does the pin of
 /// the device folded into it, and the app is told by its name.
@@ -941,13 +963,15 @@ fn a_machine_to_pair_again_removed_from_the_file_while_running_is_forgotten() {
              the laptop's line was removed while the daemon ran (#231)"
         );
         assert!(
-            told.contains("\"laptop\""),
-            "the app must be told the laptop was forgotten, by its name: {told:?}"
+            told_as_a_listing(&told),
+            "the app was not told, by the laptop's name, that its listing to pair again \
+             was removed, or was told a pairing was removed that it never held (#231): \
+             {told:?}"
         );
     });
 }
 
-// LEDGER R231-19 | class B | 6 trust store state across two starts + 5 file content on disk
+// LEDGER R231-23 | class B | 6 trust store state across two starts + 5 file content on disk
 /// The daemon's own save drops the 0.12 list from config.toml, since a
 /// machine to pair again is not in the cache (#231). That is not a removal:
 /// the listings stay at the next start, even when the save came while a

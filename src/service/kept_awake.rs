@@ -295,3 +295,44 @@ fn a_refused_assertion_is_taken_at_the_next_sweep() {
         mac.run_while(body).await;
     });
 }
+
+// LEDGER R231-24 | class B | 2 PowerAssertion calls made by a running daemon + 1 struct state: its trust store, after a first start on a 0.12 config
+/// A mac upgraded from 0.12, whose list names the pc and whose device for
+/// the pc is pinned to it and switched on, is not kept awake by that list
+/// and does not let the pc control it: the list grants nothing until the
+/// two are paired again (#231).
+#[test]
+fn a_v0_12_list_keeps_the_mac_awake_for_nothing() {
+    run_local(async {
+        let pc = machine();
+        let tables = format!(
+            "[authorized_fingerprints]\n\"{}\" = \"desk pc\"\n\n{}",
+            pc.fingerprint,
+            device_for(&pc.fingerprint)
+        );
+        let mut mac =
+            Daemon::start("awake-v012-mac", &tables, input_emulation::Backend::Dummy).await;
+        let seen = Rc::new(Seen::default());
+        mac.keep_awake_through(Box::new(Recording(seen.clone())));
+        let (trust, ipc) = (mac.trust(), mac.ipc());
+        let body = async {
+            let mut app = ipc.connect().await;
+            let awake = settled(&mut app, &seen).await;
+            let (listed, granted) = {
+                let t = trust.read().expect("lock");
+                (
+                    t.to_pair_again(&pc.fingerprint).is_some(),
+                    t.capabilities(&pc.fingerprint),
+                )
+            };
+            assert_eq!(
+                (listed, granted, awake),
+                (true, Caps::NONE, (false, 0, 0)),
+                "(the pc listed to pair again, what it is granted, (held, takes, releases)) \
+                 after an upgrade from a 0.12 list with a device for the pc switched on: the \
+                 list granted the pc something or kept the mac awake (#231)"
+            );
+        };
+        mac.run_while(body).await;
+    });
+}
