@@ -3,8 +3,8 @@
 //! network until something wakes it by hand, as a lid-lift does.
 //!
 //! This module only takes and releases the assertion. When one is wanted is
-//! decided by the daemon: only while a paired device that may control this
-//! Mac is switched on.
+//! decided by the daemon: only while a paired device may control this Mac,
+//! whether or not it is switched on here.
 
 use core_foundation::array::CFArray;
 use core_foundation::base::{CFType, TCFType};

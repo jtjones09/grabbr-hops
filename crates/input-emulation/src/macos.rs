@@ -1806,9 +1806,8 @@ impl Emulation for MacOSEmulation {
         log::trace!("{event:?}");
         // Wake a sleeping display on any incoming remote input (throttled). The
         // system stays awake via the power assertion the daemon holds while a
-        // device that may control this Mac is paired and switched on
-        // (`macos_keep_awake`), but synthetic CGEvents don't wake the screen by
-        // themselves — this does.
+        // paired device may control this Mac (`macos_keep_awake`), but
+        // synthetic CGEvents don't wake the screen by themselves — this does.
         self.declare_user_activity();
         match event {
             Event::Pointer(pointer_event) => {
