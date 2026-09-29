@@ -453,11 +453,14 @@ mod marks {
 /// is saying what kind of copy it is.
 ///
 /// arboard is built without its `wayland-data-control` feature, so it reads
-/// the text over X11 on Wayland too, through Xwayland, which offers a Wayland
-/// copy's MIME types as X11 targets: the marks looked at are those of the
-/// very copy whose text is read. Enabling that feature would read Wayland
-/// copies past this check. Where no X server can be reached, arboard cannot
-/// open the clipboard and nothing is read at all.
+/// the text over X11 on Wayland too, through Xwayland. The compositor's X
+/// window manager (mutter, KWin, the wlroots XWM) offers a Wayland copy's
+/// MIME types to X11 clients as targets, so the marks looked at are those of
+/// the very copy whose text is read. Some bridge a Wayland copy only while an
+/// X11 window has focus; a copy not bridged is not seen here, nor read.
+/// Enabling that feature would read Wayland copies past this check, and a
+/// test fails if the crate it pulls in enters the build. Where no X server
+/// can be reached, arboard cannot open the clipboard and nothing is read.
 ///
 /// X11 keeps no count of copies, so `generation` is `None`: a copy that lands
 /// between the check and the read is caught by the next poll, which finds it
@@ -689,6 +692,22 @@ mod tests {
             Ok(t) => eprintln!("[clipboard] open + read OK ({} chars)", t.len()),
             Err(e) => eprintln!("[clipboard] opened; no text present (acceptable): {e}"),
         }
+    }
+
+    // LEDGER T22431 | class S | lockfile text: Cargo.lock | pair T22428
+    /// On Linux the marks are read over X11, and so is the text: arboard is
+    /// built without `wayland-data-control`. That feature pulls in
+    /// wl-clipboard-rs and reads Wayland copies without looking at their
+    /// marks, so the crate entering the build fails here.
+    #[test]
+    fn no_wayland_clipboard_reader_is_built() {
+        let lock = include_str!("../Cargo.lock");
+        assert!(
+            !lock.contains("name = \"wl-clipboard-rs\""),
+            "wl-clipboard-rs is in Cargo.lock: a Wayland clipboard reader \
+             would read copies a password manager marked, past the X11 marks \
+             check in clipboard::marks"
+        );
     }
 }
 
@@ -1679,7 +1698,10 @@ mod the_clipboard_is_read_only_when_it_may_be {
         /// Its marks cannot be looked at, as while another app holds it open.
         busy: bool,
         generation: i64,
-        /// A copy lands while the text is being read, once.
+        /// No count of copies is kept, as on X11.
+        uncounted: bool,
+        /// A marked copy lands after the marks are looked at and before the
+        /// text is read, once: the text read is that copy's.
         copied_while_read: Option<String>,
         /// Once the text is read, the app that copied it marks it private,
         /// as it adds its next type: the count of copies does not move.
@@ -1705,16 +1727,17 @@ mod the_clipboard_is_read_only_when_it_may_be {
         }
 
         fn generation(&mut self) -> Option<i64> {
-            Some(self.0.borrow().generation)
+            let board = self.0.borrow();
+            (!board.uncounted).then_some(board.generation)
         }
 
         fn text(&mut self) -> Option<String> {
             let mut board = self.0.borrow_mut();
             board.texts_read += 1;
-            let text = board.text.clone();
             if let Some(next) = board.copied_while_read.take() {
                 board.copy(&next, true);
             }
+            let text = board.text.clone();
             if std::mem::take(&mut board.marked_after_read) {
                 board.private = true;
             }
@@ -1918,6 +1941,45 @@ mod the_clipboard_is_read_only_when_it_may_be {
         );
     }
 
+    // LEDGER T22430 | class B | 1 return value: Clipboard::changed, driven by Clipboard::spawn's poll over a stand-in clipboard that keeps no count of copies
+    #[test]
+    fn with_no_count_of_copies_a_marked_copy_read_past_the_check_is_not_sent() {
+        run_local(async {
+            let board = Rc::new(RefCell::new(Board {
+                uncounted: true,
+                ..Board::default()
+            }));
+            let wanted = Rc::new(Cell::new(true));
+            let (mut clipboard, asked) = task(&board, &wanted);
+            polls(&asked, 2).await;
+
+            // The marks are looked at on an ordinary copy; a marked one lands
+            // before the text is read, and nothing counts the change.
+            {
+                let mut board = board.borrow_mut();
+                board.copy("ordinary", false);
+                board.copied_while_read = Some("a password".into());
+            }
+            polls(&asked, 5).await;
+            assert!(
+                board.borrow().copied_while_read.is_none(),
+                "the marked copy never landed"
+            );
+            assert_eq!(
+                sent_within(&mut clipboard, NEVER_WITHIN).await,
+                None,
+                "a marked copy read past the check was sent"
+            );
+
+            board.borrow_mut().copy("ordinary again", false);
+            assert_eq!(
+                sent_within(&mut clipboard, ARRIVES_WITHIN).await.as_deref(),
+                Some("ordinary again"),
+                "an ordinary copy was not sent where no count of copies is kept"
+            );
+        });
+    }
+
     // LEDGER T22419 | class B | 6 struct state: the stand-in clipboard's writes, through Clipboard::apply
     #[test]
     fn text_from_peers_is_written_latest_first_and_only_once() {
@@ -2077,9 +2139,14 @@ mod the_marks_on_an_x11_copy {
     };
     use x11rb::wrapper::ConnectionExt as _;
 
-    use super::marks::{self, Atoms, PRIVATE};
+    use super::marks::{self, Atoms};
     use super::{Clipboard, ClipboardEvent, System, SystemClipboard};
     use crate::test_harness::{ARRIVES_WITHIN, NEVER_WITHIN, run_local, wait_until};
+
+    /// The target KeePassXC offers beside every copy it makes, spelled as it
+    /// spells it: written out here, not taken from the code under test, so a
+    /// misspelt name there is caught.
+    const KEEPASSXC_MARK: &str = "x-kde-passwordManagerHint";
 
     /// Set on the copy of this test binary that runs the clipboard task on
     /// the test's X server.
@@ -2195,7 +2262,7 @@ mod the_marks_on_an_x11_copy {
                 atom("CLIPBOARD"),
                 atom("TARGETS"),
                 atom("UTF8_STRING"),
-                atom(PRIVATE),
+                atom(KEEPASSXC_MARK),
             );
             let window = conn.generate_id().unwrap();
             let root = conn.setup().roots[screen].root;
@@ -2363,29 +2430,34 @@ mod the_marks_on_an_x11_copy {
         );
     }
 
+    /// What `display`'s marks say once its clipboard's owner answers. `None`
+    /// means ask again, as the clipboard task does; an owner slowed by a
+    /// loaded test run is given until [`ARRIVES_WITHIN`].
+    fn answered(display: &str) -> Option<bool> {
+        let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
+        loop {
+            let said = marks::private_on(Some(display));
+            if said.is_some() || std::time::Instant::now() >= deadline {
+                return said;
+            }
+        }
+    }
+
     // LEDGER T22427 | class B | 1 return value: clipboard::marks::private_on against Xvfb
     #[test]
     fn a_copy_offering_the_password_manager_hint_is_private() {
         let Some(x) = xvfb() else { return };
-        assert_eq!(
-            marks::private_on(Some(&x.display)),
-            Some(false),
-            "an empty clipboard"
-        );
+        assert_eq!(answered(&x.display), Some(false), "an empty clipboard");
         {
             let _copy = copy(&x.display, "ordinary", false);
-            assert_eq!(
-                marks::private_on(Some(&x.display)),
-                Some(false),
-                "an ordinary copy"
-            );
+            assert_eq!(answered(&x.display), Some(false), "an ordinary copy");
         }
         {
             let _copy = copy(&x.display, "a password", true);
             assert_eq!(
-                marks::private_on(Some(&x.display)),
+                answered(&x.display),
                 Some(true),
-                "a copy offering {PRIVATE}"
+                "a copy offering {KEEPASSXC_MARK}"
             );
         }
         let _hung = own(&x.display, "a password", true, false);
@@ -2393,6 +2465,19 @@ mod the_marks_on_an_x11_copy {
             marks::private_on(Some(&x.display)),
             None,
             "a copy whose app does not say what it offers"
+        );
+    }
+
+    // LEDGER T22429 | class B | 1 return value: clipboard::marks::private_on on a display with no X server
+    #[test]
+    fn the_marks_are_not_known_where_no_x_server_answers() {
+        // No server listens on this display's socket, and a unix display is
+        // never tried over TCP: its marks cannot be looked at, and a copy
+        // arboard reads over a connection it already holds is then not read.
+        assert_eq!(
+            marks::private_on(Some("unix/:59999")),
+            None,
+            "a display with no X server"
         );
     }
 
@@ -2480,7 +2565,7 @@ mod the_marks_on_an_x11_copy {
             assert_eq!(
                 sent(&mut clipboard, NEVER_WITHIN).await,
                 None,
-                "a copy offering {PRIVATE} was sent"
+                "a copy offering {KEEPASSXC_MARK} was sent"
             );
             drop(secret);
 
