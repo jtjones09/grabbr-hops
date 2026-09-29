@@ -87,23 +87,38 @@ fn a_device_moved_onto_a_taken_edge_trades_edges_and_switches_nothing_off() {
                     .exchange(&[FrontendRequest::UpdatePosition(pc, Position::Right)])
                     .await;
 
-                let notices = |what: &str| {
+                let errors = |what: &str| {
                     events
                         .iter()
                         .filter(|e| matches!(e, FrontendEvent::Error(t) if t.starts_with(what)))
                         .count()
                 };
+                // The trade is told as activity: it is a move that worked, not an
+                // error for the banner.
+                let activity = |what: &str| {
+                    events
+                        .iter()
+                        .filter(|e| matches!(e, FrontendEvent::Activity(t) if t.starts_with(what)))
+                        .count()
+                };
                 assert_eq!(
-                    (now(), notices("Switched off"), notices("Moved \"media-rig\" to the left edge")),
+                    (
+                        now(),
+                        errors("Switched off"),
+                        activity("Moved \"media-rig\" to the left edge"),
+                        errors("Moved"),
+                    ),
                     (
                         vec![
                             ("desk-pc".to_owned(), Position::Right, true),
                             ("media-rig".to_owned(), Position::Left, true),
                         ],
                         0,
-                        1
+                        1,
+                        0,
                     ),
-                    "(devices, switch-off notices, notices the rig moved) after the move: {events:?}"
+                    "(devices, switch-off notices, activity saying the rig moved, error \
+                     banners about the move) after the move: {events:?}"
                 );
                 assert_eq!(
                     saved(&file),

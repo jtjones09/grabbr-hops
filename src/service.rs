@@ -3774,7 +3774,9 @@ impl Service {
                             .unwrap_or_else(|| format!("device {h}"))
                     };
                     let (moved, mover) = (name(other), name(handle));
-                    self.notify_frontend(FrontendEvent::Error(format!(
+                    // A trade is a move that worked, so it is told as activity,
+                    // not in the error banner.
+                    self.notify_frontend(FrontendEvent::Activity(format!(
                         "Moved \"{moved}\" to the {from} edge — \"{mover}\" now uses \
                          the {pos} edge, and two devices cannot share one edge."
                     )));
