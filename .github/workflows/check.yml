@@ -80,7 +80,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev \
-            libxtst-dev pkg-config libfontconfig1-dev
+            libxtst-dev pkg-config libfontconfig1-dev \
+            xvfb  # an X server for the clipboard tests (src/clipboard.rs)
       - name: check
         run: cargo check --locked --no-default-features --features "${{ matrix.features }}" --all-targets
       - name: test
@@ -129,7 +130,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev \
-            libxtst-dev pkg-config libfontconfig1-dev
+            libxtst-dev pkg-config libfontconfig1-dev \
+            xvfb  # an X server for the clipboard tests (src/clipboard.rs)
       # Was `-p hops-ipc -p hops-frontend-core`, which ran 121 of 166 tests. The
       # hops-slint guards — the sole evidence for four merged PRs — had never
       # executed in CI. A guard that does not run is a comment.
