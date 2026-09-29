@@ -11,8 +11,8 @@ older hops.
 
 ## The port
 
-A `port = 4242` line in `config.toml`, at the top or in a device's
-`[[clients]]` entry, keeps 4242. Remove it on every machine to move to
+hops 0.12 listens on 4242, the old port. A `port = 4242` line in
+`config.toml`, at the top or in a device's `[[clients]]` entry, keeps it. Remove it on every machine to move to
 4722, or keep 4242 on all of them. A firewall rule that lets UDP 4242 in
 must be changed to 4722; on Windows, a `hops.exe` unpacked into a new
 folder also needs a new rule (see
@@ -22,7 +22,7 @@ hops uses is in [NETWORK.md](NETWORK.md).
 ## Stop the old service on Windows
 
 The 0.12 background service keeps running beside 0.13 until it is
-stopped. The steps are in [service/README.md](../service/README.md).
+stopped. The steps are in [service/README.md](../service/README.md#windows).
 
 ## macOS
 

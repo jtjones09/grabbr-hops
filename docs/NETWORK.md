@@ -10,8 +10,8 @@ a machine behind a VPN or security client is in
 | What | Protocol and port | Direction |
 | --- | --- | --- |
 | Input, clipboard and pairing between two machines | QUIC over UDP 4722, TLS 1.3 | see below for which machine opens it |
-| Asking whether an older hops answers | the start of a QUIC handshake to UDP 4242 | outbound, only after a dial to 4722 got no answer |
-| Finding other machines on the LAN | multicast DNS, UDP 5353 | multicast, both ways; off with `discovery = false` or `listen = false` |
+| Asking whether a machine still runs hops 0.12 | the start of a QUIC handshake to UDP 4242, the old port | outbound, only after a dial to 4722 got no answer |
+| Finding other machines on the LAN | multicast DNS, UDP 5353, over IPv4 and IPv6 | multicast, both ways; off with `discovery = false` or `listen = false` |
 | Looking up a device added by name | the system resolver | outbound DNS, as any program's lookup |
 | The app talking to the hops service | a Unix socket, or a named pipe on Windows | this machine only; nothing on the network |
 
@@ -25,9 +25,11 @@ Every connection is QUIC over UDP, encrypted and authenticated with
 TLS 1.3. Each machine proves the key it was paired with; a machine it
 holds no pairing with is refused during the handshake. The port is 4722
 unless `port` in `config.toml` says otherwise; a dial leaves from a
-random local port. hops uses IPv4 only: it
-listens on every IPv4 interface, and a machine cannot be reached over
-IPv6.
+random local port. hops listens on every IPv4 interface and on no IPv6
+one, so it cannot be reached over IPv6. A name can resolve to IPv6
+addresses as well: a controlled machine dialling out, and the check for
+an old hops below, send to every address the name gives, IPv6 ones
+included, but only an IPv4 address can answer.
 
 Input, the clipboard, the pairing number and the notice that a machine
 was removed all travel over these connections; hops opens no other. An
@@ -54,15 +56,15 @@ which way control goes:
   the other as the controlling machine.
 
 When a dial to 4722 gets no answer, hops sends the start of a handshake to
-UDP 4242 on the same addresses, the port hops used before 0.13, and
-finishes no handshake there. If an older hops answers, the app says which
+UDP 4242 on the same addresses, the old port that hops 0.12 listens on,
+and finishes no handshake there. If an older hops answers, the app says which
 machine to update.
 
 ## Discovery
 
-Unless it is turned off, hops announces itself by multicast DNS (UDP 5353)
-as `_hops._udp.local.` and listens for other machines doing the same, so
-they appear in add device. The announcement carries:
+Unless it is turned off, hops announces itself by multicast DNS (UDP 5353,
+on every interface, over IPv4 and IPv6) as `_hops._udp.local.` and listens
+for other machines doing the same, so they appear in add device. The announcement carries:
 
 - this machine's hostname;
 - its IPv4 addresses, other than loopback, and the port hops listens on;
@@ -78,10 +80,10 @@ starts, so restart it after changing them.
 
 - `discovery = false`: no announcement and no listening for others. Add
   devices by address or hostname instead.
-- `listen = false`: hops binds no port, announces nothing and looks for
-  no other machine. It is
-  controlled only over the connections it opens to the machines paired
-  to control it.
+- `listen = false`: hops listens on no port, announces nothing and looks
+  for no other machine; each dial it makes still leaves from a random
+  local port. It is controlled only over the connections it opens to the
+  machines paired to control it.
 
 ## The local channel
 

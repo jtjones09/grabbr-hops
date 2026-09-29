@@ -56,22 +56,63 @@ fn documents() -> Vec<(String, String)> {
         .collect()
 }
 
-/// The numbers `text` gives as a port: after `UDP `, `port `, `port = `,
-/// `LocalPort ` or a `host:`.
-fn ports_in(text: &str) -> Vec<u32> {
+/// Every number in `text` that could be a port: four or five digits
+/// standing alone. Left out, because they cannot be one: a number that
+/// begins with `0` (a file mode such as `0600`), a year from 2000 to 2099,
+/// and a number joined to a word, a `-` or a `.` and digit (an advisory id
+/// such as `RUSTSEC-2026-0285`, a date, a version). A port written in one
+/// of those shapes is not read.
+fn numbers_in(text: &str) -> Vec<u32> {
+    let bytes = text.as_bytes();
+    let joined = |b: u8| b.is_ascii_alphanumeric() || b == b'-' || b == b'_';
     let mut found = Vec::new();
-    for lead in ["UDP ", "port ", "port = ", "LocalPort ", ":"] {
-        let mut rest = text;
-        while let Some(at) = rest.find(lead) {
-            rest = &rest[at + lead.len()..];
-            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-            let next = rest[digits.len()..].chars().next();
-            if (4..=5).contains(&digits.len()) && !next.is_some_and(|c| c.is_ascii_alphanumeric()) {
-                found.push(digits.parse().expect("digits"));
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let end = bytes[i..]
+            .iter()
+            .position(|b| !b.is_ascii_digit())
+            .map_or(bytes.len(), |n| i + n);
+        let before = i.checked_sub(1).map(|j| bytes[j]);
+        let after = bytes.get(end).copied();
+        let after_next = bytes.get(end + 1).copied();
+        let standalone = !before.is_some_and(|b| joined(b) || b == b'.')
+            && !after.is_some_and(joined)
+            && !(after == Some(b'.') && after_next.is_some_and(|b| b.is_ascii_digit()));
+        let digits = &text[i..end];
+        if standalone && (4..=5).contains(&digits.len()) && !digits.starts_with('0') {
+            let n: u32 = digits.parse().expect("digits");
+            if !(2000..=2099).contains(&n) {
+                found.push(n);
             }
         }
+        i = end;
     }
     found
+}
+
+/// Whether `block` says the port it gives is the one before 0.13: it names
+/// version 0.12, says "before 0.13" or "before v0.13", or says "old port".
+/// Each must stand as its own words, so `0.120` or "threshold port" does not
+/// count, and a paragraph about 0.13 alone does not either.
+fn says_old_port(block: &str) -> bool {
+    let lower = block.to_lowercase();
+    let whole = |needle: &str| {
+        lower.match_indices(needle).any(|(at, _)| {
+            let before = lower[..at].chars().next_back();
+            let after = lower[at + needle.len()..].chars().next();
+            !before.is_some_and(|c| c.is_alphanumeric() || c == '.')
+                && !after.is_some_and(|c| c.is_alphanumeric())
+        })
+    };
+    whole("0.12")
+        || whole("v0.12")
+        || whole("before 0.13")
+        || whole("before v0.13")
+        || whole("old port")
 }
 
 #[test]
@@ -81,9 +122,9 @@ fn every_port_the_docs_give_is_one_hops_uses() {
         // The old port may appear only in a paragraph that says it is old.
         let mut start = 0;
         for block in text.split("\n\n") {
-            let old_port_said_old = ["0.12", "0.13", "older"].iter().any(|w| block.contains(w));
+            let old_port_said_old = says_old_port(block);
             for (n, line) in block.lines().enumerate() {
-                for port in ports_in(line) {
+                for port in numbers_in(line) {
                     let known = port == u32::from(DEFAULT_PORT)
                         || port == u32::from(MDNS_PORT)
                         || (port == u32::from(PORT_BEFORE_V013) && old_port_said_old);
@@ -97,9 +138,11 @@ fn every_port_the_docs_give_is_one_hops_uses() {
     }
     assert!(
         wrong.is_empty(),
-        "a document gives a port hops does not use, or gives {PORT_BEFORE_V013} without \
-         saying it is the port before 0.13. hops listens on {DEFAULT_PORT} \
-         (hops_ipc::DEFAULT_PORT):\n    {}",
+        "a document gives a port hops does not use, or gives {PORT_BEFORE_V013} in a \
+         paragraph that does not say it is the port before 0.13 (\"0.12\", \"before 0.13\" \
+         or \"old port\"). hops listens on {DEFAULT_PORT} (hops_ipc::DEFAULT_PORT). A \
+         four- or five-digit number that is not a port can be written as one of the \
+         shapes numbers_in leaves out:\n    {}",
         wrong.join("\n    ")
     );
 }
@@ -155,10 +198,36 @@ fn the_architecture_page_describes_quic_not_the_pre_fork_tcp_channel() {
 }
 
 #[test]
-fn ports_in_reads_each_way_a_document_writes_a_port() {
+fn numbers_in_reads_every_standalone_number_and_no_id_date_or_mode() {
     assert_eq!(
-        ports_in("UDP 4722, port = 4242, LocalPort 5353, a.local:4723, UDP:4724"),
-        vec![4722, 4242, 5353, 4723, 4724]
+        numbers_in("UDP 4722, port = 4242. LocalPort 5353, a.local:4723, is 4724; (4725 unless"),
+        vec![4722, 4242, 5353, 4723, 4724, 4725]
     );
-    assert!(ports_in("RUSTSEC-2026-0285, 0600, ~/.config, port 80").is_empty());
+    assert!(
+        numbers_in("RUSTSEC-2026-0285, 2026-09-29, 0600, v0.13.4242, in 2026, port 80, #231")
+            .is_empty()
+    );
+}
+
+#[test]
+fn only_a_paragraph_that_calls_the_port_old_may_give_it() {
+    for old in [
+        "hops 0.12 listens on 4242.",
+        "hops before v0.13 used 4242",
+        "the old port, 4242",
+        "(v0.12.0) 4242",
+    ] {
+        assert!(says_old_port(old), "{old:?} says the port is old");
+    }
+    for current in [
+        "In hops 0.13, let UDP 4242 in.",
+        "An older hops in a new folder, 4242.",
+        "hops 0.120 uses 4242",
+        "a threshold port 4242",
+    ] {
+        assert!(
+            !says_old_port(current),
+            "{current:?} does not say the port is old"
+        );
+    }
 }
