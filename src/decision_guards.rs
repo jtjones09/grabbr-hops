@@ -4604,11 +4604,12 @@ mod the_windows_daemon_is_never_installed_elevated {
     //! runner registers a Windows scheduled task, so the text is what can be
     //! checked.
     //!
-    //! One exception, named here and nowhere else: the README's section on
-    //! upgrading from hops 0.12, whose task script registered its daemon
-    //! elevated. Removing that task and stopping the daemon it started need
-    //! an administrator PowerShell, and that section may ask for one for
-    //! those commands only. No step that installs hops may.
+    //! The README may ask for an administrator PowerShell in one case: to
+    //! remove the task hops 0.12 registered elevated and stop the daemon it
+    //! started. The check is an allowlist, not a list of forbidden steps. A
+    //! section that mentions elevation in any way, and every section after it
+    //! until a paragraph sends the reader to a normal PowerShell, may hold only
+    //! code that removes or reads, and prose that names nothing that installs.
 
     const SCRIPT: &str = include_str!("../service/windows/install-hops-daemon.ps1");
     const README: &str = include_str!("../service/README.md");
@@ -4640,66 +4641,92 @@ mod the_windows_daemon_is_never_installed_elevated {
              file the user can write."
         );
 
-        let mut asks = Vec::new();
-        let (install, upgrade) = upgrade_section(README);
-        for (file, text) in [
-            ("service/windows/install-hops-daemon.ps1", SCRIPT),
-            ("service/README.md", install.as_str()),
-        ] {
-            let lower = words(text);
-            for phrase in ASKS {
-                if lower.contains(phrase) {
-                    asks.push(format!("{file}: \"{phrase}\""));
-                }
-            }
-        }
+        let script = words(SCRIPT);
+        let asks: Vec<&str> = SCRIPT_ASKS
+            .into_iter()
+            .filter(|phrase| script.contains(phrase))
+            .collect();
         assert!(
             asks.is_empty(),
-            "the Windows install instructions still ask for elevation: {asks:?}. \
-             The daemon runs as the user, so its install needs no administrator, \
-             and telling users to use one invites the elevated install that \
-             2026-09-15 took out."
+            "install-hops-daemon.ps1 asks for elevation: {asks:?}. The daemon runs \
+             as the user, so its install needs no administrator."
         );
-        let beyond = beyond_removing_0_12(&upgrade);
+
+        let (beyond, elevated_blocks) = elevated_beyond_removal(README);
         assert!(
             beyond.is_empty(),
-            "the README's section on upgrading from hops 0.12 asks for an \
-             administrator for more than removing 0.12's elevated task and stopping \
-             its daemon: {beyond:?}. Only those need one; installing this version \
-             never does."
+            "service/README.md asks for, or goes on in, an elevated PowerShell \
+             for more than removing hops 0.12's task and stopping its daemon: \
+             {beyond:?}. Where a section mentions elevation, and after it until a \
+             paragraph sends the reader to a normal PowerShell, a code block may \
+             hold only {REMOVE_OR_READ:?} and the prose may name nothing that \
+             installs. Installing this version never needs an administrator."
+        );
+        assert!(
+            elevated_blocks > 0,
+            "no code block in service/README.md was read as run elevated, so the \
+             scan for the 0.12 removal steps matches nothing and proves nothing"
         );
     }
 
-    /// The phrases that ask for an administrator PowerShell, lower-cased.
-    const ASKS: [&str; 4] = [
+    /// What asks, in the install script, for an elevated shell, lower-cased.
+    /// The script's comments say why hops is never elevated, so bare words
+    /// such as "elevated" or "administrator" are not enough there.
+    const SCRIPT_ASKS: [&str; 12] = [
         "run as administrator",
+        "runasadministrator",
+        "-verb runas",
         "elevated powershell",
+        "elevated shell",
+        "elevated prompt",
+        "elevated terminal",
         "administrator powershell",
         "powershell as administrator",
+        "admin shell",
+        "admin prompt",
+        "as admin",
     ];
 
-    /// The heading of the README's one exception: upgrading from hops 0.12,
-    /// whose task script registered its daemon elevated, so that removing the
-    /// task and stopping the daemon it started need an administrator.
-    const UPGRADE: &str = "#### Upgrading from hops 0.12 or older";
+    /// What makes a README section one that mentions elevation, lower-cased.
+    /// Deliberately wide: a section that only explains elevation matches too,
+    /// and passes as long as it holds nothing but removal steps.
+    const ELEVATION: [&str; 23] = [
+        "admin",
+        "elevat",
+        "run as",
+        "runas",
+        "uac",
+        "user account control",
+        "privilege",
+        "highest",
+        "same window",
+        "same shell",
+        "same powershell",
+        "same prompt",
+        "same terminal",
+        "same console",
+        "same session",
+        "that window",
+        "that shell",
+        "that powershell",
+        "this window",
+        "this shell",
+        "still open",
+        "keep it open",
+        "leave it open",
+    ];
 
-    /// `readme` split into everything but the upgrade section, and that
-    /// section: from [`UPGRADE`] to the next heading outside a code block.
-    fn upgrade_section(readme: &str) -> (String, String) {
-        let (mut rest, mut section) = (String::new(), String::new());
-        let (mut inside, mut fenced) = (false, false);
-        for line in readme.lines() {
-            if line.trim_start().starts_with("```") {
-                fenced = !fenced;
-            } else if !fenced && line.starts_with('#') {
-                inside = line.trim_end() == UPGRADE;
-            }
-            let into = if inside { &mut section } else { &mut rest };
-            into.push_str(line);
-            into.push('\n');
-        }
-        (rest, section)
-    }
+    /// The commands an elevated PowerShell in the README may run: they
+    /// remove 0.12's task and Run values, stop its daemon, or read state.
+    const REMOVE_OR_READ: [&str; 7] = [
+        "unregister-scheduledtask",
+        "stop-process",
+        "remove-itemproperty",
+        "get-scheduledtask",
+        "get-process",
+        "get-nettcpconnection",
+        "get-itemproperty",
+    ];
 
     /// `text` lower-cased with every run of white space one space, so a
     /// phrase wrapped across lines is still found.
@@ -4710,72 +4737,157 @@ mod the_windows_daemon_is_never_installed_elevated {
             .to_lowercase()
     }
 
-    /// What `section` asks an administrator for beyond removing hops 0.12's
-    /// task and stopping its daemon. A paragraph there asks for one when it
-    /// says "admin" at all, or any of [`ASKS`]. Each such paragraph must come
-    /// directly before a code block, must name nothing that installs, and
-    /// that block may hold only the removal commands; anything else is
-    /// returned.
-    fn beyond_removing_0_12(section: &str) -> Vec<String> {
-        const REMOVING: [&str; 3] = [
-            "unregister-scheduledtask ",
-            "$old = get-nettcpconnection ",
-            "stop-process ",
-        ];
-        let asks = |paragraph: &str| {
-            let text = words(paragraph);
-            (text.contains("admin") || ASKS.iter().any(|p| text.contains(p))).then_some(text)
-        };
-        let mut beyond = Vec::new();
-        let (mut paragraphs, mut current) = (Vec::<String>::new(), String::new());
-        let (mut fenced, mut asked) = (false, false);
-        for line in section.lines() {
-            let lower = line.trim().to_lowercase();
-            if lower.starts_with("```") {
-                fenced = !fenced;
-                if fenced {
-                    paragraphs.push(std::mem::take(&mut current));
-                    let last = paragraphs.iter().rposition(|p| !p.trim().is_empty());
-                    for (i, paragraph) in paragraphs.drain(..).enumerate() {
-                        let Some(text) = asks(&paragraph) else {
-                            continue;
-                        };
-                        if Some(i) != last {
-                            beyond.push(format!("not directly before the commands: {text}"));
-                        } else {
-                            asked = true;
-                        }
-                        beyond.extend(installing(&text).map(|w| format!("names {w}: {text}")));
-                    }
-                } else {
-                    asked = false;
-                }
-            } else if fenced {
-                if asked
-                    && !lower.is_empty()
-                    && (!REMOVING.iter().any(|cmd| lower.starts_with(cmd))
-                        || lower.contains([';', '|', '&'])
-                        || installing(&lower).next().is_some())
-                {
-                    beyond.push(line.trim().to_string());
-                }
-            } else if lower.is_empty() {
-                paragraphs.push(std::mem::take(&mut current));
-            } else {
-                current.push_str(line);
-                current.push('\n');
-            }
-        }
-        paragraphs.push(current);
-        for text in paragraphs.iter().filter_map(|p| asks(p)) {
-            beyond.push(format!("with no commands after it: {text}"));
-        }
-        beyond
+    /// A paragraph of prose, a heading among them, or a code block's lines.
+    enum Part {
+        Prose(String),
+        Code(Vec<String>),
     }
 
-    /// Each word of `text` that installs or registers hops: an install
-    /// script, a registration, or `hops.exe`. Removing words, such as
-    /// `uninstall` or `Unregister-ScheduledTask`, are not.
+    /// `doc` cut at each heading outside a code block. A section starts
+    /// with its heading as prose. A fence opens with ``` or ~~~ and closes
+    /// with the same; a fence left open runs to the end as code.
+    fn sections(doc: &str) -> Vec<Vec<Part>> {
+        let mut sections = vec![Vec::new()];
+        let (mut prose, mut code) = (String::new(), Vec::new());
+        let mut fence: Option<&str> = None;
+        for line in doc.lines() {
+            let trimmed = line.trim_start();
+            let marker = ["```", "~~~"].into_iter().find(|m| trimmed.starts_with(m));
+            let section = sections.last_mut().expect("never empty");
+            match (fence, marker) {
+                (Some(open), Some(m)) if open == m => {
+                    section.push(Part::Code(std::mem::take(&mut code)));
+                    fence = None;
+                }
+                (Some(_), _) => code.push(line.to_string()),
+                (None, Some(m)) => {
+                    section.push(Part::Prose(std::mem::take(&mut prose)));
+                    fence = Some(m);
+                }
+                (None, None) if trimmed.starts_with('#') => {
+                    section.push(Part::Prose(std::mem::take(&mut prose)));
+                    sections.push(vec![Part::Prose(line.to_string())]);
+                }
+                (None, None) if trimmed.is_empty() => {
+                    section.push(Part::Prose(std::mem::take(&mut prose)))
+                }
+                (None, None) => {
+                    prose.push_str(line);
+                    prose.push('\n');
+                }
+            }
+        }
+        let section = sections.last_mut().expect("never empty");
+        if fence.is_some() {
+            section.push(Part::Code(code));
+        }
+        section.push(Part::Prose(prose));
+        sections
+    }
+
+    /// Whether `text` mentions elevation in any of the ways [`ELEVATION`]
+    /// names.
+    fn mentions_elevation(text: &str) -> bool {
+        let text = words(text);
+        ELEVATION.iter().any(|phrase| text.contains(phrase))
+    }
+
+    /// Whether `paragraph` sends the reader to a normal PowerShell: it says
+    /// so, mentions no elevation, and holds no word that could turn it
+    /// around.
+    fn back_to_normal(paragraph: &str) -> bool {
+        const TURNS: [&str; 10] = [
+            "not", "no", "never", "don't", "nor", "instead", "rather", "except", "unless",
+            "without",
+        ];
+        let text = words(paragraph);
+        text.contains("normal powershell")
+            && !mentions_elevation(&text)
+            && !text
+                .split(|c: char| !(c.is_alphanumeric() || c == '\''))
+                .any(|w| TURNS.contains(&w))
+    }
+
+    /// Whether a line of a code block run elevated only removes or reads:
+    /// blank, a comment, or one command of [`REMOVE_OR_READ`], alone or
+    /// assigned to a variable, with nothing that could chain, nest or
+    /// continue another command.
+    fn removes_or_reads(line: &str) -> bool {
+        let line = line.trim().to_lowercase();
+        if line.is_empty() || (line.starts_with('#') && !line.starts_with("#requires")) {
+            return true;
+        }
+        if line.contains([';', '|', '&', '(', ')', '{', '}', '`', '<', '>']) {
+            return false;
+        }
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let command = match words.as_slice() {
+            [var, "=", command, ..] if var.starts_with('$') => command,
+            [command, ..] => command,
+            [] => return true,
+        };
+        REMOVE_OR_READ.contains(command)
+    }
+
+    /// Everything in `doc` asked of an elevated PowerShell beyond removing
+    /// or reading, and how many code blocks were read as run elevated.
+    ///
+    /// A section that mentions elevation anywhere, its heading and code
+    /// comments included, is elevated throughout, and so is every section
+    /// after it until a paragraph outside an elevated section sends the
+    /// reader back to a normal PowerShell. A heading alone does not: the
+    /// reader's shell is still the one they opened.
+    fn elevated_beyond_removal(doc: &str) -> (Vec<String>, usize) {
+        let (mut beyond, mut blocks, mut carried) = (Vec::new(), 0, false);
+        for parts in sections(doc) {
+            let heading = match parts.first() {
+                Some(Part::Prose(h)) => h.trim().to_string(),
+                _ => String::new(),
+            };
+            let text: String = parts
+                .iter()
+                .map(|part| match part {
+                    Part::Prose(p) => p.clone(),
+                    Part::Code(lines) => lines.join("\n"),
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let asks = mentions_elevation(&text);
+            let mut elevated = carried || asks;
+            for part in &parts {
+                match part {
+                    Part::Prose(p) => {
+                        if !asks && back_to_normal(p) {
+                            elevated = false;
+                        }
+                        if elevated {
+                            beyond.extend(
+                                installing(p)
+                                    .map(|w| format!("{heading}: names {w}: {}", words(p))),
+                            );
+                        }
+                    }
+                    Part::Code(lines) if elevated => {
+                        blocks += 1;
+                        beyond.extend(
+                            lines
+                                .iter()
+                                .filter(|line| !removes_or_reads(line))
+                                .map(|line| format!("{heading}: {}", line.trim())),
+                        );
+                    }
+                    Part::Code(_) => {}
+                }
+            }
+            carried = elevated;
+        }
+        beyond.dedup();
+        (beyond, blocks)
+    }
+
+    /// Each word of `text` that installs, registers or starts hops: an
+    /// install script, a registration, a service, or `hops.exe`. Removing
+    /// words, such as `uninstall` or `Unregister-ScheduledTask`, are not.
     fn installing(text: &str) -> impl Iterator<Item = &str> {
         text.split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '.'))
             .filter(|w| {
@@ -4783,6 +4895,43 @@ mod the_windows_daemon_is_never_installed_elevated {
                 (w.contains("install") && !w.starts_with("uninstall"))
                     || (w.contains("register") && !w.starts_with("unregister"))
                     || w.contains("hops.exe")
+                    || w.contains("new-service")
+                    || w.contains("start-process")
+                    || w.contains("schtasks")
+                    || w == "sc.exe"
+                    || w.contains("new-itemproperty")
+                    || w.contains("set-itemproperty")
             })
+    }
+
+    // LEDGER T69b | class B | 1 return value: elevated_beyond_removal on built documents
+    #[test]
+    fn the_scanner_reads_an_elevated_shell_on_across_blocks_and_headings() {
+        let removal = "Unregister-ScheduledTask -TaskName hops-daemon -Confirm:$false";
+        let doc = |after: &str| {
+            format!(
+                "## A\n\nOpen PowerShell as administrator:\n\n```powershell\n{removal}\n```\n{after}"
+            )
+        };
+        let install = "```powershell\n.\\install-hops-daemon.ps1\n```\n";
+        let (clean, blocks) = elevated_beyond_removal(&doc(""));
+        assert!(clean.is_empty() && blocks == 1, "{clean:?} {blocks}");
+        for after in [
+            format!("\n{install}"),
+            format!("\nIn the same window:\n\n{install}"),
+            format!("\n## B\n\n{install}"),
+            format!("\n## B\n\nNot from a normal PowerShell:\n\n{install}"),
+            format!("\n## B\n\nFrom a normal PowerShell, or the same window:\n\n{install}"),
+            "\n~~~\nSet-ExecutionPolicy Bypass\n~~~\n".to_string(),
+            format!("\nFrom a normal PowerShell:\n\n{install}"),
+            "\n```\nStop-Process -Id 1; hops\n```\n".to_string(),
+        ] {
+            let (beyond, _) = elevated_beyond_removal(&doc(&after));
+            assert!(!beyond.is_empty(), "passed: {after}");
+        }
+        let (beyond, _) = elevated_beyond_removal(&doc(&format!(
+            "\n## B\n\nFrom a normal PowerShell:\n\n{install}"
+        )));
+        assert!(beyond.is_empty(), "{beyond:?}");
     }
 }
