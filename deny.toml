@@ -35,4 +35,12 @@ ignore = [
     # generates code and has no runtime presence; being unmaintained is not a
     # defect in the code it emits.
     { id = "RUSTSEC-2024-0436", reason = "paste: compile-time macro only, no runtime code" },
+    # rustybuzz and ttf-parser are reached only through resvg/usvg, which Slint
+    # uses to draw SVG images: rustybuzz shapes text inside an SVG, and
+    # ttf-parser reads the fonts that text is drawn in. The hops GUI draws no
+    # SVG (its tray icon is a PNG compiled into the binary) and loads no image
+    # from a peer, a file or the network, so no outside input reaches either.
+    # Its own text is laid out by Slint without them.
+    { id = "RUSTSEC-2026-0206", reason = "rustybuzz: shapes text in SVG images only; the GUI draws no SVG and loads no image from a peer, a file or the network" },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser: reads fonts for SVG text only; the GUI draws no SVG and loads no image from a peer, a file or the network" },
 ]

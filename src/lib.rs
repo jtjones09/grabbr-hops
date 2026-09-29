@@ -69,6 +69,11 @@ mod trust_save;
 #[cfg(test)]
 mod decision_guards;
 
+/// The public documents state the ports, ALPNs and discovery service the
+/// code uses.
+#[cfg(test)]
+mod doc_guards;
+
 /// Two machines in one test process: a real listener and a real dialer on
 /// loopback, with recording emulation and scripted capture.
 #[cfg(test)]

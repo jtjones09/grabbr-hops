@@ -63,7 +63,9 @@ macro, so no secret is visible there.
 
 The secrets belong to the **`macos-signing` environment** (Settings →
 Environments → `macos-signing` → Environment secrets), and only `sign-macos`
-names that environment. Repository-level secrets with the same names are also
+names that environment. Its deployment branches and tags are limited to
+`v*` tags and `release/*` branches, so no other ref can run a job that reads
+them. Repository-level secrets with the same names are also
 readable by it, so once the environment holds them, delete the repository-level
 copies; otherwise any job in any workflow can still reference them.
 
@@ -82,8 +84,11 @@ refuses a release that lacks any of its assets or whose assets do not match
 `SHA256SUMS`.
 
 To get a signed dmg without releasing, run the workflow by hand (Actions →
-release → Run workflow) from any branch. Every job except publish runs, and the
-dmg is attached to the run as the `hops-macos-universal-dmg` artifact.
+release → Run workflow) from a `release/*` branch or a `v*` tag. Every job
+except publish runs, and the dmg is attached to the run as the
+`hops-macos-universal-dmg` artifact. The `macos-signing` environment admits
+only those refs, so a run from any other branch stops at `sign-macos`
+without reading a secret.
 
 `verify-macos-release.sh` passes only when `spctl` reports
 `source=Notarized Developer ID` for the dmg and for the app inside it, both
