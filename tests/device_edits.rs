@@ -24,7 +24,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use hops_ipc::{
     AsyncFrontendEventReader, AsyncFrontendRequestWriter, ClientConfig, ClientState, FrontendEvent,
-    FrontendRequest,
+    FrontendRequest, Geometry, Position,
 };
 use sha2::{Digest, Sha256};
 
@@ -75,26 +75,7 @@ impl Daemon {
             &config_path,
             |port| config.replace("{port}", &port.to_string()),
             &log,
-            || {
-                Command::new(env!("CARGO_BIN_EXE_hops"))
-                    .arg("--config")
-                    .arg(&config_path)
-                    .arg("--cert-path")
-                    .arg(config_dir.join("lan-mouse.pem"))
-                    .arg("daemon")
-                    .env_clear()
-                    .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-                    .env("HOME", &dir)
-                    .env("XDG_RUNTIME_DIR", &dir)
-                    .env("XDG_CONFIG_HOME", dir.join(".config"))
-                    .env("XDG_STATE_HOME", &dir)
-                    .env("HOPS_LOG_FILE", &log)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .expect("the hops binary starts")
-            },
+            || spawn(&dir, &config_path, &log),
         );
         Daemon {
             child,
@@ -103,6 +84,58 @@ impl Daemon {
             log,
         }
     }
+
+    /// Stop the daemon and start it again on the config it saved, as a
+    /// reboot or an upgrade does. Only the listen port is changed.
+    fn restart(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let saved = std::fs::read_to_string(&self.config).expect("the saved config");
+        let (child, _) = common::launch(
+            &self.config,
+            |port| {
+                let mut out = String::new();
+                let mut done = false;
+                for line in saved.lines() {
+                    if !done && line.starts_with("port = ") {
+                        out.push_str(&format!("port = {port}"));
+                        done = true;
+                    } else {
+                        out.push_str(line);
+                    }
+                    out.push('\n');
+                }
+                out
+            },
+            &self.log,
+            || spawn(&self.dir, &self.config, &self.log),
+        );
+        self.child = child;
+    }
+}
+
+/// The hops daemon on `config_path`, with every other path it could touch
+/// under `dir`.
+fn spawn(dir: &std::path::Path, config_path: &std::path::Path, log: &std::path::Path) -> Child {
+    let config_dir = config_path.parent().expect("a config directory");
+    Command::new(env!("CARGO_BIN_EXE_hops"))
+        .arg("--config")
+        .arg(config_path)
+        .arg("--cert-path")
+        .arg(config_dir.join("lan-mouse.pem"))
+        .arg("daemon")
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", dir)
+        .env("XDG_RUNTIME_DIR", dir)
+        .env("XDG_CONFIG_HOME", dir.join(".config"))
+        .env("XDG_STATE_HOME", dir)
+        .env("HOPS_LOG_FILE", log)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the hops binary starts")
 }
 
 const DUMMY: &str = "port = {port}\ncapture_backend = \"dummy\"\n\
@@ -724,6 +757,97 @@ fn naming_a_connected_device_changes_only_its_name() {
             (1, 0),
             "(links opened, links closed): naming the device touched its link; \
              log:\n{}",
+            daemon.log()
+        );
+    });
+}
+
+// LEDGER T174 | class B | 1 device list returned over IPC by the hops binary, before and after a restart and a reload; 4 config file written by the hops binary
+/// Where a device is drawn on the arrange canvas is saved, and comes back
+/// after a restart and after the file is edited (#174). It used to live in
+/// memory only: the config had no field for it, so every restart put every
+/// device back where its edge placed it. Drawing a device does not move its
+/// edge: crossing still follows `position`.
+#[test]
+fn an_arranged_layout_survives_a_restart_and_a_reload() {
+    local(async {
+        let desk = "\n[[clients]]\nhostname = \"desk.invalid\"\nposition = \"left\"\n";
+        let mut daemon = Daemon::start("g", &format!("{DUMMY}{desk}"));
+        let mut frontend = Frontend::attach().await;
+        let handle = handle_named(&frontend.devices().await, "desk.invalid");
+        // drawn to the right of this machine, while its edge is the left
+        let drawn = Geometry {
+            x: 364,
+            y: 108,
+            width: 96,
+            height: 64,
+        };
+        frontend
+            .send(FrontendRequest::UpdateGeometry(handle, Some(drawn)))
+            .await;
+        let placed = |devices: &Devices| {
+            let (c, _) = &devices[&handle_named(devices, "desk.invalid")];
+            (c.geometry, c.pos)
+        };
+        assert_eq!(
+            placed(&frontend.devices().await),
+            (Some(drawn), Position::Left),
+            "(where it is drawn, its edge) after drawing it; log:\n{}",
+            daemon.log()
+        );
+        let saved = until("the layout to be saved", Duration::from_secs(60), || {
+            std::fs::read_to_string(&daemon.config).is_ok_and(|t| t.contains("geometry"))
+        })
+        .await;
+        let file = std::fs::read_to_string(&daemon.config).unwrap_or_default();
+        assert!(
+            saved && file.contains("position = \"left\""),
+            "the layout was not saved beside the device's edge:\n{file}"
+        );
+
+        drop(frontend);
+        daemon.restart();
+        let mut frontend = Frontend::attach().await;
+        assert_eq!(
+            placed(&frontend.devices().await),
+            (Some(drawn), Position::Left),
+            "(where it is drawn, its edge) after a restart; config:\n{}\nlog:\n{}",
+            std::fs::read_to_string(&daemon.config).unwrap_or_default(),
+            daemon.log()
+        );
+
+        // The file is edited from outside, which reloads it.
+        let port = std::fs::read_to_string(&daemon.config)
+            .expect("config")
+            .lines()
+            .find_map(|l| l.strip_prefix("port = ").map(str::to_string))
+            .expect("port line");
+        let moved = Geometry {
+            x: 20,
+            y: 16,
+            width: 96,
+            height: 64,
+        };
+        std::fs::write(
+            &daemon.config,
+            format!("{DUMMY}{desk}geometry = {{ x = 20, y = 16, width = 96, height = 64 }}\n")
+                .replace("{port}", &port),
+        )
+        .expect("rewrite");
+        // Read the devices until the reload lands, not the log: a "config
+        // changed" line can be for an earlier write, and a loaded machine can
+        // deliver file events many seconds late.
+        let started = tokio::time::Instant::now();
+        let mut now = placed(&frontend.devices().await);
+        while now != (Some(moved), Position::Left) && started.elapsed() < Duration::from_secs(60) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            now = placed(&frontend.devices().await);
+        }
+        assert_eq!(
+            now,
+            (Some(moved), Position::Left),
+            "(where it is drawn, its edge) after the file was edited; config:\n{}\nlog:\n{}",
+            std::fs::read_to_string(&daemon.config).unwrap_or_default(),
             daemon.log()
         );
     });

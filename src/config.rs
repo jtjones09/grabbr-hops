@@ -16,7 +16,7 @@ use thiserror::Error;
 use toml_edit::{self, DocumentMut};
 
 use hops_cli::CliArgs;
-use hops_ipc::{DEFAULT_PORT, Position, RevokedEntry};
+use hops_ipc::{DEFAULT_PORT, Geometry, Position, RevokedEntry};
 
 use input_event::scancode::{
     self,
@@ -152,9 +152,13 @@ struct TomlClient {
     #[serde(default)]
     fingerprint: Option<String>,
     /// What the device is called, apart from where it is dialled (#13).
-    /// Last, as a config may list a device's fields in order.
     #[serde(default)]
     label: Option<String>,
+    /// Where the device is drawn on the arrange canvas (#174). Only the
+    /// picture: which edge the pointer crosses at is `position`.
+    /// Last, as a config may list a device's fields in order.
+    #[serde(default)]
+    geometry: Option<Geometry>,
 }
 
 impl ConfigToml {
@@ -386,6 +390,7 @@ pub struct ConfigClient {
     pub active: bool,
     pub enter_hook: Option<String>,
     pub fingerprint: Option<String>,
+    pub geometry: Option<Geometry>,
 }
 
 impl From<TomlClient> for ConfigClient {
@@ -405,6 +410,7 @@ impl From<TomlClient> for ConfigClient {
         let fingerprint = toml
             .fingerprint
             .filter(|fp| hops_ipc::identity::valid_fingerprint(fp));
+        let geometry = toml.geometry;
         Self {
             label,
             ips,
@@ -414,6 +420,7 @@ impl From<TomlClient> for ConfigClient {
             active,
             enter_hook,
             fingerprint,
+            geometry,
         }
     }
 }
@@ -435,6 +442,7 @@ impl From<ConfigClient> for TomlClient {
         let activate_on_startup = if client.active { Some(true) } else { None };
         let enter_hook = client.enter_hook;
         let fingerprint = client.fingerprint;
+        let geometry = client.geometry;
         Self {
             label,
             hostname,
@@ -445,6 +453,7 @@ impl From<ConfigClient> for TomlClient {
             activate_on_startup,
             enter_hook,
             fingerprint,
+            geometry,
         }
     }
 }
@@ -1053,7 +1062,8 @@ impl Config {
                 )
             })?,
             // nothing on disk to keep
-            Err(e) if e.kind() == io::ErrorKind::NotFound => toml_edit::ser::to_string_pretty(ours)
+            Err(e) if e.kind() == io::ErrorKind::NotFound => merge::render(ours)
+                .map(|doc| doc.to_string())
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
             Err(e) => return Err(e),
         };
@@ -2228,6 +2238,7 @@ position = \"right\"
             active: false,
             enter_hook: None,
             fingerprint: Some(DESK.to_string()),
+            geometry: None,
         });
         config.set_clients(clients);
         config.write_back().expect("the save");
@@ -2303,6 +2314,51 @@ position = \"right\"
             "\"from-the-file\"",
             "a save wrote a command into the file: the hook is set by editing \
              the file and nowhere else (#56)"
+        );
+    }
+
+    // LEDGER T174b | class B | 4 file on disk written by Config::write_back, read back by Config
+    #[test]
+    fn where_a_device_is_drawn_is_saved_into_its_entry_and_read_back() {
+        let (s, mut config) = scratch(
+            "geometry",
+            "[[clients]]\nhostname = \"garage-pc\" # by hand\nposition = \"left\"\n",
+        );
+        let drawn = Geometry {
+            x: 364,
+            y: -8,
+            width: 96,
+            height: 64,
+        };
+        let mut clients = config.clients();
+        clients[0].geometry = Some(drawn);
+        config.set_clients(clients);
+        config.write_back().expect("the save");
+
+        let doc = on_disk(&s);
+        assert_eq!(
+            text(entry(&doc, 0), "geometry"),
+            "{ x = 364, y = -8, width = 96, height = 64 }",
+            "the layout is not written into the device's entry, on one line:\n{doc}"
+        );
+        assert_eq!(text(entry(&doc, 0), "position"), "\"left\"", "{doc}");
+        assert!(doc.to_string().contains("# by hand"), "{doc}");
+        config.read_from_disk().expect("the read");
+        assert_eq!(
+            config.clients()[0].geometry,
+            Some(drawn),
+            "the saved layout does not read back:\n{doc}"
+        );
+
+        // cleared, it goes from the file
+        let mut clients = config.clients();
+        clients[0].geometry = None;
+        config.set_clients(clients);
+        config.write_back().expect("the second save");
+        let doc = on_disk(&s);
+        assert!(
+            entry(&doc, 0).get("geometry").is_none(),
+            "a cleared layout stayed in the file:\n{doc}"
         );
     }
 
@@ -2915,6 +2971,7 @@ aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
                         active: false,
                         enter_hook: None,
                         fingerprint: None,
+                        geometry: None,
                     });
                     c.set_clients(clients);
                 },

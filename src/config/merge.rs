@@ -61,7 +61,7 @@ pub(super) fn merge(
     let mut doc: DocumentMut = disk.parse()?;
     let theirs: ConfigToml = toml_edit::de::from_document(doc.clone())?;
     // The daemon's own rendering, which new items are taken from.
-    let fresh: DocumentMut = toml_edit::ser::to_string_pretty(ours)?.parse()?;
+    let fresh = render(ours)?;
 
     if !same_map(
         &theirs.authorized_fingerprints,
@@ -86,6 +86,28 @@ pub(super) fn merge(
         &fresh_entries,
     )?;
     Ok(doc.to_string())
+}
+
+/// `ours` as the daemon writes it. A device's `geometry` goes on one line in
+/// its entry: written as a `[clients.geometry]` table, a key a person later
+/// types below it would belong to the geometry and not to the device.
+pub(super) fn render(ours: &ConfigToml) -> Result<DocumentMut, MergeError> {
+    let mut doc: DocumentMut = toml_edit::ser::to_string_pretty(ours)?.parse()?;
+    if let Some(entries) = doc
+        .get_mut("clients")
+        .and_then(Item::as_array_of_tables_mut)
+    {
+        for entry in entries.iter_mut() {
+            if let Some(slot) = entry.get_mut("geometry") {
+                let item = std::mem::take(slot);
+                *slot = match item.into_table() {
+                    Ok(table) => Item::Value(Value::InlineTable(table.into_inline_table())),
+                    Err(item) => item,
+                };
+            }
+        }
+    }
+    Ok(doc)
 }
 
 fn entries(clients: &Option<Vec<TomlClient>>) -> Vec<ConfigClient> {
@@ -238,6 +260,7 @@ fn change_fields(entry: &mut Table, base: &ConfigClient, ours: &ConfigClient, fr
         // the file's alone (#56)
         enter_hook: _,
         fingerprint,
+        geometry,
     } = base;
     let changed = [
         ("label", *label != ours.label),
@@ -247,6 +270,7 @@ fn change_fields(entry: &mut Table, base: &ConfigClient, ours: &ConfigClient, fr
         ("position", *pos != ours.pos),
         ("activate_on_startup", *active != ours.active),
         ("fingerprint", *fingerprint != ours.fingerprint),
+        ("geometry", *geometry != ours.geometry),
     ];
     for (key, _) in changed.iter().filter(|(_, changed)| *changed) {
         match fresh.get(key) {
@@ -385,6 +409,7 @@ fn pair(left: &[ConfigClient], right: &[ConfigClient], against: Against) -> Vec<
             active,
             enter_hook,
             fingerprint,
+            geometry,
         } = a;
         [
             *label != b.label,
@@ -395,6 +420,7 @@ fn pair(left: &[ConfigClient], right: &[ConfigClient], against: Against) -> Vec<
             *active != b.active,
             *enter_hook != b.enter_hook,
             b.fingerprint.is_some() && *fingerprint != b.fingerprint,
+            *geometry != b.geometry,
         ]
         .into_iter()
         .filter(|&d| d)

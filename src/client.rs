@@ -94,7 +94,7 @@ impl ClientManager {
             port: config_client.port,
             pos: config_client.pos,
             cmd: config_client.enter_hook,
-            geometry: None,
+            geometry: config_client.geometry,
         };
         let state = ClientState {
             active: config_client.active,
@@ -331,10 +331,9 @@ impl ClientManager {
         }
     }
 
-    /// update the spatial layout rect of the client (the drag-to-arrange
-    /// canvas). Purely additive/storage — unlike `set_pos`, this does NOT
-    /// affect capture activation; coordinate-based crossing is a separate,
-    /// not-yet-built behavior change that reads this field later.
+    /// Where the device is drawn on the arrange canvas, saved with the rest
+    /// of its entry (#174). Unlike `set_pos` it does not touch capture: the
+    /// edge the pointer crosses at is still `pos`.
     pub(crate) fn set_geometry(&self, handle: ClientHandle, geometry: Option<Geometry>) {
         if let Some((c, _s)) = self.clients.borrow_mut().get_mut(handle) {
             c.geometry = geometry;
@@ -681,6 +680,7 @@ pub(crate) fn config_entry(config: &ClientConfig, state: &ClientState) -> Config
         active: state.active,
         enter_hook: config.cmd.clone(),
         fingerprint: state.peer_fingerprint.clone(),
+        geometry: config.geometry,
     }
 }
 
@@ -715,6 +715,7 @@ mod reload_permutation {
             active: false,
             enter_hook: None,
             fingerprint: None,
+            geometry: None,
         }
     }
 
@@ -949,6 +950,7 @@ mod the_switch_gates_clipboard_by_fingerprint {
             active: on,
             enter_hook: None,
             fingerprint: pin.map(str::to_string),
+            geometry: None,
         })
     }
 
@@ -1054,6 +1056,7 @@ mod one_device_dials_each_machine {
             active: true,
             enter_hook: None,
             fingerprint: pin,
+            geometry: None,
         });
         assert!(d.clients.is_on(handle), "precondition");
         handle

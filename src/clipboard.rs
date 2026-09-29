@@ -1219,6 +1219,7 @@ mod clipboard_follows_the_switch {
                 active: true,
                 enter_hook: None,
                 fingerprint: Some(peer.fingerprint.clone()),
+                geometry: None,
             })
         }
     }
