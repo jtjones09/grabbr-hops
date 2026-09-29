@@ -1,9 +1,14 @@
-//! Asking macOS for what capture needs (#169).
+//! Asking macOS for what capture and emulation need (#169).
 //!
 //! The daemon only checks its permissions, silently: it runs under launchd,
 //! where a system prompt may never show. The app asks instead, when the user
-//! turns capture on or opens the setting, never at launch: a Mac that is only
-//! ever controlled needs neither permission, and is not asked for either.
+//! turns capture on or opens the setting, never at launch.
+//!
+//! Capture needs Accessibility and Input Monitoring. Emulation, which a Mac
+//! that is only ever controlled runs and nothing else, needs Accessibility,
+//! which also grants posting input; it never needs Input Monitoring. There is
+//! no prompt to raise for Accessibility, so for emulation the app opens its
+//! list when the user asks from the banner that names it.
 //!
 //! The app and the daemon are one signed binary with one identifier, so a
 //! grant made through the app's prompt is the daemon's too; the daemon's
@@ -13,7 +18,7 @@
 //! Only macOS acts on it; elsewhere no capture fails for a permission.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
-use hops_frontend_core::{CaptureFault, CaptureState, Permission};
+use hops_frontend_core::{CaptureFault, CaptureState, EmulationFault, EmulationState, Permission};
 
 /// What the app does for a capture that failed for want of permissions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +41,20 @@ pub(crate) fn for_capture(capture: &CaptureState) -> Option<Ask> {
     let pane = missing.iter().copied().min()?;
     Some(Ask {
         input_monitoring: missing.contains(&Permission::InputMonitoring),
+        pane,
+    })
+}
+
+/// What to ask for while emulation is in `emulation`; `None` when no
+/// permission is missing. Never Input Monitoring, which emulation does not
+/// read.
+pub(crate) fn for_emulation(emulation: &EmulationState) -> Option<Ask> {
+    let EmulationState::Failed(EmulationFault::Missing(missing)) = emulation else {
+        return None;
+    };
+    let pane = missing.iter().copied().min()?;
+    Some(Ask {
+        input_monitoring: false,
         pane,
     })
 }

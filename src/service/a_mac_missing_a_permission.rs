@@ -20,6 +20,7 @@ use crate::test_harness::run_local;
 use hops_ipc::{AsyncFrontendListener, DaemonEndpoint};
 use input_capture::Permission;
 use input_capture::scripted::Script;
+use input_emulation::recording::Recording;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -45,6 +46,17 @@ impl Drop for Scratch {
 
 /// A daemon whose capture reads `script`.
 async fn daemon(tag: &str, script: &Script) -> (Service, Scratch) {
+    daemon_among(tag, script, Some(input_emulation::Backend::Dummy), vec![]).await
+}
+
+/// A daemon whose capture reads `script` and whose emulation is `backend`,
+/// or the first of `candidates` that starts when that is `None`.
+async fn daemon_among(
+    tag: &str,
+    script: &Script,
+    backend: Option<input_emulation::Backend>,
+    candidates: Vec<input_emulation::Backend>,
+) -> (Service, Scratch) {
     // Short, for a socket path in it (`sun_path`).
     let dir = PathBuf::from(format!("/tmp/h-cf-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -65,11 +77,12 @@ async fn daemon(tag: &str, script: &Script) -> (Service, Scratch) {
         .expect("the scratch endpoint");
     let config = crate::config::Config::in_scratch(&config, &dir.join("hops.pem"))
         .expect("the scratch config");
-    let mut service = Service::with_backends(
+    let mut service = Service::with_backends_among(
         config,
         frontends,
         Some(script.backend()),
-        Some(input_emulation::Backend::Dummy),
+        backend,
+        candidates,
     )
     .await
     .expect("a daemon in the scratch directory");
@@ -178,6 +191,43 @@ fn a_capture_refused_a_permission_is_failed_naming_it_not_off() {
             "macOS refused capture for want of Input Monitoring. A frontend must be \
              told capture failed and which setting to change; \"Disabled\" is what \
              the user sees when capture is merely off. It was told: {seen:?}"
+        );
+    });
+}
+
+/// No emulation backend is configured, so the daemon tries its own in order,
+/// as a Mac does: one refused Accessibility, then `dummy`. The fall to
+/// `dummy` is refused, and the frontend is told emulation failed, naming
+/// Accessibility, rather than that it runs.
+// LEDGER G2-6 | class B | 2 bytes over the real IPC socket: Service::run with EmulationTask::do_emulation
+#[test]
+fn a_fall_to_dummy_with_no_backend_configured_is_failed_naming_the_permission() {
+    run_local(async {
+        let refused = Recording::new();
+        refused.refuse_permission();
+        let candidates = vec![refused.backend(), input_emulation::Backend::Dummy];
+        let (mut service, scratch) = daemon_among("fall", &Script::new(), None, candidates).await;
+        let mut seen = Vec::new();
+        let told = async {
+            let mut frontend = Frontend::connect(&scratch).await;
+            frontend
+                .until("EmulationStatus", &mut seen, |s| {
+                    failed(s) || s == &json!("Enabled")
+                })
+                .await
+        };
+        let told = tokio::select! {
+            ended = service.run() => panic!("the daemon ended: {ended:?}"),
+            told = told => told,
+            _ = tokio::time::sleep(DEADLINE) => None,
+        };
+        shut_down(service).await;
+        assert_eq!(
+            told,
+            Some(json!({ "Failed": { "Missing": ["Accessibility"] } })),
+            "with no backend configured, emulation fell to dummy past a backend \
+             refused Accessibility. It must be refused, naming the permission. \
+             It was told: {seen:?}"
         );
     });
 }

@@ -17,8 +17,8 @@ use crate::{
 use futures::StreamExt;
 use hops_ipc::{
     AsyncFrontendListener, AttemptOrigin, CaptureState, ClientHandle, DaemonEndpoint,
-    DiscoveredDevice, FrontendEvent, FrontendRequest, IpcError, IpcListenerCreationError, Position,
-    Status,
+    DiscoveredDevice, EmulationState, FrontendEvent, FrontendRequest, IpcError,
+    IpcListenerCreationError, Position,
 };
 use local_channel::mpsc::{Receiver, channel};
 use log;
@@ -228,8 +228,8 @@ pub struct Service {
     pending_frontend_events: VecDeque<FrontendEvent>,
     /// status of input capture (enabled / disabled)
     capture_status: CaptureState,
-    /// status of input emulation (enabled / disabled)
-    emulation_status: Status,
+    /// Whether input emulation runs, and why not when it should.
+    emulation_status: EmulationState,
     /// Watches for a macOS permission granted while capture or emulation
     /// cannot start (#221).
     permission_watch: PermissionWatch,
@@ -677,6 +677,25 @@ impl Service {
         capture_backend: Option<input_capture::Backend>,
         emulation_backend: Option<input_emulation::Backend>,
     ) -> Result<Self, ServiceError> {
+        Self::with_backends_among(
+            config,
+            frontend_listener,
+            capture_backend,
+            emulation_backend,
+            input_emulation::InputEmulation::auto_order(),
+        )
+        .await
+    }
+
+    /// [`Self::with_backends`], trying `emulation_candidates` in order when
+    /// no emulation backend is chosen.
+    async fn with_backends_among(
+        config: Config,
+        frontend_listener: AsyncFrontendListener,
+        capture_backend: Option<input_capture::Backend>,
+        emulation_backend: Option<input_emulation::Backend>,
+        emulation_candidates: Vec<input_emulation::Backend>,
+    ) -> Result<Self, ServiceError> {
         let client_manager = ClientManager::default();
         for client in config.clients() {
             client_manager.add_with_config(client);
@@ -817,7 +836,12 @@ impl Service {
 
         // input capture + emulation
         let capture = Capture::new(capture_backend, conn, config.release_bind());
-        let emulation = Emulation::new(emulation_backend, listener, trust.clone());
+        let emulation = Emulation::among(
+            emulation_backend,
+            emulation_candidates,
+            listener,
+            trust.clone(),
+        );
 
         // create dns resolver
         let resolver = DnsResolver::new()?;
@@ -1382,13 +1406,26 @@ impl Service {
             },
             EmulationEvent::EmulationDisabled => {
                 self.permission_watch.stopped(Side::Emulation);
-                self.emulation_status = Status::Disabled;
-                self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
+                self.emulation_status = EmulationState::Disabled;
+                self.notify_frontend(FrontendEvent::EmulationStatus(
+                    self.emulation_status.clone(),
+                ));
             }
             EmulationEvent::EmulationEnabled => {
                 self.permission_watch.started(Side::Emulation);
-                self.emulation_status = Status::Enabled;
-                self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
+                self.emulation_status = EmulationState::Enabled;
+                self.notify_frontend(FrontendEvent::EmulationStatus(
+                    self.emulation_status.clone(),
+                ));
+            }
+            // A backend that was never created never said it stopped, so the
+            // permission watch hears of it here, as it does for capture.
+            EmulationEvent::EmulationFailed(fault) => {
+                self.permission_watch.stopped(Side::Emulation);
+                self.emulation_status = EmulationState::Failed(fault);
+                self.notify_frontend(FrontendEvent::EmulationStatus(
+                    self.emulation_status.clone(),
+                ));
             }
             EmulationEvent::ReleaseNotify => self.capture.release(),
             EmulationEvent::EdgePushed { addr, side } => {
@@ -1613,8 +1650,13 @@ impl Service {
         // the silence #141 set out to remove; the render was fixed and the
         // publish was not.
         self.publish_discovered();
-        self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
+        self.notify_frontend(FrontendEvent::EmulationStatus(
+            self.emulation_status.clone(),
+        ));
         self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status.clone()));
+        // Before the port: a machine that only dials out binds none, and its
+        // configured port is not one anything can reach (#15).
+        self.notify_frontend(FrontendEvent::Listening(self.listening));
         self.notify_frontend(FrontendEvent::PortChanged(self.port, None));
         // A frontend that attaches while a trust change is still unsaved is
         // told, or the only notice went to no one.
@@ -2116,6 +2158,33 @@ impl Service {
         true
     }
 
+    /// What this machine holds for `fp`, for a line about refusing it, when
+    /// it holds a pairing in force with it. One whose pairing lapsed knocks
+    /// as a stranger and pairs again through add device, so it is told as
+    /// one.
+    fn paired_here(&self, fp: &str) -> Option<crate::prompt_gate::PairedHere> {
+        let (name, controlled_from_here) = {
+            let trust = self.trust.read().expect("lock");
+            if !trust.has_live_lease(fp) {
+                return None;
+            }
+            (trust.label(fp).unwrap_or_default(), trust.we_may_drive(fp))
+        };
+        let devices = self.client_manager.every_pinned_to(fp);
+        let switched_off =
+            !devices.is_empty() && devices.iter().all(|&h| !self.client_manager.is_on(h));
+        let name = match devices.first() {
+            Some(&h) if name.trim().is_empty() => self.device_name(h),
+            _ if name.trim().is_empty() => format!("the machine {}", fp.get(..8).unwrap_or(fp)),
+            _ => name,
+        };
+        Some(crate::prompt_gate::PairedHere {
+            name,
+            controlled_from_here,
+            switched_off,
+        })
+    }
+
     /// The ONLY path from an approval prompt to the allowlist.
     ///
     /// A machine removed here knocks as a stranger, and like any stranger it
@@ -2167,7 +2236,10 @@ impl Service {
                     // Nobody here asked for this, and a stranger can cause it at
                     // will: a summarised line in the activity log, never the
                     // error banner (#150, #171).
-                    if let Some(refused) = self.prompt_gate.note_refusal(&fingerprint, addr, now) {
+                    if let Some(mut refused) =
+                        self.prompt_gate.note_refusal(&fingerprint, addr, now)
+                    {
+                        refused.paired = self.paired_here(&fingerprint);
                         log::info!("{}", refused.log_line());
                         self.notify_frontend(FrontendEvent::Activity(refused.notice()));
                     }
@@ -2909,20 +2981,33 @@ impl Service {
 
     /// Tell every frontend what the trust store now grants: who may drive
     /// this machine (derived from live leases only, or a frontend would claim
-    /// a machine can drive you when its lease has lapsed), and each pairing's
-    /// clipboard.
+    /// a machine can drive you when its lease has lapsed), and every pairing,
+    /// whichever way control goes, with its name and clipboard. A pairing
+    /// this machine only controls is in the second and not the first, and a
+    /// frontend lists it from there: it was listed nowhere, so it could not
+    /// be removed.
     fn publish_trust(&mut self) {
-        let (keys, pairings, unconfirmed) = {
+        let (keys, peers, unconfirmed) = {
             let trust = self.trust.read().expect("lock");
-            (trust.config_cache(), trust.pairings(), trust.unconfirmed())
+            let peers: Vec<(String, crate::trust::Caps, String)> = trust
+                .pairings()
+                .into_iter()
+                .map(|(fp, caps)| {
+                    let label = trust.label(&fp).unwrap_or_default();
+                    (fp, caps, label)
+                })
+                .collect();
+            (trust.config_cache(), peers, trust.unconfirmed())
         };
-        let mut peers: HashMap<String, hops_ipc::PeerTrust> = pairings
+        let mut peers: HashMap<String, hops_ipc::PeerTrust> = peers
             .into_iter()
-            .map(|(fp, caps)| {
+            .map(|(fp, caps, label)| {
                 let t = hops_ipc::PeerTrust {
                     clipboard_from: caps.contains(crate::trust::Caps::CLIPBOARD_FROM),
                     clipboard_to: caps.contains(crate::trust::Caps::CLIPBOARD_TO),
                     pending: false,
+                    label,
+                    we_may_drive: caps.contains(crate::trust::Caps::I_MAY_DRIVE),
                 };
                 (fp, t)
             })
@@ -4156,6 +4241,12 @@ mod adding_a_device;
 #[cfg(all(test, unix))]
 mod dialled_by_the_controlled_machine;
 
+#[cfg(all(test, unix, any(feature = "tui", feature = "slint")))]
+mod every_pairing_is_listed;
+
+#[cfg(all(test, unix, any(feature = "tui", feature = "slint")))]
+mod what_a_controlled_machine_shows;
+
 /// The whole daemon in this process, for a test that drives it the way a
 /// frontend and a peer do.
 #[cfg(all(test, unix))]
@@ -4440,5 +4531,71 @@ mod a_wrong_pairing_answer_is_not_a_refused_grant {
                 })
                 .await;
         });
+    }
+}
+
+#[cfg(test)]
+mod a_pin_outlives_its_lease {
+    //! `drop_untrusted_pins` runs at start and on every config reload. It may
+    //! drop only a pin the trust store has no record of: a device whose lease
+    //! lapsed, or whose pairing still waits for its number, keeps its pin.
+
+    use super::drop_untrusted_pins;
+    use crate::client::ClientManager;
+    use crate::trust::{Caps, Term, TrustStore};
+
+    const T0: u64 = 4_000_000_000;
+    const HOUR: u64 = 3_600;
+
+    fn fp(tag: u8) -> String {
+        (0u8..32)
+            .map(|i| format!("{:02x}", tag.wrapping_add(i)))
+            .collect::<Vec<_>>()
+            .join(":")
+    }
+
+    fn pinned_to(m: &ClientManager, fingerprint: &str) -> hops_ipc::ClientHandle {
+        let h = m.add_client();
+        m.set_peer_fingerprint(h, Some(fingerprint.to_string()));
+        h
+    }
+
+    #[test]
+    fn only_a_pin_the_trust_store_never_heard_of_is_dropped() {
+        let mut trust = TrustStore::new(&fp(0x01), T0).expect("ours");
+        let (lapsed, pending, stranger) = (fp(0x40), fp(0x60), fp(0x80));
+        trust
+            .issue_with_term(&lapsed, "lapsed", Caps::OUTBOUND, Term::Secs(HOUR))
+            .expect("issue");
+        trust.sweep(T0 + 2 * HOUR);
+        trust
+            .issue(&pending, "pending", Caps::OUTBOUND)
+            .expect("issue");
+        assert!(
+            !trust.has_live_lease(&lapsed) && !trust.has_live_lease(&pending),
+            "precondition: neither holds a lease in force"
+        );
+
+        let m = ClientManager::default();
+        let (a, b, c) = (
+            pinned_to(&m, &lapsed),
+            pinned_to(&m, &pending),
+            pinned_to(&m, &stranger),
+        );
+
+        let dropped = drop_untrusted_pins(&m, &trust);
+
+        assert_eq!(
+            dropped,
+            vec![c],
+            "only the pin nothing records may go, and it must: dropped {dropped:?}"
+        );
+        assert_eq!(m.peer_fingerprint(a), Some(lapsed));
+        assert_eq!(m.peer_fingerprint(b), Some(pending));
+        assert_eq!(
+            m.peer_fingerprint(c),
+            None,
+            "a pin nothing vouches for is dropped"
+        );
     }
 }

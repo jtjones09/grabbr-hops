@@ -154,6 +154,9 @@ pub(crate) enum EmulationEvent {
     EmulationDisabled,
     /// emulation was enabled
     EmulationEnabled,
+    /// Emulation could not start, or stopped with an error: why, and the
+    /// permission to grant when that is why.
+    EmulationFailed(hops_ipc::EmulationFault),
     /// capture should be released
     ReleaseNotify,
     /// the remote-controlled cursor was deliberately pushed past a screen
@@ -199,12 +202,26 @@ enum EmulationRequest {
 }
 
 impl Emulation {
+    /// [`Self::among`] the backends a machine tries on its own.
+    #[cfg(test)]
     pub(crate) fn new(
         backend: Option<input_emulation::Backend>,
         listener: LanMouseListener,
         trust: crate::transport::Trust,
     ) -> Self {
-        let emulation_proxy = EmulationProxy::new(backend, listener.pressure(), trust.clone());
+        Self::among(backend, InputEmulation::auto_order(), listener, trust)
+    }
+
+    /// Emulation through `backend`, or through the first of `candidates`
+    /// that starts when none is configured.
+    pub(crate) fn among(
+        backend: Option<input_emulation::Backend>,
+        candidates: Vec<input_emulation::Backend>,
+        listener: LanMouseListener,
+        trust: crate::transport::Trust,
+    ) -> Self {
+        let emulation_proxy =
+            EmulationProxy::among(backend, candidates, listener.pressure(), trust.clone());
         let driven = emulation_proxy.driven.clone();
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
@@ -652,8 +669,19 @@ impl QueueMetrics {
 }
 
 impl EmulationProxy {
+    /// [`Self::among`] the backends a machine tries on its own.
+    #[cfg(test)]
     fn new(
         backend: Option<input_emulation::Backend>,
+        pressure: Rc<crate::listen::InputPressure>,
+        trust: crate::transport::Trust,
+    ) -> Self {
+        Self::among(backend, InputEmulation::auto_order(), pressure, trust)
+    }
+
+    fn among(
+        backend: Option<input_emulation::Backend>,
+        candidates: Vec<input_emulation::Backend>,
         pressure: Rc<crate::listen::InputPressure>,
         trust: crate::transport::Trust,
     ) -> Self {
@@ -666,6 +694,7 @@ impl EmulationProxy {
         let emulation_task = EmulationTask {
             driven: driven.clone(),
             backend,
+            candidates,
             exit_requested: exit_requested.clone(),
             request_rx,
             event_tx,
@@ -746,7 +775,10 @@ impl EmulationProxy {
 struct EmulationTask {
     /// Told what peers hold down here, and when a teardown lets go of it.
     driven: Rc<Driven>,
+    /// The backend configured, if any.
     backend: Option<input_emulation::Backend>,
+    /// Tried in order when none is configured.
+    candidates: Vec<input_emulation::Backend>,
     exit_requested: Rc<Cell<bool>>,
     request_rx: Receiver<ProxyRequest>,
     event_tx: Sender<EmulationEvent>,
@@ -866,11 +898,54 @@ impl PeerQueues {
     }
 }
 
+/// Why `emulation` may not run, or `None` when it may: a real backend, or
+/// `dummy` asked for (`asked`) or overridden. A real backend the system
+/// withheld a permission from on the way down to `dummy` is named, so the
+/// person is told what to grant rather than only that input would be
+/// discarded; the override still runs `dummy` in its place.
+fn refuse_the_fall(
+    emulation: &InputEmulation,
+    asked: Option<input_emulation::Backend>,
+    overridden: bool,
+) -> Option<InputEmulationError> {
+    let dummy = input_emulation::Backend::Dummy;
+    if emulation.backend() != dummy || asked == Some(dummy) || overridden {
+        return None;
+    }
+    let withheld = emulation.withheld_permissions();
+    Some(if withheld.is_empty() {
+        InputEmulationError::NoUsableBackend
+    } else {
+        InputEmulationError::Withheld(withheld.to_vec())
+    })
+}
+
+/// What to tell the user about emulation that ended with `e`: the settings
+/// to change when a permission is missing, and the error otherwise.
+fn fault_of(e: &InputEmulationError) -> hops_ipc::EmulationFault {
+    match e.missing_permissions() {
+        Some(missing) if !missing.is_empty() => hops_ipc::EmulationFault::Missing(
+            missing
+                .iter()
+                .map(|p| match p {
+                    input_emulation::Permission::Accessibility => {
+                        hops_ipc::Permission::Accessibility
+                    }
+                })
+                .collect(),
+        ),
+        _ => hops_ipc::EmulationFault::Backend(e.to_string()),
+    }
+}
+
 impl EmulationTask {
     async fn run(mut self) {
         loop {
             if let Err(e) = self.do_emulation().await {
                 log::warn!("input emulation exited: {e}");
+                let _ = self
+                    .event_tx
+                    .send(EmulationEvent::EmulationFailed(fault_of(&e)));
             }
             if self.exit_requested.get() {
                 break;
@@ -890,8 +965,15 @@ impl EmulationTask {
 
     async fn do_emulation(&mut self) -> Result<(), InputEmulationError> {
         log::info!("creating input emulation ...");
+        let (backend, candidates) = (self.backend, self.candidates.clone());
+        let chosen = async move {
+            match backend {
+                Some(_) => InputEmulation::new(backend).await,
+                None => InputEmulation::first_that_starts(candidates).await,
+            }
+        };
         let mut emulation = tokio::select! {
-            r = InputEmulation::new(self.backend) => r?,
+            r = chosen => r?,
             // allow termination event while requesting input emulation
             _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
         };
@@ -905,18 +987,17 @@ impl EmulationTask {
         // The Linux release shipped exactly this for months (#47) — built with
         // no backend features at all, so selection had nowhere to go.
         if emulation.backend() == input_emulation::Backend::Dummy {
-            let asked_for_dummy = self.backend == Some(input_emulation::Backend::Dummy);
-            let overridden = std::env::var("HOPS_ALLOW_DUMMY").is_ok_and(|v| v != "0");
             let _ = self.event_tx.send(EmulationEvent::BackendDegraded(
                 emulation.backend().to_string(),
             ));
-            if !asked_for_dummy && !overridden {
-                log::error!(
-                    "input emulation fell back to `dummy` — all input would be silently \
-                     discarded. Refusing. Set HOPS_ALLOW_DUMMY=1 to override."
-                );
-                return Err(InputEmulationError::NoUsableBackend);
-            }
+        }
+        let overridden = std::env::var("HOPS_ALLOW_DUMMY").is_ok_and(|v| v != "0");
+        if let Some(refusal) = refuse_the_fall(&emulation, self.backend, overridden) {
+            log::error!(
+                "input emulation fell back to `dummy` — all input would be silently \
+                 discarded. Refusing. Set HOPS_ALLOW_DUMMY=1 to override."
+            );
+            return Err(refusal);
         }
 
         // used to send enabled and disabled events
@@ -3304,6 +3385,71 @@ mod a_pairing_approved_both_ways {
                 "B's key to reach A over a new connection",
             )
             .await;
+        });
+    }
+}
+
+#[cfg(test)]
+mod a_fall_to_dummy_names_what_was_withheld {
+    //! A Mac without Accessibility falls past its real backend to `dummy`,
+    //! which is refused. The refusal names the permission, so the app can
+    //! say what to grant; the override still runs `dummy`.
+    //!
+    //! The emulations here are chosen the way a Mac chooses its own, with
+    //! no backend configured: the recording stand-in refused its permission,
+    //! then `dummy`.
+
+    use super::{InputEmulationError, fault_of, refuse_the_fall};
+    use crate::test_harness::run_local;
+    use hops_ipc::{EmulationFault, Permission};
+    use input_emulation::recording::Recording;
+    use input_emulation::{Backend, InputEmulation};
+
+    async fn chosen(backends: impl IntoIterator<Item = Backend>) -> InputEmulation {
+        InputEmulation::first_that_starts(backends)
+            .await
+            .expect("dummy always starts")
+    }
+
+    // LEDGER G2-4 | class B | 1 return value: refuse_the_fall over emulations from first_that_starts, folded by fault_of
+    #[test]
+    fn the_refusal_names_the_permission_and_the_override_still_runs() {
+        run_local(async {
+            let refused = Recording::new();
+            refused.refuse_permission();
+            let fell_past_refusal = chosen([refused.backend(), Backend::Dummy]).await;
+            let gone = Recording::new().backend();
+            let fell_past_failure = chosen([gone, Backend::Dummy]).await;
+            let working = Recording::new();
+            let real = chosen([working.backend(), Backend::Dummy]).await;
+            let told = |e: &InputEmulation, asked: Option<Backend>, overridden: bool| {
+                refuse_the_fall(e, asked, overridden).map(|e| fault_of(&e))
+            };
+            assert_eq!(
+                told(&fell_past_refusal, None, false),
+                Some(EmulationFault::Missing(vec![Permission::Accessibility])),
+                "a fall past a backend refused Accessibility must name it"
+            );
+            assert!(
+                matches!(
+                    refuse_the_fall(&fell_past_failure, None, false),
+                    Some(InputEmulationError::NoUsableBackend)
+                ),
+                "a fall past backends that failed otherwise names no permission"
+            );
+            assert_eq!(
+                (
+                    told(&fell_past_refusal, Some(Backend::Dummy), false),
+                    told(&fell_past_refusal, None, true),
+                    told(&real, None, false),
+                ),
+                (None, None, None),
+                "(dummy asked for, HOPS_ALLOW_DUMMY set, a real backend): each runs"
+            );
+            for e in [fell_past_refusal, fell_past_failure, real] {
+                let mut e = e;
+                e.terminate().await;
+            }
         });
     }
 }

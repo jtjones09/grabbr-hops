@@ -42,6 +42,9 @@ struct Log {
     /// How long each injected event takes, so a test can make injection the
     /// slow step and see what happens to everything waiting behind it.
     consume_takes: Option<std::time::Duration>,
+    /// Creating a backend fails as a system withholding its permission
+    /// does.
+    refused: bool,
 }
 
 type Shared = Arc<Mutex<Log>>;
@@ -76,6 +79,7 @@ impl Recording {
             fail_when: None,
             button_scope,
             consume_takes: None,
+            refused: false,
         }));
         REGISTRY
             .lock()
@@ -100,6 +104,12 @@ impl Recording {
     /// waiting on a real device.
     pub fn consume_takes(&self, how_long: std::time::Duration) {
         self.log.lock().expect("recording log").consume_takes = Some(how_long);
+    }
+
+    /// Make creating a backend fail as it does on a Mac that has not
+    /// granted hops Accessibility.
+    pub fn refuse_permission(&self) {
+        self.log.lock().expect("recording log").refused = true;
     }
 
     /// Make `consume` return an error for every event matching `when`. The
@@ -132,6 +142,9 @@ impl RecordingEmulation {
             .as_ref()
             .and_then(|registry| registry.get(&id).cloned())
             .ok_or(RecordingEmulationCreationError::NotRegistered)?;
+        if log.lock().expect("recording log").refused {
+            return Err(RecordingEmulationCreationError::Refused);
+        }
         Ok(Self { log })
     }
 
@@ -144,6 +157,8 @@ impl RecordingEmulation {
 pub enum RecordingEmulationCreationError {
     #[error("no recording is registered under this id; was it dropped?")]
     NotRegistered,
+    #[error("the system does not grant the permission to post input")]
+    Refused,
 }
 
 #[async_trait]

@@ -20,8 +20,9 @@ use tokio::sync::{Notify, mpsc};
 
 pub use hops_ipc::{
     AttemptOrigin, Build, CaptureFault, CaptureState, ClientConfig, ClientHandle, ClientState,
-    Controller, CrossingRefusal, DiscoveredDevice, FrontendEvent, FrontendRequest, NewDevice,
-    PairingCheck, PeerTrust, Permission, Position, Status, connect_async,
+    Controller, CrossingRefusal, DiscoveredDevice, EmulationFault, EmulationState, FrontendEvent,
+    FrontendRequest, NewDevice, PairingCheck, PeerTrust, Permission, Position, Status,
+    connect_async,
 };
 
 pub mod connection;
@@ -87,8 +88,8 @@ pub struct AppModel {
     pub clients: BTreeMap<ClientHandle, (ClientConfig, ClientState)>,
     /// Local input-capture status, and why it failed when it did.
     pub capture: CaptureState,
-    /// Local input-emulation status.
-    pub emulation: Status,
+    /// Local input-emulation status, and why it failed when it did.
+    pub emulation: EmulationState,
     /// This device's public-key fingerprint.
     pub fingerprint: Option<String>,
     /// Trusted peer fingerprints -> description.
@@ -99,6 +100,10 @@ pub struct AppModel {
     pub trust: HashMap<String, PeerTrust>,
     /// The daemon's listen port.
     pub port: Option<u16>,
+    /// The daemon listens on no port: it only dials out (#15), so
+    /// [`Self::port`] is its configured port and not one anything can reach.
+    /// False from a daemon that does not say, which always listened.
+    pub dials_out_only: bool,
     /// Until when pairing prompts may appear on this machine, or `None` while
     /// the window is closed (#195).
     pub pairing_open_until: Option<Instant>,
@@ -216,7 +221,7 @@ impl Device {
     /// Excludes ONLY a bare inbound pairing request, which lives in the pairing
     /// banner instead.
     pub fn is_listable(&self) -> bool {
-        self.send.is_some() || self.receive
+        self.send.is_some() || self.receive || self.paired
     }
 }
 
@@ -249,6 +254,7 @@ impl AppModel {
             }
             FrontendEvent::CaptureStatus(s) => self.capture = s,
             FrontendEvent::EmulationStatus(s) => self.emulation = s,
+            FrontendEvent::Listening(listening) => self.dials_out_only = !listening,
             FrontendEvent::PublicKeyFingerprint(fp) => self.fingerprint = Some(fp),
             FrontendEvent::TrustUpdated(map) => {
                 self.trust = map;
@@ -589,6 +595,39 @@ impl AppModel {
         })
     }
 
+    /// Why emulation, which should run, does not, for a frontend to show
+    /// while it is so; `None` while emulation runs or is simply off.
+    ///
+    /// A Mac that is only ever controlled needs Accessibility for this and
+    /// for nothing else, and was told only that emulation was off.
+    pub fn emulation_problem(&self) -> Option<String> {
+        let EmulationState::Failed(fault) = &self.emulation else {
+            return None;
+        };
+        Some(match fault {
+            EmulationFault::Missing(missing) => {
+                let names: Vec<String> = missing.iter().map(ToString::to_string).collect();
+                let names = names.join(" and ");
+                format!(
+                    "Input emulation cannot run: macOS does not grant hops {names}, which \
+                     this Mac needs to be controlled from other machines. Turn hops on \
+                     under System Settings → Privacy & Security → {names}."
+                )
+            }
+            EmulationFault::Backend(error) => format!("Input emulation is not running: {error}"),
+        })
+    }
+
+    /// The port as a frontend shows it: the number, "dials out only" for a
+    /// daemon that listens on none, or a dash before the daemon says.
+    pub fn port_words(&self) -> String {
+        match self.port {
+            _ if self.dials_out_only => "dials out only".to_string(),
+            Some(port) => port.to_string(),
+            None => "—".to_string(),
+        }
+    }
+
     /// The model a frontend opens with: this build, and what the front door
     /// found. A service it restarted is told as a notice.
     pub fn launched(launch: Launch) -> Self {
@@ -675,7 +714,8 @@ impl AppModel {
         self.discovery_active = false;
         self.discovery_quiet = false;
         self.capture = CaptureState::Disabled;
-        self.emulation = Status::Disabled;
+        self.emulation = EmulationState::Disabled;
+        self.dials_out_only = false;
         for (_, state) in self.clients.values_mut() {
             state.active_addr = None;
             state.alive = false;
@@ -999,6 +1039,11 @@ pub struct Device {
     /// True iff the device's fingerprint is in the authorized allowlist
     /// (trusted to connect *in*).
     pub receive: bool,
+    /// This machine holds a pairing with it, whichever way control goes:
+    /// what makes the card removable by fingerprint.
+    pub paired: bool,
+    /// Its pairing lets this machine control it.
+    pub controls: bool,
 }
 
 /// The hostname to store for a machine picked off the network list.
@@ -1151,8 +1196,32 @@ impl AppModel {
                     connection: Connection::ServiceGone,
                     send: None,
                     receive: true,
+                    paired: true,
+                    controls: false,
                 },
             );
+        }
+
+        // 1b. every other pairing, whichever way control goes. The allowlist
+        // above names only the machines that may drive this one, so a pairing
+        // this machine only controls, with no device pinned to it yet, was on
+        // no card, and nothing in the app could remove it. One mid-pairing is
+        // on its number card instead.
+        for (fp, t) in &self.trust {
+            if is_self(fp) || t.pending {
+                continue;
+            }
+            let device = by_fp.entry(fp.clone()).or_insert_with(|| Device {
+                fingerprint: Some(fp.clone()),
+                label: display_label(None, Some(&t.label), fp),
+                trust: TrustState::Trusted,
+                connection: Connection::ServiceGone,
+                send: None,
+                receive: false,
+                paired: true,
+                controls: false,
+            });
+            device.controls = t.we_may_drive;
         }
 
         // 2. outgoing clients -> attach a send facet, joining by peer_fingerprint
@@ -1175,6 +1244,8 @@ impl AppModel {
                         connection: Connection::ServiceGone,
                         send: None,
                         receive: false,
+                        paired: false,
+                        controls: false,
                     });
                     // One entry per card. Of two entries for one machine, the
                     // first added names the card and takes its buttons (#12):
@@ -1212,6 +1283,8 @@ impl AppModel {
                     connection: Connection::ServiceGone,
                     send: Some(send),
                     receive: false,
+                    paired: false,
+                    controls: false,
                 }),
             }
         }
@@ -1226,6 +1299,8 @@ impl AppModel {
                     connection: Connection::ServiceGone,
                     send: None,
                     receive: false,
+                    paired: false,
+                    controls: false,
                 });
             }
         }
@@ -1305,7 +1380,12 @@ impl AppModel {
                 .is_some_and(|s| s.state.removed_by_peer),
             // The daemon says so for a device whose machine dials in to be
             // driven from here (#15).
-            dials_us: device.send.as_ref().is_some_and(|s| s.state.dials_us),
+            // With no device, a pairing this machine controls is reached
+            // only by its own dial: nothing here has an address for it.
+            dials_us: match &device.send {
+                Some(s) => s.state.dials_us,
+                None => device.controls,
+            },
         }
     }
 }
@@ -3237,6 +3317,7 @@ mod the_state_follows_the_events {
                 clipboard_from: true,
                 clipboard_to: true,
                 pending: false,
+                ..Default::default()
             },
         )])));
         m.apply(FrontendEvent::Enumerate(vec![(

@@ -15,7 +15,9 @@ use crate::capture::ICaptureEvent;
 use crate::emulation::EmulationEvent;
 use crate::permission_watch::{Permission, PermissionWatch};
 use crate::test_harness::run_local;
-use hops_ipc::{AsyncFrontendListener, CaptureState, DaemonEndpoint, FrontendEvent, Status};
+use hops_ipc::{
+    AsyncFrontendListener, CaptureState, DaemonEndpoint, EmulationState, FrontendEvent,
+};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -154,7 +156,7 @@ async fn daemon(
 async fn until_both_run(service: &mut Service) {
     let deadline = tokio::time::Instant::now() + DEADLINE;
     while service.capture_status != CaptureState::Enabled
-        || service.emulation_status != Status::Enabled
+        || service.emulation_status != EmulationState::Enabled
     {
         tokio::select! {
             event = service.capture.event() => service.handle_capture_event(event),
@@ -275,11 +277,11 @@ fn a_daemon_started_without_the_permissions_ends_once_they_are_granted() {
         };
         let ran = (
             service.capture_status.is_enabled(),
-            service.emulation_status,
+            service.emulation_status.is_enabled(),
         );
         assert_eq!(
             ran,
-            (false, Status::Disabled),
+            (false, false),
             "a backend was created, so this did not test a daemon that never started one"
         );
         assert!(
