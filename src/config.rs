@@ -601,6 +601,25 @@ fn subtract_revoked(
     (authorized, refused)
 }
 
+/// What the `[authorized_fingerprints]` table of `config` lists, keys
+/// lowercased, less anything `[revoked_fingerprints]` lists; `None` when it
+/// has no such table.
+fn listed_in(config: &ConfigToml) -> Option<HashMap<String, String>> {
+    let listed = config
+        .authorized_fingerprints
+        .as_ref()?
+        .iter()
+        .map(|(k, v)| (k.to_lowercase(), v.clone()))
+        .collect();
+    let revoked = config
+        .revoked_fingerprints
+        .iter()
+        .flatten()
+        .map(|(k, v)| (k.to_lowercase(), v.clone()))
+        .collect();
+    Some(subtract_revoked(listed, &revoked).0)
+}
+
 /// Make sure a config is at `path`, writing the default when none is, after
 /// removing what an earlier process that ended part-way through writing one
 /// left beside it.
@@ -810,11 +829,20 @@ impl Config {
     /// Read only to find devices removed from it (`crate::cache_listed`): the
     /// table grants nothing.
     pub fn listed_as_trusted(&self) -> Option<HashMap<String, String>> {
-        self.config_toml
-            .as_ref()?
-            .authorized_fingerprints
-            .as_ref()?;
-        Some(self.effective_allowlist().0)
+        listed_in(self.config_toml.as_ref()?)
+    }
+
+    /// [`Self::listed_as_trusted`], read from the file on disk now rather
+    /// than from the config last read. `None` when the file cannot be read,
+    /// is empty or does not parse: a file being written says nothing about
+    /// which devices it lists.
+    pub fn listed_on_disk(&self) -> Option<HashMap<String, String>> {
+        let text = fs::read_to_string(&self.config_path).ok()?;
+        if text.trim().is_empty() {
+            return None;
+        }
+        let document = text.parse::<DocumentMut>().ok()?;
+        listed_in(&toml_edit::de::from_document::<ConfigToml>(document).ok()?)
     }
 
     /// Drop the `[revoked_fingerprints]` table at the next write: removing a

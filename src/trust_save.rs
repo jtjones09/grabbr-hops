@@ -64,6 +64,12 @@ impl TrustSaver {
             .map(|changes| saved_notice(&changes))
     }
 
+    /// Whether anything is waiting to reach disk: the store there may still
+    /// hold what memory has changed.
+    pub(crate) fn is_pending(&self) -> bool {
+        self.unsaved.is_some()
+    }
+
     /// What a frontend attaching now must be shown, while a change waits.
     #[must_use = "the notice is how the user learns trust did not reach disk"]
     pub(crate) fn pending_notice(&self) -> Option<String> {

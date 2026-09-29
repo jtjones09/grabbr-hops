@@ -17,10 +17,24 @@
 //! it, would read as removed; and so would one whose right to drive this
 //! machine was taken away, written out, and given back before the next save.
 //! The file can only ever make the daemon forget a device, never trust one.
+//!
+//! A removal is final, so it is acted on only once the file has settled: a
+//! second read [`SETTLE`] after the one that found it must agree
+//! ([`confirmed`]). A file read while a save is still writing it, as an
+//! older build writes in place, can lack lines it is about to gain.
+//!
+//! While the trust store holds a change that has not reached disk, what is
+//! recorded only grows ([`Listed::record_keeping`]): a device forgotten in
+//! memory is still on disk, and must still read as removed at the next start.
 
 use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// How long after a read that finds a device removed the file is read again
+/// to confirm it.
+pub const SETTLE: Duration = Duration::from_secs(1);
 
 /// The file, beside `config.toml`, naming each device the cache has listed.
 pub const FILE_NAME: &str = "authorized_fingerprints.listed";
@@ -33,7 +47,7 @@ pub struct Listed {
 }
 
 /// A fingerprint as the store keys it.
-fn canonical(fp: &str) -> String {
+pub fn canonical(fp: &str) -> String {
     hops_ipc::identity::canonical_fingerprint(fp).unwrap_or_else(|| fp.trim().to_lowercase())
 }
 
@@ -81,10 +95,20 @@ impl Listed {
         gone
     }
 
-    /// Record that the cache lists `listed` and nothing else. Saves when
+    /// Record that the cache lists `listed` and nothing else, or, when
+    /// `keep` is set, keep what is recorded already as well: while the trust store on disk may still trust a device
+    /// forgotten in memory, that device must stay recorded, or at the next
+    /// start the file's lack of it no longer reads as a removal. Saves when
     /// that changes what is recorded.
-    pub fn record(&mut self, listed: impl IntoIterator<Item = String>) -> io::Result<()> {
-        let next: BTreeSet<String> = listed.into_iter().map(|fp| canonical(&fp)).collect();
+    pub fn record_keeping(
+        &mut self,
+        listed: impl IntoIterator<Item = String>,
+        keep: bool,
+    ) -> io::Result<()> {
+        let mut next: BTreeSet<String> = listed.into_iter().map(|fp| canonical(&fp)).collect();
+        if keep {
+            next.extend(self.fingerprints.iter().cloned());
+        }
         if next == self.fingerprints {
             return Ok(());
         }
@@ -97,6 +121,21 @@ impl Listed {
         self.fingerprints = next;
         Ok(())
     }
+}
+
+/// Of `removed`, found by one read of the file, those a second read, `again`,
+/// taken once the file has settled, does not list either. Nothing when the
+/// second read has no table or could not be made: two reads that do not
+/// agree remove nothing.
+pub fn confirmed(removed: Vec<String>, again: Option<&HashMap<String, String>>) -> Vec<String> {
+    let Some(again) = again else {
+        return Vec::new();
+    };
+    let listed: BTreeSet<String> = again.keys().map(|fp| canonical(fp)).collect();
+    removed
+        .into_iter()
+        .filter(|fp| !listed.contains(&canonical(fp)))
+        .collect()
 }
 
 /// What the app is told of devices forgotten because the cache no longer
@@ -136,7 +175,7 @@ mod tests {
         let granted = table(&[DESK, LAPTOP]);
         let never = listed.removed(&granted, Some(&table(&[DESK])));
         listed
-            .record([DESK.to_uppercase(), LAPTOP.to_string()])
+            .record_keeping([DESK.to_uppercase(), LAPTOP.to_string()], false)
             .expect("recorded");
         let listed = Listed::read(&dir);
         let gone = listed.removed(&granted, Some(&table(&[DESK])));
@@ -145,7 +184,9 @@ mod tests {
         // The laptop's right to drive this machine is taken away and saved,
         // then given back by a pairing, which does not save the cache.
         let mut listed = listed;
-        listed.record([DESK.to_string()]).expect("recorded");
+        listed
+            .record_keeping([DESK.to_string()], false)
+            .expect("recorded");
         let regained = Listed::read(&dir).removed(&granted, Some(&table(&[DESK])));
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
@@ -153,6 +194,49 @@ mod tests {
             (vec![], vec![LAPTOP.to_string()], vec![], vec![], vec![]),
             "(never listed, listed then deleted, no table, a line added, dropped \
              from the cache by a save and granted again since)"
+        );
+    }
+
+    // LEDGER T2270 | class B | 1 return value of confirmed
+    #[test]
+    fn a_removal_stands_only_when_a_second_read_agrees() {
+        let found = || vec![LAPTOP.to_string()];
+        let back = confirmed(found(), Some(&table(&[DESK, &LAPTOP.to_uppercase()])));
+        let unreadable = confirmed(found(), None);
+        let agreed = confirmed(found(), Some(&table(&[DESK])));
+        assert_eq!(
+            (back, unreadable, agreed),
+            (vec![], vec![], vec![LAPTOP.to_string()]),
+            "(the second read lists it again, the second read failed, the second \
+             read agrees it is gone)"
+        );
+    }
+
+    // LEDGER T2271 | class B | 4 file content on disk via Listed::read
+    #[test]
+    fn what_is_recorded_only_grows_while_asked_to_keep_it() {
+        let dir = std::env::temp_dir().join(format!("hops-listed-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let granted = table(&[DESK, LAPTOP]);
+        let mut listed = Listed::read(&dir);
+        listed
+            .record_keeping([DESK.to_string(), LAPTOP.to_string()], false)
+            .expect("recorded");
+        listed
+            .record_keeping([DESK.to_string()], true)
+            .expect("recorded");
+        let kept = Listed::read(&dir).removed(&granted, Some(&table(&[DESK])));
+        listed
+            .record_keeping([DESK.to_string()], false)
+            .expect("recorded");
+        let replaced = Listed::read(&dir).removed(&granted, Some(&table(&[DESK])));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            (kept, replaced),
+            (vec![LAPTOP.to_string()], vec![]),
+            "(the laptop, recorded while kept, reads as removed; once replaced it \
+             does not)"
         );
     }
 }

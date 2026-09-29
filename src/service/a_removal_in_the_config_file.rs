@@ -57,6 +57,16 @@ fn config_listing(trusted: &[(&str, &str)]) -> String {
     text
 }
 
+/// The config with no `[authorized_fingerprints]` table at all, as a
+/// template, an old backup or a file written by hand has none; told apart
+/// from the others by its release keys, two where they have the four the
+/// daemon uses by default.
+fn config_without_the_table() -> String {
+    "port = 0\ncapture_backend = \"dummy\"\nemulation_backend = \"dummy\"\n\
+     discovery = false\nrelease_bind = [\"KeyLeftCtrl\", \"KeyLeftAlt\"]\n"
+        .to_string()
+}
+
 /// Save `text` as the config the way an editor or an older build does: a
 /// new file renamed over the old one.
 fn save_config(dir: &Path, text: &str) {
@@ -67,12 +77,18 @@ fn save_config(dir: &Path, text: &str) {
 
 /// A daemon started on `dir`, its `n`th start, with an app's endpoint.
 async fn start(dir: &Path, n: u32) -> (Service, DaemonEndpoint) {
+    start_with(dir, n, || {}).await
+}
+
+/// [`start`], running `read` once the daemon has read its config.
+async fn start_with(dir: &Path, n: u32, read: impl FnOnce()) -> (Service, DaemonEndpoint) {
     let endpoint = DaemonEndpoint::Unix(dir.join(format!("s{n}.sock")));
     let frontends = AsyncFrontendListener::at_with_token_file(&endpoint, &dir.join("ipc-token"))
         .await
         .expect("the scratch endpoint");
     let config = crate::config::Config::in_scratch(&dir.join("config.toml"), &dir.join("hops.pem"))
         .expect("the scratch config");
+    read();
     let service = Service::with_backends(
         config,
         frontends,
@@ -167,6 +183,8 @@ fn a_device_removed_from_the_file_while_stopped_is_forgotten_at_start() {
         let (mut second, endpoint) = start(&s.0, 2).await;
         let after = known(&second.trust);
         let told = notice_while_running(&mut second, &s.0, &endpoint, || {}).await;
+        // The next app opened is not told again.
+        let again = told_on_attach(&mut second, &s.0, &endpoint).await;
         stop(second).await;
 
         // A line put back grants nothing: only a pairing does.
@@ -184,6 +202,10 @@ fn a_device_removed_from_the_file_while_stopped_is_forgotten_at_start() {
         assert!(
             told.contains("\"laptop\""),
             "the app must be told the laptop was forgotten, and why: {told:?}"
+        );
+        assert!(
+            !again.iter().any(|said| said.contains("config.toml")),
+            "the notice was repeated to the next app opened: {again:?}"
         );
     });
 }
@@ -245,13 +267,14 @@ fn a_device_removed_from_the_file_while_running_is_forgotten() {
 }
 
 /// Have an app connected to `endpoint` send `request`, and return once the
-/// daemon has handled it, while `service` runs.
+/// daemon has handled it, while `service` runs, with every error notice the
+/// app was sent until then.
 async fn app_asks(
     service: &mut Service,
     dir: &Path,
     endpoint: &DaemonEndpoint,
     request: hops_ipc::FrontendRequest,
-) {
+) -> Vec<String> {
     use tokio::io::AsyncWriteExt;
     let DaemonEndpoint::Unix(path) = endpoint else {
         unreachable!("a unix socket")
@@ -272,19 +295,115 @@ async fn app_asks(
             write.write_all(line.as_bytes()).await.expect("sent");
         }
         let mut lines = read.lines();
+        let mut errors = Vec::new();
         while let Ok(Some(line)) = lines.next_line().await {
             let event: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+            if let Some(said) = event.get("Error").and_then(|e| e.as_str()) {
+                errors.push(said.to_string());
+            }
             if event.get("Barrier") == Some(&serde_json::json!(7)) {
-                return;
+                return errors;
             }
         }
         panic!("the daemon hung up on the app");
     };
     tokio::select! {
         ended = service.run() => panic!("the daemon ended: {ended:?}"),
-        () = handled => {}
+        errors = handled => errors,
         _ = tokio::time::sleep(DEADLINE) => panic!("the daemon did not handle the request"),
     }
+}
+
+/// Connect an app to `endpoint` while `service` runs, and return every error
+/// notice in the state it is sent on attaching, which ends with this
+/// machine's fingerprint.
+async fn told_on_attach(
+    service: &mut Service,
+    dir: &Path,
+    endpoint: &DaemonEndpoint,
+) -> Vec<String> {
+    let DaemonEndpoint::Unix(path) = endpoint else {
+        unreachable!("a unix socket")
+    };
+    let token = std::fs::read_to_string(dir.join("ipc-token")).expect("the token");
+    let told = async {
+        let stream = tokio::net::UnixStream::connect(path)
+            .await
+            .expect("the daemon's socket");
+        let (read, mut write) = tokio::io::split(stream);
+        let mut read = BufReader::new(read);
+        hops_ipc::prove_to_daemon(&mut read, &mut write, token.trim())
+            .await
+            .expect("the two-way proof is made");
+        let mut lines = read.lines();
+        let mut errors = Vec::new();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+            if let Some(said) = event.get("Error").and_then(|e| e.as_str()) {
+                errors.push(said.to_string());
+            }
+            if event.get("PublicKeyFingerprint").is_some() {
+                return errors;
+            }
+        }
+        panic!("the daemon hung up on the app");
+    };
+    tokio::select! {
+        ended = service.run() => panic!("the daemon ended: {ended:?}"),
+        errors = told => errors,
+        _ = tokio::time::sleep(DEADLINE) => panic!("the app was not sent its state"),
+    }
+}
+
+/// Run `service`, once `then` has run, until `signal` is raised with `done`
+/// true of it.
+async fn run_until(
+    service: &mut Service,
+    signal: Signal,
+    then: impl FnOnce(),
+    done: impl Fn(&Service) -> bool,
+) {
+    let signals = service.config_signals.clone();
+    let notify = match signal {
+        Signal::Reloaded => &signals.reloaded,
+        Signal::Checked => &signals.checked,
+    };
+    // A signal left over from before `then` is not the one waited for.
+    let _ = futures::FutureExt::now_or_never(notify.notified());
+    then();
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    loop {
+        tokio::select! {
+            ended = service.run() => panic!("the daemon ended: {ended:?}"),
+            () = notify.notified() => {}
+            _ = tokio::time::sleep_until(deadline) => panic!("the daemon never raised {signal:?}"),
+        }
+        if done(service) {
+            return;
+        }
+    }
+}
+
+/// What [`run_until`] waits for.
+#[derive(Debug, Clone, Copy)]
+enum Signal {
+    /// A change to config.toml was read.
+    Reloaded,
+    /// The check for removals a read scheduled has run.
+    Checked,
+}
+
+/// Trust `fp` to drive this machine, as a pairing confirmed on both machines
+/// does, and save the store and the config as the daemon does after one.
+fn pair_while_running(service: &mut Service, fp: &str, label: &str) {
+    service
+        .trust
+        .write()
+        .expect("lock")
+        .issue_confirmed(fp, label, crate::trust::Caps::DRIVE_ME)
+        .expect("the grant");
+    service.persist_trust(format!("trusting {label}"));
+    service.save_config();
 }
 
 // LEDGER T2267 | class B | 5 file content on disk after a request over the real IPC socket
@@ -298,7 +417,7 @@ fn a_device_removed_in_the_app_leaves_the_file_at_once() {
         let both = [(DESK, "desk mac"), (LAPTOP, "laptop")];
         std::fs::write(s.0.join("config.toml"), config_listing(&both)).expect("a config");
         let (mut service, endpoint) = start(&s.0, 1).await;
-        app_asks(
+        let _ = app_asks(
             &mut service,
             &s.0,
             &endpoint,
@@ -311,6 +430,245 @@ fn a_device_removed_in_the_app_leaves_the_file_at_once() {
             on_disk.contains(DESK) && !on_disk.contains(LAPTOP),
             "the laptop was removed in the app and config.toml still lists it, or \
              lost the desk:\n{on_disk}"
+        );
+    });
+}
+
+// LEDGER T2272 | class B | 6 trust store state across two starts
+/// A device paired while the daemon runs is recorded as listed when the
+/// config is saved with it, so removing its line later removes it, like any
+/// other.
+#[test]
+fn a_device_paired_while_running_is_forgotten_once_removed_from_the_file() {
+    run_local(async {
+        let s = scratch("paired");
+        let desk = [(DESK, "desk mac")];
+        std::fs::write(s.0.join("config.toml"), config_listing(&desk)).expect("a config");
+        let (mut first, _) = start(&s.0, 1).await;
+        pair_while_running(&mut first, LAPTOP, "laptop");
+        let saved = std::fs::read_to_string(s.0.join("config.toml")).unwrap_or_default();
+        stop(first).await;
+        assert!(
+            saved.contains(LAPTOP),
+            "the pairing was not saved:\n{saved}"
+        );
+
+        save_config(&s.0, &config_listing(&desk));
+        let (second, _) = start(&s.0, 2).await;
+        let after = known(&second.trust);
+        stop(second).await;
+        assert_eq!(
+            after,
+            (true, false),
+            "(desk, laptop) trusted after the laptop, paired while the daemon ran, \
+             was removed from config.toml"
+        );
+    });
+}
+
+// LEDGER T2273 | class B | 6 trust store state across two starts
+/// A device paired while config.toml does not parse, so the save that would
+/// list it fails, was never listed there: the file's lack of it once it
+/// parses again is not a removal.
+#[test]
+fn a_device_paired_while_the_file_could_not_be_saved_is_kept() {
+    run_local(async {
+        let s = scratch("unsaved");
+        let desk = [(DESK, "desk mac")];
+        std::fs::write(s.0.join("config.toml"), config_listing(&desk)).expect("a config");
+        let (mut first, _) = start(&s.0, 1).await;
+        // A hand edit half done: the daemon leaves such a file as it is.
+        std::fs::write(s.0.join("config.toml"), "port = [\n").expect("a broken config");
+        pair_while_running(&mut first, LAPTOP, "laptop");
+        stop(first).await;
+
+        // The edit finished, from the copy the person had open.
+        save_config(&s.0, &config_listing(&desk));
+        let (second, _) = start(&s.0, 2).await;
+        let after = known(&second.trust);
+        stop(second).await;
+        assert_eq!(
+            after,
+            (true, true),
+            "(desk, laptop) trusted: the laptop was paired while config.toml could \
+             not be saved, so it never listed it, and its absence is not a removal"
+        );
+    });
+}
+
+// LEDGER T2274 | class B | 6 trust store state at a start and while running, through the config watcher
+/// A config.toml with no `[authorized_fingerprints]` table at all, as when it
+/// is replaced by a template, an old backup or a file written by hand, is
+/// not a removal of every device.
+#[test]
+fn a_file_with_no_table_removes_nothing() {
+    run_local(async {
+        let s = scratch("notable");
+        let both = [(DESK, "desk mac"), (LAPTOP, "laptop")];
+        std::fs::write(s.0.join("config.toml"), config_listing(&both)).expect("a config");
+        let (mut first, _) = start(&s.0, 1).await;
+        let dir = s.0.clone();
+        run_until(
+            &mut first,
+            Signal::Checked,
+            move || save_config(&dir, &config_without_the_table()),
+            |service| service.config.release_bind().len() == 2,
+        )
+        .await;
+        let running = known(&first.trust);
+        stop(first).await;
+
+        // As the file is at this start, whatever was recorded before.
+        save_config(&s.0, &config_without_the_table());
+        let (second, _) = start(&s.0, 2).await;
+        let at_start = known(&second.trust);
+        stop(second).await;
+        assert_eq!(
+            (running, at_start),
+            ((true, true), (true, true)),
+            "((desk, laptop) trusted) after the table went while running, and at the \
+             next start"
+        );
+    });
+}
+
+// LEDGER T2275 | class B | 6 trust store state, through the config watcher
+/// A save that writes the file in place can be read before it has written
+/// every line. A removal is acted on only once the file has settled.
+#[test]
+fn a_file_read_while_it_was_still_being_written_removes_nothing() {
+    run_local(async {
+        let s = scratch("partial");
+        let both = [(DESK, "desk mac"), (LAPTOP, "laptop")];
+        let path = s.0.join("config.toml");
+        std::fs::write(&path, config_listing(&both)).expect("a config");
+        let (mut service, _) = start(&s.0, 1).await;
+        // The first part of a save written in place, read by the daemon ...
+        let partial = path.clone();
+        let listed = |service: &Service| service.config.listed_as_trusted().map(|t| t.len());
+        run_until(
+            &mut service,
+            Signal::Reloaded,
+            move || std::fs::write(&partial, config_listing(&both[..1])).expect("the first part"),
+            |service| listed(service) == Some(1),
+        )
+        .await;
+        let read_partly = listed(&service);
+        // ... and the rest.
+        run_until(
+            &mut service,
+            Signal::Checked,
+            move || std::fs::write(&path, config_listing(&both)).expect("the rest"),
+            |service| listed(service) == Some(2),
+        )
+        .await;
+        let after = known(&service.trust);
+        stop(service).await;
+        assert_eq!(
+            (read_partly, after),
+            (Some(1), (true, true)),
+            "(devices the daemon read while the save was part done, (desk, laptop) \
+             trusted once it finished)"
+        );
+    });
+}
+
+// LEDGER T2276 | class B | 6 trust store state
+/// The check reads the file again, and forgets only what both reads agree
+/// was removed: one read the file lacked a line, the file on disk has it.
+#[test]
+fn a_removal_the_file_on_disk_does_not_show_is_not_made() {
+    run_local(async {
+        let s = scratch("reread");
+        let both = [(DESK, "desk mac"), (LAPTOP, "laptop")];
+        let path = s.0.join("config.toml");
+        std::fs::write(&path, config_listing(&both)).expect("a config");
+        let (mut service, _) = start(&s.0, 1).await;
+        std::fs::write(&path, config_listing(&both[..1])).expect("the laptop's line gone");
+        service.config.read_from_disk().expect("read");
+        service.handle_config_change();
+        std::fs::write(&path, config_listing(&both)).expect("and back");
+        service.check_removals();
+        let back = known(&service.trust);
+        std::fs::write(&path, config_listing(&both[..1])).expect("the laptop's line gone");
+        service.config.read_from_disk().expect("read");
+        service.handle_config_change();
+        service.check_removals();
+        let gone = known(&service.trust);
+        stop(service).await;
+        assert_eq!(
+            (back, gone),
+            ((true, true), (true, false)),
+            "((desk, laptop) trusted) when the file on disk lists the laptop again, \
+             and when it agrees it is gone"
+        );
+    });
+}
+
+// LEDGER T2277 | class B | 6 trust store state across three starts
+/// A device forgotten at a start whose trust store could not be saved is
+/// still on disk: it must read as removed again at the next start, however
+/// often the config is saved in between.
+#[test]
+fn a_removal_whose_store_save_failed_is_made_again_at_the_next_start() {
+    run_local(async {
+        let s = scratch("nosave");
+        let both = [(DESK, "desk mac"), (LAPTOP, "laptop")];
+        std::fs::write(s.0.join("config.toml"), config_listing(&both)).expect("a config");
+        let (first, _) = start(&s.0, 1).await;
+        stop(first).await;
+
+        save_config(&s.0, &config_listing(&both[..1]));
+        // Every save of the trust store fails, as on a full disk.
+        let staging =
+            s.0.join(crate::trust_file::TRUST_FILE_NAME)
+                .with_extension("toml.tmp");
+        std::fs::create_dir_all(staging.join("in-the-way")).expect("block the store");
+        let (mut second, _) = start(&s.0, 2).await;
+        let forgotten = known(&second.trust);
+        second.save_config();
+        stop(second).await;
+
+        std::fs::remove_dir_all(&staging).expect("unblock the store");
+        let (third, _) = start(&s.0, 3).await;
+        let again = known(&third.trust);
+        stop(third).await;
+        assert_eq!(
+            (forgotten, again),
+            ((true, false), (true, false)),
+            "((desk, laptop) trusted) at the start that could not save the removal, \
+             and at the next"
+        );
+    });
+}
+
+// LEDGER T2278 | class B | 6 trust store state across two starts
+/// At a start too, a removal is made only when a second read of the file,
+/// once it has settled, agrees: the daemon read it while a save was part
+/// done, and the save has finished since.
+#[test]
+fn a_file_read_part_written_at_a_start_removes_nothing() {
+    run_local(async {
+        let s = scratch("startpart");
+        let both = [(DESK, "desk mac"), (LAPTOP, "laptop")];
+        let path = s.0.join("config.toml");
+        std::fs::write(&path, config_listing(&both)).expect("a config");
+        let (first, _) = start(&s.0, 1).await;
+        stop(first).await;
+
+        std::fs::write(&path, config_listing(&both[..1])).expect("the first part");
+        let rest = path.clone();
+        let (second, _) = start_with(&s.0, 2, move || {
+            std::fs::write(&rest, config_listing(&both)).expect("the rest");
+        })
+        .await;
+        let after = known(&second.trust);
+        stop(second).await;
+        assert_eq!(
+            after,
+            (true, true),
+            "(desk, laptop) trusted: the laptop's line was only missing from a save \
+             still being written when the daemon read it"
         );
     });
 }
