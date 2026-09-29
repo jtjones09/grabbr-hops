@@ -350,22 +350,23 @@ fn saved(answer: &Answer, marker: &str) -> Result<(), CliError> {
 /// with [`GRANT_REFUSED`], and a grant made always lists the trusted devices.
 /// The listing names only devices that may drive this machine, so a device
 /// this machine may drive is trusted without appearing in it.
+///
+/// A refusal decides first: a device already listed before the command, as
+/// one paired earlier, is listed whether or not this grant was made.
 fn granted(answer: &Answer, before: &Answer, fp: &str) -> Result<(), CliError> {
     let fp = canonical_fingerprint(fp).unwrap_or_else(|| fp.to_string());
+    if answer.said(GRANT_REFUSED) {
+        return Err(CliError::NotDone("nothing was trusted".to_string()));
+    }
     let listed = answer
         .trusted
         .as_ref()
         .or(before.trusted.as_ref())
         .is_some_and(|t| t.contains_key(&fp));
-    if !listed {
-        if answer.said(GRANT_REFUSED) {
-            return Err(CliError::NotDone("nothing was trusted".to_string()));
-        }
-        if answer.trusted.is_none() {
-            return Err(CliError::Unconfirmed(format!(
-                "the service did not say it trusted {fp}"
-            )));
-        }
+    if !listed && answer.trusted.is_none() {
+        return Err(CliError::Unconfirmed(format!(
+            "the service did not say it trusted {fp}"
+        )));
     }
     saved(answer, TRUST_NOT_SAVED)?;
     // A new pairing is approved, not trusted: it grants nothing until the
@@ -686,6 +687,21 @@ mod tests {
             granted(&refused, &Answer::default(), &fp),
             Err(CliError::NotDone(_))
         ));
+        // Refused for a device the listing before the command already
+        // named, as one that controls this machine: the refusal decides,
+        // not the listing, which says nothing about this command.
+        let listed_before = Answer {
+            trusted: Some(HashMap::from([(fp.clone(), "desk mac".to_string())])),
+            ..Default::default()
+        };
+        assert!(
+            matches!(
+                granted(&refused, &listed_before, &fp),
+                Err(CliError::NotDone(_))
+            ),
+            "a grant the service refused was reported made, because the device \
+             was already listed before the command"
+        );
     }
 
     // LEDGER T27 | class B | 1 return value: hops_cli::greeted

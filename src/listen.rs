@@ -498,9 +498,13 @@ impl LanMouseListener {
                                         // lapsed between the TLS check and here
                                         // is refused, which is why the check is
                                         // repeated rather than assumed.
-                                        let (drives, pairing) = {
+                                        let (drives, pairing, answer) = {
                                             let t = trust.read().expect("lock");
-                                            (t.may_drive_us(&fingerprint), t.is_pairing(&fingerprint))
+                                            (
+                                                t.may_drive_us(&fingerprint),
+                                                t.is_pairing(&fingerprint),
+                                                crate::pairing::Answer::here(&t, &fingerprint),
+                                            )
                                         };
                                         let mut first = None;
                                         if !drives && pairing {
@@ -515,6 +519,7 @@ impl LanMouseListener {
                                                 &ours,
                                                 &fingerprint,
                                                 addr,
+                                                answer,
                                             )
                                             .await;
                                             if first.is_none() {

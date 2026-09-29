@@ -559,6 +559,7 @@ fn one_approval_shows_one_number() {
                 number: "042917".into(),
                 handle: None,
                 attempt,
+                theirs: None,
             });
             sent(service)
         };

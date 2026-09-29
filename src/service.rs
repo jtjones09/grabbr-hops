@@ -312,6 +312,9 @@ struct Ceremony {
     addr: SocketAddr,
     /// The person here answered rightly.
     answered: bool,
+    /// The answer on this machine's card and the one the other machine sent,
+    /// when no way of control agrees with both (#220).
+    disagree: Option<(crate::pairing::Answer, crate::pairing::Answer)>,
 }
 
 impl Ceremony {
@@ -568,6 +571,29 @@ pub(crate) fn ended_notice(name: &str, why: &crate::pairing::Why, answered_addin
             format!("Pairing with {name} failed ({e}), so nothing was trusted.{stranded}")
         }
     }
+}
+
+/// What the person is told when the two cards were answered so that neither
+/// machine can control the other: `ours`, the answer here, and `theirs`, the
+/// one `name` sent.
+pub(crate) fn disagreement_notice(
+    name: &str,
+    ours: crate::pairing::Answer,
+    theirs: crate::pairing::Answer,
+) -> String {
+    let way = |this_controls: bool, that_controls: bool| match (this_controls, that_controls) {
+        (true, true) => "each controls the other".to_string(),
+        (true, false) => format!("this machine controls {name}"),
+        _ => format!("{name} controls this machine"),
+    };
+    format!(
+        "Pairing with {name} ended, so nothing was trusted: the answer here was that {}, \
+         and the answer on {name} was that {}, so neither machine could control the \
+         other. Add the device again, and choose the same machine to be in control on \
+         both.",
+        way(ours.controls(), ours.controlled()),
+        way(theirs.controlled(), theirs.controls()),
+    )
 }
 
 /// A device as a notice names it: its label, or the start of its fingerprint
@@ -2408,7 +2434,8 @@ impl Service {
                 number,
                 handle,
                 attempt,
-            } => self.show_pairing_number(fingerprint, addr, role, number, handle, attempt),
+                theirs,
+            } => self.show_pairing_number(fingerprint, addr, role, number, handle, attempt, theirs),
             PairingEvent::PeerConfirmed { fingerprint } => self.settle_pairing(fingerprint),
             PairingEvent::Ended {
                 fingerprint,
@@ -2421,6 +2448,7 @@ impl Service {
 
     /// Both machines arrived at `number`: put it in front of the person here,
     /// as the number to show or as one of three to pick from (#11).
+    #[allow(clippy::too_many_arguments)]
     fn show_pairing_number(
         &mut self,
         fp: String,
@@ -2429,6 +2457,7 @@ impl Service {
         number: String,
         handle: Option<ClientHandle>,
         attempt: u64,
+        theirs: Option<crate::pairing::Answer>,
     ) {
         use crate::pairing::Role;
         // The add dial stops once the comparison started: it has its own
@@ -2480,6 +2509,13 @@ impl Service {
                 named(&label, &fp)
             ),
         }
+        // Compared once the person here answered, on a connection whose
+        // number both machines then hold: the answer it carried is the other
+        // machine's own (#220).
+        let ours = crate::pairing::Answer::here(&self.trust.read().expect("lock"), &fp);
+        let disagree = ours
+            .zip(theirs)
+            .filter(|(ours, theirs)| !ours.agrees_with(*theirs));
         let ceremony = Ceremony {
             role,
             attempt,
@@ -2487,6 +2523,7 @@ impl Service {
             choices,
             addr,
             answered: false,
+            disagree,
         };
         let check = ceremony.check();
         self.ceremonies.insert(fp.clone(), ceremony);
@@ -2535,6 +2572,19 @@ impl Service {
                     PAIRING_NOT_FINISHED
                 ),
             }));
+            return;
+        }
+        if let Some((ours, theirs)) = c.disagree {
+            log::warn!(
+                "pairing with {fp}: the two machines' answers let neither control the other"
+            );
+            self.end_ceremony(&fp);
+            let label = self.forget_pairing(&fp).unwrap_or_default();
+            self.notify_frontend(FrontendEvent::Error(disagreement_notice(
+                &named(&label, &fp),
+                ours,
+                theirs,
+            )));
             return;
         }
         c.answered = true;
@@ -2674,6 +2724,7 @@ impl Service {
         let answered_adding = shown
             .as_ref()
             .is_some_and(|c| c.answered && c.role == crate::pairing::Role::Show);
+        let disagree = shown.as_ref().and_then(|c| c.disagree);
         if shown.is_some() {
             self.notify_frontend(FrontendEvent::PairingEnded {
                 fingerprint: fp.clone(),
@@ -2686,11 +2737,12 @@ impl Service {
         };
         let name = named(&label, &fp);
         log::info!("pairing with {name} ended: {why:?}");
-        self.notify_frontend(FrontendEvent::Error(ended_notice(
-            &name,
-            &why,
-            answered_adding,
-        )));
+        // Ended there over the answers, most likely: said as that.
+        let notice = match disagree {
+            Some((ours, theirs)) => disagreement_notice(&name, ours, theirs),
+            None => ended_notice(&name, &why, answered_adding),
+        };
+        self.notify_frontend(FrontendEvent::Error(notice));
     }
 
     /// "None of these", or a cancel: end the attempt with `fp` and keep

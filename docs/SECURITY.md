@@ -52,10 +52,6 @@ and how to recover. How to report a vulnerability is in
 - **Adding the wrong machine.** The number proves that the two screens are
   connected to each other, not that the other machine is the one meant.
   Check the name and address on the request before approving.
-- **Two machines adding each other at the same moment.** One of the two
-  comparisons that start is given up. A machine in the middle that both
-  people approved by mistake can then get two tries at a matching number
-  instead of one.
 - **Physical access.** Anyone at the keyboard can pair a machine. The keys
   are stored unencrypted; a copy of the configuration directory lets its
   holder pose as this machine to every machine that trusts it.

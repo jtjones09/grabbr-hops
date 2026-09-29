@@ -1171,22 +1171,26 @@ async fn connect_to_handle(
             Landed::Link(link) => (link, None),
             Landed::Pairing { conn, fingerprint } => {
                 let ours = transport::fingerprint_of(&identity.cert);
-                let confirmed =
-                    if client_manager.targets(handle, addr) && client_manager.is_on(handle) {
-                        crate::pairing::as_adding(
-                            &pairings,
-                            &conn,
-                            &ours,
-                            &fingerprint,
-                            addr,
-                            handle,
-                            &client_manager,
-                        )
-                        .await
-                    } else {
-                        conn.close(0u32.into(), b"stale dial");
-                        None
-                    };
+                let confirmed = if client_manager.targets(handle, addr)
+                    && client_manager.is_on(handle)
+                {
+                    let answer =
+                        crate::pairing::Answer::here(&trust.read().expect("lock"), &fingerprint);
+                    crate::pairing::as_adding(
+                        &pairings,
+                        &conn,
+                        &ours,
+                        &fingerprint,
+                        addr,
+                        handle,
+                        &client_manager,
+                        answer,
+                    )
+                    .await
+                } else {
+                    conn.close(0u32.into(), b"stale dial");
+                    None
+                };
                 let Some(confirmed) = confirmed else {
                     connecting.lock().await.remove(&handle);
                     // The receiver checks our certificate after our half of

@@ -358,6 +358,33 @@ fn a_grant_nobody_asked_for_fails_with_the_reason() {
     }
 }
 
+// LEDGER T2b | class B | 5 process: hops cli exit code, stdout and stderr; the refusal comes from the hops daemon
+/// A grant refused for a device already paired, one that controls this
+/// machine, is a refusal: the listing that names it says nothing about this
+/// command, which trusted nothing.
+#[test]
+fn a_grant_refused_for_a_paired_device_fails_with_the_reason() {
+    let d = Daemon::start(
+        "regrant",
+        &format!("[authorized_fingerprints]\n\"{PAIRED}\" = \"desk mac\"\n"),
+    );
+    let out = d.cli(&["authorize-key", "desk mac", PAIRED, "--controller", "both"]);
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        !out.status.success() && !stdout.contains("trusted"),
+        "the service refused the grant, and the command reported it made:\n{}",
+        said(&out)
+    );
+    assert!(
+        stderr.contains("not done: nothing was trusted") && stderr.contains("no pairing request"),
+        "the refusal was not reported with its reason:\n{}",
+        said(&out)
+    );
+}
+
 // LEDGER T3 | class B | 4 config file written by the hops daemon, read the moment hops cli exits 0
 #[test]
 fn each_write_verb_is_saved_by_the_time_it_returns() {
