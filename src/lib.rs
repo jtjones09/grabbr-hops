@@ -49,6 +49,7 @@ pub mod emulation_test;
 pub(crate) mod enter_hook;
 mod git_env;
 mod hop_log;
+mod keep_awake;
 mod listen;
 pub mod logging;
 pub mod match_code;

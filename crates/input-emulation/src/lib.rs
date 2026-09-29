@@ -26,6 +26,10 @@ mod libei;
 #[cfg(target_os = "macos")]
 mod macos;
 
+/// The power assertion that keeps a Mac another machine controls awake.
+#[cfg(target_os = "macos")]
+pub mod macos_keep_awake;
+
 /// fallback input emulation (logs events)
 mod dummy;
 mod error;
