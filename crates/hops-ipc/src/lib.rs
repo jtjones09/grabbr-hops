@@ -27,7 +27,7 @@
 //! peer is driving, and since it can also open add device and add a device
 //! to dial, it can pair a machine of its choosing. Such a program could
 //! equally re-sign the trust store on disk. A peer driving this machine can
-//! start such a program, which acts once the peer stops sending input.
+//! start such a program, which acts once the peer has left.
 
 use std::{
     collections::{HashMap, HashSet},

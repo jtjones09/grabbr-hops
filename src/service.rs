@@ -2086,11 +2086,21 @@ impl Service {
     /// the only usable check is one this machine makes against state only it
     /// holds — and it already knows when it is being driven.
     ///
+    /// Driven means a peer is crossed onto this machine or holds a key or
+    /// button down here, and for `QUIET` after its last input, after what it
+    /// held was let go, or after it left. Its last event alone is not enough:
+    /// a held key repeats here with nothing more sent, and a held button comes
+    /// up at the end of its session, completing a click (see
+    /// `emulation::Driven`).
+    ///
     /// Deliberately NOT applied to revocation: refusing to let you revoke while a
     /// peer is driving you would block the one action you most need in exactly
     /// the moment you need it.
     ///
-    /// The notice begins with `refused`, which says what did not happen.
+    /// The notice begins with `refused`, which says what did not happen, and
+    /// says what ends the refusal: a peer crossed in keeps it however long it
+    /// sits idle, so this machine's own mouse is refused too until the pointer
+    /// goes back.
     fn refuse_while_remotely_driven(&mut self, refused: &str, what: &str) -> bool {
         const QUIET: std::time::Duration = std::time::Duration::from_secs(2);
         if !self.emulation.remotely_driven_within(QUIET) {
@@ -2099,7 +2109,8 @@ impl Service {
         log::warn!("refusing to {what} — this machine is being driven by a peer right now");
         self.notify_frontend(FrontendEvent::Error(format!(
             "{refused}: this machine is being controlled remotely, so it refused to \
-             {what}. Use its own keyboard and mouse, then try again."
+             {what}. Move the pointer back to the machine controlling it, then try \
+             again with this machine's own keyboard and mouse."
         )));
         true
     }
