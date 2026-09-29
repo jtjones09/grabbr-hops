@@ -2174,6 +2174,14 @@ impl Service {
                 )));
             }
             DialRefusal::NotResolved { handle, hostname } => {
+                // A lookup the dial-out started before the device was
+                // renamed says nothing about the name it has now. Told, it
+                // names a name the person has already changed, and takes
+                // the one notice the new name gets.
+                if self.client_manager.get_hostname(handle).as_deref() != Some(hostname.as_str()) {
+                    log::debug!("client {handle}: {hostname} is no longer its name");
+                    return;
+                }
                 if !self.refusal_notices.due(handle, NOT_RESOLVED, now) {
                     return;
                 }

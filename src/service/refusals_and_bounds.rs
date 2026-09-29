@@ -607,3 +607,57 @@ fn a_link_that_only_looked_open_does_not_end_adding() {
         service.resolver.terminate().await;
     });
 }
+
+/// The dial-out looks a device's name up after each dial. A lookup begun
+/// before the device was renamed ends after it: that it found nothing says
+/// nothing about the new name. The person is not told about a name already
+/// changed, and the new name, if it resolves to nothing either, is told.
+// LEDGER TN-1 | class B | 6 struct state: the daemon's queue of events for the app, after update_hostname and handle_dial_refusal
+#[test]
+fn a_lookup_of_a_name_already_changed_is_not_told() {
+    use crate::connect::DialRefusal;
+    use hops_ipc::FrontendEvent;
+    run_local(async {
+        let script = Script::new();
+        let (mut service, _scratch) = daemon("renamed", "", &script).await;
+        let desk = service.client_manager.add_client();
+        service
+            .client_manager
+            .set_hostname(desk, Some("old-name.invalid".into()));
+        service.update_hostname(desk, Some("new-name.invalid".into()));
+        let _: Vec<FrontendEvent> = service.pending_frontend_events.drain(..).collect();
+
+        let not_found = |service: &mut Service| -> Vec<String> {
+            service
+                .pending_frontend_events
+                .drain(..)
+                .filter_map(|e| match e {
+                    FrontendEvent::Error(t) if t.starts_with("Could not find") => Some(t),
+                    _ => None,
+                })
+                .collect()
+        };
+        service.handle_dial_refusal(DialRefusal::NotResolved {
+            handle: desk,
+            hostname: "old-name.invalid".into(),
+        });
+        let stale = not_found(&mut service);
+        assert!(
+            stale.is_empty(),
+            "the person was told about a name the device no longer has: {stale:?}"
+        );
+        service.handle_dial_refusal(DialRefusal::NotResolved {
+            handle: desk,
+            hostname: "new-name.invalid".into(),
+        });
+        let told = not_found(&mut service);
+        assert!(
+            told.len() == 1 && told[0].contains("new-name.invalid"),
+            "the device's name resolves to nothing and the person was not told: {told:?}"
+        );
+
+        service.capture.terminate().await;
+        service.emulation.terminate().await;
+        service.resolver.terminate().await;
+    });
+}
