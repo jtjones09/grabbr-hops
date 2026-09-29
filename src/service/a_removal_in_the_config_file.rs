@@ -520,7 +520,9 @@ fn a_device_paired_while_the_file_could_not_be_saved_is_kept() {
 // LEDGER T2274 | class B | 6 trust store state at a start and while running, through the config watcher
 /// A config.toml with no `[authorized_fingerprints]` table at all, as when it
 /// is replaced by a template, an old backup or a file written by hand, is
-/// not a removal of every device.
+/// not a removal of every device. Nor does a start that reads one forget
+/// which devices the file listed, so removing the laptop's line once the
+/// table is back is still a removal.
 #[test]
 fn a_file_with_no_table_removes_nothing() {
     run_local(async {
@@ -544,11 +546,17 @@ fn a_file_with_no_table_removes_nothing() {
         let (second, _) = start(&s.0, 2).await;
         let at_start = known(&second.trust);
         stop(second).await;
+
+        // The table back, without the laptop: a real removal.
+        save_config(&s.0, &config_listing(&both[..1]));
+        let (third, _) = start(&s.0, 3).await;
+        let removed = known(&third.trust);
+        stop(third).await;
         assert_eq!(
-            (running, at_start),
-            ((true, true), (true, true)),
-            "((desk, laptop) trusted) after the table went while running, and at the \
-             next start"
+            (running, at_start, removed),
+            ((true, true), (true, true), (true, false)),
+            "((desk, laptop) trusted) after the table went while running, at the \
+             next start, and once the table was back without the laptop"
         );
     });
 }

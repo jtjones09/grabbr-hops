@@ -801,7 +801,9 @@ impl Service {
         // start would trust it again from the store on disk. So does one the
         // first read lacked and the second did not: that read was of a save
         // part done, and a removal of the device later must still read as one.
-        let keep = trust_saver.is_pending() || disagreed;
+        // A file with no table at all lists nothing and removes nothing, so
+        // it leaves the record as it was.
+        let keep = trust_saver.is_pending() || disagreed || config.listed_as_trusted().is_none();
         record_listed(&mut cache_listed, &store, &config, keep);
         let forgotten_at_start =
             (!forgotten.is_empty()).then(|| crate::cache_listed::notice(&forgotten));
