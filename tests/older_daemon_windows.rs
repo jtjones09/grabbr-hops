@@ -19,10 +19,13 @@
 #![cfg(windows)]
 
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// Held by each test while it uses 127.0.0.1:5252, which they share.
@@ -48,13 +51,35 @@ fn daemon_in(dir: &Path, config: &Path, log: &Path) -> Child {
 }
 
 /// A hops 0.12 daemon on its endpoint: its first words to any connection
-/// are its state.
-fn hops_0_12() -> TcpListener {
+/// are its state. Dropping it closes the port: the accepting thread owns
+/// the only listener, so a copy left in a thread that never ends would keep
+/// 5252 taken and make the next test's daemon see a 0.12 daemon that is gone.
+struct Hops012 {
+    stop: Arc<AtomicBool>,
+    serving: Option<JoinHandle<()>>,
+}
+
+impl Drop for Hops012 {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        // Wake the accept so the thread sees the flag and drops the listener.
+        let _ = TcpStream::connect("127.0.0.1:5252");
+        if let Some(serving) = self.serving.take() {
+            let _ = serving.join();
+        }
+    }
+}
+
+fn hops_0_12() -> Hops012 {
     let listener = TcpListener::bind("127.0.0.1:5252")
         .expect("127.0.0.1:5252 is free on the test machine, for a stand-in hops 0.12 daemon");
-    let serving = listener.try_clone().expect("the listener");
-    std::thread::spawn(move || {
-        for stream in serving.incoming() {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopping = stop.clone();
+    let serving = std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            if stopping.load(Ordering::SeqCst) {
+                break;
+            }
             let Ok(mut stream) = stream else { continue };
             std::thread::spawn(move || {
                 let _ = stream.write_all(b"{\"Enumerate\":[]}\n{\"PortChanged\":[4242,null]}\n");
@@ -63,7 +88,10 @@ fn hops_0_12() -> TcpListener {
             });
         }
     });
-    listener
+    Hops012 {
+        stop,
+        serving: Some(serving),
+    }
 }
 
 // LEDGER T2269 | class B | 5 process exit code and log line + 4 files on disk
