@@ -30,6 +30,16 @@ pub struct Daemon {
     log: PathBuf,
     config: PathBuf,
     starts: u32,
+    power: Power,
+}
+
+/// Whether a daemon may take the machine's real power assertion.
+#[derive(Clone, Copy)]
+pub enum Power {
+    /// `GRABBR_KEEP_AWAKE=off`: it holds none, whatever it pairs with.
+    Off,
+    /// `GRABBR_KEEP_AWAKE` unset: it does what a daemon in use does.
+    AsInUse,
 }
 
 impl Drop for Daemon {
@@ -41,6 +51,11 @@ impl Drop for Daemon {
 }
 
 impl Daemon {
+    /// The daemon's process id.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     pub fn log(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
@@ -57,7 +72,7 @@ impl Daemon {
         let _ = self.child.wait();
         self.starts += 1;
         self.log = self.dir.join(format!("daemon.{}.log", self.starts));
-        self.child = spawn(&self.dir, &self.config, &self.log);
+        self.child = spawn(&self.dir, &self.config, &self.log, self.power);
         if wait_until_running(&mut self.child, &self.log).is_err() {
             panic!(
                 "the daemon's port was taken while it restarted; log:\n{}",
@@ -76,9 +91,15 @@ impl Daemon {
     }
 }
 
-fn spawn(dir: &std::path::Path, config: &std::path::Path, log: &std::path::Path) -> Child {
+fn spawn(
+    dir: &std::path::Path,
+    config: &std::path::Path,
+    log: &std::path::Path,
+    power: Power,
+) -> Child {
     let config_dir = config.parent().expect("the config's directory");
-    Command::new(env!("CARGO_BIN_EXE_hops"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hops"));
+    command
         .arg("--config")
         .arg(config)
         .arg("--cert-path")
@@ -86,8 +107,6 @@ fn spawn(dir: &std::path::Path, config: &std::path::Path, log: &std::path::Path)
         .arg("daemon")
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        // A test daemon holds no real power assertion.
-        .env("GRABBR_KEEP_AWAKE", "off")
         .env("HOME", dir)
         .env("XDG_RUNTIME_DIR", dir)
         .env("XDG_CONFIG_HOME", dir.join(".config"))
@@ -95,9 +114,13 @@ fn spawn(dir: &std::path::Path, config: &std::path::Path, log: &std::path::Path)
         .env("HOPS_LOG_FILE", log)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("the hops binary starts")
+        .stderr(Stdio::null());
+    if let Power::Off = power {
+        // A test daemon holds no real power assertion unless its test is
+        // about that assertion.
+        command.env("GRABBR_KEEP_AWAKE", "off");
+    }
+    command.spawn().expect("the hops binary starts")
 }
 
 /// Start the built daemon in a scratch directory named for `tag`, with
@@ -114,6 +137,17 @@ pub fn start(tag: &str, tables: &str) -> (Daemon, u16) {
 
 /// [`start`] on the ports `port` gives, one per start (see [`launch_on`]).
 pub fn start_on(port: impl FnMut() -> u16, tag: &str, tables: &str) -> (Daemon, u16) {
+    start_with(port, tag, tables, Power::Off)
+}
+
+/// [`start`], with `power` saying whether the daemon may take the
+/// machine's real power assertion.
+pub fn start_with(
+    port: impl FnMut() -> u16,
+    tag: &str,
+    tables: &str,
+    power: Power,
+) -> (Daemon, u16) {
     // Short, for `sun_path` (about 104 bytes on macOS).
     let dir = PathBuf::from(format!("/tmp/{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -138,7 +172,7 @@ pub fn start_on(port: impl FnMut() -> u16, tag: &str, tables: &str) -> (Daemon, 
             )
         },
         &log,
-        || spawn(&dir, &config, &log),
+        || spawn(&dir, &config, &log, power),
     );
     let daemon = Daemon {
         child,
@@ -146,6 +180,7 @@ pub fn start_on(port: impl FnMut() -> u16, tag: &str, tables: &str) -> (Daemon, 
         log,
         config,
         starts: 0,
+        power,
     };
     daemon.drain_the_watcher();
     (daemon, port)

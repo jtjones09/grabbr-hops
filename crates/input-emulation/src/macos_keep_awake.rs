@@ -77,6 +77,12 @@ impl Drop for PowerAssertion {
 /// The assertions this process holds, as `(type, name)` pairs: what
 /// `pmset -g assertions` lists for it. Empty when the list cannot be read.
 pub fn held_by_this_process() -> Vec<(String, String)> {
+    held_by(std::process::id())
+}
+
+/// The assertions the process `pid` holds, as [`held_by_this_process`]
+/// lists them.
+pub fn held_by(pid: u32) -> Vec<(String, String)> {
     let mut by_pid: CFDictionaryRef = std::ptr::null();
     // SAFETY: `by_pid` is a valid out-pointer; on success it holds a
     // dictionary this code owns (the create rule).
@@ -85,7 +91,10 @@ pub fn held_by_this_process() -> Vec<(String, String)> {
     }
     let by_pid: CFDictionary<CFNumber, CFArray<CFDictionary<CFString, CFType>>> =
         unsafe { CFDictionary::wrap_under_create_rule(by_pid) };
-    let pid = CFNumber::from(std::process::id() as i32);
+    let Ok(pid) = i32::try_from(pid) else {
+        return vec![];
+    };
+    let pid = CFNumber::from(pid);
     let Some(ours) = by_pid.find(&pid) else {
         return vec![];
     };
