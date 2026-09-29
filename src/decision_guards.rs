@@ -4710,42 +4710,79 @@ mod the_windows_daemon_is_never_installed_elevated {
             .to_lowercase()
     }
 
-    /// Each ask for an administrator in `section` whose prose is not followed
-    /// by a code block of only the commands that remove hops 0.12's task and
-    /// stop its daemon; and each line of such a block that is something else.
+    /// What `section` asks an administrator for beyond removing hops 0.12's
+    /// task and stopping its daemon. A paragraph there asks for one when it
+    /// says "admin" at all, or any of [`ASKS`]. Each such paragraph must come
+    /// directly before a code block, must name nothing that installs, and
+    /// that block may hold only the removal commands; anything else is
+    /// returned.
     fn beyond_removing_0_12(section: &str) -> Vec<String> {
         const REMOVING: [&str; 3] = [
             "unregister-scheduledtask ",
             "$old = get-nettcpconnection ",
             "stop-process ",
         ];
-        let asks_in = |prose: &str| {
-            let prose = words(prose);
-            ASKS.iter()
-                .find(|p| prose.contains(*p))
-                .map(|p| p.to_string())
+        let asks = |paragraph: &str| {
+            let text = words(paragraph);
+            (text.contains("admin") || ASKS.iter().any(|p| text.contains(p))).then_some(text)
         };
         let mut beyond = Vec::new();
-        let (mut prose, mut asked, mut fenced) = (String::new(), None, false);
+        let (mut paragraphs, mut current) = (Vec::<String>::new(), String::new());
+        let (mut fenced, mut asked) = (false, false);
         for line in section.lines() {
             let lower = line.trim().to_lowercase();
             if lower.starts_with("```") {
                 fenced = !fenced;
-                asked = if fenced { asks_in(&prose) } else { None };
-                prose.clear();
-            } else if !fenced {
-                prose.push_str(line);
-                prose.push('\n');
-            } else if asked.is_some()
-                && !lower.is_empty()
-                && !REMOVING.iter().any(|cmd| lower.starts_with(cmd))
-            {
-                beyond.push(line.trim().to_string());
+                if fenced {
+                    paragraphs.push(std::mem::take(&mut current));
+                    let last = paragraphs.iter().rposition(|p| !p.trim().is_empty());
+                    for (i, paragraph) in paragraphs.drain(..).enumerate() {
+                        let Some(text) = asks(&paragraph) else {
+                            continue;
+                        };
+                        if Some(i) != last {
+                            beyond.push(format!("not directly before the commands: {text}"));
+                        } else {
+                            asked = true;
+                        }
+                        beyond.extend(installing(&text).map(|w| format!("names {w}: {text}")));
+                    }
+                } else {
+                    asked = false;
+                }
+            } else if fenced {
+                if asked
+                    && !lower.is_empty()
+                    && (!REMOVING.iter().any(|cmd| lower.starts_with(cmd))
+                        || lower.contains([';', '|', '&'])
+                        || installing(&lower).next().is_some())
+                {
+                    beyond.push(line.trim().to_string());
+                }
+            } else if lower.is_empty() {
+                paragraphs.push(std::mem::take(&mut current));
+            } else {
+                current.push_str(line);
+                current.push('\n');
             }
         }
-        if let Some(unused) = asks_in(&prose) {
-            beyond.push(format!("\"{unused}\" with no commands after it"));
+        paragraphs.push(current);
+        for text in paragraphs.iter().filter_map(|p| asks(p)) {
+            beyond.push(format!("with no commands after it: {text}"));
         }
         beyond
+    }
+
+    /// Each word of `text` that installs or registers hops: an install
+    /// script, a registration, or `hops.exe`. Removing words, such as
+    /// `uninstall` or `Unregister-ScheduledTask`, are not.
+    fn installing(text: &str) -> impl Iterator<Item = &str> {
+        text.split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '.'))
+            .filter(|w| {
+                let w = w.to_lowercase();
+                (w.contains("install") && !w.starts_with("uninstall"))
+                    || (w.contains("register") && !w.starts_with("unregister"))
+                    || w.contains("hops.exe")
+            })
     }
 }

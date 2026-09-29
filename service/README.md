@@ -98,7 +98,7 @@ Remove-ItemProperty $run -Name hops-daemon,hops-gui
 
 Then remove the task and stop the old daemon. The task runs it elevated, so
 this needs PowerShell as administrator; without the task, a normal one does.
-It removes and stops, and installs nothing:
+These commands only remove and stop:
 
 ```powershell
 Unregister-ScheduledTask -TaskName hops-daemon -Confirm:$false
