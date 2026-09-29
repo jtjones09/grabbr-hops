@@ -79,8 +79,8 @@ emulation requires.
 
 hops runs as you and is never elevated: an administrator process started from a
 folder you can write hands administrator to anything that can replace the file.
-The cost is that hops cannot type or click into an elevated window. An enter
-hook set in `config.toml` does not run if hops is started elevated.
+The cost is that hops cannot type or click into an elevated window. Started
+elevated, hops refuses to run and says why, and so does the script above.
 
 #### Upgrading from hops 0.12 or older
 
@@ -88,9 +88,9 @@ The old daemon listens where this version does not look for one, and this
 version will not start beside it. hops 0.12 started at sign-in from a Run value
 or from a scheduled task.
 
-First, from a normal PowerShell, remove the Run values its `install.ps1` set.
-They are in your own registry hive, so a shell started with another account's
-password would look in that account's:
+First, open a new, normal PowerShell and remove the Run values its
+`install.ps1` set. They are in your own registry hive, so a shell started with
+another account's password would look in that account's:
 
 ```powershell
 $run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'

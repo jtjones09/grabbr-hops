@@ -25,6 +25,16 @@ param(
     [string]$HopsPath = "$env:LOCALAPPDATA\hops\hops.exe"
 )
 
+# Refuse to go on elevated, before registering anything: hops is never
+# elevated, and hops.exe refuses to run so. Under UAC the token is in the
+# Administrators role only when it is elevated.
+$me = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+if ($me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Error ("This PowerShell is elevated. hops runs as you and is never " +
+        "elevated. Open a new, normal PowerShell and run this script again.")
+    exit 1
+}
+
 if (-not (Test-Path $HopsPath)) {
     Write-Error "hops.exe not found at '$HopsPath'. Pass -HopsPath <full path>."
     exit 1

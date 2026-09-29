@@ -12,6 +12,7 @@ pub mod daemon_start;
 mod dial_back;
 pub mod discovery;
 mod dns;
+pub mod elevation;
 mod emulation;
 pub mod emulation_test;
 pub(crate) mod enter_hook;

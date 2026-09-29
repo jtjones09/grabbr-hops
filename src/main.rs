@@ -35,6 +35,8 @@ enum HopsError {
     Slint(#[from] hops_slint::SlintError),
     #[error(transparent)]
     Cli(#[from] CliError),
+    #[error(transparent)]
+    Elevated(#[from] hops::elevation::Elevated),
 }
 
 fn main() {
@@ -122,16 +124,30 @@ fn runs_the_daemon(command: Option<Command>) -> bool {
     }
 }
 
-/// Run the daemon (the receiver service). A redundant instance self-exits,
-/// and so does one beside a daemon of an older build that listens where this
-/// build's claim cannot see it (on Windows, hops 0.12 and older).
+/// Run the daemon (the receiver service). On Windows one in an elevated
+/// process refuses and exits 1: hops runs as the user, never elevated
+/// (#109). A redundant instance self-exits, and so does one beside a daemon
+/// of an older build that listens where this build's claim cannot see it (on
+/// Windows, hops 0.12 and older).
 fn run_daemon() -> Result<(), HopsError> {
-    if let Err(e) =
-        hops::daemon_start::refuse_beside_older(DaemonEndpoint::of_older_builds().as_ref())
-    {
-        return daemon_ended(Err(HopsError::Service(ServiceError::IpcListen(e))));
-    }
-    daemon_ended(run_async(run_service()))
+    unless_elevated(hops::elevation::daemon_process_is_elevated(), || {
+        if let Err(e) =
+            hops::daemon_start::refuse_beside_older(DaemonEndpoint::of_older_builds().as_ref())
+        {
+            return daemon_ended(Err(HopsError::Service(ServiceError::IpcListen(e))));
+        }
+        daemon_ended(run_async(run_service()))
+    })
+}
+
+/// `run`, unless this process is `elevated`: then nothing of the daemon
+/// runs, and the error says why and what to do.
+fn unless_elevated(
+    elevated: bool,
+    run: impl FnOnce() -> Result<(), HopsError>,
+) -> Result<(), HopsError> {
+    hops::elevation::daemon_may_run(elevated)?;
+    run()
 }
 
 /// What the daemon's end means for how the process exits. One that found
@@ -447,6 +463,39 @@ mod a_daemon_ended_for_a_grant_exits_unsuccessfully {
             held.is_err(),
             "a daemon whose endpoint something else holds must exit 1 with the \
              reason, not as if a daemon were running: {held:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod an_elevated_daemon_refuses_to_run {
+    //! hops runs as the user and is never elevated (#109). On Windows,
+    //! `run_daemon` passes whether its token is elevated; here the seam is
+    //! called with each answer, so the refusal is tested on every system.
+    use super::{HopsError, unless_elevated};
+    use std::cell::Cell;
+
+    // LEDGER T1093 | class B | 1 return value + whether the daemon ran
+    #[test]
+    fn nothing_of_the_daemon_runs_when_elevated_and_it_exits_1() {
+        let ran = Cell::new(false);
+        let got = unless_elevated(true, || {
+            ran.set(true);
+            Ok(())
+        });
+        assert!(
+            matches!(got, Err(HopsError::Elevated(_))) && !ran.get(),
+            "an elevated process ran the daemon, or exited 0 without saying why: \
+             ran {}, {got:?}",
+            ran.get()
+        );
+        let got = unless_elevated(false, || {
+            ran.set(true);
+            Ok(())
+        });
+        assert!(
+            got.is_ok() && ran.get(),
+            "a daemon that is not elevated did not run"
         );
     }
 }
