@@ -185,7 +185,13 @@ impl InputEmulation {
             return b;
         }
 
-        Self::first_that_starts([
+        Self::first_that_starts(Self::auto_order()).await
+    }
+
+    /// The backends tried, in order, when none is configured. `Dummy` is
+    /// last, so it is chosen only when every real backend failed.
+    pub fn auto_order() -> Vec<Backend> {
+        vec![
             #[cfg(wlroots)]
             Backend::Wlroots,
             #[cfg(libei)]
@@ -199,8 +205,7 @@ impl InputEmulation {
             #[cfg(target_os = "macos")]
             Backend::MacOs,
             Backend::Dummy,
-        ])
-        .await
+        ]
     }
 
     /// The first of `backends` that starts, in order. What the system

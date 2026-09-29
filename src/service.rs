@@ -640,6 +640,25 @@ impl Service {
         capture_backend: Option<input_capture::Backend>,
         emulation_backend: Option<input_emulation::Backend>,
     ) -> Result<Self, ServiceError> {
+        Self::with_backends_among(
+            config,
+            frontend_listener,
+            capture_backend,
+            emulation_backend,
+            input_emulation::InputEmulation::auto_order(),
+        )
+        .await
+    }
+
+    /// [`Self::with_backends`], trying `emulation_candidates` in order when
+    /// no emulation backend is chosen.
+    async fn with_backends_among(
+        config: Config,
+        frontend_listener: AsyncFrontendListener,
+        capture_backend: Option<input_capture::Backend>,
+        emulation_backend: Option<input_emulation::Backend>,
+        emulation_candidates: Vec<input_emulation::Backend>,
+    ) -> Result<Self, ServiceError> {
         let client_manager = ClientManager::default();
         for client in config.clients() {
             client_manager.add_with_config(client);
@@ -779,7 +798,12 @@ impl Service {
 
         // input capture + emulation
         let capture = Capture::new(capture_backend, conn, config.release_bind());
-        let emulation = Emulation::new(emulation_backend, listener, trust.clone());
+        let emulation = Emulation::among(
+            emulation_backend,
+            emulation_candidates,
+            listener,
+            trust.clone(),
+        );
 
         // create dns resolver
         let resolver = DnsResolver::new()?;

@@ -108,12 +108,26 @@ enum EmulationRequest {
 }
 
 impl Emulation {
+    /// [`Self::among`] the backends a machine tries on its own.
+    #[cfg(test)]
     pub(crate) fn new(
         backend: Option<input_emulation::Backend>,
         listener: LanMouseListener,
         trust: crate::transport::Trust,
     ) -> Self {
-        let emulation_proxy = EmulationProxy::new(backend, listener.pressure(), trust.clone());
+        Self::among(backend, InputEmulation::auto_order(), listener, trust)
+    }
+
+    /// Emulation through `backend`, or through the first of `candidates`
+    /// that starts when none is configured.
+    pub(crate) fn among(
+        backend: Option<input_emulation::Backend>,
+        candidates: Vec<input_emulation::Backend>,
+        listener: LanMouseListener,
+        trust: crate::transport::Trust,
+    ) -> Self {
+        let emulation_proxy =
+            EmulationProxy::among(backend, candidates, listener.pressure(), trust.clone());
         let last_injected = emulation_proxy.last_injected.clone();
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
@@ -563,8 +577,19 @@ impl QueueMetrics {
 }
 
 impl EmulationProxy {
+    /// [`Self::among`] the backends a machine tries on its own.
+    #[cfg(test)]
     fn new(
         backend: Option<input_emulation::Backend>,
+        pressure: Rc<crate::listen::InputPressure>,
+        trust: crate::transport::Trust,
+    ) -> Self {
+        Self::among(backend, InputEmulation::auto_order(), pressure, trust)
+    }
+
+    fn among(
+        backend: Option<input_emulation::Backend>,
+        candidates: Vec<input_emulation::Backend>,
         pressure: Rc<crate::listen::InputPressure>,
         trust: crate::transport::Trust,
     ) -> Self {
@@ -575,6 +600,7 @@ impl EmulationProxy {
         let metrics = Rc::new(QueueMetrics::default());
         let emulation_task = EmulationTask {
             backend,
+            candidates,
             exit_requested: exit_requested.clone(),
             request_rx,
             event_tx,
@@ -655,7 +681,10 @@ impl EmulationProxy {
 }
 
 struct EmulationTask {
+    /// The backend configured, if any.
     backend: Option<input_emulation::Backend>,
+    /// Tried in order when none is configured.
+    candidates: Vec<input_emulation::Backend>,
     exit_requested: Rc<Cell<bool>>,
     request_rx: Receiver<ProxyRequest>,
     event_tx: Sender<EmulationEvent>,
@@ -842,8 +871,15 @@ impl EmulationTask {
 
     async fn do_emulation(&mut self) -> Result<(), InputEmulationError> {
         log::info!("creating input emulation ...");
+        let (backend, candidates) = (self.backend, self.candidates.clone());
+        let chosen = async move {
+            match backend {
+                Some(_) => InputEmulation::new(backend).await,
+                None => InputEmulation::first_that_starts(candidates).await,
+            }
+        };
         let mut emulation = tokio::select! {
-            r = InputEmulation::new(self.backend) => r?,
+            r = chosen => r?,
             // allow termination event while requesting input emulation
             _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
         };
