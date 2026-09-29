@@ -1035,11 +1035,13 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
             // (Bonjour on macOS, Avahi via nsswitch on Linux) -- see
             // resolve_hostname in src/dns.rs.
             //
-            // This is what makes a discovered device SELF-HEALING. The pinned
-            // addresses are a snapshot, so if the peer's DHCP lease changes they
-            // go stale. hops dials the union of pinned addresses and freshly
-            // resolved ones on every reconnect, so a resolvable `.local` name
-            // keeps working after every address it was added with has changed.
+            // The pinned addresses are a snapshot, so if the peer's DHCP lease
+            // changes they go stale. hops dials them together with the
+            // addresses the name resolves to. The name is looked up when the
+            // device is switched on or renamed, and, on a machine that dials
+            // out to be driven, again after every dial that reaches nothing.
+            // A machine that dials to drive the peer does not look it up
+            // again by itself: switching the device off and on does.
             let hostname = hops_frontend_core::discovered_hostname(&label);
             match add_request(&hostname, &port, position, addrs) {
                 Ok(add) => {

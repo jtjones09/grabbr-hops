@@ -630,3 +630,49 @@ pub(crate) fn door(me: &Machine) -> Door {
     });
     door
 }
+
+/// A QUIC endpoint on loopback that holds no key of anyone's: a stock rustls
+/// server whose resolver has no certificate, which rustls answers with the
+/// alert `access_denied` at the ClientHello, before any certificate. That is
+/// also what a close forged by anything on the path looks like. Its port,
+/// and the addresses it has answered so far: one per dial, since every dial
+/// is made from a socket of its own.
+pub(crate) fn keyless_listener() -> (
+    quinn::Endpoint,
+    u16,
+    std::rc::Rc<std::cell::RefCell<std::collections::HashSet<std::net::SocketAddr>>>,
+) {
+    #[derive(Debug)]
+    struct NoCertificate;
+    impl rustls::server::ResolvesServerCert for NoCertificate {
+        fn resolve(
+            &self,
+            _: rustls::server::ClientHello<'_>,
+        ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+            None
+        }
+    }
+    let mut crypto = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .expect("TLS 1.3")
+    .with_no_client_auth()
+    .with_cert_resolver(Arc::new(NoCertificate));
+    crypto.alpn_protocols = transport::served_alpns();
+    let cfg = quinn::ServerConfig::with_crypto(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(crypto).expect("quic server config"),
+    ));
+    let endpoint = quinn::Endpoint::server(cfg, (Ipv4Addr::LOCALHOST, 0).into()).expect("endpoint");
+    let port = endpoint.local_addr().expect("addr").port();
+    let answered: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<std::net::SocketAddr>>> =
+        Default::default();
+    let (serving, seen) = (endpoint.clone(), answered.clone());
+    tokio::task::spawn_local(async move {
+        while let Some(incoming) = serving.accept().await {
+            seen.borrow_mut().insert(incoming.remote_address());
+            let _ = incoming.await;
+        }
+    });
+    (endpoint, port, answered)
+}

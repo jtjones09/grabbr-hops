@@ -105,6 +105,12 @@ pub(crate) enum DialRefusal {
         handle: ClientHandle,
         addr: SocketAddr,
     },
+    /// This machine dials the device to be driven by it (#15), and its
+    /// hostname resolves to no address, with no other address to dial.
+    NotResolved {
+        handle: ClientHandle,
+        hostname: String,
+    },
     /// Nothing answered at the device's port, and a hops of this version
     /// answered at `addr`, the port hops listened on before v0.13: its
     /// config still names that port (#16).
@@ -191,6 +197,19 @@ struct PeerLink {
     /// The machine at the other end dialled it, to be driven by this one
     /// (#15), rather than this machine dialling it.
     dialled_in: bool,
+    /// This link and no other, even one to the same address before or
+    /// after it: the machine at the other end takes a crossing per link.
+    serial: u64,
+}
+
+/// An event a peer sent: the device it came from, the event, and the
+/// serial of the link it arrived on.
+pub(crate) type Heard = (ClientHandle, ProtoEvent, u64);
+
+/// A serial no link made before it has.
+fn next_link_serial() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn client_config(
@@ -324,6 +343,7 @@ async fn connect(
             fingerprint,
             handle,
             dialled_in: false,
+            serial: next_link_serial(),
         }),
         addr,
     ))
@@ -458,8 +478,8 @@ pub(crate) struct LanMouseConnection {
     client_manager: ClientManager,
     conns: Rc<Mutex<HashMap<SocketAddr, PeerLink>>>,
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
-    recv_rx: Receiver<(ClientHandle, ProtoEvent)>,
-    recv_tx: Sender<(ClientHandle, ProtoEvent)>,
+    recv_rx: Receiver<Heard>,
+    recv_tx: Sender<Heard>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
     /// Material for building a FRESH client config per dial. The observed-
     /// fingerprint slot MUST NOT be shared: it is written by the TLS verifier and
@@ -553,7 +573,9 @@ impl LanMouseConnection {
         self.pairing_events = None;
     }
 
-    pub(crate) async fn recv(&mut self) -> (ClientHandle, ProtoEvent) {
+    /// The next event a peer sent, with the device it came from and the
+    /// link it arrived on ([`Self::link_serial`]).
+    pub(crate) async fn recv(&mut self) -> Heard {
         self.recv_rx.recv().await.expect("channel closed")
     }
 
@@ -608,6 +630,14 @@ impl LanMouseConnection {
     /// The address `handle`'s connection is open to, if it has one.
     pub(crate) fn active_addr(&self, handle: ClientHandle) -> Option<SocketAddr> {
         self.client_manager.active_addr(handle)
+    }
+
+    /// Which link `handle` is on now, if it has one. A crossing its peer
+    /// took on one link is not taken on the next: the peer drops what
+    /// arrives on a link no Enter crossed (#212).
+    pub(crate) async fn link_serial(&self, handle: ClientHandle) -> Option<u64> {
+        let addr = self.client_manager.active_addr(handle)?;
+        self.conns.lock().await.get(&addr).map(|link| link.serial)
     }
 
     /// Whether `handle`'s peer last said it is injecting input.
@@ -860,6 +890,7 @@ impl Adopter {
             fingerprint: fingerprint.clone(),
             handle,
             dialled_in: true,
+            serial: next_link_serial(),
         };
         let mut open = s.conns.lock().await;
         if let Some(current) = s.client_manager.active_addr(handle) {
@@ -1002,7 +1033,7 @@ async fn connect_to_handle(
     handle: ClientHandle,
     conns: Rc<Mutex<HashMap<SocketAddr, PeerLink>>>,
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
-    tx: Sender<(ClientHandle, ProtoEvent)>,
+    tx: Sender<Heard>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
     identity: Arc<Identity>,
     trust: Trust,
@@ -1213,6 +1244,7 @@ async fn connect_to_handle(
                     fingerprint,
                     handle,
                     dialled_in: false,
+                    serial: next_link_serial(),
                 };
                 (link, Some((confirmed.recv, confirmed.commit)))
             }
@@ -1345,7 +1377,7 @@ async fn connect_to_handle(
 struct Session {
     client_manager: ClientManager,
     conns: Rc<Mutex<HashMap<SocketAddr, PeerLink>>>,
-    recv_tx: Sender<(ClientHandle, ProtoEvent)>,
+    recv_tx: Sender<Heard>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
     trust: Trust,
     clipboard_in: Sender<PeerClipboard>,
@@ -1496,7 +1528,7 @@ async fn receive_loop(
     addr: SocketAddr,
     link: PeerLink,
     conns: Rc<Mutex<HashMap<SocketAddr, PeerLink>>>,
-    tx: Sender<(ClientHandle, ProtoEvent)>,
+    tx: Sender<Heard>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
     clipboard: ClipboardInlet,
     state_tx: Sender<ClientHandle>,
@@ -1564,7 +1596,7 @@ async fn receive_loop(
                         let _ = state_tx.send(handle);
                     }
                     event => {
-                        let _ = tx.send((handle, event));
+                        let _ = tx.send((handle, event, link.serial));
                     }
                 }
             }
