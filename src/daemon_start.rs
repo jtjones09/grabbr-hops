@@ -83,28 +83,43 @@ const OLDER_ASK: Duration = Duration::from_secs(1);
 /// A daemon on the older builds' endpoint, in words.
 const OLDER_BUILD: &str = "hops 0.12 or older";
 
-/// How to stop a daemon of hops 0.12 or older, which only Windows has apart
-/// from this build's (see [`DaemonEndpoint::of_older_builds`]), and keep its
-/// sign-in task from starting it again, for the copy of hops at `exe`.
+/// How to stop a daemon of hops 0.12 or older listening on `older`, which
+/// only Windows has apart from this build's (see
+/// [`DaemonEndpoint::of_older_builds`]), and keep it from starting again at
+/// sign-in.
 ///
-/// The task has the name this build's own task script gives it, so the
-/// steps offer to point it at this copy as well as to remove it.
-pub fn older_stop(exe: &Path) -> String {
-    // A path in a PowerShell single-quoted string: a quote is doubled.
-    let exe = exe.display().to_string().replace('\'', "''");
-    // Each command on a line of its own, so a wrapped line does not split one.
+/// hops 0.12 started at sign-in from a scheduled task named `hops-daemon`,
+/// which its task script registered elevated, or from the `hops-daemon` and
+/// `hops-gui` values of the Run key, which its installer set. The old daemon
+/// is found by the port it listens on: this build's program has the same
+/// name. This build is registered again by its own task script, from a
+/// shell that is not elevated, so it never runs elevated (service/README.md):
+/// pointing the old task at it would keep the task's elevation.
+pub fn older_stop(older: &DaemonEndpoint) -> String {
+    let port = match older {
+        DaemonEndpoint::Tcp(addr) => addr.port(),
+        _ => OLDER_PORT,
+    };
+    // Each command on a line of its own, apart from the words around it, and
+    // short enough not to wrap in the app.
     format!(
-        "To stop it, in PowerShell:\n\
-         Stop-ScheduledTask -TaskName hops-daemon\n\
-         Its sign-in task starts it again at every sign-in. Remove the task:\n\
+        "To stop it, open PowerShell as administrator, since its sign-in task may run \
+         it elevated. Remove what starts it at sign-in, then stop it; a line that \
+         finds nothing to remove says so:\n\
          Unregister-ScheduledTask -TaskName hops-daemon -Confirm:$false\n\
-         or run this version from it instead:\n\
-         Set-ScheduledTask -TaskName hops-daemon -Action (New-ScheduledTaskAction \
-         -Execute '{exe}' -Argument daemon)\n\
-         If the old one still runs, end the old hops.exe in Task Manager. Then open \
-         hops again."
+         $run = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run'\n\
+         Remove-ItemProperty $run -Name hops-daemon,hops-gui\n\
+         $old = Get-NetTCPConnection -LocalPort {port} -State Listen\n\
+         Stop-Process -Id $old.OwningProcess\n\
+         Quit the old hops in the notification area too, then open hops again. To start \
+         this version at sign-in, register it with its task script from a normal \
+         PowerShell, never an administrator one (service/README.md). If the old one runs \
+         as another user of this computer, only that user or an administrator can stop it."
     )
 }
+
+/// The port hops 0.12 and older listened on, on Windows.
+const OLDER_PORT: u16 = 5252;
 
 /// Why the front door started nothing beside a daemon of hops 0.12 or older,
 /// and what to do.
@@ -125,10 +140,34 @@ pub fn refuse_beside_older(older: Option<&DaemonEndpoint>) -> Result<(), IpcList
     match older {
         Some(older) if older_daemon_at(older) => Err(IpcListenerCreationError::Older {
             endpoint: older.clone(),
-            hint: older_stop(&std::env::current_exe().unwrap_or_default()),
+            hint: older_stop(older),
         }),
         _ => Ok(()),
     }
+}
+
+/// Take `older`, where a daemon of hops 0.12 or older listens on Windows,
+/// and hold it while this daemon runs, accepting nothing there. Such a
+/// daemon started after this one then finds it taken and exits, as it does
+/// beside another daemon of its own build; without this it ran beside this
+/// one (#222: at most one daemon). Nothing a connection there is sent, so
+/// [`refuse_beside_older`] does not take this daemon for an older one.
+///
+/// `None` when there is nothing to hold, or it cannot be taken, as when a
+/// daemon of another user of this computer holds it: a best effort that
+/// never stops this daemon starting.
+pub fn hold_older_endpoint(older: Option<&DaemonEndpoint>) -> Option<std::net::TcpListener> {
+    let Some(DaemonEndpoint::Tcp(addr)) = older else {
+        return None;
+    };
+    std::net::TcpListener::bind(addr)
+        .inspect_err(|e| {
+            log::info!(
+                "not holding {addr}, where {OLDER_BUILD} listened: {e}. A daemon of that \
+                 version started now would run beside this one"
+            )
+        })
+        .ok()
 }
 
 /// The pause between asks.
@@ -561,20 +600,21 @@ fn front_door<W: Watch>(
             return report(DaemonStart::CannotProbe, Some(e.to_string()));
         }
     };
+    let answers = endpoint.answers();
     // A daemon of an older build does not answer on this build's endpoint,
     // and would run on beside one started here (#222: at most one daemon).
-    if let Some(older) = older.filter(older_daemon_at) {
+    // Asked only while none of this build answers: one that does holds the
+    // older endpoint ([`hold_older_endpoint`]), so no older daemon runs
+    // beside it, and asking there would only make every open wait.
+    if let Some(older) = older.filter(|older| !answers && older_daemon_at(older)) {
         log::warn!("a daemon of {OLDER_BUILD} answers on {older}; not starting one beside it");
         return StartReport {
-            left: Some(format!(
-                "{BESIDE_OLDER} {}",
-                older_stop(&std::env::current_exe().unwrap_or_default())
-            )),
+            left: Some(format!("{BESIDE_OLDER} {}", older_stop(&older))),
             left_build: Some(OLDER_BUILD.to_string()),
             ..report(DaemonStart::AlreadyRunning, None)
         };
     }
-    let (how, replaced) = if endpoint.answers() {
+    let (how, replaced) = if answers {
         let (verdict, stated) = judge(&endpoint, watch);
         let theirs = stated.as_ref().map(in_words).unwrap_or_default();
         match verdict {
@@ -1907,7 +1947,12 @@ mod a_daemon_of_hops_0_12_on_its_old_endpoint {
     // LEDGER T2260 | class B | 1 return value + launches asked for, against a stand-in 0.12 daemon on a real port
     #[test]
     fn the_front_door_starts_nothing_beside_a_0_12_daemon_and_says_how_to_stop_it() {
-        let (report, launched) = open_beside(hops_0_12());
+        let old = hops_0_12();
+        let DaemonEndpoint::Tcp(addr) = &old else {
+            unreachable!("a port")
+        };
+        let port = addr.port();
+        let (report, launched) = open_beside(old);
         let said = report.problem().unwrap_or_default();
         assert_eq!(
             (report.outcome, launched),
@@ -1915,35 +1960,107 @@ mod a_daemon_of_hops_0_12_on_its_old_endpoint {
             "a hops 0.12 daemon answers on its old endpoint, and the front door \
              started a second daemon beside it: {report:?}"
         );
-        // The sign-in task is named, with how to remove it and how to run
-        // this copy from it instead.
-        let this_copy = std::env::current_exe().expect("this program");
+        // Both ways 0.12 started at sign-in are removed, from an elevated
+        // shell, since its task ran elevated; the old daemon is found by its
+        // port; and this version is registered from a shell that is not.
         for needed in [
             "hops 0.12 or older".to_string(),
+            "PowerShell as administrator".to_string(),
             "Unregister-ScheduledTask -TaskName hops-daemon".to_string(),
+            "$run = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run'\n\
+             Remove-ItemProperty $run -Name hops-daemon,hops-gui"
+                .to_string(),
             format!(
-                "Set-ScheduledTask -TaskName hops-daemon -Action (New-ScheduledTaskAction \
-                 -Execute '{}' -Argument daemon)",
-                this_copy.display()
+                "$old = Get-NetTCPConnection -LocalPort {port} -State Listen\n\
+                 Stop-Process -Id $old.OwningProcess"
             ),
+            "from a normal PowerShell, never an administrator one".to_string(),
         ] {
             assert!(
                 said.contains(&needed),
-                "the app must name the old daemon and its sign-in task; missing \
+                "the app must name the old daemon and how to stop it for good; missing \
                  {needed:?} in {said:?}"
             );
         }
+        // Pointing the old task at this copy keeps the task's elevation, and
+        // runs this copy elevated from wherever it was unpacked.
+        assert!(
+            !said.contains("Set-ScheduledTask"),
+            "the steps must not run this copy from the old, elevated task: {said:?}"
+        );
     }
 
-    /// A quote in the path of this copy would end the PowerShell string the
-    /// steps put it in, and the command would run something else.
-    // LEDGER T2268 | class B | 1 return value
+    /// Once this daemon runs, a daemon of hops 0.12 started after it finds its
+    /// endpoint taken and exits, as it does beside another of its own; and the
+    /// endpoint held is not taken for a 0.12 daemon.
+    // LEDGER T2279 | class B | 1 return value + a bind on a real port
     #[test]
-    fn the_steps_quote_this_copys_path_for_powershell() {
-        let said = super::older_stop(std::path::Path::new("C:/Users/o'neil/hops/hops.exe"));
-        assert!(
-            said.contains("-Execute 'C:/Users/o''neil/hops/hops.exe' -Argument daemon"),
-            "a quote in the path must be doubled inside the single-quoted string: {said:?}"
+    fn a_0_12_daemon_cannot_start_beside_this_one() {
+        let older = nothing_listening();
+        let DaemonEndpoint::Tcp(addr) = &older else {
+            unreachable!("a port")
+        };
+        let held = super::hold_older_endpoint(Some(&older));
+        // As hops 0.12 takes its endpoint.
+        let taken = TcpListener::bind(addr).map(|_| ()).map_err(|e| e.kind());
+        let (report, launched) = open_beside(older.clone());
+        drop(held);
+        assert_eq!(
+            (taken, report.outcome, launched),
+            (
+                Err(std::io::ErrorKind::AddrInUse),
+                DaemonStart::Started(4711),
+                vec![Launch::Start]
+            ),
+            "(a 0.12 daemon taking its endpoint, the front door) while this daemon \
+             holds that endpoint"
+        );
+    }
+
+    /// While a daemon of this build answers, the front door does not ask the
+    /// older endpoint: that daemon holds it, and asking would make every open
+    /// wait on it.
+    // LEDGER T2280 | class B | connections made to a real port
+    #[test]
+    fn the_older_endpoint_is_not_asked_while_this_builds_daemon_answers() {
+        // Counts the connections made to it before one that says "F".
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let addr = listener.local_addr().expect("its address");
+        let (fenced, before_fence) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut asked = 0;
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut first = [0u8; 1];
+                match stream.read(&mut first) {
+                    Ok(1) if first == *b"F" => {
+                        let _ = fenced.send(asked);
+                        return;
+                    }
+                    _ => asked += 1,
+                }
+            }
+        });
+        let this = Build {
+            version: "0.13.0".into(),
+            commit: "abcdef1".into(),
+        };
+        let _ = start_or_restart_beside_older(
+            Ok(standing(b"")),
+            Some(DaemonEndpoint::Tcp(addr)),
+            &this,
+            |_| Ok(4711),
+            &mut Serves,
+            Duration::from_secs(5),
+        );
+        let mut fence = std::net::TcpStream::connect(addr).expect("the counting port");
+        fence.write_all(b"F").expect("the fence");
+        let asked = before_fence
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the fence was seen");
+        assert_eq!(
+            asked, 0,
+            "the front door asked the older endpoint while this build's daemon answered"
         );
     }
 

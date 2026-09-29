@@ -328,6 +328,9 @@ where
 async fn run_service() -> Result<(), ServiceError> {
     let endpoint = DaemonEndpoint::of_this_platform().map_err(IpcListenerCreationError::from)?;
     let mut service = Service::start(&endpoint, Config::new).await?;
+    // Taken once this daemon holds its own endpoint, and held until it ends.
+    let _older =
+        hops::daemon_start::hold_older_endpoint(DaemonEndpoint::of_older_builds().as_ref());
     service.run().await?;
     log::info!("service exited!");
     Ok(())

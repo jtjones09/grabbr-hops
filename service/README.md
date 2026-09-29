@@ -81,14 +81,25 @@ The cost is that hops cannot type or click into an elevated window. An enter
 hook set in `config.toml` does not run if hops is started elevated.
 
 Upgrading from hops 0.12 or older: the old daemon listens where this version
-does not look for one, and this version will not start beside it. Stop it and
-run this version from the same task:
+does not look for one, and this version will not start beside it. hops 0.12
+started at sign-in from a task its script registered elevated, or from the Run
+key its installer set. Since that task runs elevated, use an administrator
+PowerShell to remove both and stop the old daemon:
 
 ```powershell
-Stop-ScheduledTask -TaskName hops-daemon
-.\install-hops-daemon.ps1 -HopsPath 'C:\path\to\new\hops.exe'
-Start-ScheduledTask -TaskName hops-daemon
+Unregister-ScheduledTask -TaskName hops-daemon -Confirm:$false
+$run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+Remove-ItemProperty $run -Name hops-daemon,hops-gui
+$old = Get-NetTCPConnection -LocalPort 5252 -State Listen
+Stop-Process -Id $old.OwningProcess
 ```
+
+A line that finds nothing to remove says so; that is expected. Quit the old
+hops in the notification area too.
+
+Then register this version from a normal PowerShell, as above, so it does not
+run elevated. Do not point the old task at the new `hops.exe`: the task keeps
+its elevation.
 
 ## 3. Configure over SSH
 

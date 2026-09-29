@@ -94,6 +94,8 @@ fn a_daemon_exits_beside_a_0_12_daemon_before_it_touches_anything() {
     for needed in [
         "older hops daemon",
         "Unregister-ScheduledTask -TaskName hops-daemon",
+        "-Name hops-daemon,hops-gui",
+        "-LocalPort 5252",
     ] {
         assert!(
             logged.contains(needed),
