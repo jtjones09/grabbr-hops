@@ -193,8 +193,9 @@ pub struct Service {
     /// The devices the `[authorized_fingerprints]` cache has listed, so one
     /// removed from it is known to have been removed there.
     cache_listed: crate::cache_listed::Listed,
-    /// What the first app to attach is told about devices forgotten at start
-    /// because the cache no longer listed them.
+    /// What every app that attaches is told about devices forgotten at start
+    /// because the cache no longer listed them. Not only the first: the front
+    /// door's build probe attaches too, before the app it opens, and hangs up.
     forgotten_at_start: Option<String>,
     /// When to read config.toml again to confirm what the last reload found
     /// removed from the cache ([`crate::cache_listed::SETTLE`]).
@@ -609,7 +610,9 @@ async fn claim_then_read_config<L, C>(
 /// cache in `config` listed before and no longer lists: an older build, or a
 /// person, removed it there (see `crate::cache_listed`). A removal found is
 /// confirmed by reading the file again once it has settled. Returns the
-/// store, what the cache has listed, and the names of the devices forgotten.
+/// store, what the cache has listed, the names of the devices forgotten, and
+/// whether the two reads disagreed, when the first read is not to be recorded
+/// in place of what was.
 async fn forget_removed_from_cache(
     mut store: crate::trust::TrustStore,
     config: &Config,
@@ -618,13 +621,17 @@ async fn forget_removed_from_cache(
     crate::trust::TrustStore,
     crate::cache_listed::Listed,
     Vec<String>,
+    bool,
 ) {
     let listed = crate::cache_listed::Listed::read(config_dir);
     let mut removed = listed.removed(&store.config_cache(), config.listed_as_trusted().as_ref());
+    let mut disagreed = false;
     if !removed.is_empty() {
         // Only when something reads as removed, so a start pays nothing.
         tokio::time::sleep(crate::cache_listed::SETTLE).await;
+        let found = removed.len();
         removed = crate::cache_listed::confirmed(removed, config.listed_on_disk().as_ref());
+        disagreed = removed.len() != found;
     }
     let mut names = Vec::new();
     for fp in removed {
@@ -636,17 +643,17 @@ async fn forget_removed_from_cache(
         );
         names.push(name);
     }
-    (store, listed, names)
+    (store, listed, names, disagreed)
 }
 
 /// Record, of what the `[authorized_fingerprints]` cache in `config` lists,
 /// the devices `store` trusts: removing one of them from the file later is a
-/// removal. While `unsaved`, what was recorded is kept as well.
+/// removal. While `keep`, what was recorded is kept as well.
 fn record_listed(
     listed: &mut crate::cache_listed::Listed,
     store: &crate::trust::TrustStore,
     config: &Config,
-    unsaved: bool,
+    keep: bool,
 ) {
     let granted: std::collections::HashSet<String> = store
         .config_cache()
@@ -660,7 +667,7 @@ fn record_listed(
         .map(|fp| crate::cache_listed::canonical(fp))
         .filter(|fp| granted.contains(fp))
         .collect();
-    if let Err(e) = listed.record_keeping(now, unsaved) {
+    if let Err(e) = listed.record_keeping(now, keep) {
         log::warn!("could not record which devices config.toml lists: {e}");
     }
 }
@@ -778,7 +785,7 @@ impl Service {
             }
         };
 
-        let (store, mut cache_listed, forgotten) =
+        let (store, mut cache_listed, forgotten, disagreed) =
             forget_removed_from_cache(store, &config, &config_dir).await;
         let mut trust_saver = crate::trust_save::TrustSaver::new(trust_file);
         if !forgotten.is_empty() {
@@ -791,8 +798,11 @@ impl Service {
             }
         }
         // A device forgotten but not yet off disk stays recorded, or the next
-        // start would trust it again from the store on disk.
-        record_listed(&mut cache_listed, &store, &config, trust_saver.is_pending());
+        // start would trust it again from the store on disk. So does one the
+        // first read lacked and the second did not: that read was of a save
+        // part done, and a removal of the device later must still read as one.
+        let keep = trust_saver.is_pending() || disagreed;
+        record_listed(&mut cache_listed, &store, &config, keep);
         let forgotten_at_start =
             (!forgotten.is_empty()).then(|| crate::cache_listed::notice(&forgotten));
         drop_untrusted_pins(&client_manager, &store);
@@ -1222,12 +1232,7 @@ impl Service {
                 self.save_config();
             }
             FrontendRequest::ResolveDns(handle) => self.resolve(handle),
-            FrontendRequest::Sync => {
-                self.sync_frontend();
-                // An app attached and was told: the notice is not repeated
-                // every time an app is opened.
-                self.forgotten_at_start = None;
-            }
+            FrontendRequest::Sync => self.sync_frontend(),
             FrontendRequest::RemoveAuthorizedKey(key) => {
                 self.remove_authorized_key(key);
                 self.save_config();

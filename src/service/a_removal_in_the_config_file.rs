@@ -182,8 +182,9 @@ fn a_device_removed_from_the_file_while_stopped_is_forgotten_at_start() {
         save_config(&s.0, &config_listing(&both[..1]));
         let (mut second, endpoint) = start(&s.0, 2).await;
         let after = known(&second.trust);
-        let told = notice_while_running(&mut second, &s.0, &endpoint, || {}).await;
-        // The next app opened is not told again.
+        // The front door asks which build answers before every app it opens.
+        let probed = front_door_probe(&mut second, &s.0, &endpoint).await;
+        let told = told_on_attach(&mut second, &s.0, &endpoint).await;
         let again = told_on_attach(&mut second, &s.0, &endpoint).await;
         stop(second).await;
 
@@ -199,13 +200,14 @@ fn a_device_removed_from_the_file_while_stopped_is_forgotten_at_start() {
             "((desk, laptop) trusted) at the first start, after config.toml dropped \
              the laptop, and after a line naming it was put back"
         );
+        assert!(probed.is_some(), "the front door's probe was not answered");
         assert!(
-            told.contains("\"laptop\""),
-            "the app must be told the laptop was forgotten, and why: {told:?}"
+            told.iter().any(|said| said.contains("\"laptop\"")),
+            "the app opened after the front door's build probe was not told: {told:?}"
         );
         assert!(
-            !again.iter().any(|said| said.contains("config.toml")),
-            "the notice was repeated to the next app opened: {again:?}"
+            again.iter().any(|said| said.contains("\"laptop\"")),
+            "the next app opened was not told: {again:?}"
         );
     });
 }
@@ -311,6 +313,25 @@ async fn app_asks(
         ended = service.run() => panic!("the daemon ended: {ended:?}"),
         errors = handled => errors,
         _ = tokio::time::sleep(DEADLINE) => panic!("the daemon did not handle the request"),
+    }
+}
+
+/// Ask the daemon on `endpoint` which build it is, with the token, as the
+/// front door does before it opens an app, while `service` runs.
+async fn front_door_probe(
+    service: &mut Service,
+    dir: &Path,
+    endpoint: &DaemonEndpoint,
+) -> Option<hops_ipc::StatedBuild> {
+    let token = std::fs::read_to_string(dir.join("ipc-token")).expect("the token");
+    let endpoint = endpoint.clone();
+    // A blocking ask, off the thread the daemon runs on.
+    let asked = tokio::task::spawn_blocking(move || {
+        endpoint.build(Some(token.trim()), Duration::from_secs(20))
+    });
+    tokio::select! {
+        ended = service.run() => panic!("the daemon ended: {ended:?}"),
+        answer = asked => answer.expect("the probe ran"),
     }
 }
 
@@ -642,10 +663,11 @@ fn a_removal_whose_store_save_failed_is_made_again_at_the_next_start() {
     });
 }
 
-// LEDGER T2278 | class B | 6 trust store state across two starts
+// LEDGER T2278 | class B | 6 trust store state across three starts
 /// At a start too, a removal is made only when a second read of the file,
 /// once it has settled, agrees: the daemon read it while a save was part
-/// done, and the save has finished since.
+/// done, and the save has finished since. What that start records keeps
+/// the laptop, so removing its line later is still a removal.
 #[test]
 fn a_file_read_part_written_at_a_start_removes_nothing() {
     run_local(async {
@@ -664,11 +686,17 @@ fn a_file_read_part_written_at_a_start_removes_nothing() {
         .await;
         let after = known(&second.trust);
         stop(second).await;
+
+        // A real removal after that start is still honoured.
+        save_config(&s.0, &config_listing(&both[..1]));
+        let (third, _) = start(&s.0, 3).await;
+        let removed = known(&third.trust);
+        stop(third).await;
         assert_eq!(
-            after,
-            (true, true),
-            "(desk, laptop) trusted: the laptop's line was only missing from a save \
-             still being written when the daemon read it"
+            (after, removed),
+            ((true, true), (true, false)),
+            "((desk, laptop) trusted) after a start that read a save still being \
+             written, and after the laptop's line was then removed"
         );
     });
 }
