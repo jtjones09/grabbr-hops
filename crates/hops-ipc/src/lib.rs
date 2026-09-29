@@ -619,6 +619,11 @@ pub struct PeerTrust {
     /// This machine may control that one. False from an older daemon.
     #[serde(default)]
     pub we_may_drive: bool,
+    /// Paired with a version of hops before the trust store, and not paired
+    /// since: it grants nothing, in either direction, until it is paired
+    /// again and the direction chosen (#231). False from an older daemon.
+    #[serde(default)]
+    pub pair_again: bool,
 }
 
 /// Which way control goes between two paired machines, as the person

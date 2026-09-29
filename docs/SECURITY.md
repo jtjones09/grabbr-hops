@@ -30,10 +30,10 @@ and how to recover. How to report a vulnerability is in
 - **A trust file this machine did not write.** The list of paired machines
   is signed by a key kept beside it. A trust file edited by hand, copied
   from another installation, or restored on its own over a newer one stops
-  hops from starting instead of being trusted. This covers the trust file
-  only: when it is missing, hops rebuilds it from the list of machines in
-  `config.toml`, so a `config.toml` copied or edited while the trust file
-  is gone is trusted.
+  hops from starting instead of being trusted. When the trust file is
+  missing, the machines listed in `config.toml` are shown as needing to be
+  paired again and are trusted with nothing, so a `config.toml` copied or
+  edited while the trust file is gone grants nothing.
 
 ## What it cannot protect against
 
@@ -62,6 +62,17 @@ and how to recover. How to report a vulnerability is in
   blocked. Discovery announces that the machine runs hops, with its hostname,
   addresses and key fingerprint; set `discovery = false` in `config.toml` to
   turn it off and type addresses instead.
+
+## Upgrading from hops 0.12
+
+hops 0.12 kept one list of paired machines that did not say which machine
+controls which. hops 0.13 does not guess: each machine on that list is
+shown as paired with an older version, and trusted with nothing, in either
+direction, until it is paired again. Use "add again" on its card, or `a` in
+the terminal UI, with add device open on both machines, and choose which
+machine controls which. A pairing that goes one way is the better choice
+for a machine managed by someone else, such as a work laptop. Remove the
+card for a machine no longer used.
 
 ## Removing a machine
 
@@ -108,6 +119,7 @@ again.
 | it removed this machine | Remove it here, then pair again. |
 | waiting for its approval | That machine has not approved the pairing or picked its number yet. Open add device on it and finish there. |
 | not accepting input | hops runs there but cannot inject input. It may lack a permission, such as Accessibility on macOS. |
+| paired with an older version: add it again | It was paired by hops 0.12 and is trusted with nothing. Add it again with add device open on both machines, and choose which machine controls which. |
 | unreachable | Check that hops runs on both machines and that a firewall lets UDP in on the port hops listens on (`port` in `config.toml`, or `o` in the terminal UI). |
 
 A notice can say more:
@@ -121,6 +133,6 @@ A notice can say more:
 each device. To give the machine a new key as well, for example when a copy
 of the configuration directory may exist elsewhere: quit hops and stop its
 background service, move the whole configuration directory aside, then start
-hops. Moving only the trust file aside is not enough, since `config.toml`
-still lists the paired machines. Then remove this machine on every other
-machine.
+hops. Moving only the trust file aside ends every pairing too: the machines
+`config.toml` still lists are shown as needing to be paired again, and are
+trusted with nothing. Then remove this machine on every other machine.

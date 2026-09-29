@@ -110,11 +110,85 @@ pub fn start(tag: &str, tables: &str) -> (Daemon, u16) {
     start_on(ports::pick, tag, tables)
 }
 
+/// A pairing a daemon starts with: the other machine's fingerprint, the
+/// name it was paired under, and what it grants.
+pub type Pairing<'a> = (&'a str, &'a str, hops::trust::Caps);
+
+/// Each machine may drive the other, and the clipboard goes both ways.
+pub const BOTH_WAYS: hops::trust::Caps = hops::trust::Caps::KNOWN;
+
+/// That machine may drive this one and send it its clipboard, and nothing
+/// goes the other way.
+pub const DRIVES_US: hops::trust::Caps =
+    hops::trust::Caps::DRIVE_ME.union(hops::trust::Caps::CLIPBOARD_FROM);
+
+/// [`start`], already paired with each machine in `pairings`: the daemon's
+/// identity and a trust store signed by its authority are written before it
+/// first starts, each pairing confirmed on both machines, as the pairing
+/// card leaves it.
+///
+/// `[authorized_fingerprints]` in `tables` is not a way to pair: a daemon's
+/// first start lists those machines to be paired again and grants them
+/// nothing.
+pub fn start_paired(tag: &str, tables: &str, pairings: &[Pairing]) -> (Daemon, u16) {
+    let dir = PathBuf::from(format!("/tmp/{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let config_dir = dir.join(".config/lan-mouse");
+    std::fs::create_dir_all(&config_dir).expect("a scratch config directory");
+    seed_pairings(&config_dir, pairings);
+    start_in(dir, ports::pick, tables)
+}
+
+/// Write an identity for the daemon whose configuration directory is
+/// `config_dir`, where it reads it from, and a trust store holding
+/// `pairings`, signed by that directory's authority.
+pub fn seed_pairings(config_dir: &Path, pairings: &[Pairing]) {
+    use hops::trust_file::{TrustFile, records_of};
+    let key = rcgen::KeyPair::generate().expect("keypair");
+    let cert = rcgen::CertificateParams::new(vec!["grabbr".to_owned()])
+        .expect("params")
+        .self_signed(&key)
+        .expect("self signed");
+    std::fs::write(
+        config_dir.join("lan-mouse.pem"),
+        format!("{}{}", key.serialize_pem(), cert.pem()),
+    )
+    .expect("the identity");
+    let ours = {
+        use sha2::Digest;
+        sha2::Sha256::digest(cert.der().as_ref())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(":")
+    };
+    let authority: Arc<dyn hops::authority::Authority> = Arc::new(
+        hops::authority::SoftwareAuthority::load_or_generate(
+            &config_dir.join(hops::authority::AUTHORITY_KEY_FILE_NAME),
+        )
+        .expect("the authority"),
+    );
+    let (mut file, _) = TrustFile::open(config_dir, authority).expect("the trust file");
+    let mut store = hops::trust::TrustStore::new(&ours, file.now()).expect("our fingerprint");
+    for (fp, label, caps) in pairings {
+        store.issue(fp, label, *caps).expect("a pairing");
+        store.confirm(fp).expect("confirmed");
+    }
+    file.save(&records_of(&store))
+        .expect("the trust file saved");
+}
+
 /// [`start`] on the ports `port` gives, one per start (see [`launch_on`]).
 pub fn start_on(port: impl FnMut() -> u16, tag: &str, tables: &str) -> (Daemon, u16) {
     // Short, for `sun_path` (about 104 bytes on macOS).
     let dir = PathBuf::from(format!("/tmp/{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
+    start_in(dir, port, tables)
+}
+
+/// [`start_on`] in the scratch directory `dir`, which may already hold the
+/// daemon's identity and trust store.
+fn start_in(dir: PathBuf, port: impl FnMut() -> u16, tables: &str) -> (Daemon, u16) {
     let config_dir = dir.join(".config/lan-mouse");
     std::fs::create_dir_all(&config_dir).expect("a scratch config directory");
     std::fs::create_dir_all(dir.join("Library/Caches")).expect("scratch caches");

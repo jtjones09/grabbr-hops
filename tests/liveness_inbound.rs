@@ -21,9 +21,10 @@ async fn a_closed_inbound_link_is_shown_down_within_a_second() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let peer = common::Identity::new();
     let fingerprint = peer.fingerprint();
-    let (daemon, port) = common::start(
+    let (daemon, port) = common::start_paired(
         "h-live-in",
-        &format!("[authorized_fingerprints]\n\"{fingerprint}\" = \"driver\"\n"),
+        "",
+        &[(&fingerprint, "driver", common::DRIVES_US)],
     );
     let (mut events, _requests) = hops_ipc::connect_async(Some(Duration::from_secs(10)))
         .await

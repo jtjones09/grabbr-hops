@@ -992,6 +992,7 @@ fn device_row(d: &Device, clipboard: Option<Clipboard>, theme: &Theme) -> ListIt
         TrustState::Trusted => ("trusted", Style::default().fg(col(theme.success))),
         TrustState::Provisional => ("unverified", Style::default().fg(col(theme.warn))),
         TrustState::PendingApproval => ("pending", Style::default().fg(col(theme.warn))),
+        TrustState::PairAgain => ("pair again", Style::default().fg(col(theme.warn))),
     };
 
     let mut spans = vec![
@@ -1024,6 +1025,10 @@ fn device_row(d: &Device, clipboard: Option<Clipboard>, theme: &Theme) -> ListIt
         // Paired for this machine to control it, and no device for it yet:
         // it gets one when it dials in (#15).
         spans.push(Span::styled("dials in  ", muted));
+    } else if d.pair_again {
+        // Paired with an older version and not since: it neither connects
+        // in nor is dialled until it is paired again (#231).
+        spans.push(Span::styled("older pairing  ", muted));
     } else {
         spans.push(Span::styled("connects in only  ", muted));
     }
@@ -1360,7 +1365,13 @@ fn footer_line(
     }
 
     let mut spans = vec![Span::styled("a", key), Span::raw(" add  ")];
-    if let Some(d) = selected {
+    if selected.is_some_and(|d| d.pair_again) {
+        // Paired with an older version (#231): add it again, choosing
+        // which way control goes, or remove it. Nothing else applies.
+        spans = vec![Span::styled("a", key), Span::raw(" add it again  ")];
+        spans.push(Span::styled("d", key));
+        spans.push(Span::raw(" remove  "));
+    } else if let Some(d) = selected {
         spans.push(Span::styled("n", key));
         spans.push(Span::raw(if d.send.is_some() {
             " name  "
@@ -1864,6 +1875,71 @@ mod tests {
             (listens, port_input(&model).err()),
             (true, Some(DIALS_OUT_ONLY_NOTE)),
             "(a listening machine edits its port, one that only dials out is told why not)"
+        );
+    }
+
+    /// A machine paired with an older version and not since is one row that
+    /// says so, and its footer offers only adding it again and removing it
+    /// (#231). `d` removes it by fingerprint.
+    // LEDGER R231-6 | class B | 3 widget tree: ui() rendered to a test terminal, and confirmed() for its `d`
+    #[test]
+    fn a_machine_to_pair_again_is_a_row_that_offers_adding_it_again() {
+        use hops_frontend_core::PeerTrust;
+        let fp = "bc:05:ab:7a";
+        let mut model = AppModel::default();
+        model.connected = true;
+        model.apply(FrontendEvent::TrustUpdated(
+            [(
+                fp.to_string(),
+                PeerTrust {
+                    label: "iridium".into(),
+                    pair_again: true,
+                    ..Default::default()
+                },
+            )]
+            .into(),
+        ));
+        let devices = listable(&model);
+        assert_eq!(devices.len(), 1, "one row for the machine: {devices:?}");
+        let lines = render_at(&model, 0, 160, 24);
+        let screen = lines.join("\n");
+        if let Ok(dir) = std::env::var("HOPS_TUI_RENDER_DIR") {
+            let _ = std::fs::write(format!("{dir}/tui-pair-again.txt"), &screen);
+        }
+        assert!(
+            lines.iter().any(|l| l.contains("iridium")
+                && l.contains("pair again")
+                && l.contains("paired with an older version: add it again")),
+            "no row saying the machine must be paired again:\n{screen}"
+        );
+        let footer = footer_line(
+            None,
+            None,
+            None,
+            devices.first(),
+            None,
+            &theme::default_theme(),
+        )
+        .spans
+        .iter()
+        .map(|s| s.content.to_string())
+        .collect::<String>();
+        assert!(
+            footer.contains("add it again")
+                && footer.contains("remove")
+                && !footer.contains("rename"),
+            "the footer offers what does not apply to it: {footer}"
+        );
+        assert!(name_input(&devices[0]).is_none(), "it can be renamed");
+        assert_eq!(
+            confirmed(Confirm::Remove {
+                label: "iridium".into(),
+                handle: None,
+                fp: devices[0].fingerprint.clone(),
+                pin: None,
+                destructive: true,
+            }),
+            Some(FrontendRequest::RemoveAuthorizedKey(fp.to_string())),
         );
     }
 
@@ -3405,6 +3481,7 @@ mod every_state_on_a_row {
                 receive: true,
                 paired: true,
                 controls: true,
+                pair_again: false,
             };
             let mut term = Terminal::new(TestBackend::new(160, 3)).expect("test terminal");
             term.draw(|f| f.render_widget(List::new(vec![device_row(&d, None, &theme)]), f.area()))
@@ -3451,6 +3528,7 @@ mod every_state_on_a_row {
             receive: true,
             paired: true,
             controls: true,
+            pair_again: false,
         };
         let mut term = Terminal::new(TestBackend::new(100, 3)).expect("test terminal");
         term.draw(|f| f.render_widget(List::new(vec![device_row(&d, None, &theme)]), f.area()))

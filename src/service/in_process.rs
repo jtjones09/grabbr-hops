@@ -73,6 +73,40 @@ impl Daemon {
         daemon
     }
 
+    /// [`Daemon::start_capturing`], already paired with each machine in
+    /// `pairings`: its fingerprint, the name it was paired under, and what
+    /// the pairing grants, confirmed on both machines
+    /// ([`crate::test_harness::seed_pairings`]).
+    pub(crate) async fn start_paired(
+        tag: &str,
+        tables: &str,
+        pairings: &[(&str, &str, Caps)],
+        capture: input_capture::Backend,
+        emulation: input_emulation::Backend,
+    ) -> Self {
+        let config = |port: u16| {
+            format!(
+                "port = {port}\ncapture_backend = \"dummy\"\nemulation_backend = \"dummy\"\n\
+                 discovery = false\n\n{tables}"
+            )
+        };
+        let mut daemon = Self::build_with(
+            crate::test_ports::pick,
+            tag,
+            config,
+            pairings,
+            capture,
+            emulation,
+        )
+        .await;
+        daemon.service.permission_watch = crate::permission_watch::PermissionWatch::at_daemon_start(
+            Arc::new(|_| false),
+            Arc::new(|| false),
+            Duration::from_secs(3600),
+        );
+        daemon
+    }
+
     async fn build(
         tag: &str,
         tables: &str,
@@ -82,13 +116,65 @@ impl Daemon {
         Self::build_on(crate::test_ports::pick, tag, tables, capture, emulation).await
     }
 
+    /// A daemon's first start on `old`, a whole `config.toml` an earlier
+    /// build wrote, as an upgrade meets it: no trust file yet. Only its
+    /// `port` line is changed, to one this test may bind, and the dummy
+    /// backends and no discovery are put before it.
+    pub(crate) async fn upgraded_from(tag: &str, old: &str) -> Self {
+        let config = |port: u16| {
+            let old = old
+                .lines()
+                .map(|l| {
+                    if l.trim_start().starts_with("port =") {
+                        format!("port = {port}")
+                    } else {
+                        l.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "capture_backend = \"dummy\"\nemulation_backend = \"dummy\"\n\
+                 discovery = false\n{old}\n"
+            )
+        };
+        Self::build_with(
+            crate::test_ports::pick,
+            tag,
+            config,
+            &[],
+            input_capture::Backend::Dummy,
+            input_emulation::Backend::Dummy,
+        )
+        .await
+    }
+
     /// [`Daemon::build`] on the ports `port` gives. A port can be bound by
     /// another process between being picked and the listener binding it, so
     /// a daemon whose port is taken is built again on the next.
     async fn build_on(
-        mut port: impl FnMut() -> u16,
+        port: impl FnMut() -> u16,
         tag: &str,
         tables: &str,
+        capture: input_capture::Backend,
+        emulation: input_emulation::Backend,
+    ) -> Self {
+        let config = |port: u16| {
+            format!(
+                "port = {port}\ncapture_backend = \"dummy\"\nemulation_backend = \"dummy\"\n\
+                 discovery = false\n\n{tables}"
+            )
+        };
+        Self::build_with(port, tag, config, &[], capture, emulation).await
+    }
+
+    /// [`Daemon::build_on`] with the whole config `config_at` writes for
+    /// the port picked.
+    async fn build_with(
+        mut port: impl FnMut() -> u16,
+        tag: &str,
+        config_at: impl Fn(u16) -> String,
+        pairings: &[(&str, &str, Caps)],
         capture: input_capture::Backend,
         emulation: input_emulation::Backend,
     ) -> Self {
@@ -99,17 +185,13 @@ impl Daemon {
         let scratch = Scratch { dir };
         let dir = &scratch.dir;
         let mut last = None;
+        if !pairings.is_empty() {
+            crate::test_harness::seed_pairings(dir, &dir.join("hops.pem"), pairings);
+        }
         for _ in 0..PORT_ATTEMPTS {
             let port = port();
             let config = dir.join("config.toml");
-            std::fs::write(
-                &config,
-                format!(
-                    "port = {port}\ncapture_backend = \"dummy\"\nemulation_backend = \"dummy\"\n\
-                     discovery = false\n\n{tables}"
-                ),
-            )
-            .expect("a config");
+            std::fs::write(&config, config_at(port)).expect("a config");
             let endpoint = DaemonEndpoint::Unix(dir.join("s.sock"));
             let frontends =
                 AsyncFrontendListener::at_with_token_file(&endpoint, &dir.join("ipc-token"))

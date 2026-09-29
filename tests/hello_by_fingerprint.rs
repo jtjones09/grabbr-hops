@@ -74,15 +74,17 @@ async fn a_machine_sharing_an_address_cannot_set_another_devices_build_or_capabi
         .and_then(|s| s.local_addr())
         .expect("a free port")
         .port();
-    let (daemon, port) = common::start(
+    let (daemon, port) = common::start_paired(
         "h-hello",
         &format!(
-            "[authorized_fingerprints]\n\"{desk_fp}\" = \"desk mac\"\n\"{laptop_fp}\" = \"laptop\"\n\n\
-             [[clients]]\nposition = \"left\"\nips = [\"127.0.0.1\"]\nport = {unused}\n\
+            "[[clients]]\nposition = \"left\"\nips = [\"127.0.0.1\"]\nport = {unused}\n\
              activate_on_startup = true\nfingerprint = \"{desk_fp}\"\n",
             desk_fp = desk.fingerprint(),
-            laptop_fp = laptop.fingerprint(),
         ),
+        &[
+            (&desk.fingerprint(), "desk mac", common::BOTH_WAYS),
+            (&laptop.fingerprint(), "laptop", common::DRIVES_US),
+        ],
     );
     let (mut events, mut requests) = hops_ipc::connect_async(Some(Duration::from_secs(10)))
         .await

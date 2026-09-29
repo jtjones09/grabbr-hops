@@ -141,14 +141,14 @@ fn switching_a_device_off_closes_its_link_and_switching_it_on_dials_again() {
             .and_then(|s| s.local_addr())
             .expect("a free port")
             .port();
-        let (daemon, daemon_port) = common::start(
+        let (daemon, daemon_port) = common::start_paired(
             "h-switch",
             &format!(
-                "[authorized_fingerprints]\n\"{fp}\" = \"receiver\"\n\n\
-                 [[clients]]\nposition = \"left\"\nips = [\"127.0.0.1\"]\nport = {port}\n\
+                "[[clients]]\nposition = \"left\"\nips = [\"127.0.0.1\"]\nport = {port}\n\
                  fingerprint = \"{fp}\"\nactivate_on_startup = true\n\n\
                  [[clients]]\nposition = \"left\"\nips = [\"127.0.0.1\"]\nport = {nowhere}\n"
             ),
+            &[(&fp, "receiver", common::BOTH_WAYS)],
         );
         let log = || daemon.log();
         let (mut events, mut requests) = hops_ipc::connect_async(Some(Duration::from_secs(10)))

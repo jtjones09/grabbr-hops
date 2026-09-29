@@ -24,6 +24,12 @@ pub enum Connection {
     /// Nothing sent to it gets through, whatever its link or the switch here
     /// says, so it outranks every state but [`Connection::ServiceGone`].
     NoLongerTrusts,
+    /// Paired with a version of hops before the trust store, and not since:
+    /// it grants nothing either way until it is paired again, with the
+    /// direction chosen (#231). Nothing here or there changes that, so it
+    /// outranks every state but [`Connection::ServiceGone`] and
+    /// [`Connection::NoLongerTrusts`].
+    PairAgain,
     /// A pairing waits for the person here to compare its number (#167).
     ComparingNumber,
     /// This machine approved a pairing and waits for the other machine to
@@ -74,8 +80,9 @@ pub enum Tone {
 
 impl Connection {
     /// Every state, for frontends and tests that show or check them all.
-    pub const ALL: [Connection; 11] = [
+    pub const ALL: [Connection; 12] = [
         Connection::ServiceGone,
+        Connection::PairAgain,
         Connection::NoLongerTrusts,
         Connection::ComparingNumber,
         Connection::AwaitingOtherMachine,
@@ -94,7 +101,7 @@ impl Connection {
         use Link::{Down, Up};
         use Number::{Answered, NotYet, OnScreen};
         use SendFacet::{Off, On};
-        use Standing::{NotPaired, Paired, Pairing};
+        use Standing::{NotPaired, PairAgain, Paired, Pairing};
         // No `_ =>` arm: a new fact, or a new value of one, does not compile
         // until it is given a state.
         //
@@ -115,6 +122,9 @@ impl Connection {
             // That machine refuses this one outright: no link, switch or
             // pairing here changes that, and the card must say what does.
             (true, true, _, _, _, _) => C::NoLongerTrusts,
+            // Nothing is granted either way until it is paired again, so
+            // nothing about a link says more (#231).
+            (true, false, PairAgain, _, _, _) => C::PairAgain,
             (true, false, _, On(Up { accepting: false }), _, _) => C::NotAcceptingInput,
             // The number of a pairing in progress is on its own card; the dot
             // says whether input gets through the link that is up.
@@ -162,6 +172,7 @@ impl Connection {
             Connection::NotAcceptingInput | Connection::NoLongerTrusts => Tone::Bad,
             Connection::ComparingNumber
             | Connection::AwaitingOtherMachine
+            | Connection::PairAgain
             | Connection::NotPaired
             | Connection::Unreachable => Tone::Warn,
             Connection::ServiceGone
@@ -179,6 +190,8 @@ impl Connection {
             // Short enough to fit beside a send row's controls in the
             // window at its default width; the daemon's notice says the rest.
             Connection::NoLongerTrusts => "it removed this machine",
+            // The daemon's notice and the row's buttons say the rest.
+            Connection::PairAgain => "paired with an older version: add it again",
             Connection::ComparingNumber => "compare the number",
             Connection::AwaitingOtherMachine => "waiting for its approval",
             Connection::NotAcceptingInput => "not accepting input",
@@ -221,6 +234,9 @@ pub enum Standing {
     Paired,
     /// No pairing: never identified, or no grant either way.
     NotPaired,
+    /// Paired with a version of hops before the trust store, and granting
+    /// nothing until it is paired again (#231).
+    PairAgain,
 }
 
 /// Where the number of a pairing stands, on this machine.
@@ -269,6 +285,7 @@ mod tests {
             Standing::Pairing(Number::Answered),
             Standing::Paired,
             Standing::NotPaired,
+            Standing::PairAgain,
         ];
         let sends = [
             SendFacet::None,
@@ -312,7 +329,7 @@ mod tests {
         let all = every();
         assert_eq!(
             all.len(),
-            2 * 5 * 6 * 2 * 2 * 2,
+            2 * 6 * 6 * 2 * 2 * 2,
             "the enumeration missed a value"
         );
         for f in all {
@@ -333,6 +350,16 @@ mod tests {
                 "no longer trusts: {why}"
             );
             if f.removed_by_peer {
+                continue;
+            }
+            // A machine to pair again says so whatever else holds, and only
+            // it does (#231): it grants nothing either way until then.
+            assert_eq!(
+                f.standing == Standing::PairAgain,
+                c == Connection::PairAgain,
+                "pair again: {why}"
+            );
+            if c == Connection::PairAgain {
                 continue;
             }
             // A link that is up and refused reads refused, whatever the

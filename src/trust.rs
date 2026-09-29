@@ -766,6 +766,25 @@ pub struct TrustStore {
     /// One record per identity, ordered so the file this serialises to does not
     /// churn between saves for no reason.
     entries: BTreeMap<String, Entry>,
+    /// Machines a build before this store listed, and nothing here since:
+    /// each to be paired again (#231). Kept apart from `entries` so that no
+    /// question the store answers can read one: they name a machine and
+    /// grant it nothing, in either direction.
+    pair_again: BTreeMap<String, PairAgain>,
+}
+
+/// A machine a build before the trust store listed in
+/// `[authorized_fingerprints]`, which was never paired under it (#231).
+///
+/// That list fed both directions and never said which way control goes, so
+/// the upgrade does not guess one: the machine is listed, to be paired again
+/// with the direction asked (#220), and grants nothing until then.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PairAgain {
+    /// The name the old list gave it.
+    pub label: String,
+    /// When the upgrade found it, in unix seconds.
+    pub since: u64,
 }
 
 impl TrustStore {
@@ -781,6 +800,7 @@ impl TrustStore {
             ours,
             clock: Clock::new(floor),
             entries: BTreeMap::new(),
+            pair_again: BTreeMap::new(),
         })
     }
 
@@ -816,6 +836,10 @@ impl TrustStore {
             });
         }
         let peer = lease.peer.clone();
+        // A pairing both machines confirmed is the pairing again (#231).
+        if lease.confirmed {
+            self.pair_again.remove(&peer);
+        }
         self.entries.entry(peer).or_default().lease = Some(lease);
         Ok(())
     }
@@ -1093,8 +1117,13 @@ impl TrustStore {
             .entries
             .get_mut(&fp)
             .ok_or_else(|| TrustError::Unknown(fp.clone()))?;
-        let lease = entry.lease.as_mut().ok_or(TrustError::Unknown(fp))?;
+        let lease = entry
+            .lease
+            .as_mut()
+            .ok_or(TrustError::Unknown(fp.clone()))?;
         lease.confirmed = true;
+        // Paired again, so no longer one to pair again (#231).
+        self.pair_again.remove(&fp);
         Ok(())
     }
 
@@ -1237,8 +1266,52 @@ impl TrustStore {
     /// Needs no authority and cannot fail. Sessions are the caller's job:
     /// identity is checked once, at the handshake, so forgetting does nothing
     /// to a connection already up.
+    ///
+    /// A machine listed only to be paired again is forgotten the same way.
     pub fn forget(&mut self, fingerprint: &str) -> bool {
-        self.entries.remove(&key(fingerprint)).is_some()
+        let fp = key(fingerprint);
+        let listed = self.pair_again.remove(&fp).is_some();
+        self.entries.remove(&fp).is_some() || listed
+    }
+
+    /// Record `fingerprint` as a machine to pair again, named `label`
+    /// (#231). The load door for such a record, and the migration's.
+    ///
+    /// Grants nothing: it is kept apart from every lease, and no question
+    /// the store answers reads it. A fingerprint that already holds a
+    /// record here is left as it is, and one that is not canonical is
+    /// refused, since no peer could ever present it.
+    pub fn list_to_pair_again(
+        &mut self,
+        fingerprint: &str,
+        label: &str,
+        since: u64,
+    ) -> Result<(), TrustError> {
+        let fp = canonical_fingerprint(fingerprint)
+            .ok_or_else(|| TrustError::BadFingerprint(fingerprint.to_string()))?;
+        if fp == self.ours || self.entries.contains_key(&fp) {
+            return Ok(());
+        }
+        self.pair_again.insert(
+            fp,
+            PairAgain {
+                label: sanitize_label(label),
+                since,
+            },
+        );
+        Ok(())
+    }
+
+    /// The machine `fingerprint` is listed to be paired again: a build
+    /// before this store listed it, and it has not been paired since. Its
+    /// name, if so.
+    pub fn to_pair_again(&self, fingerprint: &str) -> Option<&PairAgain> {
+        self.pair_again.get(&key(fingerprint))
+    }
+
+    /// Every machine listed to be paired again, by fingerprint.
+    pub fn every_to_pair_again(&self) -> impl Iterator<Item = (&str, &PairAgain)> {
+        self.pair_again.iter().map(|(fp, p)| (fp.as_str(), p))
     }
 
     // -- decisions ---------------------------------------------------------
@@ -1413,53 +1486,46 @@ impl TrustStore {
     // -- migration ---------------------------------------------------------
 
     /// Turn the two legacy `config.toml` tables into records. Runs once per
-    /// installation; afterwards those tables are a cache nothing reads.
+    /// installation, when there is no trust file; afterwards those tables are
+    /// a cache nothing reads.
     ///
-    /// # Capabilities a carried-forward fingerprint gets
+    /// # What a carried-forward fingerprint gets
     ///
-    /// [`Caps::INBOUND`] always. [`Caps::OUTBOUND`] only when `dialled` names it
-    /// — that is, when a `[[clients]]` entry actually pinned that fingerprint.
-    /// The clipboard half of each is [`existing_pairing_clipboard`] of the drive
-    /// bits (#186).
+    /// Nothing (#231). Each is listed to be paired again
+    /// ([`TrustStore::list_to_pair_again`]), which names the machine and
+    /// grants it no direction and no clipboard.
     ///
-    /// The tempting answer is "both, because the old flat map fed both
-    /// verifiers." It fed both, but membership was **necessary and not
-    /// sufficient** for outbound: a dial also needs a client entry aimed at that
-    /// peer. A fingerprint that was allowlisted and never a dial target had
-    /// outbound permission in theory and never once in practice, so minting it
-    /// now would be a capability the user never granted, created at upgrade, by
-    /// the code that claims to retire exactly that defect (#130).
-    ///
-    /// Restricting to the dialled set is therefore not a narrowing anyone can
-    /// feel: the mouse keeps crossing to precisely the machines it crossed to
-    /// yesterday. What it removes is a permission that was never exercised.
+    /// The old list cannot say more. A build before this store fed the one
+    /// list to both the inbound and the outbound check, so a fingerprint in
+    /// it said only that someone approved that machine once, never which
+    /// machine was to control which. A `[[clients]]` entry does not say it
+    /// either: v0.12.0 wrote no fingerprint on one, so which listed machine
+    /// answers at its address is unknown, and a device aimed at a machine
+    /// is not a choice that the machine may not control this one. Granting
+    /// inbound to everything listed, as this function once did, took the
+    /// grant away from every machine that controlled another and handed it
+    /// to every machine that was controlled; granting both directions
+    /// mints control nobody chose (#130). Asking is the only answer that is
+    /// not a guess, and the pairing card asks (#220).
     ///
     /// # Removals
     ///
     /// A fingerprint in `revoked` was removed by the build that wrote the
-    /// table. Removal now forgets (#184), so nothing is recorded for it, and
-    /// an `authorized` entry for the same fingerprint is not carried forward
-    /// either: the table said it was removed, and removed means gone. Both
-    /// spellings of one fingerprint are matched, since the old tables were
-    /// compared case-insensitively.
+    /// table. Removal forgets (#184), so nothing is recorded for it, and an
+    /// `authorized` entry for the same fingerprint is not listed either: the
+    /// table said it was removed, and removed means gone. Both spellings of
+    /// one fingerprint are matched, since the old tables were compared
+    /// case-insensitively.
     ///
     /// # Malformed fingerprints
     ///
-    /// A malformed *authorized* key is dropped: computed leaf-cert fingerprints
-    /// are always canonical, so it could never have matched a peer and dropping
-    /// it takes nothing away.
-    ///
-    /// # Term
-    ///
-    /// [`DEFAULT_TERM`], the same as a lease a user approves today. A
-    /// carried-forward grant used to get 400 days so that an upgrade would not
-    /// arm a deadline the user was never shown; with no term at all (#183)
-    /// there is no deadline to arm.
+    /// A malformed *authorized* key is dropped: computed leaf-cert
+    /// fingerprints are always canonical, so it could never have matched a
+    /// peer and dropping it takes nothing away.
     pub fn migrate_from_config(
         &mut self,
         authorized: &HashMap<String, String>,
         revoked: &HashMap<String, RevokedEntry>,
-        dialled: &HashSet<String>,
         now: u64,
     ) -> MigrationReport {
         let mut report = MigrationReport::default();
@@ -1469,15 +1535,10 @@ impl TrustStore {
         // tables become one record set, and it records nothing.
         let removed: HashSet<String> = revoked.keys().map(|fp| key(fp)).collect();
 
-        let dialled: HashSet<String> = dialled.iter().map(|fp| key(fp)).collect();
-
         for (fp, label) in authorized {
             // Both legacy readers lowercase but neither trims, so two spellings
             // of one identity can arrive as two map entries and collapse to one
-            // record here. Keyed insertion is what makes that harmless; an
-            // earlier draft pushed to a vector and produced a duplicate row that
-            // the store's own validator then refused, so the upgrade could not
-            // complete at all.
+            // record here. Keyed insertion is what makes that harmless.
             let Some(fp) = canonical_fingerprint(fp) else {
                 report.dropped.push(fp.clone());
                 continue;
@@ -1488,39 +1549,14 @@ impl TrustStore {
                 }
                 continue;
             }
-            let drive = if dialled.contains(&fp) {
-                Caps::DRIVE_ME | Caps::I_MAY_DRIVE
-            } else {
-                Caps::DRIVE_ME
-            };
-            // The v0.12 config never asked about the clipboard, so the
-            // pairing gets what #186 decided for every pairing made before
-            // that question existed.
-            let caps = drive | existing_pairing_clipboard(drive);
-            let lease = Lease {
-                peer: fp.clone(),
-                issued_to: self.ours.clone(),
-                // The old grant door never sanitised its description — only the
-                // rename did — so every label from that door, the CLI included,
-                // reaches this point unsanitised.
-                label: label.clone(),
-                caps,
-                origin: Origin::Migrated,
-                issued_at: now,
-                expiry: DEFAULT_TERM.expiry_from(now),
-                clipboard_chosen: false,
-                // A person approved each of these, before there was a number
-                // to compare; they cannot be asked about one they never saw.
-                confirmed: true,
-            };
-            match self.admit(lease) {
-                Ok(()) if !report.leased.contains(&fp) => report.leased.push(fp),
+            match self.list_to_pair_again(&fp, label, now) {
+                Ok(()) if !report.to_pair_again.contains(&fp) => report.to_pair_again.push(fp),
                 Ok(()) => {}
                 Err(_) => report.dropped.push(fp),
             }
         }
 
-        report.leased.sort();
+        report.to_pair_again.sort();
         report.refused.sort();
         report.dropped.sort();
         report
@@ -1531,8 +1567,8 @@ impl TrustStore {
 /// question a user will ask after upgrading.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MigrationReport {
-    /// Fingerprints that became live leases.
-    pub leased: Vec<String>,
+    /// Fingerprints listed to be paired again, granting nothing (#231).
+    pub to_pair_again: Vec<String>,
     /// Authorized entries the removals table also named: not carried
     /// forward, and not recorded (#184).
     pub refused: Vec<String>,
@@ -1812,10 +1848,6 @@ mod tests {
                 )
             })
             .collect()
-    }
-
-    fn dialled(fps: &[&str]) -> HashSet<String> {
-        fps.iter().map(|f| (*f).to_string()).collect()
     }
 
     // ------------------------------------------------------------ direction
@@ -2228,27 +2260,22 @@ mod tests {
         assert!(s.may_drive_us(&peer));
     }
 
-    /// This asserted a warning at 395 days and a lapse at 400. The migrated
-    /// lease now carries no term (#183), so there is no outage to warn about.
+    /// A machine the old config listed stays listed and grants nothing, however
+    /// long the store runs: no sweep, lapse or expiry turns it into a lease
+    /// (#231).
     #[test]
-    fn an_upgraded_fleet_still_works_ten_years_on_and_is_never_nagged() {
+    fn a_machine_listed_to_pair_again_never_becomes_a_grant_with_time() {
         let mut s = store();
         let peer = fp(0x25);
         let mut config = HashMap::new();
         config.insert(peer.clone(), "desk".to_string());
-        s.migrate_from_config(&config, &HashMap::new(), &HashSet::new(), T0);
+        s.migrate_from_config(&config, &HashMap::new(), T0);
 
         for later in [T0 + 395 * DAY, T0 + 400 * DAY, T0 + 10 * YEAR] {
-            assert!(
-                s.sweep(later).is_empty(),
-                "a carried-forward pairing lapsed at {later} — nothing renews a \
-                 lease yet, so a lapse is a device that stops working for good"
-            );
-            assert!(s.may_drive_us(&peer), "it must still work at {later}");
-            assert!(
-                !s.is_expiring(&peer),
-                "and nothing may ask the user to renew what cannot lapse"
-            );
+            assert!(s.sweep(later).is_empty(), "a listing lapsed at {later}");
+            assert_eq!(s.forget_long_lapsed(later), 0, "a listing was aged out");
+            assert_eq!(s.capabilities(&peer), Caps::NONE, "granted at {later}");
+            assert!(s.to_pair_again(&peer).is_some(), "unlisted at {later}");
         }
     }
 
@@ -2686,34 +2713,75 @@ mod tests {
 
     // --------------------------------------------------------------- migration
 
+    // LEDGER R231-2 | class B | 1 return value: migrate_from_config, capabilities, to_pair_again, is_known
+    /// The flat list fed both TLS verifiers and never said which machine
+    /// controls which, so the upgrade grants neither direction and no
+    /// clipboard, and lists each machine to be paired again (#231).
     #[test]
-    fn migration_grants_outbound_only_to_a_peer_the_old_config_actually_dialled() {
-        // The flat allowlist fed both TLS verifiers, so "it was already both
-        // directions" is tempting. It was necessary and not sufficient: an
-        // outbound dial also needed a [[clients]] entry aimed at that peer, so a
-        // fingerprint that was never a dial target had outbound in theory and
-        // never once in practice. Minting it now would be a capability the user
-        // never granted, created at upgrade, by the code that retires #130.
-        let (both, inbound_only) = (fp(0x80), fp(0x81));
+    fn migration_grants_nothing_and_lists_each_machine_to_pair_again() {
+        let (receiver, sender) = (fp(0x80), fp(0x81));
         let mut s = store();
         let report = s.migrate_from_config(
-            &allow(&[(&both, "receiver"), (&inbound_only, "sender")]),
+            &allow(&[(&receiver, "receiver"), (&sender, "sender")]),
             &HashMap::new(),
-            &dialled(&[&both]),
             T0,
         );
 
-        assert_eq!(report.leased.len(), 2);
-        assert!(s.may_drive_us(&both) && s.we_may_drive(&both));
-        assert!(
-            s.may_drive_us(&inbound_only),
-            "a peer that connected in must keep connecting in — this is the \
-             direction the fleet was actually using"
+        assert_eq!(report.to_pair_again, {
+            let mut both = vec![receiver.clone(), sender.clone()];
+            both.sort();
+            both
+        });
+        for peer in [&receiver, &sender] {
+            assert_eq!(
+                s.capabilities(peer),
+                Caps::NONE,
+                "the upgrade granted {peer} something a list of fingerprints cannot say"
+            );
+            assert!(!s.is_known(peer), "a listing was made a pairing record");
+            assert!(s.to_pair_again(peer).is_some(), "{peer} was not listed");
+        }
+        assert!(s.is_empty(), "the upgrade wrote a lease");
+    }
+
+    // LEDGER R231-3 | class B | 1 return value: list_to_pair_again, issue, confirm, forget, to_pair_again
+    /// Pairing a listed machine again takes it off the list once both
+    /// machines confirm, and not before; removing one forgets it; a listing
+    /// never replaces a pairing already here.
+    #[test]
+    fn a_listed_machine_leaves_the_list_by_pairing_again_or_removal() {
+        let (again, gone, paired) = (fp(0x86), fp(0x87), fp(0x8a));
+        let mut s = store();
+        s.issue_confirmed(&paired, "paired", Caps::INBOUND)
+            .expect("issue");
+        s.migrate_from_config(
+            &allow(&[(&again, "again"), (&gone, "gone"), (&paired, "old name")]),
+            &HashMap::new(),
+            T0,
         );
         assert!(
-            !s.we_may_drive(&inbound_only),
-            "and the direction it never exercised must not be minted at upgrade"
+            s.to_pair_again(&paired).is_none(),
+            "a machine already paired here was listed to be paired again"
         );
+        assert_eq!(s.label(&paired).as_deref(), Some("paired"));
+
+        s.issue(&again, "again", Caps::DRIVE).expect("approve");
+        assert!(
+            s.to_pair_again(&again).is_some(),
+            "an approval not yet confirmed took the machine off the list"
+        );
+        s.confirm(&again).expect("confirm");
+        assert!(
+            s.to_pair_again(&again).is_none(),
+            "paired again, still listed"
+        );
+        assert_eq!(
+            s.capabilities(&again).intersection(Caps::DRIVE),
+            Caps::DRIVE
+        );
+
+        assert!(s.forget(&gone), "removing a listed machine found nothing");
+        assert!(s.to_pair_again(&gone).is_none(), "removed, still listed");
     }
 
     #[test]
@@ -2723,7 +2791,6 @@ mod tests {
         let report = s.migrate_from_config(
             &allow(&[(&peer, "attacker")]),
             &removed(&[(&peer, REMOVED_AT)]),
-            &dialled(&[&peer]),
             T0,
         );
         assert_eq!(report.refused, vec![peer.clone()]);
@@ -2734,7 +2801,7 @@ mod tests {
              that used to be restated at four doors is applied here, once"
         );
         assert!(
-            !s.is_known(&peer),
+            !s.is_known(&peer) && s.to_pair_again(&peer).is_none(),
             "a removal recorded before the upgrade was carried into the store"
         );
     }
@@ -2746,7 +2813,6 @@ mod tests {
         s.migrate_from_config(
             &allow(&[(&peer.to_uppercase(), "attacker")]),
             &removed(&[(&peer, REMOVED_AT)]),
-            &HashSet::new(),
             T0,
         );
         assert_eq!(
@@ -2763,11 +2829,10 @@ mod tests {
         s.migrate_from_config(
             &allow(&[(&peer, "attacker")]),
             &removed(&[(&peer.to_uppercase(), REMOVED_AT)]),
-            &HashSet::new(),
             T0,
         );
         assert_eq!(s.capabilities(&peer), Caps::NONE);
-        assert!(!s.is_known(&peer));
+        assert!(!s.is_known(&peer) && s.to_pair_again(&peer).is_none());
     }
 
     #[test]
@@ -2782,11 +2847,10 @@ mod tests {
         s.migrate_from_config(
             &allow(&[(&peer, "a"), (&spaced, "b")]),
             &removed(&[(&peer, REMOVED_AT), (&spaced, REMOVED_AT)]),
-            &HashSet::new(),
             T0,
         );
         assert!(
-            s.is_empty(),
+            s.is_empty() && s.every_to_pair_again().next().is_none(),
             "a removed identity under two spellings left a record"
         );
     }
@@ -2797,11 +2861,13 @@ mod tests {
         let report = s.migrate_from_config(
             &allow(&[("not-a-fingerprint", "junk")]),
             &removed(&[("also-not-one", REMOVED_AT)]),
-            &HashSet::new(),
             T0,
         );
         assert_eq!(report.dropped, vec!["not-a-fingerprint".to_string()]);
-        assert!(s.is_empty(), "a malformed entry left a record");
+        assert!(
+            s.is_empty() && s.every_to_pair_again().next().is_none(),
+            "a malformed entry left a record"
+        );
     }
 
     /// A device removed before the upgrade is not recorded anywhere after
@@ -2821,13 +2887,12 @@ mod tests {
                     revoked_at: T0 + 1_000 * DAY,
                 },
             )]),
-            &HashSet::new(),
             T0,
         );
 
         assert!(
-            report.leased.is_empty(),
-            "an empty allowlist must migrate to no leases at all"
+            report.to_pair_again.is_empty(),
+            "an empty allowlist must list nothing"
         );
         assert!(
             s.is_empty(),
@@ -2851,12 +2916,10 @@ mod tests {
     fn a_migrated_label_is_sanitised_on_the_way_in() {
         let peer = fp(0x89);
         let mut s = store();
-        s.migrate_from_config(
-            &allow(&[(&peer, "ev\u{202e}il")]),
-            &HashMap::new(),
-            &HashSet::new(),
-            T0,
+        s.migrate_from_config(&allow(&[(&peer, "ev\u{202e}il")]), &HashMap::new(), T0);
+        assert_eq!(
+            s.to_pair_again(&peer).map(|p| p.label.as_str()),
+            Some("evil")
         );
-        assert_eq!(s.label(&peer).as_deref(), Some("evil"));
     }
 }

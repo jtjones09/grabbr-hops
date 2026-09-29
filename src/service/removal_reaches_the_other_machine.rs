@@ -57,13 +57,13 @@ fn a_machine_removed_while_apart_learns_it_on_its_next_dial() {
         let desk = Daemon::start("apart-desk", "", input_emulation::Backend::Dummy).await;
         let (desk_fp, desk_port, desk_trust, desk_ipc) =
             (desk.fingerprint(), desk.port(), desk.trust(), desk.ipc());
-        let laptop = Daemon::start_capturing(
+        let laptop = Daemon::start_paired(
             "apart-laptop",
             &format!(
-                "[authorized_fingerprints]\n\"{desk_fp}\" = \"desk\"\n\n\
-                 [[clients]]\nposition = \"right\"\nips = [\"127.0.0.1\"]\nport = {desk_port}\n\
+                "[[clients]]\nposition = \"right\"\nips = [\"127.0.0.1\"]\nport = {desk_port}\n\
                  activate_on_startup = true\nfingerprint = \"{desk_fp}\"\n"
             ),
+            &[(&desk_fp, "desk", Caps::DRIVE)],
             script.backend(),
             input_emulation::Backend::Dummy,
         )

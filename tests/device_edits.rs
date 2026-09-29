@@ -52,6 +52,11 @@ impl Daemon {
 
     /// Start a daemon on `config`, with `{port}` replaced by its listen port.
     fn start(tag: &str, config: &str) -> Daemon {
+        Self::start_paired(tag, config, &[])
+    }
+
+    /// [`Daemon::start`], already paired with each machine in `pairings`.
+    fn start_paired(tag: &str, config: &str, pairings: &[common::Pairing]) -> Daemon {
         // Short, for `sun_path` (about 104 bytes on macOS), and resolved: on
         // macOS /tmp is a link, and the config watcher matches the path the
         // filesystem reports, which is the resolved one.
@@ -62,6 +67,7 @@ impl Daemon {
         let config_dir = dir.join(".config/lan-mouse");
         std::fs::create_dir_all(&config_dir).expect("a scratch config directory");
         std::fs::create_dir_all(dir.join("Library/Caches")).expect("scratch caches");
+        common::seed_pairings(&config_dir, pairings);
         // SAFETY: the tests in this binary hold ONE_AT_A_TIME, and set these
         // before anything that reads the environment.
         unsafe {
@@ -199,16 +205,20 @@ impl Receiver {
     }
 
     /// A config with one device at the left edge pointing at this receiver,
-    /// switched on and trusted in both directions, as an upgrade from a
-    /// build that had dialled it leaves it.
+    /// switched on. The pairing with it is [`Receiver::pairing`].
     fn config(&self) -> String {
         format!(
             "{DUMMY}\n[[clients]]\nhostname = \"127.0.0.1\"\nips = [\"127.0.0.1\"]\n\
              port = {}\nposition = \"left\"\nactivate_on_startup = true\n\
-             fingerprint = \"{fp}\"\n\n[authorized_fingerprints]\n\"{fp}\" = \"receiver\"\n",
+             fingerprint = \"{fp}\"\n",
             self.port,
             fp = self.fingerprint,
         )
+    }
+
+    /// The daemon's pairing with this receiver: each may drive the other.
+    fn pairing(&self) -> [common::Pairing<'_>; 1] {
+        [(&self.fingerprint, "receiver", common::BOTH_WAYS)]
     }
 }
 
@@ -312,7 +322,7 @@ fn local(test: impl std::future::Future<Output = ()>) {
 /// A daemon connected to a receiver, and a frontend attached to it.
 async fn connected(tag: &str) -> (Daemon, Receiver, Frontend, u64) {
     let receiver = Receiver::start();
-    let daemon = Daemon::start(tag, &receiver.config());
+    let daemon = Daemon::start_paired(tag, &receiver.config(), &receiver.pairing());
     let mut frontend = Frontend::attach().await;
     let up = until("the daemon to dial", Duration::from_secs(20), || {
         receiver.accepted.get() > 0
@@ -512,12 +522,13 @@ fn a_delete_or_rename_for_a_pin_the_device_no_longer_has_is_refused() {
     local(async {
         let pin = format!("{}11", "11:".repeat(31));
         let shown = format!("{}22", "22:".repeat(31));
-        let daemon = Daemon::start(
+        let daemon = Daemon::start_paired(
             "5",
             &format!(
                 "{DUMMY}\n[[clients]]\nhostname = \"desk.invalid\"\nposition = \"left\"\n\
-                 fingerprint = \"{pin}\"\n\n[authorized_fingerprints]\n\"{pin}\" = \"desk\"\n"
+                 fingerprint = \"{pin}\"\n"
             ),
+            &[(&pin, "desk", common::BOTH_WAYS)],
         );
         let mut frontend = Frontend::attach().await;
         let handle = handle_named(&frontend.devices().await, "desk.invalid");
@@ -681,13 +692,14 @@ fn deleting_a_machine_saved_as_two_devices_removes_both() {
                  fingerprint = \"{pin}\"\n"
             )
         };
-        let daemon = Daemon::start(
+        let daemon = Daemon::start_paired(
             "7",
             &format!(
-                "{DUMMY}{}{}\n[authorized_fingerprints]\n\"{pin}\" = \"desk\"\n",
+                "{DUMMY}{}{}",
                 entry("desk.invalid", "top"),
                 entry("192.0.2.10", "bottom"),
             ),
+            &[(&pin, "desk", common::BOTH_WAYS)],
         );
         let mut frontend = Frontend::attach().await;
         let shown = frontend.devices().await;

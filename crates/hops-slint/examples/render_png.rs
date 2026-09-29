@@ -199,6 +199,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             trusted: true,
             clipboard: "shared both ways".into(),
             clipboard_on: true,
+            pair_again: false,
         },
         // send-only, never connected (provisional — no fingerprint learned yet)
         DeviceRow {
@@ -216,6 +217,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             trusted: false,
             clipboard: "".into(),
             clipboard_on: false,
+            pair_again: false,
         },
         // receive-only trusted peer, connected in
         DeviceRow {
@@ -233,6 +235,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             trusted: true,
             clipboard: "arrives here from this device".into(),
             clipboard_on: true,
+            pair_again: false,
         },
         // receive-only trusted peer, offline
         DeviceRow {
@@ -250,6 +253,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             trusted: true,
             clipboard: "off".into(),
             clipboard_on: false,
+            pair_again: false,
         },
         // a machine this one controls that dials in to be controlled (#15),
         // with its link down: this machine waits for it
@@ -268,6 +272,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             trusted: true,
             clipboard: "goes from here to this device".into(),
             clipboard_on: true,
+            pair_again: false,
         },
         // a pairing this machine only controls, with no device for it yet:
         // listed, and removable, before that machine first dials in
@@ -286,6 +291,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             trusted: true,
             clipboard: "goes from here to this device".into(),
             clipboard_on: true,
+            pair_again: false,
         },
         // the machine this one dials removed this one (#184): the card says
         // so and keeps its delete button, rather than vanishing
@@ -304,6 +310,26 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             trusted: true,
             clipboard: "".into(),
             clipboard_on: false,
+            pair_again: false,
+        },
+        // paired with an older version and not since (#231): it grants
+        // nothing, and the card offers to add it again or remove it
+        DeviceRow {
+            handle: "".into(),
+            name: "iridium".into(),
+            addr: "".into(),
+            pos: "".into(),
+            active: false,
+            tone: hops_slint::dot_tone(Connection::PairAgain.tone()),
+            status: Connection::PairAgain.words().into(),
+            has_send: false,
+            fingerprint: "bc:05:ab".into(),
+            fp_full: "bc:05:ab:7a:a4:de".into(),
+            pin: "".into(),
+            trusted: false,
+            clipboard: "".into(),
+            clipboard_on: false,
+            pair_again: true,
         },
     ])));
 

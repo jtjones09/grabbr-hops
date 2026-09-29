@@ -213,14 +213,12 @@ async fn refusals(ipc: &Ipc, mac: &Machine, fp: &str, port: u16) -> Vec<String> 
     }
 }
 
-/// The pc's config, as an older build wrote it: the machine `fp` paired as
-/// "desk mac", and a device for it, pinned to it and switched off. A pin
-/// survives the start only for a machine the trust store knows, and the
-/// first start moves this pairing into the store.
+/// The pc's config: a device for the machine `fp`, pinned to it and
+/// switched off. A pin survives the start only for a machine the trust
+/// store knows, so the pc starts paired with it as "desk mac".
 fn switched_off_device_for(fp: &str) -> String {
     format!(
-        "[authorized_fingerprints]\n\"{fp}\" = \"desk mac\"\n\n\
-         [[clients]]\nposition = \"left\"\nips = [\"127.0.0.1\"]\nport = 9\n\
+        "[[clients]]\nposition = \"left\"\nips = [\"127.0.0.1\"]\nport = 9\n\
          activate_on_startup = false\nfingerprint = \"{fp}\"\n"
     )
 }
@@ -235,19 +233,16 @@ fn switched_off_device_for(fp: &str) -> String {
 fn a_refused_machine_that_is_paired_is_named_and_its_switch_is_said() {
     run_local(async {
         let mac = machine();
-        let pc = Daemon::start(
+        // This machine controls the mac, and the mac may not control it.
+        let pc = Daemon::start_paired(
             "off-pc",
             &switched_off_device_for(&mac.fingerprint),
+            &[(&mac.fingerprint, "desk mac", Caps::OUTBOUND)],
+            input_capture::Backend::Dummy,
             input_emulation::Backend::Dummy,
         )
         .await;
-        let (pc_fp, pc_port, pc_trust, pc_ipc) =
-            (pc.fingerprint(), pc.port(), pc.trust(), pc.ipc());
-        // This machine controls the mac, and the mac may not control it.
-        pc_trust
-            .write()
-            .expect("lock")
-            .drop_capabilities(&mac.fingerprint, Caps::DRIVE_ME);
+        let (pc_fp, pc_port, pc_ipc) = (pc.fingerprint(), pc.port(), pc.ipc());
 
         let body = async {
             let refused = refusals(&pc_ipc, &mac, &pc_fp, pc_port).await;

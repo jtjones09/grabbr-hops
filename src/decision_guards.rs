@@ -383,20 +383,24 @@ mod a_grant_carries_only_the_direction_that_was_approved {
 }
 
 mod an_upgrade_mints_no_permission_the_old_config_never_granted {
-    //! **Decided 2026-09-05 (#130).** The carried-forward over-grant retires at
-    //! migration; the upgrade must not create a direction the user never gave.
+    //! **Decided 2026-09-05 (#130), narrowed 2026-09-29 (#231).** The upgrade
+    //! must not create a direction the user never gave.
     //!
-    //! **Why.** `[authorized_fingerprints]` membership was *necessary and not
-    //! sufficient* for outbound: a dial also needed a `[[clients]]` entry aimed
-    //! at that peer. A fingerprint that was allowlisted and never a dial target
-    //! held outbound permission in theory and never once in practice. Minting
-    //! it at upgrade would be a capability the user never granted, created by
-    //! the very code that claims to retire that defect.
+    //! **Why.** `[authorized_fingerprints]` fed both verifiers and never said
+    //! which machine controls which. #130 stopped minting outbound for a
+    //! fingerprint no `[[clients]]` entry dialled, and carried inbound forward
+    //! for all of them. #231 found that still a guess: v0.12.0 wrote no
+    //! fingerprint on a `[[clients]]` entry, so no listed machine was ever
+    //! known to be dialled, and every controller lost its grant while every
+    //! controlled machine gained one. Option B was taken: a machine the old
+    //! config listed grants nothing, in either direction, and is listed to be
+    //! paired again, where the pairing card asks the direction (#220).
     //!
-    //! **What makes this urgent rather than theoretical.** Two migrations exist
-    //! in this tree, they disagree, and the tested one is not the one that runs.
+    //! The half of #130 this keeps, no outbound minted at upgrade, holds
+    //! trivially; these tests still assert it by name so a regression that
+    //! mints it again fails here and says which decision it breaks.
 
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
 
     use crate::trust::{Caps, TrustStore, system_seconds};
     use crate::trust_file::rebuild;
@@ -404,11 +408,9 @@ mod an_upgrade_mints_no_permission_the_old_config_never_granted {
 
     use super::fp32;
 
-    /// Migration stamps `issued_at` from the caller and the store enforces
-    /// expiry against `max(system clock, floor)`. A hardcoded timestamp is
-    /// therefore a lease that has already lapsed by the time anyone runs this,
-    /// and the guard then fails for the wrong reason — which is worse than not
-    /// having it, because the message would name #130 for a clock problem.
+    /// Migration stamps its time from the caller and the store enforces
+    /// against `max(system clock, floor)`, so a hardcoded time would be
+    /// measuring the machine the test runs on.
     fn upgrading_now() -> u64 {
         system_seconds()
     }
@@ -420,111 +422,88 @@ mod an_upgrade_mints_no_permission_the_old_config_never_granted {
             .collect()
     }
 
-    /// **RED TODAY (#130).**
-    ///
-    /// This was RED when written: the migration the daemon ran handed every
-    /// carried-forward fingerprint both directions unconditionally, for four
-    /// hundred days. That duplicate has been deleted and the daemon now
-    /// migrates through the store.
+    // LEDGER R231-4 | class B | 1 return value: TrustStore::migrate_from_config, trust_file::rebuild, capabilities, to_pair_again
+    /// A machine the old config listed gets no permission, in either
+    /// direction and through the disk round trip every later start makes,
+    /// and stays listed to be paired again.
     #[test]
-    fn a_fingerprint_the_old_config_never_dialled_gets_no_outbound_permission() {
+    fn a_fingerprint_the_old_config_listed_gets_no_permission_either_way() {
         let ours = fp32(0x01);
-        let never_dialled = fp32(0x44);
+        let listed = fp32(0x44);
 
         let now = upgrading_now();
         let mut migrated = TrustStore::new(&ours, 0).expect("our own fingerprint");
         migrated.migrate_from_config(
-            &old_allowlist(&[(&never_dialled, "a box that only ever knocked")]),
+            &old_allowlist(&[(&listed, "a box the old list named")]),
             &HashMap::<String, RevokedEntry>::new(),
-            &HashSet::new(),
             now,
         );
-        // Through disk, because the round trip is where an upgrade actually
-        // lands and where a widening would show up.
         let (store, refused) = rebuild(&ours, now, &crate::trust_file::records_of(&migrated))
             .expect("rebuild the migrated store");
 
         assert!(
             refused.is_empty(),
             "the migrated records did not survive their own rebuild: {refused:?}. \
-             An upgrade that cannot load what it just wrote locks the user out."
+             An upgrade that cannot load what it just wrote loses the list of \
+             machines to pair again."
         );
-        assert!(
-            store.may_drive_us(&never_dialled),
-            "the upgrade dropped an inbound grant that was live yesterday. \
-             Carrying inbound forward is the whole reason migration exists — \
-             without it every paired machine silently stops working on upgrade."
-        );
-        assert!(
-            !store.we_may_drive(&never_dialled),
-            "the upgrade MINTED outbound permission for a fingerprint the old \
-             config never dialled (#130). Old membership was necessary and not \
-             sufficient for outbound — a dial also needed a [[clients]] entry — \
-             so this is a capability the user never granted, created at upgrade \
-             time by the code whose job is to retire exactly this defect. \
-             Restricting to the dialled set is not a narrowing anyone can feel: \
-             the mouse keeps crossing to precisely the machines it crossed to \
-             yesterday."
-        );
+        for (name, s) in [
+            ("in the upgrade's run", &migrated),
+            ("at a later start", &store),
+        ] {
+            assert!(
+                !s.we_may_drive(&listed),
+                "{name}: the upgrade MINTED outbound permission (#130). The old list \
+                 never said this machine may control that one."
+            );
+            assert!(
+                !s.may_drive_us(&listed),
+                "{name}: the upgrade granted inbound to a machine the old list named \
+                 (#231). The list fed both directions and said nothing of which one \
+                 was meant, so granting inbound is a guess, and for every machine \
+                 that controlled another it is the wrong one."
+            );
+            assert_eq!(
+                s.capabilities(&listed),
+                Caps::NONE,
+                "{name}: clipboard granted"
+            );
+            assert!(
+                s.to_pair_again(&listed).is_some(),
+                "{name}: the machine the old list named is not listed to be paired \
+                 again, so the app cannot show it or offer to pair it (#231)"
+            );
+        }
     }
 
-    /// **RED TODAY (#130).** Two migrations, one rule.
-    ///
-    /// `TrustStore::migrate_from_config` gets this right and has zero
-    /// production callers. `trust_file::migrate` gets it wrong and is the one
-    /// the daemon runs. Their own tests pass in isolation, which is why nobody
-    /// noticed: the guarded one is dead code.
-    ///
-    /// This asserts they AGREE, because "two files disagree and each is
-    /// internally consistent" is the failure a per-file test can never see.
-    /// The duplicate this guard was written to catch has since been deleted, so
-    /// the assertion changed from "the two agree" to "the one that survives is
-    /// the one with the rule". Kept rather than removed: the failure it guards
-    /// against is a second migration reappearing, and a test named for the rule
-    /// still fails if the surviving one starts granting outbound to everything.
+    // LEDGER R231-5 | class B | 1 return value: TrustStore::migrate_from_config, trust_file::rebuild, capabilities
+    /// One migration, one rule: whether or not a `[[clients]]` entry was
+    /// aimed at a listed machine, it is granted nothing, and sealing and
+    /// reloading changes that for none of them.
     #[test]
-    fn there_is_one_migration_and_it_grants_outbound_only_to_a_dialled_peer() {
+    fn there_is_one_migration_and_it_grants_nothing() {
         let ours = fp32(0x01);
-        let dialled = fp32(0x55);
-        let never_dialled = fp32(0x66);
+        let (receiver, knocker) = (fp32(0x55), fp32(0x66));
         let now = upgrading_now();
 
-        let authorized =
-            old_allowlist(&[(&dialled, "the receiver"), (&never_dialled, "a knocker")]);
-        let revoked = HashMap::<String, RevokedEntry>::new();
-
         let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
-        let dial_targets: HashSet<String> = [dialled.clone()].into_iter().collect();
-        store.migrate_from_config(&authorized, &revoked, &dial_targets, now);
-
-        assert!(
-            store.capabilities(&dialled).contains(Caps::I_MAY_DRIVE),
-            "a fingerprint the old config actually dialled must keep outbound, \
-             or the mouse stops crossing to a machine it crossed to yesterday"
+        store.migrate_from_config(
+            &old_allowlist(&[(&receiver, "the receiver"), (&knocker, "a knocker")]),
+            &HashMap::<String, RevokedEntry>::new(),
+            now,
         );
-        assert!(
-            !store
-                .capabilities(&never_dialled)
-                .contains(Caps::I_MAY_DRIVE),
-            "a fingerprint that was allowlisted but never dialled must NOT get \
-             outbound at upgrade. Allowlist membership was necessary and not \
-             sufficient for a dial, so minting it now creates a capability the \
-             user never granted, at upgrade, by the code that exists to retire \
-             exactly that defect"
-        );
-        assert!(
-            store.capabilities(&never_dialled).contains(Caps::DRIVE_ME),
-            "it must still keep inbound, or an upgrade silently drops peers"
-        );
-
-        // The round trip through disk must not widen anything.
         let (reloaded, _) =
             rebuild(&ours, now, &crate::trust_file::records_of(&store)).expect("rebuild");
-        for fp in [&dialled, &never_dialled] {
+        for fp in [&receiver, &knocker] {
+            assert_eq!(
+                store.capabilities(fp),
+                Caps::NONE,
+                "the upgrade granted {fp} something the old list cannot say (#130, #231)"
+            );
             assert_eq!(
                 reloaded.capabilities(fp),
-                store.capabilities(fp),
-                "sealing and reloading changed what {fp} is permitted"
+                Caps::NONE,
+                "sealing and reloading granted {fp} something"
             );
         }
     }
@@ -550,10 +529,6 @@ mod pairings_made_before_182_keep_the_clipboard_direction_their_lease_grants {
     //! the on arm of the per-device switch also turns a clipboard back on by, and
     //! this runs both machines' real transports over loopback, so swapping the
     //! direction there fails here.
-
-    use std::collections::{HashMap, HashSet};
-
-    use hops_ipc::RevokedEntry;
 
     use crate::test_harness::{
         ARRIVES_WITHIN, Machine, NEVER_WITHIN, applied_within, clipboard_pair, machine, run_local,
@@ -600,51 +575,17 @@ mod pairings_made_before_182_keep_the_clipboard_direction_their_lease_grants {
         )
     }
 
-    /// Paired on v0.12, which kept one flat allowlist: each machine listed the
-    /// other, and only the driver had a client entry dialling its peer.
-    fn migrated(driven: &Machine, driver: &Machine) -> (TrustStore, TrustStore) {
-        let migrate = |me: &Machine, peer: &Machine, dialled: bool| {
-            let mut store = TrustStore::new(&me.fingerprint, 0).expect("ours");
-            let authorized: HashMap<String, String> =
-                [(peer.fingerprint.clone(), "peer".to_string())].into();
-            let dialled: HashSet<String> = if dialled {
-                [peer.fingerprint.clone()].into()
-            } else {
-                HashSet::new()
-            };
-            let now = store.now();
-            store.migrate_from_config(
-                &authorized,
-                &HashMap::<String, RevokedEntry>::new(),
-                &dialled,
-                now,
-            );
-            store
-        };
-        (
-            migrate(driven, driver, false),
-            migrate(driver, driven, true),
-        )
-    }
-
     // LEDGER T1861 | class B | 1 return value: ClipboardInbox::next over the queue transport::clipboard_accept_loop fills; ClipboardSender::broadcast, ClipboardSenderListen::broadcast, grant_for_attempt, migrate_from_config, trust_file::rebuild
     #[test]
     fn existing_pairings_keep_their_clipboard_direction() {
         run_local(async {
             type Pairing = fn(&Machine, &Machine) -> (TrustStore, TrustStore);
-            let pairings: [(&str, Pairing, bool); 4] = [
+            // A pairing carried forward from a v0.12 config was a case here.
+            // It grants nothing now, the clipboard included, and is paired
+            // again (#231): `an_upgrade_mints_no_permission_the_old_config_never_granted`.
+            let pairings: [(&str, Pairing, bool); 2] = [
                 ("approved, in the run that approved it", approved, false),
                 ("approved, loaded at a later start", approved, true),
-                (
-                    "carried forward from a v0.12 config, in the upgrade's run",
-                    migrated,
-                    false,
-                ),
-                (
-                    "carried forward from a v0.12 config, loaded at a later start",
-                    migrated,
-                    true,
-                ),
             ];
             for (how, pair_up, reload) in pairings {
                 let (driven, driver) = (machine(), machine());
@@ -2289,12 +2230,21 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
     fn a_held_key_or_a_button_let_go_as_the_peer_leaves_keeps_widening_refused() {
         run_local(async {
             let (desk, laptop) = (machine(), machine());
-            let tables = format!(
-                "[authorized_fingerprints]\n\"{}\" = \"desk mac\"\n\"{}\" = \"laptop\"\n",
-                desk.fingerprint, laptop.fingerprint
-            );
+            // Each may drive this machine and send it its clipboard, as a
+            // pairing made before the clipboard was asked about grants.
+            let from = Caps::DRIVE_ME | Caps::CLIPBOARD_FROM;
             let recording = Recording::new();
-            let daemon = Daemon::start("held", &tables, recording.backend()).await;
+            let daemon = Daemon::start_paired(
+                "held",
+                "",
+                &[
+                    (&desk.fingerprint, "desk mac", from),
+                    (&laptop.fingerprint, "laptop", from),
+                ],
+                input_capture::Backend::Dummy,
+                recording.backend(),
+            )
+            .await;
             let (ours, port, trust, ipc) = (
                 daemon.fingerprint(),
                 daemon.port(),
@@ -2440,12 +2390,21 @@ mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_
     fn only_approving_a_prompt_or_turning_the_clipboard_on_widens_trust_and_neither_while_driven() {
         run_local(async {
             let (desk, laptop, stranger, newcomer) = (machine(), machine(), machine(), machine());
-            let tables = format!(
-                "[authorized_fingerprints]\n\"{}\" = \"desk mac\"\n\"{}\" = \"laptop\"\n",
-                desk.fingerprint, laptop.fingerprint
-            );
+            // Each may drive this machine and send it its clipboard, as a
+            // pairing made before the clipboard was asked about grants.
+            let from = Caps::DRIVE_ME | Caps::CLIPBOARD_FROM;
             let recording = Recording::new();
-            let daemon = Daemon::start("widen", &tables, recording.backend()).await;
+            let daemon = Daemon::start_paired(
+                "widen",
+                "",
+                &[
+                    (&desk.fingerprint, "desk mac", from),
+                    (&laptop.fingerprint, "laptop", from),
+                ],
+                input_capture::Backend::Dummy,
+                recording.backend(),
+            )
+            .await;
             let (ours, port, trust, ipc) = (
                 daemon.fingerprint(),
                 daemon.port(),

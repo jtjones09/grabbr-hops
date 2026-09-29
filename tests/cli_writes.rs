@@ -49,6 +49,11 @@ fn free_port() -> u16 {
 impl Daemon {
     /// Start a daemon whose config is the dummy backends plus `tables`.
     fn start(tag: &str, tables: &str) -> Daemon {
+        Self::start_paired(tag, tables, &[])
+    }
+
+    /// [`Daemon::start`], already paired with each machine in `pairings`.
+    fn start_paired(tag: &str, tables: &str, pairings: &[common::Pairing]) -> Daemon {
         // Short, for `sun_path` (about 104 bytes on macOS).
         let dir = PathBuf::from(format!("/tmp/h-cw{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -57,6 +62,7 @@ impl Daemon {
         let config_dir = dir.join(".config/lan-mouse");
         std::fs::create_dir_all(&config_dir).expect("a scratch config directory");
         std::fs::create_dir_all(dir.join("Library/Caches")).expect("scratch caches");
+        common::seed_pairings(&config_dir, pairings);
         let config = config_dir.join("config.toml");
         let log = dir.join("daemon.log");
         let (child, port) = common::launch(
@@ -364,10 +370,7 @@ fn a_grant_nobody_asked_for_fails_with_the_reason() {
 /// command, which trusted nothing.
 #[test]
 fn a_grant_refused_for_a_paired_device_fails_with_the_reason() {
-    let d = Daemon::start(
-        "regrant",
-        &format!("[authorized_fingerprints]\n\"{PAIRED}\" = \"desk mac\"\n"),
-    );
+    let d = Daemon::start_paired("regrant", "", &[(PAIRED, "desk mac", common::DRIVES_US)]);
     let out = d.cli(&["authorize-key", "desk mac", PAIRED, "--controller", "both"]);
     let (stdout, stderr) = (
         String::from_utf8_lossy(&out.stdout),
