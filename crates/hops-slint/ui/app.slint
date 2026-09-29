@@ -264,11 +264,16 @@ export component AppWindow inherits Window {
         root.add-device-position = root.free-position;
         root.show-add-device = false;
     }
-    // `in-out`: Rust sets both together, once, when the canvas opens — NOT
-    // re-pushed by the poll timer (see layout_canvas.slint's header note on
-    // why a drag would otherwise get fought by the next live update).
+    // Rust sets the boxes when the canvas opens, when a box is dropped, and
+    // when the devices it draws change while it is open (see src/canvas.rs).
     in-out property <bool> show-layout-canvas: false;
     in-out property <[CanvasBox]> canvas-boxes: [];
+    // paired machines this one may control that have no device here, so no
+    // edge: named under the canvas rather than drawn on it
+    in property <string> canvas-unplaced;
+    // this machine's box: its name and kind ("this Mac", "this PC", ...)
+    in property <string> this-machine-name;
+    in property <string> this-machine-kind: "this computer";
 
     callback enable-input();
     callback open-capture-settings();
@@ -301,7 +306,8 @@ export component AppWindow inherits Window {
     // exec can; elsewhere the button did nothing and said nothing (#173).
     in property <bool> can-switch-interface: true;
     callback open-layout-canvas();
-    callback update-device-geometry(string /* handle */, float /* x */, float /* y */);
+    // a box on the arrange canvas was dropped with its top-left corner here
+    callback device-dropped(string /* handle */, float /* x */, float /* y */);
 
     VerticalLayout {
         padding: Space.xxl;
@@ -1453,12 +1459,15 @@ if root.devices.length > 0 || !root.show-add-device: Card {
 
         LayoutCanvas {
             width: 560px;
-            height: 420px;
+            height: self.preferred-height;
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             boxes: root.canvas-boxes;
+            unplaced: root.canvas-unplaced;
+            this-name: root.this-machine-name;
+            this-kind: root.this-machine-kind;
             close => { root.show-layout-canvas = false; }
-            geometry-changed(handle, x, y) => { root.update-device-geometry(handle, x, y); }
+            dropped(handle, x, y) => { root.device-dropped(handle, x, y); }
         }
     }
 }

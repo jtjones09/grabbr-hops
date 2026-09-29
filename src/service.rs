@@ -3744,10 +3744,27 @@ impl Service {
         self.broadcast_client(handle);
     }
 
+    /// Move the device at `handle` to the `pos` edge. A switched-on device
+    /// moved onto an edge another switched-on device uses trades edges with
+    /// it, so both keep working (#174): activation would otherwise switch
+    /// the other one off, and the arrange canvas moves devices by dropping
+    /// them.
     fn update_pos(&mut self, handle: ClientHandle, pos: Position) {
+        let from = self.client_manager.get_pos(handle);
+        let holder = self
+            .client_manager
+            .client_at(pos)
+            .filter(|&other| other != handle);
         // update state in event input emulator & input capture
         if self.client_manager.set_pos(handle, pos) {
             self.deactivate_client(handle);
+            if let (Some(other), Some(from)) = (holder, from) {
+                if self.client_manager.set_pos(other, from) {
+                    self.deactivate_client(other);
+                    self.activate_client(other);
+                }
+                self.broadcast_client(other);
+            }
             self.activate_client(handle);
         }
         self.broadcast_client(handle);
@@ -4608,6 +4625,9 @@ mod each_controls_the_other;
 
 #[cfg(all(test, unix))]
 mod kept_awake;
+
+#[cfg(all(test, unix))]
+mod a_move_onto_a_taken_edge;
 
 #[cfg(all(test, unix, any(feature = "tui", feature = "slint")))]
 mod every_pairing_is_listed;
