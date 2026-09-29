@@ -3,7 +3,8 @@
 //!
 //! Runs the hops binary as it runs in use, with `GRABBR_KEEP_AWAKE` unset,
 //! and reads what the system lists for the daemon's process. The pairing is
-//! made through the config tables an upgrade reads.
+//! written to the trust store before the daemon starts: a config table lists
+//! a machine to pair again and grants it nothing (#231).
 #![cfg(target_os = "macos")]
 
 mod common;
@@ -33,10 +34,10 @@ async fn the_daemon_holds_the_assertion_only_while_something_may_control_it() {
     let fingerprint = peer.fingerprint();
 
     // Paired with a device that may control this Mac.
-    let (paired, _) = common::start_with(
-        common::ports::pick,
+    let (paired, _) = common::start_paired_with(
         "h-awake-p",
-        &format!("[authorized_fingerprints]\n\"{fingerprint}\" = \"desk pc\"\n"),
+        "",
+        &[(&fingerprint, "desk pc", common::DRIVES_US)],
         common::Power::AsInUse,
     );
     let until = Instant::now() + DEADLINE;

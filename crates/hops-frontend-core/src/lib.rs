@@ -221,7 +221,7 @@ impl Device {
     /// Excludes ONLY a bare inbound pairing request, which lives in the pairing
     /// banner instead.
     pub fn is_listable(&self) -> bool {
-        self.send.is_some() || self.receive || self.paired
+        self.send.is_some() || self.receive || self.paired || self.pair_again
     }
 }
 
@@ -1007,6 +1007,9 @@ pub enum TrustState {
     Trusted,
     /// An un-authorized peer awaiting the user's pairing approval.
     PendingApproval,
+    /// Paired with a version of hops before the trust store, and not since:
+    /// it grants nothing until it is paired again (#231).
+    PairAgain,
 }
 
 /// The outgoing ("send input to this device") facet of a [`Device`], present
@@ -1044,6 +1047,10 @@ pub struct Device {
     pub paired: bool,
     /// Its pairing lets this machine control it.
     pub controls: bool,
+    /// Paired with a version of hops before the trust store and not since
+    /// (#231): it grants nothing, and the card offers to add it again or
+    /// remove it by fingerprint.
+    pub pair_again: bool,
 }
 
 /// The hostname to store for a machine picked off the network list.
@@ -1159,8 +1166,9 @@ impl AppModel {
     pub fn clipboard(&self, fp: &str) -> Option<Clipboard> {
         self.trust
             .get(fp)
-            // mid-pairing: nothing is shared yet, and there is nothing to switch
-            .filter(|t| !t.pending)
+            // mid-pairing, or to pair again: nothing is shared, and there is
+            // nothing to switch
+            .filter(|t| !t.pending && !t.pair_again)
             .map(|t| match (t.clipboard_from, t.clipboard_to) {
                 (false, false) => Clipboard::Off,
                 (true, false) => Clipboard::FromIt,
@@ -1198,6 +1206,7 @@ impl AppModel {
                     receive: true,
                     paired: true,
                     controls: false,
+                    pair_again: false,
                 },
             );
         }
@@ -1211,6 +1220,22 @@ impl AppModel {
             if is_self(fp) || t.pending {
                 continue;
             }
+            // Paired with an older version and not since (#231): one card,
+            // to add again or remove, holding nothing.
+            if t.pair_again {
+                by_fp.entry(fp.clone()).or_insert_with(|| Device {
+                    fingerprint: Some(fp.clone()),
+                    label: display_label(None, Some(&t.label), fp),
+                    trust: TrustState::PairAgain,
+                    connection: Connection::ServiceGone,
+                    send: None,
+                    receive: false,
+                    paired: false,
+                    controls: false,
+                    pair_again: true,
+                });
+                continue;
+            }
             let device = by_fp.entry(fp.clone()).or_insert_with(|| Device {
                 fingerprint: Some(fp.clone()),
                 label: display_label(None, Some(&t.label), fp),
@@ -1220,6 +1245,7 @@ impl AppModel {
                 receive: false,
                 paired: true,
                 controls: false,
+                pair_again: false,
             });
             device.controls = t.we_may_drive;
         }
@@ -1246,6 +1272,7 @@ impl AppModel {
                         receive: false,
                         paired: false,
                         controls: false,
+                        pair_again: false,
                     });
                     // One entry per card. Of two entries for one machine, the
                     // first added names the card and takes its buttons (#12):
@@ -1285,6 +1312,7 @@ impl AppModel {
                     receive: false,
                     paired: false,
                     controls: false,
+                    pair_again: false,
                 }),
             }
         }
@@ -1301,6 +1329,7 @@ impl AppModel {
                     receive: false,
                     paired: false,
                     controls: false,
+                    pair_again: false,
                 });
             }
         }
@@ -1345,6 +1374,7 @@ impl AppModel {
                     Some(_) => Number::OnScreen,
                 },
             ),
+            Some(fp) if self.trust.get(fp).is_some_and(|t| t.pair_again) => Standing::PairAgain,
             Some(fp)
                 if self.authorized.contains_key(fp)
                     || self.trust.get(fp).is_some_and(|t| !t.pending) =>

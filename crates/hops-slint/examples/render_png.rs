@@ -4,6 +4,7 @@
 //
 //   cargo run -p lan-mouse-slint --example render_png -- /path/to/out.png [w] [h] [theme_index] [mode]
 //   mode: normal (default) | settings | add-device | edit-device | delete-confirm | removed-delete-confirm | revoke-confirm | layout-canvas
+//         | folded-delete-confirm | folded-remove-confirm
 //         | layout-canvas
 //
 // Requires the crate's slint dep to carry feature "software-renderer-systemfonts"
@@ -199,6 +200,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             trusted: true,
             clipboard: "shared both ways".into(),
             clipboard_on: true,
+            pair_again: false,
         },
         // send-only, never connected (provisional — no fingerprint learned yet)
         DeviceRow {
@@ -216,6 +218,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             trusted: false,
             clipboard: "".into(),
             clipboard_on: false,
+            pair_again: false,
         },
         // receive-only trusted peer, connected in
         DeviceRow {
@@ -233,6 +236,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             trusted: true,
             clipboard: "arrives here from this device".into(),
             clipboard_on: true,
+            pair_again: false,
         },
         // receive-only trusted peer, offline
         DeviceRow {
@@ -250,6 +254,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             trusted: true,
             clipboard: "off".into(),
             clipboard_on: false,
+            pair_again: false,
         },
         // a machine this one controls that dials in to be controlled (#15),
         // with its link down: this machine waits for it
@@ -268,6 +273,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             trusted: true,
             clipboard: "goes from here to this device".into(),
             clipboard_on: true,
+            pair_again: false,
         },
         // a pairing this machine only controls, with no device for it yet:
         // listed, and removable, before that machine first dials in
@@ -286,6 +292,7 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             trusted: true,
             clipboard: "goes from here to this device".into(),
             clipboard_on: true,
+            pair_again: false,
         },
         // the machine this one dials removed this one (#184): the card says
         // so and keeps its delete button, rather than vanishing
@@ -304,6 +311,45 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
             trusted: true,
             clipboard: "".into(),
             clipboard_on: false,
+            pair_again: false,
+        },
+        // the same, folded with the device its address reached (#231): one
+        // card, still granting nothing
+        DeviceRow {
+            handle: "6".into(),
+            name: "iridium".into(),
+            addr: "192.0.2.156:4722".into(),
+            pos: "right".into(),
+            active: true,
+            tone: hops_slint::dot_tone(Connection::PairAgain.tone()),
+            status: Connection::PairAgain.words().into(),
+            has_send: true,
+            fingerprint: "bc:05:ab".into(),
+            fp_full: "bc:05:ab:7a:a4:de".into(),
+            pin: "bc:05:ab:7a:a4:de".into(),
+            trusted: false,
+            clipboard: "".into(),
+            clipboard_on: false,
+            pair_again: true,
+        },
+        // paired with an older version and not since (#231): it grants
+        // nothing, and the card offers to add it again or remove it
+        DeviceRow {
+            handle: "".into(),
+            name: "osmium".into(),
+            addr: "".into(),
+            pos: "".into(),
+            active: false,
+            tone: hops_slint::dot_tone(Connection::PairAgain.tone()),
+            status: Connection::PairAgain.words().into(),
+            has_send: false,
+            fingerprint: "e7:31:0d".into(),
+            fp_full: "e7:31:0d:58:c2:19".into(),
+            pin: "".into(),
+            trusted: false,
+            clipboard: "".into(),
+            clipboard_on: false,
+            pair_again: true,
         },
     ])));
 
@@ -420,6 +466,10 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
         Some("delete-confirm") => ui.set_confirm_delete_handle("1".into()),
         // the device whose machine removed this one, asked about deleting it
         Some("removed-delete-confirm") => ui.set_confirm_delete_handle("4".into()),
+        // iridium: a device folded into its listing to pair again (#231),
+        // asked about deleting it, and about removing it
+        Some("folded-delete-confirm") => ui.set_confirm_delete_handle("6".into()),
+        Some("folded-remove-confirm") => ui.set_confirm_revoke_fp("bc:05:ab:7a:a4:de".into()),
         // b7:2a:55 is the mock windows-pc — a trusted, receive-capable peer
         Some("revoke-confirm") => ui.set_confirm_revoke_fp("b7:2a:55:e1:90:33".into()),
         // The arrange overlay is a hardcoded 560x420 centred by

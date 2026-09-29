@@ -197,12 +197,10 @@ fn refusing_receiver(me: &common::Identity) -> u16 {
 async fn refusals_reach_the_app_as_errors_or_activity_and_a_stranger_prompts_once_per_address() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let paired = common::Identity::new();
-    let (daemon, port) = common::start(
+    let (daemon, port) = common::start_paired(
         "h-refuse",
-        &format!(
-            "[authorized_fingerprints]\n\"{}\" = \"sentinel\"\n",
-            paired.fingerprint()
-        ),
+        "",
+        &[(&paired.fingerprint(), "sentinel", common::DRIVES_US)],
     );
     let mut app = App::connect().await;
     // Every property is checked and reported together, so one run says which

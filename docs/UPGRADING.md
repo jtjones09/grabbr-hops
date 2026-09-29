@@ -9,6 +9,13 @@ other, so update all of them. When a dial gets no answer on 4722, 0.13
 checks the old port, and the app names the machine that still runs an
 older hops.
 
+## Pair each machine again
+
+hops 0.12 kept one list of paired machines that did not say which machine
+controls which, so 0.13 trusts none of them until they are paired again.
+Each shows as "paired with an older version: add it again". The steps are
+in [SECURITY.md](SECURITY.md#upgrading-from-hops-012).
+
 ## The port
 
 hops 0.12 listens on 4242, the old port. A `port = 4242` line in

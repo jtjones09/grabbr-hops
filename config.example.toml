@@ -7,10 +7,10 @@ release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
 # machine still set to 4242 is not reached by one that dials 4722)
 # port = 4722
 
-# optional: set to false on a machine that should only dial out, such as
-# one behind a VPN or security client that drops incoming connections. It
-# then listens on no port and is controlled over the connection it opens to
-# each machine that controls it.
+# optional: set to false so that this machine listens on no port. It is
+# controlled over the connection it opens to each machine that controls
+# it, which it does whether or not it listens, so a machine behind a VPN
+# or security client that drops incoming connections works either way.
 # listen = false
 
 # optional: set to false to stop announcing this machine on the local
@@ -18,8 +18,10 @@ release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
 # others; devices are then added by address. See docs/NETWORK.md.
 # discovery = false
 
-# list of authorized tls certificate fingerprints that
-# are accepted for incoming traffic
+# the machines allowed to control this one, written by hops as a record.
+# Adding a line trusts nothing: pairings are kept in a signed trust file
+# beside this one. Removing a line removes that machine here too. A list
+# written by hops 0.12 shows each machine as one to pair again.
 [authorized_fingerprints]
 "bc:05:ab:7a:a4:de:88:8c:2f:92:ac:bc:b8:49:b8:24:0d:44:b3:e6:a4:ef:d7:0b:6c:69:6d:77:53:0b:14:80" = "iridium"
 

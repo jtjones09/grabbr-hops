@@ -108,15 +108,21 @@ fn capture_pos(pos: hops_ipc::Position) -> Position {
 }
 
 /// The controlled machine's config: it only dials out, and holds a device
-/// for the controlling machine at `port` on loopback, pinned to `fp`, which
-/// it may drive and which may drive it, as a pairing made before v0.13
-/// migrates to.
+/// for the controlling machine at `port` on loopback, pinned to `fp`. Its
+/// pairing with that machine is [`paired_with`].
 fn dials_out_to(fp: &str, port: u16) -> String {
     format!(
-        "listen = false\n\n[authorized_fingerprints]\n\"{fp}\" = \"desk pc\"\n\n\
+        "listen = false\n\n\
          [[clients]]\nposition = \"left\"\nips = [\"127.0.0.1\"]\nport = {port}\n\
          activate_on_startup = true\nfingerprint = \"{fp}\"\n"
     )
+}
+
+/// The controlled machine's pairing with the controlling machine `fp`: each
+/// may drive the other, as the pairing card's "each controls the other"
+/// leaves it.
+fn paired_with(fp: &str) -> [(&str, &str, Caps); 1] {
+    [(fp, "desk pc", Caps::DRIVE)]
 }
 
 // LEDGER T1 | class B | 6 struct state: Recording::calls() on the dialling daemon, two whole daemons in-process
@@ -136,9 +142,10 @@ fn the_controlled_machine_dials_out_and_is_driven_over_its_own_link() {
         let pc = Daemon::start_capturing("rv-pc", "", pc_script.backend(), on_pc.backend()).await;
         let (pc_fp, pc_port, pc_trust, pc_ipc) =
             (pc.fingerprint(), pc.port(), pc.trust(), pc.ipc());
-        let mac = Daemon::start_capturing(
+        let mac = Daemon::start_paired(
             "rv-mac",
             &dials_out_to(&pc_fp, pc_port),
+            &paired_with(&pc_fp),
             mac_script.backend(),
             on_mac.backend(),
         )
@@ -266,9 +273,10 @@ fn a_redial_while_the_pointer_is_across_lands_its_input_or_gives_it_back() {
         let pc = Daemon::start_capturing("rd-pc", "", pc_script.backend(), on_pc.backend()).await;
         let (pc_fp, pc_port, pc_trust, pc_ipc) =
             (pc.fingerprint(), pc.port(), pc.trust(), pc.ipc());
-        let mac = Daemon::start_capturing(
+        let mac = Daemon::start_paired(
             "rd-mac",
             &dials_out_to(&pc_fp, pc_port),
+            &paired_with(&pc_fp),
             mac_script.backend(),
             on_mac.backend(),
         )
@@ -425,15 +433,16 @@ fn the_controlled_machine_dials_again_until_its_link_is_taken() {
         let pc = Daemon::start("again-pc", "", input_emulation::Backend::Dummy).await;
         let (pc_fp, pc_port, pc_trust, pc_ipc) =
             (pc.fingerprint(), pc.port(), pc.trust(), pc.ipc());
-        let mac = Daemon::start(
+        let mac = Daemon::start_paired(
             "again-mac",
             &dials_out_to(&pc_fp, pc_port),
+            &paired_with(&pc_fp),
+            input_capture::Backend::Dummy,
             input_emulation::Backend::Dummy,
         )
         .await;
-        // Each controls the other, as the mac's migrated pairing says: a
-        // machine that only dials out dials this one too, since nothing can
-        // dial it.
+        // Each controls the other, as the mac's pairing says: the mac dials
+        // this one to be driven by it.
         let mac_fp = mac.fingerprint();
         pc_trust
             .write()
@@ -487,9 +496,11 @@ fn a_keyless_endpoint_at_the_controllers_address_does_not_say_it_removed_this_ma
     run_local(async {
         let pc = crate::test_harness::machine();
         let (_keyless, port, answered) = crate::test_harness::keyless_listener();
-        let mac = Daemon::start(
+        let mac = Daemon::start_paired(
             "keyless-mac",
             &dials_out_to(&pc.fingerprint, port),
+            &paired_with(&pc.fingerprint),
+            input_capture::Backend::Dummy,
             input_emulation::Backend::Dummy,
         )
         .await;
@@ -552,12 +563,19 @@ fn a_name_that_resolves_to_nothing_is_told_once_until_it_changes() {
     run_local(async {
         let pc = crate::test_harness::machine();
         let config = format!(
-            "listen = false\n\n[authorized_fingerprints]\n\"{fp}\" = \"desk pc\"\n\n\
+            "listen = false\n\n\
              [[clients]]\nposition = \"left\"\nhostname = \"no-such-machine.invalid\"\n\
              port = 9\nactivate_on_startup = false\nfingerprint = \"{fp}\"\n",
             fp = pc.fingerprint
         );
-        let mac = Daemon::start("unresolved-mac", &config, input_emulation::Backend::Dummy).await;
+        let mac = Daemon::start_paired(
+            "unresolved-mac",
+            &config,
+            &paired_with(&pc.fingerprint),
+            input_capture::Backend::Dummy,
+            input_emulation::Backend::Dummy,
+        )
+        .await;
         let mac_ipc = mac.ipc();
         let body = async {
             let not_found = |name: &'static str| {

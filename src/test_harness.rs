@@ -676,3 +676,36 @@ pub(crate) fn keyless_listener() -> (
     });
     (endpoint, port, answered)
 }
+
+/// Pair the daemon whose identity is (or will be) at `cert`, in the
+/// configuration directory `dir`, with each machine in `pairings` before it
+/// starts: a trust store signed by that directory's authority, each pairing
+/// confirmed on both machines, as the pairing card leaves it. The label is
+/// the name each was paired under, and the capabilities what it grants.
+///
+/// The way a test starts a daemon already paired. `[authorized_fingerprints]`
+/// in its config is not one: a daemon's first start lists those machines to
+/// be paired again and grants them nothing (#231). The daemon tests that use
+/// it run on unix, where they reach its IPC socket.
+#[cfg(unix)]
+pub(crate) fn seed_pairings(
+    dir: &std::path::Path,
+    cert: &std::path::Path,
+    pairings: &[(&str, &str, Caps)],
+) {
+    let identity = crate::crypto::load_or_generate_key_and_cert(cert).expect("the identity");
+    let ours = crate::crypto::certificate_fingerprint(&identity);
+    let authority: Arc<dyn crate::authority::Authority> = Arc::new(
+        crate::authority::SoftwareAuthority::load_or_generate(
+            &dir.join(crate::authority::AUTHORITY_KEY_FILE_NAME),
+        )
+        .expect("the authority"),
+    );
+    let (mut file, _) = crate::trust_file::TrustFile::open(dir, authority).expect("the trust file");
+    let mut store = TrustStore::new(&ours, file.now()).expect("our fingerprint");
+    for (fp, label, caps) in pairings {
+        store.issue_confirmed(fp, label, *caps).expect("a pairing");
+    }
+    file.save(&crate::trust_file::records_of(&store))
+        .expect("the trust file saved");
+}

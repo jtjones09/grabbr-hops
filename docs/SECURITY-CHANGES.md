@@ -28,6 +28,12 @@ Since 0.12.0. No advisory was published for these.
   removed machine could be trusted again after a restart.
 - Every pairing is listed and can be removed, including one this machine
   only controls.
+- A pairing made by 0.12 grants nothing until the two machines are paired
+  again, choosing which controls which. Before, the upgrade trusted every
+  machine on 0.12's list, which never said which way control goes.
+- The list of machines in `config.toml` grants nothing, including when the
+  trust file is missing. A machine removed from it, by hand or by 0.12, is
+  removed here too.
 - Renaming a device can no longer make it trusted.
 - The list of paired machines is signed; a trust file edited by hand or
   copied from elsewhere stops hops instead of being trusted. A config

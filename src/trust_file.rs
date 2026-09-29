@@ -230,6 +230,10 @@ pub enum DiskState {
     /// and dropped as the store loads: removing a device now forgets it, so
     /// this build never writes one.
     Revoked,
+    /// A machine a build before the trust store listed, to be paired again
+    /// (#231). Carries no capability and never loads as a lease: it names
+    /// the machine so the app can offer to pair it again or remove it.
+    PairAgain,
 }
 
 /// What act produced this lease. Recorded because under #130 the provenance of
@@ -1053,6 +1057,20 @@ fn validate(leases: &[LeaseRecord], path: &Path) -> Result<(), TrustFileError> {
                     ));
                 }
             }
+            // Listed to be paired again: it grants nothing, so a record that
+            // claims a capability or a clipboard, or a confirmed pairing, is
+            // not one this machine wrote.
+            DiskState::PairAgain => {
+                if !lease.caps.is_empty() || lease.clipboard.is_some() || lease.confirmed {
+                    return Err(TrustFileError::untrusted(
+                        path,
+                        format!(
+                            "{} is listed to be paired again but claims a pairing",
+                            lease.fingerprint
+                        ),
+                    ));
+                }
+            }
         }
     }
     Ok(())
@@ -1113,6 +1131,12 @@ pub fn rebuild(
                      device now forgets it, and it can be paired again",
                     r.fingerprint
                 ));
+            }
+            // A machine to pair again (#231). Listed, and never a lease.
+            DiskState::PairAgain => {
+                if let Err(e) = store.list_to_pair_again(&r.fingerprint, &r.label, r.issued_at) {
+                    refused.push(format!("{}: {e}", r.fingerprint));
+                }
             }
             // A pairing interrupted before both machines confirmed it. The
             // number it was confirmed with died with that session, and a
@@ -1339,6 +1363,13 @@ pub fn records_of(store: &TrustStore) -> Vec<LeaseRecord> {
     let mut out: Vec<LeaseRecord> = Vec::new();
     for (fp, e) in store.entries() {
         if let Some(l) = e.lease.as_ref() {
+            // A machine to pair again, approved here and waiting for its
+            // number, is written as the listing alone: one row per
+            // fingerprint, and the unconfirmed lease would be dropped as the
+            // store loads anyway, which leaves the listing as it was (#231).
+            if !l.confirmed && store.to_pair_again(fp).is_some() {
+                continue;
+            }
             let mut caps = Vec::new();
             if l.caps.contains(Caps::DRIVE_ME) {
                 caps.push(DiskCap::Inbound);
@@ -1391,6 +1422,22 @@ pub fn records_of(store: &TrustStore) -> Vec<LeaseRecord> {
             });
         }
     }
+    // A machine to pair again: its name and when the upgrade found it, and
+    // nothing it may do (#231).
+    for (fp, p) in store.every_to_pair_again() {
+        out.push(LeaseRecord {
+            fingerprint: fp.to_string(),
+            label: p.label.clone(),
+            state: DiskState::PairAgain,
+            origin: DiskOrigin::Migrated,
+            issued_at: p.since,
+            expires_at: None,
+            revoked_at: None,
+            caps: vec![],
+            confirmed: false,
+            clipboard: None,
+        });
+    }
     // Stable order so an unchanged store produces an identical file, and a diff
     // of the file shows what actually changed.
     out.sort_by(|a, b| a.fingerprint.cmp(&b.fingerprint));
@@ -1400,9 +1447,8 @@ pub fn records_of(store: &TrustStore) -> Vec<LeaseRecord> {
 //
 // There were two, and they disagreed: this one granted every carried-forward
 // fingerprint BOTH directions unconditionally, while `TrustStore::migrate_from_config`
-// grants outbound only to a peer the old config actually dialled — and explains
-// at length why minting it otherwise is a capability the user never granted,
-// created at upgrade, by the code that claims to retire exactly that defect.
+// explained why minting a direction nobody chose is a capability the user never
+// granted, created at upgrade. It now grants none at all (#231).
 //
 // The one with the reasoning and the tests had zero production callers. The one
 // that ran had none of either. Two implementations of one rule is how that
@@ -1484,27 +1530,29 @@ mod tests {
     /// way to produce rows. They keep doing that, against the implementation
     /// that actually runs.
     ///
-    /// `dialled` is empty here, so a carried-forward fingerprint gets INBOUND
-    /// only. That is the correct rule and it is why the over-grant test below
-    /// changed rather than being deleted.
+    /// A carried-forward fingerprint is listed to be paired again and
+    /// granted nothing (#231).
     fn migrate(
         authorized: HashMap<String, String>,
         revoked: HashMap<String, RevokedEntry>,
         now: u64,
     ) -> Migration {
         let mut store = TrustStore::new(&ours(), now).expect("ours");
-        let report = store.migrate_from_config(
-            &authorized,
-            &revoked,
-            &std::collections::HashSet::new(),
-            now,
-        );
+        let report = store.migrate_from_config(&authorized, &revoked, now);
         Migration {
             leases: records_of(&store),
-            carried_forward: report.leased.len(),
+            carried_forward: report.to_pair_again.len(),
             refused: report.refused,
             dropped: report.dropped,
         }
+    }
+
+    /// The rows of a store holding one pairing with `fp`, approved and
+    /// confirmed on both machines, granting `caps`.
+    fn approved(fp: &str, label: &str, caps: Caps, now: u64) -> Vec<LeaseRecord> {
+        let mut store = TrustStore::new(&ours(), now).expect("ours");
+        store.issue_confirmed(fp, label, caps).expect("a pairing");
+        records_of(&store)
     }
 
     /// The machine the shim migrates for.
@@ -1583,48 +1631,113 @@ mod tests {
         assert!(m.leases.is_empty(), "a record was written");
     }
 
-    /// This asserted BOTH directions, and was wrong. The flat allowlist did
-    /// feed both verifiers, but membership was **necessary and not sufficient**
-    /// for outbound: a dial also needed a `[[clients]]` entry aimed at that
-    /// peer. A fingerprint that was allowlisted and never dialled had outbound
-    /// in theory and never once in practice, so minting it at upgrade creates a
-    /// capability the user never granted — by the code whose job is to retire
-    /// exactly that defect.
-    ///
-    /// The shim above migrates with an empty dialled set, so this peer is the
-    /// never-dialled case.
+    /// This asserted inbound carried forward, and before that both
+    /// directions. The old list never said which machine controls which, so
+    /// the upgrade grants neither (#231): the fingerprint is saved as a
+    /// machine to pair again, with nothing it may do, and reads back so.
+    // LEDGER R231-8 | class B | 1 return value: records_of, rebuild, to_pair_again
     #[test]
-    fn an_unrevoked_fingerprint_survives_with_inbound_and_is_not_handed_outbound() {
+    fn an_unrevoked_fingerprint_is_listed_to_pair_again_and_granted_nothing() {
         let m = migrate(allow(&[(A, "laptop")]), removals(&[]), NOW);
-        let lease = find(&m, A).expect("carried forward");
-        assert_eq!(lease.caps, vec![DiskCap::Inbound]);
+        let record = find(&m, A).expect("listed");
+        assert_eq!(
+            (
+                record.state,
+                record.caps.as_slice(),
+                record.confirmed,
+                &record.clipboard
+            ),
+            (DiskState::PairAgain, &[][..], false, &None),
+            "the upgrade saved a pairing for a machine the old list named"
+        );
         let store = rebuilt(&m.leases, NOW);
-        assert!(
-            store.may_drive_us(A) && !store.we_may_drive(A),
-            "a peer the old config never dialled keeps inbound — dropping that \
-             would break a working fleet with nothing in the UI to explain it — \
-             and must NOT be handed outbound it never had"
+        assert_eq!(store.capabilities(A), Caps::NONE, "it grants something");
+        assert_eq!(
+            store.to_pair_again(A).map(|p| p.label.as_str()),
+            Some("laptop"),
+            "it is no longer listed, or lost its name, once saved and read back"
         );
         assert!(m.refused.is_empty());
     }
 
+    // LEDGER R231-9 | class B | 1 return value: validate, TrustFile::open
+    /// A machine listed to pair again, edited on disk to claim a capability,
+    /// is refused before the signature is even read, and by it after.
+    #[test]
+    fn a_hand_edit_that_turns_a_listing_into_a_grant_is_refused() {
+        let d = tmpdir("relist");
+        let m = migrate(allow(&[(A, "laptop")]), removals(&[]), NOW);
+        let (mut file, _) = TrustFile::open(&d, authority(&d)).expect("open");
+        file.save(&m.leases).expect("save");
+
+        let p = d.join(TRUST_FILE_NAME);
+        let text = fs::read_to_string(&p).expect("read");
+        let widened = text.replace("caps = []", "caps = [\"inbound\"]");
+        assert_ne!(widened, text, "precondition: the edit applied");
+        let forged: TrustBody =
+            toml_edit::de::from_str(widened.rsplit_once(SIGNATURE_SEPARATOR).expect("body").0)
+                .expect("the forgery parses");
+        assert!(
+            validate(&forged.leases, &p).is_err(),
+            "a listing that claims a capability passed the structural checks"
+        );
+        fs::write(&p, &widened).expect("write");
+        let err = TrustFile::open(&d, authority(&d)).expect_err("must refuse");
+        assert!(matches!(err, TrustFileError::Untrusted { .. }), "{err}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    // LEDGER R231-10 | class B | 1 return value: records_of, TrustFile::save, TrustFile::open, rebuild
+    /// A machine to pair again, approved here and waiting for its number,
+    /// is saved: as the listing alone, which reads back listed and granting
+    /// nothing, as a restart before the number is confirmed leaves it.
+    #[test]
+    fn a_listed_machine_approved_again_is_saved_as_still_listed() {
+        let d = tmpdir("reapprove");
+        let mut store = TrustStore::new(&ours(), NOW).expect("store");
+        store.list_to_pair_again(A, "laptop", NOW).expect("listed");
+        store
+            .issue_answered(A, "laptop", Controller::Both, false)
+            .expect("approved");
+        let (mut file, _) = TrustFile::open(&d, authority(&d)).expect("open");
+        if let Err(e) = file.save(&records_of(&store)) {
+            panic!("approving a machine listed to pair again could not be saved: {e}");
+        }
+        let (_, loaded) = TrustFile::open(&d, authority(&d)).expect("reopen");
+        let Loaded::Present { leases, .. } = loaded else {
+            panic!("the store must be found on the second open");
+        };
+        let (back, refused) = rebuild(&ours(), NOW, &leases).expect("rebuild");
+        assert_eq!(
+            (
+                back.capabilities(A),
+                back.to_pair_again(A).map(|p| p.label.as_str()),
+                refused
+            ),
+            (Caps::NONE, Some("laptop"), Vec::<String>::new()),
+            "an approval not yet confirmed, read back"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
     // -- the three questions the brief asks the migration to answer ---------
 
-    /// This asserted a warning at 395 days and a lapse at 401. A migrated
-    /// lease does not lapse (#183); its saved date is there for older builds.
+    /// This asserted a warning at 395 days and a lapse at 401. A lease does
+    /// not lapse (#183); its saved date is there for older builds.
     // LEDGER T5 | class B | 1 return value: records_of, rebuild
     #[test]
-    fn an_upgraded_fleet_is_still_working_ten_years_on() {
-        let m = migrate(allow(&[(A, "laptop")]), removals(&[]), NOW);
-        let lease = find(&m, A).expect("carried forward");
+    fn a_pairing_is_still_working_ten_years_on() {
+        let rows = approved(A, "laptop", Caps::INBOUND, NOW);
+        let lease = rows.iter().find(|l| l.fingerprint == A).expect("saved");
+        let at = lease.issued_at;
         assert_eq!(
             lease.expires_at,
-            Some(NOW + 400 * DAY),
+            Some(at + 400 * DAY),
             "a lease that does not lapse is saved with the latest date a build \
              from before #183 accepts, or that build refuses to start"
         );
-        let mut store = rebuilt(&m.leases, NOW);
-        for later in [NOW + 395 * DAY, NOW + 401 * DAY, NOW + 10 * 365 * DAY] {
+        let mut store = rebuilt(&rows, NOW);
+        for later in [at + 395 * DAY, at + 401 * DAY, at + 10 * 365 * DAY] {
             assert!(store.sweep(later).is_empty(), "lapsed at {later}");
             assert!(store.may_drive_us(A), "stopped working at {later}");
             assert!(!store.is_expiring(A), "asked to renew at {later}");
@@ -1805,9 +1918,9 @@ mod tests {
     #[test]
     fn a_hand_edit_that_widens_a_lease_is_refused() {
         let d = tmpdir("widen");
-        let m = migrate(allow(&[(A, "laptop")]), removals(&[]), NOW);
+        let rows = approved(A, "laptop", Caps::INBOUND, NOW);
         let (mut file, _) = TrustFile::open(&d, authority(&d)).expect("open");
-        file.save(&m.leases).expect("save");
+        file.save(&rows).expect("save");
 
         let p = d.join(TRUST_FILE_NAME);
         let text = fs::read_to_string(&p).expect("read");

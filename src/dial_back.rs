@@ -11,10 +11,19 @@
 //! Decided by the lease, never by the address. This machine holds a standing
 //! link to a device, dialled to be driven by it, when the device is switched
 //! on, has an address, is pinned to its machine, and the lease with that
-//! machine lets it drive this one ([`crate::trust::Caps::DRIVE_ME`]) and
-//! either does not let this machine drive it, or this machine does not
-//! listen. A lease that goes both ways, on a machine that listens, is dialled
-//! as before: each machine dials the other to drive it.
+//! machine lets it drive this one ([`crate::trust::Caps::DRIVE_ME`]). That
+//! holds whether or not the lease also lets this machine drive that one, and
+//! whether or not this machine listens (#232): a machine that cannot be
+//! dialled, behind a VPN or security client that drops incoming connections,
+//! is still reached through the link it opens, with no setting to find.
+//! `listen = false` means only that no port is opened.
+//!
+//! When both machines dial for one direction, one link carries it. A link
+//! the controlling machine dialled in is up, so this machine waits rather
+//! than dialling; the controlling machine takes a link dialled to it only
+//! while its own is not up, and closes its own dial if one dialled to it
+//! came up first (`connect::Adopter::adopt`). The first link up is kept, and
+//! the other attempt stops without either being closed in turn.
 //!
 //! # Admission, both ends
 //!
@@ -477,7 +486,7 @@ impl DialBack {
 
     /// The devices this machine should dial to be driven by, and the
     /// machine each is pinned to. See the module docs for the rule.
-    pub(crate) fn wanted(&self, listening: bool) -> HashMap<ClientHandle, String> {
+    pub(crate) fn wanted(&self) -> HashMap<ClientHandle, String> {
         let trust = self.context.trust.read().expect("lock");
         self.context
             .clients
@@ -486,10 +495,7 @@ impl DialBack {
             .filter_map(|(handle, config, state)| {
                 let fp = state.peer_fingerprint?;
                 let has_address = config.hostname.is_some() || !config.fix_ips.is_empty();
-                let wanted = state.active
-                    && has_address
-                    && trust.may_drive_us(&fp)
-                    && (!trust.we_may_drive(&fp) || !listening);
+                let wanted = state.active && has_address && trust.may_drive_us(&fp);
                 wanted.then_some((handle, fp))
             })
             .collect()
@@ -497,8 +503,8 @@ impl DialBack {
 
     /// Start a held link for each device wanted and not yet held, and stop
     /// each one held that is no longer wanted, closing its link.
-    pub(crate) fn reconcile(&mut self, listening: bool) {
-        let wanted = self.wanted(listening);
+    pub(crate) fn reconcile(&mut self) {
+        let wanted = self.wanted();
         let stale: Vec<ClientHandle> = self
             .held
             .iter()
@@ -545,6 +551,13 @@ impl DialBack {
                 conn.close(0u32.into(), reason);
             }
         }
+    }
+
+    /// The listener's door for the links this machine dials, for a test to
+    /// count the links in it holds.
+    #[cfg(all(test, unix))]
+    pub(crate) fn admitter(&self) -> Admitter {
+        self.context.admitter.clone()
     }
 
     /// Stop every held link.
@@ -619,6 +632,16 @@ async fn hold(
 ) {
     let mut wait = FIRST_RETRY;
     loop {
+        // The machine that drives this one dialled it, and that link is up:
+        // it carries this direction, so nothing is dialled until it drops
+        // (#232). Asked before every dial, so a link dialled here and one
+        // dialled in are never both kept, and neither is closed for the
+        // other.
+        if context.admitter.links_from(&fingerprint).await > 0 {
+            wait = FIRST_RETRY;
+            tokio::time::sleep(FIRST_RETRY).await;
+            continue;
+        }
         let (addrs, port) = addresses(&context.clients, handle);
         match dial_to_be_driven(&context.identity, &context.trust, &addrs, &fingerprint).await {
             Ok(up) => {
@@ -703,7 +726,7 @@ mod tests {
         ARRIVES_WITHIN, Dialer, Machine, NEVER_WITHIN, dialer, heard_within, machine, next_within,
         run_local, trust, wait_until,
     };
-    use crate::trust::Caps;
+    use crate::trust::{Caps, TrustStore};
     use hops_proto::Position;
     use input_emulation::recording::{Recorded, Recording};
     use input_event::{Event, KeyboardEvent};
@@ -984,7 +1007,7 @@ mod tests {
                     controller(&k_m, trust(&k_m, &[&c_m], Caps::OUTBOUND), &c_m.fingerprint).await;
                 let (mut dial_back, _refusals, _listener) =
                     holding(&c_m, &k_m, &[], k.port, "localhost", resolved).await;
-                dial_back.reconcile(false);
+                dial_back.reconcile();
                 wait_until(case, HELD_WITHIN, || k.adopted.borrow().contains(&true)).await;
                 dial_back.stop_all();
             }
@@ -997,7 +1020,7 @@ mod tests {
             let (_other, stale) = elsewhere_on_loopback(&other_m, &c_m, k.port).await;
             let (mut dial_back, mut refusals, _listener) =
                 holding(&c_m, &k_m, &[&other_m], k.port, "127.0.0.1", vec![stale]).await;
-            dial_back.reconcile(false);
+            dial_back.reconcile();
             let told = next_within(&mut refusals, HELD_WITHIN).await;
             assert!(
                 matches!(&told, Some(DialRefusal::NotThePinnedMachine { seen, .. })
@@ -1054,7 +1077,7 @@ mod tests {
             let at = vec![IpAddr::from([127, 0, 0, 1])];
             let (mut dial_back, mut refusals, _listener) =
                 holding(&c, &k, &[&other_m], port, "no-such-machine.invalid", at).await;
-            dial_back.reconcile(false);
+            dial_back.reconcile();
             // Two dials, and the lookup after the first between them.
             for dial in ["first", "second"] {
                 let told = next_within(&mut refusals, HELD_WITHIN).await;
@@ -1078,7 +1101,7 @@ mod tests {
             let (k, c) = (machine(), machine());
             let (mut dial_back, mut refusals, _listener) =
                 holding(&c, &k, &[], 9, "no-such-machine.invalid", Vec::new()).await;
-            dial_back.reconcile(false);
+            dial_back.reconcile();
             let told = next_within(&mut refusals, HELD_WITHIN).await;
             assert!(
                 matches!(&told, Some(DialRefusal::NotResolved { hostname, .. })
@@ -1570,6 +1593,196 @@ mod tests {
             let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("a silent port");
             let silent_port = silent.local_addr().expect("addr").port();
             assert_eq!(older_version_at(&loopback, silent_port).await, None);
+        });
+    }
+
+    /// A fingerprint in the form the store keys by, every byte `n`.
+    fn fp(n: u8) -> String {
+        vec![format!("{n:02x}"); 32].join(":")
+    }
+
+    // LEDGER R232-1 | class B | 1 return value: DialBack::wanted over a real store and device list
+    /// Which devices this machine dials to be driven by (#232): each one
+    /// switched on, with an address, pinned to a machine whose confirmed
+    /// lease lets it drive this one, whether or not that lease also lets
+    /// this machine drive it. No other lease, no listing to pair again, and
+    /// no device switched off, without an address or unpinned, is dialled.
+    #[test]
+    fn a_device_is_dialled_to_be_driven_exactly_when_its_lease_lets_it_drive_this_one() {
+        run_local(async {
+            let c = machine();
+            let mut store = TrustStore::new(&c.fingerprint, 0).expect("store");
+            let (drives_us, both, we_drive, approved, listed, stranger) =
+                (fp(1), fp(2), fp(3), fp(4), fp(5), fp(6));
+            for (peer, caps) in [
+                (&drives_us, Caps::INBOUND),
+                (&both, Caps::DRIVE),
+                (&we_drive, Caps::OUTBOUND),
+            ] {
+                store.issue_confirmed(peer, "peer", caps).expect("issue");
+            }
+            store
+                .issue(&approved, "peer", Caps::INBOUND)
+                .expect("approved, number not yet confirmed");
+            store
+                .list_to_pair_again(&listed, "peer", 0)
+                .expect("listed");
+            let trust: Trust = Arc::new(std::sync::RwLock::new(store));
+
+            let clients = ClientManager::default();
+            let device = |case: &'static str, pin: Option<&str>, address: bool, on: bool| {
+                let handle = clients.add_client();
+                if address {
+                    clients.set_hostname(handle, Some("desk-mac.local".to_string()));
+                }
+                clients.set_peer_fingerprint(handle, pin.map(str::to_string));
+                if on {
+                    clients.activate_client(handle);
+                }
+                (handle, case)
+            };
+            let cases = [
+                device(
+                    "its lease lets it drive this one",
+                    Some(&drives_us),
+                    true,
+                    true,
+                ),
+                device("its lease goes both ways", Some(&both), true, true),
+                device(
+                    "its lease lets only this one drive it",
+                    Some(&we_drive),
+                    true,
+                    true,
+                ),
+                device(
+                    "its number is not yet confirmed",
+                    Some(&approved),
+                    true,
+                    true,
+                ),
+                device("it is listed to pair again", Some(&listed), true, true),
+                device("no lease names it", Some(&stranger), true, true),
+                device("it is switched off", Some(&drives_us), true, false),
+                device("it has no address", Some(&both), false, true),
+                device("it is pinned to no machine", None, true, true),
+            ];
+            let (clipboard_tx, _) = channel();
+            let listener =
+                LanMouseListener::dial_only(c.identity.clone(), trust.clone(), clipboard_tx)
+                    .await
+                    .expect("a listener on no port");
+            let (refusals, _) = channel();
+            let (state_tx, _) = channel();
+            let dial_back = DialBack::new(
+                c.identity.clone(),
+                trust,
+                clients,
+                listener.admitter(),
+                refusals,
+                state_tx,
+            );
+            let wanted = dial_back.wanted();
+            let mut dialled: Vec<&str> = cases
+                .iter()
+                .filter(|(h, _)| wanted.contains_key(h))
+                .map(|(_, case)| *case)
+                .collect();
+            dialled.sort();
+            assert_eq!(
+                dialled,
+                [
+                    "its lease goes both ways",
+                    "its lease lets it drive this one"
+                ],
+                "the devices dialled to be driven"
+            );
+        });
+    }
+
+    // LEDGER R232-2 | class B | 6 struct state: the controlling machine's Adopter::adopt results and its own link's serial, while DialBack::reconcile holds a device whose machine's link in is up
+    /// The machine that drives this one dialled it first, and its link is
+    /// up. This machine dials nothing to be driven while that link is up:
+    /// the controlling machine is offered no second link, and its own is
+    /// the one kept. Once that link is gone, the dial is made and taken.
+    #[test]
+    fn a_link_the_controlling_machine_dialled_in_is_not_dialled_again() {
+        run_local(async {
+            let (k_m, c_m) = (machine(), machine());
+            let c_trust = trust(&c_m, &[&k_m], Caps::INBOUND);
+            let (clipboard_tx, _) = channel();
+            let (c_listener, c_port) = LanMouseListener::bind_at(
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+                c_m.identity.clone(),
+                c_trust.clone(),
+                clipboard_tx,
+            )
+            .await
+            .expect("the controlled machine's listener");
+            let links_in = c_listener.admitter();
+
+            // The controlling machine dials the controlled one to drive it.
+            let k = controller(&k_m, trust(&k_m, &[&c_m], Caps::OUTBOUND), &c_m.fingerprint).await;
+            k.dialer.clients.set_port(k.dialer.handle, c_port);
+            let deadline = tokio::time::Instant::now() + HELD_WITHIN;
+            while links_in.links_from(&k_m.fingerprint).await == 0 {
+                let _ = k.dialer.conn.send(ProtoEvent::Ping, k.dialer.handle).await;
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "precondition: the controlling machine's own link never came up"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let kept = k.dialer.conn.link_serial(k.dialer.handle).await;
+            assert!(
+                kept.is_some(),
+                "precondition: the controlling machine holds no link"
+            );
+
+            // The controlled machine holds a device for it, to be driven.
+            let clients = ClientManager::default();
+            let handle = clients.add_client();
+            clients.set_hostname(handle, Some("localhost".to_string()));
+            clients.set_dns_ips(handle, vec![IpAddr::from([127, 0, 0, 1])]);
+            clients.set_port(handle, k.port);
+            clients.set_peer_fingerprint(handle, Some(k_m.fingerprint.clone()));
+            clients.activate_client(handle);
+            let (refusals, _refused) = channel();
+            let (state_tx, _) = channel();
+            let mut dial_back = DialBack::new(
+                c_m.identity.clone(),
+                c_trust,
+                clients,
+                links_in.clone(),
+                refusals,
+                state_tx,
+            );
+            dial_back.reconcile();
+            tokio::time::sleep(NEVER_WITHIN).await;
+            let offered = k.adopted.borrow().clone();
+            assert_eq!(
+                (
+                    offered,
+                    k.dialer.conn.link_serial(k.dialer.handle).await,
+                    links_in.links_from(&k_m.fingerprint).await,
+                ),
+                (vec![], kept, 1),
+                "the controlled machine dialled to be driven while that machine's own \
+                 link in was up: offered links taken, the kept link's serial, links in"
+            );
+
+            k.dialer
+                .conn
+                .revoker()
+                .close_fingerprint(&c_m.fingerprint)
+                .await;
+            wait_until(
+                "the dial to be driven, once the link in is gone",
+                HELD_WITHIN,
+                || k.adopted.borrow().contains(&true),
+            )
+            .await;
+            dial_back.stop_all();
         });
     }
 }

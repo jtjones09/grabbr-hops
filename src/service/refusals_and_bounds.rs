@@ -37,6 +37,17 @@ impl Drop for Scratch {
 /// A daemon in a scratch directory, with `tables` appended to its config
 /// and capture scripted by `script`.
 async fn daemon(tag: &str, tables: &str, script: &Script) -> (Service, Scratch) {
+    paired_daemon(tag, tables, &[], script).await
+}
+
+/// [`daemon`], already paired with each machine in `pairings`
+/// ([`crate::test_harness::seed_pairings`]).
+async fn paired_daemon(
+    tag: &str,
+    tables: &str,
+    pairings: &[(&str, &str, Caps)],
+    script: &Script,
+) -> (Service, Scratch) {
     // Short, for a socket path in it (`sun_path`).
     let dir = PathBuf::from(format!("/tmp/h-rf-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -58,6 +69,9 @@ async fn daemon(tag: &str, tables: &str, script: &Script) -> (Service, Scratch) 
     let frontends = AsyncFrontendListener::at_with_token_file(&endpoint, &dir.join("ipc-token"))
         .await
         .expect("the scratch endpoint");
+    if !pairings.is_empty() {
+        crate::test_harness::seed_pairings(&dir, &dir.join("hops.pem"), pairings);
+    }
     let config = crate::config::Config::in_scratch(&config, &dir.join("hops.pem"))
         .expect("the scratch config");
     let service = Service::with_backends(
@@ -177,14 +191,14 @@ async fn cross_into(
         LanMouseListener::bind_loopback(desk.identity.clone(), shared.clone(), clip_tx)
             .await
             .expect("the desk mac listens");
-    let (mut service, scratch) = daemon(
+    let (mut service, scratch) = paired_daemon(
         tag,
         &format!(
-            "[authorized_fingerprints]\n\"{fp}\" = \"desk mac\"\n\n\
-             [[clients]]\nposition = \"left\"\nips = [\"127.0.0.1\"]\nport = {desk_port}\n\
+            "[[clients]]\nposition = \"left\"\nips = [\"127.0.0.1\"]\nport = {desk_port}\n\
              activate_on_startup = true\nfingerprint = \"{fp}\"\n",
             fp = desk.fingerprint
         ),
+        &[(&desk.fingerprint, "desk mac", Caps::DRIVE)],
         &script,
     )
     .await;
@@ -341,17 +355,20 @@ fn a_crossing_whose_address_reaches_another_paired_machine_says_which() {
         .expect("the laptop listens");
 
         let script = Script::new();
-        let (mut service, scratch) = daemon(
+        let (mut service, scratch) = paired_daemon(
             "pin",
             &format!(
-                "[authorized_fingerprints]\n\"{desk}\" = \"desk mac\"\n\"{laptop}\" = \"laptop\"\n\n\
-                 [[clients]]\nposition = \"left\"\nips = [\"127.0.0.1\"]\nport = {laptop_port}\n\
+                "[[clients]]\nposition = \"left\"\nips = [\"127.0.0.1\"]\nport = {laptop_port}\n\
                  activate_on_startup = true\nfingerprint = \"{desk}\"\n\n\
                  [[clients]]\nposition = \"right\"\nips = [\"127.0.0.1\"]\nport = {laptop_port}\n\
                  fingerprint = \"{laptop}\"\n",
                 desk = desk.fingerprint,
                 laptop = laptop.fingerprint,
             ),
+            &[
+                (&desk.fingerprint, "desk mac", Caps::DRIVE),
+                (&laptop.fingerprint, "laptop", Caps::DRIVE),
+            ],
             &script,
         )
         .await;
@@ -659,5 +676,62 @@ fn a_lookup_of_a_name_already_changed_is_not_told() {
         service.capture.terminate().await;
         service.emulation.terminate().await;
         service.resolver.terminate().await;
+    });
+}
+
+// LEDGER R231-10 | class B | 2 bytes (IPC events) from the whole daemon in-process, crossing driven by scripted capture
+/// Upgraded from v0.12.0, which listed the desk mac and kept a device for
+/// its address with no fingerprint. A crossing dials it, and the app is
+/// told the desk mac must be paired again, not that it is not paired
+/// (#231).
+#[test]
+fn a_crossing_into_a_machine_paired_with_an_older_version_says_to_pair_it_again() {
+    run_local(async {
+        let desk = machine();
+        let (clip_tx, _clip_rx) = local_channel::mpsc::channel();
+        let (_desk_listener, desk_port) = LanMouseListener::bind_loopback(
+            desk.identity.clone(),
+            trust(&desk, &[], Caps::INBOUND),
+            clip_tx,
+        )
+        .await
+        .expect("the desk mac listens");
+        let script = Script::new();
+        let (mut service, scratch) = daemon(
+            "older",
+            &format!(
+                "[authorized_fingerprints]\n\"{fp}\" = \"desk mac\"\n\n\
+                 [[clients]]\nposition = \"left\"\nips = [\"127.0.0.1\"]\nport = {desk_port}\n\
+                 activate_on_startup = true\n",
+                fp = desk.fingerprint
+            ),
+            &script,
+        )
+        .await;
+        let mut app = attached(&mut service, &scratch).await;
+        let crossing = async {
+            loop {
+                script.push(Position::Left, CaptureEvent::Begin);
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        };
+        let mut seen = Vec::new();
+        let told = tokio::select! {
+            told = app.next_text("Error", &mut seen, |t| t.contains("desk mac")) => told,
+            ended = service.run() => panic!("the daemon ended: {:?}", ended.err()),
+            _ = crossing => unreachable!(),
+            _ = tokio::time::sleep(DEADLINE) => None,
+        };
+        service.capture.terminate().await;
+        service.emulation.terminate().await;
+        service.resolver.terminate().await;
+        let told = told.unwrap_or_else(|| {
+            panic!("the app was told nothing naming the desk mac; it was told: {seen:?}")
+        });
+        assert!(
+            told.contains("paired with an older version of hops") && told.contains("paired again"),
+            "the dial to a machine paired with an older version does not say to pair it \
+             again: {told:?}"
+        );
     });
 }

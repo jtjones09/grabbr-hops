@@ -251,6 +251,7 @@ fn device_rows(m: &AppModel) -> Vec<DeviceRow> {
                 trusted: d.paired,
                 clipboard: clipboard.map(clipboard_words).unwrap_or_default().into(),
                 clipboard_on: clipboard.is_some_and(|c| c.is_on()),
+                pair_again: d.pair_again,
             }
         })
         .collect()

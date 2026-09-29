@@ -106,7 +106,8 @@ cargo build --release --no-default-features --features "tui libei_capture libei_
 5. Move your cursor off that edge — it hops over. Keyboard, scroll, and modifier
    keys follow.
 
-Upgrading from 0.12? Update every machine: see [docs/UPGRADING.md](docs/UPGRADING.md).
+Upgrading from 0.12? Update every machine and pair each again: see
+[docs/UPGRADING.md](docs/UPGRADING.md).
 
 ## Other ways to run it
 

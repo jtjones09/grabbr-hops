@@ -146,5 +146,6 @@ top-level README), with `hops tui` over SSH standing in for the window: press
 Both machines approve the request, then compare the number; neither can
 approve for the other. Writing a fingerprint into `config.toml` is not how a
 machine is paired: pairings live in a signed trust file, and `config.toml`'s
-list is read only to rebuild that file when it is missing. How to remove a
-machine or recover one is in [docs/SECURITY.md](../docs/SECURITY.md).
+list grants nothing. When that file is missing, each machine on the list is
+shown as needing to be paired again. How to remove a machine or recover one
+is in [docs/SECURITY.md](../docs/SECURITY.md).

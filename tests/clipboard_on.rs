@@ -28,6 +28,7 @@ const OFF: PeerTrust = PeerTrust {
     pending: false,
     label: String::new(),
     we_may_drive: false,
+    pair_again: false,
 };
 
 /// What a machine that may drive this one, and that this one does not
@@ -38,6 +39,7 @@ const FROM_IT: PeerTrust = PeerTrust {
     pending: false,
     label: String::new(),
     we_may_drive: false,
+    pair_again: false,
 };
 
 async fn attach() -> (AsyncFrontendEventReader, AsyncFrontendRequestWriter) {
@@ -82,9 +84,10 @@ async fn reported(
 // LEDGER EN-4 | class B | 5 process + 4 file on disk: FrontendRequest::EnableClipboard into the built daemon, FrontendEvent::TrustUpdated from it, trust.toml unchanged by a second request, across a restart
 #[tokio::test(flavor = "current_thread")]
 async fn turning_the_clipboard_on_follows_the_drive_direction_and_survives_a_restart() {
-    let (mut daemon, _port) = common::start(
+    let (mut daemon, _port) = common::start_paired(
         "h-clip-on",
-        &format!("[authorized_fingerprints]\n\"{DESK_MAC}\" = \"desk mac\"\n"),
+        "",
+        &[(DESK_MAC, "desk mac", common::DRIVES_US)],
     );
 
     let (mut events, mut requests) = attach().await;

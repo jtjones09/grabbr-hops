@@ -44,16 +44,18 @@ which way control goes:
 - **The controlling machine dials**, offering `grabbr-hop/1`, when the
   pointer crosses to the device and no link is up. This is the usual
   case. The controlled machine needs UDP 4722 open inbound.
-- **The controlled machine dials**, offering `grabbr-hop/1-driven`, when
-  the other machine may control it and either this machine may not
-  control the other, or this machine is set to `listen = false`. It holds
-  that connection open, and dials again 1 second after it drops, waiting
-  up to 30 seconds between tries. The controlling machine needs UDP 4722
-  open inbound; the controlled machine needs only outbound UDP. This is
-  how a machine behind a VPN or security client that drops unsolicited
-  inbound connections is controlled.
-- **Each controls the other**, on machines that both listen: each dials
-  the other as the controlling machine.
+- **The controlled machine dials**, offering `grabbr-hop/1-driven`,
+  whenever the other machine may control it, its device is switched on,
+  and no connection the other machine opened is up. This holds whether
+  or not this machine may also control the other, and whether or not it
+  listens. It holds that connection open, and dials again 1 second after
+  it drops, waiting up to 30 seconds between tries. The controlling
+  machine needs UDP 4722 open inbound; the controlled machine needs only
+  outbound UDP. This is how a machine behind a VPN or security client
+  that drops unsolicited inbound connections is controlled.
+- **Each controls the other**: each machine does both. For each
+  direction, the first connection up carries it, and the other attempt
+  stops.
 
 When a dial to 4722 gets no answer, hops sends the start of a handshake to
 UDP 4242 on the same addresses, the old port that hops 0.12 listens on,

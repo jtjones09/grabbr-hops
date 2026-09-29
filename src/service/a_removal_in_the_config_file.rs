@@ -7,6 +7,13 @@
 //! trust store existed, so such a removal was undone: the device was trusted
 //! again at the next start.
 //!
+//! A machine the table names that a build before the trust store paired, and
+//! that the store holds only to be paired again (#231), is removed the same
+//! way while the file still lists it. The table grants nothing either way: a
+//! test here that needs a device trusted pairs it in the trust store before
+//! the first start ([`paired_with`]), since a first start lists what the
+//! table names to be paired again.
+//!
 //! The whole daemon runs in this process, started more than once on one
 //! scratch directory as a machine is restarted; what is observed is its trust
 //! store and what an app connected over its IPC socket is told.
@@ -65,6 +72,19 @@ fn config_without_the_table() -> String {
     "port = 0\ncapture_backend = \"dummy\"\nemulation_backend = \"dummy\"\n\
      discovery = false\nrelease_bind = [\"KeyLeftCtrl\", \"KeyLeftAlt\"]\n"
         .to_string()
+}
+
+/// Pair the daemon in `dir` with each of `devices` before its first start,
+/// each allowed to drive this machine and confirmed on both machines, as the
+/// pairing card leaves it. Listing them in config.toml does not pair them: a
+/// first start lists those to be paired again and grants them nothing
+/// (#231).
+fn paired_with(dir: &Path, devices: &[(&str, &str)]) {
+    let pairings: Vec<(&str, &str, crate::trust::Caps)> = devices
+        .iter()
+        .map(|(fp, label)| (*fp, *label, crate::trust::Caps::DRIVE_ME))
+        .collect();
+    crate::test_harness::seed_pairings(dir, &dir.join("hops.pem"), &pairings);
 }
 
 /// Save `text` as the config the way an editor or an older build does: a
@@ -166,14 +186,18 @@ async fn notice_while_running(
 }
 
 // LEDGER T2264 | class B | 6 trust store state across three starts + 2 event over the real IPC socket
-/// The upgrade and downgrade case: the store trusts both machines, an older
-/// build removes the laptop from config.toml, and this build starts again.
+/// The downgrade case: the store trusts both machines, an older build
+/// removes the laptop from config.toml, and this build starts again. The
+/// store holds both from a pairing, not from the table (#231); the upgrade
+/// case, where it holds them only to be paired again, is
+/// [`a_machine_to_pair_again_removed_from_the_file_is_forgotten`].
 #[test]
 fn a_device_removed_from_the_file_while_stopped_is_forgotten_at_start() {
     run_local(async {
         let s = scratch("start");
         let both = [(DESK, "desk mac"), (LAPTOP, "laptop")];
         std::fs::write(s.0.join("config.toml"), config_listing(&both)).expect("a config");
+        paired_with(&s.0, &both);
         let (first, _) = start(&s.0, 1).await;
         let before = known(&first.trust);
         stop(first).await;
@@ -198,7 +222,8 @@ fn a_device_removed_from_the_file_while_stopped_is_forgotten_at_start() {
             (before, after, put_back),
             ((true, true), (true, false), (true, false)),
             "((desk, laptop) trusted) at the first start, after config.toml dropped \
-             the laptop, and after a line naming it was put back"
+             the laptop, and after a line naming it was put back. \
+             Each device was paired in the trust store, as the table grants nothing (#231)."
         );
         assert!(probed.is_some(), "the front door's probe was not answered");
         assert!(
@@ -221,6 +246,7 @@ fn a_device_the_file_never_listed_is_kept() {
         let s = scratch("never");
         let both = [(DESK, "desk mac"), (LAPTOP, "laptop")];
         std::fs::write(s.0.join("config.toml"), config_listing(&both)).expect("a config");
+        paired_with(&s.0, &both);
         let (first, _) = start(&s.0, 1).await;
         stop(first).await;
         // As a build before this one left it: no record of what was listed,
@@ -234,7 +260,8 @@ fn a_device_the_file_never_listed_is_kept() {
             after,
             (true, true),
             "(desk, laptop) trusted: the laptop was never listed as far as this \
-             build knows, so its absence is not a removal"
+             build knows, so its absence is not a removal. \
+             Each device was paired in the trust store, as the table grants nothing (#231)."
         );
     });
 }
@@ -247,6 +274,7 @@ fn a_device_removed_from_the_file_while_running_is_forgotten() {
         let s = scratch("live");
         let both = [(DESK, "desk mac"), (LAPTOP, "laptop")];
         std::fs::write(s.0.join("config.toml"), config_listing(&both)).expect("a config");
+        paired_with(&s.0, &both);
         let (mut service, endpoint) = start(&s.0, 1).await;
         let before = known(&service.trust);
         let dir = s.0.clone();
@@ -259,7 +287,8 @@ fn a_device_removed_from_the_file_while_running_is_forgotten() {
         assert_eq!(
             (before, after),
             ((true, true), (true, false)),
-            "((desk, laptop) trusted) before and after the laptop's line was removed"
+            "((desk, laptop) trusted) before and after the laptop's line was removed. \
+             Each device was paired in the trust store, as the table grants nothing (#231)."
         );
         assert!(
             told.contains("\"laptop\""),
@@ -437,6 +466,7 @@ fn a_device_removed_in_the_app_leaves_the_file_at_once() {
         let s = scratch("app");
         let both = [(DESK, "desk mac"), (LAPTOP, "laptop")];
         std::fs::write(s.0.join("config.toml"), config_listing(&both)).expect("a config");
+        paired_with(&s.0, &both);
         let (mut service, endpoint) = start(&s.0, 1).await;
         let _ = app_asks(
             &mut service,
@@ -450,7 +480,8 @@ fn a_device_removed_in_the_app_leaves_the_file_at_once() {
         assert!(
             on_disk.contains(DESK) && !on_disk.contains(LAPTOP),
             "the laptop was removed in the app and config.toml still lists it, or \
-             lost the desk:\n{on_disk}"
+             lost the desk. Each device was paired in the trust store, as the table \
+             grants nothing (#231):\n{on_disk}"
         );
     });
 }
@@ -465,6 +496,7 @@ fn a_device_paired_while_running_is_forgotten_once_removed_from_the_file() {
         let s = scratch("paired");
         let desk = [(DESK, "desk mac")];
         std::fs::write(s.0.join("config.toml"), config_listing(&desk)).expect("a config");
+        paired_with(&s.0, &desk);
         let (mut first, _) = start(&s.0, 1).await;
         pair_while_running(&mut first, LAPTOP, "laptop");
         let saved = std::fs::read_to_string(s.0.join("config.toml")).unwrap_or_default();
@@ -482,7 +514,8 @@ fn a_device_paired_while_running_is_forgotten_once_removed_from_the_file() {
             after,
             (true, false),
             "(desk, laptop) trusted after the laptop, paired while the daemon ran, \
-             was removed from config.toml"
+             was removed from config.toml. \
+             Each device was paired in the trust store, as the table grants nothing (#231)."
         );
     });
 }
@@ -497,6 +530,7 @@ fn a_device_paired_while_the_file_could_not_be_saved_is_kept() {
         let s = scratch("unsaved");
         let desk = [(DESK, "desk mac")];
         std::fs::write(s.0.join("config.toml"), config_listing(&desk)).expect("a config");
+        paired_with(&s.0, &desk);
         let (mut first, _) = start(&s.0, 1).await;
         // A hand edit half done: the daemon leaves such a file as it is.
         std::fs::write(s.0.join("config.toml"), "port = [\n").expect("a broken config");
@@ -512,7 +546,8 @@ fn a_device_paired_while_the_file_could_not_be_saved_is_kept() {
             after,
             (true, true),
             "(desk, laptop) trusted: the laptop was paired while config.toml could \
-             not be saved, so it never listed it, and its absence is not a removal"
+             not be saved, so it never listed it, and its absence is not a removal. \
+             Each device was paired in the trust store, as the table grants nothing (#231)."
         );
     });
 }
@@ -529,6 +564,7 @@ fn a_file_with_no_table_removes_nothing() {
         let s = scratch("notable");
         let both = [(DESK, "desk mac"), (LAPTOP, "laptop")];
         std::fs::write(s.0.join("config.toml"), config_listing(&both)).expect("a config");
+        paired_with(&s.0, &both);
         let (mut first, _) = start(&s.0, 1).await;
         let dir = s.0.clone();
         run_until(
@@ -556,7 +592,8 @@ fn a_file_with_no_table_removes_nothing() {
             (running, at_start, removed),
             ((true, true), (true, true), (true, false)),
             "((desk, laptop) trusted) after the table went while running, at the \
-             next start, and once the table was back without the laptop"
+             next start, and once the table was back without the laptop. \
+             Each device was paired in the trust store, as the table grants nothing (#231)."
         );
     });
 }
@@ -571,6 +608,7 @@ fn a_file_read_while_it_was_still_being_written_removes_nothing() {
         let both = [(DESK, "desk mac"), (LAPTOP, "laptop")];
         let path = s.0.join("config.toml");
         std::fs::write(&path, config_listing(&both)).expect("a config");
+        paired_with(&s.0, &both);
         let (mut service, _) = start(&s.0, 1).await;
         // The first part of a save written in place, read by the daemon ...
         let partial = path.clone();
@@ -597,7 +635,8 @@ fn a_file_read_while_it_was_still_being_written_removes_nothing() {
             (read_partly, after),
             (Some(1), (true, true)),
             "(devices the daemon read while the save was part done, (desk, laptop) \
-             trusted once it finished)"
+             trusted once it finished). \
+             Each device was paired in the trust store, as the table grants nothing (#231)."
         );
     });
 }
@@ -612,6 +651,7 @@ fn a_removal_the_file_on_disk_does_not_show_is_not_made() {
         let both = [(DESK, "desk mac"), (LAPTOP, "laptop")];
         let path = s.0.join("config.toml");
         std::fs::write(&path, config_listing(&both)).expect("a config");
+        paired_with(&s.0, &both);
         let (mut service, _) = start(&s.0, 1).await;
         std::fs::write(&path, config_listing(&both[..1])).expect("the laptop's line gone");
         service.config.read_from_disk().expect("read");
@@ -629,7 +669,8 @@ fn a_removal_the_file_on_disk_does_not_show_is_not_made() {
             (back, gone),
             ((true, true), (true, false)),
             "((desk, laptop) trusted) when the file on disk lists the laptop again, \
-             and when it agrees it is gone"
+             and when it agrees it is gone. \
+             Each device was paired in the trust store, as the table grants nothing (#231)."
         );
     });
 }
@@ -644,6 +685,7 @@ fn a_removal_whose_store_save_failed_is_made_again_at_the_next_start() {
         let s = scratch("nosave");
         let both = [(DESK, "desk mac"), (LAPTOP, "laptop")];
         std::fs::write(s.0.join("config.toml"), config_listing(&both)).expect("a config");
+        paired_with(&s.0, &both);
         let (first, _) = start(&s.0, 1).await;
         stop(first).await;
 
@@ -666,7 +708,8 @@ fn a_removal_whose_store_save_failed_is_made_again_at_the_next_start() {
             (forgotten, again),
             ((true, false), (true, false)),
             "((desk, laptop) trusted) at the start that could not save the removal, \
-             and at the next"
+             and at the next. \
+             Each device was paired in the trust store, as the table grants nothing (#231)."
         );
     });
 }
@@ -683,6 +726,7 @@ fn a_file_read_part_written_at_a_start_removes_nothing() {
         let both = [(DESK, "desk mac"), (LAPTOP, "laptop")];
         let path = s.0.join("config.toml");
         std::fs::write(&path, config_listing(&both)).expect("a config");
+        paired_with(&s.0, &both);
         let (first, _) = start(&s.0, 1).await;
         stop(first).await;
 
@@ -704,7 +748,267 @@ fn a_file_read_part_written_at_a_start_removes_nothing() {
             (after, removed),
             ((true, true), (true, false)),
             "((desk, laptop) trusted) after a start that read a save still being \
-             written, and after the laptop's line was then removed"
+             written, and after the laptop's line was then removed. \
+             Each device was paired in the trust store, as the table grants nothing (#231)."
+        );
+    });
+}
+
+const STRANGER: &str = "cc:bb:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:\
+11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00";
+const PASSER: &str = "dd:bb:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:\
+11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00";
+
+/// Of `fps`, each the store in `trust` grants anything to, in either
+/// direction.
+fn granted(trust: &Trust, fps: &[&str]) -> Vec<String> {
+    let trust = trust.read().expect("lock");
+    fps.iter()
+        .filter(|fp| trust.capabilities(fp) != crate::trust::Caps::NONE)
+        .map(|fp| fp.to_string())
+        .collect()
+}
+
+/// Of `fps`, each the store in `trust` lists to be paired again (#231).
+fn listed_again(trust: &Trust, fps: &[&str]) -> Vec<String> {
+    let trust = trust.read().expect("lock");
+    fps.iter()
+        .filter(|fp| trust.to_pair_again(fp).is_some())
+        .map(|fp| fp.to_string())
+        .collect()
+}
+
+/// Whether a device of `service` is pinned to `fp`.
+fn pinned(service: &Service, fp: &str) -> bool {
+    !service.client_manager.every_pinned_to(fp).is_empty()
+}
+
+/// The config listing `trusted`, with a device on the left pinned to the
+/// laptop, as a device folded into the laptop's listing is saved (#231).
+fn with_a_device_for_the_laptop(trusted: &[(&str, &str)]) -> String {
+    format!(
+        "{}\n[[clients]]\nposition = \"left\"\nips = [\"127.0.0.1\"]\nport = 9\n\
+         fingerprint = \"{LAPTOP}\"\n",
+        config_listing(trusted)
+    )
+}
+
+/// What a notice of `laptop`'s removal must say when the laptop held only a
+/// listing to be paired again: it had no pairing to remove (#231).
+fn told_as_a_listing(told: &str) -> bool {
+    told.contains("\"laptop\" was removed from the list an older version of hops wrote")
+        && told.contains("no longer shown here as one to pair again")
+        && !told.contains("pairing is removed")
+}
+
+// LEDGER R231-20 | class B | 6 trust store state across three starts and a reload through the config watcher
+/// `[authorized_fingerprints]` in config.toml grants nothing, whether or not
+/// the trust file is there (#231). With no trust file, as at the upgrade
+/// from 0.12 or once the file is lost, each machine the table names is
+/// listed to be paired again. With the trust file there, a line added while
+/// the daemon is stopped, or while it runs, grants nothing and lists
+/// nothing. A device pinned to a listed machine, as a device an older build
+/// dialled is, makes no difference: it grants neither direction.
+#[test]
+fn the_list_in_the_config_file_grants_nothing_with_or_without_the_trust_file() {
+    run_local(async {
+        let s = scratch("grant");
+        let all = [
+            (DESK, "desk mac"),
+            (LAPTOP, "laptop"),
+            (STRANGER, "stranger"),
+            (PASSER, "passer"),
+        ];
+        let fps: Vec<&str> = all.iter().map(|(fp, _)| *fp).collect();
+        let seen = |trust: &Trust| (granted(trust, &fps), listed_again(trust, &fps));
+
+        // No trust file: the first start after the upgrade from 0.12.
+        std::fs::write(
+            s.0.join("config.toml"),
+            with_a_device_for_the_laptop(&all[..2]),
+        )
+        .expect("a config");
+        let (first, _) = start(&s.0, 1).await;
+        let upgraded = seen(&first.trust);
+        let pinned_at_upgrade = pinned(&first, LAPTOP);
+        stop(first).await;
+
+        // The trust file there: a line added while the daemon is stopped ...
+        save_config(&s.0, &with_a_device_for_the_laptop(&all[..3]));
+        let (mut second, _) = start(&s.0, 2).await;
+        let added_while_stopped = seen(&second.trust);
+        // ... and one added while it runs.
+        let dir = s.0.clone();
+        run_until(
+            &mut second,
+            Signal::Checked,
+            move || save_config(&dir, &with_a_device_for_the_laptop(&all)),
+            |service| service.config.listed_as_trusted().map(|t| t.len()) == Some(4),
+        )
+        .await;
+        let added_while_running = seen(&second.trust);
+        stop(second).await;
+
+        // The trust file lost, with every line still in config.toml.
+        std::fs::remove_file(s.0.join(crate::trust_file::TRUST_FILE_NAME)).expect("the trust file");
+        let (third, _) = start(&s.0, 3).await;
+        let rebuilt = seen(&third.trust);
+        let pinned_when_rebuilt = pinned(&third, LAPTOP);
+        stop(third).await;
+
+        assert!(
+            pinned_at_upgrade && pinned_when_rebuilt,
+            "precondition: a device is pinned to the laptop at both starts with no trust \
+             file (at the upgrade {pinned_at_upgrade}, once rebuilt {pinned_when_rebuilt})"
+        );
+        let none = Vec::<String>::new;
+        let names = |fps: &[&str]| fps.iter().map(|fp| fp.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            (upgraded, added_while_stopped, added_while_running, rebuilt),
+            (
+                (none(), names(&[DESK, LAPTOP])),
+                (none(), names(&[DESK, LAPTOP])),
+                (none(), names(&[DESK, LAPTOP])),
+                (none(), names(&fps)),
+            ),
+            "(granted anything, listed to pair again) with no trust file, after a line \
+             was added while stopped, after one was added while running, and once the \
+             trust file was lost: a list in config.toml granted a machine something, or \
+             a line added beside the trust file listed one. The list never grants, with \
+             or without the trust file (#231)."
+        );
+    });
+}
+
+// LEDGER R231-21 | class B | 6 trust store state and client pins across two starts + 2 event over the real IPC socket
+/// The upgrade case of a removal in the file: the store holds what the 0.12
+/// list named only to be paired again (#231). An older build removes the
+/// laptop's line, and at the next start its listing goes, and so does the
+/// pin of the device folded into it; the app is told by the laptop's name.
+#[test]
+fn a_machine_to_pair_again_removed_from_the_file_is_forgotten() {
+    run_local(async {
+        let s = scratch("again");
+        let both = [(DESK, "desk mac"), (LAPTOP, "laptop")];
+        std::fs::write(s.0.join("config.toml"), with_a_device_for_the_laptop(&both))
+            .expect("a config");
+        let (first, _) = start(&s.0, 1).await;
+        let upgraded = (
+            listed_again(&first.trust, &[DESK, LAPTOP]),
+            pinned(&first, LAPTOP),
+        );
+        stop(first).await;
+
+        // As an older build saves after removing the laptop.
+        save_config(&s.0, &with_a_device_for_the_laptop(&both[..1]));
+        let (mut second, endpoint) = start(&s.0, 2).await;
+        let after = (
+            listed_again(&second.trust, &[DESK, LAPTOP]),
+            pinned(&second, LAPTOP),
+        );
+        let told = told_on_attach(&mut second, &s.0, &endpoint).await;
+        stop(second).await;
+        assert_eq!(
+            (upgraded, after),
+            (
+                (vec![DESK.to_string(), LAPTOP.to_string()], true),
+                (vec![DESK.to_string()], false),
+            ),
+            "((listed to pair again), a device pinned to the laptop) at the upgrade \
+             and once an older build removed the laptop from config.toml: its \
+             listing, or the pin of the device folded into it, was kept (#231)"
+        );
+        assert!(
+            told.iter().any(|said| told_as_a_listing(said)),
+            "the app was not told, by the laptop's name, that its listing to pair again \
+             was removed, or was told a pairing was removed that it never held (#231): \
+             {told:?}"
+        );
+    });
+}
+
+// LEDGER R231-22 | class B | 6 trust store state and client pins + 2 event over the real IPC socket, through the config watcher
+/// A person removes, while the daemon runs, the line of a machine the store
+/// lists to be paired again (#231): its listing goes, and so does the pin of
+/// the device folded into it, and the app is told by its name.
+#[test]
+fn a_machine_to_pair_again_removed_from_the_file_while_running_is_forgotten() {
+    run_local(async {
+        let s = scratch("againlive");
+        let both = [(DESK, "desk mac"), (LAPTOP, "laptop")];
+        std::fs::write(s.0.join("config.toml"), with_a_device_for_the_laptop(&both))
+            .expect("a config");
+        let (mut service, endpoint) = start(&s.0, 1).await;
+        let before = (
+            listed_again(&service.trust, &[DESK, LAPTOP]),
+            pinned(&service, LAPTOP),
+        );
+        let dir = s.0.clone();
+        let told = notice_while_running(&mut service, &s.0, &endpoint, move || {
+            save_config(&dir, &with_a_device_for_the_laptop(&both[..1]));
+        })
+        .await;
+        let after = (
+            listed_again(&service.trust, &[DESK, LAPTOP]),
+            pinned(&service, LAPTOP),
+        );
+        stop(service).await;
+        assert_eq!(
+            (before, after),
+            (
+                (vec![DESK.to_string(), LAPTOP.to_string()], true),
+                (vec![DESK.to_string()], false),
+            ),
+            "((listed to pair again), a device pinned to the laptop) before and after \
+             the laptop's line was removed while the daemon ran (#231)"
+        );
+        assert!(
+            told_as_a_listing(&told),
+            "the app was not told, by the laptop's name, that its listing to pair again \
+             was removed, or was told a pairing was removed that it never held (#231): \
+             {told:?}"
+        );
+    });
+}
+
+// LEDGER R231-23 | class B | 6 trust store state across two starts + 5 file content on disk
+/// The daemon's own save drops the 0.12 list from config.toml, since a
+/// machine to pair again is not in the cache (#231). That is not a removal:
+/// the listings stay at the next start, even when the save came while a
+/// trust change could not reach disk, which keeps what is recorded.
+#[test]
+fn the_daemon_dropping_the_old_list_is_not_a_removal() {
+    run_local(async {
+        let s = scratch("dropped");
+        std::fs::write(
+            s.0.join("config.toml"),
+            config_listing(&[(DESK, "desk mac")]),
+        )
+        .expect("a config");
+        let (mut first, _) = start(&s.0, 1).await;
+        // Every save of the trust store fails, as on a full disk, so the
+        // pairing below waits to reach it as the config is saved.
+        let staging =
+            s.0.join(crate::trust_file::TRUST_FILE_NAME)
+                .with_extension("toml.tmp");
+        std::fs::create_dir_all(staging.join("in-the-way")).expect("block the store");
+        pair_while_running(&mut first, LAPTOP, "laptop");
+        let saved = std::fs::read_to_string(s.0.join("config.toml")).unwrap_or_default();
+        stop(first).await;
+        std::fs::remove_dir_all(&staging).expect("unblock the store");
+
+        let (second, _) = start(&s.0, 2).await;
+        let after = listed_again(&second.trust, &[DESK]);
+        stop(second).await;
+        assert!(
+            !saved.contains(DESK),
+            "precondition: the daemon's save kept the 0.12 list's line:\n{saved}"
+        );
+        assert_eq!(
+            after,
+            vec![DESK.to_string()],
+            "the desk, listed to pair again, was forgotten because the daemon's own \
+             save dropped its line from config.toml (#231)"
         );
     });
 }

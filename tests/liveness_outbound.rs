@@ -62,13 +62,13 @@ fn a_closed_outbound_link_is_shown_down_within_a_second() {
         // capture crosses there, which it does continuously. (One device per
         // machine (#12): a second, unpinned device for the same receiver is
         // refused, so it cannot stand in for this one.)
-        let (daemon, _) = common::start(
+        let (daemon, _) = common::start_paired(
             "h-live-out",
             &format!(
-                "[authorized_fingerprints]\n\"{fp}\" = \"receiver\"\n\n\
-                 [[clients]]\nposition = \"left\"\nips = [\"127.0.0.1\"]\nport = {port}\n\
+                "[[clients]]\nposition = \"left\"\nips = [\"127.0.0.1\"]\nport = {port}\n\
                  fingerprint = \"{fp}\"\n"
             ),
+            &[(&fp, "receiver", common::BOTH_WAYS)],
         );
         let (mut events, mut requests) = hops_ipc::connect_async(Some(Duration::from_secs(10)))
             .await

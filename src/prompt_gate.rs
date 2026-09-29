@@ -120,6 +120,7 @@ impl PromptGate {
             fingerprint: fingerprint.to_owned(),
             from,
             paired: None,
+            pair_again: None,
         })
     }
 
@@ -279,6 +280,10 @@ pub(crate) struct Refused {
     /// a pairing with it: set by the caller, which holds the trust store and
     /// the devices.
     pub(crate) paired: Option<PairedHere>,
+    /// The name the latest knock's machine was listed under, when a build
+    /// before the trust store paired it and it has not been paired since
+    /// (#231): set by the caller, which holds the trust store.
+    pub(crate) pair_again: Option<String>,
 }
 
 /// A refused machine this machine is paired with, in the terms the app's
@@ -322,6 +327,9 @@ impl Refused {
         if let Some(paired) = &self.paired {
             return paired.notice(self.count);
         }
+        if let Some(name) = &self.pair_again {
+            return pair_again_notice(name, self.count);
+        }
         let from = self
             .from
             .map_or_else(|| "a machine".to_owned(), |a| a.ip().to_string());
@@ -338,6 +346,20 @@ impl Refused {
             )
         }
     }
+}
+
+/// The app's line for refusing a machine paired with an older version of
+/// hops and not paired since (#231): what it is, and how to pair it again.
+pub(crate) fn pair_again_notice(name: &str, count: u32) -> String {
+    let refused = if count == 1 {
+        format!("Refused a connection from {name}")
+    } else {
+        format!("Refused {count} connections, the latest from {name}")
+    };
+    format!(
+        "{refused}: it was paired with an older version of hops and must be paired again. \
+         Open add device here and on it, and choose which machine controls which."
+    )
 }
 
 impl PairedHere {

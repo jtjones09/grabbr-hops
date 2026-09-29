@@ -99,6 +99,7 @@ fn start(hook: &str) -> (Daemon, PathBuf) {
     std::fs::create_dir_all(&out).expect("a directory for the hook to write in");
     let (device_port, fp) = device();
     let hook = hook.replace("{out}", &out.display().to_string());
+    common::seed_pairings(&config_dir, &[(&fp, "device", common::BOTH_WAYS)]);
     let config = config_dir.join("config.toml");
     let log = dir.join("daemon.log");
     let (child, _) = common::launch(
@@ -109,9 +110,6 @@ fn start(hook: &str) -> (Daemon, PathBuf) {
              capture_backend = \"dummy\"\n\
              emulation_backend = \"dummy\"\n\
              discovery = false\n\
-             \n\
-             [authorized_fingerprints]\n\
-             \"{fp}\" = \"device\"\n\
              \n\
              [[clients]]\n\
              position = \"left\"\n\

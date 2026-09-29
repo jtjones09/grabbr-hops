@@ -250,12 +250,25 @@ pub fn fingerprint_of(der: &CertificateDer<'_>) -> String {
 /// it — making it trivial for the user to authorize the receiver.
 ///
 /// This is the OUTBOUND question, and it is deliberately not the inbound one.
+///
+/// A fingerprint in `observed` is only what the receiver presented: a
+/// rejected certificate is rejected before the receiver signs anything, so
+/// it proves nothing. `proven` is set once the receiver's signature over the
+/// handshake checked out against that certificate, which only the holder of
+/// its key can make.
 #[derive(Debug)]
 pub struct FpServerVerifier {
     provider: Arc<CryptoProvider>,
     trust: Trust,
     observed: Arc<Mutex<Option<String>>>,
     role: Dialler,
+    /// Complete the handshake with a machine listed to pair again (#231),
+    /// so that it proves its key. Set only for a device pinned to no
+    /// machine: the dial measures which machine answers at its address,
+    /// and `connect` closes the connection before any stream is opened,
+    /// since such a machine may not be driven.
+    measure_listed: bool,
+    proven: Option<Arc<Mutex<Option<String>>>>,
 }
 
 impl FpServerVerifier {
@@ -274,7 +287,39 @@ impl FpServerVerifier {
             trust,
             observed,
             role,
+            measure_listed: false,
+            proven: None,
         }
+    }
+
+    /// For a dial that drives, by a device pinned to no machine: it also
+    /// completes the handshake with a machine listed to pair again, and
+    /// sets `proven` to the fingerprint whose key signed the handshake
+    /// (#231). Completing it grants nothing: the dial still checks, before
+    /// any stream, that this machine may drive the machine it reached.
+    pub fn measuring(
+        trust: Trust,
+        observed: Arc<Mutex<Option<String>>>,
+        proven: Arc<Mutex<Option<String>>>,
+    ) -> Self {
+        Self {
+            measure_listed: true,
+            proven: Some(proven),
+            ..Self::for_role(trust, observed, Dialler::Drives)
+        }
+    }
+
+    /// Record `cert` as proven when its signature over the handshake
+    /// checked out.
+    fn proved(
+        &self,
+        cert: &CertificateDer<'_>,
+        checked: Result<HandshakeSignatureValid, TlsError>,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        if let (Ok(_), Some(proven)) = (&checked, &self.proven) {
+            *proven.lock().expect("lock") = Some(fingerprint_of(cert));
+        }
+        checked
     }
 }
 
@@ -301,7 +346,9 @@ impl ServerCertVerifier for FpServerVerifier {
             let trust = self.trust.read().expect("lock");
             match self.role {
                 Dialler::Drives => {
-                    trust.we_may_drive(&fingerprint) || trust.is_pairing(&fingerprint)
+                    trust.we_may_drive(&fingerprint)
+                        || trust.is_pairing(&fingerprint)
+                        || (self.measure_listed && trust.to_pair_again(&fingerprint).is_some())
                 }
                 Dialler::IsDriven => trust.may_drive_us(&fingerprint),
             }
@@ -326,11 +373,14 @@ impl ServerCertVerifier for FpServerVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
-        rustls::crypto::verify_tls12_signature(
-            message,
+        self.proved(
             cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.provider.signature_verification_algorithms,
+            ),
         )
     }
 
@@ -340,11 +390,14 @@ impl ServerCertVerifier for FpServerVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
-        rustls::crypto::verify_tls13_signature(
-            message,
+        self.proved(
             cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.provider.signature_verification_algorithms,
+            ),
         )
     }
 

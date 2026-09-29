@@ -396,8 +396,8 @@ impl RecentNotices {
 /// each dial share it, so the person is told once, not once by each.
 const NOT_RESOLVED: &str = "not-resolved";
 
-/// Drop any persisted client pin naming a fingerprint that is not in the
-/// allowlist.
+/// Drop any persisted client pin naming a fingerprint the trust store has no
+/// record of.
 ///
 /// Such a pin can never let anyone in — the outbound dial is fail-closed against
 /// it — but it CAN silently brick a client: no machine can satisfy it, so every
@@ -405,6 +405,11 @@ const NOT_RESOLVED: &str = "not-resolved";
 /// client re-learn the identity on its next successful handshake, which is
 /// exactly what a never-connected client does. A pin the trust store knows is
 /// kept through any edit to the device's hostname or address (#99).
+///
+/// So is a pin to a machine listed to pair again (#231): it was measured, when
+/// that machine proved its key at the device's address, and it is what folds
+/// the device's card and the listing into one. It grants nothing, as the
+/// listing grants nothing.
 fn drop_untrusted_pins(
     client_manager: &ClientManager,
     trust: &crate::trust::TrustStore,
@@ -417,7 +422,7 @@ fn drop_untrusted_pins(
                 // `is_known`, not `has_live_lease`: a lapsed lease must keep
                 // its pin, or a device that only needed renewing is stranded on
                 // an address we forgot.
-                .filter(|fp| !trust.is_known(fp))
+                .filter(|fp| !trust.is_known(fp) && trust.to_pair_again(fp).is_none())
                 .map(|fp| (h, fp))
         })
         .collect();
@@ -429,6 +434,23 @@ fn drop_untrusted_pins(
         client_manager.clear_pins_matching(fp);
     }
     stale.into_iter().map(|(h, _)| h).collect()
+}
+
+/// Whether device `handle` may be pinned to `fp`, a machine that proved its
+/// key at `addr` when the device was dialled (#231): `fp` is still listed to
+/// pair again, the device is still pinned to no machine, and it still dials
+/// `addr`. A device whose address changed while the dial ran is not the
+/// device that address answered for.
+fn may_pin_to_listed(
+    clients: &ClientManager,
+    trust: &crate::trust::TrustStore,
+    handle: ClientHandle,
+    fp: &str,
+    addr: SocketAddr,
+) -> bool {
+    trust.to_pair_again(fp).is_some()
+        && clients.peer_fingerprint(handle).is_none()
+        && clients.targets(handle, addr)
 }
 
 /// Why an approved prompt granted nothing.
@@ -646,11 +668,46 @@ async fn claim_then_read_config<L, C>(
     Ok((claimed, config))
 }
 
+/// What a removal from the `[authorized_fingerprints]` table in config.toml
+/// takes away, by fingerprint, with the name each is held under: each device
+/// the store writes to that table, and each machine a build before the store
+/// listed there, held to be paired again (#231). The table only ever takes
+/// one of these away; it grants nothing, to either.
+fn removable_from_the_file(store: &crate::trust::TrustStore) -> HashMap<String, String> {
+    let mut removable = store.config_cache();
+    for (fp, listed) in store.every_to_pair_again() {
+        removable
+            .entry(fp.to_string())
+            .or_insert_with(|| listed.label.clone());
+    }
+    removable
+}
+
+/// How a notice names `fp`: by its pairing's name, or the name it is listed
+/// under to be paired again (#231).
+fn name_held(store: &crate::trust::TrustStore, fp: &str) -> String {
+    let label = store
+        .label(fp)
+        .or_else(|| store.to_pair_again(fp).map(|p| p.label.clone()))
+        .unwrap_or_default();
+    named(&label, fp)
+}
+
+/// `fp` as a notice of its removal from config.toml tells it: by its name,
+/// and whether it held only a listing to be paired again (#231).
+fn forgotten_as(store: &crate::trust::TrustStore, fp: &str) -> crate::cache_listed::Forgotten {
+    crate::cache_listed::Forgotten {
+        name: name_held(store, fp),
+        to_pair_again: store.to_pair_again(fp).is_some(),
+    }
+}
+
 /// Forget each device the trust store holds that the `[authorized_fingerprints]`
 /// cache in `config` listed before and no longer lists: an older build, or a
-/// person, removed it there (see `crate::cache_listed`). A removal found is
+/// person, removed it there (see `crate::cache_listed`). A machine listed to
+/// be paired again (#231) is forgotten the same way. A removal found is
 /// confirmed by reading the file again once it has settled. Returns the
-/// store, what the cache has listed, the names of the devices forgotten, and
+/// store, what the cache has listed, the devices forgotten, and
 /// whether the two reads disagreed, when the first read is not to be recorded
 /// in place of what was.
 async fn forget_removed_from_cache(
@@ -660,11 +717,14 @@ async fn forget_removed_from_cache(
 ) -> (
     crate::trust::TrustStore,
     crate::cache_listed::Listed,
-    Vec<String>,
+    Vec<crate::cache_listed::Forgotten>,
     bool,
 ) {
     let listed = crate::cache_listed::Listed::read(config_dir);
-    let mut removed = listed.removed(&store.config_cache(), config.listed_as_trusted().as_ref());
+    let mut removed = listed.removed(
+        &removable_from_the_file(&store),
+        config.listed_as_trusted().as_ref(),
+    );
     let mut disagreed = false;
     if !removed.is_empty() {
         // Only when something reads as removed, so a start pays nothing.
@@ -673,30 +733,31 @@ async fn forget_removed_from_cache(
         removed = crate::cache_listed::confirmed(removed, config.listed_on_disk().as_ref());
         disagreed = removed.len() != found;
     }
-    let mut names = Vec::new();
+    let mut forgotten = Vec::new();
     for fp in removed {
-        let name = named(&store.label(&fp).unwrap_or_default(), &fp);
+        let told = forgotten_as(&store, &fp);
         store.forget(&fp);
         log::warn!(
-            "forgot {name} ({fp}): config.toml no longer lists it, so it was removed there, \
-             by hand or by an older build"
+            "forgot {} ({fp}): config.toml no longer lists it, so it was removed there, \
+             by hand or by an older build",
+            told.name
         );
-        names.push(name);
+        forgotten.push(told);
     }
-    (store, listed, names, disagreed)
+    (store, listed, forgotten, disagreed)
 }
 
 /// Record, of what the `[authorized_fingerprints]` cache in `config` lists,
-/// the devices `store` trusts: removing one of them from the file later is a
-/// removal. While `keep`, what was recorded is kept as well.
+/// the devices `store` trusts or lists to be paired again: removing one of
+/// them from the file later is a removal. While `keep`, what was recorded is
+/// kept as well.
 fn record_listed(
     listed: &mut crate::cache_listed::Listed,
     store: &crate::trust::TrustStore,
     config: &Config,
     keep: bool,
 ) {
-    let granted: std::collections::HashSet<String> = store
-        .config_cache()
+    let granted: std::collections::HashSet<String> = removable_from_the_file(store)
         .keys()
         .map(|fp| crate::cache_listed::canonical(fp))
         .collect();
@@ -815,27 +876,20 @@ impl Service {
                 // First run under leases. This is the one-way door: after it,
                 // the config tables never answer a trust question again.
                 //
-                // Through the store, deliberately. Outbound is granted only to
-                // a fingerprint the old config actually DIALLED — allowlist
-                // membership was necessary but not sufficient for outbound, so
-                // minting it for everything would create at upgrade exactly the
-                // capability this rework exists to retire.
-                let dialled: std::collections::HashSet<String> = client_manager
-                    .get_client_states()
-                    .into_iter()
-                    .filter_map(|(_, _, st)| st.peer_fingerprint)
-                    .collect();
+                // Through the store, deliberately, and granting nothing: the
+                // old list never said which machine controls which, so each
+                // machine it names is listed to be paired again, and the
+                // pairing card asks the direction (#231, #220).
                 let mut store =
                     crate::trust::TrustStore::new(&public_key_fingerprint, trust_file.now())?;
                 let report = store.migrate_from_config(
                     &config.authorized_fingerprints(),
                     &config.revoked_fingerprints(),
-                    &dialled,
                     trust_file.now(),
                 );
                 log::info!(
-                    "migrated the trust store: {} leases, {} removed before, {} dropped",
-                    report.leased.len(),
+                    "migrated the trust store: {} to pair again, {} removed before, {} dropped",
+                    report.to_pair_again.len(),
                     report.refused.len(),
                     report.dropped.len(),
                 );
@@ -850,8 +904,8 @@ impl Service {
         if !forgotten.is_empty() {
             // Through the saver, so a save that fails is retried every minute
             // and every app that attaches is told, as for any trust change.
-            let unsaved =
-                trust_saver.save_change(&store, format!("removing {}", forgotten.join(", ")));
+            let names: Vec<&str> = forgotten.iter().map(|f| f.name.as_str()).collect();
+            let unsaved = trust_saver.save_change(&store, format!("removing {}", names.join(", ")));
             if let Some(unsaved) = unsaved {
                 log::error!("{unsaved}");
             }
@@ -1068,7 +1122,7 @@ impl Service {
                     self.settle_keep_awake();
                     self.keep_awake.retry_refused();
                 }
-                _ = dial_back.tick() => self.dial_back.reconcile(self.listening),
+                _ = dial_back.tick() => self.dial_back.reconcile(),
                 dialled = next_or_never(&mut self.dialled_in) => self.handle_dialled_in(dialled),
                 _ = add_dials.tick(), if !self.adding.is_empty() || !self.approved.is_empty() => {
                     self.retry_adding();
@@ -1272,7 +1326,13 @@ impl Service {
                             .into_iter()
                             .filter(|&h| h != handle),
                     );
-                    if self.trust.read().expect("lock").is_known(&fp) {
+                    // A device folded into a listing to pair again (#231) is
+                    // one card with it, and deleting the card removes both.
+                    let recorded = {
+                        let trust = self.trust.read().expect("lock");
+                        trust.is_known(&fp) || trust.to_pair_again(&fp).is_some()
+                    };
+                    if recorded {
                         log::warn!("deleting client {handle}: also revoking its trust ({fp})");
                         self.remove_authorized_key(fp);
                     }
@@ -1415,7 +1475,21 @@ impl Service {
             // waits to reach disk, a device forgotten in memory may still be
             // trusted there, so nothing recorded is dropped until it lands.
             let unsaved = self.trust_saver.is_pending();
-            if let Err(e) = self.cache_listed.record_keeping(written, unsaved) {
+            // A machine listed to be paired again (#231) is not in the cache,
+            // so this save dropped its line from a list an older build wrote:
+            // the file's lack of it from now on is not a removal.
+            let dropped: Vec<String> = self
+                .trust
+                .read()
+                .expect("lock")
+                .every_to_pair_again()
+                .map(|(fp, _)| fp.to_string())
+                .collect();
+            let recorded = self
+                .cache_listed
+                .record_keeping(written, unsaved)
+                .and_then(|()| self.cache_listed.unrecord(dropped));
+            if let Err(e) = recorded {
                 log::warn!("could not record which devices config.toml lists: {e}");
             }
         }
@@ -1491,7 +1565,7 @@ impl Service {
     fn check_removals(&mut self) {
         self.removal_check = None;
         let removed = {
-            let granted = self.trust.read().expect("lock").config_cache();
+            let granted = removable_from_the_file(&self.trust.read().expect("lock"));
             self.cache_listed
                 .removed(&granted, self.config.listed_as_trusted().as_ref())
         };
@@ -1501,17 +1575,16 @@ impl Service {
             crate::cache_listed::confirmed(removed, self.config.listed_on_disk().as_ref())
         };
         if !removed.is_empty() {
-            let names: Vec<String> = {
+            let forgotten: Vec<crate::cache_listed::Forgotten> = {
                 let trust = self.trust.read().expect("lock");
-                removed
-                    .iter()
-                    .map(|fp| named(&trust.label(fp).unwrap_or_default(), fp))
-                    .collect()
+                removed.iter().map(|fp| forgotten_as(&trust, fp)).collect()
             };
             for fp in removed {
                 self.remove_authorized_key(fp);
             }
-            self.notify_frontend(FrontendEvent::Error(crate::cache_listed::notice(&names)));
+            self.notify_frontend(FrontendEvent::Error(crate::cache_listed::notice(
+                &forgotten,
+            )));
         }
         #[cfg(test)]
         self.config_signals.checked.notify_one();
@@ -2048,6 +2121,15 @@ impl Service {
                     self.raise_connection_attempt(fp, AttemptOrigin::OutboundDial, Some(addr));
                 }
             }
+            DialRefusal::PairAgain {
+                handle,
+                fingerprint,
+                addr,
+            } => {
+                self.pin_to_listed(handle, &fingerprint, addr);
+                // Then told as any dial to it is: it must be paired again.
+                self.handle_dial_refusal(DialRefusal::Untrusted { fingerprint, addr });
+            }
             DialRefusal::RefusedByPeer {
                 handle,
                 fingerprint,
@@ -2352,6 +2434,55 @@ impl Service {
         true
     }
 
+    /// Pin device `handle`, pinned to no machine, to `fp`, a machine listed
+    /// to pair again that answered the device's dial at `addr` and proved its
+    /// key there (#231). The device's card and the listing are then one card,
+    /// as one machine is (#12).
+    ///
+    /// The pin is a measured identity and grants nothing. Every permission is
+    /// asked of the trust store by fingerprint, and the store lists that
+    /// machine with no lease; the pin only says which machine the device's
+    /// address reached, and the dial checks it, failing closed. Pairing it
+    /// again through the card grants what the pairing card asks.
+    fn pin_to_listed(&mut self, handle: ClientHandle, fp: &str, addr: SocketAddr) {
+        let may = may_pin_to_listed(
+            &self.client_manager,
+            &self.trust.read().expect("lock"),
+            handle,
+            fp,
+            addr,
+        );
+        if !may {
+            return;
+        }
+        match self.client_manager.pin(handle, fp.to_string()) {
+            Ok(true) => {
+                log::info!(
+                    "client {handle}: {addr} is {fp}, listed to pair again; pinned to it, \
+                     granting nothing"
+                );
+                self.save_config();
+                self.broadcast_client(handle);
+            }
+            Ok(false) => {}
+            Err(other) => log::info!(
+                "client {handle}: {addr} is {fp}, which client {other} is already pinned to"
+            ),
+        }
+    }
+
+    /// The name `fp` was listed under, when a build before the trust store
+    /// paired it and it has not been paired since (#231).
+    fn pair_again_name(&self, fp: &str) -> Option<String> {
+        let trust = self.trust.read().expect("lock");
+        let listed = trust.to_pair_again(fp)?;
+        Some(if listed.label.trim().is_empty() {
+            format!("the machine {}", fp.get(..8).unwrap_or(fp))
+        } else {
+            listed.label.clone()
+        })
+    }
+
     /// What this machine holds for `fp`, for a line about refusing it, when
     /// it holds a pairing in force with it. One whose pairing lapsed knocks
     /// as a stranger and pairs again through add device, so it is told as
@@ -2412,6 +2543,19 @@ impl Service {
                 return;
             }
             Admit::Closed => match origin {
+                AttemptOrigin::OutboundDial if self.pair_again_name(&fingerprint).is_some() => {
+                    let name = self.pair_again_name(&fingerprint).unwrap_or_default();
+                    log::info!(
+                        "our dial reached {fingerprint} at {addr:?}, paired with an older \
+                         version of hops and not since, and add device is not open"
+                    );
+                    self.notify_frontend(FrontendEvent::Error(format!(
+                        "{name} was paired with an older version of hops and must be paired \
+                         again. Open Add device on both machines, choose which machine \
+                         controls which, then move the pointer across again."
+                    )));
+                    return;
+                }
                 AttemptOrigin::OutboundDial => {
                     log::info!(
                         "our dial reached {fingerprint} at {addr:?}, which is not paired with \
@@ -2434,6 +2578,7 @@ impl Service {
                         self.prompt_gate.note_refusal(&fingerprint, addr, now)
                     {
                         refused.paired = self.paired_here(&fingerprint);
+                        refused.pair_again = self.pair_again_name(&fingerprint);
                         log::info!("{}", refused.log_line());
                         self.notify_frontend(FrontendEvent::Activity(refused.notice()));
                     }
@@ -2618,12 +2763,13 @@ impl Service {
         // goes too, and so does an approval here still waiting for its
         // number: what its card answered is on the lease, and the approval
         // itself must not outlive it (#220).
-        let label = self
-            .trust
-            .read()
-            .expect("lock")
-            .label(&fp)
-            .unwrap_or_default();
+        let label = {
+            let trust = self.trust.read().expect("lock");
+            trust
+                .label(&fp)
+                .or_else(|| trust.to_pair_again(&fp).map(|p| p.label.clone()))
+                .unwrap_or_default()
+        };
         self.trust.write().expect("lock").forget(&fp);
         self.pending_attempts.forget(&fp);
         self.approved.remove(&fp);
@@ -3181,8 +3327,12 @@ impl Service {
     /// frontend lists it from there: it was listed nowhere, so it could not
     /// be removed.
     fn publish_trust(&mut self) {
-        let (keys, peers, unconfirmed) = {
+        let (keys, peers, unconfirmed, to_pair_again) = {
             let trust = self.trust.read().expect("lock");
+            let to_pair_again: Vec<(String, String)> = trust
+                .every_to_pair_again()
+                .map(|(fp, p)| (fp.to_string(), p.label.clone()))
+                .collect();
             let peers: Vec<(String, crate::trust::Caps, String)> = trust
                 .pairings()
                 .into_iter()
@@ -3191,7 +3341,12 @@ impl Service {
                     (fp, caps, label)
                 })
                 .collect();
-            (trust.config_cache(), peers, trust.unconfirmed())
+            (
+                trust.config_cache(),
+                peers,
+                trust.unconfirmed(),
+                to_pair_again,
+            )
         };
         let mut peers: HashMap<String, hops_ipc::PeerTrust> = peers
             .into_iter()
@@ -3202,6 +3357,7 @@ impl Service {
                     pending: false,
                     label,
                     we_may_drive: caps.contains(crate::trust::Caps::I_MAY_DRIVE),
+                    pair_again: false,
                 };
                 (fp, t)
             })
@@ -3216,6 +3372,16 @@ impl Service {
                     ..Default::default()
                 },
             );
+        }
+        // Paired with a build before the trust store, and granting nothing
+        // until paired again (#231). A pairing under way for one is shown as
+        // that pairing.
+        for (fp, label) in to_pair_again {
+            peers.entry(fp).or_insert(hops_ipc::PeerTrust {
+                label,
+                pair_again: true,
+                ..Default::default()
+            });
         }
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
         self.notify_frontend(FrontendEvent::TrustUpdated(peers));
@@ -3792,7 +3958,6 @@ mod trust_door_guard {
                     revoked_at: 1_000,
                 },
             )]),
-            &std::collections::HashSet::new(),
             2_000,
         );
 
@@ -3804,7 +3969,7 @@ mod trust_door_guard {
              removed device came back after a reboot"
         );
         assert!(
-            !store.is_known(&fp),
+            !store.is_known(&fp) && store.to_pair_again(&fp).is_none(),
             "and nothing is recorded for it: removal forgets (#184)"
         );
     }
@@ -4439,6 +4604,9 @@ mod adding_a_device;
 mod dialled_by_the_controlled_machine;
 
 #[cfg(all(test, unix))]
+mod each_controls_the_other;
+
+#[cfg(all(test, unix))]
 mod kept_awake;
 
 #[cfg(all(test, unix, any(feature = "tui", feature = "slint")))]
@@ -4446,6 +4614,9 @@ mod every_pairing_is_listed;
 
 #[cfg(all(test, unix, any(feature = "tui", feature = "slint")))]
 mod what_a_controlled_machine_shows;
+
+#[cfg(all(test, unix, any(feature = "tui", feature = "slint")))]
+mod upgraded_from_v0_12;
 
 /// The whole daemon in this process, for a test that drives it the way a
 /// frontend and a peer do.
@@ -4738,7 +4909,8 @@ mod a_wrong_pairing_answer_is_not_a_refused_grant {
 mod a_pin_outlives_its_lease {
     //! `drop_untrusted_pins` runs at start and on every config reload. It may
     //! drop only a pin the trust store has no record of: a device whose lease
-    //! lapsed, or whose pairing still waits for its number, keeps its pin.
+    //! lapsed, whose pairing still waits for its number, or whose machine is
+    //! listed to pair again (#231), keeps its pin.
 
     use super::drop_untrusted_pins;
     use crate::client::ClientManager;
@@ -4760,10 +4932,52 @@ mod a_pin_outlives_its_lease {
         h
     }
 
+    // LEDGER R231-15 | class B | 1 return value: service::may_pin_to_listed on a real ClientManager and TrustStore
+    /// A device is pinned to a listed machine that proved its key at an
+    /// address only while it still dials that address, is still pinned to
+    /// no machine, and the machine is still listed (#231).
+    #[test]
+    fn a_device_is_pinned_only_to_what_answered_at_its_own_address() {
+        use super::may_pin_to_listed;
+        use std::net::SocketAddr;
+        let mut trust = TrustStore::new(&fp(0x01), T0).expect("ours");
+        let (listed, other) = (fp(0xa0), fp(0xc0));
+        trust
+            .list_to_pair_again(&listed, "iridium", T0)
+            .expect("listed");
+        let m = ClientManager::default();
+        let h = m.add_client();
+        let port = m.get_port(h).expect("a port");
+        let at: SocketAddr = ([192, 0, 2, 156], port).into();
+        let elsewhere: SocketAddr = ([192, 0, 2, 157], port).into();
+        m.set_fix_ips(h, vec![at.ip()]);
+        assert!(
+            may_pin_to_listed(&m, &trust, h, &listed, at),
+            "precondition: a device with no pin, dialled at its own address, where a \
+             listed machine proved its key, is pinned to it"
+        );
+        let refused = [
+            ("its address changed while the dial ran", &listed, elsewhere),
+            ("the machine is not listed to pair again", &other, at),
+        ];
+        for (why, machine, addr) in refused {
+            assert!(
+                !may_pin_to_listed(&m, &trust, h, machine, addr),
+                "a device was pinned though {why}: the pin would name a machine its \
+                 address did not answer as"
+            );
+        }
+        m.set_peer_fingerprint(h, Some(other.clone()));
+        assert!(
+            !may_pin_to_listed(&m, &trust, h, &listed, at),
+            "a device already pinned to a machine was pinned to another"
+        );
+    }
+
     #[test]
     fn only_a_pin_the_trust_store_never_heard_of_is_dropped() {
         let mut trust = TrustStore::new(&fp(0x01), T0).expect("ours");
-        let (lapsed, pending, stranger) = (fp(0x40), fp(0x60), fp(0x80));
+        let (lapsed, pending, stranger, listed) = (fp(0x40), fp(0x60), fp(0x80), fp(0xa0));
         trust
             .issue_with_term(&lapsed, "lapsed", Caps::OUTBOUND, Term::Secs(HOUR))
             .expect("issue");
@@ -4771,16 +4985,22 @@ mod a_pin_outlives_its_lease {
         trust
             .issue(&pending, "pending", Caps::OUTBOUND)
             .expect("issue");
+        trust
+            .list_to_pair_again(&listed, "listed", T0)
+            .expect("listed");
         assert!(
-            !trust.has_live_lease(&lapsed) && !trust.has_live_lease(&pending),
-            "precondition: neither holds a lease in force"
+            !trust.has_live_lease(&lapsed)
+                && !trust.has_live_lease(&pending)
+                && !trust.is_known(&listed),
+            "precondition: none holds a lease in force, and the listed one holds none"
         );
 
         let m = ClientManager::default();
-        let (a, b, c) = (
+        let (a, b, c, d) = (
             pinned_to(&m, &lapsed),
             pinned_to(&m, &pending),
             pinned_to(&m, &stranger),
+            pinned_to(&m, &listed),
         );
 
         let dropped = drop_untrusted_pins(&m, &trust);
@@ -4792,6 +5012,12 @@ mod a_pin_outlives_its_lease {
         );
         assert_eq!(m.peer_fingerprint(a), Some(lapsed));
         assert_eq!(m.peer_fingerprint(b), Some(pending));
+        assert_eq!(
+            m.peer_fingerprint(d),
+            Some(listed),
+            "a pin to a machine listed to pair again is what folds its device into the \
+             listing's card, and was measured when that machine proved its key (#231)"
+        );
         assert_eq!(
             m.peer_fingerprint(c),
             None,
