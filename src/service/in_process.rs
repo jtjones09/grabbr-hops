@@ -117,34 +117,69 @@ impl Daemon {
     }
 
     /// A daemon's first start on `old`, a whole `config.toml` an earlier
-    /// build wrote, as an upgrade meets it: no trust file yet. Only its
+    /// build wrote, as an upgrade meets it: no trust file yet. Only its own
     /// `port` line is changed, to one this test may bind, and the dummy
     /// backends and no discovery are put before it.
     pub(crate) async fn upgraded_from(tag: &str, old: &str) -> Self {
+        Self::upgraded_with(
+            tag,
+            old,
+            input_capture::Backend::Dummy,
+            input_emulation::Backend::Dummy,
+        )
+        .await
+    }
+
+    /// [`Daemon::upgraded_from`], capturing from `capture` and injecting
+    /// into `emulation`. This machine's own permissions are not consulted.
+    pub(crate) async fn upgraded_with(
+        tag: &str,
+        old: &str,
+        capture: input_capture::Backend,
+        emulation: input_emulation::Backend,
+    ) -> Self {
         let config = |port: u16| {
-            let old = old
-                .lines()
-                .map(|l| {
-                    if l.trim_start().starts_with("port =") {
-                        format!("port = {port}")
-                    } else {
-                        l.to_string()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
             format!(
                 "capture_backend = \"dummy\"\nemulation_backend = \"dummy\"\n\
-                 discovery = false\n{old}\n"
+                 discovery = false\n{}\n",
+                on_port(old, port)
             )
         };
-        Self::build_with(
+        let mut daemon = Self::build_with(
             crate::test_ports::pick,
             tag,
             config,
             &[],
+            capture,
+            emulation,
+        )
+        .await;
+        daemon.service.permission_watch = crate::permission_watch::PermissionWatch::at_daemon_start(
+            Arc::new(|_| false),
+            Arc::new(|| false),
+            Duration::from_secs(3600),
+        );
+        daemon
+    }
+
+    /// A daemon started again on the files [`keep_files`] kept from an
+    /// earlier one in `kept`: its config, identity and trust file, as a
+    /// restart reads them. Only its own `port` line is changed.
+    pub(crate) async fn restarted(
+        tag: &str,
+        kept: &std::path::Path,
+        emulation: input_emulation::Backend,
+    ) -> Self {
+        let old = std::fs::read_to_string(kept.join("config.toml")).expect("the kept config");
+        let config = |port: u16| on_port(&old, port);
+        Self::build_from(
+            crate::test_ports::pick,
+            tag,
+            config,
+            &[],
+            Some(kept),
             input_capture::Backend::Dummy,
-            input_emulation::Backend::Dummy,
+            emulation,
         )
         .await
     }
@@ -171,10 +206,24 @@ impl Daemon {
     /// [`Daemon::build_on`] with the whole config `config_at` writes for
     /// the port picked.
     async fn build_with(
+        port: impl FnMut() -> u16,
+        tag: &str,
+        config_at: impl Fn(u16) -> String,
+        pairings: &[(&str, &str, Caps)],
+        capture: input_capture::Backend,
+        emulation: input_emulation::Backend,
+    ) -> Self {
+        Self::build_from(port, tag, config_at, pairings, None, capture, emulation).await
+    }
+
+    /// [`Daemon::build_with`], its directory holding the files in `kept`
+    /// first, when there are some.
+    async fn build_from(
         mut port: impl FnMut() -> u16,
         tag: &str,
         config_at: impl Fn(u16) -> String,
         pairings: &[(&str, &str, Caps)],
+        kept: Option<&std::path::Path>,
         capture: input_capture::Backend,
         emulation: input_emulation::Backend,
     ) -> Self {
@@ -185,6 +234,9 @@ impl Daemon {
         let scratch = Scratch { dir };
         let dir = &scratch.dir;
         let mut last = None;
+        if let Some(kept) = kept {
+            keep_files(kept, dir);
+        }
         if !pairings.is_empty() {
             crate::test_harness::seed_pairings(dir, &dir.join("hops.pem"), pairings);
         }
@@ -275,6 +327,37 @@ impl Daemon {
         self.service.emulation.terminate().await;
         self.service.resolver.terminate().await;
         out
+    }
+}
+
+/// `config` with its own `port` line, the one before any table, set to
+/// `port`. A device's `port` line, in its table, is left alone.
+fn on_port(config: &str, port: u16) -> String {
+    let mut in_table = false;
+    config
+        .lines()
+        .map(|l| {
+            in_table |= l.trim_start().starts_with('[');
+            if !in_table && l.trim_start().starts_with("port =") {
+                format!("port = {port}")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Copy what a daemon in `from` reads at start into `to`: every file but
+/// its IPC socket and token, which each start makes for itself.
+pub(crate) fn keep_files(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).expect("a directory to keep them in");
+    for entry in std::fs::read_dir(from).expect("the daemon's directory") {
+        let path = entry.expect("an entry").path();
+        let name = path.file_name().expect("a name").to_owned();
+        if path.is_file() && name != "s.sock" && name != "ipc-token" {
+            std::fs::copy(&path, to.join(name)).expect("a file kept");
+        }
     }
 }
 

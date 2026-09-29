@@ -98,6 +98,15 @@ pub(crate) enum DialRefusal {
         fingerprint: String,
         addr: SocketAddr,
     },
+    /// A device pinned to no machine was dialled at `addr`, and the machine
+    /// that answered proved its key there: `fingerprint`, which is listed to
+    /// pair again (#231). The service may pin the device to it. That machine
+    /// was not connected: nothing about the listing lets this one drive it.
+    PairAgain {
+        handle: ClientHandle,
+        fingerprint: String,
+        addr: SocketAddr,
+    },
     /// Something at `addr` refused the ALPN this machine offers to be
     /// driven, which hops v0.12 and earlier do not serve, or answered only
     /// on the port those versions listened on (#16).
@@ -220,6 +229,23 @@ fn client_config(
     client_config_for(identity, trust, observed, transport::Dialler::Drives)
 }
 
+/// A dial's config for a device pinned to no machine: as
+/// [`client_config`], and it also completes the handshake with a machine
+/// listed to pair again, recording in `proven` the machine whose key
+/// signed it (#231).
+fn measuring_client_config(
+    identity: &Identity,
+    trust: Trust,
+    observed: Arc<StdMutex<Option<String>>>,
+    proven: Arc<StdMutex<Option<String>>>,
+) -> ClientConfig {
+    client_config_with(
+        identity,
+        Arc::new(FpServerVerifier::measuring(trust, observed, proven)),
+        transport::Dialler::Drives,
+    )
+}
+
 /// A dial's config for `role`: the ALPN it offers, and the question its
 /// verifier asks of the machine that answers (#15). Only that one ALPN is
 /// offered, so the role cannot be negotiated into another.
@@ -230,6 +256,15 @@ pub(crate) fn client_config_for(
     role: transport::Dialler,
 ) -> ClientConfig {
     let verifier = Arc::new(FpServerVerifier::for_role(trust, observed, role));
+    client_config_with(identity, verifier, role)
+}
+
+/// A dial's config for `role`, its receiver checked by `verifier`.
+fn client_config_with(
+    identity: &Identity,
+    verifier: Arc<FpServerVerifier>,
+    role: transport::Dialler,
+) -> ClientConfig {
     let mut crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(verifier)
@@ -415,6 +450,29 @@ struct Dial {
     addr: SocketAddr,
     cfg: ClientConfig,
     observed: Arc<StdMutex<Option<String>>>,
+    /// The machine whose key signed this address's handshake, if it did.
+    proven: Arc<StdMutex<Option<String>>>,
+}
+
+/// The machine listed to pair again (#231) that a dial for a device pinned
+/// to no machine measured, and an address it proved its key at.
+///
+/// Measured means every address that answered answered as that one machine,
+/// and at least one of them completed the handshake with its key. What an
+/// address presented without signing proves nothing: any machine can send
+/// another's certificate, and a certificate is refused before its holder
+/// signs anything.
+fn listed_machine_measured(
+    seen: &[(SocketAddr, String)],
+    proven: &[(SocketAddr, String)],
+    trust: &Trust,
+) -> Option<(SocketAddr, String)> {
+    let TrustPrompt::Offer { fp, .. } = decide_trust_prompt(seen) else {
+        return None;
+    };
+    let (at, _) = proven.iter().find(|(_, p)| *p == fp)?;
+    let listed = trust.read().expect("lock").to_pair_again(&fp).is_some();
+    listed.then_some((*at, fp))
 }
 
 async fn connect_any(
@@ -1065,14 +1123,30 @@ async fn connect_to_handle(
         // slower than the real receiver decides which fingerprint the user is
         // asked to trust — and the user, who just added this device and is
         // expecting a prompt, approves it.
+        // A device pinned to no machine measures which machine answers at
+        // its address: one listed to pair again is made to prove its key,
+        // so that the device can be pinned to it (#231).
+        let unpinned = expected_fp.is_none();
         let dials: Vec<Dial> = addrs
             .iter()
             .map(|&addr| {
                 let observed = Arc::new(StdMutex::new(None));
+                let proven = Arc::new(StdMutex::new(None));
+                let cfg = if unpinned {
+                    measuring_client_config(
+                        &identity,
+                        trust.clone(),
+                        observed.clone(),
+                        proven.clone(),
+                    )
+                } else {
+                    client_config(&identity, trust.clone(), observed.clone())
+                };
                 Dial {
                     addr,
-                    cfg: client_config(&identity, trust.clone(), observed.clone()),
+                    cfg,
                     observed,
+                    proven,
                 }
             })
             .collect();
@@ -1092,6 +1166,22 @@ async fn connect_to_handle(
                             .map(|fp| (d.addr, fp))
                     })
                     .collect();
+                let proven: Vec<(SocketAddr, String)> = dials
+                    .iter()
+                    .filter_map(|d| d.proven.lock().expect("lock").take().map(|fp| (d.addr, fp)))
+                    .collect();
+                if let Some((addr, fingerprint)) = listed_machine_measured(&seen, &proven, &trust) {
+                    log::info!(
+                        "client {handle}: {addr} proved it is {fingerprint}, which is listed \
+                         to pair again; it is not connected"
+                    );
+                    let _ = refusals.send(DialRefusal::PairAgain {
+                        handle,
+                        fingerprint,
+                        addr,
+                    });
+                    return Err(e);
+                }
                 match e {
                     // The handshake succeeded, so the machine that answered is
                     // one this machine may drive, but it is not the one this
@@ -2481,6 +2571,7 @@ mod tests {
                         addr,
                         cfg: client_config(&client, empty.clone(), observed.clone()),
                         observed,
+                        proven: Arc::new(StdMutex::new(None)),
                     }
                 })
                 .collect();
@@ -2493,6 +2584,126 @@ mod tests {
                     Some(fps[i].as_str()),
                     "address {i} must record ITS OWN receiver — a shared slot would leave \
                      both holding whichever handshake finished last"
+                );
+            }
+        });
+    }
+
+    /// A server presenting `presented`'s certificate and signing the
+    /// handshake with `signer`'s key: `presented` itself when they are one,
+    /// an impostor when not. Certificates are public; keys are not.
+    fn server_signing_as(presented: &Identity, signer: &Identity) -> quinn::ServerConfig {
+        #[derive(Debug)]
+        struct Presents(Arc<rustls::sign::CertifiedKey>);
+        impl rustls::server::ResolvesServerCert for Presents {
+            fn resolve(
+                &self,
+                _: rustls::server::ClientHello<'_>,
+            ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+                Some(self.0.clone())
+            }
+        }
+        let key = rustls::crypto::ring::default_provider()
+            .key_provider
+            .load_private_key(signer.key.clone_key())
+            .expect("a signing key");
+        let certified = rustls::sign::CertifiedKey::new(vec![presented.cert.clone()], key);
+        let mut crypto = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(Presents(Arc::new(certified))));
+        crypto.alpn_protocols = vec![transport::ALPN.to_vec()];
+        quinn::ServerConfig::with_crypto(Arc::new(
+            QuicServerConfig::try_from(crypto).expect("quic server"),
+        ))
+    }
+
+    // LEDGER R231-14 | class B | 1 return value: listed_machine_measured over the slots FpServerVerifier::measuring filled on real loopback handshakes
+    /// A device pinned to no machine is pinned to a machine listed to pair
+    /// again only once that machine proved its key at the device's address
+    /// (#231). An impostor presenting the listed machine's certificate, and
+    /// signing with a key of its own, is seen as that machine and measured
+    /// as nothing.
+    #[test]
+    fn only_a_machine_that_signs_for_its_certificate_is_measured() {
+        transport::install_crypto_provider();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        tokio::task::LocalSet::new().block_on(&rt, async {
+            let (client, listed, impostor) = (identity(), identity(), identity());
+            let listed_fp = transport::fingerprint_of(&listed.cert);
+            let mut store =
+                crate::trust::TrustStore::new(&transport::fingerprint_of(&client.cert), 0)
+                    .expect("our fingerprint");
+            store
+                .list_to_pair_again(&listed_fp, "iridium", 0)
+                .expect("listed");
+            let trust: Trust = Arc::new(RwLock::new(store));
+            let client_ep =
+                Endpoint::client("127.0.0.1:0".parse().expect("addr")).expect("client endpoint");
+            for (who, server, measured) in [
+                (
+                    "the listed machine",
+                    server_signing_as(&listed, &listed),
+                    true,
+                ),
+                (
+                    "an impostor presenting its certificate",
+                    server_signing_as(&listed, &impostor),
+                    false,
+                ),
+            ] {
+                let ep = Endpoint::server(server, "127.0.0.1:0".parse().expect("addr"))
+                    .expect("server endpoint");
+                let addr = ep.local_addr().expect("local addr");
+                spawn_local(async move {
+                    while let Some(incoming) = ep.accept().await {
+                        spawn_local(async move {
+                            let _ = incoming.await;
+                        });
+                    }
+                });
+                let (observed, proven) =
+                    (Arc::new(StdMutex::new(None)), Arc::new(StdMutex::new(None)));
+                let dial = Dial {
+                    addr,
+                    cfg: measuring_client_config(
+                        &client,
+                        trust.clone(),
+                        observed.clone(),
+                        proven.clone(),
+                    ),
+                    observed,
+                    proven,
+                };
+                let dialled = connect_any(&client_ep, std::slice::from_ref(&dial), None, &trust, 0)
+                    .await
+                    .map(|_| ());
+                let slot = |s: &Arc<StdMutex<Option<String>>>| -> Vec<(SocketAddr, String)> {
+                    s.lock()
+                        .expect("lock")
+                        .clone()
+                        .map(|fp| (addr, fp))
+                        .into_iter()
+                        .collect()
+                };
+                let (seen, proved) = (slot(&dial.observed), slot(&dial.proven));
+                assert_eq!(
+                    seen,
+                    [(addr, listed_fp.clone())],
+                    "precondition: {who} presented the listed machine's certificate"
+                );
+                assert!(
+                    dialled.is_err(),
+                    "{who}: a dial to a machine listed to pair again connected"
+                );
+                assert_eq!(
+                    listed_machine_measured(&seen, &proved, &trust),
+                    measured.then(|| (addr, listed_fp.clone())),
+                    "{who}: a device pinned to no machine is pinned to a listed machine \
+                     only when the answer at its address proved that machine's key (#231); \
+                     proven: {proved:?}"
                 );
             }
         });

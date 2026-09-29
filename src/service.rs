@@ -380,8 +380,8 @@ impl RecentNotices {
 /// each dial share it, so the person is told once, not once by each.
 const NOT_RESOLVED: &str = "not-resolved";
 
-/// Drop any persisted client pin naming a fingerprint that is not in the
-/// allowlist.
+/// Drop any persisted client pin naming a fingerprint the trust store has no
+/// record of.
 ///
 /// Such a pin can never let anyone in — the outbound dial is fail-closed against
 /// it — but it CAN silently brick a client: no machine can satisfy it, so every
@@ -389,6 +389,11 @@ const NOT_RESOLVED: &str = "not-resolved";
 /// client re-learn the identity on its next successful handshake, which is
 /// exactly what a never-connected client does. A pin the trust store knows is
 /// kept through any edit to the device's hostname or address (#99).
+///
+/// So is a pin to a machine listed to pair again (#231): it was measured, when
+/// that machine proved its key at the device's address, and it is what folds
+/// the device's card and the listing into one. It grants nothing, as the
+/// listing grants nothing.
 fn drop_untrusted_pins(
     client_manager: &ClientManager,
     trust: &crate::trust::TrustStore,
@@ -401,7 +406,7 @@ fn drop_untrusted_pins(
                 // `is_known`, not `has_live_lease`: a lapsed lease must keep
                 // its pin, or a device that only needed renewing is stranded on
                 // an address we forgot.
-                .filter(|fp| !trust.is_known(fp))
+                .filter(|fp| !trust.is_known(fp) && trust.to_pair_again(fp).is_none())
                 .map(|fp| (h, fp))
         })
         .collect();
@@ -1133,7 +1138,13 @@ impl Service {
                             .into_iter()
                             .filter(|&h| h != handle),
                     );
-                    if self.trust.read().expect("lock").is_known(&fp) {
+                    // A device folded into a listing to pair again (#231) is
+                    // one card with it, and deleting the card removes both.
+                    let recorded = {
+                        let trust = self.trust.read().expect("lock");
+                        trust.is_known(&fp) || trust.to_pair_again(&fp).is_some()
+                    };
+                    if recorded {
                         log::warn!("deleting client {handle}: also revoking its trust ({fp})");
                         self.remove_authorized_key(fp);
                     }
@@ -1347,6 +1358,7 @@ impl Service {
                 )));
             }
             EmulationEvent::ConnectionAttempt { fingerprint, addr } => {
+                self.measure_devices_at(&fingerprint, addr);
                 self.raise_connection_attempt(fingerprint, AttemptOrigin::Inbound, Some(addr));
             }
             EmulationEvent::Entered {
@@ -1855,6 +1867,15 @@ impl Service {
                     self.raise_connection_attempt(fp, AttemptOrigin::OutboundDial, Some(addr));
                 }
             }
+            DialRefusal::PairAgain {
+                handle,
+                fingerprint,
+                addr,
+            } => {
+                self.pin_to_listed(handle, &fingerprint, addr);
+                // Then told as any dial to it is: it must be paired again.
+                self.handle_dial_refusal(DialRefusal::Untrusted { fingerprint, addr });
+            }
             DialRefusal::RefusedByPeer {
                 handle,
                 fingerprint,
@@ -2149,6 +2170,72 @@ impl Service {
              again with this machine's own keyboard and mouse."
         )));
         true
+    }
+
+    /// Pin device `handle`, pinned to no machine, to `fp`, a machine listed
+    /// to pair again that answered the device's dial at `addr` and proved its
+    /// key there (#231). The device's card and the listing are then one card,
+    /// as one machine is (#12).
+    ///
+    /// The pin is a measured identity and grants nothing. Every permission is
+    /// asked of the trust store by fingerprint, and the store lists that
+    /// machine with no lease; the pin only says which machine the device's
+    /// address reached, and the dial checks it, failing closed. Pairing it
+    /// again through the card grants what the pairing card asks.
+    fn pin_to_listed(&mut self, handle: ClientHandle, fp: &str, addr: SocketAddr) {
+        if self.trust.read().expect("lock").to_pair_again(fp).is_none()
+            || self.client_manager.peer_fingerprint(handle).is_some()
+            || !self.client_manager.targets(handle, addr)
+        {
+            return;
+        }
+        match self.client_manager.pin(handle, fp.to_string()) {
+            Ok(true) => {
+                log::info!(
+                    "client {handle}: {addr} is {fp}, listed to pair again; pinned to it, \
+                     granting nothing"
+                );
+                self.save_config();
+                self.broadcast_client(handle);
+            }
+            Ok(false) => {}
+            Err(other) => log::info!(
+                "client {handle}: {addr} is {fp}, which client {other} is already pinned to"
+            ),
+        }
+    }
+
+    /// A machine listed to pair again knocked from `addr` (#231). Each device
+    /// switched on and pinned to no machine that names that address is
+    /// dialled, so that its own dial measures which machine answers there
+    /// and pins it ([`Self::pin_to_listed`]). The knock proves nothing by
+    /// itself: it was refused before the knocking machine signed anything.
+    /// So it only starts the measurement, once a minute per device at most.
+    fn measure_devices_at(&mut self, fp: &str, addr: SocketAddr) {
+        if self.trust.read().expect("lock").to_pair_again(fp).is_none()
+            || !self.client_manager.every_pinned_to(fp).is_empty()
+        {
+            return;
+        }
+        let now = Instant::now();
+        let at: Vec<ClientHandle> = self
+            .client_manager
+            .get_client_states()
+            .into_iter()
+            .filter(|(_, _, s)| {
+                s.active && s.peer_fingerprint.is_none() && s.ips.contains(&addr.ip())
+            })
+            .map(|(h, _, _)| h)
+            .collect();
+        for handle in at {
+            if self.refusal_notices.due(handle, "measure", now) {
+                log::info!(
+                    "{fp}, listed to pair again, knocked from {addr}: dialling client {handle} \
+                     there to learn which machine it is"
+                );
+                self.capture.dial(handle);
+            }
+        }
     }
 
     /// The name `fp` was listed under, when a build before the trust store
@@ -4583,7 +4670,8 @@ mod a_wrong_pairing_answer_is_not_a_refused_grant {
 mod a_pin_outlives_its_lease {
     //! `drop_untrusted_pins` runs at start and on every config reload. It may
     //! drop only a pin the trust store has no record of: a device whose lease
-    //! lapsed, or whose pairing still waits for its number, keeps its pin.
+    //! lapsed, whose pairing still waits for its number, or whose machine is
+    //! listed to pair again (#231), keeps its pin.
 
     use super::drop_untrusted_pins;
     use crate::client::ClientManager;
@@ -4608,7 +4696,7 @@ mod a_pin_outlives_its_lease {
     #[test]
     fn only_a_pin_the_trust_store_never_heard_of_is_dropped() {
         let mut trust = TrustStore::new(&fp(0x01), T0).expect("ours");
-        let (lapsed, pending, stranger) = (fp(0x40), fp(0x60), fp(0x80));
+        let (lapsed, pending, stranger, listed) = (fp(0x40), fp(0x60), fp(0x80), fp(0xa0));
         trust
             .issue_with_term(&lapsed, "lapsed", Caps::OUTBOUND, Term::Secs(HOUR))
             .expect("issue");
@@ -4616,16 +4704,22 @@ mod a_pin_outlives_its_lease {
         trust
             .issue(&pending, "pending", Caps::OUTBOUND)
             .expect("issue");
+        trust
+            .list_to_pair_again(&listed, "listed", T0)
+            .expect("listed");
         assert!(
-            !trust.has_live_lease(&lapsed) && !trust.has_live_lease(&pending),
-            "precondition: neither holds a lease in force"
+            !trust.has_live_lease(&lapsed)
+                && !trust.has_live_lease(&pending)
+                && !trust.is_known(&listed),
+            "precondition: none holds a lease in force, and the listed one holds none"
         );
 
         let m = ClientManager::default();
-        let (a, b, c) = (
+        let (a, b, c, d) = (
             pinned_to(&m, &lapsed),
             pinned_to(&m, &pending),
             pinned_to(&m, &stranger),
+            pinned_to(&m, &listed),
         );
 
         let dropped = drop_untrusted_pins(&m, &trust);
@@ -4637,6 +4731,12 @@ mod a_pin_outlives_its_lease {
         );
         assert_eq!(m.peer_fingerprint(a), Some(lapsed));
         assert_eq!(m.peer_fingerprint(b), Some(pending));
+        assert_eq!(
+            m.peer_fingerprint(d),
+            Some(listed),
+            "a pin to a machine listed to pair again is what folds its device into the \
+             listing's card, and was measured when that machine proved its key (#231)"
+        );
         assert_eq!(
             m.peer_fingerprint(c),
             None,

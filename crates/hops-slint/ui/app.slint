@@ -991,7 +991,10 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                 }
 
                                 // --- send facet: position + active toggle + edit/delete ---
-                                if d.has-send && !confirming: VerticalLayout {
+                                // Not on a machine to pair again (#231): it is
+                                // neither crossed to nor dialled for anything
+                                // until then, and the room is its status's.
+                                if d.has-send && !d.pair-again && !confirming: VerticalLayout {
                                     alignment: center;
                                     Chip {
                                         text: d.pos;
@@ -1007,7 +1010,7 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                         }
                                     }
                                 }
-                                if d.has-send && !confirming: VerticalLayout {
+                                if d.has-send && !d.pair-again && !confirming: VerticalLayout {
                                     alignment: center;
                                     Toggle {
                                         checked: d.active;
@@ -1053,7 +1056,9 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                         }
                                     }
                                 }
-                                if d.has-send && root.confirm-delete-handle != d.handle: VerticalLayout {
+                                // A machine to pair again that has a device
+                                // is one card, removed whole by "remove" below.
+                                if d.has-send && !d.pair-again && root.confirm-delete-handle != d.handle: VerticalLayout {
                                     alignment: center;
                                     PillButton {
                                         text: "delete";
@@ -1143,7 +1148,15 @@ if root.devices.length > 0 || !root.show-add-device: Card {
                                         text: "yes";
                                         danger: true;
                                         clicked => {
-                                            root.revoke(d.fp-full);
+                                            // Folded with its device (#231): the
+                                            // device goes with the listing, as
+                                            // one card for one machine.
+                                            if d.pair-again && d.has-send {
+                                                root.delete-device(d.handle, d.pin);
+                                                root.editing-device = "";
+                                            } else {
+                                                root.revoke(d.fp-full);
+                                            }
                                             root.confirm-revoke-fp = "";
                                         }
                                     }
