@@ -3,11 +3,15 @@
 //! A Mac that idle-sleeps suspends hops, and the machine controlling it can
 //! no longer reach it until someone wakes it by hand. So a Mac holds a power
 //! assertion, `PreventUserIdleSystemSleep` named "hops KVM receiver active",
-//! but only while at least one paired device that may control it is
-//! switched on here ([`wanted`]). With nothing paired, or with every such
-//! device switched off, removed or no longer granted control, the Mac
-//! sleeps as it would without hops. Remote input also wakes the display, which
-//! the emulation backend does per event and is not decided here.
+//! but only while at least one paired device may control it ([`wanted`]).
+//! With nothing paired, or with every such pairing removed or no longer
+//! granting control, the Mac sleeps as it would without hops. Remote input
+//! also wakes the display, which the emulation backend does per event and
+//! is not decided here.
+//!
+//! Switching a device off does not let the Mac sleep: it stops this Mac's
+//! pointer crossing to that device, but the device may still cross onto
+//! this Mac over a link it opens (#218), and an asleep Mac is unreachable.
 //!
 //! `GRABBR_KEEP_AWAKE=display` holds `PreventUserIdleDisplaySleep` instead,
 //! so the screen never blanks; `=off` never holds one, for a Mac woken over
@@ -16,27 +20,17 @@
 //! The decision is made here, on every platform, and reaches the system
 //! through [`PowerAssertion`]; only macOS has one to take.
 
-use crate::client::ClientManager;
 use crate::transport::Trust;
 
 /// Whether this machine should be kept awake now: some device it holds a
-/// pairing with may control it ([`crate::trust::TrustStore::may_drive_us`],
-/// the test every inbound event passes), and no device entry pinned to that
-/// machine is switched off here (off means off, #218; the test the
-/// clipboard also asks).
-pub(crate) fn wanted(trust: &Trust, clients: &ClientManager) -> bool {
-    let drivers: Vec<String> = {
-        let trust = trust.read().expect("lock");
-        trust
-            .entries()
-            .map(|(fp, _)| fp)
-            .filter(|fp| trust.may_drive_us(fp))
-            .map(str::to_string)
-            .collect()
-    };
-    drivers
-        .iter()
-        .any(|fp| clients.switch_allows_clipboard(fp, None))
+/// pairing with may control it. That is
+/// [`crate::trust::TrustStore::may_drive_us`], the test every inbound event
+/// passes and nothing else: a device switched off here may still drive this
+/// machine over a link it opened.
+pub(crate) fn wanted(trust: &Trust) -> bool {
+    let store = trust.read().expect("lock");
+    let any = store.entries().any(|(fp, _)| store.may_drive_us(fp));
+    any
 }
 
 /// What `GRABBR_KEEP_AWAKE` asks for.
@@ -187,8 +181,8 @@ pub(crate) mod macos {
             match iopm::PowerAssertion::take(self.kind) {
                 Ok(held) => {
                     log::info!(
-                        "holding a power assertion ({kind}): a paired device that may \
-                         control this Mac is switched on, and an asleep Mac is unreachable"
+                        "holding a power assertion ({kind}): a paired device may control \
+                         this Mac, and an asleep Mac is unreachable"
                     );
                     self.held = Some(held);
                     true
@@ -206,8 +200,8 @@ pub(crate) mod macos {
         fn release(&mut self) {
             if self.held.take().is_some() {
                 log::info!(
-                    "released the power assertion: no paired device that may control \
-                     this Mac is switched on"
+                    "released the power assertion: no paired device may control this \
+                     Mac"
                 );
             }
         }
@@ -260,15 +254,13 @@ pub(crate) mod recording {
 
 #[cfg(test)]
 mod held_only_while_a_controller_may_drive {
-    //! The decision, over real trust stores and device lists: pairing, the
-    //! direction a lease grants, the switch, and removal.
+    //! The decision, over real trust stores: pairing, the direction a lease
+    //! grants, and removal.
 
     use super::recording::{Recording, Seen};
     use super::*;
     use crate::test_harness::{Machine, machine};
     use crate::trust::{Caps, TrustStore};
-    use hops_ipc::Position;
-    use std::collections::HashSet;
     use std::rc::Rc;
     use std::sync::{Arc, RwLock};
 
@@ -278,27 +270,12 @@ mod held_only_while_a_controller_may_drive {
         ))
     }
 
-    fn device(clients: &ClientManager, pin: &str, on: bool) -> hops_ipc::ClientHandle {
-        clients.add_with_config(crate::config::ConfigClient {
-            label: None,
-            ips: HashSet::new(),
-            hostname: None,
-            port: hops_ipc::DEFAULT_PORT,
-            pos: Position::default(),
-            active: on,
-            enter_hook: None,
-            fingerprint: Some(pin.to_string()),
-            geometry: None,
-        })
-    }
-
-    // LEDGER KA-1 | class B | 1 return value: keep_awake::wanted over a real TrustStore and ClientManager
+    // LEDGER KA-1 | class B | 1 return value: keep_awake::wanted over a real TrustStore
     #[test]
-    fn only_a_paired_device_that_may_control_this_machine_and_is_on_keeps_it_awake() {
+    fn only_a_paired_device_that_may_control_this_machine_keeps_it_awake() {
         let (mac, pc, laptop) = (machine(), machine(), machine());
         let trust = store(&mac);
-        let clients = ClientManager::default();
-        assert!(!wanted(&trust, &clients), "kept awake with nothing paired");
+        assert!(!wanted(&trust), "kept awake with nothing paired");
 
         // This machine controls the laptop only: the laptop may not drive it.
         trust
@@ -307,7 +284,7 @@ mod held_only_while_a_controller_may_drive {
             .issue_confirmed(&laptop.fingerprint, "laptop", Caps::OUTBOUND)
             .expect("issue");
         assert!(
-            !wanted(&trust, &clients),
+            !wanted(&trust),
             "kept awake for a pairing that only lets this machine control the other"
         );
 
@@ -318,7 +295,7 @@ mod held_only_while_a_controller_may_drive {
             .issue(&pc.fingerprint, "desk pc", Caps::INBOUND)
             .expect("issue");
         assert!(
-            !wanted(&trust, &clients),
+            !wanted(&trust),
             "kept awake for a pairing not yet confirmed"
         );
 
@@ -328,24 +305,8 @@ mod held_only_while_a_controller_may_drive {
             .issue_confirmed(&pc.fingerprint, "desk pc", Caps::DRIVE)
             .expect("issue");
         assert!(
-            wanted(&trust, &clients),
+            wanted(&trust),
             "not kept awake for a paired machine that may control this one"
-        );
-
-        let pc_here = device(&clients, &pc.fingerprint, true);
-        assert!(
-            wanted(&trust, &clients),
-            "its device, switched on, stopped it"
-        );
-        clients.deactivate_client(pc_here);
-        assert!(
-            !wanted(&trust, &clients),
-            "kept awake for a machine whose device is switched off"
-        );
-        clients.activate_client(pc_here);
-        assert!(
-            wanted(&trust, &clients),
-            "switched back on, it no longer keeps this machine awake"
         );
 
         trust
@@ -353,7 +314,7 @@ mod held_only_while_a_controller_may_drive {
             .expect("lock")
             .drop_capabilities(&pc.fingerprint, Caps::DRIVE_ME);
         assert!(
-            !wanted(&trust, &clients),
+            !wanted(&trust),
             "kept awake for a machine that may no longer control this one"
         );
 
@@ -362,12 +323,9 @@ mod held_only_while_a_controller_may_drive {
             .expect("lock")
             .issue_confirmed(&pc.fingerprint, "desk pc", Caps::DRIVE)
             .expect("issue");
-        assert!(wanted(&trust, &clients), "paired again, not kept awake");
+        assert!(wanted(&trust), "paired again, not kept awake");
         trust.write().expect("lock").forget(&pc.fingerprint);
-        assert!(
-            !wanted(&trust, &clients),
-            "kept awake for a machine that was removed"
-        );
+        assert!(!wanted(&trust), "kept awake for a machine that was removed");
     }
 
     // LEDGER KA-2 | class B | 1 calls made through the PowerAssertion seam by KeepAwake::set

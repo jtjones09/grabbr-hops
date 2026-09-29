@@ -252,7 +252,7 @@ pub struct Service {
     /// the run loop does not busy-poll a closed channel)
     clipboard_alive: bool,
     /// The power assertion that keeps this machine awake while a paired
-    /// device that may control it is switched on; settled after every event.
+    /// device may control it; settled after every event.
     keep_awake: crate::keep_awake::KeepAwake,
     /// inbound clipboard text received from peers, applied to the local
     /// clipboard if the pairing still takes it from its sender
@@ -1016,9 +1016,9 @@ impl Service {
                     break;
                 }
             }
-            // After every event rather than where trust or a switch changes:
-            // those are many places, and one missed would keep the machine
-            // awake, or let it sleep, until the next.
+            // After every event rather than where trust changes: those are
+            // many places, and one missed would keep the machine awake, or
+            // let it sleep, until the next.
             self.settle_keep_awake();
         }
 
@@ -1042,10 +1042,10 @@ impl Service {
         }
     }
 
-    /// Hold the power assertion while some paired device that may control
-    /// this machine is switched on here, and only then.
+    /// Hold the power assertion while some paired device may control this
+    /// machine, and only then.
     fn settle_keep_awake(&mut self) {
-        let wanted = crate::keep_awake::wanted(&self.trust, &self.client_manager);
+        let wanted = crate::keep_awake::wanted(&self.trust);
         self.keep_awake.set(wanted);
     }
 
