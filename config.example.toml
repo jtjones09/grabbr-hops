@@ -13,6 +13,11 @@ release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
 # each machine that controls it.
 # listen = false
 
+# optional: set to false to stop announcing this machine on the local
+# network (its hostname, addresses and key fingerprint) and looking for
+# others; devices are then added by address. See docs/NETWORK.md.
+# discovery = false
+
 # list of authorized tls certificate fingerprints that
 # are accepted for incoming traffic
 [authorized_fingerprints]

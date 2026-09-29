@@ -61,7 +61,8 @@ and how to recover. How to report a vulnerability is in
 - **The network itself.** Traffic cannot be read or changed, but it can be
   blocked. Discovery announces that the machine runs hops, with its hostname,
   addresses and key fingerprint; set `discovery = false` in `config.toml` to
-  turn it off and type addresses instead.
+  turn it off and type addresses instead. Every port and connection hops
+  uses is in [NETWORK.md](NETWORK.md).
 
 ## Removing a machine
 
@@ -101,14 +102,21 @@ user account or a deleted directory gives the machine a new key. The other
 machines then no longer recognise it: remove its old card on each and pair
 again.
 
-**A device no longer connects.** Its card says where it stands:
+**A device no longer connects.** Its card says where it stands. Every
+state other than "connected" is here:
 
 | The card says | What to do |
 | --- | --- |
+| not connected | The two are paired and no link is up either way, with nothing known to be wrong. Move the pointer to it. If the card then says something else, see that row. |
+| off | It is switched off on this machine. Switch it on. |
+| compare the number | Pairing is under way and the number is on this screen. Pick the same number on the other machine. |
 | it removed this machine | Remove it here, then pair again. |
 | waiting for its approval | That machine has not approved the pairing or picked its number yet. Open add device on it and finish there. |
 | not accepting input | hops runs there but cannot inject input. It may lack a permission, such as Accessibility on macOS. |
-| unreachable | Check that hops runs on both machines and that a firewall lets UDP in on the port hops listens on (`port` in `config.toml`, or `o` in the terminal UI). |
+| unreachable | This machine dialled it and nothing answered. Check that hops runs there and that its firewall lets UDP in on the port hops listens on (4722 unless `port` in `config.toml` says otherwise; `o` in the terminal UI). If it is behind a VPN or security client that drops incoming connections, pair again so that it dials this machine, as in [MANAGED-MAC.md](MANAGED-MAC.md). |
+| waiting for it to dial | That machine opens the connection to this one, and has not yet. Check that hops runs there with this machine switched on, and that this machine's firewall lets UDP in on the port hops listens on. |
+| not paired | Neither machine may control the other. Pair them again. |
+| service not answering | hops' background service is not running here, and the card shows what was last known. Start hops again. |
 
 A notice can say more:
 

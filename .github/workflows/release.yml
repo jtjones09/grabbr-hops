@@ -253,6 +253,10 @@ jobs:
             echo
             echo "Each archive, and the app in the dmg, holds \`LICENSE\`, \`THIRD-PARTY-NOTICES.txt\` and a CycloneDX SBOM for each target its binary is built for. Each binary also embeds the list of crates it was built from, which \`cargo audit bin <binary>\` reads."
             echo
+            echo "## Security changes"
+            echo
+            echo "The security fixes in this release are listed in [docs/SECURITY-CHANGES.md](https://github.com/${GITHUB_REPOSITORY:?}/blob/${GITHUB_REF#refs/*/}/docs/SECURITY-CHANGES.md)."
+            echo
             echo "## Advisories this release does not act on"
             echo
             if [ "$count" -eq 0 ]; then

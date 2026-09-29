@@ -1455,6 +1455,30 @@ exit "$(cat "$STUB/exit")"
             }
         }
 
+        // The notes point at the security changes as of the tag released.
+        assert!(
+            real.text
+                .contains("(https://github.com/example/hops/blob/v1.2.3/docs/SECURITY-CHANGES.md)"),
+            "the release notes do not link the tag's security changes:\n{}",
+            real.text
+        );
+
+        // The GUI ships these two, so the notes say what reaches them rather
+        // than the scope line every transitive unmaintained crate gets.
+        for krate in ["rustybuzz", "ttf-parser"] {
+            let (id, ..) = REPORTED
+                .iter()
+                .find(|a| a.2 == krate)
+                .expect("a reported advisory");
+            assert!(
+                ignored
+                    .iter()
+                    .any(|(i, reason)| i == id && reason.starts_with(&format!("{krate}: "))),
+                "deny.toml gives {id} ({krate}) no reason of its own, so the release notes \
+                 explain it only by the scope that lets it through"
+            );
+        }
+
         // The report is of the gate with every exception removed.
         let widened: toml_edit::DocumentMut = real.config.parse().unwrap_or_else(|e| {
             panic!(
@@ -1660,6 +1684,8 @@ exit "$(cat "$STUB/exit")"
         /// Exit status of `codesign --verify --strict` on the app.
         verify_app: i32,
         identifier: &'static str,
+        /// The team `codesign -dv` names as the app's signer.
+        team: &'static str,
         /// A file under hops.app/Contents that the mounted image leaves out.
         omit: Option<String>,
         /// A file under hops.app/Contents that the mounted image holds empty.
@@ -1689,6 +1715,7 @@ exit "$(cat "$STUB/exit")"
                 stapler_app: 0,
                 verify_app: 0,
                 identifier: "com.grabbr.hops",
+                team: "9V42Q953X9",
                 omit: None,
                 empty: None,
                 audited: true,
@@ -1737,7 +1764,7 @@ exit "$code"
                 format!(
                     r#"for a; do target="$a"; done
 case "$1" in
-  -dv|--display) printf 'Executable=%s/Contents/MacOS/hops\nIdentifier={}\nFormat=app bundle with Mach-O universal (x86_64 arm64)\n' "$target" >&2 ;;
+  -dv|--display) printf 'Executable=%s/Contents/MacOS/hops\nIdentifier={}\nFormat=app bundle with Mach-O universal (x86_64 arm64)\nTeamIdentifier={team}\n' "$target" >&2 ;;
   --verify)
     [ "$2" = --strict ] || exit 64
     [ {verify} = 0 ] || {{ printf '%s: a sealed resource is missing or invalid\n' "$target" >&2; exit {verify}; }} ;;
@@ -1745,6 +1772,7 @@ case "$1" in
 esac
 "#,
                     self.identifier,
+                    team = self.team,
                     verify = self.verify_app
                 ),
             );
@@ -1900,6 +1928,14 @@ esac
                     .into(),
                 Tools {
                     identifier: "hops",
+                    ..Tools::release()
+                },
+                Some(image),
+            ),
+            (
+                "the app is notarized, but signed by another team".into(),
+                Tools {
+                    team: "EXAMPLE123",
                     ..Tools::release()
                 },
                 Some(image),

@@ -23,6 +23,8 @@ release is published, and the advisory is published with it.
 
 Security fixes go into the next release. Only the latest release is
 supported; fixes are not backported, so update to the latest release.
+The security fixes in each release are listed in
+[docs/SECURITY-CHANGES.md](docs/SECURITY-CHANGES.md).
 
 ## Scope
 
@@ -50,6 +52,8 @@ Out of scope:
 
 [docs/SECURITY.md](docs/SECURITY.md) states what pairing protects against,
 what it cannot protect against, and how to remove a machine or recover one.
+[docs/NETWORK.md](docs/NETWORK.md) lists every port and connection hops
+uses.
 
 ## Verifying a release
 
@@ -66,6 +70,25 @@ gh attestation verify hops-linux-x86_64.tar.gz --repo jtjones09/grabbr-hops \
   --signer-workflow jtjones09/grabbr-hops/.github/workflows/release.yml \
   --source-ref refs/tags/v0.13.0
 ```
+
+On a Mac, also check that the dmg and the installed app are notarized
+and signed by this project's Developer ID, team `9V42Q953X9`:
+
+```sh
+spctl -a -vv -t open --context context:primary-signature hops-macos-universal.dmg
+xcrun stapler validate hops-macos-universal.dmg
+spctl -a -vv -t execute /Applications/hops.app
+codesign -dv /Applications/hops.app
+```
+
+Both `spctl` checks must print `source=Notarized Developer ID` and an
+`origin` ending in `(9V42Q953X9)`; `accepted` alone is printed for
+anything once Gatekeeper assessments are turned off. `stapler` must say
+the validate action worked, and `codesign` must print
+`Identifier=com.grabbr.hops` and `TeamIdentifier=9V42Q953X9`. The release
+workflow runs the same checks, in `scripts/verify-macos-release.sh`,
+before it publishes the dmg. The `.tar.gz` and the Windows `.zip` are not
+code-signed; check those with the attestation above.
 
 Each archive, and the app in the dmg, holds `LICENSE`,
 `THIRD-PARTY-NOTICES.txt` and a CycloneDX SBOM (`hops-<target>.cdx.json`)
