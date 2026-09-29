@@ -1363,6 +1363,13 @@ pub fn records_of(store: &TrustStore) -> Vec<LeaseRecord> {
     let mut out: Vec<LeaseRecord> = Vec::new();
     for (fp, e) in store.entries() {
         if let Some(l) = e.lease.as_ref() {
+            // A machine to pair again, approved here and waiting for its
+            // number, is written as the listing alone: one row per
+            // fingerprint, and the unconfirmed lease would be dropped as the
+            // store loads anyway, which leaves the listing as it was (#231).
+            if !l.confirmed && store.to_pair_again(fp).is_some() {
+                continue;
+            }
             let mut caps = Vec::new();
             if l.caps.contains(Caps::DRIVE_ME) {
                 caps.push(DiskCap::Inbound);
@@ -1677,6 +1684,39 @@ mod tests {
         fs::write(&p, &widened).expect("write");
         let err = TrustFile::open(&d, authority(&d)).expect_err("must refuse");
         assert!(matches!(err, TrustFileError::Untrusted { .. }), "{err}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    // LEDGER R231-10 | class B | 1 return value: records_of, TrustFile::save, TrustFile::open, rebuild
+    /// A machine to pair again, approved here and waiting for its number,
+    /// is saved: as the listing alone, which reads back listed and granting
+    /// nothing, as a restart before the number is confirmed leaves it.
+    #[test]
+    fn a_listed_machine_approved_again_is_saved_as_still_listed() {
+        let d = tmpdir("reapprove");
+        let mut store = TrustStore::new(&ours(), NOW).expect("store");
+        store.list_to_pair_again(A, "laptop", NOW).expect("listed");
+        store
+            .issue_answered(A, "laptop", Controller::Both, false)
+            .expect("approved");
+        let (mut file, _) = TrustFile::open(&d, authority(&d)).expect("open");
+        if let Err(e) = file.save(&records_of(&store)) {
+            panic!("approving a machine listed to pair again could not be saved: {e}");
+        }
+        let (_, loaded) = TrustFile::open(&d, authority(&d)).expect("reopen");
+        let Loaded::Present { leases, .. } = loaded else {
+            panic!("the store must be found on the second open");
+        };
+        let (back, refused) = rebuild(&ours(), NOW, &leases).expect("rebuild");
+        assert_eq!(
+            (
+                back.capabilities(A),
+                back.to_pair_again(A).map(|p| p.label.as_str()),
+                refused
+            ),
+            (Caps::NONE, Some("laptop"), Vec::<String>::new()),
+            "an approval not yet confirmed, read back"
+        );
         let _ = fs::remove_dir_all(&d);
     }
 

@@ -82,6 +82,10 @@ machine controls which. A pairing that goes one way is the better choice
 for a machine managed by someone else, such as a work laptop. Remove the
 card for a machine no longer used.
 
+hops 0.13 drops the old list from `config.toml` the next time it saves its
+settings. A machine moved back to hops 0.12 after the upgrade has to be
+paired again there too.
+
 ## Removing a machine
 
 Remove it from its card in the app, or with `d` in the terminal UI

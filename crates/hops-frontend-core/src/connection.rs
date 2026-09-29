@@ -82,8 +82,8 @@ impl Connection {
     /// Every state, for frontends and tests that show or check them all.
     pub const ALL: [Connection; 12] = [
         Connection::ServiceGone,
-        Connection::PairAgain,
         Connection::NoLongerTrusts,
+        Connection::PairAgain,
         Connection::ComparingNumber,
         Connection::AwaitingOtherMachine,
         Connection::NotAcceptingInput,
