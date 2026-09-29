@@ -95,6 +95,11 @@ const OLDER_BUILD: &str = "hops 0.12 or older";
 /// name. This build is registered again by its own task script, from a
 /// shell that is not elevated, so it never runs elevated (service/README.md):
 /// pointing the old task at it would keep the task's elevation.
+///
+/// The Run values are removed from a shell that is not elevated: they are in
+/// the user's own hive, and an administrator shell opened with another
+/// account's password reads that account's. Only the task and the daemon it
+/// started elevated need an administrator.
 pub fn older_stop(older: &DaemonEndpoint) -> String {
     let port = match older {
         DaemonEndpoint::Tcp(addr) => addr.port(),
@@ -103,18 +108,23 @@ pub fn older_stop(older: &DaemonEndpoint) -> String {
     // Each command on a line of its own, apart from the words around it, and
     // short enough not to wrap in the app.
     format!(
-        "To stop it, open PowerShell as administrator, since its sign-in task may run \
-         it elevated. Remove what starts it at sign-in, then stop it; a line that \
-         finds nothing to remove says so:\n\
-         Unregister-ScheduledTask -TaskName hops-daemon -Confirm:$false\n\
+        "To stop it for good, first remove what its installer set to start it at \
+         sign-in, from a normal PowerShell:\n\
          $run = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run'\n\
          Remove-ItemProperty $run -Name hops-daemon,hops-gui\n\
+         Then remove the task its task script set, which runs it elevated, and stop \
+         it, from PowerShell as administrator (a normal one does if there is no task):\n\
+         Unregister-ScheduledTask -TaskName hops-daemon -Confirm:$false\n\
          $old = Get-NetTCPConnection -LocalPort {port} -State Listen\n\
          Stop-Process -Id $old.OwningProcess\n\
-         Quit the old hops in the notification area too, then open hops again. To start \
-         this version at sign-in, register it with its task script from a normal \
-         PowerShell, never an administrator one (service/README.md). If the old one runs \
-         as another user of this computer, only that user or an administrator can stop it."
+         A line that finds nothing to remove says so. Quit the old hops in the \
+         notification area too, then open hops again. To start this version at \
+         sign-in, from a normal PowerShell, never an administrator one: run \
+         install-hops-daemon.ps1 from service\\windows in the source code zip on the \
+         release page (service/README.md); or, if 0.12 came from install.ps1 in a \
+         clone of the source, update the clone and run install.ps1 again. If the old \
+         one runs as another user of this computer, only that user or an administrator \
+         can stop it."
     )
 }
 
@@ -161,6 +171,12 @@ pub fn hold_older_endpoint(older: Option<&DaemonEndpoint>) -> Option<std::net::T
         return None;
     };
     std::net::TcpListener::bind(addr)
+        .inspect(|_| {
+            log::info!(
+                "holding {addr}, where {OLDER_BUILD} listened, so a daemon of that \
+                 version started now exits"
+            )
+        })
         .inspect_err(|e| {
             log::info!(
                 "not holding {addr}, where {OLDER_BUILD} listened: {e}. A daemon of that \
@@ -1960,24 +1976,54 @@ mod a_daemon_of_hops_0_12_on_its_old_endpoint {
             "a hops 0.12 daemon answers on its old endpoint, and the front door \
              started a second daemon beside it: {report:?}"
         );
-        // Both ways 0.12 started at sign-in are removed, from an elevated
-        // shell, since its task ran elevated; the old daemon is found by its
-        // port; and this version is registered from a shell that is not.
-        for needed in [
-            "hops 0.12 or older".to_string(),
-            "PowerShell as administrator".to_string(),
-            "Unregister-ScheduledTask -TaskName hops-daemon".to_string(),
-            "$run = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run'\n\
-             Remove-ItemProperty $run -Name hops-daemon,hops-gui"
-                .to_string(),
-            format!(
-                "$old = Get-NetTCPConnection -LocalPort {port} -State Listen\n\
-                 Stop-Process -Id $old.OwningProcess"
+        // Both ways 0.12 started at sign-in are removed, and the old daemon
+        // is found by its port. The Run values from a shell that is not
+        // elevated, since they are the user's own; from an administrator one
+        // only what 0.12's elevated task needs, and nothing that installs.
+        let lines: Vec<&str> = said.lines().collect();
+        let after = |ask: &str, n: usize| {
+            let at = lines.iter().position(|l| l.contains(ask))?;
+            Some((at, lines.get(at + 1..at + 1 + n)?.to_vec()))
+        };
+        let normal = after("from a normal PowerShell:", 2);
+        let admin = after("from PowerShell as administrator", 4);
+        let old_daemon = format!("$old = Get-NetTCPConnection -LocalPort {port} -State Listen");
+        assert_eq!(
+            (
+                normal.as_ref().map(|(_, cmds)| cmds.clone()),
+                admin.as_ref().map(|(_, cmds)| cmds[..3].to_vec()),
+                admin
+                    .as_ref()
+                    .map(|(_, cmds)| cmds[3].starts_with("A line")),
+                normal.zip(admin).map(|((n, _), (a, _))| n < a),
             ),
-            "from a normal PowerShell, never an administrator one".to_string(),
+            (
+                Some(vec![
+                    "$run = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run'",
+                    "Remove-ItemProperty $run -Name hops-daemon,hops-gui",
+                ]),
+                Some(vec![
+                    "Unregister-ScheduledTask -TaskName hops-daemon -Confirm:$false",
+                    old_daemon.as_str(),
+                    "Stop-Process -Id $old.OwningProcess",
+                ]),
+                Some(true),
+                Some(true),
+            ),
+            "(the commands for a normal PowerShell, those for an administrator one, \
+             prose after them, the normal one first) in {said:?}"
+        );
+        // This version is registered from a shell that is not elevated, with
+        // a script a 0.12 user can find, or by the installer 0.12 came from.
+        for needed in [
+            "hops 0.12 or older",
+            "from a normal PowerShell, never an administrator one",
+            "install-hops-daemon.ps1 from service\\windows in the source code zip on the \
+             release page",
+            "update the clone and run install.ps1 again",
         ] {
             assert!(
-                said.contains(&needed),
+                said.contains(needed),
                 "the app must name the old daemon and how to stop it for good; missing \
                  {needed:?} in {said:?}"
             );

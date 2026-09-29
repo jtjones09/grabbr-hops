@@ -80,16 +80,28 @@ folder you can write hands administrator to anything that can replace the file.
 The cost is that hops cannot type or click into an elevated window. An enter
 hook set in `config.toml` does not run if hops is started elevated.
 
-Upgrading from hops 0.12 or older: the old daemon listens where this version
-does not look for one, and this version will not start beside it. hops 0.12
-started at sign-in from a task its script registered elevated, or from the Run
-key its installer set. Since that task runs elevated, use an administrator
-PowerShell to remove both and stop the old daemon:
+#### Upgrading from hops 0.12 or older
+
+The old daemon listens where this version does not look for one, and this
+version will not start beside it. hops 0.12 started at sign-in from the Run key
+its `install.ps1` set, or from a task its `install-hops-daemon.ps1` registered
+elevated.
+
+First, from a normal PowerShell, remove the Run values. They are in your own
+registry hive; a shell elevated with another account's password would look in
+that account's:
+
+```powershell
+$run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+Remove-ItemProperty $run -Name hops-daemon,hops-gui
+```
+
+Then remove the task and stop the old daemon. The task runs it elevated, so
+this needs PowerShell as administrator; without the task, a normal one does.
+It removes and stops, and installs nothing:
 
 ```powershell
 Unregister-ScheduledTask -TaskName hops-daemon -Confirm:$false
-$run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-Remove-ItemProperty $run -Name hops-daemon,hops-gui
 $old = Get-NetTCPConnection -LocalPort 5252 -State Listen
 Stop-Process -Id $old.OwningProcess
 ```
@@ -97,9 +109,12 @@ Stop-Process -Id $old.OwningProcess
 A line that finds nothing to remove says so; that is expected. Quit the old
 hops in the notification area too.
 
-Then register this version from a normal PowerShell, as above, so it does not
-run elevated. Do not point the old task at the new `hops.exe`: the task keeps
-its elevation.
+Then set this version to start at sign-in from a normal PowerShell, so it does
+not run elevated: register it with `install-hops-daemon.ps1` as above, from
+`service\windows` in the source code zip on the release page; or, if 0.12 came
+from `install.ps1` in a clone of the source, update the clone and run
+`install.ps1` again. Do not point the old task at the new `hops.exe`: the task
+keeps its elevation.
 
 ## 3. Configure over SSH
 

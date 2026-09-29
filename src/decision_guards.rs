@@ -4603,6 +4603,12 @@ mod the_windows_daemon_is_never_installed_elevated {
     //! words that ship: the install script and the instructions for it. No CI
     //! runner registers a Windows scheduled task, so the text is what can be
     //! checked.
+    //!
+    //! One exception, named here and nowhere else: the README's section on
+    //! upgrading from hops 0.12, whose task script registered its daemon
+    //! elevated. Removing that task and stopping the daemon it started need
+    //! an administrator PowerShell, and that section may ask for one for
+    //! those commands only. No step that installs hops may.
 
     const SCRIPT: &str = include_str!("../service/windows/install-hops-daemon.ps1");
     const README: &str = include_str!("../service/README.md");
@@ -4635,12 +4641,13 @@ mod the_windows_daemon_is_never_installed_elevated {
         );
 
         let mut asks = Vec::new();
+        let (install, upgrade) = upgrade_section(README);
         for (file, text) in [
             ("service/windows/install-hops-daemon.ps1", SCRIPT),
-            ("service/README.md", README),
+            ("service/README.md", install.as_str()),
         ] {
-            let lower = text.to_lowercase();
-            for phrase in ["run as administrator", "elevated powershell"] {
+            let lower = words(text);
+            for phrase in ASKS {
                 if lower.contains(phrase) {
                     asks.push(format!("{file}: \"{phrase}\""));
                 }
@@ -4653,5 +4660,92 @@ mod the_windows_daemon_is_never_installed_elevated {
              and telling users to use one invites the elevated install that \
              2026-09-15 took out."
         );
+        let beyond = beyond_removing_0_12(&upgrade);
+        assert!(
+            beyond.is_empty(),
+            "the README's section on upgrading from hops 0.12 asks for an \
+             administrator for more than removing 0.12's elevated task and stopping \
+             its daemon: {beyond:?}. Only those need one; installing this version \
+             never does."
+        );
+    }
+
+    /// The phrases that ask for an administrator PowerShell, lower-cased.
+    const ASKS: [&str; 4] = [
+        "run as administrator",
+        "elevated powershell",
+        "administrator powershell",
+        "powershell as administrator",
+    ];
+
+    /// The heading of the README's one exception: upgrading from hops 0.12,
+    /// whose task script registered its daemon elevated, so that removing the
+    /// task and stopping the daemon it started need an administrator.
+    const UPGRADE: &str = "#### Upgrading from hops 0.12 or older";
+
+    /// `readme` split into everything but the upgrade section, and that
+    /// section: from [`UPGRADE`] to the next heading outside a code block.
+    fn upgrade_section(readme: &str) -> (String, String) {
+        let (mut rest, mut section) = (String::new(), String::new());
+        let (mut inside, mut fenced) = (false, false);
+        for line in readme.lines() {
+            if line.trim_start().starts_with("```") {
+                fenced = !fenced;
+            } else if !fenced && line.starts_with('#') {
+                inside = line.trim_end() == UPGRADE;
+            }
+            let into = if inside { &mut section } else { &mut rest };
+            into.push_str(line);
+            into.push('\n');
+        }
+        (rest, section)
+    }
+
+    /// `text` lower-cased with every run of white space one space, so a
+    /// phrase wrapped across lines is still found.
+    fn words(text: &str) -> String {
+        text.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    }
+
+    /// Each ask for an administrator in `section` whose prose is not followed
+    /// by a code block of only the commands that remove hops 0.12's task and
+    /// stop its daemon; and each line of such a block that is something else.
+    fn beyond_removing_0_12(section: &str) -> Vec<String> {
+        const REMOVING: [&str; 3] = [
+            "unregister-scheduledtask ",
+            "$old = get-nettcpconnection ",
+            "stop-process ",
+        ];
+        let asks_in = |prose: &str| {
+            let prose = words(prose);
+            ASKS.iter()
+                .find(|p| prose.contains(*p))
+                .map(|p| p.to_string())
+        };
+        let mut beyond = Vec::new();
+        let (mut prose, mut asked, mut fenced) = (String::new(), None, false);
+        for line in section.lines() {
+            let lower = line.trim().to_lowercase();
+            if lower.starts_with("```") {
+                fenced = !fenced;
+                asked = if fenced { asks_in(&prose) } else { None };
+                prose.clear();
+            } else if !fenced {
+                prose.push_str(line);
+                prose.push('\n');
+            } else if asked.is_some()
+                && !lower.is_empty()
+                && !REMOVING.iter().any(|cmd| lower.starts_with(cmd))
+            {
+                beyond.push(line.trim().to_string());
+            }
+        }
+        if let Some(unused) = asks_in(&prose) {
+            beyond.push(format!("\"{unused}\" with no commands after it"));
+        }
+        beyond
     }
 }

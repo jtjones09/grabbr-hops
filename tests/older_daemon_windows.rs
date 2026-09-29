@@ -11,14 +11,41 @@
 //! does not parse, so a daemon that got past the check exits on the config
 //! instead of running, having made its token.
 //!
+//! And the other way round: a daemon of this build, once running, holds
+//! that port, so a 0.12 daemon started after it finds it taken and exits.
+//!
 //! Windows only: nowhere else did an older build listen where this build's
 //! endpoint does not reach.
 #![cfg(windows)]
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+/// Held by each test while it uses 127.0.0.1:5252, which they share.
+static OLD_PORT: Mutex<()> = Mutex::new(());
+
+/// `hops daemon` with everything it could touch in `dir`, logging to `log`.
+fn daemon_in(dir: &Path, config: &Path, log: &Path) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_hops"))
+        .arg("--config")
+        .arg(config)
+        .arg("--cert-path")
+        .arg(config.with_file_name("lan-mouse.pem"))
+        .arg("daemon")
+        .env("LOCALAPPDATA", dir)
+        .env("APPDATA", dir)
+        .env("HOPS_LOG_FILE", log)
+        .env("HOPS_LOG_LEVEL", "info")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the hops binary starts")
+}
 
 /// A hops 0.12 daemon on its endpoint: its first words to any connection
 /// are its state.
@@ -42,6 +69,7 @@ fn hops_0_12() -> TcpListener {
 // LEDGER T2269 | class B | 5 process exit code and log line + 4 files on disk
 #[test]
 fn a_daemon_exits_beside_a_0_12_daemon_before_it_touches_anything() {
+    let _port = OLD_PORT.lock().unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!("h-old-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let config_dir = dir.join("lan-mouse");
@@ -52,20 +80,7 @@ fn a_daemon_exits_beside_a_0_12_daemon_before_it_touches_anything() {
     let log = dir.join("daemon.log");
     let old = hops_0_12();
 
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_hops"))
-        .arg("--config")
-        .arg(&config)
-        .arg("--cert-path")
-        .arg(&cert)
-        .arg("daemon")
-        .env("LOCALAPPDATA", &dir)
-        .env("APPDATA", &dir)
-        .env("HOPS_LOG_FILE", &log)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("the hops binary starts");
+    let mut daemon = daemon_in(&dir, &config, &log);
     let deadline = Instant::now() + Duration::from_secs(60);
     let exit = loop {
         if let Some(status) = daemon.try_wait().expect("the process's status") {
@@ -103,4 +118,58 @@ fn a_daemon_exits_beside_a_0_12_daemon_before_it_touches_anything() {
              one; missing {needed:?} in:\n{logged}"
         );
     }
+}
+
+/// A daemon of this build, killed and its directory removed when the test
+/// ends, however it ends.
+struct Running(Child, PathBuf);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+        let _ = std::fs::remove_dir_all(&self.1);
+    }
+}
+
+// LEDGER T2281 | class B | 5 log line + a bind on the real port, against the built binary
+#[test]
+fn a_running_daemon_holds_the_0_12_port() {
+    let _port = OLD_PORT.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("h-hold-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let config_dir = dir.join("lan-mouse");
+    std::fs::create_dir_all(&config_dir).expect("a scratch config directory");
+    let config = config_dir.join("config.toml");
+    std::fs::write(
+        &config,
+        "port = 0\ncapture_backend = \"dummy\"\nemulation_backend = \"dummy\"\n\
+         discovery = false\n",
+    )
+    .expect("a config");
+    let log = dir.join("daemon.log");
+    let mut daemon = Running(daemon_in(&dir, &config, &log), dir.clone());
+
+    // The service loop is logged as running only after the port is taken.
+    let read = || std::fs::read_to_string(&log).unwrap_or_default();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !read().contains("service running; stops on") {
+        let ended = daemon.0.try_wait().expect("the process's status");
+        assert!(
+            ended.is_none() && Instant::now() < deadline,
+            "the daemon never reported its service loop running ({ended:?}):\n{}",
+            read()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let taken = TcpListener::bind("127.0.0.1:5252").map(drop);
+    let logged = read();
+    drop(daemon);
+    assert_eq!(
+        taken.map_err(|e| e.kind()),
+        Err(std::io::ErrorKind::AddrInUse),
+        "a hops 0.12 daemon started now could take 127.0.0.1:5252 and run beside \
+         this one:\n{logged}"
+    );
 }
