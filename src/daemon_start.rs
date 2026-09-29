@@ -3585,7 +3585,7 @@ mod a_launch_agent_is_never_pointed_at_a_disk_image {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // LEDGER T8c | class B | 1 the verdict, for a volume each way, and the probe on real mounts
+    // LEDGER T8c | class B | 1 the verdict, for a volume each way
     #[test]
     fn an_app_on_a_writable_volume_is_installed_and_one_on_a_read_only_image_is_not() {
         // Some keep Applications on a second disk, which is mounted under
@@ -3602,10 +3602,20 @@ mod a_launch_agent_is_never_pointed_at_a_disk_image {
             super::place_of(exe, |_| true).is_some(),
             "an app on a read-only image was accepted"
         );
+    }
 
-        // The probe itself: a scratch directory is writable, and on macOS the
-        // system volume is mounted read-only, as a disk image is.
-        assert!(!super::mounted_read_only(&std::env::temp_dir()));
+    // LEDGER T8d | class B | 1 the probe on real mounts
+    // Unix only: elsewhere the probe answers read-only for every path, and
+    // nothing outside macOS reaches it.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_reads_a_scratch_directory_as_writable_and_the_system_volume_as_not() {
+        // A scratch directory is writable, and on macOS the system volume is
+        // mounted read-only, as a disk image is.
+        assert!(
+            !super::mounted_read_only(&std::env::temp_dir()),
+            "a writable scratch directory read as read-only"
+        );
         if cfg!(target_os = "macos") {
             assert!(
                 super::mounted_read_only(std::path::Path::new("/usr/bin")),
