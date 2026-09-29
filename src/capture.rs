@@ -784,6 +784,22 @@ impl CaptureTask {
             },
         };
 
+        // A link that is up and not answered on yet is still connecting:
+        // its peer has said nothing about its input, and a send there is
+        // refused as if it had said it takes none. A crossing made again
+        // after a redial meets one whenever the pointer moves before the
+        // first Pong. The Enter waits for that answer, asked for again by
+        // the next event, and the crossing is given up on at its deadline
+        // if none comes, so the pointer is held no longer than any crossing.
+        if matches!(event, ProtoEvent::Enter(_))
+            && self.awaiting_ack.is_some()
+            && self.conn.active_addr(handle).is_some()
+            && !self.conn.peer_answered(handle)
+        {
+            log::debug!("client {handle}: its link is not answered yet; the Enter waits");
+            return Ok(());
+        }
+
         // Recorded before the send: a down whose send fails may still have
         // reached the peer, and an up it never needed is dropped there.
         if let ProtoEvent::Input(Event::Pointer(PointerEvent::Button { button, state, .. })) = event
@@ -1062,10 +1078,14 @@ impl<T> DropGuard<T> {
 }
 
 impl<T> Drop for DropGuard<T> {
+    /// A receiver already gone has no one left to tell. Panicking here
+    /// instead turns a capture task dropped after its owner (a test
+    /// unwinding, a runtime shutting down) into a second panic, which
+    /// aborts the process if it lands while the first is unwinding.
     fn drop(&mut self) {
-        self.tx
-            .send(self.on_drop.take().expect("item"))
-            .expect("channel closed");
+        if let Some(on_drop) = self.on_drop.take() {
+            let _ = self.tx.send(on_drop);
+        }
     }
 }
 
@@ -1175,6 +1195,8 @@ mod release_mid_drag {
         sender: String,
         /// Whether the receiver acknowledges a crossing, from now on.
         acks: Rc<std::cell::Cell<bool>>,
+        /// The receiver's answer to a ping from now on, or `None` for none.
+        pongs: Rc<std::cell::Cell<Option<bool>>>,
         /// Closes the receiver's end of a link.
         revoker: crate::listen::ConnRevoker,
         _notices: Notices,
@@ -1235,6 +1257,8 @@ mod release_mid_drag {
             let received = wire.clone();
             let acks = Rc::new(std::cell::Cell::new(answers.ack));
             let acking = acks.clone();
+            let pongs = Rc::new(std::cell::Cell::new(answers.pong));
+            let ponging = pongs.clone();
             let revoker = listener.revoker();
             spawn_local(async move {
                 while let Some(event) = listener.next().await {
@@ -1244,7 +1268,7 @@ mod release_mid_drag {
                     received.borrow_mut().push(event);
                     match event {
                         ProtoEvent::Ping => {
-                            if let Some(alive) = answers.pong {
+                            if let Some(alive) = ponging.get() {
                                 listener.reply(addr, ProtoEvent::Pong(alive)).await
                             }
                         }
@@ -1302,6 +1326,7 @@ mod release_mid_drag {
                 receiver: receiver.fingerprint.clone(),
                 sender: sender.fingerprint.clone(),
                 acks,
+                pongs,
                 revoker,
                 _notices: notices,
             }
@@ -1366,9 +1391,13 @@ mod release_mid_drag {
 
         /// The receiver closes the link and the sender dials it again,
         /// with no event captured in between. The receiver then acknowledges
-        /// a crossing only if `acks`.
-        pub(super) async fn relink(&self, acks: bool) {
+        /// a crossing only if `acks`, and answers pings with `pong`. Returns
+        /// once the new link is up and, if the receiver answers pings, once
+        /// one was answered on it: until then the sender has not heard
+        /// whether its peer takes input.
+        pub(super) async fn relink(&self, acks: bool, pong: Option<bool>) {
             self.acks.set(acks);
+            self.pongs.set(pong);
             assert_eq!(self.revoker.close_fingerprint(&self.sender).await, 1);
             wait_until("the link to drop", PATIENCE, || {
                 self.clients.active_addr(self.handle).is_none()
@@ -1379,6 +1408,19 @@ mod release_mid_drag {
                 self.clients.active_addr(self.handle).is_some()
             })
             .await;
+            if pong.is_some() {
+                wait_until(
+                    "the receiver to answer a ping on the new link",
+                    PATIENCE,
+                    || self.clients.answered(self.handle),
+                )
+                .await;
+            }
+        }
+
+        /// The receiver answers pings with `pong` from now on.
+        pub(super) fn pong(&self, pong: Option<bool>) {
+            self.pongs.set(pong);
         }
 
         pub(super) fn frames(&self) -> Vec<ProtoEvent> {
@@ -1387,6 +1429,15 @@ mod release_mid_drag {
 
         pub(super) fn count(&self, want: &ProtoEvent) -> usize {
             self.wire.borrow().iter().filter(|e| same(e, want)).count()
+        }
+
+        /// How many `want` arrived after the first `from` frames.
+        pub(super) fn since(&self, from: usize, want: &ProtoEvent) -> usize {
+            let wire = self.wire.borrow();
+            wire[from.min(wire.len())..]
+                .iter()
+                .filter(|e| same(e, want))
+                .count()
         }
 
         /// How many `want` arrived after the `leaves`-th Leave.
@@ -1831,7 +1882,7 @@ mod a_refused_crossing {
     fn a_crossing_made_again_on_a_new_link_and_never_answered_gives_the_pointer_back() {
         run_local(async {
             let mut v = Visit::start_with(true, REAL_DEADLINE).await;
-            v.relink(false).await;
+            v.relink(false, Some(true)).await;
             assert!(
                 v.script.held(),
                 "precondition: the pointer was given back when the link dropped"
@@ -1855,6 +1906,122 @@ mod a_refused_crossing {
                 v.frames()
             );
             v.capture.terminate().await;
+        });
+    }
+
+    // LEDGER TR-1 | class B | 5 capture backend state: Script::held + 2 frames received by listen::LanMouseListener
+    /// The link drops while the pointer is across and is made again, and
+    /// the pointer moves before the receiver has answered a ping on the new
+    /// link. Until it has, the sender has not heard whether it takes input:
+    /// the crossing waits, rather than being given back as refused by a
+    /// receiver that takes no input, which it never said. Once it answers,
+    /// the crossing is made on the new link and input lands there. Which
+    /// comes first, the pointer or the answer, is up to the network, and
+    /// must not decide whether the pointer stays or snaps back.
+    #[test]
+    fn a_crossing_made_again_waits_for_the_new_link_to_be_answered() {
+        run_local(async {
+            let mut v = Visit::start(true).await;
+            v.relink(true, None).await;
+            let relinked = v.frames().len();
+            for _ in 0..15 {
+                v.script.push(Position::Left, CaptureEvent::Input(MOTION));
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                v.script.held() && v.count(&ProtoEvent::Leave(0)) == 0,
+                "the pointer was given back before the receiver said anything on \
+                 the new link: {:?}",
+                v.frames()
+            );
+            assert!(
+                !refused(&told(&mut v.capture), CrossingRefusal::NotAcceptingInput),
+                "the user was told the receiver takes no input, which it never said"
+            );
+
+            v.pong(Some(true));
+            let started = tokio::time::Instant::now();
+            while v.since(relinked, &ProtoEvent::Input(MOTION)) == 0 {
+                assert!(
+                    started.elapsed() < PATIENCE,
+                    "input never landed on the new link: {:?}",
+                    v.frames()
+                );
+                v.script.push(Position::Left, CaptureEvent::Input(MOTION));
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                v.since(relinked, &ProtoEvent::Enter(hops_proto::Position::Right)) > 0,
+                "input went to the new link with no crossing made on it: {:?}",
+                v.frames()
+            );
+            assert!(
+                v.script.held() && v.count(&ProtoEvent::Leave(0)) == 0,
+                "the crossing was made again and the pointer given back anyway: {:?}",
+                v.frames()
+            );
+            v.capture.terminate().await;
+        });
+    }
+
+    // LEDGER TR-2 | class B | 5 capture backend state: Script::held + events the capture task sends the service
+    /// As above, and the receiver never answers on the new link. The
+    /// crossing waits no longer than any crossing for its Ack, then the
+    /// pointer is given back as unanswered and the receiver told the visit
+    /// ended. It is not reported as a receiver that takes no input.
+    #[test]
+    fn a_crossing_made_again_on_a_link_never_answered_gives_the_pointer_back_as_unanswered() {
+        run_local(async {
+            let mut v = Visit::start_with(true, REAL_DEADLINE).await;
+            v.relink(false, None).await;
+            let leaves = v.count(&ProtoEvent::Leave(0));
+            let started = tokio::time::Instant::now();
+            while v.script.held() {
+                assert!(
+                    started.elapsed() < PATIENCE,
+                    "a crossing made again on a link never answered kept the pointer: {:?}",
+                    v.frames()
+                );
+                v.script.push(Position::Left, CaptureEvent::Input(MOTION));
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                started.elapsed() >= ACK_DEADLINE,
+                "the pointer was given back after {:?}, before the crossing's deadline",
+                started.elapsed()
+            );
+            assert!(
+                v.leaves(leaves + 1, PATIENCE).await,
+                "the receiver was never told the visit ended: {:?}",
+                v.frames()
+            );
+            let told = told(&mut v.capture);
+            assert!(
+                refused(&told, CrossingRefusal::Unanswered)
+                    && !refused(&told, CrossingRefusal::NotAcceptingInput),
+                "the user was not told the crossing went unanswered: {told:?}"
+            );
+            v.capture.terminate().await;
+        });
+    }
+
+    // LEDGER TR-3 | class B | 1 return value: the capture task's JoinHandle (DropGuard::drop in CaptureTask::do_capture)
+    /// The capture task is torn down after the receiver of its events is
+    /// gone, the order a runtime shutting down or a test unwinding drops
+    /// them in. Saying capture stopped then has no one to tell and must not
+    /// panic: under `panic = "abort"` that ends the process.
+    #[test]
+    fn a_capture_torn_down_after_its_owner_ends_without_a_panic() {
+        run_local(async {
+            let v = Visit::start(true).await;
+            let Capture { task, event_rx, .. } = v.capture;
+            drop(event_rx);
+            task.abort();
+            let ended = task.await;
+            assert!(
+                !ended.as_ref().is_err_and(|e| e.is_panic()),
+                "the capture task panicked as it was torn down: {ended:?}"
+            );
         });
     }
 
