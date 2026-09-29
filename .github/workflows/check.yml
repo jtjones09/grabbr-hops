@@ -80,10 +80,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev \
-            libxtst-dev pkg-config libfontconfig1-dev
+            libxtst-dev pkg-config libfontconfig1-dev \
+            xvfb  # an X server for the clipboard tests (src/clipboard.rs)
       - name: check
         run: cargo check --locked --no-default-features --features "${{ matrix.features }}" --all-targets
       - name: test
+        if: runner.os != 'Windows'
         run: cargo test --locked --no-default-features --features "${{ matrix.features }}"
       # The guard in src/lib.rs, observed: a Linux build with no capture or
       # no emulation backend must fail to compile, and say why. x11 capture is a
@@ -98,6 +100,25 @@ jobs:
             fi
             grep -q "this build has no input" <<<"$out" || { echo "$out" | tail -20; exit 1; }
           done
+      # GitHub's Windows runners run every job as an administrator with User
+      # Account Control off, and hops refuses to run elevated (#109). So this
+      # runner tests the refusal itself, with the real binary, in a build
+      # without `elevated_ci_runner`. HOPS_TEST_RUNNER_IS_ELEVATED is read by
+      # those tests alone: it fails them if the runner stops being elevated,
+      # when they would prove nothing.
+      - name: test the refusal to run elevated
+        if: runner.os == 'Windows'
+        env:
+          HOPS_TEST_RUNNER_IS_ELEVATED: "1"
+        run: cargo test --locked --no-default-features --features "${{ matrix.features }}" --lib --bins --test elevated_refusal
+      # Every test, in a debug build that may run elevated so that the tests
+      # which start hops run here. The feature does not compile without debug
+      # assertions, and nothing that builds a release names it
+      # (`only_windows_ci_test_builds_may_run_elevated` in
+      # tests/release_pipeline.rs).
+      - name: test
+        if: runner.os == 'Windows'
+        run: cargo test --locked --no-default-features --features "${{ matrix.features }} elevated_ci_runner"
 
   # The trust tests are the ones that must never silently stop running: each was
   # written to fail without its fix, and several guard a shipped vulnerability.
@@ -129,7 +150,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev \
-            libxtst-dev pkg-config libfontconfig1-dev
+            libxtst-dev pkg-config libfontconfig1-dev \
+            xvfb  # an X server for the clipboard tests (src/clipboard.rs)
       # Was `-p hops-ipc -p hops-frontend-core`, which ran 121 of 166 tests. The
       # hops-slint guards — the sole evidence for four merged PRs — had never
       # executed in CI. A guard that does not run is a comment.

@@ -13,9 +13,15 @@ release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
 # or security client that drops incoming connections works either way.
 # listen = false
 
-# the machines paired with this one, written by hops as a record. Editing
-# it trusts nothing: pairings are kept in a signed trust file beside this
-# one. A list written by hops 0.12 shows each machine as one to pair again.
+# optional: set to false to stop announcing this machine on the local
+# network (its hostname, addresses and key fingerprint) and looking for
+# others; devices are then added by address. See docs/NETWORK.md.
+# discovery = false
+
+# the machines paired with this one, written by hops as a record. Adding a
+# line trusts nothing: pairings are kept in a signed trust file beside this
+# one. Removing a line removes that machine here too. A list written by
+# hops 0.12 shows each machine as one to pair again.
 [authorized_fingerprints]
 "bc:05:ab:7a:a4:de:88:8c:2f:92:ac:bc:b8:49:b8:24:0d:44:b3:e6:a4:ef:d7:0b:6c:69:6d:77:53:0b:14:80" = "iridium"
 

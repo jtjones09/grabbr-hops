@@ -446,10 +446,159 @@ mod marks {
     }
 }
 
-/// Elsewhere no mark is read yet. X11 and Wayland apps mark a secret copy
-/// with the MIME target `x-kde-passwordManagerHint` holding `secret`, which
-/// arboard does not expose.
-#[cfg(not(any(target_os = "macos", windows)))]
+/// Linux and the other X11 systems: the target `x-kde-passwordManagerHint`
+/// among those the owner of the CLIPBOARD selection offers. KeePassXC adds it,
+/// holding `secret`, to every copy it makes (src/gui/Clipboard.cpp); Klipper
+/// and wl-clipboard read it. Any value counts: an app that names the target
+/// is saying what kind of copy it is.
+///
+/// arboard is built without its `wayland-data-control` feature, so it reads
+/// the text over X11 on Wayland too, through Xwayland. The compositor's X
+/// window manager (mutter, KWin, the wlroots XWM) offers a Wayland copy's
+/// MIME types to X11 clients as targets, so the marks looked at are those of
+/// the very copy whose text is read. Some bridge a Wayland copy only while an
+/// X11 window has focus; a copy not bridged is not seen here, nor read.
+/// Enabling that feature would read Wayland copies past this check, and a
+/// test fails if the crate it pulls in enters the build. Where no X server
+/// can be reached, arboard cannot open the clipboard and nothing is read.
+///
+/// X11 keeps no count of copies, so `generation` is `None`: a copy that lands
+/// between the check and the read is caught by the next poll, which finds it
+/// marked before its text has settled.
+#[cfg(all(unix, not(target_os = "macos")))]
+mod marks {
+    use std::time::{Duration, Instant};
+
+    use x11rb::connection::Connection;
+    use x11rb::protocol::Event;
+    use x11rb::protocol::xproto::{
+        Atom, AtomEnum, ConnectionExt as _, CreateWindowAux, GetPropertyReply, WindowClass,
+    };
+
+    pub(super) const PRIVATE: &str = "x-kde-passwordManagerHint";
+
+    /// How long the owner of the selection has to list its targets. The poll
+    /// waits on it, so this is short; an owner that misses it is asked again
+    /// on the next poll, and its copy is not read until it answers.
+    const ANSWER_WITHIN: Duration = Duration::from_millis(300);
+
+    /// The atoms the check names. `mark` is `NONE` when no client has named
+    /// the mark yet, so no copy can offer it.
+    pub(super) struct Atoms {
+        pub(super) clipboard: Atom,
+        pub(super) targets: Atom,
+        pub(super) property: Atom,
+        pub(super) mark: Atom,
+    }
+
+    pub(super) fn private() -> Option<bool> {
+        private_on(None)
+    }
+
+    /// Whether the copy on `display`'s clipboard is marked. `None` when that
+    /// cannot be told now: no X server, or an owner that did not answer.
+    pub(super) fn private_on(display: Option<&str>) -> Option<bool> {
+        let (conn, screen) = x11rb::connect(display).ok()?;
+        let intern = |name: &str, only_if_exists: bool| {
+            conn.intern_atom(only_if_exists, name.as_bytes()).ok()
+        };
+        let cookies = [
+            intern("CLIPBOARD", false)?,
+            intern("TARGETS", false)?,
+            intern("HOPS_CLIPBOARD_TARGETS", false)?,
+            intern(PRIVATE, true)?,
+        ];
+        let mut answers = Vec::with_capacity(cookies.len());
+        for cookie in cookies {
+            answers.push(cookie.reply().ok()?.atom);
+        }
+        let atoms = Atoms {
+            clipboard: answers[0],
+            targets: answers[1],
+            property: answers[2],
+            mark: answers[3],
+        };
+
+        let owner = conn
+            .get_selection_owner(atoms.clipboard)
+            .ok()?
+            .reply()
+            .ok()?;
+        if owner.owner == x11rb::NONE {
+            return Some(false);
+        }
+
+        let window = conn.generate_id().ok()?;
+        let root = conn.setup().roots.get(screen)?.root;
+        conn.create_window(
+            x11rb::COPY_DEPTH_FROM_PARENT,
+            window,
+            root,
+            0,
+            0,
+            1,
+            1,
+            0,
+            WindowClass::INPUT_ONLY,
+            x11rb::COPY_FROM_PARENT,
+            &CreateWindowAux::new(),
+        )
+        .ok()?;
+        conn.convert_selection(
+            window,
+            atoms.clipboard,
+            atoms.targets,
+            atoms.property,
+            x11rb::CURRENT_TIME,
+        )
+        .ok()?;
+        conn.flush().ok()?;
+
+        let deadline = Instant::now() + ANSWER_WITHIN;
+        while Instant::now() < deadline {
+            let Some(event) = conn.poll_for_event().ok()? else {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            };
+            let Event::SelectionNotify(notice) = event else {
+                continue;
+            };
+            if notice.requestor != window || notice.target != atoms.targets {
+                continue;
+            }
+            // An owner that lists no targets cannot have offered the mark.
+            if notice.property == x11rb::NONE {
+                return Some(false);
+            }
+            let answer = conn
+                .get_property(true, window, atoms.property, AtomEnum::ANY, 0, 1 << 16)
+                .ok()?
+                .reply()
+                .ok()?;
+            return offers_mark(&answer, &atoms);
+        }
+        None
+    }
+
+    /// Whether the owner's list of targets holds the mark. `None` when the
+    /// answer is not a whole list of atoms: sent in parts, cut short, or of
+    /// another kind. Its copy is then not read.
+    pub(super) fn offers_mark(answer: &GetPropertyReply, atoms: &Atoms) -> Option<bool> {
+        let listed = answer.type_ == Atom::from(AtomEnum::ATOM) || answer.type_ == atoms.targets;
+        if !listed || answer.bytes_after != 0 {
+            return None;
+        }
+        let mut targets = answer.value32()?;
+        Some(targets.any(|target| target == atoms.mark))
+    }
+
+    pub(super) fn generation() -> Option<i64> {
+        None
+    }
+}
+
+/// Elsewhere no mark is read.
+#[cfg(not(any(unix, windows)))]
 mod marks {
     pub(super) fn private() -> Option<bool> {
         Some(false)
@@ -543,6 +692,22 @@ mod tests {
             Ok(t) => eprintln!("[clipboard] open + read OK ({} chars)", t.len()),
             Err(e) => eprintln!("[clipboard] opened; no text present (acceptable): {e}"),
         }
+    }
+
+    // LEDGER T22431 | class S | lockfile text: Cargo.lock | pair T22428
+    /// On Linux the marks are read over X11, and so is the text: arboard is
+    /// built without `wayland-data-control`. That feature pulls in
+    /// wl-clipboard-rs and reads Wayland copies without looking at their
+    /// marks, so the crate entering the build fails here.
+    #[test]
+    fn no_wayland_clipboard_reader_is_built() {
+        let lock = include_str!("../Cargo.lock");
+        assert!(
+            !lock.contains("name = \"wl-clipboard-rs\""),
+            "wl-clipboard-rs is in Cargo.lock: a Wayland clipboard reader \
+             would read copies a password manager marked, past the X11 marks \
+             check in clipboard::marks"
+        );
     }
 }
 
@@ -1533,7 +1698,10 @@ mod the_clipboard_is_read_only_when_it_may_be {
         /// Its marks cannot be looked at, as while another app holds it open.
         busy: bool,
         generation: i64,
-        /// A copy lands while the text is being read, once.
+        /// No count of copies is kept, as on X11.
+        uncounted: bool,
+        /// A marked copy lands after the marks are looked at and before the
+        /// text is read, once: the text read is that copy's.
         copied_while_read: Option<String>,
         /// Once the text is read, the app that copied it marks it private,
         /// as it adds its next type: the count of copies does not move.
@@ -1559,16 +1727,17 @@ mod the_clipboard_is_read_only_when_it_may_be {
         }
 
         fn generation(&mut self) -> Option<i64> {
-            Some(self.0.borrow().generation)
+            let board = self.0.borrow();
+            (!board.uncounted).then_some(board.generation)
         }
 
         fn text(&mut self) -> Option<String> {
             let mut board = self.0.borrow_mut();
             board.texts_read += 1;
-            let text = board.text.clone();
             if let Some(next) = board.copied_while_read.take() {
                 board.copy(&next, true);
             }
+            let text = board.text.clone();
             if std::mem::take(&mut board.marked_after_read) {
                 board.private = true;
             }
@@ -1772,6 +1941,45 @@ mod the_clipboard_is_read_only_when_it_may_be {
         );
     }
 
+    // LEDGER T22430 | class B | 1 return value: Clipboard::changed, driven by Clipboard::spawn's poll over a stand-in clipboard that keeps no count of copies
+    #[test]
+    fn with_no_count_of_copies_a_marked_copy_read_past_the_check_is_not_sent() {
+        run_local(async {
+            let board = Rc::new(RefCell::new(Board {
+                uncounted: true,
+                ..Board::default()
+            }));
+            let wanted = Rc::new(Cell::new(true));
+            let (mut clipboard, asked) = task(&board, &wanted);
+            polls(&asked, 2).await;
+
+            // The marks are looked at on an ordinary copy; a marked one lands
+            // before the text is read, and nothing counts the change.
+            {
+                let mut board = board.borrow_mut();
+                board.copy("ordinary", false);
+                board.copied_while_read = Some("a password".into());
+            }
+            polls(&asked, 5).await;
+            assert!(
+                board.borrow().copied_while_read.is_none(),
+                "the marked copy never landed"
+            );
+            assert_eq!(
+                sent_within(&mut clipboard, NEVER_WITHIN).await,
+                None,
+                "a marked copy read past the check was sent"
+            );
+
+            board.borrow_mut().copy("ordinary again", false);
+            assert_eq!(
+                sent_within(&mut clipboard, ARRIVES_WITHIN).await.as_deref(),
+                Some("ordinary again"),
+                "an ordinary copy was not sent where no count of copies is kept"
+            );
+        });
+    }
+
     // LEDGER T22419 | class B | 6 struct state: the stand-in clipboard's writes, through Clipboard::apply
     #[test]
     fn text_from_peers_is_written_latest_first_and_only_once() {
@@ -1904,5 +2112,469 @@ mod the_marks_on_a_macos_copy {
             }
             assert_eq!(marked, private, "a copy with the type {kind}");
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod the_marks_on_an_x11_copy {
+    //! The target password managers put on an X11 copy, read from an X
+    //! server the test starts (Xvfb): the user's display is never touched.
+
+    use std::cell::Cell;
+    use std::io::{BufRead, BufReader};
+    use std::os::fd::FromRawFd;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command, Stdio};
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread::JoinHandle;
+    use std::time::Duration;
+
+    use x11rb::connection::Connection;
+    use x11rb::protocol::Event;
+    use x11rb::protocol::xproto::{
+        Atom, AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, GetPropertyReply, PropMode,
+        SELECTION_NOTIFY_EVENT, SelectionNotifyEvent, WindowClass,
+    };
+    use x11rb::wrapper::ConnectionExt as _;
+
+    use super::marks::{self, Atoms};
+    use super::{Clipboard, ClipboardEvent, System, SystemClipboard};
+    use crate::test_harness::{ARRIVES_WITHIN, NEVER_WITHIN, run_local, wait_until};
+
+    /// The target KeePassXC offers beside every copy it makes, spelled as it
+    /// spells it: written out here, not taken from the code under test, so a
+    /// misspelt name there is caught.
+    const KEEPASSXC_MARK: &str = "x-kde-passwordManagerHint";
+
+    /// Set on the copy of this test binary that runs the clipboard task on
+    /// the test's X server.
+    const CHILD: &str = "HOPS_TEST_X11_CLIPBOARD_CHILD";
+
+    /// An X server of the test's own, stopped when dropped.
+    struct Xvfb {
+        child: Child,
+        display: String,
+    }
+
+    impl Drop for Xvfb {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// Starts Xvfb on a display it picks. `None` where Xvfb is not
+    /// installed; on CI that fails the test, which would otherwise pass
+    /// having checked nothing.
+    fn xvfb() -> Option<Xvfb> {
+        let mut fds = [0; 2];
+        // SAFETY: `fds` holds the two descriptors pipe2() writes. Both close
+        // on exec, so no other test's child holds the write end.
+        assert_eq!(
+            unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
+            0,
+            "a pipe"
+        );
+        // SAFETY: the read end, owned from here on.
+        let ready = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let write_end = fds[1];
+        let mut xvfb = Command::new("Xvfb");
+        xvfb.args(["-displayfd", &write_end.to_string(), "-nolisten", "tcp"])
+            .args(["-screen", "0", "64x64x24"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: fcntl only, between fork and exec: Xvfb keeps the write end.
+        unsafe {
+            xvfb.pre_exec(move || {
+                if libc::fcntl(write_end, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let spawned = xvfb.spawn();
+        // SAFETY: the write end, closed here once; the child has its own.
+        unsafe { libc::close(write_end) };
+        let child = match spawned {
+            Ok(child) => child,
+            Err(e) => {
+                assert!(
+                    std::env::var_os("CI").is_none(),
+                    "Xvfb could not be started ({e}): the X11 marks were not checked"
+                );
+                eprintln!("[clipboard] no Xvfb ({e}): X11 marks not checked");
+                return None;
+            }
+        };
+        let mut line = String::new();
+        BufReader::new(ready)
+            .read_line(&mut line)
+            .expect("Xvfb names its display");
+        let number = line.trim();
+        assert!(!number.is_empty(), "Xvfb exited before naming a display");
+        Some(Xvfb {
+            child,
+            display: format!(":{number}"),
+        })
+    }
+
+    /// An app holding a copy on `display`'s clipboard, until dropped.
+    struct Copy {
+        stop: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl Drop for Copy {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                thread.join().expect("the copying app ends");
+            }
+        }
+    }
+
+    /// Copies `text` on `display` the way KeePassXC does when `marked`: the
+    /// target `x-kde-passwordManagerHint`, holding `secret`, beside the text.
+    fn copy(display: &str, text: &str, marked: bool) -> Copy {
+        own(display, text, marked, true)
+    }
+
+    /// An app that takes the clipboard and, unless it `answers`, never
+    /// answers what is asked of it, as one that has hung.
+    fn own(display: &str, text: &str, marked: bool, answers: bool) -> Copy {
+        let (display, text) = (display.to_string(), text.to_string());
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let (owned_tx, owned_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let (conn, screen) = x11rb::connect(Some(&display)).expect("the test's X server");
+            let atom = |name: &str| {
+                conn.intern_atom(false, name.as_bytes())
+                    .unwrap()
+                    .reply()
+                    .unwrap()
+                    .atom
+            };
+            let (clipboard, targets, utf8, mark) = (
+                atom("CLIPBOARD"),
+                atom("TARGETS"),
+                atom("UTF8_STRING"),
+                atom(KEEPASSXC_MARK),
+            );
+            let window = conn.generate_id().unwrap();
+            let root = conn.setup().roots[screen].root;
+            conn.create_window(
+                x11rb::COPY_DEPTH_FROM_PARENT,
+                window,
+                root,
+                0,
+                0,
+                1,
+                1,
+                0,
+                WindowClass::INPUT_ONLY,
+                x11rb::COPY_FROM_PARENT,
+                &CreateWindowAux::new(),
+            )
+            .unwrap();
+            conn.set_selection_owner(window, clipboard, x11rb::CURRENT_TIME)
+                .unwrap();
+            let owner = conn
+                .get_selection_owner(clipboard)
+                .unwrap()
+                .reply()
+                .unwrap();
+            assert_eq!(owner.owner, window, "the copying app holds the clipboard");
+            owned_tx.send(()).unwrap();
+
+            while !stopped.load(Ordering::Relaxed) {
+                let Some(event) = conn.poll_for_event().unwrap() else {
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                };
+                let Event::SelectionRequest(asked) = event else {
+                    continue;
+                };
+                if !answers {
+                    continue;
+                }
+                let property = match asked.property {
+                    x11rb::NONE => asked.target,
+                    property => property,
+                };
+                let answered = if asked.target == targets {
+                    let mut offered = vec![targets, utf8];
+                    if marked {
+                        offered.push(mark);
+                    }
+                    conn.change_property32(
+                        PropMode::REPLACE,
+                        asked.requestor,
+                        property,
+                        AtomEnum::ATOM,
+                        &offered,
+                    )
+                    .unwrap();
+                    property
+                } else if asked.target == utf8 {
+                    conn.change_property8(
+                        PropMode::REPLACE,
+                        asked.requestor,
+                        property,
+                        utf8,
+                        text.as_bytes(),
+                    )
+                    .unwrap();
+                    property
+                } else if asked.target == mark && marked {
+                    conn.change_property8(
+                        PropMode::REPLACE,
+                        asked.requestor,
+                        property,
+                        AtomEnum::STRING,
+                        b"secret",
+                    )
+                    .unwrap();
+                    property
+                } else {
+                    x11rb::NONE
+                };
+                let notice = SelectionNotifyEvent {
+                    response_type: SELECTION_NOTIFY_EVENT,
+                    sequence: 0,
+                    time: asked.time,
+                    requestor: asked.requestor,
+                    selection: asked.selection,
+                    target: asked.target,
+                    property: answered,
+                };
+                conn.send_event(false, asked.requestor, EventMask::NO_EVENT, notice)
+                    .unwrap();
+                conn.flush().unwrap();
+            }
+        });
+        owned_rx
+            .recv_timeout(ARRIVES_WITHIN)
+            .expect("the copying app took the clipboard");
+        Copy {
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// A reply to TARGETS of kind `kind`, listing `targets`, with `more`
+    /// bytes left unsent.
+    fn listed(kind: Atom, targets: &[Atom], more: u32) -> GetPropertyReply {
+        GetPropertyReply {
+            format: 32,
+            type_: kind,
+            bytes_after: more,
+            value_len: targets.len() as u32,
+            value: targets
+                .iter()
+                .flat_map(|target| target.to_ne_bytes())
+                .collect(),
+            ..GetPropertyReply::default()
+        }
+    }
+
+    // LEDGER T22426 | class B | 1 return value: clipboard::marks::offers_mark
+    #[test]
+    fn a_list_of_targets_holding_the_mark_is_private_and_one_without_it_is_not() {
+        let atoms = Atoms {
+            clipboard: 1,
+            targets: 2,
+            property: 3,
+            mark: 40,
+        };
+        let atom = Atom::from(AtomEnum::ATOM);
+        let incr = 41;
+        for (answer, private, what) in [
+            (
+                listed(atom, &[2, 30, 40], 0),
+                Some(true),
+                "the mark among the targets",
+            ),
+            (
+                listed(2, &[40], 0),
+                Some(true),
+                "the mark, listed as TARGETS",
+            ),
+            (
+                listed(atom, &[2, 30], 0),
+                Some(false),
+                "targets without the mark",
+            ),
+            (listed(atom, &[], 0), Some(false), "no targets"),
+            (listed(atom, &[2, 30], 4), None, "a list cut short"),
+            (listed(incr, &[64], 0), None, "a list sent in parts"),
+            (
+                GetPropertyReply {
+                    format: 8,
+                    ..listed(atom, &[40], 0)
+                },
+                None,
+                "a list not of atoms",
+            ),
+        ] {
+            assert_eq!(marks::offers_mark(&answer, &atoms), private, "{what}");
+        }
+        let unnamed = Atoms { mark: 0, ..atoms };
+        assert_eq!(
+            marks::offers_mark(&listed(atom, &[2, 30], 0), &unnamed),
+            Some(false),
+            "a mark no client has named"
+        );
+    }
+
+    /// What `display`'s marks say once its clipboard's owner answers. `None`
+    /// means ask again, as the clipboard task does; an owner slowed by a
+    /// loaded test run is given until [`ARRIVES_WITHIN`].
+    fn answered(display: &str) -> Option<bool> {
+        let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
+        loop {
+            let said = marks::private_on(Some(display));
+            if said.is_some() || std::time::Instant::now() >= deadline {
+                return said;
+            }
+        }
+    }
+
+    // LEDGER T22427 | class B | 1 return value: clipboard::marks::private_on against Xvfb
+    #[test]
+    fn a_copy_offering_the_password_manager_hint_is_private() {
+        let Some(x) = xvfb() else { return };
+        assert_eq!(answered(&x.display), Some(false), "an empty clipboard");
+        {
+            let _copy = copy(&x.display, "ordinary", false);
+            assert_eq!(answered(&x.display), Some(false), "an ordinary copy");
+        }
+        {
+            let _copy = copy(&x.display, "a password", true);
+            assert_eq!(
+                answered(&x.display),
+                Some(true),
+                "a copy offering {KEEPASSXC_MARK}"
+            );
+        }
+        let _hung = own(&x.display, "a password", true, false);
+        assert_eq!(
+            marks::private_on(Some(&x.display)),
+            None,
+            "a copy whose app does not say what it offers"
+        );
+    }
+
+    // LEDGER T22429 | class B | 1 return value: clipboard::marks::private_on on a display with no X server
+    #[test]
+    fn the_marks_are_not_known_where_no_x_server_answers() {
+        // No server listens on this display's socket, and a unix display is
+        // never tried over TCP: its marks cannot be looked at, and a copy
+        // arboard reads over a connection it already holds is then not read.
+        assert_eq!(
+            marks::private_on(Some("unix/:59999")),
+            None,
+            "a display with no X server"
+        );
+    }
+
+    /// The path of the test run in the child, for `--exact`.
+    const CHILD_TEST: &str =
+        "clipboard::the_marks_on_an_x11_copy::the_clipboard_task_on_the_display_in_its_environment";
+
+    // LEDGER T22428 | class B | 5 process: exit status and test summary of a child running Clipboard::spawn over System (arboard and marks) on Xvfb
+    #[test]
+    fn a_copy_offering_the_password_manager_hint_is_not_sent_by_the_clipboard_task() {
+        let Some(x) = xvfb() else { return };
+        // arboard opens the display DISPLAY names, which a test cannot set
+        // for its own process while others run beside it.
+        let run = Command::new(std::env::current_exe().expect("this test binary"))
+            .args([CHILD_TEST, "--exact", "--ignored", "--nocapture"])
+            .env("DISPLAY", &x.display)
+            .env_remove("WAYLAND_DISPLAY")
+            .env(CHILD, "1")
+            .output()
+            .expect("the child test runs");
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(run.status.success(), "the child test failed:\n{said}");
+        assert!(
+            said.contains("test result: ok. 1 passed"),
+            "the child test did not run:\n{said}"
+        );
+    }
+
+    /// Run only by the test above, in a process of its own with DISPLAY on
+    /// the test's X server: the clipboard task on the system clipboard sends
+    /// ordinary copies and never a marked one.
+    #[test]
+    #[ignore = "run by a_copy_offering_the_password_manager_hint_is_not_sent_by_the_clipboard_task"]
+    fn the_clipboard_task_on_the_display_in_its_environment() {
+        if std::env::var_os(CHILD).is_none() {
+            return;
+        }
+        let display = std::env::var("DISPLAY").expect("DISPLAY names the test's X server");
+        run_local(async {
+            let polled = Rc::new(Cell::new(0usize));
+            let counted = polled.clone();
+            let mut clipboard = Clipboard::spawn(
+                Box::new(move || {
+                    counted.set(counted.get() + 1);
+                    true
+                }),
+                Duration::from_millis(20),
+                || {
+                    let clipboard = arboard::Clipboard::new().expect("the test's X server");
+                    Some(Box::new(System { clipboard }) as Box<dyn SystemClipboard>)
+                },
+            );
+            let polls = |n: usize| {
+                let until = polled.get() + n;
+                let polled = polled.clone();
+                async move {
+                    wait_until("the clipboard task to poll", ARRIVES_WITHIN, || {
+                        polled.get() >= until
+                    })
+                    .await
+                }
+            };
+            async fn sent(clipboard: &mut Clipboard, within: Duration) -> Option<String> {
+                match tokio::time::timeout(within, clipboard.changed()).await {
+                    Ok(Some(ClipboardEvent::Changed(text))) => Some(text),
+                    _ => None,
+                }
+            }
+            polls(2).await;
+
+            let first = copy(&display, "ordinary", false);
+            assert_eq!(
+                sent(&mut clipboard, ARRIVES_WITHIN).await.as_deref(),
+                Some("ordinary"),
+                "an ordinary copy was not sent"
+            );
+            drop(first);
+
+            let secret = copy(&display, "a password", true);
+            polls(10).await;
+            assert_eq!(
+                sent(&mut clipboard, NEVER_WITHIN).await,
+                None,
+                "a copy offering {KEEPASSXC_MARK} was sent"
+            );
+            drop(secret);
+
+            let _next = copy(&display, "ordinary again", false);
+            assert_eq!(
+                sent(&mut clipboard, ARRIVES_WITHIN).await.as_deref(),
+                Some("ordinary again"),
+                "an ordinary copy after a marked one was not sent"
+            );
+        });
     }
 }

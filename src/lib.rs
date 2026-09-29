@@ -33,6 +33,7 @@ compile_error!(
 
 pub mod authority;
 pub mod build_check;
+mod cache_listed;
 mod capture;
 pub mod capture_test;
 pub mod client;
@@ -44,11 +45,13 @@ pub mod daemon_start;
 mod dial_back;
 pub mod discovery;
 mod dns;
+pub mod elevation;
 mod emulation;
 pub mod emulation_test;
 pub(crate) mod enter_hook;
 mod git_env;
 mod hop_log;
+mod keep_awake;
 mod listen;
 pub mod logging;
 pub mod match_code;
@@ -68,6 +71,11 @@ mod trust_save;
 /// See the module docs for the bar each guard is held to.
 #[cfg(test)]
 mod decision_guards;
+
+/// The public documents state the ports, ALPNs and discovery service the
+/// code uses.
+#[cfg(test)]
+mod doc_guards;
 
 /// Two machines in one test process: a real listener and a real dialer on
 /// loopback, with recording emulation and scripted capture.

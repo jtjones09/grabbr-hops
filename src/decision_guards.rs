@@ -4733,13 +4733,29 @@ mod the_windows_daemon_is_never_installed_elevated {
     //! user can write hands administrator to anything that can replace the
     //! file, and its enter hook comes from a config file the user can write.
     //!
-    //! The runtime half is `crate::enter_hook`, which refuses the hook in an
-    //! elevated process and is tested by calling it. This half is about the
-    //! words that ship: the install script and the instructions for it. No CI
-    //! runner registers a Windows scheduled task, so the text is what can be
-    //! checked.
+    //! The reason holds for every hops process, so the enforcement is in code
+    //! and covers every command: on Windows `main` refuses an elevated
+    //! process before it opens its log or parses an argument, daemon, app,
+    //! tray, TUI and CLI alike (`crate::elevation`, tested by calling `main.rs`
+    //! `unless_elevated`; that `main` goes through it is guarded below). The
+    //! enter hook is refused in any elevated process (`crate::enter_hook`).
+    //! Both install scripts refuse an elevated shell before they do anything
+    //! else, which the test below requires of their text, since no CI runner
+    //! runs them.
+    //!
+    //! The README scan below is a lint for honest mistakes. A scan of prose
+    //! cannot be complete: a lookalike letter, or wording it has not seen,
+    //! passes it. It may ask for an administrator PowerShell in one case: to
+    //! remove the task hops 0.12 registered elevated and stop the daemon it
+    //! started. A section that mentions elevation in any way, and every
+    //! section after it until a paragraph sends the reader to a new, normal
+    //! PowerShell in one of two fixed forms, may hold only code and inline
+    //! code that removes or reads, and prose that names nothing that
+    //! installs. No code in the Windows sections may start with `sudo` or
+    //! `gsudo`.
 
     const SCRIPT: &str = include_str!("../service/windows/install-hops-daemon.ps1");
+    const INSTALLER: &str = include_str!("../install.ps1");
     const README: &str = include_str!("../service/README.md");
 
     /// PowerShell with `#` comments removed, lower-cased, since PowerShell
@@ -4769,24 +4785,584 @@ mod the_windows_daemon_is_never_installed_elevated {
              file the user can write."
         );
 
-        let mut asks = Vec::new();
-        for (file, text) in [
-            ("service/windows/install-hops-daemon.ps1", SCRIPT),
-            ("service/README.md", README),
+        for (name, source) in [
+            ("install-hops-daemon.ps1", SCRIPT),
+            ("install.ps1", INSTALLER),
         ] {
-            let lower = text.to_lowercase();
-            for phrase in ["run as administrator", "elevated powershell"] {
-                if lower.contains(phrase) {
-                    asks.push(format!("{file}: \"{phrase}\""));
+            let refusal = refuses_elevation_first(&powershell_code(source));
+            assert!(
+                refusal.is_ok(),
+                "{name} does not refuse an elevated shell before it does anything \
+                 else: {}. It must test the current token with \
+                 `IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)` \
+                 and `exit` non-zero, with only its parameters, \
+                 `$ErrorActionPreference = 'Stop'` and the token read ahead of it.",
+                refusal.err().unwrap_or_default()
+            );
+
+            let script = words(source);
+            let asks: Vec<&str> = SCRIPT_ASKS
+                .into_iter()
+                .filter(|phrase| script.contains(phrase))
+                .collect();
+            assert!(
+                asks.is_empty(),
+                "{name} asks for elevation: {asks:?}. hops runs as the user, so its \
+                 install needs no administrator."
+            );
+        }
+
+        let (beyond, elevated_blocks) = elevated_beyond_removal(README);
+        assert!(
+            beyond.is_empty(),
+            "service/README.md asks for, or goes on in, an elevated PowerShell \
+             for more than removing hops 0.12's task and stopping its daemon: \
+             {beyond:?}. Where a section mentions elevation, and after it until a \
+             paragraph begins \"Then, from a new, normal PowerShell\" or says \
+             \"open a new, normal PowerShell\", code and inline code may hold only \
+             {REMOVE_OR_READ:?} and the prose may name nothing that installs; no \
+             code in the Windows sections may start with sudo or gsudo. \
+             Installing this version never needs an administrator."
+        );
+        assert!(
+            elevated_blocks > 0,
+            "no code block in service/README.md was read as run elevated, so the \
+             scan for the 0.12 removal steps matches nothing and proves nothing"
+        );
+    }
+
+    /// Whether an install script, as [`powershell_code`], refuses an elevated
+    /// shell before it does anything else: an `if` on the current token being
+    /// in the Administrators role, which under UAC it is only when elevated,
+    /// whose block exits non-zero. Only the script's parameters,
+    /// `$ErrorActionPreference = 'Stop'` and the token read come before it.
+    fn refuses_elevation_first(code: &str) -> Result<(), String> {
+        const ROLE: &str = "isinrole([security.principal.windowsbuiltinrole]::administrator)";
+        const TOKEN: &str = "$me = [security.principal.windowsprincipal]\
+                             [security.principal.windowsidentity]::getcurrent()";
+        let lines: Vec<&str> = code.lines().map(str::trim).collect();
+        let check = lines
+            .iter()
+            .position(|l| {
+                (l.starts_with("if (") || l.starts_with("if("))
+                    && l.contains(ROLE)
+                    && !l.contains("-not")
+                    && !l.contains('!')
+            })
+            .ok_or("no `if` tests the Administrators role")?;
+        let end = check
+            + lines[check..]
+                .iter()
+                .position(|l| *l == "}")
+                .ok_or("the `if` block is not closed")?;
+        let exits = lines[check..end].iter().any(|l| {
+            l.strip_prefix("exit ")
+                .and_then(|n| n.trim().parse::<i32>().ok())
+                .is_some_and(|n| n != 0)
+        });
+        if !exits {
+            return Err("its `if` block does not `exit` non-zero".into());
+        }
+        let mut params = false;
+        let mut read = false;
+        for line in &lines[..check] {
+            if params {
+                params = *line != ")";
+            } else if line.starts_with("param(") {
+                params = !line.ends_with(')');
+            } else if *line == TOKEN {
+                read = true;
+            } else if !line.is_empty() && *line != "$erroractionpreference = 'stop'" {
+                return Err(format!("`{line}` comes before the refusal"));
+            }
+        }
+        if !read {
+            return Err("it does not read the current token just before the refusal".into());
+        }
+        Ok(())
+    }
+
+    /// A backstop, as source text, for what [`crate::elevation`]'s and
+    /// `main.rs`'s tests cannot call: `main` itself, whose commands would
+    /// start a daemon or open a window. `main` does nothing before it asks
+    /// `unless_elevated` with the process's own answer; the log is opened
+    /// only after, in `start`, so a refused process creates, opens and
+    /// rotates no file; every command goes through `start`; and a refusal
+    /// exits with what [`crate::elevation::refuse`] returns.
+    // LEDGER T1094 | class S | source text | pair T1091, T1093, T1095, T1096, T1097, T1098
+    #[test]
+    fn every_command_goes_through_the_refusal_first() {
+        const SEAM: &str = "unless_elevated(hops::elevation::refused_here(), start)";
+        let code = super::scan::code_only(include_str!("main.rs"));
+        let squeezed = |from: &str, to: &str| -> String {
+            let at = code.find(from).unwrap_or(code.len());
+            let end = code[at..].find(to).map_or(code.len(), |i| at + i);
+            code[at..end]
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect()
+        };
+        assert_eq!(
+            squeezed("fn main() {", SEAM),
+            "fnmain(){match",
+            "src/main.rs: `main` must open with a match on `{SEAM}`. Anything \
+             before it runs elevated: the log, for one, creates and rotates files \
+             in a folder the user can write."
+        );
+        let main = squeezed("fn main() {", "\n}\n");
+        assert!(
+            main.contains(
+                "Err(HopsError::Elevated(e))=>process::exit(hops::elevation::refuse(&e)),"
+            ),
+            "src/main.rs: an elevated process must exit with what \
+             `hops::elevation::refuse` returns, which says why where it is seen \
+             and is 1 (T1096, T1097); `main` does something else"
+        );
+        assert_eq!(
+            squeezed("fn start() -> Result<(), HopsError> {", "\n}\n"),
+            "fnstart()->Result<(),HopsError>{hops::logging::init(hops::logging::role_from_argv());\
+             install_panic_logger();dispatch()",
+            "src/main.rs: `start` must open the log, install the panic logger and \
+             dispatch, and nothing else"
+        );
+        let calls = |name: &str| -> Vec<String> {
+            code.match_indices(name)
+                .filter(|(at, _)| {
+                    let prev = code[..*at].chars().next_back().unwrap_or(' ');
+                    let next = code[at + name.len()..].chars().next().unwrap_or(' ');
+                    !(prev.is_alphanumeric() || matches!(prev, '_' | ':' | '.'))
+                        && !(next.is_alphanumeric() || next == '_')
+                        && !code[..*at].ends_with("fn ")
+                })
+                .map(|(at, _)| super::scan::enclosing_fn(&code, at))
+                .collect()
+        };
+        assert_eq!(
+            (
+                calls("start"),
+                calls("hops::logging::init"),
+                calls("install_panic_logger"),
+                calls("dispatch"),
+                calls("run()"),
+            ),
+            (
+                vec!["fn main".to_string()],
+                vec!["fn start".to_string()],
+                vec!["fn start".to_string()],
+                vec!["fn start".to_string()],
+                vec!["fn dispatch".to_string()],
+            ),
+            "src/main.rs opens the log, or reaches `start`, `dispatch` or `run`, \
+             other than through `{SEAM}`"
+        );
+    }
+
+    /// What asks, in the install script, for an elevated shell, lower-cased.
+    /// The script's comments say why hops is never elevated, so bare words
+    /// such as "elevated" or "administrator" are not enough there.
+    const SCRIPT_ASKS: [&str; 12] = [
+        "run as administrator",
+        "runasadministrator",
+        "-verb runas",
+        "elevated powershell",
+        "elevated shell",
+        "elevated prompt",
+        "elevated terminal",
+        "administrator powershell",
+        "powershell as administrator",
+        "admin shell",
+        "admin prompt",
+        "as admin",
+    ];
+
+    /// What makes a README section one that mentions elevation, lower-cased.
+    /// Deliberately wide: a section that only explains elevation matches too,
+    /// and passes as long as it holds nothing but removal steps.
+    const ELEVATION: &[&str] = &[
+        "admin",
+        "elevat",
+        "run as",
+        "runas",
+        "uac",
+        "user account control",
+        "privilege",
+        "highest",
+        "same window",
+        "same shell",
+        "same powershell",
+        "same prompt",
+        "same terminal",
+        "same console",
+        "same session",
+        "that window",
+        "that shell",
+        "that powershell",
+        "this window",
+        "this shell",
+        "still open",
+        "keep it open",
+        "leave it open",
+        "keep using",
+        "this one",
+        "that one",
+        "same one",
+        "ctrl+shift+enter",
+    ];
+
+    /// The commands an elevated PowerShell in the README may run: they
+    /// remove 0.12's task and Run values, stop its daemon, or read state.
+    const REMOVE_OR_READ: [&str; 7] = [
+        "unregister-scheduledtask",
+        "stop-process",
+        "remove-itemproperty",
+        "get-scheduledtask",
+        "get-process",
+        "get-nettcpconnection",
+        "get-itemproperty",
+    ];
+
+    /// `text` lower-cased with every run of white space one space, so a
+    /// phrase wrapped across lines is still found.
+    fn words(text: &str) -> String {
+        text.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    }
+
+    /// A paragraph of prose, a heading among them, or a code block's lines.
+    enum Part {
+        Prose(String),
+        Code(Vec<String>),
+    }
+
+    /// A heading's level (0 before the first heading) and what follows it,
+    /// the heading first, as prose.
+    struct Section {
+        level: usize,
+        parts: Vec<Part>,
+    }
+
+    /// How far `line` is indented, a tab reaching the next multiple of four.
+    fn indent(line: &str) -> usize {
+        line.chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .fold(0, |n, c| if c == '\t' { n + 4 - n % 4 } else { n + 1 })
+    }
+
+    /// The fence `line` holds as CommonMark reads one: indented at most
+    /// three spaces, three or more backticks or tildes. Its character, its
+    /// length, and what follows it.
+    fn fence(line: &str) -> Option<(char, usize, &str)> {
+        if indent(line) > 3 {
+            return None;
+        }
+        let trimmed = line.trim_start();
+        let mark = trimmed.chars().next().filter(|c| *c == '`' || *c == '~')?;
+        let len = trimmed.chars().take_while(|c| *c == mark).count();
+        (len >= 3).then(|| (mark, len, &trimmed[len..]))
+    }
+
+    /// `doc` cut at each heading outside a code block, read as CommonMark
+    /// reads it. A fence closes only with its own character, at least as
+    /// long, and nothing after it; a fence left open runs to the end as
+    /// code. A line indented four spaces that does not continue a paragraph
+    /// starts an indented code block.
+    fn sections(doc: &str) -> Vec<Section> {
+        let mut sections = vec![Section {
+            level: 0,
+            parts: Vec::new(),
+        }];
+        let (mut prose, mut code) = (String::new(), Vec::new());
+        let mut fenced: Option<(char, usize)> = None;
+        let mut indented = false;
+        for line in doc.lines() {
+            let parts = &mut sections.last_mut().expect("never empty").parts;
+            if let Some((mark, len)) = fenced {
+                match fence(line) {
+                    Some((m, l, rest)) if m == mark && l >= len && rest.trim().is_empty() => {
+                        parts.push(Part::Code(std::mem::take(&mut code)));
+                        fenced = None;
+                    }
+                    _ => code.push(line.to_string()),
+                }
+                continue;
+            }
+            if indented {
+                if line.trim().is_empty() || indent(line) >= 4 {
+                    code.push(line.to_string());
+                    continue;
+                }
+                parts.push(Part::Code(std::mem::take(&mut code)));
+                indented = false;
+            }
+            let trimmed = line.trim_start();
+            match fence(line) {
+                // A backtick fence's info string holds no backtick.
+                Some((mark, len, info)) if mark == '~' || !info.contains('`') => {
+                    parts.push(Part::Prose(std::mem::take(&mut prose)));
+                    fenced = Some((mark, len));
+                }
+                _ if trimmed.is_empty() => parts.push(Part::Prose(std::mem::take(&mut prose))),
+                _ if indent(line) >= 4 && prose.is_empty() => {
+                    indented = true;
+                    code.push(line.to_string());
+                }
+                _ if indent(line) <= 3 && trimmed.starts_with('#') => {
+                    parts.push(Part::Prose(std::mem::take(&mut prose)));
+                    sections.push(Section {
+                        level: trimmed.chars().take_while(|c| *c == '#').count(),
+                        parts: vec![Part::Prose(line.to_string())],
+                    });
+                }
+                _ => {
+                    prose.push_str(line);
+                    prose.push('\n');
                 }
             }
         }
-        assert!(
-            asks.is_empty(),
-            "the Windows install instructions still ask for elevation: {asks:?}. \
-             The daemon runs as the user, so its install needs no administrator, \
-             and telling users to use one invites the elevated install that \
-             2026-09-15 took out."
-        );
+        let parts = &mut sections.last_mut().expect("never empty").parts;
+        if fenced.is_some() || indented {
+            parts.push(Part::Code(code));
+        }
+        parts.push(Part::Prose(prose));
+        sections
+    }
+
+    /// Whether `text` mentions elevation in any of the ways [`ELEVATION`]
+    /// names.
+    fn mentions_elevation(text: &str) -> bool {
+        let text = words(text);
+        ELEVATION.iter().any(|phrase| text.contains(phrase))
+    }
+
+    /// Whether `paragraph` sends the reader to a new, normal PowerShell, in
+    /// one of two fixed forms: it begins "Then, from a new, normal
+    /// PowerShell", or says "open a new, normal PowerShell". It must also
+    /// mention no elevation and hold no word that could turn it around.
+    fn back_to_normal(paragraph: &str) -> bool {
+        const TURNS: [&str; 10] = [
+            "not", "no", "never", "don't", "nor", "instead", "rather", "except", "unless",
+            "without",
+        ];
+        let text = words(paragraph);
+        (text.starts_with("then, from a new, normal powershell")
+            || text.contains("open a new, normal powershell"))
+            && !mentions_elevation(&text)
+            && !text
+                .split(|c: char| !(c.is_alphanumeric() || c == '\''))
+                .any(|w| TURNS.contains(&w))
+    }
+
+    /// Whether a line of a code block run elevated only removes or reads:
+    /// blank, a comment, or one command of [`REMOVE_OR_READ`], alone or
+    /// assigned to a variable, with nothing that could chain, nest or
+    /// continue another command.
+    fn removes_or_reads(line: &str) -> bool {
+        let line = line.trim().to_lowercase();
+        if line.is_empty() || (line.starts_with('#') && !line.starts_with("#requires")) {
+            return true;
+        }
+        if line.contains([';', '|', '&', '(', ')', '{', '}', '`', '<', '>']) {
+            return false;
+        }
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let command = match words.as_slice() {
+            [var, "=", command, ..] if var.starts_with('$') => command,
+            [command, ..] => command,
+            [] => return true,
+        };
+        REMOVE_OR_READ.contains(command)
+    }
+
+    /// Whether a line of code starts with `sudo` or `gsudo`, which on
+    /// Windows run the rest of the line elevated: by name or path, with or
+    /// without `.exe`, after PowerShell's `&` or `.` if any.
+    fn runs_elevated(line: &str) -> bool {
+        let line = line.trim().to_lowercase();
+        let command = line
+            .split_whitespace()
+            .map(|w| w.trim_start_matches('&'))
+            .find(|w| !w.is_empty() && *w != ".")
+            .unwrap_or("")
+            .trim_matches(['"', '\'']);
+        let name = command.rsplit(['\\', '/']).next().unwrap_or("");
+        matches!(name.trim_end_matches(".exe"), "sudo" | "gsudo")
+    }
+
+    /// The inline code spans in `prose`.
+    fn spans(prose: &str) -> impl Iterator<Item = &str> {
+        prose.split('`').skip(1).step_by(2)
+    }
+
+    /// Everything in `doc` asked of an elevated PowerShell beyond removing
+    /// or reading, and how many code blocks were read as run elevated.
+    ///
+    /// A section that mentions elevation anywhere, its heading and code
+    /// comments included, is elevated throughout, and so is every section
+    /// after it until a paragraph outside an elevated section sends the
+    /// reader to a new, normal PowerShell ([`back_to_normal`]). A heading
+    /// alone does not: the reader's shell is still the one they opened. In
+    /// an elevated section every code line and inline code span must only
+    /// remove or read, and the prose may name nothing that installs.
+    ///
+    /// Apart from that, no code in the Windows sections (from a heading of
+    /// level three or less naming Windows to the next such heading) may
+    /// start with `sudo` or `gsudo`, elevated section or not.
+    fn elevated_beyond_removal(doc: &str) -> (Vec<String>, usize) {
+        let (mut beyond, mut blocks, mut carried, mut windows) = (Vec::new(), 0, false, false);
+        for Section { level, parts } in sections(doc) {
+            let heading = match parts.first() {
+                Some(Part::Prose(h)) => h.trim().to_string(),
+                _ => String::new(),
+            };
+            if (1..=3).contains(&level) {
+                windows = words(&heading).contains("windows");
+            }
+            let text: String = parts
+                .iter()
+                .map(|part| match part {
+                    Part::Prose(p) => p.clone(),
+                    Part::Code(lines) => lines.join("\n"),
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let asks = mentions_elevation(&text);
+            let mut elevated = carried || asks;
+            for part in &parts {
+                let code: Vec<&str> = match part {
+                    Part::Prose(p) => spans(p).collect(),
+                    Part::Code(lines) => lines.iter().map(String::as_str).collect(),
+                };
+                if windows {
+                    beyond.extend(
+                        code.iter()
+                            .filter(|line| runs_elevated(line))
+                            .map(|line| format!("{heading}: runs elevated: {}", line.trim())),
+                    );
+                }
+                match part {
+                    Part::Prose(p) => {
+                        if !asks && back_to_normal(p) {
+                            elevated = false;
+                        }
+                        if elevated {
+                            beyond.extend(
+                                installing(p)
+                                    .map(|w| format!("{heading}: names {w}: {}", words(p))),
+                            );
+                            beyond.extend(
+                                code.iter()
+                                    .filter(|span| !removes_or_reads(span))
+                                    .map(|span| format!("{heading}: runs `{}`", span.trim())),
+                            );
+                        }
+                    }
+                    Part::Code(_) if elevated => {
+                        blocks += 1;
+                        beyond.extend(
+                            code.iter()
+                                .filter(|line| !removes_or_reads(line))
+                                .map(|line| format!("{heading}: {}", line.trim())),
+                        );
+                    }
+                    Part::Code(_) => {}
+                }
+            }
+            carried = elevated;
+        }
+        beyond.dedup();
+        (beyond, blocks)
+    }
+
+    /// Each word of `text` that installs, registers or starts hops: an
+    /// install script, a registration, a service, or `hops.exe`. Removing
+    /// words, such as `uninstall` or `Unregister-ScheduledTask`, are not.
+    fn installing(text: &str) -> impl Iterator<Item = &str> {
+        text.split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '.'))
+            .filter(|w| {
+                let w = w.to_lowercase();
+                (w.contains("install") && !w.starts_with("uninstall"))
+                    || (w.contains("register") && !w.starts_with("unregister"))
+                    || w.contains("hops.exe")
+                    || w.contains("new-service")
+                    || w.contains("start-process")
+                    || w.contains("schtasks")
+                    || w == "sc.exe"
+                    || w.contains("new-itemproperty")
+                    || w.contains("set-itemproperty")
+            })
+    }
+
+    // LEDGER T69b | class B | 1 return value: elevated_beyond_removal on built documents
+    #[test]
+    fn the_scanner_reads_an_elevated_shell_on_across_blocks_and_headings() {
+        let removal = "Unregister-ScheduledTask -TaskName hops-daemon -Confirm:$false";
+        let doc = |after: &str| {
+            format!(
+                "## A\n\nOpen PowerShell as administrator:\n\n```powershell\n{removal}\n```\n{after}"
+            )
+        };
+        let install = "```powershell\n.\\install-hops-daemon.ps1\n```\n";
+        let (clean, blocks) = elevated_beyond_removal(&doc(""));
+        assert!(clean.is_empty() && blocks == 1, "{clean:?} {blocks}");
+        for after in [
+            format!("\n{install}"),
+            format!("\nIn the same window:\n\n{install}"),
+            format!("\n## B\n\n{install}"),
+            format!("\n## B\n\nNot from a normal PowerShell:\n\n{install}"),
+            format!("\n## B\n\nFrom a normal PowerShell, or the same window:\n\n{install}"),
+            "\n~~~\nSet-ExecutionPolicy Bypass\n~~~\n".to_string(),
+            format!("\nFrom a normal PowerShell:\n\n{install}"),
+            "\n```\nStop-Process -Id 1; hops\n```\n".to_string(),
+            // Only the two fixed forms send the reader back.
+            format!("\n## B\n\nFrom a normal PowerShell:\n\n{install}"),
+            format!("\n## B\n\nA normal PowerShell cannot, so go on here:\n\n{install}"),
+            format!("\n## B\n\nClose the normal PowerShell you opened first:\n\n{install}"),
+            // An indented code block is code.
+            "\nThen:\n\n    C:\\hops\\hops daemon\n".to_string(),
+            // A fence closes only as CommonMark closes it.
+            "\n```\nStop-Process -Id 1\n    ```\nC:\\hops\\hops daemon\n```\n".to_string(),
+            // Inline code in elevated prose is run through the allowlist.
+            "\nThen start it with `C:\\hops\\hops daemon`.\n".to_string(),
+            "\nThen run `irm https://example.invalid/a.ps1 | iex`.\n".to_string(),
+        ] {
+            let (beyond, _) = elevated_beyond_removal(&doc(&after));
+            assert!(!beyond.is_empty(), "passed: {after}");
+        }
+        for back in [
+            "Then, from a new, normal PowerShell:",
+            "Now open a new, normal PowerShell and run:",
+        ] {
+            let (beyond, _) =
+                elevated_beyond_removal(&doc(&format!("\n## B\n\n{back}\n\n{install}")));
+            assert!(beyond.is_empty(), "{back}: {beyond:?}");
+        }
+        let (beyond, _) =
+            elevated_beyond_removal(&doc("\nThen read it with `Get-ScheduledTask hops`.\n"));
+        assert!(beyond.is_empty(), "{beyond:?}");
+    }
+
+    // LEDGER T69c | class B | 1 return value: elevated_beyond_removal on built documents
+    #[test]
+    fn the_windows_sections_run_nothing_through_sudo_or_ctrl_shift_enter() {
+        let install = ".\\install-hops-daemon.ps1";
+        let windows = |body: &str| format!("### Windows\n\n{body}\n\n## Next\n");
+        let (clean, _) =
+            elevated_beyond_removal(&windows(&format!("```powershell\n{install}\n```")));
+        assert!(clean.is_empty(), "{clean:?}");
+        for body in [
+            format!("```powershell\nsudo {install}\n```"),
+            format!("```cmd\ngsudo.exe {install}\n```"),
+            format!("```\n& C:\\tools\\gsudo {install}\n```"),
+            format!("Then:\n\n    sudo {install}"),
+            format!("Open PowerShell with Ctrl+Shift+Enter:\n\n```powershell\n{install}\n```"),
+        ] {
+            let (beyond, _) = elevated_beyond_removal(&windows(&body));
+            assert!(!beyond.is_empty(), "passed: {body}");
+        }
+        let (linux, _) =
+            elevated_beyond_removal("### Linux\n\n```sh\nsudo loginctl enable-linger\n```\n");
+        assert!(linux.is_empty(), "{linux:?}");
     }
 }

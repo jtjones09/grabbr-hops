@@ -273,6 +273,12 @@ impl Daemon {
         )
     }
 
+    /// Keep this machine awake through `power` rather than through none, as
+    /// a test's daemon otherwise does.
+    pub(crate) fn keep_awake_through(&mut self, power: Box<dyn crate::keep_awake::PowerAssertion>) {
+        self.service.keep_awake = crate::keep_awake::KeepAwake::with(power);
+    }
+
     /// This machine's fingerprint.
     pub(crate) fn fingerprint(&self) -> String {
         self.service.public_key_fingerprint.clone()

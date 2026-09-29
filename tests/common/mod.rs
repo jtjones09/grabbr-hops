@@ -30,6 +30,16 @@ pub struct Daemon {
     log: PathBuf,
     config: PathBuf,
     starts: u32,
+    power: Power,
+}
+
+/// Whether a daemon may take the machine's real power assertion.
+#[derive(Clone, Copy)]
+pub enum Power {
+    /// `GRABBR_KEEP_AWAKE=off`: it holds none, whatever it pairs with.
+    Off,
+    /// `GRABBR_KEEP_AWAKE` unset: it does what a daemon in use does.
+    AsInUse,
 }
 
 impl Drop for Daemon {
@@ -41,6 +51,11 @@ impl Drop for Daemon {
 }
 
 impl Daemon {
+    /// The daemon's process id.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     pub fn log(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
@@ -57,7 +72,7 @@ impl Daemon {
         let _ = self.child.wait();
         self.starts += 1;
         self.log = self.dir.join(format!("daemon.{}.log", self.starts));
-        self.child = spawn(&self.dir, &self.config, &self.log);
+        self.child = spawn(&self.dir, &self.config, &self.log, self.power);
         if wait_until_running(&mut self.child, &self.log).is_err() {
             panic!(
                 "the daemon's port was taken while it restarted; log:\n{}",
@@ -76,9 +91,15 @@ impl Daemon {
     }
 }
 
-fn spawn(dir: &std::path::Path, config: &std::path::Path, log: &std::path::Path) -> Child {
+fn spawn(
+    dir: &std::path::Path,
+    config: &std::path::Path,
+    log: &std::path::Path,
+    power: Power,
+) -> Child {
     let config_dir = config.parent().expect("the config's directory");
-    Command::new(env!("CARGO_BIN_EXE_hops"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hops"));
+    command
         .arg("--config")
         .arg(config)
         .arg("--cert-path")
@@ -93,9 +114,13 @@ fn spawn(dir: &std::path::Path, config: &std::path::Path, log: &std::path::Path)
         .env("HOPS_LOG_FILE", log)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("the hops binary starts")
+        .stderr(Stdio::null());
+    if let Power::Off = power {
+        // A test daemon holds no real power assertion unless its test is
+        // about that assertion.
+        command.env("GRABBR_KEEP_AWAKE", "off");
+    }
+    command.spawn().expect("the hops binary starts")
 }
 
 /// Start the built daemon in a scratch directory named for `tag`, with
@@ -131,12 +156,23 @@ pub const DRIVES_US: hops::trust::Caps =
 /// first start lists those machines to be paired again and grants them
 /// nothing.
 pub fn start_paired(tag: &str, tables: &str, pairings: &[Pairing]) -> (Daemon, u16) {
+    start_paired_with(tag, tables, pairings, Power::Off)
+}
+
+/// [`start_paired`], with `power` saying whether the daemon may take the
+/// machine's real power assertion.
+pub fn start_paired_with(
+    tag: &str,
+    tables: &str,
+    pairings: &[Pairing],
+    power: Power,
+) -> (Daemon, u16) {
     let dir = PathBuf::from(format!("/tmp/{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let config_dir = dir.join(".config/lan-mouse");
     std::fs::create_dir_all(&config_dir).expect("a scratch config directory");
     seed_pairings(&config_dir, pairings);
-    start_in(dir, ports::pick, tables)
+    start_in(dir, ports::pick, tables, power)
 }
 
 /// Write an identity for the daemon whose configuration directory is
@@ -180,15 +216,26 @@ pub fn seed_pairings(config_dir: &Path, pairings: &[Pairing]) {
 
 /// [`start`] on the ports `port` gives, one per start (see [`launch_on`]).
 pub fn start_on(port: impl FnMut() -> u16, tag: &str, tables: &str) -> (Daemon, u16) {
+    start_with(port, tag, tables, Power::Off)
+}
+
+/// [`start`], with `power` saying whether the daemon may take the
+/// machine's real power assertion.
+pub fn start_with(
+    port: impl FnMut() -> u16,
+    tag: &str,
+    tables: &str,
+    power: Power,
+) -> (Daemon, u16) {
     // Short, for `sun_path` (about 104 bytes on macOS).
     let dir = PathBuf::from(format!("/tmp/{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    start_in(dir, port, tables)
+    start_in(dir, port, tables, power)
 }
 
 /// [`start_on`] in the scratch directory `dir`, which may already hold the
 /// daemon's identity and trust store.
-fn start_in(dir: PathBuf, port: impl FnMut() -> u16, tables: &str) -> (Daemon, u16) {
+fn start_in(dir: PathBuf, port: impl FnMut() -> u16, tables: &str, power: Power) -> (Daemon, u16) {
     let config_dir = dir.join(".config/lan-mouse");
     std::fs::create_dir_all(&config_dir).expect("a scratch config directory");
     std::fs::create_dir_all(dir.join("Library/Caches")).expect("scratch caches");
@@ -210,7 +257,7 @@ fn start_in(dir: PathBuf, port: impl FnMut() -> u16, tables: &str) -> (Daemon, u
             )
         },
         &log,
-        || spawn(&dir, &config, &log),
+        || spawn(&dir, &config, &log, power),
     );
     let daemon = Daemon {
         child,
@@ -218,6 +265,7 @@ fn start_in(dir: PathBuf, port: impl FnMut() -> u16, tables: &str) -> (Daemon, u
         log,
         config,
         starts: 0,
+        power,
     };
     daemon.drain_the_watcher();
     (daemon, port)

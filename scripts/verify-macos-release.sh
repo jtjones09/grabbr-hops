@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Verify a release dmg the way the Mac that opens it will: Gatekeeper accepts
 # the image and the app inside it as notarized Developer ID code, both carry a
-# stapled ticket, and the app is signed as com.grabbr.hops. Then check that it
-# carries what every release artifact does: LICENSE, the third-party notices,
-# an SBOM for each target of the universal binary, and a binary built with
-# cargo auditable.
+# stapled ticket, and the app is signed as com.grabbr.hops by team 9V42Q953X9.
+# Then check that it carries what every release artifact does: LICENSE, the
+# third-party notices, an SBOM for each target of the universal binary, and a
+# binary built with cargo auditable.
 #
 #   scripts/verify-macos-release.sh <dmg>
 #
@@ -19,6 +19,7 @@ set -euo pipefail
 
 DMG="${1:?usage: verify-macos-release.sh <dmg>}"
 IDENTIFIER="com.grabbr.hops"
+TEAM="9V42Q953X9"
 
 fail() {
     echo "::error::$*" >&2
@@ -61,6 +62,10 @@ codesign --verify --strict "$APP" || fail "hops.app's signature does not verify.
 id="$(codesign -dv "$APP" 2>&1 | sed -n 's/^Identifier=//p')"
 [ "$id" = "$IDENTIFIER" ] ||
     fail "hops.app is signed as '$id', not $IDENTIFIER; macOS would not apply its grants."
+# Notarization proves only that some Developer ID signed it; the team says whose.
+team="$(codesign -dv "$APP" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+[ "$team" = "$TEAM" ] ||
+    fail "hops.app is signed by team '$team', not $TEAM."
 
 for f in LICENSE THIRD-PARTY-NOTICES.txt \
          hops-aarch64-apple-darwin.cdx.json hops-x86_64-apple-darwin.cdx.json; do
@@ -70,5 +75,5 @@ done
 grep -qaF .dep-v0 "$APP/Contents/MacOS/hops" ||
     fail "hops.app's binary embeds no dependency list; it was not built with cargo auditable."
 
-echo "OK: $DMG and the hops.app inside it are notarized, stapled and signed as $IDENTIFIER,"
-echo "    and the app carries its licence, notices, SBOMs and dependency list."
+echo "OK: $DMG and the hops.app inside it are notarized, stapled and signed as $IDENTIFIER"
+echo "    by team $TEAM, and the app carries its licence, notices, SBOMs and dependency list."

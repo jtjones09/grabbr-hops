@@ -35,22 +35,19 @@ enum HopsError {
     Slint(#[from] hops_slint::SlintError),
     #[error(transparent)]
     Cli(#[from] CliError),
+    #[error(transparent)]
+    Elevated(#[from] hops::elevation::Elevated),
 }
 
 fn main() {
-    // Logging first, before anything that can fail: a config parse error is
-    // one of the things most worth having in the log.
-    hops::logging::init(hops::logging::role_from_argv());
-    install_panic_logger();
-
-    // Before anything that reads the config. This is the command someone runs
-    // to find out why the others are failing, so it must not need them to work.
-    if let Some(config::Command::BuildCheck { repo, strict }) = config::command_from_args() {
-        run_build_check(repo, strict);
-    }
-
-    match run() {
+    // First, every command included: hops runs as the user, never elevated
+    // (#109). A refused process opens no log, since an elevated process that
+    // creates, opens or rotates a file where the user can write is the very
+    // hazard, and reports on stderr and, where nothing keeps that on screen,
+    // in a message box.
+    match unless_elevated(hops::elevation::refused_here(), start) {
         Ok(()) => {}
+        Err(HopsError::Elevated(e)) => process::exit(hops::elevation::refuse(&e)),
         // A `hops cli` command answers whoever ran it, a script as much as a
         // terminal, and the log reaches stderr only at a terminal.
         Err(HopsError::Cli(e)) => {
@@ -62,6 +59,40 @@ fn main() {
             process::exit(1);
         }
     }
+}
+
+/// `command`, unless this process is `elevated`: then nothing of hops runs,
+/// not its log and not an argument parse, and the error says why and what
+/// to do.
+///
+/// No command is exempt. `build-check` runs git in a checkout the user can
+/// write, whose config can name programs for git to run, and `--help` and
+/// `--version` have no use elevated that a normal shell lacks.
+fn unless_elevated(
+    elevated: bool,
+    command: impl FnOnce() -> Result<(), HopsError>,
+) -> Result<(), HopsError> {
+    hops::elevation::may_run(elevated)?;
+    command()
+}
+
+/// hops, once this process may run.
+fn start() -> Result<(), HopsError> {
+    // Logging first, before anything that can fail: a config parse error is
+    // one of the things most worth having in the log.
+    hops::logging::init(hops::logging::role_from_argv());
+    install_panic_logger();
+    dispatch()
+}
+
+/// Every command, once the log is open.
+fn dispatch() -> Result<(), HopsError> {
+    // Before anything that reads the config. This is the command someone runs
+    // to find out why the others are failing, so it must not need them to work.
+    if let Some(config::Command::BuildCheck { repo, strict }) = config::command_from_args() {
+        run_build_check(repo, strict);
+    }
+    run()
 }
 
 /// Report whether this binary matches its source, then exit. Never returns.
@@ -122,8 +153,16 @@ fn runs_the_daemon(command: Option<Command>) -> bool {
     }
 }
 
-/// Run the daemon (the receiver service). A redundant instance self-exits.
+/// Run the daemon (the receiver service). A redundant instance self-exits,
+/// and so does one beside a daemon of an older build that listens where this
+/// build's claim cannot see it (on Windows, hops 0.12 and older). An elevated
+/// one never gets here ([`unless_elevated`]).
 fn run_daemon() -> Result<(), HopsError> {
+    if let Err(e) =
+        hops::daemon_start::refuse_beside_older(DaemonEndpoint::of_older_builds().as_ref())
+    {
+        return daemon_ended(Err(HopsError::Service(ServiceError::IpcListen(e))));
+    }
     daemon_ended(run_async(run_service()))
 }
 
@@ -321,6 +360,9 @@ where
 async fn run_service() -> Result<(), ServiceError> {
     let endpoint = DaemonEndpoint::of_this_platform().map_err(IpcListenerCreationError::from)?;
     let mut service = Service::start(&endpoint, Config::new).await?;
+    // Taken once this daemon holds its own endpoint, and held until it ends.
+    let _older =
+        hops::daemon_start::hold_older_endpoint(DaemonEndpoint::of_older_builds().as_ref());
     service.run().await?;
     log::info!("service exited!");
     Ok(())
@@ -419,11 +461,58 @@ mod a_daemon_ended_for_a_grant_exits_unsuccessfully {
             "a daemon that ended for a grant must exit 1, or launchd leaves it down \
              until the next login: {granted:?}"
         );
+        let older = daemon_ended(Err(HopsError::Service(ServiceError::IpcListen(
+            IpcListenerCreationError::Older {
+                endpoint: hops_ipc::DaemonEndpoint::Tcp(
+                    "127.0.0.1:5252".parse().expect("an address"),
+                ),
+                hint: String::new(),
+            },
+        ))));
+        assert!(
+            older.is_err(),
+            "a daemon that did not start beside an older build's must exit 1 with \
+             the reason, not as if a daemon of this build were running: {older:?}"
+        );
         assert!(beside.is_ok(), "{beside:?}");
         assert!(
             held.is_err(),
             "a daemon whose endpoint something else holds must exit 1 with the \
              reason, not as if a daemon were running: {held:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod an_elevated_hops_refuses_to_run {
+    //! hops runs as the user and is never elevated (#109). On Windows `main`
+    //! passes whether its token is elevated, before any command runs; here
+    //! the seam is called with each answer, so the refusal is tested on every
+    //! system. That `main` goes through it is guarded in `decision_guards`.
+    use super::{HopsError, unless_elevated};
+    use std::cell::Cell;
+
+    // LEDGER T1093 | class B | 1 return value + whether the command ran
+    #[test]
+    fn nothing_of_hops_runs_when_elevated_and_it_exits_1() {
+        let ran = Cell::new(false);
+        let got = unless_elevated(true, || {
+            ran.set(true);
+            Ok(())
+        });
+        assert!(
+            matches!(got, Err(HopsError::Elevated(_))) && !ran.get(),
+            "an elevated process ran a hops command, or exited 0 without saying \
+             why: ran {}, {got:?}",
+            ran.get()
+        );
+        let got = unless_elevated(false, || {
+            ran.set(true);
+            Ok(())
+        });
+        assert!(
+            got.is_ok() && ran.get(),
+            "a process that is not elevated did not run its command"
         );
     }
 }

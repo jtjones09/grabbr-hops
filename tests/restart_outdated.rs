@@ -1,6 +1,6 @@
 //! The front door against a real daemon on Linux (#222): a daemon of another
-//! build that the service runs is stopped and replaced, and one of this build
-//! is left running.
+//! build that the service runs is stopped and replaced, one of this build is
+//! left running, and so is one run from another copy of hops.
 //!
 //! Runs the built binary as the daemon, detached into a session of its own as
 //! the front door starts it, with dummy capture and emulation, discovery off,
@@ -21,7 +21,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use hops::daemon_start::{
-    DaemonStart, Launch, ThisMachine, start_or_restart_reported, stop_outdated_daemon,
+    AsProgram, DaemonStart, Launch, start_or_restart_reported, stop_outdated_daemon_of,
 };
 use hops_ipc::{Build, DaemonEndpoint};
 
@@ -62,6 +62,11 @@ fn scratch() -> Scratch {
 /// so it has no controlling terminal, on a port of its own. Waits until its
 /// loop runs.
 fn daemon(scratch: &Scratch, log: &Path) -> Child {
+    daemon_of(Path::new(env!("CARGO_BIN_EXE_hops")), scratch, log)
+}
+
+/// [`daemon`], run from the hops program at `program`.
+fn daemon_of(program: &Path, scratch: &Scratch, log: &Path) -> Child {
     let (child, _) = common::launch(
         &scratch.config,
         |port| {
@@ -71,7 +76,7 @@ fn daemon(scratch: &Scratch, log: &Path) -> Child {
         },
         log,
         || {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_hops"));
+            let mut command = Command::new(program);
             command
                 .arg("--config")
                 .arg(&scratch.config)
@@ -135,6 +140,9 @@ fn exits(child: &mut Child, within: Duration) -> bool {
 fn an_outdated_daemon_is_replaced_and_one_of_this_build_is_left_running() {
     let scratch = scratch();
     let endpoint = DaemonEndpoint::of_this_platform().expect("the scratch endpoint");
+    // The front door is the app run from the built binary.
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_hops"));
+    let app = || AsProgram(bin.clone());
     let mut old = daemon(&scratch, &scratch.dir.join("old.log"));
     let ours = build_of_the_binary();
 
@@ -147,7 +155,7 @@ fn an_outdated_daemon_is_replaced_and_one_of_this_build_is_left_running() {
             launched.push(launch);
             Err(std::io::Error::other("not to be asked"))
         },
-        &mut ThisMachine,
+        &mut app(),
         WITHIN,
     );
     let old_still_runs = matches!(old.try_wait(), Ok(None));
@@ -166,13 +174,13 @@ fn an_outdated_daemon_is_replaced_and_one_of_this_build_is_left_running() {
             let Launch::Restart(pid) = launch else {
                 return Err(std::io::Error::other(format!("asked to {launch:?}")));
             };
-            stop_outdated_daemon(pid, &endpoint, WITHIN)?;
+            stop_outdated_daemon_of(pid, &endpoint, &bin, WITHIN)?;
             let started = daemon(&scratch, &scratch.dir.join("new.log"));
             let id = started.id();
             new = Some((pid, started));
             Ok(id)
         },
-        &mut ThisMachine,
+        &mut app(),
         WITHIN,
     );
     let old_pid = old.id();
@@ -181,6 +189,27 @@ fn an_outdated_daemon_is_replaced_and_one_of_this_build_is_left_running() {
     let new_pid = new.id();
     let _ = new.kill();
     let _ = new.wait();
+
+    // A daemon run from another copy of hops is that copy's service: the
+    // app leaves it running, and says why.
+    let copy = scratch.dir.join("copy").join("hops");
+    std::fs::create_dir_all(copy.parent().expect("its directory")).expect("a directory");
+    std::fs::copy(&bin, &copy).expect("another copy of hops");
+    let mut theirs = daemon_of(&copy, &scratch, &scratch.dir.join("copy.log"));
+    let mut launched_beside = Vec::new();
+    let beside = start_or_restart_reported(
+        Ok(endpoint.clone()),
+        &other,
+        |launch| {
+            launched_beside.push(launch);
+            Err(std::io::Error::other("not to be asked"))
+        },
+        &mut app(),
+        WITHIN,
+    );
+    let theirs_still_runs = matches!(theirs.try_wait(), Ok(None));
+    let _ = theirs.kill();
+    let _ = theirs.wait();
     if !old_exited {
         let _ = old.kill();
         let _ = old.wait();
@@ -198,6 +227,19 @@ fn an_outdated_daemon_is_replaced_and_one_of_this_build_is_left_running() {
         "the daemon runs {ours}, the app {other}, and the service started it; it \
          had to be stopped and replaced: {replaced:?}\nold log:\n{}",
         std::fs::read_to_string(scratch.dir.join("old.log")).unwrap_or_default()
+    );
+    assert_eq!(
+        (beside.outcome, launched_beside, theirs_still_runs),
+        (DaemonStart::AlreadyRunning, vec![], true),
+        "a daemon of another copy of hops was stopped or replaced: {beside:?}"
+    );
+    assert!(
+        beside
+            .left
+            .as_deref()
+            .unwrap_or_default()
+            .contains("another copy"),
+        "the app must say it left the other copy's daemon running: {beside:?}"
     );
     let note = replaced.note().unwrap_or_default();
     assert!(

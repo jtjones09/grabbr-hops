@@ -106,6 +106,9 @@ cargo build --release --no-default-features --features "tui libei_capture libei_
 5. Move your cursor off that edge — it hops over. Keyboard, scroll, and modifier
    keys follow.
 
+Upgrading from 0.12? Update every machine and pair each again: see
+[docs/UPGRADING.md](docs/UPGRADING.md).
+
 ## Other ways to run it
 
 - **Terminal UI** (keyboard-driven, great over SSH): `hops tui`.
@@ -161,6 +164,11 @@ usual.
   number; the number does not vouch for the machine you chose to add.
 - **No cloud, no accounts:** machines connect directly over your LAN. There is no
   relay and no telemetry.
+- **Network:** UDP 4722 between machines, and multicast DNS to find them.
+  Which machine connects to which, and how to turn listening and discovery
+  off, are in [docs/NETWORK.md](docs/NETWORK.md). A machine behind a VPN or
+  security client that drops incoming connections can dial out instead:
+  [docs/MANAGED-MAC.md](docs/MANAGED-MAC.md).
 - **Removal:** removing a device ends its pairing at once and tells it if it is
   connected. hops keeps no record of it; to use it again, pair again.
 

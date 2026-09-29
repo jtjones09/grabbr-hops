@@ -30,10 +30,13 @@ and how to recover. How to report a vulnerability is in
 - **A trust file this machine did not write.** The list of paired machines
   is signed by a key kept beside it. A trust file edited by hand, copied
   from another installation, or restored on its own over a newer one stops
-  hops from starting instead of being trusted. When the trust file is
-  missing, the machines listed in `config.toml` are shown as needing to be
-  paired again and are trusted with nothing, so a `config.toml` copied or
-  edited while the trust file is gone grants nothing.
+  hops from starting instead of being trusted. The list of machines in
+  `config.toml` grants nothing. When the trust file is missing, the
+  machines on that list are shown as needing to be paired again and are
+  trusted with nothing, so a `config.toml` copied or edited while the
+  trust file is gone grants nothing. While the trust file is there, a
+  machine removed from that list, by hand or by an older version of hops,
+  is removed here too, and one added to it is not trusted.
 - **Reaching a machine that cannot be dialled.** A machine dials each
   machine allowed to control it, as well as waiting to be dialled, so one
   behind a VPN or security client that drops incoming connections is still
@@ -69,7 +72,8 @@ and how to recover. How to report a vulnerability is in
 - **The network itself.** Traffic cannot be read or changed, but it can be
   blocked. Discovery announces that the machine runs hops, with its hostname,
   addresses and key fingerprint; set `discovery = false` in `config.toml` to
-  turn it off and type addresses instead.
+  turn it off and type addresses instead. Every port and connection hops
+  uses is in [NETWORK.md](NETWORK.md).
 
 ## Upgrading from hops 0.12
 
@@ -94,8 +98,9 @@ address change, the device is shown under that machine's card instead. It
 still grants nothing, and pairing it again still needs the number.
 
 hops 0.13 drops the old list from `config.toml` the next time it saves its
-settings. A machine moved back to hops 0.12 after the upgrade has to be
-paired again there too.
+settings. Until then, removing a machine's line from it, by hand or with
+hops 0.12, removes that machine's card here too. A machine moved back to
+hops 0.12 after the upgrade has to be paired again there too.
 
 ## Removing a machine
 
@@ -135,15 +140,22 @@ user account or a deleted directory gives the machine a new key. The other
 machines then no longer recognise it: remove its old card on each and pair
 again.
 
-**A device no longer connects.** Its card says where it stands:
+**A device no longer connects.** Its card says where it stands. Every
+state other than "connected" is here:
 
 | The card says | What to do |
 | --- | --- |
+| not connected | The two are paired and no link is up either way, with nothing known to be wrong. Move the pointer to it. If the card then says something else, see that row. |
+| off | It is switched off on this machine. Switch it on. |
+| compare the number | Pairing is under way and the number is on this screen. Pick the same number on the other machine. |
 | it removed this machine | Remove it here, then pair again. |
 | waiting for its approval | That machine has not approved the pairing or picked its number yet. Open add device on it and finish there. |
 | not accepting input | hops runs there but cannot inject input. It may lack a permission, such as Accessibility on macOS. |
 | paired with an older version: add it again | It was paired by hops 0.12 and is trusted with nothing. Add it again with add device open on both machines, and choose which machine controls which. |
-| unreachable | Check that hops runs on both machines. One of the two must accept UDP on the port hops listens on (`port` in `config.toml`, or `o` in the terminal UI): a machine that cannot accept it is reached through the connection it opens to each machine allowed to control it. |
+| unreachable | This machine dialled it and nothing answered. Check that hops runs there and that its firewall lets UDP in on the port hops listens on (4722 unless `port` in `config.toml` says otherwise; `o` in the terminal UI). A machine that cannot accept incoming connections, such as one behind a VPN or security client, is reached over the connection it opens to each machine allowed to control it, which needs this machine's firewall to let UDP in on that port, as in [MANAGED-MAC.md](MANAGED-MAC.md). |
+| waiting for it to dial | That machine opens the connection to this one, and has not yet. Check that hops runs there with this machine switched on, and that this machine's firewall lets UDP in on the port hops listens on. |
+| not paired | Neither machine may control the other. Pair them again. |
+| service not answering | hops' background service is not running here, and the card shows what was last known. Start hops again. |
 
 A notice can say more:
 

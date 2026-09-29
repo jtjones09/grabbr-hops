@@ -67,7 +67,7 @@ codesign identity. After re-signing, `launchctl bootout` + `bootstrap` (not
 ### Windows
 
 ```powershell
-# from a normal PowerShell; no administrator needed:
+# from a normal PowerShell:
 cd windows
 .\install-hops-daemon.ps1 -HopsPath 'C:\path\to\hops.exe'
 ```
@@ -77,10 +77,50 @@ purpose: a service runs in the isolated session 0 and cannot inject input into
 your desktop. The task runs hops in your interactive session, which is what input
 emulation requires.
 
+#### Why hops is never elevated
+
 hops runs as you and is never elevated: an administrator process started from a
 folder you can write hands administrator to anything that can replace the file.
-The cost is that hops cannot type or click into an elevated window. An enter
-hook set in `config.toml` does not run if hops is started elevated.
+The cost is that hops cannot type or click into an elevated window. Started
+elevated, hops refuses to run and says why, and so does the script above.
+
+#### Upgrading from hops 0.12 or older
+
+The old daemon listens where this version does not look for one, and this
+version will not start beside it. hops 0.12 started at sign-in from a Run value
+or from a scheduled task.
+
+First, open a new, normal PowerShell and remove the Run values its
+`install.ps1` set. They are in your own registry hive, so a shell started with
+another account's password would look in that account's:
+
+```powershell
+$run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+Remove-ItemProperty $run -Name hops-daemon,hops-gui
+```
+
+##### Removing the task 0.12 ran elevated
+
+The task runs the old daemon elevated, so removing it and stopping that daemon
+needs PowerShell as administrator; without the task, a normal one does. These
+commands only remove and stop:
+
+```powershell
+Unregister-ScheduledTask -TaskName hops-daemon -Confirm:$false
+$old = Get-NetTCPConnection -LocalPort 5252 -State Listen
+Stop-Process -Id $old.OwningProcess
+```
+
+A line that finds nothing to remove says so; that is expected. Quit the old
+hops in the notification area too. Remove the task rather than reuse it: it
+keeps its elevation.
+
+##### Starting this version at sign-in
+
+Then, from a new, normal PowerShell, set this version to start at sign-in:
+register it with `install-hops-daemon.ps1` as above, from `service\windows` in
+the source code zip on the release page; or, if 0.12 came from `install.ps1` in
+a clone of the source, update the clone and run `install.ps1` again.
 
 ## 3. Configure over SSH
 
@@ -106,5 +146,6 @@ top-level README), with `hops tui` over SSH standing in for the window: press
 Both machines approve the request, then compare the number; neither can
 approve for the other. Writing a fingerprint into `config.toml` is not how a
 machine is paired: pairings live in a signed trust file, and `config.toml`'s
-list is read only to rebuild that file when it is missing. How to remove a
-machine or recover one is in [docs/SECURITY.md](../docs/SECURITY.md).
+list grants nothing. When that file is missing, each machine on the list is
+shown as needing to be paired again. How to remove a machine or recover one
+is in [docs/SECURITY.md](../docs/SECURITY.md).
