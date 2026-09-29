@@ -749,15 +749,16 @@ impl Service {
         // clipboard sync: a single inbound channel both transports push received
         // payloads into, each with its sender's fingerprint, plus the local
         // monitor/apply backend. Only a peer whose lease carries clipboard-from
-        // reaches the channel. It is unbounded: each transfer is capped at
-        // transport::MAX_CLIPBOARD_BYTES and stalled transfers time out, but
-        // such a peer flooding valid payloads is not yet back-pressured; a
-        // bounded/coalescing channel is the future hardening.
+        // reaches the channel, and each link holds a bounded share of it
+        // (transport::QUEUED_PER_LINK). The bound is per link, not per peer:
+        // a peer linked more than once holds a share on each. The backend
+        // reads the clipboard only
+        // while some pairing, switched on, takes it.
         let (clipboard_in_tx, clipboard_in) = channel();
         let (refusals_tx, dial_refusals) = channel();
         let (persist_tx, persist_requests) = channel();
         let (state_tx, state_changes) = channel();
-        let clipboard = Clipboard::new();
+        let clipboard = Clipboard::new(trust.clone(), client_manager.clone());
 
         // listener + connection. Both hold the same store and ask it different
         // questions: the listener whether a peer may drive us, the connection
