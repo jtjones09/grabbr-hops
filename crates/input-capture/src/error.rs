@@ -40,6 +40,19 @@ pub enum CaptureError {
     #[cfg(libei)]
     #[error("libei disconnected - reason: `{0}`")]
     Disconnected(String),
+    /// The compositor captured the pointer and left out what says for which
+    /// edge (#103).
+    #[cfg(libei)]
+    #[error("the compositor started input capture but {0}: no device to send it to")]
+    Unattributed(String),
+    /// The capture task ended without returning: it was cancelled or failed.
+    #[cfg(libei)]
+    #[error("the input capture task ended abnormally: {0}")]
+    TaskFailed(String),
+    /// The Wayland connection failed or the compositor broke the protocol.
+    #[cfg(layer_shell)]
+    #[error("wayland: {0}")]
+    Wayland(String),
     #[cfg(target_os = "macos")]
     #[error("failed to warp mouse cursor: `{0}`")]
     WarpCursor(CGError),

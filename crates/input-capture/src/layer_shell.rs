@@ -158,7 +158,7 @@ impl Window {
         output: &WlOutput,
         pos: Position,
         size: (i32, i32),
-    ) -> Window {
+    ) -> io::Result<Window> {
         log::debug!("creating window output: {output:?}, size: {size:?}");
         let g = &state.globals;
 
@@ -166,8 +166,8 @@ impl Window {
             Position::Left | Position::Right => (1, size.1 as u32),
             Position::Top | Position::Bottom => (size.0 as u32, 1),
         };
-        let mut file = tempfile::tempfile().unwrap();
-        draw(&mut file, (width, height));
+        let mut file = tempfile::tempfile()?;
+        draw(&mut file, (width, height))?;
         let pool = g
             .shm
             .create_pool(file.as_fd(), (width * height * 4) as i32, qh, ());
@@ -203,12 +203,12 @@ impl Window {
         layer_surface.set_margin(0, 0, 0, 0);
         surface.set_input_region(None);
         surface.commit();
-        Window {
+        Ok(Window {
             pos,
             buffer,
             surface,
             layer_surface,
-        }
+        })
     }
 }
 
@@ -254,19 +254,20 @@ fn get_output_configuration(state: &State, pos: Position) -> Vec<Output> {
         .collect()
 }
 
-fn draw(f: &mut File, (width, height): (u32, u32)) {
+fn draw(f: &mut File, (width, height): (u32, u32)) -> io::Result<()> {
     let mut buf = BufWriter::new(f);
     for _ in 0..height {
         for _ in 0..width {
             if env::var("LM_DEBUG_LAYER_SHELL").ok().is_some() {
                 // AARRGGBB
-                buf.write_all(&0xff11d116u32.to_ne_bytes()).unwrap();
+                buf.write_all(&0xff11d116u32.to_ne_bytes())?;
             } else {
                 // AARRGGBB
-                buf.write_all(&0x00000000u32.to_ne_bytes()).unwrap();
+                buf.write_all(&0x00000000u32.to_ne_bytes())?;
             }
         }
     }
+    buf.flush()
 }
 
 impl LayerShellInputCapture {
@@ -388,11 +389,10 @@ impl LayerShellInputCapture {
 
 impl State {
     fn update_output_info(&mut self, name: u32) {
-        let output = self
-            .outputs
-            .iter_mut()
-            .find(|o| o.global.name == name)
-            .expect("output not found");
+        let Some(output) = self.outputs.iter_mut().find(|o| o.global.name == name) else {
+            log::debug!("output {name} is gone: ignoring its update");
+            return;
+        };
         if output.has_xdg_info {
             output.info.replace(output.pending_info.clone());
             self.update_windows();
@@ -440,7 +440,9 @@ impl State {
         serial: u32,
         qh: &QueueHandle<State>,
     ) {
-        let window = self.focused.as_ref().unwrap();
+        let Some(window) = self.focused.as_ref() else {
+            return;
+        };
 
         // hide the cursor
         pointer.set_cursor(serial, None, 0, 0);
@@ -534,9 +536,10 @@ impl State {
         );
         outputs.iter().for_each(|o| {
             if let Some(info) = o.info.as_ref() {
-                let window = Window::new(self, &self.qh, &o.wl_output, pos, info.size);
-                let window = Arc::new(window);
-                self.active_windows.push(window);
+                match Window::new(self, &self.qh, &o.wl_output, pos, info.size) {
+                    Ok(window) => self.active_windows.push(Arc::new(window)),
+                    Err(e) => log::warn!("no capture window on {o} at {pos}: {e}"),
+                }
             }
         });
     }
@@ -557,27 +560,34 @@ impl State {
 }
 
 impl Inner {
-    fn read(&mut self) -> bool {
-        match self.state.read_guard.take().unwrap().read() {
-            Ok(_) => true,
-            Err(WaylandError::Io(e)) if e.kind() == ErrorKind::WouldBlock => false,
+    fn read(&mut self) -> Result<bool, CaptureError> {
+        let Some(guard) = self.state.read_guard.take() else {
+            return Ok(false);
+        };
+        match guard.read() {
+            Ok(_) => Ok(true),
+            Err(WaylandError::Io(e)) if e.kind() == ErrorKind::WouldBlock => Ok(false),
             Err(WaylandError::Io(e)) => {
                 log::error!("error reading from wayland socket: {e}");
-                false
+                Ok(false)
             }
-            Err(WaylandError::Protocol(e)) => {
-                panic!("wayland protocol violation: {e}")
-            }
+            Err(WaylandError::Protocol(e)) => Err(CaptureError::Wayland(format!(
+                "the compositor reported a protocol violation: {e}"
+            ))),
         }
     }
 
-    fn prepare_read(&mut self) -> io::Result<()> {
+    fn prepare_read(&mut self) -> Result<(), CaptureError> {
         loop {
             match self.queue.prepare_read() {
                 None => match self.queue.dispatch_pending(&mut self.state) {
                     Ok(_) => continue,
-                    Err(DispatchError::Backend(WaylandError::Io(e))) => return Err(e),
-                    Err(e) => panic!("failed to dispatch wayland events: {e}"),
+                    Err(DispatchError::Backend(WaylandError::Io(e))) => return Err(e.into()),
+                    Err(e) => {
+                        return Err(CaptureError::Wayland(format!(
+                            "failed to dispatch wayland events: {e}"
+                        )));
+                    }
                 },
                 Some(r) => {
                     self.state.read_guard = Some(r);
@@ -587,39 +597,35 @@ impl Inner {
         }
     }
 
-    fn dispatch_events(&mut self) {
+    fn dispatch_events(&mut self) -> Result<(), CaptureError> {
         match self.queue.dispatch_pending(&mut self.state) {
-            Ok(_) => {}
+            Ok(_) => Ok(()),
             Err(DispatchError::Backend(WaylandError::Io(e))) => {
                 log::error!("Wayland Error: {e}");
+                Ok(())
             }
             Err(DispatchError::Backend(e)) => {
-                panic!("backend error: {e}");
+                Err(CaptureError::Wayland(format!("backend error: {e}")))
             }
             Err(DispatchError::BadMessage {
                 sender_id,
                 interface,
                 opcode,
-            }) => {
-                panic!("bad message {sender_id}, {interface} , {opcode}");
-            }
+            }) => Err(CaptureError::Wayland(format!(
+                "bad message {sender_id}, {interface}, {opcode}"
+            ))),
         }
     }
 
-    fn flush_events(&mut self) -> io::Result<()> {
+    fn flush_events(&mut self) -> Result<(), CaptureError> {
         // flush outgoing events
         match self.queue.flush() {
-            Ok(_) => (),
-            Err(e) => match e {
-                WaylandError::Io(e) => {
-                    return Err(e);
-                }
-                WaylandError::Protocol(e) => {
-                    panic!("wayland protocol violation: {e}")
-                }
-            },
+            Ok(_) => Ok(()),
+            Err(WaylandError::Io(e)) => Err(e.into()),
+            Err(WaylandError::Protocol(e)) => Err(CaptureError::Wayland(format!(
+                "the compositor reported a protocol violation: {e}"
+            ))),
         }
-        Ok(())
     }
 }
 
@@ -627,21 +633,19 @@ impl Inner {
 impl Capture for LayerShellInputCapture {
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
         self.add_client(pos);
-        let inner = self.0.get_mut();
-        Ok(inner.flush_events()?)
+        self.0.get_mut().flush_events()
     }
 
     async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError> {
         self.delete_client(pos);
-        let inner = self.0.get_mut();
-        Ok(inner.flush_events()?)
+        self.0.get_mut().flush_events()
     }
 
     async fn release(&mut self) -> Result<(), CaptureError> {
         log::debug!("releasing pointer");
         let inner = self.0.get_mut();
         inner.state.ungrab();
-        Ok(inner.flush_events()?)
+        inner.flush_events()
     }
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {
@@ -664,28 +668,33 @@ impl Stream for LayerShellInputCapture {
                 let inner = guard.get_inner_mut();
 
                 // read events
-                while inner.read() {
+                loop {
+                    match inner.read() {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(e) => return Poll::Ready(Some(Err(e))),
+                    }
                     // prepare next read
-                    match inner.prepare_read() {
-                        Ok(_) => {}
-                        Err(e) => return Poll::Ready(Some(Err(e.into()))),
+                    if let Err(e) = inner.prepare_read() {
+                        return Poll::Ready(Some(Err(e)));
                     }
                 }
 
                 // dispatch the events
-                inner.dispatch_events();
+                if let Err(e) = inner.dispatch_events() {
+                    return Poll::Ready(Some(Err(e)));
+                }
 
                 // flush outgoing events
-                if let Err(e) = inner.flush_events() {
-                    if e.kind() != ErrorKind::WouldBlock {
-                        return Poll::Ready(Some(Err(e.into())));
-                    }
+                match inner.flush_events() {
+                    Err(CaptureError::Io(e)) if e.kind() == ErrorKind::WouldBlock => {}
+                    Err(e) => return Poll::Ready(Some(Err(e))),
+                    Ok(()) => {}
                 }
 
                 // prepare for the next read
-                match inner.prepare_read() {
-                    Ok(_) => {}
-                    Err(e) => return Poll::Ready(Some(Err(e.into()))),
+                if let Err(e) = inner.prepare_read() {
+                    return Poll::Ready(Some(Err(e)));
                 }
             }
 
@@ -748,20 +757,12 @@ impl Dispatch<WlPointer, ()> for State {
                 surface_y: _,
             } => {
                 // get client corresponding to the focused surface
-                {
-                    if let Some(window) = app.active_windows.iter().find(|w| w.surface == surface) {
-                        app.focused = Some(window.clone());
-                        app.grab(&surface, pointer, serial, qh);
-                    } else {
-                        return;
-                    }
-                }
-                let pos = app
-                    .active_windows
-                    .iter()
-                    .find(|w| w.surface == surface)
-                    .map(|w| w.pos)
-                    .unwrap();
+                let Some(window) = app.active_windows.iter().find(|w| w.surface == surface) else {
+                    return;
+                };
+                let pos = window.pos;
+                app.focused = Some(window.clone());
+                app.grab(&surface, pointer, serial, qh);
                 app.pending_events.push_back((pos, CaptureEvent::Begin));
             }
             wl_pointer::Event::Leave { .. } => {
@@ -995,11 +996,10 @@ impl Dispatch<ZxdgOutputV1, u32> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        let output = state
-            .outputs
-            .iter_mut()
-            .find(|o| o.global.name == *name)
-            .expect("output");
+        let Some(output) = state.outputs.iter_mut().find(|o| o.global.name == *name) else {
+            log::debug!("xdg_output {name}: its output is gone, ignoring {event:?}");
+            return;
+        };
 
         log::debug!("xdg_output {name} - {event:?}");
         match event {
@@ -1023,7 +1023,7 @@ impl Dispatch<ZxdgOutputV1, u32> for State {
                 output.pending_info.description = description;
                 output.has_xdg_info = true;
             }
-            _ => todo!(),
+            _ => log::debug!("xdg_output {name}: ignoring an event this version does not know"),
         }
     }
 }

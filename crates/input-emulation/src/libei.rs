@@ -1,10 +1,12 @@
 use futures::{StreamExt, future};
 use std::{
-    env, fs, io,
+    env,
+    ffi::OsString,
+    fs, io,
     os::{fd::OwnedFd, unix::net::UnixStream},
     path::PathBuf,
     sync::{
-        Arc, Mutex, RwLock,
+        Arc, Mutex, PoisonError, RwLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -51,24 +53,31 @@ pub(crate) struct LibeiEmulation {
     session: Session<RemoteDesktop>,
 }
 
-/// Get the path to the RemoteDesktop token file
-fn get_token_file_path() -> PathBuf {
-    let cache_dir = env::var("XDG_CACHE_HOME")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let home = env::var("HOME").expect("HOME not set");
-            PathBuf::from(home).join(".cache")
-        });
-
+/// The RemoteDesktop token file, under `$XDG_CACHE_HOME` or else
+/// `$HOME/.cache`; none when neither is set, which used to panic.
+fn token_file_path(cache_home: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+    let cache_dir = match (cache_home, home) {
+        (Some(cache), _) => PathBuf::from(cache),
+        (None, Some(home)) => PathBuf::from(home).join(".cache"),
+        (None, None) => return None,
+    };
     // Keeps the upstream directory name on purpose, like ~/.config/lan-mouse;
     // the identity shown to users is input_event::APP_ID.
-    cache_dir.join("lan-mouse").join("remote-desktop.token")
+    Some(cache_dir.join("lan-mouse").join("remote-desktop.token"))
+}
+
+fn get_token_file_path() -> io::Result<PathBuf> {
+    token_file_path(env::var_os("XDG_CACHE_HOME"), env::var_os("HOME")).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "neither XDG_CACHE_HOME nor HOME is set",
+        )
+    })
 }
 
 /// Read the RemoteDesktop token from file
 fn read_token() -> Option<String> {
-    let token_path = get_token_file_path();
+    let token_path = get_token_file_path().ok()?;
     match fs::read_to_string(&token_path) {
         Ok(token) => Some(token.trim().to_string()),
         Err(_) => None,
@@ -77,13 +86,20 @@ fn read_token() -> Option<String> {
 
 /// Write the RemoteDesktop token to file
 fn write_token(token: &str) -> io::Result<()> {
-    let token_path = get_token_file_path();
+    let token_path = get_token_file_path()?;
     if let Some(parent) = token_path.parent() {
         fs::create_dir_all(parent)?;
     }
 
     fs::write(&token_path, token)?;
     Ok(())
+}
+
+/// Microseconds since the Unix epoch, or 0 on a clock set before it.
+fn now_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros() as u64)
 }
 
 async fn get_ei_fd() -> Result<(RemoteDesktop, Session<RemoteDesktop>, OwnedFd), ashpd::Error> {
@@ -178,20 +194,26 @@ impl Emulation for LibeiEmulation {
         event: Event,
         _handle: EmulationHandle,
     ) -> Result<(), EmulationError> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_micros() as u64;
+        let now = now_micros();
         if self.libei_error.load(Ordering::SeqCst) {
             // don't break sending additional events but signal error
-            if let Some(e) = self.error.lock().unwrap().take() {
+            if let Some(e) = self
+                .error
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+            {
                 return Err(e);
             }
         }
         match event {
             Event::Pointer(p) => match p {
                 PointerEvent::Motion { time: _, dx, dy } => {
-                    let pointer_device = self.devices.pointer.read().unwrap();
+                    let pointer_device = self
+                        .devices
+                        .pointer
+                        .read()
+                        .unwrap_or_else(PoisonError::into_inner);
                     if let Some((d, p)) = pointer_device.as_ref() {
                         p.motion_relative(dx as f32, dy as f32);
                         d.frame(self.conn.serial(), now);
@@ -202,7 +224,11 @@ impl Emulation for LibeiEmulation {
                     button,
                     state,
                 } => {
-                    let button_device = self.devices.button.read().unwrap();
+                    let button_device = self
+                        .devices
+                        .button
+                        .read()
+                        .unwrap_or_else(PoisonError::into_inner);
                     if let Some((d, b)) = button_device.as_ref() {
                         b.button(
                             button,
@@ -219,7 +245,11 @@ impl Emulation for LibeiEmulation {
                     axis,
                     value,
                 } => {
-                    let scroll_device = self.devices.scroll.read().unwrap();
+                    let scroll_device = self
+                        .devices
+                        .scroll
+                        .read()
+                        .unwrap_or_else(PoisonError::into_inner);
                     if let Some((d, s)) = scroll_device.as_ref() {
                         match axis {
                             0 => s.scroll(0., value as f32),
@@ -229,7 +259,11 @@ impl Emulation for LibeiEmulation {
                     }
                 }
                 PointerEvent::AxisDiscrete120 { axis, value } => {
-                    let scroll_device = self.devices.scroll.read().unwrap();
+                    let scroll_device = self
+                        .devices
+                        .scroll
+                        .read()
+                        .unwrap_or_else(PoisonError::into_inner);
                     if let Some((d, s)) = scroll_device.as_ref() {
                         match axis {
                             0 => s.scroll_discrete(0, value),
@@ -245,7 +279,11 @@ impl Emulation for LibeiEmulation {
                     key,
                     state,
                 } => {
-                    let keyboard_device = self.devices.keyboard.read().unwrap();
+                    let keyboard_device = self
+                        .devices
+                        .keyboard
+                        .read()
+                        .unwrap_or_else(PoisonError::into_inner);
                     if let Some((d, k)) = keyboard_device.as_ref() {
                         k.key(
                             key,
@@ -297,7 +335,10 @@ async fn ei_task(
             Ok(()) => {}
             Err(e) => {
                 libei_error.store(true, Ordering::SeqCst);
-                error.lock().unwrap().replace(e);
+                error
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .replace(e);
                 // wait for termination -> otherwise we will loop forever
                 future::pending::<()>().await;
             }
@@ -345,28 +386,28 @@ async fn ei_event_handler(
                     devices
                         .pointer
                         .write()
-                        .unwrap()
+                        .unwrap_or_else(PoisonError::into_inner)
                         .replace((device.device().clone(), pointer));
                 }
                 if let Some(keyboard) = e.device().interface::<Keyboard>() {
                     devices
                         .keyboard
                         .write()
-                        .unwrap()
+                        .unwrap_or_else(PoisonError::into_inner)
                         .replace((device.device().clone(), keyboard));
                 }
                 if let Some(scroll) = e.device().interface::<Scroll>() {
                     devices
                         .scroll
                         .write()
-                        .unwrap()
+                        .unwrap_or_else(PoisonError::into_inner)
                         .replace((device.device().clone(), scroll));
                 }
                 if let Some(button) = e.device().interface::<Button>() {
                     devices
                         .button
                         .write()
-                        .unwrap()
+                        .unwrap_or_else(PoisonError::into_inner)
                         .replace((device.device().clone(), button));
                 }
             }
@@ -398,7 +439,9 @@ async fn ei_event_handler(
             // EiEvent::TouchDown(_) => { },
             // EiEvent::TouchUp(_) => { },
             // EiEvent::TouchMotion(_) => { },
-            _ => unreachable!("unexpected ei event"),
+            // A sender context is sent none of these; an EIS server that
+            // does anyway is ignored, not a reason to end the daemon.
+            _ => log::warn!("ignoring an ei event meant for a receiver context"),
         }
         context.flush().map_err(|e| io::Error::new(e.kind(), e))?;
     }
@@ -469,5 +512,27 @@ mod tests {
              than hops, so the devices it is given carry another name"
         );
         assert_eq!(context_type, eis::handshake::ContextType::Sender);
+    }
+
+    // LEDGER | behaviour | token_file_path for each environment a session may have
+    /// A session started without HOME, as some service managers do, used to
+    /// end the daemon when emulation asked the portal for a restore token.
+    #[test]
+    fn the_restore_token_needs_no_home_to_start_emulation() {
+        use std::path::PathBuf;
+
+        use super::token_file_path;
+
+        assert_eq!(token_file_path(None, None), None);
+        assert_eq!(
+            token_file_path(None, Some("/home/t".into())),
+            Some(PathBuf::from(
+                "/home/t/.cache/lan-mouse/remote-desktop.token"
+            ))
+        );
+        assert_eq!(
+            token_file_path(Some("/c".into()), Some("/home/t".into())),
+            Some(PathBuf::from("/c/lan-mouse/remote-desktop.token"))
+        );
     }
 }
