@@ -19,19 +19,20 @@ use std::{
     cell::Cell,
     collections::HashMap,
     io,
+    mem::ManuallyDrop,
     num::NonZeroU32,
     os::unix::net::UnixStream,
     pin::Pin,
     rc::Rc,
     sync::Arc,
-    task::{Context, Poll},
+    task::{Context, Poll, ready},
 };
 use tokio::{
     sync::{
         Notify,
         mpsc::{self, Receiver, Sender},
     },
-    task::JoinHandle,
+    task::{JoinError, JoinHandle},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -57,15 +58,86 @@ enum LibeiNotifyEvent {
     Destroy(Position),
 }
 
-#[allow(dead_code)]
 pub struct LibeiInputCapture {
-    input_capture: Pin<Box<InputCapture>>,
-    capture_task: JoinHandle<Result<(), CaptureError>>,
+    capture_task: CaptureTask<InputCapture>,
     event_rx: Receiver<(Position, CaptureEvent)>,
     notify_capture: Sender<LibeiNotifyEvent>,
     notify_release: Arc<Notify>,
-    cancellation_token: CancellationToken,
-    terminated: bool,
+}
+
+/// The capture task, and the value it reads through a raw pointer, which
+/// must outlive it.
+///
+/// Dropping it without [`CaptureTask::terminate`] used to panic, which with
+/// `panic = "abort"` ended the daemon, and during an unwind aborts any build
+/// (#103). It now stops the task instead, and leaks `owner` while the task
+/// may still exist, so the pointer never dangles.
+struct CaptureTask<T> {
+    owner: ManuallyDrop<Pin<Box<T>>>,
+    task: JoinHandle<Result<(), CaptureError>>,
+    cancel: CancellationToken,
+    /// The task's result was taken, so the handle must not be polled again.
+    done: bool,
+}
+
+impl<T> CaptureTask<T> {
+    fn new(
+        owner: Pin<Box<T>>,
+        task: JoinHandle<Result<(), CaptureError>>,
+        cancel: CancellationToken,
+    ) -> Self {
+        Self {
+            owner: ManuallyDrop::new(owner),
+            task,
+            cancel,
+            done: false,
+        }
+    }
+
+    /// The task's result, once. Afterwards it reads as ended.
+    fn poll_result(&mut self, cx: &mut Context) -> Poll<Result<(), CaptureError>> {
+        if self.done {
+            return Poll::Ready(Ok(()));
+        }
+        let r = ready!(self.task.poll_unpin(cx));
+        self.done = true;
+        Poll::Ready(joined(r))
+    }
+
+    /// Stops the task and waits for it. Calling it again is harmless.
+    async fn terminate(&mut self) -> Result<(), CaptureError> {
+        self.cancel.cancel();
+        if self.done {
+            return Ok(());
+        }
+        log::debug!("waiting for capture to terminate...");
+        let r = (&mut self.task).await;
+        self.done = true;
+        log::debug!("done!");
+        joined(r)
+    }
+}
+
+/// A task that did not return, as the error it ends capture with.
+fn joined(r: Result<Result<(), CaptureError>, JoinError>) -> Result<(), CaptureError> {
+    r.unwrap_or_else(|e| Err(CaptureError::TaskFailed(e.to_string())))
+}
+
+impl<T> Drop for CaptureTask<T> {
+    fn drop(&mut self) {
+        if self.done || self.task.is_finished() {
+            // SAFETY: the task's future is gone, so nothing reads `owner`
+            // through a pointer any more; it is dropped once, here.
+            unsafe { ManuallyDrop::drop(&mut self.owner) };
+        } else {
+            // The runtime drops an aborted task's future only when it next
+            // runs it, and that future still points into `owner`: leave
+            // `owner` allocated rather than let the pointer dangle.
+            log::warn!("input capture was dropped without being terminated: stopping its task");
+            self.cancel.cancel();
+            self.task.abort();
+        }
+    }
 }
 
 /// returns (start pos, end pos), inclusive
@@ -115,10 +187,7 @@ fn select_barriers(
             .regions()
             .iter()
             .map(|r| {
-                let id = *next_barrier_id;
-                *next_barrier_id = next_barrier_id
-                    .checked_add(1)
-                    .expect("barrier id out of range");
+                let id = take_barrier_id(next_barrier_id);
                 let position = pos_to_barrier(r, *pos);
                 pos_for_barrier.insert(id, *pos);
                 ICBarrier::new(id, position)
@@ -127,6 +196,14 @@ fn select_barriers(
         barriers.append(&mut client_barriers);
     }
     (barriers, pos_for_barrier)
+}
+
+/// The next barrier id, starting over at 1 past `u32::MAX`: ids only need to
+/// differ within one session, and a session sets far fewer.
+fn take_barrier_id(next: &mut NonZeroU32) -> BarrierID {
+    let id = *next;
+    *next = next.checked_add(1).unwrap_or(NonZeroU32::MIN);
+    id
 }
 
 async fn update_barriers(
@@ -244,13 +321,10 @@ impl LibeiInputCapture {
         let capture_task = tokio::task::spawn_local(capture);
 
         let producer = Self {
-            input_capture,
+            capture_task: CaptureTask::new(input_capture, capture_task, cancellation_token),
             event_rx,
-            capture_task,
             notify_capture,
             notify_release,
-            cancellation_token,
-            terminated: false,
         };
 
         Ok(producer)
@@ -270,7 +344,7 @@ async fn do_capture(
     /* safety: libei_task does not outlive Self */
     let input_capture = unsafe { &*input_capture };
     let mut active_clients: Vec<Position> = vec![];
-    let mut next_barrier_id = NonZeroU32::new(1).expect("id must be non-zero");
+    let mut next_barrier_id = NonZeroU32::MIN;
 
     let mut zones_changed = input_capture.receive_zones_changed().await?;
 
@@ -406,69 +480,89 @@ async fn do_capture_session(
     };
 
     let capture_session_task = async {
-        // receiver for activation tokens
-        let mut activated = input_capture.receive_activated().await?;
-        let mut ei_devices_changed = false;
-        loop {
-            tokio::select! {
-                activated = activated.next() => {
-                    let activated = activated.ok_or(CaptureError::ActivationClosed)?;
-                    log::debug!("activated: {activated:?}");
+        let r = async {
+            // receiver for activation tokens
+            let mut activated = input_capture.receive_activated().await?;
+            let mut ei_devices_changed = false;
+            loop {
+                tokio::select! {
+                    activated = activated.next() => {
+                        let activated = activated.ok_or(CaptureError::ActivationClosed)?;
+                        log::debug!("activated: {activated:?}");
 
-                    // get barrier id from activation
-                    let barrier_id = match activated.barrier_id() {
-                        Some(ActivatedBarrier::Barrier(id)) => id,
-                        // workaround for KDE plasma not reporting barrier ids
-                        Some(ActivatedBarrier::UnknownBarrier) | None => find_corresponding_client(&barriers, activated.cursor_position().expect("no cursor position reported by compositor")),
-                    };
+                        let (barrier_id, pos) = match client_for_activation(
+                            activated.barrier_id(),
+                            activated.cursor_position(),
+                            &barriers,
+                            &pos_for_barrier_id,
+                        ) {
+                            Ok(found) => found,
+                            Err(e) => {
+                                // The compositor holds the pointer until told
+                                // to let go: give it back before stopping.
+                                log::warn!("{e}");
+                                let released =
+                                    release_capture(input_capture, session, &activated, None).await;
+                                if let Err(r) = released {
+                                    log::warn!("could not hand the pointer back: {r}");
+                                }
+                                return Err(e);
+                            }
+                        };
+                        current_pos.replace(Some(pos));
 
-                    // find client corresponding to barrier
-                    let pos = *pos_for_barrier_id.get(&barrier_id).expect("invalid barrier id");
-                    current_pos.replace(Some(pos));
+                        // client entered => send event
+                        event_tx
+                            .send((pos, CaptureEvent::Begin))
+                            .await
+                            .map_err(|_| CaptureError::EndOfStream)?;
 
-                    // client entered => send event
-                    event_tx.send((pos, CaptureEvent::Begin)).await.expect("no channel");
+                        tokio::select! {
+                            _ = notify_release.notified() => { /* capture release */
+                                log::debug!("release session requested");
+                            },
+                            _ = release_session.notified() => { /* release session */
+                                log::debug!("ei devices changed");
+                                ei_devices_changed = true;
+                            },
+                            _ = cancel_session.cancelled() => { /* kill session notify */
+                                log::debug!("session cancel requested");
+                                break
+                            },
+                        }
 
-                    tokio::select! {
-                        _ = notify_release.notified() => { /* capture release */
-                            log::debug!("release session requested");
-                        },
-                        _ = release_session.notified() => { /* release session */
-                            log::debug!("ei devices changed");
-                            ei_devices_changed = true;
-                        },
-                        _ = cancel_session.cancelled() => { /* kill session notify */
-                            log::debug!("session cancel requested");
-                            break
-                        },
+                        let barrier = barriers.iter().find(|b| b.barrier_id == barrier_id);
+                        let at = release_point(activated.cursor_position(), barrier, pos);
+                        release_capture(input_capture, session, &activated, at).await?;
+
                     }
-
-                    release_capture(input_capture, session, activated, pos).await?;
-
+                    _ = notify_release.notified() => { /* capture release -> we are not capturing anyway, so ignore */
+                        log::debug!("release session requested");
+                    },
+                    _ = release_session.notified() => { /* release session */
+                        log::debug!("ei devices changed");
+                        ei_devices_changed = true;
+                    },
+                    _ = cancel_session.cancelled() => { /* kill session notify */
+                        log::debug!("session cancel requested");
+                        break
+                    },
                 }
-                _ = notify_release.notified() => { /* capture release -> we are not capturing anyway, so ignore */
-                    log::debug!("release session requested");
-                },
-                _ = release_session.notified() => { /* release session */
-                    log::debug!("ei devices changed");
-                    ei_devices_changed = true;
-                },
-                _ = cancel_session.cancelled() => { /* kill session notify */
-                    log::debug!("session cancel requested");
-                    break
-                },
+                if ei_devices_changed {
+                    /* for whatever reason, GNOME seems to kill the session
+                     * as soon as devices are added or removed, so we need
+                     * to cancel */
+                    break;
+                }
             }
-            if ei_devices_changed {
-                /* for whatever reason, GNOME seems to kill the session
-                 * as soon as devices are added or removed, so we need
-                 * to cancel */
-                break;
-            }
+            Ok::<(), CaptureError>(())
         }
-        // cancel libei task
+        .await;
+        // However the session ended, the libei task must too, or the join
+        // below waits on it for good.
         log::debug!("session exited: killing libei task");
         cancel_ei_handler.cancel();
-        Ok::<(), CaptureError>(())
+        r
     };
 
     let (a, b) = tokio::join!(ei_task, capture_session_task);
@@ -482,36 +576,96 @@ async fn do_capture_session(
     Ok(())
 }
 
+/// Hands the pointer back to the compositor, at `at` when given.
 async fn release_capture(
     input_capture: &InputCapture,
     session: &Session<InputCapture>,
-    activated: Activated,
-    current_pos: Position,
+    activated: &Activated,
+    at: Option<(f64, f64)>,
 ) -> Result<(), CaptureError> {
     if let Some(activation_id) = activated.activation_id() {
         log::debug!("releasing input capture {activation_id}");
     }
-    let (x, y) = activated
-        .cursor_position()
-        .expect("compositor did not report cursor position!");
+    let release_options = ReleaseOptions::default()
+        .set_activation_id(activated.activation_id())
+        .set_cursor_position(at);
+    input_capture.release(session, release_options).await?;
+    Ok(())
+}
+
+/// The barrier and client an activation is for: the barrier the compositor
+/// names or, when it names none (KDE Plasma), the one nearest the cursor.
+///
+/// Both are optional in the portal protocol. This used to `.expect()` them,
+/// which ended the daemon on a compositor that sent neither (#103).
+fn client_for_activation(
+    barrier: Option<ActivatedBarrier>,
+    cursor: Option<(f32, f32)>,
+    barriers: &[ICBarrier],
+    pos_for_barrier_id: &HashMap<BarrierID, Position>,
+) -> Result<(BarrierID, Position), CaptureError> {
+    let barrier_id = match barrier {
+        Some(ActivatedBarrier::Barrier(id)) => id,
+        Some(ActivatedBarrier::UnknownBarrier) | None => {
+            let Some(cursor) = cursor else {
+                return Err(CaptureError::Unattributed(
+                    "reported neither the barrier crossed nor the cursor position".into(),
+                ));
+            };
+            find_corresponding_client(barriers, cursor).ok_or_else(|| {
+                CaptureError::Unattributed("no barrier was set to match the cursor to".into())
+            })?
+        }
+    };
+    match pos_for_barrier_id.get(&barrier_id) {
+        Some(&pos) => Ok((barrier_id, pos)),
+        None => Err(CaptureError::Unattributed(format!(
+            "named barrier {barrier_id}, which hops did not set"
+        ))),
+    }
+}
+
+/// Where to hand the pointer back: one pixel inside the edge crossed, so it
+/// does not cross again at once. At the cursor when the compositor reported
+/// it, which it need not; otherwise at the middle of the barrier crossed.
+fn release_point(
+    cursor: Option<(f32, f32)>,
+    barrier: Option<&ICBarrier>,
+    pos: Position,
+) -> Option<(f64, f64)> {
+    let (x, y) = match (cursor, barrier) {
+        (Some((x, y)), _) => (f64::from(x), f64::from(y)),
+        (None, Some(b)) => {
+            let (x1, y1, x2, y2) = b.position;
+            log::warn!(
+                "the compositor did not report the cursor position: \
+                 releasing at the middle of the {pos} barrier"
+            );
+            (
+                (f64::from(x1) + f64::from(x2)) / 2.,
+                (f64::from(y1) + f64::from(y2)) / 2.,
+            )
+        }
+        (None, None) => {
+            log::warn!(
+                "the compositor did not report the cursor position: \
+                 releasing where the compositor chooses"
+            );
+            return None;
+        }
+    };
     log::debug!("client entered @ ({x}, {y})");
-    let (dx, dy) = match current_pos {
-        // offset cursor position to not enter again immediately
+    let (dx, dy) = match pos {
         Position::Left => (1., 0.),
         Position::Right => (-1., 0.),
         Position::Top => (0., 1.),
         Position::Bottom => (0., -1.),
     };
-    // release 1px to the right of the entered zone
-    let cursor_position = (x as f64 + dx, y as f64 + dy);
-    let release_options = ReleaseOptions::default()
-        .set_activation_id(activated.activation_id())
-        .set_cursor_position(Some(cursor_position));
-    input_capture.release(session, release_options).await?;
-    Ok(())
+    Some((x + dx, y + dy))
 }
 
-fn find_corresponding_client(barriers: &[ICBarrier], pos: (f32, f32)) -> BarrierID {
+/// The barrier nearest `pos`, if any was set.
+fn find_corresponding_client(barriers: &[ICBarrier], pos: (f32, f32)) -> Option<BarrierID> {
     barriers
         .iter()
         .copied()
@@ -520,8 +674,7 @@ fn find_corresponding_client(barriers: &[ICBarrier], pos: (f32, f32)) -> Barrier
             let (x1, y1, x2, y2) = (x1 as f32, y1 as f32, x2 as f32, y2 as f32);
             distance_to_line(((x1, y1), (x2, y2)), pos) as i32
         })
-        .expect("could not find barrier corresponding to client")
-        .barrier_id
+        .map(|b| b.barrier_id)
 }
 
 fn distance_to_line(line: ((f32, f32), (f32, f32)), p: (f32, f32)) -> f32 {
@@ -573,7 +726,10 @@ async fn handle_ei_event(
         _ => {
             if let Some(pos) = current_client {
                 for event in Event::from_ei_event(ei_event) {
-                    event_tx.send((pos, CaptureEvent::Input(event))).await.expect("no channel");
+                    event_tx
+                        .send((pos, CaptureEvent::Input(event)))
+                        .await
+                        .map_err(|_| CaptureError::EndOfStream)?;
                 }
             }
         }
@@ -605,26 +761,7 @@ impl LanMouseInputCapture for LibeiInputCapture {
     }
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {
-        self.cancellation_token.cancel();
-        let task = &mut self.capture_task;
-        log::debug!("waiting for capture to terminate...");
-        let res = if !task.is_finished() {
-            task.await.expect("libei task panic")
-        } else {
-            Ok(())
-        };
-        self.terminated = true;
-        log::debug!("done!");
-        res
-    }
-}
-
-impl Drop for LibeiInputCapture {
-    fn drop(&mut self) {
-        if !self.terminated {
-            /* this workaround is needed until async drop is stabilized */
-            panic!("LibeiInputCapture dropped without being terminated!");
-        }
+        self.capture_task.terminate().await
     }
 }
 
@@ -632,13 +769,270 @@ impl Stream for LibeiInputCapture {
     type Item = Result<(Position, CaptureEvent), CaptureError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        match self.capture_task.poll_unpin(cx) {
-            Poll::Ready(r) => match r.expect("failed to join") {
-                Ok(()) => Poll::Ready(None),
-                Err(e) => Poll::Ready(Some(Err(e))),
-            },
+        match self.capture_task.poll_result(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(None),
+            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
             Poll::Pending => self.event_rx.poll_recv(cx).map(|e| e.map(Result::Ok)),
         }
+    }
+}
+
+/// What a compositor may leave out of the portal's data, run through the
+/// decisions the capture makes on it. The portal types are built by decoding
+/// the D-Bus bytes a compositor would send, so a terse message is exactly
+/// what ashpd hands the capture.
+#[cfg(test)]
+mod terse_compositor {
+    use std::{cell::Cell, collections::HashMap, num::NonZeroU32, rc::Rc, time::Duration};
+
+    use ashpd::{
+        desktop::input_capture::{Activated, Zones},
+        zvariant::{self, LE, OwnedObjectPath, Value, serialized::Context},
+    };
+    use tokio_util::sync::CancellationToken;
+
+    use super::{
+        CaptureError, CaptureTask, ICBarrier, Position, client_for_activation, release_point,
+        select_barriers,
+    };
+
+    /// An `Activated` signal carrying only `fields`.
+    fn activated(fields: &[(&'static str, Value<'static>)]) -> Activated {
+        let path = OwnedObjectPath::try_from("/org/freedesktop/portal/desktop/session/1/t")
+            .expect("a path");
+        let dict: HashMap<&str, Value> = fields.iter().cloned().collect();
+        let data = zvariant::to_bytes(Context::new_dbus(LE, 0), &(path, dict)).expect("encodes");
+        data.deserialize::<Activated>().expect("decodes").0
+    }
+
+    /// A `Zones` response listing `regions` as (width, height, x, y).
+    fn zones(regions: Vec<(u32, u32, i32, i32)>) -> Zones {
+        let dict = HashMap::from([
+            ("zones", Value::from(regions)),
+            ("zone_set", Value::from(7u32)),
+        ]);
+        let data = zvariant::to_bytes(Context::new_dbus(LE, 0), &dict).expect("encodes");
+        data.deserialize::<Zones>().expect("decodes").0
+    }
+
+    /// One 1920x1080 screen, and hops's barriers on its left and right edges.
+    fn screen() -> (Vec<ICBarrier>, HashMap<NonZeroU32, Position>) {
+        let zones = zones(vec![(1920, 1080, 0, 0)]);
+        let mut next = NonZeroU32::MIN;
+        select_barriers(&zones, &[Position::Left, Position::Right], &mut next)
+    }
+
+    fn cursor(x: f64, y: f64) -> (&'static str, Value<'static>) {
+        ("cursor_position", Value::from((x, y)))
+    }
+
+    fn barrier(id: u32) -> (&'static str, Value<'static>) {
+        ("barrier_id", Value::from(id))
+    }
+
+    fn attribute(a: &Activated) -> Result<(NonZeroU32, Position), CaptureError> {
+        let (barriers, ids) = screen();
+        client_for_activation(a.barrier_id(), a.cursor_position(), &barriers, &ids)
+    }
+
+    fn unattributed(r: Result<(NonZeroU32, Position), CaptureError>) -> String {
+        match r {
+            Err(e @ CaptureError::Unattributed(_)) => e.to_string(),
+            other => panic!("expected capture to end naming what is missing, got {other:?}"),
+        }
+    }
+
+    // LEDGER | behaviour | client_for_activation over a decoded Activated signal
+    #[test]
+    fn an_activation_naming_its_barrier_goes_to_that_edge() {
+        let (_, right) =
+            attribute(&activated(&[barrier(2), cursor(1919.0, 500.0)])).expect("found");
+        assert_eq!(right, Position::Right);
+        let (_, left) = attribute(&activated(&[barrier(1)])).expect("found");
+        assert_eq!(left, Position::Left);
+    }
+
+    // LEDGER | behaviour | client_for_activation, KDE Plasma's shape
+    #[test]
+    fn an_activation_naming_no_barrier_goes_to_the_edge_nearest_the_cursor() {
+        // Plasma sends barrier id 0, which ashpd reads as UnknownBarrier.
+        let unknown = activated(&[barrier(0), cursor(1919.0, 20.0)]);
+        assert_eq!(attribute(&unknown).expect("found").1, Position::Right);
+        let absent = activated(&[cursor(0.0, 900.0)]);
+        assert_eq!(attribute(&absent).expect("found").1, Position::Left);
+    }
+
+    // LEDGER | behaviour | client_for_activation with neither optional field
+    #[test]
+    fn an_activation_naming_neither_barrier_nor_cursor_ends_capture_not_the_daemon() {
+        for terse in [activated(&[]), activated(&[barrier(0)])] {
+            let e = unattributed(attribute(&terse));
+            assert!(
+                e.contains("neither the barrier crossed nor the cursor position"),
+                "the error does not say what the compositor left out: {e}"
+            );
+        }
+    }
+
+    // LEDGER | behaviour | client_for_activation with a barrier id hops never set
+    #[test]
+    fn an_activation_naming_a_barrier_hops_did_not_set_ends_capture() {
+        let e = unattributed(attribute(&activated(&[barrier(99), cursor(0.0, 0.0)])));
+        assert!(e.contains("barrier 99"), "{e}");
+    }
+
+    // LEDGER | behaviour | client_for_activation with no barriers set
+    #[test]
+    fn a_cursor_with_no_barrier_to_match_ends_capture() {
+        let a = activated(&[cursor(10.0, 10.0)]);
+        let e = unattributed(client_for_activation(
+            a.barrier_id(),
+            a.cursor_position(),
+            &[],
+            &HashMap::new(),
+        ));
+        assert!(e.contains("no barrier"), "{e}");
+    }
+
+    // LEDGER | behaviour | release_point for each thing a compositor may send
+    #[test]
+    fn a_release_without_a_cursor_position_lands_inside_the_barrier_crossed() {
+        let (barriers, _) = screen();
+        let right = barriers
+            .iter()
+            .find(|b| b.barrier_id.get() == 2)
+            .expect("right barrier");
+        let a = activated(&[barrier(2)]);
+        assert_eq!(a.cursor_position(), None);
+        assert_eq!(
+            release_point(a.cursor_position(), Some(right), Position::Right),
+            Some((1919.0, 539.5)),
+            "released anywhere but one pixel inside the middle of the right edge"
+        );
+        let a = activated(&[barrier(2), cursor(1920.0, 300.0)]);
+        assert_eq!(
+            release_point(a.cursor_position(), Some(right), Position::Right),
+            Some((1919.0, 300.0))
+        );
+        assert_eq!(release_point(None, None, Position::Left), None);
+    }
+
+    // LEDGER | behaviour | release_point on each edge, with and without a cursor
+    /// A release on the wrong side of its barrier crosses straight back to
+    /// the peer, so each edge must land one pixel inside the screen.
+    #[test]
+    fn every_edge_releases_one_pixel_inside_the_screen() {
+        let zones = zones(vec![(1920, 1080, 0, 0)]);
+        let mut next = NonZeroU32::MIN;
+        let edges = [
+            Position::Left,
+            Position::Right,
+            Position::Top,
+            Position::Bottom,
+        ];
+        let (barriers, _) = select_barriers(&zones, &edges, &mut next);
+        let cursor_on_edge = [(0.0, 300.0), (1920.0, 300.0), (700.0, 0.0), (700.0, 1080.0)];
+        let from_cursor = [(1.0, 300.0), (1919.0, 300.0), (700.0, 1.0), (700.0, 1079.0)];
+        let from_middle = [(1.0, 539.5), (1919.0, 539.5), (959.5, 1.0), (959.5, 1079.0)];
+        for (i, pos) in edges.into_iter().enumerate() {
+            let barrier = &barriers[i];
+            assert_eq!(
+                release_point(Some(cursor_on_edge[i]), Some(barrier), pos),
+                Some(from_cursor[i]),
+                "{pos}: released outside the screen from the cursor"
+            );
+            assert_eq!(
+                release_point(None, Some(barrier), pos),
+                Some(from_middle[i]),
+                "{pos}: released outside the screen from the barrier's middle"
+            );
+        }
+    }
+
+    // LEDGER | behaviour | select_barriers on decoded Zones at the top of the id range
+    #[test]
+    fn barrier_ids_start_over_instead_of_running_out() {
+        let zones = zones(vec![(1920, 1080, 0, 0), (1280, 1024, 1920, 0)]);
+        let mut next = NonZeroU32::MAX;
+        let (barriers, ids) = select_barriers(&zones, &[Position::Right], &mut next);
+        let got: Vec<u32> = barriers.iter().map(|b| b.barrier_id.get()).collect();
+        assert_eq!(got, [u32::MAX, 1]);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(next.get(), 2);
+    }
+
+    /// Something the capture task borrows, which says when it is freed.
+    struct Owner(Rc<Cell<bool>>);
+
+    impl Drop for Owner {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+
+    fn owner() -> (std::pin::Pin<Box<Owner>>, Rc<Cell<bool>>) {
+        let freed = Rc::new(Cell::new(false));
+        (Box::pin(Owner(freed.clone())), freed)
+    }
+
+    // LEDGER | behaviour | CaptureTask dropped while its task runs
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_the_capture_unterminated_stops_its_task_instead_of_panicking() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                // A task that ignores cancellation, as one stuck in a portal
+                // call would: only aborting it ends it.
+                let (guard, ended) = owner();
+                let (owner, freed) = owner();
+                let cancel = CancellationToken::new();
+                let task = tokio::task::spawn_local(async move {
+                    let _guard = guard;
+                    futures::future::pending::<Result<(), CaptureError>>().await
+                });
+                drop(CaptureTask::new(owner, task, cancel.clone()));
+                assert!(cancel.is_cancelled(), "the task was not told to stop");
+                assert!(
+                    !freed.get(),
+                    "what the running task points into was freed under it"
+                );
+                let stopped = tokio::time::timeout(Duration::from_secs(30), async {
+                    while !ended.get() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+                assert!(
+                    stopped.is_ok(),
+                    "the task still runs after its capture was dropped"
+                );
+            })
+            .await;
+    }
+
+    // LEDGER | behaviour | CaptureTask::terminate on a task that panicked
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_capture_task_that_panicked_ends_capture_with_an_error() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (owner, freed) = owner();
+                let task = tokio::task::spawn_local(async {
+                    panic!("the capture task fails");
+                });
+                let mut capture = CaptureTask::new(owner, task, CancellationToken::new());
+                match capture.terminate().await {
+                    Err(CaptureError::TaskFailed(_)) => {}
+                    other => panic!("expected TaskFailed, got {other:?}"),
+                }
+                assert!(
+                    capture.terminate().await.is_ok(),
+                    "a second terminate failed"
+                );
+                let polled = std::future::poll_fn(|cx| capture.poll_result(cx)).await;
+                assert!(polled.is_ok(), "the ended task was read twice");
+                drop(capture);
+                assert!(freed.get(), "a terminated capture leaked what it owned");
+            })
+            .await;
     }
 }
 
