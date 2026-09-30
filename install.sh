@@ -11,11 +11,35 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")" && pwd)"
 BIN="$REPO/target/release/hops"
 
+# The feature sets the releases build (.github/workflows/release.yml). On
+# macOS the input backends come with the platform; on Linux they are cargo
+# features, and a build without them connects but can neither capture nor
+# inject (#74).
+MACOS_FEATURES="tui slint"
+LINUX_FEATURES="tui libei_capture libei_emulation layer_shell_capture wlroots_emulation x11_capture x11_emulation rdp_emulation"
+case "$(uname -s)" in
+  Darwin) FEATURES="$MACOS_FEATURES" ;;
+  *) FEATURES="$LINUX_FEATURES" ;;
+esac
+
 echo "==> Building hops (first build takes a couple of minutes)…"
-( cd "$REPO" && cargo build --release --no-default-features --features "tui slint" )
+( cd "$REPO" && cargo build --release --no-default-features --features "$FEATURES" )
 
 case "$(uname -s)" in
   Darwin)
+    # Run from an app bundle made by the generator the release uses. macOS
+    # reads what hops may do from the bundle's Info.plist: a bare binary
+    # declares no Bonjour service, so its discovery is blocked with no prompt
+    # and no error (#149).
+    #
+    # --sign: with a signing identity from the keychain (or DEVELOPER_ID),
+    # under the identifier com.grabbr.hops, so the Accessibility and Input
+    # Monitoring grants survive a rebuild. An ad hoc signature is a new
+    # identity every time, and is used only when there is no identity (#78).
+    VERSION="$(grep -m1 '^version' "$REPO/Cargo.toml" | sed -E 's/.*"(.*)".*/\1/')"
+    APP="$REPO/target/release/hops.app"
+    "$REPO/scripts/macos-app-bundle.sh" "$BIN" "$VERSION" "$APP" "" --sign >/dev/null
+    BIN="$APP/Contents/MacOS/hops"
     echo "==> Setting up login agents: background receiver + menu-bar tray…"
     mkdir -p "$HOME/hops/logs" "$HOME/Library/LaunchAgents"
     uid="$(id -u)"
@@ -47,18 +71,26 @@ case "$(uname -s)" in
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ThrottleInterval</key><integer>10</integer>
   <key>ProcessType</key><string>Interactive</string>
+  <!-- Lists the job under hops in System Settings → Login Items. -->
+  <key>AssociatedBundleIdentifiers</key><array><string>com.grabbr.hops</string></array>
   ${session}
   <key>StandardOutPath</key><string>${HOME}/hops/logs/${log}</string>
   <key>StandardErrorPath</key><string>${HOME}/hops/logs/${log}</string>
 </dict></plist>
 PLIST
+      # launchd creates a missing output file with its own umask, readable
+      # by every account. Create it first, readable by this user alone.
+      : >> "$HOME/hops/logs/${log}"
+      chmod 600 "$HOME/hops/logs/${log}"
       launchctl bootout "gui/${uid}/${label}" 2>/dev/null || true
       launchctl bootstrap "gui/${uid}" "$plist"
     done
     echo
     echo "✅  hops is running (look for the tray icon in your menu bar)."
-    echo "⚠️  ONE manual step — macOS needs your OK for hops to move the cursor:"
-    echo "      System Settings → Privacy & Security → Accessibility → turn on \"hops\""
+    echo "⚠️  macOS needs your OK, under System Settings → Privacy & Security:"
+    echo "      Accessibility     → turn on \"hops\" (to move the cursor)"
+    echo "      Input Monitoring  → turn on \"hops\" (to control other machines from this one)"
+    echo "      Local Network     → turn on \"hops\" (to find the other machines)"
     open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility" 2>/dev/null || true
     ;;
   Linux)
@@ -74,6 +106,20 @@ Restart=on-failure
 [Install]
 WantedBy=default.target
 UNIT
+    # The desktop entry lets the portal's consent prompt name hops. The portal
+    # ignores an entry whose Exec it cannot find, so Exec names this build.
+    # Escaped as the Desktop Entry spec reads a quoted argument: \ " ` $ take
+    # a backslash, the value's own escaping then doubles every backslash, and
+    # % is doubled. An Exec GLib cannot parse drops the entry, silently.
+    exec_bin="$(printf '%s' "$BIN" | sed -e 's/[\\"`$]/\\&/g' -e 's/\\/\\\\/g' -e 's/%/%%/g')"
+    apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+    mkdir -p "$apps"
+    while IFS= read -r line; do
+      case "$line" in
+        Exec=*) printf 'Exec="%s"\n' "$exec_bin" ;;
+        *) printf '%s\n' "$line" ;;
+      esac
+    done < "$REPO/resources/com.grabbr.hops.desktop" > "$apps/com.grabbr.hops.desktop"
     systemctl --user daemon-reload
     systemctl --user enable --now hops.service
     echo

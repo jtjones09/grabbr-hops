@@ -17,6 +17,11 @@ on:
     branches: [main]
   pull_request:
 
+# Nothing here writes to the repository. Without this line every job gets the
+# repository's default token permissions, which may include write.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
@@ -32,9 +37,13 @@ jobs:
     name: default features
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master 2026-09-03, base of branch 1.98.0
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: system deps
         run: |
           sudo apt-get update
@@ -54,82 +63,151 @@ jobs:
         include:
           - { os: macos-latest,   features: "tui slint" }
           - { os: windows-latest, features: "tui slint" }
-          - { os: ubuntu-latest,  features: "tui" }
+          # Linux's backends are features: "tui" alone has none, and no longer
+          # compiles (src/lib.rs). tests/launcher_features.rs holds these
+          # three to release.yml's.
+          - { os: ubuntu-latest,  features: "tui libei_capture libei_emulation layer_shell_capture wlroots_emulation x11_capture x11_emulation rdp_emulation" }
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master 2026-09-03, base of branch 1.98.0
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: system deps (linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev \
-            libxtst-dev pkg-config libfontconfig1-dev
+            libxtst-dev pkg-config libfontconfig1-dev \
+            xvfb  # an X server for the clipboard tests (src/clipboard.rs)
       - name: check
         run: cargo check --locked --no-default-features --features "${{ matrix.features }}" --all-targets
       - name: test
+        if: runner.os != 'Windows'
         run: cargo test --locked --no-default-features --features "${{ matrix.features }}"
-      # The workspace tests run on macOS. The IPC crate has Linux-only code
-      # and tests: the sticky bit on the daemon's lock and socket, and a
-      # listener whose queue of connections not yet accepted is full.
-      - name: test hops-ipc (linux)
+      # The guard in src/lib.rs, observed: a Linux build with no capture or
+      # no emulation backend must fail to compile, and say why. x11 capture is a
+      # stub, so it does not count as a capture backend.
+      - name: a Linux build with no input backend does not compile
         if: runner.os == 'Linux'
-        run: cargo test --locked -p hops-ipc
+        run: |
+          for features in "tui" "tui libei_capture" "tui libei_emulation" "tui x11_capture x11_emulation"; do
+            if out="$(cargo check --locked --no-default-features --features "$features" 2>&1)"; then
+              echo "::error::--features \"$features\" compiled, with no input backend of one kind"
+              exit 1
+            fi
+            grep -q "this build has no input" <<<"$out" || { echo "$out" | tail -20; exit 1; }
+          done
+      # GitHub's Windows runners run every job as an administrator with User
+      # Account Control off, and hops refuses to run elevated (#109). So this
+      # runner tests the refusal itself, with the real binary, in a build
+      # without `elevated_ci_runner`. HOPS_TEST_RUNNER_IS_ELEVATED is read by
+      # those tests alone: it fails them if the runner stops being elevated,
+      # when they would prove nothing.
+      - name: test the refusal to run elevated
+        if: runner.os == 'Windows'
+        env:
+          HOPS_TEST_RUNNER_IS_ELEVATED: "1"
+        run: cargo test --locked --no-default-features --features "${{ matrix.features }}" --lib --bins --test elevated_refusal
+      # Every test, in a debug build that may run elevated so that the tests
+      # which start hops run here. The feature does not compile without debug
+      # assertions, and nothing that builds a release names it
+      # (`only_windows_ci_test_builds_may_run_elevated` in
+      # tests/release_pipeline.rs).
+      - name: test
+        if: runner.os == 'Windows'
+        run: cargo test --locked --no-default-features --features "${{ matrix.features }} elevated_ci_runner"
 
   # The trust tests are the ones that must never silently stop running: each was
   # written to fail without its fix, and several guard a shipped vulnerability.
+  #
+  # Linux as well as macOS: with macOS alone, a Linux-only deadlock failed only
+  # the Ubuntu release job, twice, while this job was green, and the tests of
+  # every crate but the root one never ran on Linux at all. The runner is not
+  # root, and tests of refusals that root would bypass rely on that. The IPC
+  # crate's Linux-only tests (the sticky bit on the daemon's lock and socket,
+  # a full accept queue) run here too. `the_workspace_tests_run_on_linux_and_on_macos`
+  # in tests/release_pipeline.rs fails if either runner is dropped.
   workspace-tests:
-    name: workspace tests
-    runs-on: macos-latest
+    name: workspace tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master 2026-09-03, base of branch 1.98.0
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: system deps (linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev \
+            libxtst-dev pkg-config libfontconfig1-dev \
+            xvfb  # an X server for the clipboard tests (src/clipboard.rs)
       # Was `-p hops-ipc -p hops-frontend-core`, which ran 121 of 166 tests. The
       # hops-slint guards — the sole evidence for four merged PRs — had never
       # executed in CI. A guard that does not run is a comment.
       - run: cargo test --locked --workspace --all-targets
 
+  # The IPC crate's tests on Windows: the daemon's named pipe, who it admits,
+  # the two-way proof over it, and the GUI's single-instance event. The
+  # workspace tests above run on Linux and macOS only, and the release job
+  # tests only the root crate, so the Windows transport was type-checked
+  # and never run. `the_ipc_tests_run_on_windows` in
+  # tests/release_pipeline.rs fails if this job is dropped or narrowed.
+  ipc-tests-windows:
+    name: IPC tests (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master 2026-09-03, base of branch 1.98.0
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo test --locked -p hops-ipc --all-targets
+
   # hops commits to NOT reading raw input devices on Linux. Capture is
   # portal-mediated (xdg-desktop-portal InputCapture / libei), which is
-  # consent-gated and revocable; /dev/input is neither.
+  # consent-gated and revocable; a raw device is neither.
   #
-  # This exists because the installer used to tell every Linux user to run
-  # `sudo usermod -aG input $USER` — granting system-wide keylogging, on a
+  # This exists because the installer used to tell every Linux user to add
+  # themselves to the input group, granting system-wide keylogging, on a
   # machine running a KVM, for a capability no hops code ever used. A
   # commitment about what software does NOT do is worth nothing unless
   # something fails when it stops being true.
+  #
+  # It was two greps here: one over the installer, later a list of extensions
+  # without `.rs`, and one over two of the crates. Each was scoped to where a
+  # defect had been found, not to the property. The test reads every tracked
+  # file outside a `tests` directory; the workspace tests run it as well.
   no-raw-input-devices:
     name: no /dev/input access
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: the input path must stay portal-mediated
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master 2026-09-03, base of branch 1.98.0
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: system deps
         run: |
-          if grep -rnE '/dev/(input|uinput)|EVIOCGRAB|\bevdev::' \
-               crates/input-capture/src crates/input-emulation/src src \
-               --include='*.rs' ; then
-            echo "::error::hops must not open raw input devices — see SECURITY-MODEL.md."
-            echo "If this is a deliberate, privileged, opt-in backend, update this"
-            echo "job and the security model in the same PR, not afterwards."
-            exit 1
-          fi
-          echo "OK: no raw input-device access."
-      # This checked install.sh alone and passed for months while the same
-      # instruction sat in service/README.md and service/hops-headless.service.
-      # A guard scoped to one file cannot prove a claim about the project.
-      - name: nothing shipped may tell users to grant one
-        run: |
-          if grep -rnE 'usermod .*-aG .*input|gpasswd .*input' \
-               --include='*.sh' --include='*.md' --include='*.service' \
-               --include='*.ps1' --include='*.plist' --include='*.yml' \
-               . --exclude-dir=target --exclude-dir=.git --exclude-dir=.github ; then
-            echo "::error::nothing shipped may instruct users into the input group."
-            echo "hops has no uinput backend; that grant is system-wide keystroke"
-            echo "read access in exchange for a capability this code does not have."
-            exit 1
-          fi
-          echo "OK: nothing instructs input-group membership."
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev \
+            libxtst-dev pkg-config libfontconfig1-dev
+      - name: nothing shipped opens a raw input device or tells anyone to
+        run: cargo test --locked --test no_raw_input_devices
 
   # A build script runs on the HOST. `cfg!(unix)` / `cfg!(target_os = ...)` inside
   # one therefore describes the build machine, not the target — which silently
@@ -141,7 +219,9 @@ jobs:
     name: build scripts read the target, not the host
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: no host platform predicates in build.rs
         run: |
           # strip comment lines first — the fixed scripts explain the trap in prose
@@ -161,8 +241,10 @@ jobs:
     name: dependency advisories
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2, cargo-deny 0.20.2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1, cargo-deny 0.20.2
         with:
           command: check advisories
           arguments: --all-features --workspace
@@ -171,8 +253,11 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master 2026-09-03, base of branch 1.98.0
+        with:
+          toolchain: 1.98.0
           components: rustfmt
       - run: cargo fmt --all --check

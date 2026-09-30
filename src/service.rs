@@ -1,21 +1,24 @@
 use crate::{
     capture::{Capture, CaptureType, ICaptureEvent},
     client::ClientManager,
-    clipboard::{Clipboard, ClipboardEvent},
-    config::{Config, ConfigClient, ConfigError},
-    connect::{ClipboardSender, LanMouseConnection},
+    clipboard::{Clipboard, ClipboardEvent, ClipboardInbox},
+    config::{Config, ConfigError},
+    connect::{ClipboardSender, DialRefusal, LanMouseConnection},
     crypto,
-    discovery::{DiscoveredPeer, Discovery, DiscoveryEvent},
+    discovery::{Discovery, DiscoveryEvent},
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
+    enter_hook,
     hop_log::Lifecycle,
     listen::{ClipboardSenderListen, LanMouseListener, ListenerCreationError},
+    permission_watch::{AfterGrant, PermissionWatch, Side},
     prompt_gate::{Admit, PromptGate},
 };
 use futures::StreamExt;
 use hops_ipc::{
-    AsyncFrontendListener, AttemptOrigin, ClientHandle, DaemonEndpoint, DiscoveredDevice,
-    FrontendEvent, FrontendRequest, IpcError, IpcListenerCreationError, Position, Status,
+    AsyncFrontendListener, AttemptOrigin, CaptureState, ClientHandle, DaemonEndpoint,
+    DiscoveredDevice, EmulationState, FrontendEvent, FrontendRequest, IpcError,
+    IpcListenerCreationError, Position,
 };
 use local_channel::mpsc::{Receiver, channel};
 use log;
@@ -28,6 +31,8 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{process::Command, sync::Notify};
+
+mod pending;
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
@@ -51,6 +56,10 @@ pub enum ServiceError {
     Authority(#[from] crate::authority::AuthorityError),
     #[error("could not listen for stop requests: {0}")]
     Signal(io::Error),
+    /// A macOS permission was granted while the daemon ran, and launchd
+    /// starts it again after an unsuccessful exit, which this is (#221).
+    #[error("macOS now grants hops {0}; exiting so that launchd starts it again with the grant")]
+    PermissionGranted(String),
 }
 
 /// What asks the daemon to stop and leave through its shutdown, which lets go
@@ -124,8 +133,18 @@ impl StopRequests {
     }
 }
 
+/// How a refused answer to a pairing's number begins. Not as a refused
+/// grant: `hops cli authorize-key` reads any notice that begins that way as
+/// its own grant refused.
+const PAIRING_NOT_FINISHED: &str = "The pairing is not finished";
+
 /// How often a device being added is dialled again until it answers (#195).
 const ADD_DIAL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How often the links this machine dials to be driven are matched to what
+/// its devices and leases say (#15): a new pairing, a device switched on or
+/// re-addressed, or a lease withdrawn, is acted on within this long.
+const DIAL_BACK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How often the daemon looks for leases that have lapsed while nothing was
 /// being sent.
@@ -150,11 +169,14 @@ pub struct Service {
     /// switched off in config or when mDNS could not start — discovery is a
     /// convenience, never a precondition for hops running (#136).
     discovery: Option<Discovery>,
-    /// Peers seen on the network, keyed by advertised label. Not trusted: a
-    /// claimed fingerprint here is an unauthenticated assertion by whatever is
-    /// on the LAN, useful only for labelling and for spotting a mismatch when
-    /// the TLS certificate actually arrives.
-    discovered: HashMap<String, DiscoveredPeer>,
+    /// Discovery has heard no other machine since it started, for long
+    /// enough to say so (#149).
+    discovery_quiet: bool,
+    /// Peers seen on the network, bounded. Not trusted: a claimed
+    /// fingerprint here is an unauthenticated assertion by whatever is on the
+    /// LAN, useful only for labelling and for spotting a mismatch when the TLS
+    /// certificate actually arrives.
+    discovered: crate::discovery::DiscoveredPeers,
     /// frontend listener
     frontend_listener: AsyncFrontendListener,
     /// The lease store. Shared with both TLS verifiers, which ask it the
@@ -165,28 +187,48 @@ pub struct Service {
     /// with one set there is no second table to outrank the first: a hand-edit
     /// is caught by the seal over the file, not by a precedence rule.
     trust: crate::transport::Trust,
-    /// Sealed persistence for the store above.
-    trust_file: crate::trust_file::TrustFile,
-    /// The provenance of the prompt each fingerprint is currently waiting on.
-    ///
-    /// A grant has to be shaped by HOW the peer arrived: an unsolicited knock
-    /// asks "may this machine drive mine", our own dial asks "may I drive that
-    /// machine". They are different questions and they were being answered with
-    /// the same capability, so confirming a receiver handed it control of this
-    /// machine — the exact harm the direction split exists to remove.
-    ///
-    /// Bounded like the TLS attempt queue, and for the same reason: anyone on
-    /// the network can cause an entry.
-    pending_origin: HashMap<String, AttemptOrigin>,
+    /// Sealed persistence for the store above, and whether a change is still
+    /// waiting to reach it.
+    trust_saver: crate::trust_save::TrustSaver,
+    /// The devices the `[authorized_fingerprints]` cache has listed, so one
+    /// removed from it is known to have been removed there.
+    cache_listed: crate::cache_listed::Listed,
+    /// What every app that attaches is told about devices forgotten at start
+    /// because the cache no longer listed them. Not only the first: the front
+    /// door's build probe attaches too, before the app it opens, and hangs up.
+    forgotten_at_start: Option<String>,
+    /// When to read config.toml again to confirm what the last reload found
+    /// removed from the cache ([`crate::cache_listed::SETTLE`]).
+    removal_check: Option<tokio::time::Instant>,
+    /// Raised as the config is reloaded and as a removal check ends.
+    #[cfg(test)]
+    config_signals: std::sync::Arc<ConfigSignals>,
+    /// The pairing prompts raised and not yet answered.
+    pending_attempts: pending::PendingAttempts,
     /// Whether a pairing prompt may appear right now (#195).
     prompt_gate: crate::prompt_gate::PromptGate,
+    /// How far a test has moved the clock the pairing window is timed by, so
+    /// it can let a window close without waiting for it.
+    #[cfg(test)]
+    pairing_skew: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Devices switched on while the pairing window was open and not yet
     /// paired, dialled every second until they connect, with when that began.
     /// Without it a new device is only dialled when the pointer crosses to it.
     adding: HashMap<ClientHandle, Instant>,
-    /// The clock floor last written to disk, so a quiet daemon does not rewrite
-    /// a sealed file every sweep for nothing.
-    last_persisted_floor: u64,
+    /// Pairings approved here and not yet confirmed on both machines, with
+    /// when, where from, and whether that machine knocked here. One that has
+    /// no number on screen once the pairing window has passed is forgotten,
+    /// so it cannot summon a number card later (#195).
+    approved: HashMap<String, Approved>,
+    /// Pairings whose number is on screen here, until both machines confirm
+    /// or the attempt ends (#11, #167).
+    ceremonies: HashMap<String, Ceremony>,
+    /// The attempts the listener holds, for machines adding this one.
+    pairings_in: crate::pairing::Pairings,
+    pairing_events_in: Option<Receiver<crate::pairing::PairingEvent>>,
+    /// The attempts the connection holds, for machines this one adds.
+    pairings_out: crate::pairing::Pairings,
+    pairing_events_out: Option<Receiver<crate::pairing::PairingEvent>>,
     /// (outgoing) client information
     client_manager: ClientManager,
     /// current port
@@ -198,9 +240,12 @@ pub struct Service {
     /// frontend events queued for sending
     pending_frontend_events: VecDeque<FrontendEvent>,
     /// status of input capture (enabled / disabled)
-    capture_status: Status,
-    /// status of input emulation (enabled / disabled)
-    emulation_status: Status,
+    capture_status: CaptureState,
+    /// Whether input emulation runs, and why not when it should.
+    emulation_status: EmulationState,
+    /// Watches for a macOS permission granted while capture or emulation
+    /// cannot start (#221).
+    permission_watch: PermissionWatch,
     /// keep track of registered connections to avoid duplicate barriers
     incoming_conns: HashSet<SocketAddr>,
     /// addrs whose cursor is currently ON this device (crossing-level state) —
@@ -219,12 +264,21 @@ pub struct Service {
     /// whether the clipboard backend is still running (false once it stops, so
     /// the run loop does not busy-poll a closed channel)
     clipboard_alive: bool,
-    /// inbound clipboard text received from peers, applied to the local clipboard
-    clipboard_in: Receiver<String>,
-    /// fingerprints of RECEIVERS we tried to dial but don't trust (from the
-    /// connect side). Turned into `ConnectionAttempt` below so the UI can offer
-    /// to authorize them — the outbound counterpart of the inbound pairing prompt.
-    untrusted_receivers: Receiver<(String, SocketAddr)>,
+    /// The power assertion that keeps this machine awake while a paired
+    /// device may control it; settled after every event.
+    keep_awake: crate::keep_awake::KeepAwake,
+    /// inbound clipboard text received from peers, applied to the local
+    /// clipboard if the pairing still takes it from its sender
+    clipboard_in: ClipboardInbox,
+    /// Dials that ended in a way the user may need telling about (from the
+    /// connect side). An untrusted receiver becomes a `ConnectionAttempt` so
+    /// the UI can offer to authorize it — the outbound counterpart of the
+    /// inbound pairing prompt. A refusal becomes a notice (#171).
+    dial_refusals: Receiver<DialRefusal>,
+    /// When each device last had a refusal notice of each kind, so a device
+    /// refused on every crossing, or every second while it is being added,
+    /// says so once a minute rather than each time.
+    refusal_notices: RecentNotices,
     /// a client's peer_fingerprint was just learned — persist it and republish
     persist_requests: Receiver<ClientHandle>,
     /// a client's LIVE state changed — republish it, without touching the config
@@ -243,6 +297,15 @@ pub struct Service {
     revoke_listen: crate::listen::ConnRevoker,
     /// broadcast local clipboard changes to incoming-connection peers
     clipboard_out_listen: ClipboardSenderListen,
+    /// Whether this machine listens for peers; `false` when it only dials
+    /// out (#15).
+    listening: bool,
+    /// The links this machine dials to the machines that control it (#15).
+    dial_back: crate::dial_back::DialBack,
+    /// Links machines dialled to be driven by this one, from the listener.
+    dialled_in: Option<Receiver<crate::listen::DialledIn>>,
+    /// Takes such a link as its device's link.
+    adopter: crate::connect::Adopter,
 }
 
 #[derive(Debug)]
@@ -252,15 +315,101 @@ struct Incoming {
     pos: Position,
 }
 
-/// Drop any persisted client pin naming a fingerprint that is not in the
-/// allowlist.
+/// A number on screen here, waiting for the person and the other machine.
+#[derive(Debug, Clone)]
+struct Ceremony {
+    role: crate::pairing::Role,
+    /// The attempt the number was compared in.
+    attempt: u64,
+    /// The number this machine arrived at.
+    number: String,
+    /// What a machine being added offers: the number among two others.
+    choices: Vec<String>,
+    addr: SocketAddr,
+    /// The person here answered rightly.
+    answered: bool,
+    /// The answer on this machine's card and the one the other machine sent,
+    /// when no way of control agrees with both (#220).
+    disagree: Option<(crate::pairing::Answer, crate::pairing::Answer)>,
+}
+
+impl Ceremony {
+    fn check(&self) -> hops_ipc::PairingCheck {
+        match self.role {
+            crate::pairing::Role::Show => hops_ipc::PairingCheck::Show(self.number.clone()),
+            crate::pairing::Role::Pick => hops_ipc::PairingCheck::Pick(self.choices.clone()),
+        }
+    }
+}
+
+/// The next item from `rx`, or never, once it is gone or closed.
+async fn next_or_never<T>(rx: &mut Option<Receiver<T>>) -> T {
+    if let Some(r) = rx.as_mut() {
+        if let Some(item) = r.recv().await {
+            return item;
+        }
+    }
+    *rx = None;
+    std::future::pending().await
+}
+
+/// When each device last had a refusal notice of each kind.
+///
+/// A crossing into a device that refuses this machine is retried on every
+/// crossing, and a device being added is dialled every second, so without
+/// this the same notice would repeat as fast as the dials do.
+#[derive(Default)]
+struct RecentNotices {
+    shown: HashMap<(ClientHandle, &'static str), Instant>,
+}
+
+impl RecentNotices {
+    /// How long a notice stays quiet after it is shown.
+    const QUIET: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Whether a notice of `kind` about `handle` may be shown at `now`, and
+    /// if so, record that it was.
+    fn due(&mut self, handle: ClientHandle, kind: &'static str, now: Instant) -> bool {
+        // Handles are never reused, so a removed device's entries would stay.
+        if self.shown.len() >= 64 {
+            self.shown
+                .retain(|_, at| now.saturating_duration_since(*at) < Self::QUIET);
+        }
+        match self.shown.get(&(handle, kind)) {
+            Some(at) if now.saturating_duration_since(*at) < Self::QUIET => false,
+            _ => {
+                self.shown.insert((handle, kind), now);
+                true
+            }
+        }
+    }
+
+    /// Let the next notice of `kind` about `handle` be shown at once: what
+    /// it would be about has changed.
+    fn forget(&mut self, handle: ClientHandle, kind: &'static str) {
+        self.shown.remove(&(handle, kind));
+    }
+}
+
+/// The notice that a device's hostname resolves to nothing. The lookup made
+/// as a device is switched on or renamed and the ones a dial-out makes after
+/// each dial share it, so the person is told once, not once by each.
+const NOT_RESOLVED: &str = "not-resolved";
+
+/// Drop any persisted client pin naming a fingerprint the trust store has no
+/// record of.
 ///
 /// Such a pin can never let anyone in — the outbound dial is fail-closed against
-/// it — but it CAN silently brick a client: hand-editing `hostname` to retarget a
-/// device while leaving the old `fingerprint = ...` behind makes every dial fail
-/// identity verification with no visible cause. Dropping it lets the client
-/// re-learn the identity on its next successful handshake, which is exactly what
-/// a never-connected client does.
+/// it — but it CAN silently brick a client: no machine can satisfy it, so every
+/// dial fails identity verification with no visible cause. Dropping it lets the
+/// client re-learn the identity on its next successful handshake, which is
+/// exactly what a never-connected client does. A pin the trust store knows is
+/// kept through any edit to the device's hostname or address (#99).
+///
+/// So is a pin to a machine listed to pair again (#231): it was measured, when
+/// that machine proved its key at the device's address, and it is what folds
+/// the device's card and the listing into one. It grants nothing, as the
+/// listing grants nothing.
 fn drop_untrusted_pins(
     client_manager: &ClientManager,
     trust: &crate::trust::TrustStore,
@@ -273,7 +422,7 @@ fn drop_untrusted_pins(
                 // `is_known`, not `has_live_lease`: a lapsed lease must keep
                 // its pin, or a device that only needed renewing is stranded on
                 // an address we forgot.
-                .filter(|fp| !trust.is_known(fp))
+                .filter(|fp| !trust.is_known(fp) && trust.to_pair_again(fp).is_none())
                 .map(|fp| (h, fp))
         })
         .collect();
@@ -287,6 +436,23 @@ fn drop_untrusted_pins(
     stale.into_iter().map(|(h, _)| h).collect()
 }
 
+/// Whether device `handle` may be pinned to `fp`, a machine that proved its
+/// key at `addr` when the device was dialled (#231): `fp` is still listed to
+/// pair again, the device is still pinned to no machine, and it still dials
+/// `addr`. A device whose address changed while the dial ran is not the
+/// device that address answered for.
+fn may_pin_to_listed(
+    clients: &ClientManager,
+    trust: &crate::trust::TrustStore,
+    handle: ClientHandle,
+    fp: &str,
+    addr: SocketAddr,
+) -> bool {
+    trust.to_pair_again(fp).is_some()
+        && clients.peer_fingerprint(handle).is_none()
+        && clients.targets(handle, addr)
+}
+
 /// Why an approved prompt granted nothing.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub(crate) enum GrantRefused {
@@ -296,33 +462,198 @@ pub(crate) enum GrantRefused {
     Store(#[from] crate::trust::TrustError),
 }
 
-/// The grant an approved prompt makes, shaped by how the peer arrived.
+/// The grant an approved prompt makes: what the person approving answered
+/// on its card (#220, #182).
 ///
-/// An unsolicited knock is the user answering "may this machine drive mine":
-/// INBOUND. Our own dial is the user answering "may I drive that machine":
-/// OUTBOUND. Granting INBOUND for both is exactly the defect the direction
-/// split exists to remove, and it hid in the grant door because the split was
-/// built in the store and never wired to it.
+/// Which way control goes is asked, and never inferred from how the other
+/// machine arrived: a knock here and a dial from here can each be approved
+/// in any direction, and the lease drives in exactly the one chosen, recorded
+/// as the origin the store checks. The clipboard is shared, the way control
+/// goes, only on a yes.
 ///
-/// Unknown provenance grants nothing. A grant with no prompt behind it is the
-/// case worth failing closed on.
+/// An attempt is still required. A grant with no prompt behind it is the case
+/// worth failing closed on.
 ///
-/// Through [`crate::trust::TrustStore::issue`], which takes no term, so the
-/// grant does not lapse (#183). Out of `Service::add_authorized_key` so a test
-/// can run the grant itself without standing up a daemon.
+/// Through [`crate::trust::TrustStore::issue_answered`], which takes no term,
+/// so the grant does not lapse (#183). Out of `Service::add_authorized_key`
+/// so a test can run the grant itself without standing up a daemon.
 pub(crate) fn grant_for_attempt(
     trust: &mut crate::trust::TrustStore,
     fingerprint: &str,
     label: &str,
     origin: Option<AttemptOrigin>,
+    controller: hops_ipc::Controller,
+    clipboard: bool,
 ) -> Result<crate::trust::Caps, GrantRefused> {
-    let caps = match origin {
-        Some(AttemptOrigin::Inbound) => crate::trust::Caps::INBOUND,
-        Some(AttemptOrigin::OutboundDial) => crate::trust::Caps::OUTBOUND,
-        None => return Err(GrantRefused::NoAttempt),
+    if origin.is_none() {
+        return Err(GrantRefused::NoAttempt);
+    }
+    trust.issue_answered(fingerprint, label, controller, clipboard)?;
+    Ok(trust
+        .lease(fingerprint)
+        .map_or(crate::trust::Caps::NONE, |l| l.caps))
+}
+
+/// Where a device being added stands, for [`adding_verdict`].
+#[derive(Debug, Clone, Copy)]
+struct Adding {
+    /// Still a device, and switched on.
+    on: bool,
+    /// Its link is up.
+    linked: bool,
+    /// Since it was switched on from the add form.
+    waited: std::time::Duration,
+    /// This machine's pairing window is open.
+    window_open: bool,
+    /// This machine approved the machine that answered, which has not
+    /// approved this one back (#167).
+    approved_here: bool,
+}
+
+/// An approval here waiting for its pairing to finish.
+#[derive(Debug, Clone, Copy)]
+struct Approved {
+    at: Instant,
+    /// Where the attempt approved came from.
+    addr: Option<SocketAddr>,
+    /// That machine knocked here, rather than this machine dialling it.
+    knocked: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddVerdict {
+    /// Dial it again.
+    Dial,
+    /// Keep it being added, undialled: its link is up, and may yet be
+    /// refused by a machine that has not approved this one (#171).
+    Wait,
+    /// Stop without a word: it was switched off or removed, or its link was
+    /// up when the time ran out.
+    Done,
+    /// Stop, and say why.
+    GaveUp(GaveUp),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GaveUp {
+    /// Nothing answered, or neither machine approved.
+    NotPaired,
+    /// This machine approved; the other never did.
+    NotApprovedThere,
+}
+
+impl GaveUp {
+    fn notice(self, name: &str) -> String {
+        match self {
+            GaveUp::NotPaired => format!(
+                "Pairing with {name} did not finish in two minutes. Open add device on \
+                 both machines, then switch {name} off and on to try again."
+            ),
+            GaveUp::NotApprovedThere => format!(
+                "Pairing with {name} did not finish in two minutes: this machine approved \
+                 it, and {name} never approved this one. Open add device on {name}, then \
+                 switch {name} off and on here to try again."
+            ),
+        }
+    }
+}
+
+/// Whether to go on dialling a device being added (#195), and whether to say
+/// why when stopping. The dial goes on while it is on and unlinked, for the
+/// pairing window, and waits while it is linked; an approval here that the
+/// other machine never answers still ends in a notice, which says which
+/// machine did not approve.
+fn adding_verdict(a: Adding) -> AddVerdict {
+    if !a.on {
+        return AddVerdict::Done;
+    }
+    if !a.window_open || a.waited >= PromptGate::WINDOW {
+        if a.linked {
+            return AddVerdict::Done;
+        }
+        return AddVerdict::GaveUp(if a.approved_here {
+            GaveUp::NotApprovedThere
+        } else {
+            GaveUp::NotPaired
+        });
+    }
+    if a.linked {
+        return AddVerdict::Wait;
+    }
+    AddVerdict::Dial
+}
+
+/// What the person is told when a pairing ends on its own. `answered_adding`
+/// is this machine adding the other, its person having confirmed: only then
+/// can the other machine have paired alone, its answer lost on the way.
+pub(crate) fn ended_notice(name: &str, why: &crate::pairing::Why, answered_adding: bool) -> String {
+    use crate::pairing::Why;
+    let stranded = if answered_adding {
+        format!(" If {name} lists this machine as paired, remove it there, then add it again.")
+    } else {
+        " Add the device again on both machines to retry.".to_string()
     };
-    trust.issue(fingerprint, label, caps)?;
-    Ok(caps)
+    match why {
+        Why::NoComparison => format!(
+            "{name} offered no number to compare, so pairing did not start and nothing \
+             was trusted. It runs a version of hops from before pairing numbers, or it \
+             already trusts this machine: update hops there, or remove this machine there, \
+             then add the device again."
+        ),
+        Why::Closed => format!(
+            "Pairing with {name} ended before both machines confirmed, so nothing was \
+             trusted here.{stranded}"
+        ),
+        Why::TimedOut => format!(
+            "Pairing with {name} was not confirmed on both machines within two minutes, \
+             so nothing was trusted here.{stranded}"
+        ),
+        Why::DeviceGone => format!(
+            "Pairing with {name} ended: the device was removed or switched off here, so \
+             nothing was trusted."
+        ),
+        Why::Unexpected => format!(
+            "Pairing with {name} ended: it sent something other than its confirmation, so \
+             nothing was trusted."
+        ),
+        Why::Failed(e) => {
+            format!("Pairing with {name} failed ({e}), so nothing was trusted.{stranded}")
+        }
+    }
+}
+
+/// What the person is told when the two cards were answered so that neither
+/// machine can control the other: `ours`, the answer here, and `theirs`, the
+/// one `name` sent.
+pub(crate) fn disagreement_notice(
+    name: &str,
+    ours: crate::pairing::Answer,
+    theirs: crate::pairing::Answer,
+) -> String {
+    let way = |this_controls: bool, that_controls: bool| match (this_controls, that_controls) {
+        (true, true) => "each controls the other".to_string(),
+        (true, false) => format!("this machine controls {name}"),
+        _ => format!("{name} controls this machine"),
+    };
+    format!(
+        "Pairing with {name} ended, so nothing was trusted: the answer here was that {}, \
+         and the answer on {name} was that {}, so neither machine could control the \
+         other. Add the device again, and choose the same machine to be in control on \
+         both.",
+        way(ours.controls(), ours.controlled()),
+        way(theirs.controlled(), theirs.controls()),
+    )
+}
+
+/// A device as a notice names it: its label, or the start of its fingerprint
+/// when it has none.
+fn named(label: &str, fp: &str) -> String {
+    let label = label.trim();
+    if label.is_empty() {
+        format!("the device {}", fp.get(..11).unwrap_or(fp))
+    } else {
+        format!("\"{label}\"")
+    }
 }
 
 /// Hold the claim before the config is read, and read it only then.
@@ -337,6 +668,111 @@ async fn claim_then_read_config<L, C>(
     Ok((claimed, config))
 }
 
+/// What a removal from the `[authorized_fingerprints]` table in config.toml
+/// takes away, by fingerprint, with the name each is held under: each device
+/// the store writes to that table, and each machine a build before the store
+/// listed there, held to be paired again (#231). The table only ever takes
+/// one of these away; it grants nothing, to either.
+fn removable_from_the_file(store: &crate::trust::TrustStore) -> HashMap<String, String> {
+    let mut removable = store.config_cache();
+    for (fp, listed) in store.every_to_pair_again() {
+        removable
+            .entry(fp.to_string())
+            .or_insert_with(|| listed.label.clone());
+    }
+    removable
+}
+
+/// How a notice names `fp`: by its pairing's name, or the name it is listed
+/// under to be paired again (#231).
+fn name_held(store: &crate::trust::TrustStore, fp: &str) -> String {
+    let label = store
+        .label(fp)
+        .or_else(|| store.to_pair_again(fp).map(|p| p.label.clone()))
+        .unwrap_or_default();
+    named(&label, fp)
+}
+
+/// `fp` as a notice of its removal from config.toml tells it: by its name,
+/// and whether it held only a listing to be paired again (#231).
+fn forgotten_as(store: &crate::trust::TrustStore, fp: &str) -> crate::cache_listed::Forgotten {
+    crate::cache_listed::Forgotten {
+        name: name_held(store, fp),
+        to_pair_again: store.to_pair_again(fp).is_some(),
+    }
+}
+
+/// Forget each device the trust store holds that the `[authorized_fingerprints]`
+/// cache in `config` listed before and no longer lists: an older build, or a
+/// person, removed it there (see `crate::cache_listed`). A machine listed to
+/// be paired again (#231) is forgotten the same way. A removal found is
+/// confirmed by reading the file again once it has settled. Returns the
+/// store, what the cache has listed, the devices forgotten, and
+/// whether the two reads disagreed, when the first read is not to be recorded
+/// in place of what was.
+async fn forget_removed_from_cache(
+    mut store: crate::trust::TrustStore,
+    config: &Config,
+    config_dir: &std::path::Path,
+) -> (
+    crate::trust::TrustStore,
+    crate::cache_listed::Listed,
+    Vec<crate::cache_listed::Forgotten>,
+    bool,
+) {
+    let listed = crate::cache_listed::Listed::read(config_dir);
+    let mut removed = listed.removed(
+        &removable_from_the_file(&store),
+        config.listed_as_trusted().as_ref(),
+    );
+    let mut disagreed = false;
+    if !removed.is_empty() {
+        // Only when something reads as removed, so a start pays nothing.
+        tokio::time::sleep(crate::cache_listed::SETTLE).await;
+        let found = removed.len();
+        removed = crate::cache_listed::confirmed(removed, config.listed_on_disk().as_ref());
+        disagreed = removed.len() != found;
+    }
+    let mut forgotten = Vec::new();
+    for fp in removed {
+        let told = forgotten_as(&store, &fp);
+        store.forget(&fp);
+        log::warn!(
+            "forgot {} ({fp}): config.toml no longer lists it, so it was removed there, \
+             by hand or by an older build",
+            told.name
+        );
+        forgotten.push(told);
+    }
+    (store, listed, forgotten, disagreed)
+}
+
+/// Record, of what the `[authorized_fingerprints]` cache in `config` lists,
+/// the devices `store` trusts or lists to be paired again: removing one of
+/// them from the file later is a removal. While `keep`, what was recorded is
+/// kept as well.
+fn record_listed(
+    listed: &mut crate::cache_listed::Listed,
+    store: &crate::trust::TrustStore,
+    config: &Config,
+    keep: bool,
+) {
+    let granted: std::collections::HashSet<String> = removable_from_the_file(store)
+        .keys()
+        .map(|fp| crate::cache_listed::canonical(fp))
+        .collect();
+    let now: Vec<String> = config
+        .listed_as_trusted()
+        .unwrap_or_default()
+        .keys()
+        .map(|fp| crate::cache_listed::canonical(fp))
+        .filter(|fp| granted.contains(fp))
+        .collect();
+    if let Err(e) = listed.record_keeping(now, keep) {
+        log::warn!("could not record which devices config.toml lists: {e}");
+    }
+}
+
 impl Service {
     /// Start the daemon on `endpoint`: claim it, then read the config, then
     /// everything else.
@@ -344,8 +780,10 @@ impl Service {
     /// The claim is the single-instance check. A daemon started beside a
     /// running one, or racing another through startup, stops at it with
     /// `AlreadyRunning`, having opened only its own log and the claim's lock
-    /// file. It never reads or writes the config, the token, the identity key
-    /// or the trust store that the running daemon holds.
+    /// file. It never reads or writes the config, the identity key or the
+    /// trust store that the running daemon holds, nor on unix the token. On
+    /// Windows the token names the pipe, so `endpoint` was worked out from it
+    /// before this is called.
     pub async fn start(
         endpoint: &DaemonEndpoint,
         load_config: impl FnOnce() -> Result<Config, ConfigError>,
@@ -362,6 +800,44 @@ impl Service {
     async fn new(
         config: Config,
         frontend_listener: AsyncFrontendListener,
+    ) -> Result<Self, ServiceError> {
+        let capture_backend = config.capture_backend().map(|b| b.into());
+        let emulation_backend = config.emulation_backend().map(|b| b.into());
+        Self::with_backends(
+            config,
+            frontend_listener,
+            capture_backend,
+            emulation_backend,
+        )
+        .await
+    }
+
+    /// [`Self::new`] with the capture and emulation backends chosen by the
+    /// caller, which a config file cannot name for every backend.
+    async fn with_backends(
+        config: Config,
+        frontend_listener: AsyncFrontendListener,
+        capture_backend: Option<input_capture::Backend>,
+        emulation_backend: Option<input_emulation::Backend>,
+    ) -> Result<Self, ServiceError> {
+        Self::with_backends_among(
+            config,
+            frontend_listener,
+            capture_backend,
+            emulation_backend,
+            input_emulation::InputEmulation::auto_order(),
+        )
+        .await
+    }
+
+    /// [`Self::with_backends`], trying `emulation_candidates` in order when
+    /// no emulation backend is chosen.
+    async fn with_backends_among(
+        config: Config,
+        frontend_listener: AsyncFrontendListener,
+        capture_backend: Option<input_capture::Backend>,
+        emulation_backend: Option<input_emulation::Backend>,
+        emulation_candidates: Vec<input_emulation::Backend>,
     ) -> Result<Self, ServiceError> {
         let client_manager = ClientManager::default();
         for client in config.clients() {
@@ -391,45 +867,29 @@ impl Service {
         let (mut trust_file, loaded) = crate::trust_file::TrustFile::open(&config_dir, authority)?;
 
         let store = match loaded {
+            // A version 1 store moves to version 2 here, and a pairing never
+            // confirmed is dropped, each saved before anything else happens.
             crate::trust_file::Loaded::Present { leases, .. } => {
-                let (store, refused) =
-                    crate::trust_file::rebuild(&public_key_fingerprint, trust_file.now(), &leases)?;
-                for why in &refused {
-                    // Reported, never dropped silently: a device losing trust
-                    // with no explanation is the failure this rework removes.
-                    log::warn!("trust store: {why}");
-                }
-                for (level, line) in crate::trust_file::stored_terms(&leases, &store).log_lines() {
-                    log::log!(level, "{line}");
-                }
-                store
+                crate::trust_file::start(&mut trust_file, &public_key_fingerprint, &leases)?
             }
             crate::trust_file::Loaded::Absent => {
                 // First run under leases. This is the one-way door: after it,
                 // the config tables never answer a trust question again.
                 //
-                // Through the store, deliberately. Outbound is granted only to
-                // a fingerprint the old config actually DIALLED — allowlist
-                // membership was necessary but not sufficient for outbound, so
-                // minting it for everything would create at upgrade exactly the
-                // capability this rework exists to retire.
-                let dialled: std::collections::HashSet<String> = client_manager
-                    .get_client_states()
-                    .into_iter()
-                    .filter_map(|(_, _, st)| st.peer_fingerprint)
-                    .collect();
+                // Through the store, deliberately, and granting nothing: the
+                // old list never said which machine controls which, so each
+                // machine it names is listed to be paired again, and the
+                // pairing card asks the direction (#231, #220).
                 let mut store =
                     crate::trust::TrustStore::new(&public_key_fingerprint, trust_file.now())?;
                 let report = store.migrate_from_config(
                     &config.authorized_fingerprints(),
                     &config.revoked_fingerprints(),
-                    &dialled,
                     trust_file.now(),
                 );
                 log::info!(
-                    "migrated the trust store: {} leases, {} removals, {} refused, {} dropped",
-                    report.leased.len(),
-                    report.denied.len(),
+                    "migrated the trust store: {} to pair again, {} removed before, {} dropped",
+                    report.to_pair_again.len(),
                     report.refused.len(),
                     report.dropped.len(),
                 );
@@ -438,56 +898,108 @@ impl Service {
             }
         };
 
+        let (store, mut cache_listed, forgotten, disagreed) =
+            forget_removed_from_cache(store, &config, &config_dir).await;
+        let mut trust_saver = crate::trust_save::TrustSaver::new(trust_file);
+        if !forgotten.is_empty() {
+            // Through the saver, so a save that fails is retried every minute
+            // and every app that attaches is told, as for any trust change.
+            let names: Vec<&str> = forgotten.iter().map(|f| f.name.as_str()).collect();
+            let unsaved = trust_saver.save_change(&store, format!("removing {}", names.join(", ")));
+            if let Some(unsaved) = unsaved {
+                log::error!("{unsaved}");
+            }
+        }
+        // A device forgotten but not yet off disk stays recorded, or the next
+        // start would trust it again from the store on disk. So does one the
+        // first read lacked and the second did not: that read was of a save
+        // part done, and a removal of the device later must still read as one.
+        // A file with no table at all lists nothing and removes nothing, so
+        // it leaves the record as it was.
+        let keep = trust_saver.is_pending() || disagreed || config.listed_as_trusted().is_none();
+        record_listed(&mut cache_listed, &store, &config, keep);
+        let forgotten_at_start =
+            (!forgotten.is_empty()).then(|| crate::cache_listed::notice(&forgotten));
         drop_untrusted_pins(&client_manager, &store);
         let trust: crate::transport::Trust = Arc::new(RwLock::new(store));
 
         // clipboard sync: a single inbound channel both transports push received
-        // payloads into, plus the local monitor/apply backend. The channel is
-        // unbounded — acceptable for the trusted KVM-pair model (peers are
-        // mutually fingerprint-authenticated). Each transfer is capped at
-        // transport::MAX_CLIPBOARD_BYTES and stalled transfers time out, but a
-        // malicious/buggy *authorized* peer flooding valid payloads is not yet
-        // back-pressured; a bounded/coalescing channel is the future hardening.
+        // payloads into, each with its sender's fingerprint, plus the local
+        // monitor/apply backend. Only a peer whose lease carries clipboard-from
+        // reaches the channel, and each link holds a bounded share of it
+        // (transport::QUEUED_PER_LINK). The bound is per link, not per peer:
+        // a peer linked more than once holds a share on each. The backend
+        // reads the clipboard only
+        // while some pairing, switched on, takes it.
         let (clipboard_in_tx, clipboard_in) = channel();
-        let (untrusted_tx, untrusted_receivers) = channel();
+        let (refusals_tx, dial_refusals) = channel();
         let (persist_tx, persist_requests) = channel();
         let (state_tx, state_changes) = channel();
-        let clipboard = Clipboard::new();
+        let clipboard = Clipboard::new(trust.clone(), client_manager.clone());
 
         // listener + connection. Both hold the same store and ask it different
         // questions: the listener whether a peer may drive us, the connection
         // whether we may drive a peer.
-        let listener = LanMouseListener::new(
-            config.port(),
+        // A machine that only dials out binds no port (#15): the links it
+        // dials to be driven are read by a listener that listens on none.
+        let listening = config.listen();
+        let mut listener = if listening {
+            LanMouseListener::new(
+                config.port(),
+                identity.clone(),
+                trust.clone(),
+                clipboard_in_tx.clone(),
+            )
+            .await?
+        } else {
+            LanMouseListener::dial_only(identity.clone(), trust.clone(), clipboard_in_tx.clone())
+                .await?
+        };
+        let dial_back = crate::dial_back::DialBack::new(
             identity.clone(),
             trust.clone(),
-            clipboard_in_tx.clone(),
-        )
-        .await?;
-        let conn = LanMouseConnection::new(
+            client_manager.clone(),
+            listener.admitter(),
+            refusals_tx.clone(),
+            state_tx.clone(),
+        );
+        let dialled_in = listener.take_dialled_in();
+        let mut conn = LanMouseConnection::new(
             identity.clone(),
             client_manager.clone(),
             trust.clone(),
             clipboard_in_tx,
-            untrusted_tx,
+            refusals_tx,
             persist_tx,
             state_tx,
         )
         .map_err(|e| ServiceError::Connect(e.to_string()))?;
+        let adopter = conn.adopter();
 
         // clipboard broadcast handles — grabbed before the transports are moved
         // into capture/emulation below.
         let clipboard_out_conn = conn.clipboard_sender();
-        let clipboard_out_listen = listener.clipboard_sender();
+        let clipboard_out_listen = listener.clipboard_sender(client_manager.clone());
         // revocation handles, grabbed before both are moved into capture/emulation
         let revoke_conn = conn.revoker();
         let revoke_listen = listener.revoker();
+        // and the attempts each holds for a machine mid-pairing (#167)
+        let pairings_in = listener.pairings();
+        let pairing_events_in = listener.take_pairing_events();
+        // One board for both, so a machine dialled while it dials holds one
+        // attempt, not two (#220).
+        conn.share_pairings(pairings_in.clone());
+        let pairings_out = conn.pairings();
+        let pairing_events_out = conn.take_pairing_events();
 
         // input capture + emulation
-        let capture_backend = config.capture_backend().map(|b| b.into());
         let capture = Capture::new(capture_backend, conn, config.release_bind());
-        let emulation_backend = config.emulation_backend().map(|b| b.into());
-        let emulation = Emulation::new(emulation_backend, listener, trust.clone());
+        let emulation = Emulation::among(
+            emulation_backend,
+            emulation_candidates,
+            listener,
+            trust.clone(),
+        );
 
         // create dns resolver
         let resolver = DnsResolver::new()?;
@@ -497,14 +1009,16 @@ impl Service {
             .ok()
             .and_then(|h| h.into_string().ok())
             .unwrap_or_else(|| "hops".to_string());
+        // Nothing to announce on a machine that listens on no port.
         let discovery = Discovery::new(
-            config.discovery(),
+            config.discovery() && listening,
             config.port(),
             &public_key_fingerprint,
             &instance,
         );
 
         let port = config.port();
+        let clipboard_in = ClipboardInbox::new(clipboard_in, trust.clone(), client_manager.clone());
         let service = Self {
             config,
             capture,
@@ -512,13 +1026,26 @@ impl Service {
             frontend_listener,
             resolver,
             discovery,
-            discovered: HashMap::new(),
+            discovery_quiet: false,
+            discovered: Default::default(),
             trust,
-            trust_file,
-            pending_origin: HashMap::new(),
+            trust_saver,
+            cache_listed,
+            removal_check: None,
+            #[cfg(test)]
+            config_signals: Default::default(),
+            forgotten_at_start,
+            pending_attempts: Default::default(),
             prompt_gate: crate::prompt_gate::PromptGate::new(),
+            #[cfg(test)]
+            pairing_skew: Default::default(),
             adding: HashMap::new(),
-            last_persisted_floor: 0,
+            approved: HashMap::new(),
+            ceremonies: HashMap::new(),
+            pairings_in,
+            pairing_events_in,
+            pairings_out,
+            pairing_events_out,
             public_key_fingerprint,
             client_manager,
             frontend_event_pending: Default::default(),
@@ -526,6 +1053,7 @@ impl Service {
             pending_frontend_events: Default::default(),
             capture_status: Default::default(),
             emulation_status: Default::default(),
+            permission_watch: PermissionWatch::of_this_machine(),
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             currently_controlling: Default::default(),
@@ -533,14 +1061,20 @@ impl Service {
             next_trigger_handle: 0,
             clipboard,
             clipboard_alive: true,
+            keep_awake: crate::keep_awake::KeepAwake::for_this_machine(),
             clipboard_in,
-            untrusted_receivers,
+            dial_refusals,
+            refusal_notices: RecentNotices::default(),
             persist_requests,
             state_changes,
             clipboard_out_conn,
             clipboard_out_listen,
             revoke_conn,
             revoke_listen,
+            listening,
+            dial_back,
+            dialled_in,
+            adopter,
         };
         Ok(service)
     }
@@ -568,17 +1102,34 @@ impl Service {
         lease_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut add_dials = tokio::time::interval(ADD_DIAL_INTERVAL);
         add_dials.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut dial_back = tokio::time::interval(DIAL_BACK_INTERVAL);
+        dial_back.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         // Before the loop and once: a stream made per iteration would miss a
         // signal that lands between two of them, and once tokio installs its
         // handler the default action (exit) no longer applies.
         let mut stop = StopRequests::new().map_err(ServiceError::Signal)?;
         log::info!("service running; stops on {}", StopRequests::DESCRIPTION);
+        let mut restart_for = None;
 
+        self.settle_keep_awake();
         loop {
             tokio::select! {
-                _ = lease_sweep.tick() => self.sweep_lapsed_leases(),
-                _ = add_dials.tick(), if !self.adding.is_empty() => self.retry_adding(),
+                _ = lease_sweep.tick() => {
+                    self.sweep_lapsed_leases();
+                    // A power assertion the system refused is tried again at
+                    // this pace, not after every event.
+                    self.settle_keep_awake();
+                    self.keep_awake.retry_refused();
+                }
+                _ = dial_back.tick() => self.dial_back.reconcile(),
+                dialled = next_or_never(&mut self.dialled_in) => self.handle_dialled_in(dialled),
+                _ = add_dials.tick(), if !self.adding.is_empty() || !self.approved.is_empty() => {
+                    self.retry_adding();
+                    self.forget_unstarted_pairings();
+                }
+                event = next_or_never(&mut self.pairing_events_in) => self.handle_pairing_event(event),
+                event = next_or_never(&mut self.pairing_events_out) => self.handle_pairing_event(event),
                 request = self.frontend_listener.next() => self.handle_frontend_request(request),
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
                 event = self.emulation.event() => self.handle_emulation_event(event),
@@ -609,31 +1160,40 @@ impl Service {
                         self.broadcast_client(handle);
                     }
                 }
-                fp = self.untrusted_receivers.recv() => {
-                    if let Some((fp, addr)) = fp {
-                        // only prompt if it really is untrusted — a racing dial can
-                        // report a fingerprint that was authorized in the meantime
-                        let known = self.trust.read().expect("lock").we_may_drive(&fp);
-                        if !known {
-                            log::info!("untrusted receiver {fp} — raising an approval prompt");
-                            self.raise_connection_attempt(fp, AttemptOrigin::OutboundDial, Some(addr));
-                        }
+                refusal = self.dial_refusals.recv() => {
+                    if let Some(refusal) = refusal {
+                        self.handle_dial_refusal(refusal);
                     }
                 }
-                text = self.clipboard_in.recv() => {
+                text = self.clipboard_in.next() => {
                     if let Some(text) = text {
                         self.clipboard.apply(text);
                     }
                 }
                 _ = self.config.changed() => self.handle_config_change(),
+                _ = tokio::time::sleep_until(
+                    self.removal_check.unwrap_or_else(tokio::time::Instant::now)
+                ), if self.removal_check.is_some() => self.check_removals(),
+                after = self.permission_watch.granted() => {
+                    if let Some(granted) = self.after_permission_granted(after) {
+                        restart_for = Some(granted);
+                        break;
+                    }
+                }
                 why = stop.next() => {
                     log::info!("{why} received");
                     break;
                 }
             }
+            // After every event rather than where trust changes: those are
+            // many places, and one missed would keep the machine awake, or
+            // let it sleep, until the next.
+            self.settle_keep_awake();
         }
 
         log::info!("terminating service ...");
+        self.keep_awake.release_for_exit();
+        self.dial_back.stop_all();
         log::debug!("terminating capture ...");
         self.capture.terminate().await;
         log::debug!("terminating emulation ...");
@@ -645,11 +1205,45 @@ impl Service {
         log::debug!("terminating dns resolver ...");
         self.resolver.terminate().await;
 
-        Ok(())
+        match restart_for {
+            Some(granted) => Err(ServiceError::PermissionGranted(granted)),
+            None => Ok(()),
+        }
     }
 
-    /// A *local* clipboard change → broadcast it to every connected peer (both
-    /// directions). `None` means the clipboard backend stopped; disable the arm.
+    /// Hold the power assertion while some paired device may control this
+    /// machine, and only then.
+    fn settle_keep_awake(&mut self) {
+        let wanted = crate::keep_awake::wanted(&self.trust);
+        self.keep_awake.set(wanted);
+    }
+
+    /// A macOS permission capture or emulation was missing is now granted
+    /// (#221). Returns what was granted when the daemon should exit so that
+    /// launchd starts it again with the grant; otherwise tells the user it
+    /// takes effect once hops restarts.
+    fn after_permission_granted(&mut self, after: AfterGrant) -> Option<String> {
+        let granted = after.granted();
+        match after {
+            AfterGrant::Exit(_) => Some(granted),
+            AfterGrant::Tell(_) => {
+                log::warn!(
+                    "macOS now grants hops {granted}, which takes effect once the hops \
+                     service restarts; launchd did not start this daemon, so it cannot \
+                     restart itself"
+                );
+                self.notify_frontend(FrontendEvent::Error(format!(
+                    "macOS now grants hops {granted}. It takes effect once the hops \
+                     service restarts: stop it and start it again."
+                )));
+                None
+            }
+        }
+    }
+
+    /// A *local* clipboard change → broadcast it to every connected peer the
+    /// pairing shares it with, on links in either direction. `None` means the
+    /// clipboard backend stopped; disable the arm.
     ///
     /// Content *applied from a peer* is intentionally NOT re-broadcast (apply()
     /// seeds the poll baseline, so it never fires `changed()`), which prevents
@@ -685,19 +1279,31 @@ impl Service {
                 }
                 self.save_config();
             }
-            FrontendRequest::AuthorizeKey(desc, fp) => {
-                if self.refuse_while_remotely_driven("grant trust") {
+            FrontendRequest::AuthorizeKey {
+                label,
+                fingerprint,
+                controller,
+                clipboard,
+            } => {
+                if self.refuse_while_remotely_driven(hops_ipc::GRANT_REFUSED, "grant trust") {
                     return;
                 }
-                self.add_authorized_key(desc, fp);
+                self.add_authorized_key(label, fingerprint, controller, clipboard);
                 self.save_config();
             }
             FrontendRequest::ChangePort(port) => self.change_port(port),
-            FrontendRequest::Create => {
-                self.add_client();
-                self.save_config();
-            }
-            FrontendRequest::Delete(handle) => {
+            FrontendRequest::Create(device) => self.add_device(device),
+            FrontendRequest::Delete {
+                handle,
+                fingerprint,
+            } => {
+                // Only the device the frontend showed. Handles are never
+                // reused, but the device behind one can learn or lose its pin
+                // between the frontend drawing it and the user confirming, and
+                // the pin is what gets revoked below.
+                if !self.still_as_shown(handle, fingerprint.as_deref(), "deleted") {
+                    return;
+                }
                 // Deleting a device REVOKES it. hops can read every keystroke on
                 // the machine, so "remove this device" has to mean removed —
                 // previously delete forgot the dial address but left the peer's
@@ -705,16 +1311,35 @@ impl Service {
                 // could still take their keyboard and mouse.
                 //
                 // Deliberately here and NOT in remove_client(): that is also
-                // called by handle_config_change, which removes every client
-                // before rebuilding them, so revoking there would wipe the entire
-                // trust store on any config reload.
+                // called by handle_config_change, which removes clients it
+                // replaces, so revoking there would drop trust on a reload.
+                //
+                // A config saved before #12 can hold a second device pinned
+                // to the same machine, folded into this one's card. It goes
+                // too: left behind, the revocation clears its pin and it
+                // dials whatever answers at its address.
+                let mut gone = vec![handle];
                 if let Some(fp) = self.client_manager.peer_fingerprint(handle) {
-                    if self.trust.read().expect("lock").is_known(&fp) {
+                    gone.extend(
+                        self.client_manager
+                            .every_pinned_to(&fp)
+                            .into_iter()
+                            .filter(|&h| h != handle),
+                    );
+                    // A device folded into a listing to pair again (#231) is
+                    // one card with it, and deleting the card removes both.
+                    let recorded = {
+                        let trust = self.trust.read().expect("lock");
+                        trust.is_known(&fp) || trust.to_pair_again(&fp).is_some()
+                    };
+                    if recorded {
                         log::warn!("deleting client {handle}: also revoking its trust ({fp})");
                         self.remove_authorized_key(fp);
                     }
                 }
-                self.remove_client(handle);
+                for handle in gone {
+                    self.remove_client(handle);
+                }
                 self.save_config();
             }
             FrontendRequest::EnableCapture => self.capture.reenable(),
@@ -724,8 +1349,21 @@ impl Service {
                 self.update_fix_ips(handle, fix_ips);
                 self.save_config();
             }
-            FrontendRequest::UpdateHostname(handle, host) => {
-                self.update_hostname(handle, host);
+            FrontendRequest::UpdateLabel(handle, label) => {
+                if self.client_manager.set_label(handle, label) {
+                    self.broadcast_client(handle);
+                    self.save_config();
+                }
+            }
+            FrontendRequest::UpdateHostname {
+                handle,
+                hostname,
+                fingerprint,
+            } => {
+                if !self.still_as_shown(handle, fingerprint.as_deref(), "renamed") {
+                    return;
+                }
+                self.update_hostname(handle, hostname);
                 self.save_config();
             }
             FrontendRequest::UpdatePort(handle, port) => {
@@ -751,22 +1389,65 @@ impl Service {
                 self.save_config();
             }
             FrontendRequest::SaveConfiguration => self.save_config(),
+            // Queued behind everything the requests before it caused.
+            FrontendRequest::Barrier(n) => self.notify_frontend(FrontendEvent::Barrier(n)),
             FrontendRequest::OpenPairing => {
-                self.prompt_gate.open(Instant::now());
+                self.prompt_gate.open(self.pairing_now());
                 log::info!(
                     "add device opened: pairing requests may prompt for the next {} s",
                     crate::prompt_gate::PromptGate::WINDOW.as_secs()
                 );
                 self.publish_pairing_window();
             }
+            // Not behind `refuse_while_remotely_driven`: like removal, it only
+            // takes permission away, and a peer driving this machine gains
+            // nothing by clicking it.
+            FrontendRequest::DisableClipboard(fp) => self.disable_clipboard(fp),
+            // Widens trust, so a peer driving this machine may not give it.
+            FrontendRequest::ConfirmPairing {
+                fingerprint,
+                number,
+            } => {
+                if self.refuse_while_remotely_driven(PAIRING_NOT_FINISHED, "confirm a pairing") {
+                    return;
+                }
+                self.answer_pairing(fingerprint, number);
+            }
+            // Only takes away, like removal.
+            FrontendRequest::CancelPairing(fingerprint) => self.cancel_pairing(fingerprint),
+            // Behind it, like a grant: it widens a pairing, and a peer driving
+            // this machine could click it for itself.
+            FrontendRequest::EnableClipboard(fp) => {
+                // Not said as a refused grant: `hops cli authorize-key` reads
+                // any notice that begins that way as its own grant refused.
+                if self.refuse_while_remotely_driven(
+                    "The clipboard is still off",
+                    "turn the clipboard on",
+                ) {
+                    return;
+                }
+                self.enable_clipboard(fp);
+            }
         }
+    }
+
+    /// The time the pairing window is measured against: the monotonic clock,
+    /// moved on by a test that lets a window close without waiting for it.
+    fn pairing_now(&self) -> Instant {
+        let now = Instant::now();
+        #[cfg(test)]
+        let now = now
+            + std::time::Duration::from_millis(
+                self.pairing_skew.load(std::sync::atomic::Ordering::Relaxed),
+            );
+        now
     }
 
     /// Tell every frontend how long pairing prompts may still appear here.
     fn publish_pairing_window(&mut self) {
         let seconds = self
             .prompt_gate
-            .remaining(Instant::now())
+            .remaining(self.pairing_now())
             .map_or(0, |left| left.as_secs().max(1) as u32);
         self.notify_frontend(FrontendEvent::PairingOpen { seconds });
     }
@@ -774,37 +1455,72 @@ impl Service {
     fn save_config(&mut self) {
         let clients = self.client_manager.clients();
         let clients = clients
-            .into_iter()
-            .map(|(c, s)| ConfigClient {
-                ips: HashSet::from_iter(c.fix_ips),
-                hostname: c.hostname,
-                port: c.port,
-                pos: c.pos,
-                active: s.active,
-                enter_hook: c.cmd,
-                fingerprint: s.peer_fingerprint,
-            })
+            .iter()
+            .map(|(c, s)| crate::client::config_entry(c, s))
             .collect();
         self.config.set_clients(clients);
         // A CACHE, written and never read back as authority. It exists so an
         // older build, or a human reading the file, still sees who is trusted —
         // but the daemon answers every trust question from the sealed store.
-        let (cache, tombstones) = self.trust.read().expect("lock").config_cache();
+        let cache = self.trust.read().expect("lock").config_cache();
+        let written: Vec<String> = cache.keys().cloned().collect();
         self.config.set_authorized_keys(cache);
-        self.config.set_revoked_fingerprints(tombstones);
-        if let Err(e) = self.config.write_back() {
+        // Removing a device forgets it: the table an earlier build kept its
+        // removals in goes at the first save (#184).
+        self.config.clear_revoked_fingerprints();
+        let saved = self.config.write_back();
+        if saved.is_ok() {
+            // Recorded only once the file lists them: a device the cache
+            // does not list cannot be removed from it. While a trust change
+            // waits to reach disk, a device forgotten in memory may still be
+            // trusted there, so nothing recorded is dropped until it lands.
+            let unsaved = self.trust_saver.is_pending();
+            // A machine listed to be paired again (#231) is not in the cache,
+            // so this save dropped its line from a list an older build wrote:
+            // the file's lack of it from now on is not a removal.
+            let dropped: Vec<String> = self
+                .trust
+                .read()
+                .expect("lock")
+                .every_to_pair_again()
+                .map(|(fp, _)| fp.to_string())
+                .collect();
+            let recorded = self
+                .cache_listed
+                .record_keeping(written, unsaved)
+                .and_then(|()| self.cache_listed.unrecord(dropped));
+            if let Err(e) = recorded {
+                log::warn!("could not record which devices config.toml lists: {e}");
+            }
+        }
+        if let Err(e) = saved {
             log::warn!("failed to write config: {e}");
+            // The change is in memory only, for one when the file does not
+            // parse and is left as it is: say so, or it looks saved until the
+            // next start.
+            self.notify_frontend(FrontendEvent::Error(format!(
+                "{}: {e}",
+                hops_ipc::NOT_SAVED
+            )));
         }
     }
 
     fn handle_config_change(&mut self) {
-        for h in self.client_manager.registered_clients() {
+        // Only what the edit changed. A device whose entry reads the same keeps
+        // its handle, connection and capture; one whose entry changed or went
+        // is removed, and its replacement gets a handle never used before. So
+        // no handle a frontend or a dial holds can come to name another
+        // device (#94, #97).
+        let plan = self.client_manager.plan_reload(self.config.clients());
+        log::info!(
+            "config reloaded: {} device(s) replaced or removed, {} added",
+            plan.stale.len(),
+            plan.fresh.len()
+        );
+        for h in plan.stale {
             self.remove_client(h);
         }
-        // Every client is gone; hand out 0,1,2… again rather than letting the
-        // slab's LIFO free list reverse the numbering (#94).
-        self.client_manager.reset_handle_allocation();
-        for c in self.config.clients() {
+        for c in plan.fresh {
             let handle = self.client_manager.add_with_config(c);
             log::info!("added client {handle}");
             let (c, s) = self.client_manager.get_state(handle).unwrap();
@@ -822,7 +1538,8 @@ impl Service {
         // as the user, was a permanent trust grant with no dialog and no IPC
         // token. Trust no longer lives here: `[authorized_fingerprints]` is a
         // cache this daemon writes and never reads, and the sealed store is the
-        // only authority. A config change is no longer a trust change.
+        // only authority. A config change grants nothing; what it can do is
+        // take a device away, below.
         //
         // A hand-edited config is still exactly where a stale outbound pin gets
         // reintroduced, so that check stays — against the store.
@@ -833,7 +1550,44 @@ impl Service {
         for h in stale {
             self.broadcast_client(h);
         }
+        // A device removed from the cache in the file, by hand or by an older
+        // build, is removed here too, once the file has settled: each reload
+        // moves the check on, so it reads the file after the last write.
+        self.removal_check = Some(tokio::time::Instant::now() + crate::cache_listed::SETTLE);
         self.sync_frontend();
+        #[cfg(test)]
+        self.config_signals.reloaded.notify_one();
+    }
+
+    /// Forget each device removed from the cache in config.toml, as both the
+    /// last reload and a read of the file now find it. A line added there
+    /// grants nothing.
+    fn check_removals(&mut self) {
+        self.removal_check = None;
+        let removed = {
+            let granted = removable_from_the_file(&self.trust.read().expect("lock"));
+            self.cache_listed
+                .removed(&granted, self.config.listed_as_trusted().as_ref())
+        };
+        let removed = if removed.is_empty() {
+            removed
+        } else {
+            crate::cache_listed::confirmed(removed, self.config.listed_on_disk().as_ref())
+        };
+        if !removed.is_empty() {
+            let forgotten: Vec<crate::cache_listed::Forgotten> = {
+                let trust = self.trust.read().expect("lock");
+                removed.iter().map(|fp| forgotten_as(&trust, fp)).collect()
+            };
+            for fp in removed {
+                self.remove_authorized_key(fp);
+            }
+            self.notify_frontend(FrontendEvent::Error(crate::cache_listed::notice(
+                &forgotten,
+            )));
+        }
+        #[cfg(test)]
+        self.config_signals.checked.notify_one();
     }
 
     async fn handle_frontend_pending(&mut self) {
@@ -855,8 +1609,8 @@ impl Service {
                      missing Accessibility permission for hops."
                 )));
             }
-            EmulationEvent::ConnectionAttempt { fingerprint } => {
-                self.raise_connection_attempt(fingerprint, AttemptOrigin::Inbound, None);
+            EmulationEvent::ConnectionAttempt { fingerprint, addr } => {
+                self.raise_connection_attempt(fingerprint, AttemptOrigin::Inbound, Some(addr));
             }
             EmulationEvent::Entered {
                 addr,
@@ -881,10 +1635,19 @@ impl Service {
                     self.update_incoming(addr, pos, fingerprint);
                 }
             }
+            EmulationEvent::RemovedBy { fingerprint } => {
+                self.forget_machine_that_removed_this_one(fingerprint);
+            }
             EmulationEvent::Disconnected { addr } => {
                 self.currently_controlling.remove(&addr);
-                self.connected_peers.remove(&addr);
-                if let Some(addr) = self.remove_incoming(addr) {
+                // The frontend was told about the connection when it was made,
+                // whether or not the peer ever crossed, so it is told about
+                // its end either way. Otherwise a peer that connected and
+                // never crossed shows as connected until the app restarts
+                // (#34).
+                let connected = self.connected_peers.remove(&addr).is_some();
+                let entered = self.remove_incoming(addr).is_some();
+                if connected || entered {
                     Lifecycle::Disconnected { addr }.log();
                     self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
                 }
@@ -898,12 +1661,27 @@ impl Service {
                     .notify_frontend(FrontendEvent::PortChanged(self.port, Some(format!("{e}")))),
             },
             EmulationEvent::EmulationDisabled => {
-                self.emulation_status = Status::Disabled;
-                self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
+                self.permission_watch.stopped(Side::Emulation);
+                self.emulation_status = EmulationState::Disabled;
+                self.notify_frontend(FrontendEvent::EmulationStatus(
+                    self.emulation_status.clone(),
+                ));
             }
             EmulationEvent::EmulationEnabled => {
-                self.emulation_status = Status::Enabled;
-                self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
+                self.permission_watch.started(Side::Emulation);
+                self.emulation_status = EmulationState::Enabled;
+                self.notify_frontend(FrontendEvent::EmulationStatus(
+                    self.emulation_status.clone(),
+                ));
+            }
+            // A backend that was never created never said it stopped, so the
+            // permission watch hears of it here, as it does for capture.
+            EmulationEvent::EmulationFailed(fault) => {
+                self.permission_watch.stopped(Side::Emulation);
+                self.emulation_status = EmulationState::Failed(fault);
+                self.notify_frontend(FrontendEvent::EmulationStatus(
+                    self.emulation_status.clone(),
+                ));
             }
             EmulationEvent::ReleaseNotify => self.capture.release(),
             EmulationEvent::EdgePushed { addr, side } => {
@@ -931,22 +1709,23 @@ impl Service {
                 self.connected_peers.insert(addr, fingerprint.clone());
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
             }
-            EmulationEvent::PeerHello { addr, commit } => {
-                // Map the peer's source addr back to its client handle
-                // and stamp the commit. Skip if we don't have an
-                // outgoing client configured for this peer (incoming-
-                // only setup) — there's nowhere to display the version
-                // in that case anyway.
-                if let Some(handle) = self.client_manager.get_client(addr) {
+            EmulationEvent::PeerHello {
+                fingerprint,
+                commit,
+            } => {
+                // Stamp the commit on the device pinned to the certificate
+                // this connection presented. None for an incoming-only
+                // setup: there is nowhere to display the version then.
+                for handle in self.client_manager.pinned_to(&fingerprint) {
                     self.client_manager.set_peer_commit(handle, Some(commit));
                     self.broadcast_client(handle);
                 }
             }
-            EmulationEvent::PeerCaps { addr, flags } => {
-                // Mirror PeerHello: map the peer's addr to its client
-                // handle and record the advertised capability bits. Skip
-                // if there's no outgoing client for this peer.
-                if let Some(handle) = self.client_manager.get_client(addr) {
+            EmulationEvent::PeerCaps { fingerprint, flags } => {
+                // Mirror PeerHello. These bits decide what this machine
+                // sends the device, so a machine that only shares its
+                // address must not set them.
+                for handle in self.client_manager.pinned_to(&fingerprint) {
                     self.client_manager.set_peer_caps(handle, Some(flags));
                     self.broadcast_client(handle);
                 }
@@ -969,16 +1748,29 @@ impl Service {
                 }
             }
             ICaptureEvent::CaptureDisabled => {
-                self.capture_status = Status::Disabled;
-                self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
+                self.permission_watch.stopped(Side::Capture);
+                self.capture_status = CaptureState::Disabled;
+                self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status.clone()));
             }
             ICaptureEvent::CaptureEnabled => {
-                self.capture_status = Status::Enabled;
-                self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
+                self.permission_watch.started(Side::Capture);
+                self.capture_status = CaptureState::Enabled;
+                self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status.clone()));
+            }
+            ICaptureEvent::CaptureFailed(fault) => {
+                // A backend that was never created never said it stopped.
+                self.permission_watch.stopped(Side::Capture);
+                self.capture_status = CaptureState::Failed(fault);
+                self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status.clone()));
             }
             ICaptureEvent::ClientEntered(handle) => {
                 log::info!("entering client {handle} ...");
                 self.spawn_hook_command(handle);
+            }
+            // The pointer stayed here: say why where the user can see it,
+            // or the machine just seems to ignore the edge (#115).
+            ICaptureEvent::CrossingRefused { handle, reason } => {
+                self.notify_frontend(FrontendEvent::CrossingRefused { handle, reason });
             }
         }
     }
@@ -993,53 +1785,36 @@ impl Service {
     fn handle_discovery_event(&mut self, event: Option<DiscoveryEvent>) {
         let Some(event) = event else { return };
         match event {
-            DiscoveryEvent::Found(peer) => {
-                let key = crate::discovery::peer_key(&peer);
-                let changed = match self.discovered.get_mut(&key) {
-                    // mDNS re-announces constantly, per interface, with
-                    // different address subsets each time. Only a real change
-                    // is worth telling the frontend about.
-                    Some(known) => crate::discovery::merge(known, peer),
-                    None => {
-                        log::info!(
-                            "found {:?} on the local network at {:?}{}",
-                            peer.label,
-                            peer.addrs,
-                            match &peer.claimed_fingerprint {
-                                Some(fp) => format!(" claiming {fp}"),
-                                None => String::new(),
-                            }
-                        );
-                        self.discovered.insert(key, peer);
-                        true
-                    }
+            DiscoveryEvent::Quiet => {
+                let check = if cfg!(target_os = "macos") {
+                    "; if other machines here run hops, check System Settings → Privacy & \
+                     Security → Local Network, where hops must be on"
+                } else {
+                    ""
                 };
-                if !changed {
+                log::warn!("network discovery has heard no other machine since it started{check}");
+                self.discovery_quiet = true;
+            }
+            DiscoveryEvent::Found(peer) => {
+                // Something answered: whatever the list shows, it is not
+                // silence.
+                let was_quiet = std::mem::take(&mut self.discovery_quiet);
+                // mDNS re-announces constantly, per interface, with different
+                // address subsets each time. Only a real change is worth
+                // telling the frontend about.
+                if !self.discovered.found(peer, Instant::now()) && !was_quiet {
                     return;
                 }
             }
-            DiscoveryEvent::Lost(label) => {
-                // Filed by fingerprint, but withdrawn by name — so find the
-                // entry whose label matches rather than assuming the key.
-                // Compare BASE labels: mDNS can announce a peer as `name` and
-                // withdraw it as `name (2)`, and a raw comparison then never
-                // matches, leaving the row on screen forever.
-                let want = crate::discovery::base_label(&label);
-                let key = self
-                    .discovered
-                    .iter()
-                    .find(|(_, p)| crate::discovery::base_label(&p.label) == want)
-                    .map(|(k, _)| k.clone());
-                match key.and_then(|k| self.discovered.remove(&k)) {
-                    Some(p) => {
-                        log::info!(
-                            "{:?} stopped announcing itself on the local network",
-                            p.label
-                        )
-                    }
-                    None => return,
+            DiscoveryEvent::Lost(label) => match self.discovered.lost(&label) {
+                Some(p) => {
+                    log::info!(
+                        "{:?} stopped announcing itself on the local network",
+                        p.label
+                    )
                 }
-            }
+                None => return,
+            },
         }
         self.publish_discovered();
     }
@@ -1058,17 +1833,11 @@ impl Service {
         let trust = self.trust.read().expect("lock");
         let peers: Vec<DiscoveredDevice> = self
             .discovered
-            .values()
+            .iter()
             .filter(|p| match &p.claimed_fingerprint {
-                // `has_live_lease`, so a device whose lease lapsed reappears
-                // as discoverable and can be re-added. An expelled one does
-                // not: `is_known` would hide it forever, and it must stay
-                // visible so the user can see it is gone.
-                Some(fp) => {
-                    !configured.contains(fp)
-                        && !trust.has_live_lease(fp)
-                        && trust.denial(fp).is_none()
-                }
+                // `has_live_lease`, so a device whose lease lapsed, or that
+                // was removed, reappears as discoverable and can be re-added.
+                Some(fp) => !configured.contains(fp) && !trust.has_live_lease(fp),
                 None => true,
             })
             .map(|p| DiscoveredDevice {
@@ -1081,6 +1850,7 @@ impl Service {
         self.notify_frontend(FrontendEvent::Discovered {
             active: self.discovery.is_some(),
             peers,
+            quiet: self.discovery_quiet,
         });
     }
 
@@ -1098,10 +1868,15 @@ impl Service {
                     // name left the card reading "unresolved" forever with the
                     // reason visible only in the log, so the user's model was
                     // "hops is still thinking about it".
-                    self.notify_frontend(FrontendEvent::Error(format!(
-                        "Could not find \"{hostname}\" on the network. \
-                         Check the spelling, or use its IP address."
-                    )));
+                    if self
+                        .refusal_notices
+                        .due(handle, NOT_RESOLVED, Instant::now())
+                    {
+                        self.notify_frontend(FrontendEvent::Error(format!(
+                            "Could not find \"{hostname}\" on the network. \
+                             Check the spelling, or use its IP address."
+                        )));
+                    }
                 }
                 let ips = ips.unwrap_or_default();
                 self.client_manager.set_dns_ips(handle, ips);
@@ -1118,6 +1893,9 @@ impl Service {
     }
 
     fn sync_frontend(&mut self) {
+        // First, before any state: a frontend that receives state without it
+        // knows this daemon predates the event, and so is another build.
+        self.notify_frontend(FrontendEvent::DaemonBuild(crate::config::this_build()));
         self.publish_pairing_window();
         self.enumerate();
         // Tell a newly-attached frontend whether we are LOOKING, before anything
@@ -1128,56 +1906,28 @@ impl Service {
         // the silence #141 set out to remove; the render was fixed and the
         // publish was not.
         self.publish_discovered();
-        self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
-        self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
+        self.notify_frontend(FrontendEvent::EmulationStatus(
+            self.emulation_status.clone(),
+        ));
+        self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status.clone()));
+        // Before the port: a machine that only dials out binds none, and its
+        // configured port is not one anything can reach (#15).
+        self.notify_frontend(FrontendEvent::Listening(self.listening));
         self.notify_frontend(FrontendEvent::PortChanged(self.port, None));
+        // A frontend that attaches while a trust change is still unsaved is
+        // told, or the only notice went to no one.
+        let unsaved = self.trust_saver.pending_notice();
+        self.tell_trust_saved(unsaved);
+        if let Some(forgotten) = self.forgotten_at_start.clone() {
+            self.notify_frontend(FrontendEvent::Error(forgotten));
+        }
         self.notify_frontend(FrontendEvent::PublicKeyFingerprint(
             self.public_key_fingerprint.clone(),
         ));
-        // this device's own shareable pairing code: its fingerprint + routable
-        // LAN IPv4 addresses + hostname label (empty if there's no shareable
-        // address). IPv4 only — IPv6 link-local is scope-dependent and useless
-        // out-of-band. See hops_ipc::pairing.
-        let pairing_code = {
-            let addrs: Vec<SocketAddr> = if_addrs::get_if_addrs()
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|iface| match iface.ip() {
-                    std::net::IpAddr::V4(v4)
-                        if !v4.is_loopback()
-                            && !v4.is_link_local()
-                            && !v4.is_unspecified()
-                            && !v4.is_broadcast() =>
-                    {
-                        Some(SocketAddr::new(std::net::IpAddr::V4(v4), self.port))
-                    }
-                    _ => None,
-                })
-                .take(8) // matches hops_ipc::pairing MAX_ADDRS
-                .collect();
-            if addrs.is_empty() {
-                String::new()
-            } else {
-                let label = hostname::get()
-                    .ok()
-                    .and_then(|h| h.into_string().ok())
-                    .unwrap_or_default();
-                hops_ipc::PairingCode {
-                    fingerprint: self.public_key_fingerprint.clone(),
-                    addrs,
-                    label,
-                }
-                .encode()
-            }
-        };
-        self.notify_frontend(FrontendEvent::PairingCode(pairing_code));
-        // Derived from LIVE inbound leases only. Anything looser makes the
-        // frontend claim a machine can drive you when its lease has lapsed.
-        let (keys, tombstones) = self.trust.read().expect("lock").config_cache();
-        self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
-        // a freshly-attached frontend must learn the denylist too, or it renders
-        // revoked devices as strangers until the next change
-        self.notify_frontend(FrontendEvent::RevokedUpdated(tombstones));
+        // A freshly-attached frontend must learn the denylist and each
+        // pairing's clipboard too, or it renders revoked devices as strangers
+        // and every switch as unknown until the next change.
+        self.publish_trust();
         // re-emit current incoming connections so a freshly-attached UI knows
         // which trusted peers are connected right now, not just from future events
         let connected: Vec<(SocketAddr, String)> = self
@@ -1187,6 +1937,23 @@ impl Service {
             .collect();
         for (addr, fingerprint) in connected {
             self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
+        }
+        // Last, after the trusted set: a frontend drops a prompt for a machine
+        // it believes is already trusted.
+        self.replay_pending_attempts();
+        // and a number on screen here, or the attaching app shows none (#167)
+        let checks: Vec<(String, Ceremony)> = self
+            .ceremonies
+            .iter()
+            .map(|(fp, c)| (fp.clone(), c.clone()))
+            .collect();
+        for (fingerprint, c) in checks {
+            self.notify_frontend(FrontendEvent::PairingCheck {
+                fingerprint,
+                addr: Some(c.addr),
+                check: c.check(),
+                answered: c.answered,
+            });
         }
     }
 
@@ -1253,59 +2020,383 @@ impl Service {
         self.frontend_event_pending.notify_one();
     }
 
-    fn add_authorized_key(&mut self, desc: String, fp: String) {
-        // Canonicalise BEFORE the tombstone lookup. The check below is an exact
-        // map lookup, so an uppercased spelling of an expelled fingerprint used
-        // to miss it — and `Config::authorized_fingerprints` then folded that
-        // spelling back to canonical form on the next read, resurrecting the
-        // expelled device (issue #67).
-        let Some(fp) = hops_ipc::pairing::canonical_fingerprint(&fp) else {
+    fn add_authorized_key(
+        &mut self,
+        desc: String,
+        fp: String,
+        controller: hops_ipc::Controller,
+        clipboard: bool,
+    ) {
+        // Canonicalise first, so the grant lands on the one record the TLS
+        // doors look up (issue #67).
+        let Some(fp) = hops_ipc::identity::canonical_fingerprint(&fp) else {
             log::warn!("refusing to authorize {fp:?}: not a valid fingerprint");
-            self.notify_frontend(FrontendEvent::Error(
-                "That is not a valid device fingerprint.".to_string(),
-            ));
-            return;
-        };
-        // An expelled fingerprint is DEAD. There is deliberately no path from
-        // revoked back to authorized: the record is a tombstone, not a pause.
-        // Re-establishing a deleted device means that machine presenting a NEW
-        // identity and pairing from scratch — "the whole point of issuing new
-        // keys". Refusing here closes the last laundering route, since
-        // raise_connection_attempt already prevents a revoked peer prompting.
-        let expelled = self.trust.read().expect("lock").denial(&fp).cloned();
-        if let Some(entry) = expelled {
-            log::warn!(
-                "refusing to authorize {fp}: it was expelled as {:?}. That identity \
-                 is permanently dead — the device must present a new one.",
-                entry.label
-            );
             self.notify_frontend(FrontendEvent::Error(format!(
-                "\"{}\" was removed, and that identity cannot be trusted again. \
-                 Re-install or reset hops on that machine so it generates a new \
-                 identity, then pair it fresh.",
-                entry.label
+                "{}: that is not a valid device fingerprint.",
+                hops_ipc::GRANT_REFUSED
             )));
             return;
-        }
-        // Shaped by how the peer arrived; see `grant_for_attempt`.
-        let origin = self.pending_origin.remove(&fp);
+        };
+        // A device removed here is a stranger again, and is approved like
+        // one: only from a prompt its pairing window admitted, and granting
+        // nothing until both machines confirm the number (#184, #195, #167).
+        // What the card was answered; see `grant_for_attempt`. A prompt whose
+        // pairing window has closed grants nothing.
+        let now = self.pairing_now();
+        let attempt = self.pending_attempts.take(&self.prompt_gate, &fp, now);
+        let origin = attempt.map(|a| a.origin);
         // The lock is taken on one line on purpose: the named-door guard scans
         // for that call, and a chain split across lines drops this door out of
         // its match set without failing anything.
         let issued = {
             let mut trust = self.trust.write().expect("lock");
-            grant_for_attempt(&mut trust, &fp, &desc, origin)
+            grant_for_attempt(&mut trust, &fp, &desc, origin, controller, clipboard)
         };
         if let Err(e) = issued {
             log::warn!("refusing to authorize {fp}: {e}");
+            // Said to the frontend too: a refusal only the log knew about let
+            // `hops cli authorize-key` report success for a grant never made.
+            // Every refusal of a grant begins with GRANT_REFUSED, which is how
+            // the command tells one from any other notice.
+            let why = match e {
+                GrantRefused::NoAttempt => "no pairing request from that device is waiting. \
+                     A request can be approved only until the pairing window that \
+                     admitted it closes. Open add device, connect from that device, \
+                     then approve it."
+                    .to_string(),
+                GrantRefused::Store(e) => e.to_string(),
+            };
+            self.notify_frontend(FrontendEvent::Error(format!(
+                "{}: {why}",
+                hops_ipc::GRANT_REFUSED
+            )));
             return;
         }
-        self.persist_trust();
-        let (keys, _) = self.trust.read().expect("lock").config_cache();
-        self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+        // Named by the label the store kept: it sanitises at the door.
+        let (stored, pairing) = {
+            let trust = self.trust.read().expect("lock");
+            (trust.label(&fp).unwrap_or_default(), trust.is_pairing(&fp))
+        };
+        if pairing {
+            // A new pairing: it grants nothing until the number is confirmed
+            // on both machines, and it must start within the window (#167).
+            log::info!(
+                "approved {}: pairing finishes once both machines confirm the number",
+                named(&stored, &fp)
+            );
+            self.approved.insert(
+                fp.clone(),
+                Approved {
+                    at: Instant::now(),
+                    addr: attempt.and_then(|a| a.addr),
+                    knocked: origin == Some(AttemptOrigin::Inbound),
+                },
+            );
+        }
+        self.persist_trust(format!("trusting {}", named(&stored, &fp)));
+        self.publish_trust();
     }
 
-    /// Refuse a trust GRANT while a peer is driving this machine's input.
+    /// A dial that ended in a way the person here may need telling about.
+    ///
+    /// Each refusal was caused by someone at this machine, crossing to the
+    /// device or adding it, so each is an error they can act on (#150, #171),
+    /// once a minute per device at most. The exception is a device being
+    /// added: the machine it names may simply not have approved this one yet,
+    /// which is the expected state of a pairing in progress, so that is
+    /// activity until adding ends, and adding says so if it runs out of time.
+    fn handle_dial_refusal(&mut self, refusal: DialRefusal) {
+        let now = Instant::now();
+        match refusal {
+            DialRefusal::Untrusted {
+                fingerprint: fp,
+                addr,
+            } => {
+                // only prompt if it really is untrusted — a racing dial can
+                // report a fingerprint that was authorized in the meantime
+                let known = self.trust.read().expect("lock").we_may_drive(&fp);
+                if !known {
+                    log::info!("untrusted receiver {fp} — raising an approval prompt");
+                    // On one line: the provenance guard reads the call's line.
+                    self.raise_connection_attempt(fp, AttemptOrigin::OutboundDial, Some(addr));
+                }
+            }
+            DialRefusal::PairAgain {
+                handle,
+                fingerprint,
+                addr,
+            } => {
+                self.pin_to_listed(handle, &fingerprint, addr);
+                // Then told as any dial to it is: it must be paired again.
+                self.handle_dial_refusal(DialRefusal::Untrusted { fingerprint, addr });
+            }
+            DialRefusal::RefusedByPeer {
+                handle,
+                fingerprint,
+                addr,
+            } => {
+                // The name it was given here, even by an approval still
+                // waiting for its number: unlike `device_name`, which will not
+                // call an unconfirmed approval a pairing, this notice is about
+                // that very approval, and the name is the one just typed. A
+                // refusal can also arrive before the device is pinned to the
+                // machine that answered.
+                let label = self.trust.read().expect("lock").label(&fingerprint);
+                let name = label
+                    .filter(|l| !l.is_empty())
+                    .unwrap_or_else(|| self.device_name(handle));
+                if self.adding.contains_key(&handle) {
+                    if self.refusal_notices.due(handle, "waiting", now) {
+                        self.notify_frontend(FrontendEvent::Activity(format!(
+                            "Waiting for {name} to approve this machine: open add device on \
+                             {name} to see its request."
+                        )));
+                    }
+                } else if self.refusal_notices.due(handle, "refused", now) {
+                    log::warn!("{name} at {addr} refused this machine");
+                    self.notify_frontend(FrontendEvent::Error(format!(
+                        "{name} refused the connection: it does not let this machine control \
+                         it. To pair again, open add device on {name}, then move the pointer \
+                         across again."
+                    )));
+                }
+            }
+            DialRefusal::Forgotten {
+                handle,
+                fingerprint,
+                addr,
+            } => {
+                // Refused as a machine it holds no pairing with, by a machine
+                // this one holds a pairing with: it removed this machine
+                // (#184). Not while adding it, when it may simply not have
+                // approved this one yet, and not for a machine this one never
+                // paired with, whose refusal says nothing new.
+                let paired = {
+                    let trust = self.trust.read().expect("lock");
+                    trust.is_known(&fingerprint) && !trust.is_pairing(&fingerprint)
+                };
+                if self.adding.contains_key(&handle) || !paired {
+                    self.handle_dial_refusal(DialRefusal::RefusedByPeer {
+                        handle,
+                        fingerprint,
+                        addr,
+                    });
+                    return;
+                }
+                // The card says so and offers to remove it, rather than this
+                // machine deleting its own pairing unasked: that is harder to
+                // make sense of than a card that asks.
+                if self.client_manager.set_removed_by_peer(handle, true) {
+                    self.broadcast_client(handle);
+                }
+                if self.refusal_notices.due(handle, "removed", now) {
+                    let name = self.device_name(handle);
+                    log::warn!("{name} at {addr} ({fingerprint}) no longer trusts this machine");
+                    self.notify_frontend(FrontendEvent::Error(format!(
+                        "{name} no longer trusts this machine: it removed this machine. Remove \
+                         {name} here; to use it again, pair the two machines again."
+                    )));
+                }
+            }
+            DialRefusal::RemovedBy {
+                handle: _,
+                fingerprint,
+            } => self.forget_machine_that_removed_this_one(fingerprint),
+            DialRefusal::NotThePinnedMachine { handle, seen } => {
+                if !self.refusal_notices.due(handle, "not-pinned", now) {
+                    return;
+                }
+                let name = self.device_name(handle);
+                let answered = seen.first().map(|(addr, fp)| {
+                    let label = self.trust.read().expect("lock").label(fp);
+                    (
+                        addr.ip().to_string(),
+                        label
+                            .filter(|l| !l.is_empty())
+                            .unwrap_or_else(|| "another paired machine".to_owned()),
+                    )
+                });
+                let (addr, other) = answered.unwrap_or_else(|| {
+                    (
+                        "Its address".to_owned(),
+                        "another paired machine".to_owned(),
+                    )
+                });
+                self.notify_frontend(FrontendEvent::Error(format!(
+                    "{addr} answered for {name} as {other}, so hops did not connect to it. \
+                     Check {name}'s address or hostname."
+                )));
+            }
+            DialRefusal::WontDrive {
+                handle,
+                fingerprint,
+                addr,
+            } => {
+                if !self.refusal_notices.due(handle, "wont-drive", now) {
+                    return;
+                }
+                let name = self.device_name(handle);
+                log::warn!("{name} at {addr} ({fingerprint}) refused to control this machine");
+                self.notify_frontend(FrontendEvent::Error(format!(
+                    "{name} refused this machine's connection: it holds no pairing that lets \
+                     it control this machine. To pair again, open add device on {name}."
+                )));
+            }
+            DialRefusal::OlderVersion { handle, addr } => {
+                if !self.refusal_notices.due(handle, "older-version", now) {
+                    return;
+                }
+                let name = self.device_name(handle);
+                log::warn!("{name} at {addr} runs hops v0.12 or earlier");
+                self.notify_frontend(FrontendEvent::Error(format!(
+                    "{name} runs hops v0.12 or earlier, which this version cannot connect to: \
+                     v0.13 listens on port {} and lets a controlled machine dial out. Update \
+                     hops on {name}.",
+                    hops_ipc::DEFAULT_PORT
+                )));
+            }
+            DialRefusal::NotResolved { handle, hostname } => {
+                // A lookup the dial-out started before the device was
+                // renamed says nothing about the name it has now. Told, it
+                // names a name the person has already changed, and takes
+                // the one notice the new name gets.
+                if self.client_manager.get_hostname(handle).as_deref() != Some(hostname.as_str()) {
+                    log::debug!("client {handle}: {hostname} is no longer its name");
+                    return;
+                }
+                if !self.refusal_notices.due(handle, NOT_RESOLVED, now) {
+                    return;
+                }
+                let name = self.device_name(handle);
+                log::warn!("{name}: {hostname} resolves to no address to dial");
+                self.notify_frontend(FrontendEvent::Error(format!(
+                    "Could not find \"{hostname}\" on the network, so this machine cannot dial \
+                     {name}. hops keeps looking. Check the spelling, or use its IP address."
+                )));
+            }
+            DialRefusal::OldPort { handle, addr } => {
+                if !self.refusal_notices.due(handle, "old-port", now) {
+                    return;
+                }
+                let name = self.device_name(handle);
+                log::warn!("{name} answers only at {addr}, the port hops used before v0.13");
+                self.notify_frontend(FrontendEvent::Error(format!(
+                    "{name} listens on port {}, the port hops used before v0.13, and this \
+                     machine dials it on {}. Remove the port line from {name}'s config.toml, \
+                     or set this device's port to {}.",
+                    addr.port(),
+                    hops_ipc::DEFAULT_PORT,
+                    addr.port()
+                )));
+            }
+            DialRefusal::Conflict { handle, .. } => {
+                if !self.refusal_notices.due(handle, "conflict", now) {
+                    return;
+                }
+                let name = self.device_name(handle);
+                self.notify_frontend(FrontendEvent::Error(format!(
+                    "{name}'s addresses answered as different machines, so hops connected to \
+                     none of them. Check that its address or hostname reaches {name} only."
+                )));
+            }
+        }
+    }
+
+    /// A machine this one may drive dialled it to be driven (#15). Its link
+    /// goes to the device pinned to that machine, found by the fingerprint it
+    /// proved and never by the address it came from. A machine with no
+    /// device here gets one, pinned to it and with no address: only its own
+    /// dial reaches it.
+    fn handle_dialled_in(&mut self, dialled: crate::listen::DialledIn) {
+        let fp = dialled.fingerprint.clone();
+        let handle = match self.client_manager.every_pinned_to(&fp).first() {
+            Some(&handle) => handle,
+            None => self.add_device_that_dials_us(&fp),
+        };
+        let adopter = self.adopter.clone();
+        tokio::task::spawn_local(async move {
+            adopter.adopt(handle, dialled).await;
+        });
+    }
+
+    /// A device for the machine `fp`, which dials this one to be driven by
+    /// it and has no device here: named as its pairing is, at the first
+    /// free edge, and switched on. With every edge taken it is added
+    /// switched off, and the person told, rather than taking another
+    /// device's edge.
+    fn add_device_that_dials_us(&mut self, fp: &str) -> ClientHandle {
+        let label = self
+            .trust
+            .read()
+            .expect("lock")
+            .label(fp)
+            .filter(|l| !l.is_empty());
+        let handle = self.client_manager.add_client();
+        if let Err(other) = self.client_manager.pin(handle, fp.to_string()) {
+            log::warn!("client {handle}: {fp} is already client {other}'s machine");
+        }
+        self.client_manager.set_label(handle, label);
+        self.client_manager.set_dials_us(handle, true);
+        let free = [
+            Position::Right,
+            Position::Left,
+            Position::Top,
+            Position::Bottom,
+        ]
+        .into_iter()
+        .find(|&pos| self.client_manager.client_at(pos).is_none());
+        if let Some(pos) = free {
+            self.client_manager.set_pos(handle, pos);
+        }
+        log::info!("added client {handle} for {fp}, which dials this machine to be driven");
+        if let Some((c, s)) = self.client_manager.get_state(handle) {
+            self.notify_frontend(FrontendEvent::Created(handle, c, s));
+        }
+        match free {
+            Some(_) => self.activate_client(handle),
+            None => {
+                let name = self.device_name(handle);
+                self.notify_frontend(FrontendEvent::Error(format!(
+                    "{name} connected to be controlled from this machine, and every edge is \
+                     in use, so it was added switched off. Move a device to free an edge, \
+                     then switch {name} on."
+                )));
+            }
+        }
+        self.save_config();
+        handle
+    }
+
+    /// What to call device `handle` in a notice: the name it was paired
+    /// under, else its hostname, else its first address.
+    fn device_name(&self, handle: ClientHandle) -> String {
+        let Some((config, state)) = self.client_manager.get_state(handle) else {
+            return format!("device {handle}");
+        };
+        // The name the user gave it (#13), then the paired machine's label,
+        // then where it is dialled. An approval whose number nobody confirmed
+        // yet is not a pairing, so its label is not the name it was paired
+        // under (#167).
+        self.client_manager
+            .get_label(handle)
+            .or_else(|| {
+                state.peer_fingerprint.and_then(|fp| {
+                    let trust = self.trust.read().expect("lock");
+                    if trust.lease(&fp).is_some_and(|l| !l.confirmed) {
+                        return None;
+                    }
+                    trust.label(&fp)
+                })
+            })
+            .filter(|l| !l.is_empty())
+            .or(config.hostname)
+            .or_else(|| config.fix_ips.first().map(|ip| ip.to_string()))
+            .unwrap_or_else(|| format!("device {handle}"))
+    }
+
+    /// Refuse a request that WIDENS trust, a grant, confirming a pairing's
+    /// number or turning a clipboard on, while a peer is driving this
+    /// machine's input (#107, #167).
     ///
     /// On a KVM the pointer is not proof of local presence: a peer that still
     /// holds control can move the cursor onto an approval button and click it,
@@ -1314,58 +2405,162 @@ impl Service {
     /// the only usable check is one this machine makes against state only it
     /// holds — and it already knows when it is being driven.
     ///
+    /// Driven means a peer is crossed onto this machine or holds a key or
+    /// button down here, and for `QUIET` after its last input, after what it
+    /// held was let go, or after it left. Its last event alone is not enough:
+    /// a held key repeats here with nothing more sent, and a held button comes
+    /// up at the end of its session, completing a click (see
+    /// `emulation::Driven`).
+    ///
     /// Deliberately NOT applied to revocation: refusing to let you revoke while a
     /// peer is driving you would block the one action you most need in exactly
     /// the moment you need it.
-    fn refuse_while_remotely_driven(&mut self, what: &str) -> bool {
+    ///
+    /// The notice begins with `refused`, which says what did not happen, and
+    /// says what ends the refusal: a peer crossed in keeps it however long it
+    /// sits idle, so this machine's own mouse is refused too until the pointer
+    /// goes back.
+    fn refuse_while_remotely_driven(&mut self, refused: &str, what: &str) -> bool {
         const QUIET: std::time::Duration = std::time::Duration::from_secs(2);
         if !self.emulation.remotely_driven_within(QUIET) {
             return false;
         }
         log::warn!("refusing to {what} — this machine is being driven by a peer right now");
         self.notify_frontend(FrontendEvent::Error(format!(
-            "Refused to {what}: this machine is being controlled remotely. \
-             Use its own keyboard and mouse, then try again."
+            "{refused}: this machine is being controlled remotely, so it refused to \
+             {what}. Move the pointer back to the machine controlling it, then try \
+             again with this machine's own keyboard and mouse."
         )));
         true
     }
 
+    /// Pin device `handle`, pinned to no machine, to `fp`, a machine listed
+    /// to pair again that answered the device's dial at `addr` and proved its
+    /// key there (#231). The device's card and the listing are then one card,
+    /// as one machine is (#12).
+    ///
+    /// The pin is a measured identity and grants nothing. Every permission is
+    /// asked of the trust store by fingerprint, and the store lists that
+    /// machine with no lease; the pin only says which machine the device's
+    /// address reached, and the dial checks it, failing closed. Pairing it
+    /// again through the card grants what the pairing card asks.
+    fn pin_to_listed(&mut self, handle: ClientHandle, fp: &str, addr: SocketAddr) {
+        let may = may_pin_to_listed(
+            &self.client_manager,
+            &self.trust.read().expect("lock"),
+            handle,
+            fp,
+            addr,
+        );
+        if !may {
+            return;
+        }
+        match self.client_manager.pin(handle, fp.to_string()) {
+            Ok(true) => {
+                log::info!(
+                    "client {handle}: {addr} is {fp}, listed to pair again; pinned to it, \
+                     granting nothing"
+                );
+                self.save_config();
+                self.broadcast_client(handle);
+            }
+            Ok(false) => {}
+            Err(other) => log::info!(
+                "client {handle}: {addr} is {fp}, which client {other} is already pinned to"
+            ),
+        }
+    }
+
+    /// The name `fp` was listed under, when a build before the trust store
+    /// paired it and it has not been paired since (#231).
+    fn pair_again_name(&self, fp: &str) -> Option<String> {
+        let trust = self.trust.read().expect("lock");
+        let listed = trust.to_pair_again(fp)?;
+        Some(if listed.label.trim().is_empty() {
+            format!("the machine {}", fp.get(..8).unwrap_or(fp))
+        } else {
+            listed.label.clone()
+        })
+    }
+
+    /// What this machine holds for `fp`, for a line about refusing it, when
+    /// it holds a pairing in force with it. One whose pairing lapsed knocks
+    /// as a stranger and pairs again through add device, so it is told as
+    /// one.
+    fn paired_here(&self, fp: &str) -> Option<crate::prompt_gate::PairedHere> {
+        let (name, controlled_from_here) = {
+            let trust = self.trust.read().expect("lock");
+            if !trust.has_live_lease(fp) {
+                return None;
+            }
+            (trust.label(fp).unwrap_or_default(), trust.we_may_drive(fp))
+        };
+        let devices = self.client_manager.every_pinned_to(fp);
+        let switched_off =
+            !devices.is_empty() && devices.iter().all(|&h| !self.client_manager.is_on(h));
+        let name = match devices.first() {
+            Some(&h) if name.trim().is_empty() => self.device_name(h),
+            _ if name.trim().is_empty() => format!("the machine {}", fp.get(..8).unwrap_or(fp)),
+            _ => name,
+        };
+        Some(crate::prompt_gate::PairedHere {
+            name,
+            controlled_from_here,
+            switched_off,
+        })
+    }
+
     /// The ONLY path from an approval prompt to the allowlist.
     ///
-    /// A revoked fingerprint is dropped here with a log line and no UI event, so
-    /// a peer that reconnects after being expelled cannot put a dialog on the
-    /// user's screen. That is the whole mechanism: revocation cannot keep an
-    /// attacker out (it can re-key), but it can stop it choosing the moment you
-    /// are asked to let it back in.
+    /// A machine removed here knocks as a stranger, and like any stranger it
+    /// raises a prompt only while someone here has add device open (#195):
+    /// it cannot choose the moment the person here is asked (#184).
     fn raise_connection_attempt(
         &mut self,
         fingerprint: String,
         origin: AttemptOrigin,
         addr: Option<SocketAddr>,
     ) {
-        if let Some(entry) = self
-            .trust
-            .read()
-            .expect("lock")
-            .denial(&fingerprint)
-            .cloned()
-        {
-            log::warn!(
-                "ignoring a connection attempt from removed device {:?} ({fingerprint}) — \
-                 that identity is permanently dead; the machine must present a new one",
-                entry.label
-            );
+        // Approved here already, and waiting for its number: the request was
+        // answered, and a second prompt for it would only confuse (#167).
+        if self.trust.read().expect("lock").is_pairing(&fingerprint) {
+            log::debug!("{fingerprint} is mid-pairing here; no prompt for its {origin:?} attempt");
             return;
         }
-        let now = Instant::now();
-        match self.prompt_gate.admit(&fingerprint, now) {
+        let now = self.pairing_now();
+        // Only a knock is counted against its address: this machine's own dial
+        // is timed by the person here, not by whoever answers it.
+        let from = addr
+            .filter(|_| origin == AttemptOrigin::Inbound)
+            .map(|a| a.ip());
+        match self.prompt_gate.admit(&fingerprint, from, now) {
             Admit::Prompt => {}
             Admit::Repeat => return,
-            Admit::Closed => {
-                if let Some(line) = self.prompt_gate.note_refusal(&fingerprint, now) {
+            Admit::Throttled => {
+                if let Some(line) = self.prompt_gate.note_throttled(addr, now) {
                     log::info!("{line}");
                 }
-                if origin == AttemptOrigin::OutboundDial {
+                return;
+            }
+            Admit::Closed => match origin {
+                AttemptOrigin::OutboundDial if self.pair_again_name(&fingerprint).is_some() => {
+                    let name = self.pair_again_name(&fingerprint).unwrap_or_default();
+                    log::info!(
+                        "our dial reached {fingerprint} at {addr:?}, paired with an older \
+                         version of hops and not since, and add device is not open"
+                    );
+                    self.notify_frontend(FrontendEvent::Error(format!(
+                        "{name} was paired with an older version of hops and must be paired \
+                         again. Open Add device on both machines, choose which machine \
+                         controls which, then move the pointer across again."
+                    )));
+                    return;
+                }
+                AttemptOrigin::OutboundDial => {
+                    log::info!(
+                        "our dial reached {fingerprint} at {addr:?}, which is not paired with \
+                         this machine, and add device is not open"
+                    );
                     // Our own dial reached a machine we are not paired with, so the
                     // person at this one can act on it; a stranger knocking cannot.
                     self.notify_frontend(FrontendEvent::Error(format!(
@@ -1373,30 +2568,81 @@ impl Service {
                          machines, then move the pointer across again.",
                         addr.map_or_else(|| "That device".to_owned(), |a| a.to_string())
                     )));
+                    return;
                 }
-                return;
+                AttemptOrigin::Inbound => {
+                    // Nobody here asked for this, and a stranger can cause it at
+                    // will: a summarised line in the activity log, never the
+                    // error banner (#150, #171).
+                    if let Some(mut refused) =
+                        self.prompt_gate.note_refusal(&fingerprint, addr, now)
+                    {
+                        refused.paired = self.paired_here(&fingerprint);
+                        refused.pair_again = self.pair_again_name(&fingerprint);
+                        log::info!("{}", refused.log_line());
+                        self.notify_frontend(FrontendEvent::Activity(refused.notice()));
+                    }
+                    return;
+                }
+            },
+        }
+        match origin {
+            AttemptOrigin::OutboundDial => {
+                // Say so. A console verb can cause this, and a prompt the console
+                // summoned must not look like a peer knocking (#61).
+                log::info!(
+                    "{fingerprint} at {addr:?} was reached by OUR OWN dial, not by an \
+                     unsolicited connection — the prompt will say so, and will show the \
+                     address so it can be compared with the one that was typed"
+                );
+            }
+            AttemptOrigin::Inbound => {
+                // In the log as well as on screen: with no frontend attached,
+                // this line is the only place the request appears (#114).
+                if let Some(unlogged) = self.prompt_gate.note_admitted(now) {
+                    let from =
+                        addr.map_or_else(|| "an unknown address".to_owned(), |a| a.to_string());
+                    let more = if unlogged > 0 {
+                        format!(" ({unlogged} more requests since the last line were not logged)")
+                    } else {
+                        String::new()
+                    };
+                    log::info!(
+                        "pairing request from {from}, fingerprint {fingerprint}: before the \
+                         pairing window closes, approve it in the app or run \
+                         `hops cli authorize-key <name> {fingerprint}`{more}"
+                    );
+                }
             }
         }
-        if origin == AttemptOrigin::OutboundDial {
-            // Say so. A console verb can cause this, and a prompt the console
-            // summoned must not look like a peer knocking (#61).
-            log::info!(
-                "{fingerprint} at {addr:?} was reached by OUR OWN dial, not by an \
-                 unsolicited connection — the prompt will say so, and will show the \
-                 address so it can be compared with the one that was typed"
-            );
-        }
         // Remembered so the grant door mints the capability that matches how
-        // this peer actually arrived, rather than a fixed one.
-        if self.pending_origin.len() >= crate::transport::MAX_PENDING_ATTEMPTS {
-            self.pending_origin.clear();
-        }
-        self.pending_origin.insert(fingerprint.clone(), origin);
+        // this peer actually arrived, rather than a fixed one, and so a frontend
+        // that attaches later is shown it.
+        self.pending_attempts
+            .hold(&self.prompt_gate, fingerprint.clone(), origin, addr, now);
         self.notify_frontend(FrontendEvent::ConnectionAttempt {
             fingerprint,
             origin,
             addr,
         });
+    }
+
+    /// Show a newly attached frontend the prompts raised before it attached.
+    ///
+    /// Without this, a request that arrived while no frontend was connected,
+    /// or while one was reconnecting, was never shown to anyone (#114). Only
+    /// prompts the gate admitted are held, and only those it would still allow
+    /// on screen now are shown again.
+    fn replay_pending_attempts(&mut self) {
+        let now = self.pairing_now();
+        let replay = self.pending_attempts.replay(&self.prompt_gate, now);
+        for (fingerprint, attempt) in replay {
+            self.notify_frontend(FrontendEvent::ConnectionAttempt {
+                fingerprint,
+                origin: attempt.origin,
+                addr: attempt.addr,
+            });
+        }
     }
 
     /// Tear down every live session with `fp`, in both directions.
@@ -1413,11 +2659,7 @@ impl Service {
     /// verb, used by removal, where everything goes.
     fn cut_sessions_dir(&mut self, fp: &str, lost: crate::trust::Caps) {
         use crate::trust::Caps;
-        let handles = if lost.contains(Caps::I_MAY_DRIVE) {
-            self.client_manager.handles_with_fingerprint(fp)
-        } else {
-            Vec::new()
-        };
+        let cut_outbound = lost.contains(Caps::I_MAY_DRIVE);
         let cut_inbound = lost.contains(Caps::DRIVE_ME);
         let (inbound, outbound, peer) = (
             self.revoke_listen.clone(),
@@ -1430,7 +2672,11 @@ impl Service {
             } else {
                 0
             };
-            let cut_out = outbound.close_handles(&handles).await;
+            let cut_out = if cut_outbound {
+                outbound.close_fingerprint(&peer).await
+            } else {
+                0
+            };
             if cut_in + cut_out > 0 {
                 log::warn!(
                     "{peer}: lease lapsed, cut {cut_in} incoming + {cut_out} outgoing session(s)"
@@ -1440,9 +2686,14 @@ impl Service {
     }
 
     fn cut_sessions(&mut self, fp: &str) {
-        // Resolve the handles first: clear_pins_matching erases the fingerprint
-        // that the outbound match is made on.
-        let handles = self.client_manager.handles_with_fingerprint(fp);
+        // A pairing under way with it ends too: its connection is in no list
+        // the revokers below reach (#167).
+        self.end_ceremony(fp);
+        // Outbound links are found by the certificate each one proved, not by
+        // which device points at it: by the time this runs the device may be
+        // deleted, re-addressed, or replaced by a reload, and a lookup by
+        // device then closed nothing while the revoked machine kept its link
+        // and its clipboard.
         let (inbound, outbound, revoked) = (
             self.revoke_listen.clone(),
             self.revoke_conn.clone(),
@@ -1450,7 +2701,7 @@ impl Service {
         );
         tokio::task::spawn_local(async move {
             let cut_in = inbound.close_fingerprint(&revoked).await;
-            let cut_out = outbound.close_handles(&handles).await;
+            let cut_out = outbound.close_fingerprint(&revoked).await;
             if cut_in + cut_out > 0 {
                 log::warn!(
                     "revoked {revoked}: cut {cut_in} incoming + {cut_out} outgoing session(s)"
@@ -1467,7 +2718,7 @@ impl Service {
     /// rename from a trust grant, and a console that should only be able to
     /// relabel had, in practice, the ability to authorize.
     fn set_label(&mut self, fp: String, label: String) {
-        let Some(fp) = hops_ipc::pairing::canonical_fingerprint(&fp) else {
+        let Some(fp) = hops_ipc::identity::canonical_fingerprint(&fp) else {
             log::warn!("refusing to relabel {fp:?}: not a valid fingerprint");
             return;
         };
@@ -1491,26 +2742,41 @@ impl Service {
             log::warn!("refusing to relabel {fp}: {e}");
             return;
         }
-        self.persist_trust();
-        let (keys, _) = self.trust.read().expect("lock").config_cache();
-        self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+        let stored = self
+            .trust
+            .read()
+            .expect("lock")
+            .label(&fp)
+            .unwrap_or_default();
+        self.persist_trust(format!("renaming a device to {}", named(&stored, &fp)));
+        self.publish_trust();
     }
 
     fn remove_authorized_key(&mut self, fp: String) {
-        // Canonicalise here too, or a tombstone can be written under a spelling
-        // that `add_authorized_key` will never match (issue #67). An invalid
-        // fingerprint is still tombstoned under its lowercased form rather than
-        // dropped: refusing to revoke is the more dangerous failure.
-        let fp = hops_ipc::pairing::canonical_fingerprint(&fp)
+        // Canonicalise here too, so the removal finds the record the grant
+        // door wrote under any spelling (issue #67).
+        let fp = hops_ipc::identity::canonical_fingerprint(&fp)
             .unwrap_or_else(|| fp.trim().to_lowercase());
-        // One verb, and it is permanent for this key. The store keeps the
-        // expulsion so the peer is not a stranger again on its next dial — that
-        // is how a removal ended up one click from undone — and stamps it from
-        // the floored clock rather than a raw `SystemTime::now()`, so a
-        // backdated system clock cannot write a tombstone into the past.
-        let label = self.trust.write().expect("lock").revoke(&fp);
-        log::warn!("removed {label:?} ({fp}) — that identity is permanently dead");
-        self.persist_trust();
+        // Removing a device forgets it: its lease, its name and every other
+        // record of it go, and nothing is kept to undo (#184). It returns only
+        // by pairing again in full. A prompt it raised and nobody answered
+        // goes too, and so does an approval here still waiting for its
+        // number: what its card answered is on the lease, and the approval
+        // itself must not outlive it (#220).
+        let label = {
+            let trust = self.trust.read().expect("lock");
+            trust
+                .label(&fp)
+                .or_else(|| trust.to_pair_again(&fp).map(|p| p.label.clone()))
+                .unwrap_or_default()
+        };
+        self.trust.write().expect("lock").forget(&fp);
+        self.pending_attempts.forget(&fp);
+        self.approved.remove(&fp);
+        log::warn!("removed {label:?} ({fp}): this machine keeps no record of it");
+        self.persist_trust(format!("removing {}", named(&label, &fp)));
+        // Its links close as they are cut, and the machine at the other end
+        // is told it was removed as they do (`transport::REMOVED`).
         self.cut_sessions(&fp);
         // Revoking trust in a fingerprint releases any outbound pin on it, so a
         // client whose receiver re-keyed (e.g. reinstall) can re-learn + re-pin
@@ -1519,9 +2785,606 @@ impl Service {
         for h in self.client_manager.clear_pins_matching(&fp) {
             self.broadcast_client(h);
         }
-        let (keys, tombstones) = self.trust.read().expect("lock").config_cache();
+        self.publish_trust();
+    }
+
+    /// The machine that proved `fp` on a live link closed it because it
+    /// removed this machine (#184), so this machine forgets it too: its
+    /// pairing, and every device card pinned to it.
+    ///
+    /// Safe to accept from a peer because it can only take trust away, and
+    /// only its own: the link it came on proved `fp`, and a machine this one
+    /// holds no pairing with changes nothing.
+    fn forget_machine_that_removed_this_one(&mut self, fp: String) {
+        let (known, label) = {
+            let trust = self.trust.read().expect("lock");
+            (trust.is_known(&fp), trust.label(&fp).unwrap_or_default())
+        };
+        if !known {
+            log::debug!("{fp} said it removed this machine, which holds no pairing with it");
+            return;
+        }
+        let gone = self.client_manager.every_pinned_to(&fp);
+        let name = gone
+            .first()
+            .map(|&h| self.device_name(h))
+            .unwrap_or_else(|| named(&label, &fp));
+        log::warn!("{name} ({fp}) removed this machine: removing it here too");
+        self.trust.write().expect("lock").forget(&fp);
+        self.pending_attempts.forget(&fp);
+        // Defensive: an approval waiting for its number is a pairing in
+        // progress, and a removal from that machine reaches this machine as
+        // the pairing ending instead, so this finds nothing to drop today.
+        self.approved.remove(&fp);
+        self.persist_trust(format!(
+            "removing {}, which removed this machine",
+            named(&label, &fp)
+        ));
+        self.cut_sessions(&fp);
+        for handle in gone {
+            self.remove_client(handle);
+        }
+        self.save_config();
+        self.publish_trust();
+        self.notify_frontend(FrontendEvent::Error(format!(
+            "{name} removed this machine, so it was removed here too. To use it again, \
+             pair the two machines again."
+        )));
+    }
+
+    /// Turn a pairing's clipboard off, both ways (#182). The store keeps the
+    /// choice on the lease, so it is saved, survives a restart, and stays off
+    /// when the other direction is approved (#187). A transfer already under
+    /// way is checked again when it completes, so it is not applied either.
+    fn disable_clipboard(&mut self, fp: String) {
+        let Some(fp) = hops_ipc::identity::canonical_fingerprint(&fp) else {
+            log::warn!("refusing to turn the clipboard off for {fp:?}: not a fingerprint");
+            return;
+        };
+        // The lock is taken on one line on purpose: the named-door guard scans
+        // for that call.
+        let changed = self.trust.write().expect("lock").disable_clipboard(&fp);
+        match changed {
+            None => {
+                log::warn!("not turning the clipboard off for {fp}: it is not a paired device");
+                self.notify_frontend(FrontendEvent::Error(
+                    "That device is not paired, so it has no clipboard to turn off.".to_string(),
+                ));
+                return;
+            }
+            // Already off: nothing to save, and every app already shows it.
+            Some(false) => {
+                log::debug!("the clipboard for {fp} is already off");
+                return;
+            }
+            Some(true) => {}
+        }
+        let label = self
+            .trust
+            .read()
+            .expect("lock")
+            .label(&fp)
+            .unwrap_or_default();
+        log::info!("clipboard off for {}", named(&label, &fp));
+        self.persist_trust(format!(
+            "turning the clipboard off for {}",
+            named(&label, &fp)
+        ));
+        self.publish_trust();
+    }
+
+    /// What an attempt a transport holds for a machine mid-pairing said
+    /// (#167).
+    fn handle_pairing_event(&mut self, event: crate::pairing::PairingEvent) {
+        use crate::pairing::PairingEvent;
+        match event {
+            PairingEvent::Number {
+                fingerprint,
+                addr,
+                role,
+                number,
+                handle,
+                attempt,
+                theirs,
+            } => self.show_pairing_number(fingerprint, addr, role, number, handle, attempt, theirs),
+            PairingEvent::PeerConfirmed { fingerprint } => self.settle_pairing(fingerprint),
+            PairingEvent::Ended {
+                fingerprint,
+                why,
+                handle,
+                attempt,
+            } => self.pairing_ended(fingerprint, why, handle, attempt),
+        }
+    }
+
+    /// Both machines arrived at `number`: put it in front of the person here,
+    /// as the number to show or as one of three to pick from (#11).
+    #[allow(clippy::too_many_arguments)]
+    fn show_pairing_number(
+        &mut self,
+        fp: String,
+        addr: SocketAddr,
+        role: crate::pairing::Role,
+        number: String,
+        handle: Option<ClientHandle>,
+        attempt: u64,
+        theirs: Option<crate::pairing::Answer>,
+    ) {
+        use crate::pairing::Role;
+        // The add dial stops once the comparison started: it has its own
+        // deadline from here, and a number shown never moves to another
+        // connection. The approval stays until this attempt finishes or ends.
+        if let Some(h) = handle {
+            self.adding.remove(&h);
+        }
+        // Removed or cancelled here since it was approved: nothing to show.
+        if !self.trust.read().expect("lock").is_pairing(&fp) {
+            log::info!("{fp}: its number arrived after the pairing ended here");
+            self.end_ceremony(&fp);
+            return;
+        }
+        let choices = match role {
+            Role::Show => Vec::new(),
+            Role::Pick => match crate::pairing::choices(&number) {
+                Some(choices) => choices,
+                None => {
+                    log::error!(
+                        "no randomness to offer three numbers; ending the pairing with {fp}"
+                    );
+                    self.end_ceremony(&fp);
+                    self.forget_pairing(&fp);
+                    self.notify_frontend(FrontendEvent::Error(
+                        "Pairing ended: this machine could not draw the random numbers it \
+                         offers to pick from, so nothing was trusted."
+                            .to_string(),
+                    ));
+                    return;
+                }
+            },
+        };
+        let label = self
+            .trust
+            .read()
+            .expect("lock")
+            .label(&fp)
+            .unwrap_or_default();
+        match role {
+            // In the log too: with no app attached, this is where the number is.
+            Role::Show => log::info!(
+                "pairing with {} at {addr}: the number is {number}. Pick it on that \
+                 machine, then confirm it here.",
+                named(&label, &fp)
+            ),
+            Role::Pick => log::info!(
+                "pairing with {} at {addr}: pick the number that machine shows",
+                named(&label, &fp)
+            ),
+        }
+        // Compared once the person here answered, on a connection whose
+        // number both machines then hold: the answer it carried is the other
+        // machine's own (#220).
+        let ours = crate::pairing::Answer::here(&self.trust.read().expect("lock"), &fp);
+        let disagree = ours
+            .zip(theirs)
+            .filter(|(ours, theirs)| !ours.agrees_with(*theirs));
+        let ceremony = Ceremony {
+            role,
+            attempt,
+            number,
+            choices,
+            addr,
+            answered: false,
+            disagree,
+        };
+        let check = ceremony.check();
+        self.ceremonies.insert(fp.clone(), ceremony);
+        self.notify_frontend(FrontendEvent::PairingCheck {
+            fingerprint: fp,
+            addr: Some(addr),
+            check,
+            answered: false,
+        });
+    }
+
+    /// The person here answered the number: the confirm on the machine
+    /// adding, the pick on the one being added (#11). A number other than the
+    /// one this machine arrived at ends the attempt.
+    fn answer_pairing(&mut self, fp: String, number: String) {
+        use crate::pairing::Role;
+        let Some(fp) = hops_ipc::identity::canonical_fingerprint(&fp) else {
+            log::warn!("not answering a pairing for {fp:?}: not a fingerprint");
+            return;
+        };
+        let Some(c) = self.ceremonies.get_mut(&fp) else {
+            self.notify_frontend(FrontendEvent::Error(format!(
+                "{}: no pairing with that device is waiting for its number.",
+                PAIRING_NOT_FINISHED
+            )));
+            return;
+        };
+        if c.answered {
+            return;
+        }
+        if number.trim() != c.number {
+            let role = c.role;
+            log::warn!("pairing with {fp}: the number given is not the one this machine has");
+            self.end_ceremony(&fp);
+            let label = self.forget_pairing(&fp).unwrap_or_default();
+            let name = named(&label, &fp);
+            self.notify_frontend(FrontendEvent::Error(match role {
+                Role::Pick => format!(
+                    "{}: the number picked is not the one {name} shows, so pairing ended. \
+                     Add the device again on both machines to retry.",
+                    PAIRING_NOT_FINISHED
+                ),
+                Role::Show => format!(
+                    "{}: the number confirmed is not the one shown for {name}, so pairing \
+                     ended. Add the device again to retry.",
+                    PAIRING_NOT_FINISHED
+                ),
+            }));
+            return;
+        }
+        if let Some((ours, theirs)) = c.disagree {
+            log::warn!(
+                "pairing with {fp}: the two machines' answers let neither control the other"
+            );
+            self.end_ceremony(&fp);
+            let label = self.forget_pairing(&fp).unwrap_or_default();
+            self.notify_frontend(FrontendEvent::Error(disagreement_notice(
+                &named(&label, &fp),
+                ours,
+                theirs,
+            )));
+            return;
+        }
+        c.answered = true;
+        let (addr, check) = (c.addr, c.check());
+        log::info!("pairing with {fp}: answered here; waiting for the other machine");
+        self.pairings_in.answered(&fp);
+        self.pairings_out.answered(&fp);
+        self.notify_frontend(FrontendEvent::PairingCheck {
+            fingerprint: fp,
+            addr: Some(addr),
+            check,
+            answered: true,
+        });
+    }
+
+    /// Both machines confirmed: the person here answered, and the other
+    /// machine's confirmation then arrived on the connection the number was
+    /// compared on. The one door that makes an approval grant (#167).
+    fn settle_pairing(&mut self, fp: String) {
+        if !self.ceremonies.get(&fp).is_some_and(|c| c.answered) {
+            log::warn!("{fp} confirmed a pairing nobody here answered; ending it");
+            self.end_ceremony(&fp);
+            self.forget_pairing(&fp);
+            return;
+        }
+        // The lock is taken on one line on purpose: the named-door guard
+        // scans for that call.
+        let confirmed = self.trust.write().expect("lock").confirm(&fp);
+        if let Err(e) = confirmed {
+            log::warn!("pairing with {fp} could not be confirmed: {e}");
+            self.end_ceremony(&fp);
+            self.forget_pairing(&fp);
+            return;
+        }
+        let shown = self.ceremonies.remove(&fp);
+        let at = shown.as_ref().map(|c| c.addr.ip());
+        let dialled_here = shown
+            .as_ref()
+            .is_some_and(|c| c.role == crate::pairing::Role::Show);
+        let approved_at = self.approved.remove(&fp).and_then(|a| a.addr);
+        self.pairings_in.settled(&fp);
+        self.pairings_out.settled(&fp);
+        let label = self
+            .trust
+            .read()
+            .expect("lock")
+            .label(&fp)
+            .unwrap_or_default();
+        log::info!("paired with {}", named(&label, &fp));
+        self.persist_trust(format!("pairing with {}", named(&label, &fp)));
+        self.publish_trust();
+        let we_drive = self.trust.read().expect("lock").we_may_drive(&fp);
+        // Devices here for that machine, when the person here chose not to
+        // control it (#220): nothing can drive it from here, so dialling it
+        // again stops, and the person is told why it stays unconnected.
+        let undriven = if we_drive {
+            Vec::new()
+        } else {
+            let pinned = self.client_manager.every_pinned_to(&fp);
+            let devices = self
+                .adding
+                .keys()
+                .copied()
+                .filter(|&h| {
+                    pinned.contains(&h)
+                        || approved_at.is_some_and(|a| self.client_manager.targets(h, a))
+                })
+                .collect::<Vec<_>>();
+            for h in &devices {
+                self.adding.remove(h);
+            }
+            devices
+        };
+        let unreachable = we_drive
+            && self.client_manager.every_pinned_to(&fp).is_empty()
+            && !self
+                .client_manager
+                .get_client_states()
+                .iter()
+                .any(|(_, _, s)| at.is_some_and(|ip| s.ips.contains(&ip)));
+        let name = named(&label, &fp);
+        self.notify_frontend(FrontendEvent::PairingEnded {
+            fingerprint: fp,
+            paired: true,
+        });
+        // This machine may control that one, and has no device to dial it
+        // at. The machine that dialled here to pair connects back to be
+        // controlled (#15), and appears as a device when it does; one this
+        // machine dialled has to be added at its address.
+        if unreachable && !dialled_here {
+            self.notify_frontend(FrontendEvent::Activity(format!(
+                "Paired with {name}. It connects to this machine to be controlled from here, \
+                 and appears as a device once it does."
+            )));
+        } else if unreachable {
+            self.notify_frontend(FrontendEvent::Activity(format!(
+                "Paired with {name}. To control it from this machine, add it here as a \
+                 device at its address."
+            )));
+        }
+        // That machine controls this one: the device here for it dials it
+        // to be controlled (#15), rather than it dialling in.
+        if !we_drive && (dialled_here || !undriven.is_empty()) {
+            self.notify_frontend(FrontendEvent::Activity(format!(
+                "Paired with {name}, which controls this machine. This machine connects to \
+                 {name} so that it can."
+            )));
+        }
+    }
+
+    /// An attempt ended on its own: closed, out of time, or a peer that
+    /// offered no number. The approval here is forgotten, and the person
+    /// told what to do.
+    fn pairing_ended(
+        &mut self,
+        fp: String,
+        why: crate::pairing::Why,
+        handle: Option<ClientHandle>,
+        attempt: u64,
+    ) {
+        // An attempt other than the one whose number is on screen, one that
+        // never reached a number included: the pairing goes on there. The
+        // one on screen ending ends the pairing, however its connection
+        // closed, so one approval shows one number (#220).
+        if self
+            .ceremonies
+            .get(&fp)
+            .is_some_and(|c| c.attempt != attempt)
+        {
+            log::debug!("pairing with {fp}: an attempt not on screen ended ({why:?})");
+            return;
+        }
+        if let Some(h) = handle {
+            self.adding.remove(&h);
+        }
+        let shown = self.ceremonies.remove(&fp);
+        let answered_adding = shown
+            .as_ref()
+            .is_some_and(|c| c.answered && c.role == crate::pairing::Role::Show);
+        let disagree = shown.as_ref().and_then(|c| c.disagree);
+        if shown.is_some() {
+            self.notify_frontend(FrontendEvent::PairingEnded {
+                fingerprint: fp.clone(),
+                paired: false,
+            });
+        }
+        let Some(label) = self.forget_pairing(&fp) else {
+            log::debug!("pairing with {fp} ended ({why:?}) with nothing left to forget");
+            return;
+        };
+        let name = named(&label, &fp);
+        log::info!("pairing with {name} ended: {why:?}");
+        // Ended there over the answers, most likely: said as that.
+        let notice = match disagree {
+            Some((ours, theirs)) => disagreement_notice(&name, ours, theirs),
+            None => ended_notice(&name, &why, answered_adding),
+        };
+        self.notify_frontend(FrontendEvent::Error(notice));
+    }
+
+    /// "None of these", or a cancel: end the attempt with `fp` and keep
+    /// nothing. Only takes away, so it needs no authority.
+    fn cancel_pairing(&mut self, fp: String) {
+        let Some(fp) = hops_ipc::identity::canonical_fingerprint(&fp) else {
+            log::warn!("not cancelling a pairing for {fp:?}: not a fingerprint");
+            return;
+        };
+        self.end_ceremony(&fp);
+        if let Some(label) = self.forget_pairing(&fp) {
+            let name = named(&label, &fp);
+            log::info!("pairing with {name} cancelled here");
+            self.notify_frontend(FrontendEvent::Error(format!(
+                "Pairing with {name} was cancelled here, so nothing was trusted."
+            )));
+        }
+    }
+
+    /// Close the attempt held for `fp`, if any, and take its number off
+    /// screen. Whoever calls this says why.
+    fn end_ceremony(&mut self, fp: &str) {
+        self.pairings_in.end(fp);
+        self.pairings_out.end(fp);
+        if self.ceremonies.remove(fp).is_some() {
+            self.notify_frontend(FrontendEvent::PairingEnded {
+                fingerprint: fp.to_string(),
+                paired: false,
+            });
+        }
+    }
+
+    /// Drop the lease an approval here issued for `fp`, if it was never
+    /// confirmed on both machines, and save that. Narrows only: a confirmed
+    /// pairing is never touched. Its label when one was dropped.
+    fn forget_pairing(&mut self, fp: &str) -> Option<String> {
+        self.approved.remove(fp);
+        let label = self
+            .trust
+            .read()
+            .expect("lock")
+            .label(fp)
+            .unwrap_or_default();
+        // The lock is taken on one line on purpose: the named-door guard
+        // scans for that call.
+        let forgot = self.trust.write().expect("lock").forget_unconfirmed(fp);
+        if !forgot {
+            return None;
+        }
+        self.persist_trust(format!("ending the pairing with {}", named(&label, fp)));
+        self.publish_trust();
+        Some(label)
+    }
+
+    /// Forget approvals whose pairing showed no number within the pairing
+    /// window: the other machine never approved, or never dialled. Kept
+    /// longer, a number card could appear later at a moment nobody here
+    /// chose (#195).
+    fn forget_unstarted_pairings(&mut self) {
+        let now = Instant::now();
+        let stale = self
+            .approved
+            .iter()
+            .filter(|(fp, a)| {
+                now.saturating_duration_since(a.at) >= PromptGate::WINDOW
+                    && !self.ceremonies.contains_key(*fp)
+            })
+            .map(|(fp, a)| (fp.clone(), a.knocked))
+            .collect::<Vec<_>>();
+        for (fp, being_added) in stale {
+            let Some(label) = self.forget_pairing(&fp) else {
+                continue;
+            };
+            let name = named(&label, &fp);
+            log::info!("pairing with {name} did not start within the pairing window; forgot it");
+            // The machine adding says so through its add dial.
+            if being_added {
+                self.notify_frontend(FrontendEvent::Error(format!(
+                    "Pairing with {name} did not start within two minutes of approving it \
+                     here, so it was not kept. Add the device again on both machines."
+                )));
+            }
+        }
+    }
+
+    /// Turn a pairing's clipboard back on (#182), in the directions the
+    /// pairing drives and no others. Saved and published as the off arm is.
+    /// The caller has already refused it while a peer drives this machine.
+    fn enable_clipboard(&mut self, fp: String) {
+        let Some(fp) = hops_ipc::identity::canonical_fingerprint(&fp) else {
+            log::warn!("refusing to turn the clipboard on for {fp:?}: not a fingerprint");
+            return;
+        };
+        // The lock is taken on one line on purpose: the named-door guard scans
+        // for that call.
+        let changed = self.trust.write().expect("lock").enable_clipboard(&fp);
+        match changed {
+            None => {
+                log::warn!("not turning the clipboard on for {fp}: it is not a paired device");
+                self.notify_frontend(FrontendEvent::Error(
+                    "That device is not paired, so it has no clipboard to turn on.".to_string(),
+                ));
+                return;
+            }
+            // Already on: nothing to save, and every app already shows it.
+            Some(false) => {
+                log::debug!("the clipboard for {fp} is already on");
+                return;
+            }
+            Some(true) => {}
+        }
+        let label = self
+            .trust
+            .read()
+            .expect("lock")
+            .label(&fp)
+            .unwrap_or_default();
+        log::info!("clipboard on for {}", named(&label, &fp));
+        self.persist_trust(format!(
+            "turning the clipboard on for {}",
+            named(&label, &fp)
+        ));
+        self.publish_trust();
+    }
+
+    /// Tell every frontend what the trust store now grants: who may drive
+    /// this machine (derived from live leases only, or a frontend would claim
+    /// a machine can drive you when its lease has lapsed), and every pairing,
+    /// whichever way control goes, with its name and clipboard. A pairing
+    /// this machine only controls is in the second and not the first, and a
+    /// frontend lists it from there: it was listed nowhere, so it could not
+    /// be removed.
+    fn publish_trust(&mut self) {
+        let (keys, peers, unconfirmed, to_pair_again) = {
+            let trust = self.trust.read().expect("lock");
+            let to_pair_again: Vec<(String, String)> = trust
+                .every_to_pair_again()
+                .map(|(fp, p)| (fp.to_string(), p.label.clone()))
+                .collect();
+            let peers: Vec<(String, crate::trust::Caps, String)> = trust
+                .pairings()
+                .into_iter()
+                .map(|(fp, caps)| {
+                    let label = trust.label(&fp).unwrap_or_default();
+                    (fp, caps, label)
+                })
+                .collect();
+            (
+                trust.config_cache(),
+                peers,
+                trust.unconfirmed(),
+                to_pair_again,
+            )
+        };
+        let mut peers: HashMap<String, hops_ipc::PeerTrust> = peers
+            .into_iter()
+            .map(|(fp, caps, label)| {
+                let t = hops_ipc::PeerTrust {
+                    clipboard_from: caps.contains(crate::trust::Caps::CLIPBOARD_FROM),
+                    clipboard_to: caps.contains(crate::trust::Caps::CLIPBOARD_TO),
+                    pending: false,
+                    label,
+                    we_may_drive: caps.contains(crate::trust::Caps::I_MAY_DRIVE),
+                    pair_again: false,
+                };
+                (fp, t)
+            })
+            .collect();
+        // Approved and not yet confirmed on both machines: shown as pairing,
+        // granting nothing (#167).
+        for fp in unconfirmed {
+            peers.insert(
+                fp,
+                hops_ipc::PeerTrust {
+                    pending: true,
+                    ..Default::default()
+                },
+            );
+        }
+        // Paired with a build before the trust store, and granting nothing
+        // until paired again (#231). A pairing under way for one is shown as
+        // that pairing.
+        for (fp, label) in to_pair_again {
+            peers.entry(fp).or_insert(hops_ipc::PeerTrust {
+                label,
+                pair_again: true,
+                ..Default::default()
+            });
+        }
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
-        self.notify_frontend(FrontendEvent::RevokedUpdated(tombstones));
+        self.notify_frontend(FrontendEvent::TrustUpdated(peers));
     }
 
     /// Drop what has lapsed, and cut the sessions it was holding open.
@@ -1542,8 +3405,10 @@ impl Service {
         if lapsed.is_empty() {
             // Still persist occasionally: the clock floor only advances while
             // the daemon runs, and a floor that never reaches disk is a floor
-            // that resets on every restart.
-            self.persist_trust_if_floor_moved();
+            // that resets on every restart. A change that failed to save is
+            // retried here too, whether or not the floor moved.
+            let notice = self.trust_saver.sweep(&self.trust.read().expect("lock"));
+            self.tell_trust_saved(notice);
             return;
         }
         for lease in &lapsed {
@@ -1554,20 +3419,12 @@ impl Service {
             );
             self.cut_sessions_dir(&lease.peer, lease.caps);
         }
-        self.persist_trust();
-        let (keys, tombstones) = self.trust.read().expect("lock").config_cache();
-        self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
-        self.notify_frontend(FrontendEvent::RevokedUpdated(tombstones));
-    }
-
-    /// Persist only when the clock floor actually moved, so a quiet daemon does
-    /// not rewrite a sealed file every minute for nothing.
-    fn persist_trust_if_floor_moved(&mut self) {
-        let floor = self.trust.read().expect("lock").clock().floor();
-        if floor > self.last_persisted_floor {
-            self.last_persisted_floor = floor;
-            self.persist_trust();
-        }
+        let ended: Vec<String> = lapsed
+            .iter()
+            .map(|l| format!("the end of the pairing with {}", named(&l.label, &l.peer)))
+            .collect();
+        self.persist_trust(ended.join(", "));
+        self.publish_trust();
     }
 
     /// Write the sealed store.
@@ -1575,10 +3432,19 @@ impl Service {
     /// Deliberately separate from `save_config`: trust must not ride on the
     /// eleven callers of that, which fire for a window move or a position
     /// change. This is called only where trust actually changed.
-    fn persist_trust(&mut self) {
-        let records = crate::trust_file::records_of(&self.trust.read().expect("lock"));
-        if let Err(e) = self.trust_file.save(&records) {
-            log::error!("failed to write the trust store: {e}");
+    ///
+    /// A change that does not reach disk is not only logged: it is undone by
+    /// the next restart, so the user is told, and the sweep retries it.
+    fn persist_trust(&mut self, what: String) {
+        let notice = self
+            .trust_saver
+            .save_change(&self.trust.read().expect("lock"), what);
+        self.tell_trust_saved(notice);
+    }
+
+    fn tell_trust_saved(&mut self, notice: Option<String>) {
+        if let Some(notice) = notice {
+            self.notify_frontend(FrontendEvent::Error(notice));
         }
     }
 
@@ -1587,19 +3453,77 @@ impl Service {
         self.notify_frontend(FrontendEvent::Enumerate(clients));
     }
 
-    fn add_client(&mut self) {
+    /// Add `device` whole, switched on and dialled, and save it; or, if it
+    /// cannot be dialled, add nothing and say why (#32).
+    ///
+    /// Its first announcement already carries its address, port and edge, so
+    /// no frontend ever shows it blank, and no follow-up request has to find
+    /// it by handle.
+    fn add_device(&mut self, device: hops_ipc::NewDevice) {
+        if let Some(why) = device.refusal() {
+            log::warn!("no device added: {why}");
+            self.notify_frontend(FrontendEvent::Error(format!("Nothing was added. {why}")));
+            return;
+        }
+        let hostname = device
+            .hostname
+            .map(|h| h.trim().to_owned())
+            .filter(|h| !h.is_empty());
         let handle = self.client_manager.add_client();
+        self.client_manager.set_config(
+            handle,
+            hops_ipc::ClientConfig {
+                hostname,
+                port: device.port,
+                pos: device.pos,
+                ..Default::default()
+            },
+        );
+        self.client_manager.set_fix_ips(handle, device.fix_ips);
         log::info!("added client {handle}");
-        let (c, s) = self.client_manager.get_state(handle).unwrap();
-        self.notify_frontend(FrontendEvent::Created(handle, c, s));
+        if let Some((c, s)) = self.client_manager.get_state(handle) {
+            self.notify_frontend(FrontendEvent::Created(handle, c, s));
+        }
+        // Adding a device tries it: an inert card that is never dialled
+        // looks the same as a broken one.
+        self.set_client_active(handle, true);
+        self.begin_adding(handle);
+        self.save_config();
     }
 
     fn set_client_active(&mut self, handle: ClientHandle, active: bool) {
         if active {
             self.activate_client(handle);
         } else {
-            self.deactivate_client(handle);
+            self.switch_off(handle);
         }
+    }
+
+    /// Switch a device off: off means off (#218). No pointer crosses to it,
+    /// and the link this machine dialled to it closes. Clipboard to and from
+    /// that machine stops on every link, including one it opened to this
+    /// machine, because the transports ask
+    /// [`ClientManager::switch_allows_clipboard`] for each transfer. Input over
+    /// a link it opened stays the pairing's decision, not the switch's.
+    ///
+    /// Not for the momentary off-and-on that re-creates a device's capture:
+    /// that would drop the link for a change of edge.
+    fn switch_off(&mut self, handle: ClientHandle) {
+        self.deactivate_client(handle);
+        // By the link's own record, never the address: a link outlives a
+        // change of the device's address, and an address can be another
+        // machine's by now. The links dialled for it, and every link to the
+        // machine it is pinned to, which a rename or a new address keeps
+        // (#99). A dial still out when this runs is closed by the dialler
+        // when it lands.
+        let pin = self.client_manager.peer_fingerprint(handle);
+        let outbound = self.revoke_conn.clone();
+        tokio::task::spawn_local(async move {
+            let closed = outbound.close_device(handle, pin.as_deref()).await;
+            if closed > 0 {
+                log::info!("client {handle} switched off: closed {closed} link(s)");
+            }
+        });
     }
 
     /// Start dialling a device just switched on from a frontend, if the pairing
@@ -1610,7 +3534,8 @@ impl Service {
     /// crossing also activate clients, and none of them is someone adding a
     /// device.
     fn begin_adding(&mut self, handle: ClientHandle) {
-        if self.prompt_gate.remaining(Instant::now()).is_none() {
+        let now = self.pairing_now();
+        if self.prompt_gate.remaining(now).is_none() {
             return;
         }
         let paired = self
@@ -1621,43 +3546,79 @@ impl Service {
             return;
         }
         log::info!("dialling client {handle} every second while it is paired");
-        self.adding.insert(handle, Instant::now());
+        self.adding.insert(handle, now);
         self.capture.dial(handle);
     }
 
-    /// Dial again every device still being added. Stops for one that connected,
-    /// was switched off or removed, or ran out of time; the last says why.
+    /// Dial again every device still being added whose link is down. Stops
+    /// for one switched off or removed, one that began comparing a number
+    /// (it is removed from `adding` then), one that reached a machine
+    /// another device already dials, or one out of time; the last two say
+    /// why.
     fn retry_adding(&mut self) {
-        let now = Instant::now();
+        let now = self.pairing_now();
         let window_open = self.prompt_gate.remaining(now).is_some();
         let mut gave_up = Vec::new();
-        self.adding.retain(|&handle, &mut started| {
-            let Some((_, state)) = self.client_manager.get_state(handle) else {
-                return false;
-            };
-            if !state.active || self.client_manager.active_addr(handle).is_some() {
-                return false;
+        let mut added_before = Vec::new();
+        let adding = std::mem::take(&mut self.adding);
+        for (handle, started) in adding {
+            let state = self.client_manager.get_state(handle).map(|(_, s)| s);
+            let on = state.as_ref().is_some_and(|s| s.active);
+            if on {
+                if let Some(other) = self.client_manager.same_machine_as(handle) {
+                    added_before.push((handle, other));
+                    continue;
+                }
             }
-            if !window_open || now.saturating_duration_since(started) >= PromptGate::WINDOW {
-                gave_up.push(handle);
-                return false;
+            // A link that looks open may not be: a machine that has not
+            // approved this one completes this machine's half of the
+            // handshake and refuses it after. So a device stays being added,
+            // undialled while its link is up, until the time runs out; its
+            // refusal meanwhile is the expected one (#171).
+            let verdict = adding_verdict(Adding {
+                on,
+                linked: self.client_manager.active_addr(handle).is_some(),
+                waited: now.saturating_duration_since(started),
+                window_open,
+                approved_here: self.approved_for(handle),
+            });
+            match verdict {
+                AddVerdict::Dial => {
+                    self.adding.insert(handle, started);
+                    self.capture.dial(handle);
+                }
+                AddVerdict::Wait => {
+                    self.adding.insert(handle, started);
+                }
+                AddVerdict::Done => {}
+                AddVerdict::GaveUp(why) => gave_up.push((handle, why)),
             }
-            self.capture.dial(handle);
-            true
-        });
-        for handle in gave_up {
-            let name = self
-                .client_manager
-                .get_hostname(handle)
-                .unwrap_or_else(|| format!("device {handle}"));
-            log::info!("stopped dialling {name}: pairing did not finish in time");
+        }
+        for (handle, other) in added_before {
+            let (name, other) = (self.device_name(handle), self.device_name(other));
+            log::info!("stopped dialling {name}: it is {other}, which is already added");
             self.notify_frontend(FrontendEvent::Error(format!(
-                "Pairing with {name} did not finish in two minutes. Open add device on \
-                 both machines, then switch {name} off and on to try again."
+                "{name} is the same machine as {other}, which is already added. \
+                 Remove {name}."
             )));
+        }
+        for (handle, why) in gave_up {
+            let name = self.device_name(handle);
+            log::info!("stopped dialling {name}: pairing did not finish in time");
+            self.notify_frontend(FrontendEvent::Error(why.notice(&name)));
         }
     }
 
+    /// Whether this machine approved the machine that answered a dial for
+    /// device `handle`, and that pairing waits for the other machine.
+    fn approved_for(&self, handle: ClientHandle) -> bool {
+        self.approved.values().any(|a| {
+            a.addr
+                .is_some_and(|addr| self.client_manager.targets(handle, addr))
+        })
+    }
+
+    /// What the user calls the device at `handle`.
     fn deactivate_client(&mut self, handle: ClientHandle) {
         log::debug!("deactivating client {handle}");
         if self.client_manager.deactivate_client(handle) {
@@ -1687,7 +3648,7 @@ impl Service {
                     .client_manager
                     .get_hostname(other)
                     .unwrap_or_else(|| format!("device {other}"));
-                self.deactivate_client(other);
+                self.switch_off(other);
                 self.notify_frontend(FrontendEvent::Error(format!(
                     "Switched off \"{name}\" — it was using the {pos} edge, \
                      and two devices cannot share one edge."
@@ -1714,15 +3675,54 @@ impl Service {
 
     fn remove_client(&mut self, handle: ClientHandle) {
         self.adding.remove(&handle);
-        if self
-            .client_manager
-            .remove_client(handle)
-            .map(|(_, s)| s.active)
-            .unwrap_or(false)
-        {
+        let removed = self.client_manager.remove_client(handle);
+        if removed.as_ref().is_some_and(|(_, s)| s.active) {
             self.capture.destroy(handle);
         }
+        // Close the device's connection. Nothing can address it once the
+        // device is gone, since handles are never reused, but it stays open
+        // and still carries clipboard text until something closes it.
+        if let Some(addr) = removed.and_then(|(_, s)| s.active_addr) {
+            let outbound = self.revoke_conn.clone();
+            tokio::task::spawn_local(async move {
+                if outbound.close_addr(addr).await {
+                    log::info!("client {handle} removed: closed its connection to {addr}");
+                }
+            });
+        }
         self.notify_frontend(FrontendEvent::Deleted(handle));
+    }
+
+    /// Whether `handle` is still the device a frontend showed as pinned to
+    /// `shown`, before acting on it as `what` (past tense).
+    ///
+    /// A frontend acts on what it drew some time ago. Refusing a device whose
+    /// pin changed since is what keeps a delete, which revokes the pin, from
+    /// reaching a machine that was never on that row.
+    fn still_as_shown(&mut self, handle: ClientHandle, shown: Option<&str>, what: &str) -> bool {
+        let Some((_, state)) = self.client_manager.get_state(handle) else {
+            log::warn!("client {handle} was not {what}: no such device");
+            self.notify_frontend(FrontendEvent::NoSuchClient(handle));
+            return false;
+        };
+        let canonical = |fp: &str| {
+            hops_ipc::identity::canonical_fingerprint(fp)
+                .unwrap_or_else(|| fp.trim().to_lowercase())
+        };
+        if state.peer_fingerprint.as_deref().map(canonical) == shown.map(canonical) {
+            return true;
+        }
+        log::warn!(
+            "client {handle} was not {what}: it is pinned to {:?}, and the request \
+             was made for {shown:?}",
+            state.peer_fingerprint
+        );
+        self.notify_frontend(FrontendEvent::Error(format!(
+            "Nothing was {what}: that device changed since it was shown. Check it and \
+             try again."
+        )));
+        self.broadcast_client(handle);
+        false
     }
 
     fn update_fix_ips(&mut self, handle: ClientHandle, fix_ips: Vec<IpAddr>) {
@@ -1733,6 +3733,7 @@ impl Service {
     fn update_hostname(&mut self, handle: ClientHandle, hostname: Option<String>) {
         log::info!("hostname changed: {hostname:?}");
         if self.client_manager.set_hostname(handle, hostname.clone()) {
+            self.refusal_notices.forget(handle, NOT_RESOLVED);
             self.resolve(handle);
         }
         self.broadcast_client(handle);
@@ -1743,10 +3744,45 @@ impl Service {
         self.broadcast_client(handle);
     }
 
+    /// Move the device at `handle` to the `pos` edge. A switched-on device
+    /// moved onto an edge another switched-on device uses trades edges with
+    /// it, so both keep working (#174): activation would otherwise switch
+    /// the other one off, and the arrange canvas moves devices by dropping
+    /// them. The other device moves without being touched, so the user is
+    /// told, as for a switch-off. A device that changes edge loses its
+    /// saved canvas spot, which was on the side it left.
     fn update_pos(&mut self, handle: ClientHandle, pos: Position) {
+        let from = self.client_manager.get_pos(handle);
+        let holder = self
+            .client_manager
+            .client_at(pos)
+            .filter(|&other| other != handle);
+        if from.is_some_and(|from| from != pos) {
+            self.client_manager.set_geometry(handle, None);
+        }
         // update state in event input emulator & input capture
         if self.client_manager.set_pos(handle, pos) {
             self.deactivate_client(handle);
+            if let (Some(other), Some(from)) = (holder, from) {
+                if self.client_manager.set_pos(other, from) {
+                    self.client_manager.set_geometry(other, None);
+                    self.deactivate_client(other);
+                    self.activate_client(other);
+                    let name = |h: ClientHandle| {
+                        self.client_manager
+                            .get_hostname(h)
+                            .unwrap_or_else(|| format!("device {h}"))
+                    };
+                    let (moved, mover) = (name(other), name(handle));
+                    // A trade is a move that worked, so it is told as activity,
+                    // not in the error banner.
+                    self.notify_frontend(FrontendEvent::Activity(format!(
+                        "Moved \"{moved}\" to the {from} edge — \"{mover}\" now uses \
+                         the {pos} edge, and two devices cannot share one edge."
+                    )));
+                }
+                self.broadcast_client(other);
+            }
             self.activate_client(handle);
         }
         self.broadcast_client(handle);
@@ -1766,28 +3802,54 @@ impl Service {
         self.notify_frontend(event);
     }
 
+    /// Run the enter hook of the device at `handle`, if it has one: as a
+    /// program with arguments, never through a shell, and never while this
+    /// process is elevated. See [`crate::enter_hook`].
     fn spawn_hook_command(&self, handle: ClientHandle) {
         let Some(cmd) = self.client_manager.get_enter_cmd(handle) else {
             return;
         };
+        let hook = match enter_hook::invocation(&cmd) {
+            Ok(hook) => hook,
+            Err(refused) => {
+                log::warn!("not running the enter hook: {refused}");
+                log::debug!("the refused enter hook: {cmd}");
+                return;
+            }
+        };
+        let mut command = Command::new(&hook.program);
+        #[cfg(unix)]
+        {
+            command.args(&hook.args);
+        }
+        #[cfg(windows)]
+        {
+            if !hook.rest.is_empty() {
+                command.raw_arg(&hook.rest);
+            }
+        }
+        // The program is named at info; the arguments may hold secrets, so the
+        // whole command is logged only at debug.
+        let program = hook.program.clone();
         tokio::task::spawn_local(async move {
-            log::info!("spawning command!");
-            let mut child = match Command::new("sh").arg("-c").arg(cmd.as_str()).spawn() {
+            log::info!("running the enter hook `{program}`");
+            log::debug!("the enter hook: {cmd}");
+            let mut child = match command.spawn() {
                 Ok(c) => c,
                 Err(e) => {
-                    log::warn!("could not execute cmd: {e}");
+                    log::warn!("could not run the enter hook `{program}`: {e}");
                     return;
                 }
             };
             match child.wait().await {
                 Ok(s) => {
                     if s.success() {
-                        log::info!("{cmd} exited successfully");
+                        log::info!("the enter hook `{program}` exited successfully");
                     } else {
-                        log::warn!("{cmd} exited with {s}");
+                        log::warn!("the enter hook `{program}` exited with {s}");
                     }
                 }
-                Err(e) => log::warn!("{cmd}: {e}"),
+                Err(e) => log::warn!("the enter hook `{program}`: {e}"),
             }
         });
     }
@@ -1797,7 +3859,7 @@ impl Service {
 mod ipc_shell_guard {
     //! Guard for #56: **the frontend IPC channel must never reach a shell.**
     //!
-    //! `spawn_hook_command` runs `sh -c` with a config-supplied string. While a
+    //! `spawn_hook_command` runs a config-supplied command. While a
     //! `FrontendRequest` variant could set that string, reaching the frontend
     //! socket was equivalent to arbitrary command execution — the boundary was
     //! protecting a shell, not a settings pane. `enter_hook` is now config-file
@@ -1850,8 +3912,8 @@ mod ipc_shell_guard {
             let code = line.split("//").next().unwrap_or("");
             assert!(
                 !code.contains("EnterHook"),
-                "FrontendRequest gained an enter-hook verb: `{}`. That string is executed \
-                 with `sh -c`, so this reopens the RCE path closed in #56.",
+                "FrontendRequest gained an enter-hook verb: `{}`. That string is run \
+                 as a command, so this reopens the RCE path closed in #56.",
                 line.trim()
             );
         }
@@ -1905,7 +3967,7 @@ mod trust_door_guard {
     /// boundary where the two tables become one.
     ///
     /// The guarantee the scan was protecting still holds and is now checked by
-    /// calling the code: a fingerprint in BOTH tables migrates to a removal, not
+    /// calling the code: a fingerprint in BOTH tables migrates to nothing, not
     /// a grant. That is issue #66, tested rather than grepped.
     /// A well-formed 32-byte fingerprint made of one repeated byte.
     fn fp32(b: u8) -> String {
@@ -1916,7 +3978,7 @@ mod trust_door_guard {
     }
 
     #[test]
-    fn a_fingerprint_in_both_config_tables_migrates_to_a_removal_not_a_grant() {
+    fn a_fingerprint_in_both_config_tables_migrates_to_nothing_not_a_grant() {
         use crate::trust::Caps;
         use std::collections::HashMap;
 
@@ -1927,11 +3989,10 @@ mod trust_door_guard {
             &HashMap::from([(
                 fp.clone(),
                 hops_ipc::RevokedEntry {
-                    label: "expelled".to_string(),
+                    label: "removed".to_string(),
                     revoked_at: 1_000,
                 },
             )]),
-            &std::collections::HashSet::new(),
             2_000,
         );
 
@@ -1942,7 +4003,10 @@ mod trust_door_guard {
              capability — copy-pasting a key back into the allowlist is how a \
              removed device came back after a reboot"
         );
-        assert!(store.denial(&fp).is_some(), "and the removal must survive");
+        assert!(
+            !store.is_known(&fp) && store.to_pair_again(&fp).is_none(),
+            "and nothing is recorded for it: removal forgets (#184)"
+        );
     }
 
     #[test]
@@ -1976,9 +4040,9 @@ mod trust_door_guard {
         ] {
             assert!(
                 body_of(&src, reader).contains("to_lowercase()"),
-                "{reader} must lowercase its keys. When only the authorized table did, an \
-                 expelled fingerprint re-added in uppercase missed the tombstone and was \
-                 then folded back to canonical form on the next read — issue #67."
+                "{reader} must lowercase its keys. When only the authorized table did, a \
+                 removed fingerprint re-added in uppercase was missed by the migration \
+                 and then folded back to canonical form on the next read — issue #67."
             );
         }
     }
@@ -1989,7 +4053,7 @@ mod trust_door_guard {
             assert!(
                 body_of(&production_source(SERVICE_RS_ALL), door).contains("canonical_fingerprint"),
                 "{door} must canonicalise before touching the trust maps. An uppercased \
-                 spelling of an expelled fingerprint missed the tombstone and was folded \
+                 spelling of a fingerprint was written as a second record, and folded \
                  back to canonical form on the next config read — issue #67."
             );
         }
@@ -2094,7 +4158,7 @@ mod set_label_cannot_grant {
 
 #[cfg(test)]
 mod one_trust_write_site {
-    //! Only the named trust doors may write the allowlist or the denylist.
+    //! Only the named trust doors may write the allowlist.
     //!
     //! Layer 1 of `CONSENT-ARCHITECTURE.md` asks for exactly one place that
     //! mutates trust. This guards the property before the refactor that makes it
@@ -2136,10 +4200,14 @@ mod one_trust_write_site {
     /// deliberate act; arriving here by accident is what the guard prevents.
     const DOORS: &[&str] = &[
         "fn add_authorized_key",    // grant
-        "fn remove_authorized_key", // revoke + tombstone
+        "fn remove_authorized_key", // removal: forgets the device
         "fn set_label",             // rename, refuses unknown fingerprints
         "fn handle_config_change",  // reload: the config file is a door too
         "fn new",                   // startup load
+        "fn disable_clipboard",     // narrows one lease's clipboard, never widens
+        "fn settle_pairing",        // both machines confirmed the number (#167)
+        "fn forget_pairing",        // drops an approval never confirmed; narrows
+        "fn enable_clipboard",      // widens one lease's clipboard to its drive bits
     ];
 
     #[test]
@@ -2161,30 +4229,6 @@ mod one_trust_write_site {
     }
 
     #[test]
-    fn nothing_outside_the_named_doors_writes_the_denylist() {
-        let src = production();
-        let mut offenders = vec![];
-        for pat in [
-            "self.revoked.insert",
-            "self.revoked.remove",
-            "self.revoked =",
-        ] {
-            for (at, _) in src.match_indices(pat) {
-                let f = enclosing_fn(&src, at);
-                if !DOORS.iter().any(|d| f.starts_with(d)) {
-                    offenders.push(format!("{f} ({pat})"));
-                }
-            }
-        }
-        assert!(
-            offenders.is_empty(),
-            "these write the denylist and are not a named trust door: {offenders:?}. \
-             A revocation tombstone is irreversible; it must not be written from \
-             somewhere nobody is looking."
-        );
-    }
-
-    #[test]
     fn the_door_list_still_matches_reality() {
         // A door that no longer exists means the guard has quietly stopped
         // covering something, which is worse than not having it.
@@ -2194,6 +4238,65 @@ mod one_trust_write_site {
                 src.contains(d),
                 "{d} is listed as a trust door but no longer exists — the guard is \
                  now covering less than it claims"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod trust_reaches_every_app_whole {
+    //! What the trust store grants reaches the apps as two events that
+    //! `publish_trust` sends together: who may drive this machine, and each
+    //! pairing's clipboard (#187). A site that sends the
+    //! first alone leaves every app showing the clipboard from before the
+    //! change, and offering a switch for a clipboard that is already off.
+    //!
+    //! A source guard because the property is about every site, the next one
+    //! included. The approval and the switch are also watched running, in
+    //! `tests/pending_prompts.rs` (T7) and `tests/clipboard_off.rs`.
+
+    /// Non-test source with comments stripped: this guard names what it
+    /// forbids.
+    fn production() -> String {
+        include_str!("service.rs")
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap_or_default()
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Which `fn` encloses a given byte offset.
+    fn enclosing_fn(src: &str, at: usize) -> String {
+        src[..at]
+            .rmatch_indices("fn ")
+            .map(|(i, _)| {
+                let rest = &src[i..];
+                rest[..rest.find('(').unwrap_or(rest.len())]
+                    .trim()
+                    .to_string()
+            })
+            .next()
+            .unwrap_or_else(|| "<top level>".to_string())
+    }
+
+    // LEDGER E2A-14 | class S | source text: every trust event in service.rs is sent from publish_trust
+    #[test]
+    fn only_publish_trust_sends_the_trust_events() {
+        let src = production();
+        for event in ["AuthorizedUpdated(", "TrustUpdated("] {
+            let senders: Vec<String> = src
+                .match_indices(event)
+                .map(|(at, _)| enclosing_fn(&src, at))
+                .collect();
+            assert_eq!(
+                senders,
+                ["fn publish_trust"],
+                "{event} is sent from {senders:?}. Call publish_trust() instead: it \
+                 sends the clipboard with it, and without that every app keeps \
+                 showing the clipboard from before the change"
             );
         }
     }
@@ -2315,81 +4418,6 @@ mod attempt_origin_guard {
 }
 
 #[cfg(test)]
-mod reload_resets_handles {
-    //! The reload path itself must reset handle allocation.
-    //!
-    //! `client::reload_permutation` proves `ClientManager` behaves once the
-    //! reset is called. It cannot prove `handle_config_change` calls it — that
-    //! test drives the manager directly, so dropping the call here would leave
-    //! it green while the real reload renumbered every device again (#94).
-    //!
-    //! That is the false-pass shape this project keeps producing, so it gets its
-    //! own guard.
-
-    /// Non-test source only. Split on the marker WITHOUT a trailing newline:
-    /// `include_str!` keeps CRLF on a Windows checkout, and a trailing `\n`
-    /// there matches a `\r` and never fires.
-    fn production() -> &'static str {
-        const FULL: &str = include_str!("service.rs");
-        FULL.split("\n#[cfg(test)]").next().unwrap_or(FULL)
-    }
-
-    #[test]
-    fn handle_config_change_resets_handle_allocation() {
-        let src = production();
-        let body = src
-            .split("fn handle_config_change(")
-            .nth(1)
-            .expect("handle_config_change must exist; if renamed, update this guard");
-        let body = &body[..body.find("\n    fn ").unwrap_or(body.len())];
-        // Strip comments: the prose here explains the reset and would otherwise
-        // satisfy the search on its own.
-        let code: String = body
-            .lines()
-            .map(|l| l.split("//").next().unwrap_or(""))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            code.contains("reset_handle_allocation()"),
-            "handle_config_change removes every client and re-adds them, and Slab \
-             reuses freed keys from a LIFO free list — so without resetting, a \
-             reload REVERSES the device numbering and reverses it back on the \
-             next one. Delete is keyed by handle and tombstones irreversibly, so \
-             this silently aims an irreversible verb at the wrong machine (#94)."
-        );
-    }
-
-    /// And the reset must come after the removals, never before — resetting
-    /// first would drop live clients without tearing down their capture.
-    #[test]
-    fn the_reset_comes_after_the_removals() {
-        let src = production();
-        let body = src
-            .split("fn handle_config_change(")
-            .nth(1)
-            .expect("exists");
-        let body = &body[..body.find("\n    fn ").unwrap_or(body.len())];
-        let code: String = body
-            .lines()
-            .map(|l| l.split("//").next().unwrap_or(""))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let remove = code
-            .find("self.remove_client(")
-            .expect("the reload must still tear clients down");
-        let reset = code
-            .find("reset_handle_allocation()")
-            .expect("the reload must still reset handle allocation");
-        assert!(
-            remove < reset,
-            "reset_handle_allocation clears the slab outright; running it before \
-             the removals would drop live clients without destroying their \
-             capture."
-        );
-    }
-}
-
-#[cfg(test)]
 mod discovery_state_on_attach {
     //! A frontend must learn discovery is running the moment it attaches.
     //!
@@ -2496,11 +4524,16 @@ mod a_second_daemon_leaves_the_running_daemons_files_alone {
             let running = std::os::unix::net::UnixListener::bind(&path).expect("a unix listener");
             (running, DaemonEndpoint::Unix(path))
         };
+        // On Windows the daemon listens only on a pipe, and a pipe held by a
+        // process of this user, as this one is, is a daemon already running.
         #[cfg(windows)]
         let (running, endpoint) = {
-            let running = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
-            let addr = running.local_addr().expect("its address");
-            (running, DaemonEndpoint::Tcp(addr))
+            let name = format!(r"\\.\pipe\hops-test-taken-{}", std::process::id());
+            let running = tokio::net::windows::named_pipe::ServerOptions::new()
+                .first_pipe_instance(true)
+                .create(&name)
+                .expect("a pipe of this user");
+            (running, DaemonEndpoint::Pipe(name))
         };
 
         let read_config = Cell::new(false);
@@ -2579,4 +4612,464 @@ mod a_second_daemon_leaves_the_running_daemons_files_alone {
             "(refused as already running, read the config) for a claim refused"
         );
     }
+}
+
+#[cfg(all(test, unix))]
+mod a_permission_granted_while_it_runs;
+
+#[cfg(all(test, unix))]
+mod a_mac_missing_a_permission;
+
+#[cfg(all(test, unix))]
+mod a_refused_crossing;
+
+#[cfg(all(test, unix))]
+mod a_removal_in_the_config_file;
+
+#[cfg(all(test, unix))]
+mod refusals_and_bounds;
+
+#[cfg(all(test, unix))]
+mod removal_reaches_the_other_machine;
+
+#[cfg(all(test, unix))]
+mod adding_a_device;
+
+#[cfg(all(test, unix))]
+mod dialled_by_the_controlled_machine;
+
+#[cfg(all(test, unix))]
+mod each_controls_the_other;
+
+#[cfg(all(test, unix))]
+mod kept_awake;
+
+#[cfg(all(test, unix))]
+mod a_move_onto_a_taken_edge;
+
+#[cfg(all(test, unix, any(feature = "tui", feature = "slint")))]
+mod every_pairing_is_listed;
+
+#[cfg(all(test, unix, any(feature = "tui", feature = "slint")))]
+mod what_a_controlled_machine_shows;
+
+#[cfg(all(test, unix, any(feature = "tui", feature = "slint")))]
+mod upgraded_from_v0_12;
+
+/// The whole daemon in this process, for a test that drives it the way a
+/// frontend and a peer do.
+#[cfg(all(test, unix))]
+pub(crate) mod in_process;
+
+#[cfg(all(test, unix))]
+mod the_app_cannot_approve_a_prompt_after_its_window_closed {
+    //! The approval the app sends is honoured only while the pairing window
+    //! that admitted the prompt is still open (#107). The grant door used to
+    //! take any held prompt, so one kept past its window could be approved
+    //! at any later moment by anything holding the IPC token.
+    use super::in_process::{Daemon, compare_number, prompt_from, until_paired};
+    use crate::prompt_gate::PromptGate;
+    use crate::test_harness::{machine, run_local};
+    use crate::trust::Caps;
+    use hops_ipc::{FrontendEvent, FrontendRequest};
+    use input_emulation::recording::Recording;
+
+    fn refusals(events: &[FrontendEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                FrontendEvent::Error(text) if text.starts_with(hops_ipc::GRANT_REFUSED) => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    // LEDGER EN-4 | class B | 3 process-in-test + 1 struct state: AuthorizeKey over the daemon's IPC socket, peers knocking over loopback QUIC, the daemon's trust store
+    #[test]
+    fn approving_a_prompt_after_its_pairing_window_closed_pairs_nothing() {
+        run_local(async {
+            let (early, late) = (machine(), machine());
+            let recording = Recording::new();
+            let daemon = Daemon::start("expire", "", recording.backend()).await;
+            let (ours, port, trust, ipc, clock) = (
+                daemon.fingerprint(),
+                daemon.port(),
+                daemon.trust(),
+                daemon.ipc(),
+                daemon.pairing_clock(),
+            );
+            let (early_fp, late_fp) = (early.fingerprint.clone(), late.fingerprint.clone());
+            daemon
+                .run_while(async {
+                    use FrontendRequest as R;
+                    let mut app = ipc.connect().await;
+                    app.exchange(&[R::OpenPairing]).await;
+                    prompt_from(&mut app, &early, port, &ours).await;
+                    prompt_from(&mut app, &late, port, &ours).await;
+
+                    // Inside the window, on the moved clock: approved, and
+                    // paired once both machines confirm the number (#167).
+                    clock.advance(PromptGate::WINDOW / 2);
+                    app.exchange(&[crate::test_harness::approval(
+                        "early",
+                        &early_fp,
+                        hops_ipc::Controller::ThatMachine,
+                    )])
+                    .await;
+                    let comparing = compare_number(&mut app, &early, port, &ours).await;
+                    app.exchange(&[R::ConfirmPairing {
+                        fingerprint: early_fp.clone(),
+                        number: comparing.number.clone(),
+                    }])
+                    .await;
+                    until_paired(&trust, &early_fp).await;
+                    assert_eq!(
+                        trust
+                            .read()
+                            .expect("lock")
+                            .pairings()
+                            .into_iter()
+                            .find(|(fp, _)| *fp == early_fp)
+                            .map(|(_, caps)| caps),
+                        Some(Caps::INBOUND),
+                        "approving a prompt while its pairing window was open did not \
+                         pair the machine that knocked"
+                    );
+
+                    // Past it: refused. Opening add device again is left to
+                    // the unit test in `pending`: here a ping still in flight
+                    // from the knock would be a new request in the new window,
+                    // which may rightly be approved.
+                    clock.advance(PromptGate::WINDOW);
+                    let events = app
+                        .exchange(&[crate::test_harness::approval(
+                            "late",
+                            &late_fp,
+                            hops_ipc::Controller::ThatMachine,
+                        )])
+                        .await;
+                    assert!(
+                        !trust.read().expect("lock").is_known(&late_fp),
+                        "a prompt was approved after the pairing window that admitted \
+                         it had closed. The window is what makes a prompt answerable: \
+                         one kept past it can be approved at any later moment by \
+                         anything that can send the approval."
+                    );
+                    let refused = refusals(&events);
+                    assert!(
+                        refused.len() == 1
+                            && refused[0].contains("no pairing request")
+                            && refused[0].contains("pairing window"),
+                        "an approval after the window closed must be refused, saying no \
+                         request is waiting and why; the app was told {refused:?}"
+                    );
+                })
+                .await;
+        });
+    }
+}
+
+#[cfg(test)]
+mod pairing_notices {
+    //! What the machine adding another says when a pairing does not finish,
+    //! and when the other machine cannot compare a number (#167, #195).
+
+    use super::*;
+    use std::time::Duration;
+
+    fn adding(waited: Duration, approved_here: bool) -> Adding {
+        Adding {
+            on: true,
+            linked: false,
+            waited,
+            window_open: true,
+            approved_here,
+        }
+    }
+
+    // LEDGER G-8 | class B | 1 return value: service::adding_verdict, GaveUp::notice
+    /// An add the other machine never approves says so when the add dial
+    /// gives up, also once this machine approved its side and the pairing
+    /// waits: the notice then names the machine that did not approve.
+    #[test]
+    fn an_add_the_other_machine_never_approves_says_so() {
+        let late = PromptGate::WINDOW + Duration::from_secs(1);
+        assert_eq!(
+            adding_verdict(adding(Duration::from_secs(5), true)),
+            AddVerdict::Dial,
+            "an approval here stopped the add dial before the other machine answered"
+        );
+        for approved_here in [false, true] {
+            let verdict = adding_verdict(adding(late, approved_here));
+            let AddVerdict::GaveUp(why) = verdict else {
+                panic!(
+                    "an add nobody finished ended without a word \
+                     (approved here: {approved_here}): {verdict:?}"
+                );
+            };
+            let notice = why.notice("desk mac");
+            assert!(notice.contains("desk mac"), "{notice}");
+            if approved_here {
+                assert!(
+                    notice.contains("never approved this one"),
+                    "the notice does not say which machine did not approve: {notice}"
+                );
+            }
+        }
+        assert_eq!(
+            adding_verdict(Adding {
+                linked: true,
+                ..adding(late, true)
+            }),
+            AddVerdict::Done,
+            "a device that connected was told pairing failed"
+        );
+        // A link up before the time runs out may yet be refused by a machine
+        // that has not approved this one: kept, and not dialled again (#171).
+        assert_eq!(
+            adding_verdict(Adding {
+                linked: true,
+                ..adding(Duration::from_secs(5), false)
+            }),
+            AddVerdict::Wait,
+            "a device whose link came up stopped being added before its time ran out"
+        );
+    }
+
+    // LEDGER G-15b | class B | 1 return value: service::ended_notice
+    /// A machine that offers no number is named as an older build or one
+    /// that already trusts this machine, with what to do about each.
+    #[test]
+    fn a_peer_that_cannot_compare_is_told_apart_from_a_failure() {
+        let notice = ended_notice("\"desk mac\"", &crate::pairing::Why::NoComparison, false);
+        assert!(
+            notice.contains("version of hops from before pairing numbers")
+                && notice.contains("already trusts this machine")
+                && notice.contains("update hops there"),
+            "{notice}"
+        );
+        let stranded = ended_notice("\"desk mac\"", &crate::pairing::Why::Closed, true);
+        assert!(
+            stranded.contains("remove it there"),
+            "a machine whose answer may have been lost is not told how to clean up: \
+             {stranded}"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod an_approval_before_its_number;
+
+#[cfg(all(test, unix))]
+mod asked_at_pairing;
+
+#[cfg(all(test, unix))]
+mod a_wrong_pairing_answer_is_not_a_refused_grant {
+    //! A pairing's own notices, for a confirmation with no pairing waiting
+    //! or a wrong number, are not refusals of a grant. They go to every
+    //! frontend, and `hops cli authorize-key` reads a notice beginning with
+    //! GRANT_REFUSED as its own approval refused: a wrong pick in the app,
+    //! landing while the CLI approved another machine, made that approval
+    //! report failure.
+    use super::in_process::{Daemon, compare_number, prompt_from};
+    use crate::test_harness::{machine, run_local};
+    use hops_ipc::{FrontendEvent, FrontendRequest};
+    use input_emulation::recording::Recording;
+
+    // LEDGER GR-1 | class B | 3 process-in-test: ConfirmPairing over the daemon's IPC socket, a peer knocking over loopback QUIC
+    #[test]
+    fn a_confirmation_with_nothing_waiting_or_the_wrong_number_is_not_a_grant_refusal() {
+        run_local(async {
+            let stranger = machine();
+            let recording = Recording::new();
+            let daemon = Daemon::start("wrongpick", "", recording.backend()).await;
+            let (ours, port, ipc) = (daemon.fingerprint(), daemon.port(), daemon.ipc());
+            let fp = stranger.fingerprint.clone();
+            daemon
+                .run_while(async {
+                    use FrontendRequest as R;
+                    let mut app = ipc.connect().await;
+                    let mut said = app
+                        .exchange(&[R::ConfirmPairing {
+                            fingerprint: fp.clone(),
+                            number: "000000".into(),
+                        }])
+                        .await;
+                    app.exchange(&[R::OpenPairing]).await;
+                    prompt_from(&mut app, &stranger, port, &ours).await;
+                    app.exchange(&[crate::test_harness::approval(
+                        "desk",
+                        &fp,
+                        hops_ipc::Controller::ThatMachine,
+                    )])
+                    .await;
+                    let comparing = compare_number(&mut app, &stranger, port, &ours).await;
+                    let wrong = if comparing.number == "000000" {
+                        "000001"
+                    } else {
+                        "000000"
+                    };
+                    said.extend(
+                        app.exchange(&[R::ConfirmPairing {
+                            fingerprint: fp.clone(),
+                            number: wrong.into(),
+                        }])
+                        .await,
+                    );
+                    let errors: Vec<&str> = said
+                        .iter()
+                        .filter_map(|e| match e {
+                            FrontendEvent::Error(text) => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(
+                        errors.len(),
+                        2,
+                        "expected a notice for each answer that finished nothing: {errors:?}"
+                    );
+                    for text in errors {
+                        assert!(
+                            !text.starts_with(hops_ipc::GRANT_REFUSED)
+                                && text.starts_with(super::PAIRING_NOT_FINISHED),
+                            "a pairing's own notice reads as a refused grant to the CLI: {text:?}"
+                        );
+                    }
+                })
+                .await;
+        });
+    }
+}
+
+#[cfg(test)]
+mod a_pin_outlives_its_lease {
+    //! `drop_untrusted_pins` runs at start and on every config reload. It may
+    //! drop only a pin the trust store has no record of: a device whose lease
+    //! lapsed, whose pairing still waits for its number, or whose machine is
+    //! listed to pair again (#231), keeps its pin.
+
+    use super::drop_untrusted_pins;
+    use crate::client::ClientManager;
+    use crate::trust::{Caps, Term, TrustStore};
+
+    const T0: u64 = 4_000_000_000;
+    const HOUR: u64 = 3_600;
+
+    fn fp(tag: u8) -> String {
+        (0u8..32)
+            .map(|i| format!("{:02x}", tag.wrapping_add(i)))
+            .collect::<Vec<_>>()
+            .join(":")
+    }
+
+    fn pinned_to(m: &ClientManager, fingerprint: &str) -> hops_ipc::ClientHandle {
+        let h = m.add_client();
+        m.set_peer_fingerprint(h, Some(fingerprint.to_string()));
+        h
+    }
+
+    // LEDGER R231-15 | class B | 1 return value: service::may_pin_to_listed on a real ClientManager and TrustStore
+    /// A device is pinned to a listed machine that proved its key at an
+    /// address only while it still dials that address, is still pinned to
+    /// no machine, and the machine is still listed (#231).
+    #[test]
+    fn a_device_is_pinned_only_to_what_answered_at_its_own_address() {
+        use super::may_pin_to_listed;
+        use std::net::SocketAddr;
+        let mut trust = TrustStore::new(&fp(0x01), T0).expect("ours");
+        let (listed, other) = (fp(0xa0), fp(0xc0));
+        trust
+            .list_to_pair_again(&listed, "iridium", T0)
+            .expect("listed");
+        let m = ClientManager::default();
+        let h = m.add_client();
+        let port = m.get_port(h).expect("a port");
+        let at: SocketAddr = ([192, 0, 2, 156], port).into();
+        let elsewhere: SocketAddr = ([192, 0, 2, 157], port).into();
+        m.set_fix_ips(h, vec![at.ip()]);
+        assert!(
+            may_pin_to_listed(&m, &trust, h, &listed, at),
+            "precondition: a device with no pin, dialled at its own address, where a \
+             listed machine proved its key, is pinned to it"
+        );
+        let refused = [
+            ("its address changed while the dial ran", &listed, elsewhere),
+            ("the machine is not listed to pair again", &other, at),
+        ];
+        for (why, machine, addr) in refused {
+            assert!(
+                !may_pin_to_listed(&m, &trust, h, machine, addr),
+                "a device was pinned though {why}: the pin would name a machine its \
+                 address did not answer as"
+            );
+        }
+        m.set_peer_fingerprint(h, Some(other.clone()));
+        assert!(
+            !may_pin_to_listed(&m, &trust, h, &listed, at),
+            "a device already pinned to a machine was pinned to another"
+        );
+    }
+
+    #[test]
+    fn only_a_pin_the_trust_store_never_heard_of_is_dropped() {
+        let mut trust = TrustStore::new(&fp(0x01), T0).expect("ours");
+        let (lapsed, pending, stranger, listed) = (fp(0x40), fp(0x60), fp(0x80), fp(0xa0));
+        trust
+            .issue_with_term(&lapsed, "lapsed", Caps::OUTBOUND, Term::Secs(HOUR))
+            .expect("issue");
+        trust.sweep(T0 + 2 * HOUR);
+        trust
+            .issue(&pending, "pending", Caps::OUTBOUND)
+            .expect("issue");
+        trust
+            .list_to_pair_again(&listed, "listed", T0)
+            .expect("listed");
+        assert!(
+            !trust.has_live_lease(&lapsed)
+                && !trust.has_live_lease(&pending)
+                && !trust.is_known(&listed),
+            "precondition: none holds a lease in force, and the listed one holds none"
+        );
+
+        let m = ClientManager::default();
+        let (a, b, c, d) = (
+            pinned_to(&m, &lapsed),
+            pinned_to(&m, &pending),
+            pinned_to(&m, &stranger),
+            pinned_to(&m, &listed),
+        );
+
+        let dropped = drop_untrusted_pins(&m, &trust);
+
+        assert_eq!(
+            dropped,
+            vec![c],
+            "only the pin nothing records may go, and it must: dropped {dropped:?}"
+        );
+        assert_eq!(m.peer_fingerprint(a), Some(lapsed));
+        assert_eq!(m.peer_fingerprint(b), Some(pending));
+        assert_eq!(
+            m.peer_fingerprint(d),
+            Some(listed),
+            "a pin to a machine listed to pair again is what folds its device into the \
+             listing's card, and was measured when that machine proved its key (#231)"
+        );
+        assert_eq!(
+            m.peer_fingerprint(c),
+            None,
+            "a pin nothing vouches for is dropped"
+        );
+    }
+}
+
+/// What a test waits on to know the daemon read its config.
+#[cfg(test)]
+#[derive(Default)]
+struct ConfigSignals {
+    /// A change to config.toml was read.
+    reloaded: tokio::sync::Notify,
+    /// The check for devices removed from it that the read scheduled ran.
+    checked: tokio::sync::Notify,
 }

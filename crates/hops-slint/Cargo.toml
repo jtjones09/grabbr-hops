@@ -16,12 +16,16 @@ hops-ipc = { path = "../hops-ipc", version = "0.3.0" }
 tokio = { version = "1.32", features = ["rt", "sync", "macros", "time"] }
 thiserror = "2.0"
 log = "0.4"
+hostname = "0.4"
 
 [build-dependencies]
 slint-build = "1.17"
 
 [dev-dependencies]
 image = "0.25"
+# A headless platform, so tests can build the real AppWindow and read its
+# properties rather than the .slint source.
+i-slint-backend-testing = "1.17"
 
 # Headless render harnesses — dump a window to a PNG so the design can be
 # reviewed without a display: `cargo run -p hops-slint --example render_png -- out.png`

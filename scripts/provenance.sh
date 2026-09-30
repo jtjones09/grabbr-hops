@@ -6,11 +6,12 @@
 # from HEAD but not from the fork base); otherwise it is inherited lan-mouse code.
 # This is "what's actually ours now", not churn — a rewritten file flips to ours.
 #
-# Run from anywhere in the repo. Requires the `upstream` remote (feschber/lan-mouse).
+# Run from anywhere in the repo. The fork base is the last inherited commit,
+# named here rather than found through a remote: this repository contacts no
+# remote of the project it was forked from.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
-git fetch upstream --quiet 2>/dev/null || true
-BASE=$(git merge-base HEAD upstream/main)
+BASE=d1f41180e3f18cbc66d69dae39917b2d705c9abc
 TMP=$(mktemp)
 git rev-list "$BASE..HEAD" > "$TMP"   # the post-fork (grabbr-hop) commits
 
@@ -26,9 +27,10 @@ measure() { # $1 = path (a dir, or "." for everything)
 
 echo "grabbr-hop provenance — current Rust LOC by authorship (fork base $(git rev-parse --short "$BASE"))"
 echo
-printf "  %-20s " "OVERALL"; measure "."
+printf "  %-28s " "OVERALL"; measure "."
 echo
-for d in src input-capture input-emulation input-event lan-mouse-proto lan-mouse-ipc lan-mouse-cli lan-mouse-gtk; do
-  printf "  %-20s " "$d"; measure "$d"
+for d in src crates/*/; do
+  d="${d%/}"
+  printf "  %-28s " "$d"; measure "$d"
 done
 rm -f "$TMP"

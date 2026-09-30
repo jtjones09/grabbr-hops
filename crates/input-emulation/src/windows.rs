@@ -292,7 +292,9 @@ fn linux_keycode_to_windows_scancode(linux_keycode: u32) -> Option<u16> {
     let linux_scancode = match scancode::Linux::try_from(linux_keycode) {
         Ok(s) => s,
         Err(_) => {
-            log::warn!("unknown keycode: {linux_keycode}");
+            // Which key goes to the keylog, never to a warn line (#117).
+            input_event::keylog::key(linux_keycode, 0, "linux:unknown");
+            log::warn!("dropped a key with no Linux scancode");
             return None;
         }
     };
@@ -301,7 +303,7 @@ fn linux_keycode_to_windows_scancode(linux_keycode: u32) -> Option<u16> {
     let windows_scancode = match scancode::Windows::try_from(linux_scancode) {
         Ok(s) => s,
         Err(_) => {
-            log::warn!("failed to translate linux code into windows scancode: {linux_scancode:?}");
+            log::warn!("dropped a key with no Windows scancode");
             return None;
         }
     };

@@ -28,6 +28,8 @@ pub(crate) struct DesktopPortalEmulation {
 impl DesktopPortalEmulation {
     pub(crate) async fn new() -> Result<DesktopPortalEmulation, XdpEmulationCreationError> {
         log::debug!("connecting to org.freedesktop.portal.RemoteDesktop portal ...");
+        // Before any portal call, so the consent prompt can name hops.
+        input_event::portal::register().await;
         let proxy = RemoteDesktop::new().await?;
 
         // retry when user presses the cancel button

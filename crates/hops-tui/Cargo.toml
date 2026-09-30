@@ -8,7 +8,8 @@ license = "GPL-3.0-or-later"
 [dependencies]
 hops-frontend-core = { path = "../hops-frontend-core", version = "0.1.0" }
 hops-ipc = { path = "../hops-ipc", version = "0.3.0" }
-ratatui = "0.30"
+# line_count sizes the header by the wrapping that renders it
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 tokio = { version = "1.32.0", features = ["rt", "sync", "macros", "time"] }
 thiserror = "2.0.0"
 log = "0.4.20"

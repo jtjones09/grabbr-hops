@@ -1,7 +1,7 @@
 # hops.service — DESKTOP Linux user service.
 #
 # For a normal desktop (Wayland/X11) where hops runs alongside your graphical
-# session. For a HEADLESS server (no display), use hops-headless.service instead.
+# session. For a HEADLESS server (no monitor, no login), use hops-headless.service.
 #
 #   mkdir -p ~/.config/systemd/user
 #   cp hops.service ~/.config/systemd/user/

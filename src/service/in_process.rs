@@ -1,0 +1,634 @@
+//! The whole daemon in this process, reached the way a frontend and a peer
+//! reach it, for a test about what either can make it do.
+//!
+//! Every file is in a scratch directory, its QUIC listener is on loopback (a
+//! test build binds 127.0.0.1), capture is the dummy backend, emulation is the
+//! backend the test hands it, and discovery is off. A frontend is a real
+//! connection to its IPC socket, token and all; a peer is a real dialer from
+//! `crate::test_harness`. Nothing here reads or writes the real config, token
+//! or trust files.
+
+use super::Service;
+use crate::listen::ListenerCreationError;
+use crate::test_harness::{Machine, dialer};
+use crate::transport::Trust;
+use crate::trust::{Caps, TrustStore};
+use hops_ipc::{AsyncFrontendListener, DaemonEndpoint, FrontendEvent, FrontendRequest, Position};
+use hops_proto::ProtoEvent;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+
+/// What must happen is waited for this long at most.
+pub(crate) const DEADLINE: Duration = Duration::from_secs(30);
+
+/// How many ports a daemon is built on before its test gives up.
+const PORT_ATTEMPTS: usize = 10;
+
+/// A daemon whose loop is not running yet.
+pub(crate) struct Daemon {
+    service: Service,
+    scratch: Scratch,
+    port: u16,
+}
+
+/// The scratch directory, removed with it.
+struct Scratch {
+    dir: PathBuf,
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+impl Daemon {
+    /// A daemon whose config also holds `tables`, injecting into `emulation`.
+    pub(crate) async fn start(
+        tag: &str,
+        tables: &str,
+        emulation: input_emulation::Backend,
+    ) -> Self {
+        Self::build(tag, tables, input_capture::Backend::Dummy, emulation).await
+    }
+
+    /// [`Daemon::start`], capturing from `capture`, such as a scripted
+    /// backend a test crosses with. This machine's own permissions are not
+    /// consulted.
+    pub(crate) async fn start_capturing(
+        tag: &str,
+        tables: &str,
+        capture: input_capture::Backend,
+        emulation: input_emulation::Backend,
+    ) -> Self {
+        let mut daemon = Self::build(tag, tables, capture, emulation).await;
+        daemon.service.permission_watch = crate::permission_watch::PermissionWatch::at_daemon_start(
+            Arc::new(|_| false),
+            Arc::new(|| false),
+            Duration::from_secs(3600),
+        );
+        daemon
+    }
+
+    /// [`Daemon::start_capturing`], already paired with each machine in
+    /// `pairings`: its fingerprint, the name it was paired under, and what
+    /// the pairing grants, confirmed on both machines
+    /// ([`crate::test_harness::seed_pairings`]).
+    pub(crate) async fn start_paired(
+        tag: &str,
+        tables: &str,
+        pairings: &[(&str, &str, Caps)],
+        capture: input_capture::Backend,
+        emulation: input_emulation::Backend,
+    ) -> Self {
+        let config = |port: u16| {
+            format!(
+                "port = {port}\ncapture_backend = \"dummy\"\nemulation_backend = \"dummy\"\n\
+                 discovery = false\n\n{tables}"
+            )
+        };
+        let mut daemon = Self::build_with(
+            crate::test_ports::pick,
+            tag,
+            config,
+            pairings,
+            capture,
+            emulation,
+        )
+        .await;
+        daemon.service.permission_watch = crate::permission_watch::PermissionWatch::at_daemon_start(
+            Arc::new(|_| false),
+            Arc::new(|| false),
+            Duration::from_secs(3600),
+        );
+        daemon
+    }
+
+    async fn build(
+        tag: &str,
+        tables: &str,
+        capture: input_capture::Backend,
+        emulation: input_emulation::Backend,
+    ) -> Self {
+        Self::build_on(crate::test_ports::pick, tag, tables, capture, emulation).await
+    }
+
+    /// A daemon's first start on `old`, a whole `config.toml` an earlier
+    /// build wrote, as an upgrade meets it: no trust file yet. Only its own
+    /// `port` line is changed, to one this test may bind, and the dummy
+    /// backends and no discovery are put before it.
+    pub(crate) async fn upgraded_from(tag: &str, old: &str) -> Self {
+        Self::upgraded_with(
+            tag,
+            old,
+            input_capture::Backend::Dummy,
+            input_emulation::Backend::Dummy,
+        )
+        .await
+    }
+
+    /// [`Daemon::upgraded_from`], capturing from `capture` and injecting
+    /// into `emulation`. This machine's own permissions are not consulted.
+    pub(crate) async fn upgraded_with(
+        tag: &str,
+        old: &str,
+        capture: input_capture::Backend,
+        emulation: input_emulation::Backend,
+    ) -> Self {
+        let config = |port: u16| {
+            format!(
+                "capture_backend = \"dummy\"\nemulation_backend = \"dummy\"\n\
+                 discovery = false\n{}\n",
+                on_port(old, port)
+            )
+        };
+        let mut daemon = Self::build_with(
+            crate::test_ports::pick,
+            tag,
+            config,
+            &[],
+            capture,
+            emulation,
+        )
+        .await;
+        daemon.service.permission_watch = crate::permission_watch::PermissionWatch::at_daemon_start(
+            Arc::new(|_| false),
+            Arc::new(|| false),
+            Duration::from_secs(3600),
+        );
+        daemon
+    }
+
+    /// A daemon started again on the files [`keep_files`] kept from an
+    /// earlier one in `kept`: its config, identity and trust file, as a
+    /// restart reads them. Only its own `port` line is changed.
+    pub(crate) async fn restarted(
+        tag: &str,
+        kept: &std::path::Path,
+        emulation: input_emulation::Backend,
+    ) -> Self {
+        let old = std::fs::read_to_string(kept.join("config.toml")).expect("the kept config");
+        let config = |port: u16| on_port(&old, port);
+        Self::build_from(
+            crate::test_ports::pick,
+            tag,
+            config,
+            &[],
+            Some(kept),
+            input_capture::Backend::Dummy,
+            emulation,
+        )
+        .await
+    }
+
+    /// [`Daemon::build`] on the ports `port` gives. A port can be bound by
+    /// another process between being picked and the listener binding it, so
+    /// a daemon whose port is taken is built again on the next.
+    async fn build_on(
+        port: impl FnMut() -> u16,
+        tag: &str,
+        tables: &str,
+        capture: input_capture::Backend,
+        emulation: input_emulation::Backend,
+    ) -> Self {
+        let config = |port: u16| {
+            format!(
+                "port = {port}\ncapture_backend = \"dummy\"\nemulation_backend = \"dummy\"\n\
+                 discovery = false\n\n{tables}"
+            )
+        };
+        Self::build_with(port, tag, config, &[], capture, emulation).await
+    }
+
+    /// [`Daemon::build_on`] with the whole config `config_at` writes for
+    /// the port picked.
+    async fn build_with(
+        port: impl FnMut() -> u16,
+        tag: &str,
+        config_at: impl Fn(u16) -> String,
+        pairings: &[(&str, &str, Caps)],
+        capture: input_capture::Backend,
+        emulation: input_emulation::Backend,
+    ) -> Self {
+        Self::build_from(port, tag, config_at, pairings, None, capture, emulation).await
+    }
+
+    /// [`Daemon::build_with`], its directory holding the files in `kept`
+    /// first, when there are some.
+    async fn build_from(
+        mut port: impl FnMut() -> u16,
+        tag: &str,
+        config_at: impl Fn(u16) -> String,
+        pairings: &[(&str, &str, Caps)],
+        kept: Option<&std::path::Path>,
+        capture: input_capture::Backend,
+        emulation: input_emulation::Backend,
+    ) -> Self {
+        // Short, for a socket path in it (`sun_path`).
+        let dir = PathBuf::from(format!("/tmp/h-ip-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let scratch = Scratch { dir };
+        let dir = &scratch.dir;
+        let mut last = None;
+        if let Some(kept) = kept {
+            keep_files(kept, dir);
+        }
+        if !pairings.is_empty() {
+            crate::test_harness::seed_pairings(dir, &dir.join("hops.pem"), pairings);
+        }
+        for _ in 0..PORT_ATTEMPTS {
+            let port = port();
+            let config = dir.join("config.toml");
+            std::fs::write(&config, config_at(port)).expect("a config");
+            let endpoint = DaemonEndpoint::Unix(dir.join("s.sock"));
+            let frontends =
+                AsyncFrontendListener::at_with_token_file(&endpoint, &dir.join("ipc-token"))
+                    .await
+                    .expect("the scratch endpoint");
+            let config = crate::config::Config::in_scratch(&config, &dir.join("hops.pem"))
+                .expect("the scratch config");
+            match Service::with_backends(config, frontends, Some(capture), Some(emulation)).await {
+                Ok(service) => {
+                    return Self {
+                        service,
+                        scratch,
+                        port,
+                    };
+                }
+                Err(super::ServiceError::ListenError(ListenerCreationError::Io(e)))
+                    if e.kind() == std::io::ErrorKind::AddrInUse =>
+                {
+                    last = Some(e);
+                }
+                Err(e) => panic!("a daemon in the scratch directory: {e:?}"),
+            }
+        }
+        panic!(
+            "every port picked for the daemon was taken before its listener bound it; \
+             the last: {last:?}"
+        )
+    }
+
+    /// Keep this machine awake through `power` rather than through none, as
+    /// a test's daemon otherwise does.
+    pub(crate) fn keep_awake_through(&mut self, power: Box<dyn crate::keep_awake::PowerAssertion>) {
+        self.service.keep_awake = crate::keep_awake::KeepAwake::with(power);
+    }
+
+    /// This machine's fingerprint.
+    pub(crate) fn fingerprint(&self) -> String {
+        self.service.public_key_fingerprint.clone()
+    }
+
+    /// The daemon's own trust store: what its doors wrote, read directly.
+    pub(crate) fn trust(&self) -> Trust {
+        self.service.trust.clone()
+    }
+
+    /// Its devices, to add one before its loop runs.
+    pub(crate) fn clients(&self) -> crate::client::ClientManager {
+        self.service.client_manager.clone()
+    }
+
+    /// Its listener's links in, to count them while its loop runs.
+    pub(crate) fn links_in(&self) -> crate::listen::Admitter {
+        self.service.dial_back.admitter()
+    }
+
+    /// The port its listener is on, on loopback.
+    pub(crate) fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// The clock its pairing window is timed by, to move on while it runs.
+    pub(crate) fn pairing_clock(&self) -> PairingClock {
+        PairingClock(self.service.pairing_skew.clone())
+    }
+
+    /// The config file it reads and saves.
+    pub(crate) fn config_file(&self) -> PathBuf {
+        self.scratch.dir.join("config.toml")
+    }
+
+    /// Where a frontend reaches it.
+    pub(crate) fn ipc(&self) -> Ipc {
+        Ipc {
+            dir: self.scratch.dir.clone(),
+        }
+    }
+
+    /// Run the daemon's loop until `body` ends, then stop its tasks.
+    pub(crate) async fn run_while<T>(mut self, body: impl std::future::Future<Output = T>) -> T {
+        let out = tokio::select! {
+            ended = self.service.run() => {
+                panic!("the daemon's loop ended while the test ran: {ended:?}")
+            }
+            out = body => out,
+        };
+        self.service.capture.terminate().await;
+        self.service.emulation.terminate().await;
+        self.service.resolver.terminate().await;
+        out
+    }
+}
+
+/// `config` with its own `port` line, the one before any table, set to
+/// `port`. A device's `port` line, in its table, is left alone.
+fn on_port(config: &str, port: u16) -> String {
+    let mut in_table = false;
+    config
+        .lines()
+        .map(|l| {
+            in_table |= l.trim_start().starts_with('[');
+            if !in_table && l.trim_start().starts_with("port =") {
+                format!("port = {port}")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Copy what a daemon in `from` reads at start into `to`: every file but
+/// its IPC socket and token, which each start makes for itself.
+pub(crate) fn keep_files(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).expect("a directory to keep them in");
+    for entry in std::fs::read_dir(from).expect("the daemon's directory") {
+        let path = entry.expect("an entry").path();
+        let name = path.file_name().expect("a name").to_owned();
+        if path.is_file() && name != "s.sock" && name != "ipc-token" {
+            std::fs::copy(&path, to.join(name)).expect("a file kept");
+        }
+    }
+}
+
+/// The clock a daemon's pairing window is timed by.
+#[derive(Clone)]
+pub(crate) struct PairingClock(Arc<std::sync::atomic::AtomicU64>);
+
+impl PairingClock {
+    /// Move it on by `by`, as if that much time had passed.
+    pub(crate) fn advance(&self, by: Duration) {
+        let ms = u64::try_from(by.as_millis()).expect("a short step");
+        self.0.fetch_add(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Where a frontend connects.
+#[derive(Clone)]
+pub(crate) struct Ipc {
+    dir: PathBuf,
+}
+
+impl Ipc {
+    /// A frontend on the daemon's socket, past the two-way proof.
+    pub(crate) async fn connect(&self) -> Frontend {
+        let token = std::fs::read_to_string(self.dir.join("ipc-token")).expect("the token");
+        let stream = tokio::net::UnixStream::connect(self.dir.join("s.sock"))
+            .await
+            .expect("the daemon's socket");
+        let (rx, mut tx) = stream.into_split();
+        let mut rx = BufReader::new(rx);
+        hops_ipc::prove_to_daemon(&mut rx, &mut tx, token.trim())
+            .await
+            .expect("the two-way proof is made");
+        Frontend {
+            lines: rx.lines(),
+            tx,
+            barrier: 0,
+        }
+    }
+}
+
+/// A frontend connected to the daemon.
+pub(crate) struct Frontend {
+    lines: tokio::io::Lines<BufReader<OwnedReadHalf>>,
+    tx: OwnedWriteHalf,
+    barrier: u64,
+}
+
+impl Frontend {
+    /// Send `requests` and return every event the daemon sent until it had
+    /// handled them all: they are followed by a barrier, answered once every
+    /// request before it was handled and every event it caused was sent.
+    pub(crate) async fn exchange(&mut self, requests: &[FrontendRequest]) -> Vec<FrontendEvent> {
+        self.barrier += 1;
+        let n = self.barrier;
+        for request in requests.iter().chain([&FrontendRequest::Barrier(n)]) {
+            let mut line = serde_json::to_string(request).expect("a request serialises");
+            line.push('\n');
+            self.tx
+                .write_all(line.as_bytes())
+                .await
+                .expect("the request is sent");
+        }
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        let mut events = Vec::new();
+        loop {
+            let line = tokio::time::timeout_at(deadline, self.lines.next_line())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("the daemon never answered barrier {n}; it sent {events:?}")
+                })
+                .expect("the socket reads")
+                .unwrap_or_else(|| panic!("the daemon hung up before answering barrier {n}"));
+            match serde_json::from_str::<FrontendEvent>(&line) {
+                Ok(FrontendEvent::Barrier(m)) if m == n => return events,
+                Ok(event) => events.push(event),
+                Err(_) => {}
+            }
+        }
+    }
+}
+
+/// A store for `me` that may drive the daemon, as a peer's would be.
+pub(crate) fn trusting(me: &Machine, daemon: &str) -> Trust {
+    let mut store = TrustStore::new(&me.fingerprint, 0).expect("our fingerprint");
+    store
+        .issue_confirmed(daemon, "the daemon", Caps::OUTBOUND)
+        .expect("issue");
+    Arc::new(RwLock::new(store))
+}
+
+/// Ask until the daemon has admitted `stranger`'s knock as a prompt.
+pub(crate) async fn prompt_from(app: &mut Frontend, stranger: &Machine, port: u16, daemon: &str) {
+    let knocker = dialer(stranger, trusting(stranger, daemon), port, Position::Left);
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    loop {
+        let _ = knocker.conn.send(ProtoEvent::Ping, knocker.handle).await;
+        let events = app.exchange(&[]).await;
+        let prompted = events.iter().any(|e| {
+            matches!(e, FrontendEvent::ConnectionAttempt { fingerprint, .. }
+                if *fingerprint == stranger.fingerprint)
+        });
+        if prompted {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a machine knocking while add device was open raised no prompt"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A pairing the daemon approved, part way (#167): the machine it approved
+/// dialled again, both arrived at a number, and the daemon put its three
+/// choices in front of the app. That machine has already sent its
+/// confirmation, which the daemon reads only once the app picks the number.
+pub(crate) struct Comparing {
+    /// The number both machines arrived at.
+    pub(crate) number: String,
+    // Held so the connection stays up while the test runs.
+    _conn: quinn::Connection,
+    _send: quinn::SendStream,
+    _endpoint: quinn::Endpoint,
+}
+
+impl Comparing {
+    /// Close the connection the number was compared on, saying `reason`.
+    pub(crate) fn close(&self, reason: &[u8]) {
+        self._conn.close(0u32.into(), reason);
+    }
+}
+
+/// Dial the daemon as `stranger` does once its knock was approved there, and
+/// compare the number: the machine that knocked is the one adding, so it
+/// shows the number, and the daemon asks the app which of three it is.
+pub(crate) async fn compare_number(
+    app: &mut Frontend,
+    stranger: &Machine,
+    port: u16,
+    daemon: &str,
+) -> Comparing {
+    crate::transport::install_crypto_provider();
+    let mut endpoint =
+        quinn::Endpoint::client("127.0.0.1:0".parse().expect("loopback")).expect("an endpoint");
+    endpoint.set_default_client_config(crate::test_harness::raw_client_config(
+        stranger,
+        trusting(stranger, daemon),
+        1 << 20,
+    ));
+    let at = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let conn = tokio::time::timeout(DEADLINE, endpoint.connect(at, "grabbr").expect("a dial"))
+        .await
+        .expect("the daemon answers in time")
+        .expect("the daemon admits a machine it approved, to compare a number");
+    let number = crate::pair_ceremony::as_initiator(&conn, &stranger.fingerprint, daemon)
+        .await
+        .expect("the two machines compare a number");
+
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    loop {
+        let events = app.exchange(&[]).await;
+        let offered = events.iter().find_map(|e| match e {
+            FrontendEvent::PairingCheck {
+                fingerprint,
+                check: hops_ipc::PairingCheck::Pick(choices),
+                ..
+            } if *fingerprint == stranger.fingerprint => Some(choices.clone()),
+            _ => None,
+        });
+        if let Some(choices) = offered {
+            assert!(
+                choices.contains(&number),
+                "the daemon offered {choices:?}, and not the number both machines \
+                 arrived at, {number}"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the daemon never asked the app which number the other machine shows"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // The machine that knocked confirms: its first frame, on its input stream.
+    let mut send = conn.open_uni().await.expect("an input stream");
+    crate::transport::write_frame(
+        &mut send,
+        ProtoEvent::Hello {
+            commit: crate::config::local_commit(),
+        },
+    )
+    .await
+    .expect("its confirmation is sent");
+    Comparing {
+        number,
+        _conn: conn,
+        _send: send,
+        _endpoint: endpoint,
+    }
+}
+
+/// Wait until the daemon's store holds a pairing for `fp`.
+pub(crate) async fn until_paired(trust: &Trust, fp: &str) {
+    crate::test_harness::wait_until("the pairing is confirmed", DEADLINE, || {
+        !trust.read().expect("lock").capabilities(fp).is_empty()
+    })
+    .await;
+}
+
+// LEDGER T229a | class B | 1 the port the built daemon's listener holds, and the ports it was offered
+/// A port taken between being picked and the listener binding it costs a
+/// second port, not the test: the daemon is built again on another, and its
+/// listener holds that one.
+#[test]
+fn a_daemon_whose_port_was_taken_first_is_built_on_another() {
+    crate::test_harness::run_local(async {
+        let taken = crate::test_ports::pick();
+        let _holder = std::net::UdpSocket::bind(("127.0.0.1", taken)).expect("the port is held");
+        let offered = std::cell::RefCell::new(Vec::new());
+        let daemon = Daemon::build_on(
+            || {
+                let port = if offered.borrow().is_empty() {
+                    taken
+                } else {
+                    crate::test_ports::pick()
+                };
+                offered.borrow_mut().push(port);
+                port
+            },
+            "taken",
+            "",
+            input_capture::Backend::Dummy,
+            input_emulation::Backend::Dummy,
+        )
+        .await;
+        let port = daemon.port();
+        let listener_holds_it = std::net::UdpSocket::bind(("127.0.0.1", port)).is_err();
+        daemon.run_while(async {}).await;
+        assert_eq!(
+            (offered.into_inner(), listener_holds_it),
+            (vec![taken, port], true),
+            "the daemon was not built again on a second port when its first was taken"
+        );
+    });
+}
+
+// LEDGER T229i | class B | 1 how building a daemon whose every port is taken fails
+/// A daemon whose every port is taken fails its test with what the listener
+/// last failed with, so an address in use for another reason is not read as
+/// a port race alone.
+#[test]
+#[should_panic(expected = "was taken before its listener bound it; the last: Some(Os {")]
+fn a_daemon_whose_every_port_is_taken_fails_with_the_last_error() {
+    crate::test_harness::run_local(async {
+        let taken = crate::test_ports::pick();
+        let _holder = std::net::UdpSocket::bind(("127.0.0.1", taken)).expect("the port is held");
+        Daemon::build_on(
+            || taken,
+            "alltaken",
+            "",
+            input_capture::Backend::Dummy,
+            input_emulation::Backend::Dummy,
+        )
+        .await;
+    });
+}

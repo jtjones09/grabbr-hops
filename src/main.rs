@@ -1,6 +1,7 @@
 use hops::{
     capture_test,
     config::{self, Command, Config, ConfigError},
+    daemon_start::StartReport,
     emulation_test,
     service::{Service, ServiceError},
 };
@@ -34,24 +35,64 @@ enum HopsError {
     Slint(#[from] hops_slint::SlintError),
     #[error(transparent)]
     Cli(#[from] CliError),
+    #[error(transparent)]
+    Elevated(#[from] hops::elevation::Elevated),
 }
 
 fn main() {
+    // First, every command included: hops runs as the user, never elevated
+    // (#109). A refused process opens no log, since an elevated process that
+    // creates, opens or rotates a file where the user can write is the very
+    // hazard, and reports on stderr and, where nothing keeps that on screen,
+    // in a message box.
+    match unless_elevated(hops::elevation::refused_here(), start) {
+        Ok(()) => {}
+        Err(HopsError::Elevated(e)) => process::exit(hops::elevation::refuse(&e)),
+        // A `hops cli` command answers whoever ran it, a script as much as a
+        // terminal, and the log reaches stderr only at a terminal.
+        Err(HopsError::Cli(e)) => {
+            eprintln!("{e}");
+            process::exit(1);
+        }
+        Err(e) => {
+            log::error!("{e}");
+            process::exit(1);
+        }
+    }
+}
+
+/// `command`, unless this process is `elevated`: then nothing of hops runs,
+/// not its log and not an argument parse, and the error says why and what
+/// to do.
+///
+/// No command is exempt. `build-check` runs git in a checkout the user can
+/// write, whose config can name programs for git to run, and `--help` and
+/// `--version` have no use elevated that a normal shell lacks.
+fn unless_elevated(
+    elevated: bool,
+    command: impl FnOnce() -> Result<(), HopsError>,
+) -> Result<(), HopsError> {
+    hops::elevation::may_run(elevated)?;
+    command()
+}
+
+/// hops, once this process may run.
+fn start() -> Result<(), HopsError> {
     // Logging first, before anything that can fail: a config parse error is
     // one of the things most worth having in the log.
     hops::logging::init(hops::logging::role_from_argv());
     install_panic_logger();
+    dispatch()
+}
 
+/// Every command, once the log is open.
+fn dispatch() -> Result<(), HopsError> {
     // Before anything that reads the config. This is the command someone runs
     // to find out why the others are failing, so it must not need them to work.
     if let Some(config::Command::BuildCheck { repo, strict }) = config::command_from_args() {
         run_build_check(repo, strict);
     }
-
-    if let Err(e) = run() {
-        log::error!("{e}");
-        process::exit(1);
-    }
+    run()
 }
 
 /// Report whether this binary matches its source, then exit. Never returns.
@@ -75,8 +116,8 @@ fn run() -> Result<(), HopsError> {
             // Taken above, before the config was read. Kept so the match
             // stays exhaustive.
             Command::Daemon => run_daemon()?,
-            Command::Gui { hidden } => run_gui(hidden)?,
-            Command::Tui => run_tui()?,
+            Command::Gui { hidden } => run_gui(hidden, None)?,
+            Command::Tui => run_tui(None)?,
             // Normally handled in `main` before the config is loaded; kept
             // here so the match stays exhaustive and both paths behave alike.
             Command::BuildCheck { repo, strict } => run_build_check(repo.clone(), strict),
@@ -112,30 +153,67 @@ fn runs_the_daemon(command: Option<Command>) -> bool {
     }
 }
 
-/// Run the daemon (the receiver service). A redundant instance self-exits.
+/// Run the daemon (the receiver service). A redundant instance self-exits,
+/// and so does one beside a daemon of an older build that listens where this
+/// build's claim cannot see it (on Windows, hops 0.12 and older). An elevated
+/// one never gets here ([`unless_elevated`]).
 fn run_daemon() -> Result<(), HopsError> {
-    match run_async(run_service()) {
+    if let Err(e) =
+        hops::daemon_start::refuse_beside_older(DaemonEndpoint::of_older_builds().as_ref())
+    {
+        return daemon_ended(Err(HopsError::Service(ServiceError::IpcListen(e))));
+    }
+    daemon_ended(run_async(run_service()))
+}
+
+/// What the daemon's end means for how the process exits. One that found
+/// another daemon of this user running says so and exits 0. Any other error
+/// exits 1: that includes an endpoint something else holds (#96), and a
+/// macOS permission granted while it ran (#221), whose exit is what makes
+/// launchd, which restarts it only after a failure, start a fresh process
+/// with the grant.
+fn daemon_ended(ended: Result<(), HopsError>) -> Result<(), HopsError> {
+    match ended {
         Err(HopsError::Service(ServiceError::IpcListen(
             IpcListenerCreationError::AlreadyRunning,
         ))) => {
-            log::info!("service already running!");
+            log::warn!(
+                "a hops daemon is already running for this user; this one exits and \
+                 leaves it running"
+            );
             Ok(())
         }
         r => r,
     }
 }
 
+/// What a frontend is told as it opens: this build, to compare with the
+/// daemon's, and what the front door did about the service, if it ran: why
+/// the service did not come up, or that it restarted or left running one of
+/// another build.
+#[cfg(any(feature = "tui", feature = "slint"))]
+fn launch(started: Option<StartReport>) -> hops_frontend_core::Launch {
+    let started = started.as_ref();
+    hops_frontend_core::Launch {
+        build: Some(hops::config::this_build()),
+        start_problem: started.and_then(StartReport::problem),
+        restarted: started.and_then(StartReport::note),
+        left_running: started.and_then(|started| started.left.clone()),
+    }
+}
+
 /// Open the Slint GUI (attach-only). No-op with a hint if this build lacks it.
 /// `hidden` starts the app in the menu bar / tray only, no window shown.
-fn run_gui(hidden: bool) -> Result<(), HopsError> {
+/// `started` is what the front door did about the service, if it ran.
+fn run_gui(hidden: bool, started: Option<StartReport>) -> Result<(), HopsError> {
     #[cfg(feature = "slint")]
     {
-        hops_slint::run(hidden)?;
+        hops_slint::run(hidden, launch(started))?;
         Ok(())
     }
     #[cfg(not(feature = "slint"))]
     {
-        let _ = hidden;
+        let _ = (hidden, started);
         log::error!("this build has no GUI — rebuild with `--features slint`");
         Ok(())
     }
@@ -175,14 +253,16 @@ fn install_panic_logger() {
 }
 
 /// Open the Ratatui TUI (attach-only). No-op with a hint if this build lacks it.
-fn run_tui() -> Result<(), HopsError> {
+/// `started` is what the front door did about the service, if it ran.
+fn run_tui(started: Option<StartReport>) -> Result<(), HopsError> {
     #[cfg(feature = "tui")]
     {
-        run_async(hops_tui::run())?;
+        run_async(hops_tui::run(launch(started)))?;
         Ok(())
     }
     #[cfg(not(feature = "tui"))]
     {
+        let _ = started;
         log::error!("this build has no TUI — rebuild with `--features tui`");
         Ok(())
     }
@@ -197,7 +277,10 @@ fn front_door() -> Result<(), HopsError> {
     use hops_frontend_core::prefs::{
         Frontend, load_frontend, onboarding_done, save_frontend, set_onboarding_done,
     };
-    hops::daemon_start::ensure_running();
+    // What became of the start goes to the screen: a service that did not
+    // come up used to leave the app at "connecting" with nothing said (#189),
+    // and one of another build went on serving without a word (#222).
+    let started = hops::daemon_start::ensure_running();
 
     let frontend = if onboarding_done() {
         load_frontend().unwrap_or_else(default_frontend)
@@ -212,9 +295,9 @@ fn front_door() -> Result<(), HopsError> {
     };
 
     match frontend {
-        Frontend::Tui => run_tui(),
+        Frontend::Tui => run_tui(Some(started)),
         // front door = the user actively opening the app, so show the window
-        Frontend::Gui => run_gui(false),
+        Frontend::Gui => run_gui(false, Some(started)),
     }
 }
 
@@ -277,6 +360,9 @@ where
 async fn run_service() -> Result<(), ServiceError> {
     let endpoint = DaemonEndpoint::of_this_platform().map_err(IpcListenerCreationError::from)?;
     let mut service = Service::start(&endpoint, Config::new).await?;
+    // Taken once this daemon holds its own endpoint, and held until it ends.
+    let _older =
+        hops::daemon_start::hold_older_endpoint(DaemonEndpoint::of_older_builds().as_ref());
     service.run().await?;
     log::info!("service exited!");
     Ok(())
@@ -342,5 +428,164 @@ mod keylog_is_never_shipped {
             ROOT_MANIFEST.contains(r#"keylog = ["input-event/keylog"]"#),
             "the `keylog` feature must still exist and forward to input-event"
         );
+    }
+}
+
+#[cfg(test)]
+mod a_daemon_ended_for_a_grant_exits_unsuccessfully {
+    //! launchd restarts the daemon only after it fails (#221), so the error a
+    //! grant ends it with must reach `main`, which exits 1 on any error.
+    use super::{HopsError, IpcListenerCreationError, ServiceError, daemon_ended};
+
+    // LEDGER T2251 | class B | 1 return value of daemon_ended
+    #[test]
+    fn only_a_daemon_that_found_another_of_this_user_exits_0() {
+        let granted = daemon_ended(Err(HopsError::Service(ServiceError::PermissionGranted(
+            "Accessibility".into(),
+        ))));
+        let beside = daemon_ended(Err(HopsError::Service(ServiceError::IpcListen(
+            IpcListenerCreationError::AlreadyRunning,
+        ))));
+        let held = daemon_ended(Err(HopsError::Service(ServiceError::IpcListen(
+            IpcListenerCreationError::Held {
+                endpoint: hops_ipc::DaemonEndpoint::Tcp("127.0.0.1:9".parse().expect("an address")),
+                why: "a program that is not hops".into(),
+                hint: String::new(),
+            },
+        ))));
+        assert!(
+            matches!(
+                granted,
+                Err(HopsError::Service(ServiceError::PermissionGranted(_)))
+            ),
+            "a daemon that ended for a grant must exit 1, or launchd leaves it down \
+             until the next login: {granted:?}"
+        );
+        let older = daemon_ended(Err(HopsError::Service(ServiceError::IpcListen(
+            IpcListenerCreationError::Older {
+                endpoint: hops_ipc::DaemonEndpoint::Tcp(
+                    "127.0.0.1:5252".parse().expect("an address"),
+                ),
+                hint: String::new(),
+            },
+        ))));
+        assert!(
+            older.is_err(),
+            "a daemon that did not start beside an older build's must exit 1 with \
+             the reason, not as if a daemon of this build were running: {older:?}"
+        );
+        assert!(beside.is_ok(), "{beside:?}");
+        assert!(
+            held.is_err(),
+            "a daemon whose endpoint something else holds must exit 1 with the \
+             reason, not as if a daemon were running: {held:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod an_elevated_hops_refuses_to_run {
+    //! hops runs as the user and is never elevated (#109). On Windows `main`
+    //! passes whether its token is elevated, before any command runs; here
+    //! the seam is called with each answer, so the refusal is tested on every
+    //! system. That `main` goes through it is guarded in `decision_guards`.
+    use super::{HopsError, unless_elevated};
+    use std::cell::Cell;
+
+    // LEDGER T1093 | class B | 1 return value + whether the command ran
+    #[test]
+    fn nothing_of_hops_runs_when_elevated_and_it_exits_1() {
+        let ran = Cell::new(false);
+        let got = unless_elevated(true, || {
+            ran.set(true);
+            Ok(())
+        });
+        assert!(
+            matches!(got, Err(HopsError::Elevated(_))) && !ran.get(),
+            "an elevated process ran a hops command, or exited 0 without saying \
+             why: ran {}, {got:?}",
+            ran.get()
+        );
+        let got = unless_elevated(false, || {
+            ran.set(true);
+            Ok(())
+        });
+        assert!(
+            got.is_ok() && ran.get(),
+            "a process that is not elevated did not run its command"
+        );
+    }
+}
+
+#[cfg(all(test, any(feature = "tui", feature = "slint")))]
+mod the_front_door_shows_what_became_of_its_start {
+    //! A start that did not come up left the app at "connecting", with the
+    //! reason in a log nobody was pointed at (#189).
+    //!
+    //! The text is tested where it is made (`StartReport::problem` against a
+    //! real daemon that exits, in tests/failed_start.rs) and where it is shown
+    //! (`AppModel::service_problem`, and the TUI's rendered header); what the
+    //! front door did about a service of another build likewise
+    //! (`StartReport::note` and `left`, `AppModel::launched`). What no
+    //! behavioural test can reach is `front_door` itself, which opens a
+    //! window or a terminal UI: that it hands the report to the frontend it
+    //! opens is checked here, on its source with comments stripped.
+
+    /// A daemon of another build that the front door left running is named
+    /// before the app connects. One from before the token cannot be
+    /// connected to at all, and the app sat at "connecting" with nothing
+    /// said: the very thing #222 is about.
+    // LEDGER T2250 | class B | 1 AppModel::service_problem over main's launch()
+    #[test]
+    fn a_service_left_running_is_named_before_the_app_connects() {
+        use hops::daemon_start::{DaemonStart, StartReport};
+        let why = "On Windows hops does not restart its service. Sign out and back in \
+                   to run this version.";
+        let report = StartReport {
+            outcome: DaemonStart::AlreadyRunning,
+            why: None,
+            log_file: None,
+            within: std::time::Duration::from_secs(5),
+            replaced: None,
+            left: Some(why.into()),
+            left_build: Some("hops 0.12.0 (1111111)".into()),
+        };
+        let model = hops_frontend_core::AppModel::launched(super::launch(Some(report)));
+        let said = model.service_problem().unwrap_or_default();
+        assert!(
+            !model.connected && said.contains("hops 0.12.0 (1111111)") && said.ends_with(why),
+            "the app has not connected, and must already say which build still runs \
+             and why: {said:?}"
+        );
+    }
+
+    // LEDGER T70 | class S | source text | pair T64 (report text), T61 (model), T62 (render), T2224 (restart report), T2230 (model)
+    #[test]
+    fn front_door_hands_its_start_report_to_the_frontend_it_opens() {
+        let src = include_str!("main.rs");
+        let code: String = src
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap_or(src)
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at = code
+            .find("fn front_door(")
+            .expect("front_door must exist; if it moved, point this check there");
+        let body = &code[at..];
+        let body = &body[..body.find("\n}").unwrap_or(body.len())];
+        for needed in [
+            "let started = hops::daemon_start::ensure_running();",
+            "Frontend::Tui => run_tui(Some(started))",
+            "Frontend::Gui => run_gui(false, Some(started))",
+        ] {
+            assert!(
+                body.contains(needed),
+                "front_door no longer has `{needed}`. A service that did not come \
+                 up then reaches the screen as \"connecting\", with nothing said."
+            );
+        }
     }
 }

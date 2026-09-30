@@ -6,7 +6,7 @@ use std::{
 
 use input_event::{Event, KeyboardEvent, PointerEvent};
 
-pub use self::error::{EmulationCreationError, EmulationError, InputEmulationError};
+pub use self::error::{EmulationCreationError, EmulationError, InputEmulationError, Permission};
 
 #[cfg(windows)]
 mod windows;
@@ -25,6 +25,10 @@ mod libei;
 
 #[cfg(target_os = "macos")]
 mod macos;
+
+/// The power assertion that keeps a Mac another machine controls awake.
+#[cfg(target_os = "macos")]
+pub mod macos_keep_awake;
 
 /// fallback input emulation (logs events)
 mod dummy;
@@ -127,6 +131,11 @@ pub struct InputEmulation {
     pressed_buttons: HashMap<EmulationHandle, HashSet<u32>>,
     /// The backend's own answer, read once: it does not change.
     button_scope: ButtonScope,
+    /// What the system withheld from a backend tried before this one, when
+    /// that is why it failed. A fall to `dummy` from a Mac without
+    /// Accessibility keeps the reason, so a caller that refuses the fall can
+    /// name the permission rather than only that input would be discarded.
+    withheld: &'static [Permission],
 }
 
 impl InputEmulation {
@@ -155,6 +164,7 @@ impl InputEmulation {
             handles: HashSet::new(),
             pressed_keys: HashMap::new(),
             pressed_buttons: HashMap::new(),
+            withheld: &[],
         })
     }
 
@@ -162,6 +172,12 @@ impl InputEmulation {
     /// accepted and thrown away.
     pub fn backend(&self) -> Backend {
         self.backend
+    }
+
+    /// The permissions the system withheld from a backend tried before this
+    /// one, when that is why it failed; empty otherwise.
+    pub fn withheld_permissions(&self) -> &'static [Permission] {
+        self.withheld
     }
 
     pub async fn new(backend: Option<Backend>) -> Result<InputEmulation, EmulationCreationError> {
@@ -173,7 +189,13 @@ impl InputEmulation {
             return b;
         }
 
-        for backend in [
+        Self::first_that_starts(Self::auto_order()).await
+    }
+
+    /// The backends tried, in order, when none is configured. `Dummy` is
+    /// last, so it is chosen only when every real backend failed.
+    pub fn auto_order() -> Vec<Backend> {
+        vec![
             #[cfg(wlroots)]
             Backend::Wlroots,
             #[cfg(libei)]
@@ -187,14 +209,29 @@ impl InputEmulation {
             #[cfg(target_os = "macos")]
             Backend::MacOs,
             Backend::Dummy,
-        ] {
+        ]
+    }
+
+    /// The first of `backends` that starts, in order. What the system
+    /// withheld from one that failed before it is kept on it.
+    pub async fn first_that_starts(
+        backends: impl IntoIterator<Item = Backend>,
+    ) -> Result<InputEmulation, EmulationCreationError> {
+        let mut withheld: &'static [Permission] = &[];
+        for backend in backends {
             match Self::with_backend(backend).await {
-                Ok(b) => {
+                Ok(mut b) => {
                     log::info!("using emulation backend: {backend}");
+                    b.withheld = withheld;
                     return Ok(b);
                 }
                 Err(e) if e.cancelled_by_user() => return Err(e),
-                Err(e) => log::warn!("{e}"),
+                Err(e) => {
+                    if withheld.is_empty() {
+                        withheld = e.missing_permissions().unwrap_or_default();
+                    }
+                    log::warn!("{e}");
+                }
             }
         }
 
@@ -404,6 +441,12 @@ impl InputEmulation {
             .get_mut(&handle)
             .map(|k| k.drain().collect::<Vec<_>>())
             .unwrap_or_default();
+        // How many, never which: this is a warn line, written at the default
+        // level and copied into the macOS system log, and the keys are what
+        // the peer was typing (#117).
+        if !keys.is_empty() {
+            log::warn!("releasing {} stuck key(s)", keys.len());
+        }
         for key in keys {
             let event = Event::Keyboard(KeyboardEvent::Key {
                 time: 0,
@@ -412,9 +455,6 @@ impl InputEmulation {
             });
             if let Err(e) = self.emulation.consume(event, handle).await {
                 first_error.get_or_insert(e);
-            }
-            if let Ok(key) = input_event::scancode::Linux::try_from(key) {
-                log::warn!("releasing stuck key: {key:?}");
             }
         }
 
@@ -438,6 +478,22 @@ impl InputEmulation {
         self.pressed_keys
             .get(&handle)
             .is_some_and(|p| !p.is_empty())
+    }
+
+    /// Whether `handle` holds a key or a button down on this machine.
+    pub fn holds(&self, handle: EmulationHandle) -> bool {
+        self.has_pressed_keys(handle)
+            || self
+                .pressed_buttons
+                .get(&handle)
+                .is_some_and(|p| !p.is_empty())
+    }
+
+    /// Whether any handle holds a key or a button down on this machine. While
+    /// one does, the backend may repeat the key with no event arriving.
+    pub fn holds_anything(&self) -> bool {
+        self.pressed_keys.values().any(|p| !p.is_empty())
+            || self.pressed_buttons.values().any(|p| !p.is_empty())
     }
 
     /// update the pressed_keys for the given handle

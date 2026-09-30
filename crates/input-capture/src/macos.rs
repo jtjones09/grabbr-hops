@@ -1,4 +1,6 @@
-use super::{Capture, CaptureError, CaptureEvent, Position, error::MacosCaptureCreationError};
+use super::{
+    Capture, CaptureError, CaptureEvent, Permission, Position, error::MacosCaptureCreationError,
+};
 use async_trait::async_trait;
 use bitflags::bitflags;
 use core_foundation::{
@@ -29,7 +31,7 @@ use std::{
     ffi::{CString, c_char},
     pin::Pin,
     sync::{Arc, OnceLock},
-    task::{Context, Poll, ready},
+    task::{Context, Poll},
     thread::{self},
     time::Duration,
 };
@@ -67,9 +69,11 @@ enum ProducerEvent {
     Create(Position),
     Destroy(Position),
     Grab(Position),
-    EventTapDisabled,
     DisplayReconfigured,
 }
+
+/// What the capture's stream carries: an event, or the fault that ends it.
+type Item = Result<(Position, CaptureEvent), CaptureError>;
 
 impl InputCaptureState {
     fn new() -> Result<Self, MacosCaptureCreationError> {
@@ -214,17 +218,6 @@ impl InputCaptureState {
                     };
                 }
                 self.active_clients.remove(&p);
-            }
-            ProducerEvent::EventTapDisabled => {
-                // Tap death can happen mid-capture (TCC Accessibility
-                // revoked, tap-timeout, etc). Release state so we
-                // don't leave the cursor hidden even if the outer
-                // task only logs this error rather than propagating.
-                if self.current_pos.is_some() {
-                    self.show_cursor()?;
-                    self.current_pos = None;
-                }
-                return Err(CaptureError::EventTapDisabled);
             }
             ProducerEvent::DisplayReconfigured => {
                 // A monitor was added/removed (lid open/close), or the
@@ -443,7 +436,8 @@ fn get_events(
 fn create_event_tap<'a>(
     client_state: Arc<Mutex<InputCaptureState>>,
     notify_tx: Sender<ProducerEvent>,
-    event_tx: Sender<(Position, CaptureEvent)>,
+    event_tx: Sender<Item>,
+    recheck_tx: Sender<()>,
 ) -> Result<CGEventTap<'a>, MacosCaptureCreationError> {
     // Shared slot for the tap's mach port pointer. Stored as `usize`
     // because raw pointers aren't `Send`, but the integer
@@ -470,99 +464,96 @@ fn create_event_tap<'a>(
         CGEventType::FlagsChanged,
     ];
 
-    let event_tap_callback = move |_proxy: CGEventTapProxy,
-                                   event_type: CGEventType,
-                                   cg_ev: &CGEvent| {
-        log::trace!("Got event from tap: {event_type:?}");
-        let mut state = client_state.blocking_lock();
-        let mut capture_position = None;
-        let mut res_events = vec![];
+    let event_tap_callback =
+        move |_proxy: CGEventTapProxy, event_type: CGEventType, cg_ev: &CGEvent| {
+            log::trace!("Got event from tap: {event_type:?}");
+            let mut state = client_state.blocking_lock();
+            let mut capture_position = None;
+            let mut res_events = vec![];
 
-        // The kernel disables the tap on a long callback (Timeout — heavy load,
-        // scheduler contention, or App Nap suspending us) OR a secure-input
-        // transition (UserInput — screensaver/lock, password field, fast user
-        // switch). BOTH are recoverable: Apple's documented response is to
-        // re-enable the tap. Re-enable in place and KEEP capture state so the
-        // cursor doesn't pop back mid-session — and, crucially for UserInput, so
-        // it isn't STRANDED on this device after a screensaver (the old fatal path
-        // left the cursor stuck here until the release-bind was pressed). The OS
-        // still blocks the tap from genuinely-secure events (passwords) while it
-        // is re-enabled, so this is safe. Only tear down if we have no mach port.
-        if matches!(
-            event_type,
-            CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
-        ) {
-            if let Some(&port) = tap_mach_port_cb.get() {
-                log::warn!("CGEventTap disabled ({event_type:?}) — re-enabling");
-                unsafe {
-                    CGEventTapEnable(port as *mut c_void, true);
-                }
-            } else {
-                log::error!(
-                    "CGEventTap disabled ({event_type:?}) but mach port not stored — tearing down"
-                );
-                if state.current_pos.is_some() {
-                    let _ = CGDisplay::show_cursor(&CGDisplay::main());
-                    state.current_pos = None;
-                }
-                notify_tx
-                    .blocking_send(ProducerEvent::EventTapDisabled)
-                    .unwrap_or_else(|e| log::error!("failed to send notification: {e}"));
-            }
-            return CallbackResult::Keep;
-        }
-
-        // Are we in a client?
-        if let Some(current_pos) = state.current_pos {
-            capture_position = Some(current_pos);
-            get_events(
-                &event_type,
-                cg_ev,
-                &mut res_events,
-                &mut state.modifier_state,
-            )
-            .unwrap_or_else(|e| {
-                log::error!("Failed to get events: {e}");
-            });
-
-            // Keep (hidden) cursor at the edge of the screen
+            // The kernel disables the tap on a long callback (Timeout — heavy load,
+            // scheduler contention, or App Nap suspending us) OR a secure-input
+            // transition (UserInput — screensaver/lock, password field, fast user
+            // switch). BOTH are recoverable: Apple's documented response is to
+            // re-enable the tap. Re-enable in place and KEEP capture state so the
+            // cursor doesn't pop back mid-session — and, crucially for UserInput, so
+            // it isn't STRANDED on this device after a screensaver (the old fatal path
+            // left the cursor stuck here until the release-bind was pressed). The OS
+            // still blocks the tap from genuinely-secure events (passwords) while it
+            // is re-enabled, so this is safe.
+            //
+            // A revoked permission is the one cause re-enabling cannot mend, and
+            // re-enabling alone would report capture running forever (#79). So
+            // every disable also asks the grants watch to check now; it ends the
+            // capture, naming what is gone, if macOS no longer grants it.
             if matches!(
                 event_type,
-                CGEventType::MouseMoved
-                    | CGEventType::LeftMouseDragged
-                    | CGEventType::RightMouseDragged
-                    | CGEventType::OtherMouseDragged
+                CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
             ) {
-                state.reset_cursor().unwrap_or_else(|e| log::warn!("{e}"));
+                // Stored before the run loop source is attached, so the callback
+                // never runs without it.
+                if let Some(&port) = tap_mach_port_cb.get() {
+                    log::warn!("CGEventTap disabled ({event_type:?}) — re-enabling");
+                    unsafe {
+                        CGEventTapEnable(port as *mut c_void, true);
+                    }
+                }
+                // A check already asked for covers this one too.
+                let _ = recheck_tx.try_send(());
+                return CallbackResult::Keep;
             }
-        } else if matches!(event_type, CGEventType::MouseMoved) {
-            // Did we cross a barrier?
-            if let Some(new_pos) = state.crossed(cg_ev) {
-                capture_position = Some(new_pos);
-                state
-                    .start_capture(cg_ev, new_pos)
-                    .unwrap_or_else(|e| log::warn!("{e}"));
-                res_events.push(CaptureEvent::Begin);
-                notify_tx
-                    .blocking_send(ProducerEvent::Grab(new_pos))
-                    .expect("Failed to send notification");
-            }
-        }
 
-        if let Some(pos) = capture_position {
-            res_events.iter().for_each(|e| {
-                // error must be ignored, since the event channel
-                // may already be closed when the InputCapture instance is dropped.
-                let _ = event_tx.blocking_send((pos, *e));
-            });
-            // Returning Drop should stop the event from being processed
-            // but core fundation still returns the event
-            cg_ev.set_type(CGEventType::Null);
-            CallbackResult::Drop
-        } else {
-            CallbackResult::Keep
-        }
-    };
+            // Are we in a client?
+            if let Some(current_pos) = state.current_pos {
+                capture_position = Some(current_pos);
+                get_events(
+                    &event_type,
+                    cg_ev,
+                    &mut res_events,
+                    &mut state.modifier_state,
+                )
+                .unwrap_or_else(|e| {
+                    log::error!("Failed to get events: {e}");
+                });
+
+                // Keep (hidden) cursor at the edge of the screen
+                if matches!(
+                    event_type,
+                    CGEventType::MouseMoved
+                        | CGEventType::LeftMouseDragged
+                        | CGEventType::RightMouseDragged
+                        | CGEventType::OtherMouseDragged
+                ) {
+                    state.reset_cursor().unwrap_or_else(|e| log::warn!("{e}"));
+                }
+            } else if matches!(event_type, CGEventType::MouseMoved) {
+                // Did we cross a barrier?
+                if let Some(new_pos) = state.crossed(cg_ev) {
+                    capture_position = Some(new_pos);
+                    state
+                        .start_capture(cg_ev, new_pos)
+                        .unwrap_or_else(|e| log::warn!("{e}"));
+                    res_events.push(CaptureEvent::Begin);
+                    notify_tx
+                        .blocking_send(ProducerEvent::Grab(new_pos))
+                        .expect("Failed to send notification");
+                }
+            }
+
+            if let Some(pos) = capture_position {
+                res_events.iter().for_each(|e| {
+                    // error must be ignored, since the event channel
+                    // may already be closed when the InputCapture instance is dropped.
+                    let _ = event_tx.blocking_send(Ok((pos, *e)));
+                });
+                // Returning Drop should stop the event from being processed
+                // but core fundation still returns the event
+                cg_ev.set_type(CGEventType::Null);
+                CallbackResult::Drop
+            } else {
+                CallbackResult::Keep
+            }
+        };
 
     let tap = CGEventTap::new(
         CGEventTapLocation::Session,
@@ -594,15 +585,16 @@ fn create_event_tap<'a>(
 
 fn event_tap_thread(
     client_state: Arc<Mutex<InputCaptureState>>,
-    event_tx: Sender<(Position, CaptureEvent)>,
+    event_tx: Sender<Item>,
     notify_tx: Sender<ProducerEvent>,
+    recheck_tx: Sender<()>,
     ready: std::sync::mpsc::Sender<Result<CFRunLoop, MacosCaptureCreationError>>,
     exit: oneshot::Sender<()>,
 ) {
     // Clone now: create_event_tap consumes notify_tx into its closure.
     let display_notify_tx = notify_tx.clone();
 
-    let _tap = match create_event_tap(client_state, notify_tx, event_tx) {
+    let _tap = match create_event_tap(client_state, notify_tx, event_tx, recheck_tx) {
         Err(e) => {
             ready.send(Err(e)).expect("channel closed");
             return;
@@ -670,18 +662,23 @@ extern "C" fn display_reconfiguration_callback(_display: u32, flags: u32, user_i
 }
 
 pub struct MacOSInputCapture {
-    event_rx: Receiver<(Position, CaptureEvent)>,
+    event_rx: Receiver<Item>,
     notify_tx: Sender<ProducerEvent>,
     run_loop: CFRunLoop,
 }
 
 impl MacOSInputCapture {
     pub async fn new() -> Result<Self, MacosCaptureCreationError> {
-        request_macos_capture_permissions()?;
+        let probe: Probe = Arc::new(granted);
+        let missing = missing_permissions(&probe);
+        if !missing.is_empty() {
+            return Err(MacosCaptureCreationError::MissingPermissions(missing));
+        }
 
         let state = Arc::new(Mutex::new(InputCaptureState::new()?));
         let (event_tx, event_rx) = mpsc::channel(32);
         let (notify_tx, mut notify_rx) = mpsc::channel(32);
+        let (recheck_tx, recheck_rx) = mpsc::channel(1);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (tap_exit_tx, mut tap_exit_rx) = oneshot::channel();
 
@@ -692,11 +689,13 @@ impl MacOSInputCapture {
         log::info!("Enabling CGEvent tap");
         let event_tap_thread_state = state.clone();
         let event_tap_notify = notify_tx.clone();
+        let faults = event_tx.clone();
         thread::spawn(move || {
             event_tap_thread(
                 event_tap_thread_state,
                 event_tx,
                 event_tap_notify,
+                recheck_tx,
                 ready_tx,
                 tap_exit_tx,
             )
@@ -704,6 +703,8 @@ impl MacOSInputCapture {
 
         // wait for event tap creation result
         let run_loop = ready_rx.recv().expect("channel closed")?;
+
+        tokio::task::spawn_local(watch_grants(probe, GRANTS_EVERY, recheck_rx, faults));
 
         let _tap_task: tokio::task::JoinHandle<()> = tokio::task::spawn_local(async move {
             // Safety-net poll: the Quartz display-reconfiguration callback
@@ -750,36 +751,80 @@ impl MacOSInputCapture {
     }
 }
 
-fn request_macos_capture_permissions() -> Result<(), MacosCaptureCreationError> {
-    // Call both request functions unconditionally so macOS surfaces both
-    // TCC prompts on the very first launch. TCC always returns `false` the
-    // first time a permission is requested (the grant only becomes visible
-    // on the next process launch), so returning early on the first failure
-    // would skip the second prompt and force the user through an extra
-    // relaunch just to see it.
-    let accessibility = request_accessibility_permission();
-    let input_monitoring = request_input_monitoring_permission();
+/// Asks whether macOS grants a permission.
+type Probe = Arc<dyn Fn(Permission) -> bool + Send + Sync>;
 
-    if !accessibility {
-        return Err(MacosCaptureCreationError::AccessibilityPermission);
+/// Whether macOS grants this process `permission`. Silent: neither call
+/// raises a prompt. The daemon runs under launchd, where a prompt may never
+/// show, so the app asks instead (hops-slint) when the user turns capture on
+/// (#169). Both are required, whether or not the Session tap would start
+/// without Input Monitoring: a tap that starts without it may be sent no
+/// keys, and keys typed then would land on this machine while the pointer
+/// is on another.
+fn granted(permission: Permission) -> bool {
+    // SAFETY: each takes no arguments and only reads this process's grant.
+    unsafe {
+        match permission {
+            Permission::Accessibility => AXIsProcessTrusted() != 0,
+            Permission::InputMonitoring => CGPreflightListenEventAccess(),
+        }
     }
-    if !input_monitoring {
-        return Err(MacosCaptureCreationError::InputMonitoringPermission);
-    }
-    Ok(())
 }
 
-fn request_accessibility_permission() -> bool {
-    // Silent check. The GUI owns the one-time user-visible prompt at
-    // startup (see hops_gtk::macos_privacy) so retries triggered by
-    // clicking the "Reenable" button don't pop a fresh Accessibility
-    // alert every time.
-    unsafe { AXIsProcessTrusted() }
+/// Every permission capture needs that `probe` reports missing, so the user
+/// is told all of them at once.
+fn missing_permissions(probe: &Probe) -> Vec<Permission> {
+    [Permission::Accessibility, Permission::InputMonitoring]
+        .into_iter()
+        .filter(|&p| !probe(p))
+        .collect()
 }
 
-fn request_input_monitoring_permission() -> bool {
-    // Silent check, same reasoning as above.
-    unsafe { CGPreflightListenEventAccess() }
+/// How often capture asks, while it runs, whether macOS still grants what it
+/// needs.
+const GRANTS_EVERY: Duration = Duration::from_secs(2);
+
+/// While capture runs, asks every `every`, and at once whenever the tap is
+/// disabled, whether macOS still grants what capture needs (#79). A revoked
+/// grant may disable the tap, which is then re-enabled like any other, or
+/// may stop it without a word; either way the next check finds it. Once one
+/// is gone, the error goes on the capture's stream, which ends the session
+/// and tells the daemon which setting to change. Ends then, or once the
+/// capture is dropped.
+///
+/// The checks run on a blocking thread, so a slow answer from the system
+/// never holds the daemon's loop.
+async fn watch_grants(
+    probe: Probe,
+    every: Duration,
+    mut recheck: Receiver<()>,
+    faults: Sender<Item>,
+) {
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        // The nudges close once the tap's thread has ended and dropped it.
+        let tap_gone = tokio::select! {
+            _ = ticks.tick() => false,
+            nudge = recheck.recv() => nudge.is_none(),
+            _ = faults.closed() => return,
+        };
+        let probe = probe.clone();
+        let missing = tokio::task::spawn_blocking(move || missing_permissions(&probe))
+            .await
+            .unwrap_or_default();
+        if !missing.is_empty() {
+            let fault = CaptureError::MissingPermissions(missing);
+            log::warn!("input capture stops: {fault}");
+            let _ = faults.send(Err(fault)).await;
+            return;
+        }
+        // With the tap gone there is nothing left to watch. Holding a sender
+        // would keep the stream open, and capture would read as running.
+        if tap_gone {
+            return;
+        }
+    }
 }
 
 impl Drop for MacOSInputCapture {
@@ -828,10 +873,7 @@ impl Stream for MacOSInputCapture {
     type Item = Result<(Position, CaptureEvent), CaptureError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match ready!(self.event_rx.poll_recv(cx)) {
-            None => Poll::Ready(None),
-            Some(e) => Poll::Ready(Some(Ok(e))),
-        }
+        self.event_rx.poll_recv(cx)
     }
 }
 
@@ -876,7 +918,8 @@ extern "C" {
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
-    fn AXIsProcessTrusted() -> bool;
+    // Apple declares this `Boolean` (u8), not C `_Bool`.
+    fn AXIsProcessTrusted() -> u8;
 }
 
 unsafe fn configure_cf_settings() -> Result<(), MacosCaptureCreationError> {
@@ -922,5 +965,116 @@ bitflags! {
         const Mod3Mask = (1<<5);
         const Mod4Mask = (1<<6);
         const Mod5Mask = (1<<7);
+    }
+}
+
+#[cfg(test)]
+mod a_permission_lost_while_capture_runs {
+    //! What reaches the capture's stream once macOS takes a permission away
+    //! while capture runs (#79). The grants are a stand-in and no event tap
+    //! is created; the stream is the one the daemon reads.
+
+    use super::{CaptureError, MacOSInputCapture, Permission, Probe, mpsc, watch_grants};
+    use core_foundation::runloop::CFRunLoop;
+    use futures::StreamExt;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    /// What must happen is waited for this long at most.
+    const DEADLINE: Duration = Duration::from_secs(30);
+
+    fn run_local<F: std::future::Future>(f: F) -> F::Output {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        tokio::task::LocalSet::new().block_on(&rt, f)
+    }
+
+    /// Grants Accessibility always, and Input Monitoring while `input` holds.
+    fn system(input: &Arc<AtomicBool>) -> Probe {
+        let input = input.clone();
+        Arc::new(move |p| p == Permission::Accessibility || input.load(Ordering::SeqCst))
+    }
+
+    /// A capture whose stream the grants watch feeds, checking every
+    /// `every`, and the sender that stands in for the tap's disable nudge.
+    fn capture(probe: Probe, every: Duration) -> (MacOSInputCapture, mpsc::Sender<()>) {
+        let (event_tx, event_rx) = mpsc::channel(32);
+        let (notify_tx, _) = mpsc::channel(32);
+        let (recheck_tx, recheck_rx) = mpsc::channel(1);
+        tokio::task::spawn_local(watch_grants(probe, every, recheck_rx, event_tx));
+        let capture = MacOSInputCapture {
+            event_rx,
+            notify_tx,
+            run_loop: CFRunLoop::get_current(),
+        };
+        (capture, recheck_tx)
+    }
+
+    // LEDGER T5 | class B | 1 return value: MacOSInputCapture Stream::next fed by watch_grants
+    #[test]
+    fn a_permission_taken_away_ends_the_stream_with_an_error_naming_it() {
+        run_local(async {
+            let input = Arc::new(AtomicBool::new(true));
+            let (mut capture, _nudge) = capture(system(&input), Duration::from_millis(20));
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            input.store(false, Ordering::SeqCst);
+            let next = tokio::time::timeout(DEADLINE, capture.next()).await;
+            assert!(
+                matches!(
+                    &next,
+                    Ok(Some(Err(CaptureError::MissingPermissions(missing))))
+                        if missing == &[Permission::InputMonitoring]
+                ),
+                "Input Monitoring was taken away while capture ran. The capture's \
+                 stream must yield the error naming it, which is how the daemon \
+                 learns capture stopped and why; it yielded {next:?} (Err(Elapsed): \
+                 nothing)"
+            );
+        });
+    }
+
+    // LEDGER T15 | class B | 1 return value: MacOSInputCapture Stream::next once the tap's nudge sender is dropped
+    #[test]
+    fn a_tap_that_is_gone_with_everything_granted_ends_the_stream() {
+        run_local(async {
+            let input = Arc::new(AtomicBool::new(true));
+            let (mut capture, nudge) = capture(system(&input), Duration::from_secs(3600));
+            // The tap's thread ends and drops what it holds; so does the
+            // test's stand-in for the tap's own event sender.
+            drop(nudge);
+            let next = tokio::time::timeout(DEADLINE, capture.next()).await;
+            assert!(
+                matches!(next, Ok(None)),
+                "the tap is gone and every permission is granted. The stream must end, \
+                 as it did before the grants watch, or capture reads as running with \
+                 no tap; it yielded {next:?} (Err(Elapsed): nothing)"
+            );
+        });
+    }
+
+    // LEDGER T6 | class B | 1 return value: MacOSInputCapture Stream::next after a watch_grants nudge
+    #[test]
+    fn a_disabled_tap_checks_the_grants_at_once() {
+        run_local(async {
+            let input = Arc::new(AtomicBool::new(true));
+            // No tick falls inside the test: only the nudge can check.
+            let (mut capture, nudge) = capture(system(&input), Duration::from_secs(3600));
+            input.store(false, Ordering::SeqCst);
+            nudge.send(()).await.expect("the watch runs");
+            let next = tokio::time::timeout(DEADLINE, capture.next()).await;
+            assert!(
+                matches!(
+                    &next,
+                    Ok(Some(Err(CaptureError::MissingPermissions(missing))))
+                        if missing == &[Permission::InputMonitoring]
+                ),
+                "macOS disabled the tap after taking Input Monitoring away. The tap \
+                 is re-enabled in place, so the check its disable asks for is what \
+                 ends capture; it yielded {next:?} (Err(Elapsed): nothing)"
+            );
+        });
     }
 }

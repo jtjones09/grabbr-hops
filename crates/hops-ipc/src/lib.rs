@@ -1,13 +1,47 @@
+//! The channel between the hops daemon and its frontends.
+//!
+//! # What a frontend can do to trust: a stated limit (#107)
+//!
+//! Reaching this channel takes the token beside `config.toml` ([`token`]),
+//! so any program running as the user who owns that file can send what a
+//! frontend sends. Three requests widen what a machine may do, and nothing
+//! else a frontend sends does:
+//!
+//! * [`FrontendRequest::AuthorizeKey`] approves a pairing prompt the daemon
+//!   raised: a machine that connected while add device was open, or one the
+//!   daemon dialled then. It carries the answers given on the card: which
+//!   way control goes, and whether to share the clipboard. With no prompt
+//!   waiting it grants nothing. A prompt is forgotten when the pairing
+//!   window closes. An approval lets the two machines connect far enough to
+//!   compare a number, and grants nothing more until both confirm it.
+//! * [`FrontendRequest::ConfirmPairing`] answers that number: confirmed here
+//!   and on the other machine, the approval becomes a pairing (#167).
+//! * [`FrontendRequest::EnableClipboard`] turns a paired machine's clipboard
+//!   back on, in the directions that pairing already drives.
+//!
+//! The daemon refuses all three while a peer is driving this machine, so
+//! the machine holding the keyboard and pointer cannot click its own
+//! approval. That is the whole of the check, and it is a limit rather than
+//! a defence: a program running as the user, holding the token, can approve
+//! a pending prompt, answer its number or turn a clipboard on whenever no
+//! peer is driving, and since it can also open add device and add a device
+//! to dial, it can pair a machine of its choosing. Such a program could
+//! equally re-sign the trust store on disk. A peer driving this machine can
+//! start such a program, which acts once the peer has left.
+
 use std::{
     collections::{HashMap, HashSet},
     env::VarError,
     fmt::Display,
     io,
-    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{IpAddr, SocketAddr},
     str::FromStr,
     time::{Duration, Instant},
 };
 use thiserror::Error;
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
+};
 
 #[cfg(unix)]
 use std::{
@@ -17,19 +51,21 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-mod connect;
 mod connect_async;
+pub mod identity;
+pub mod instance;
 mod listen;
 mod ownership;
-pub mod pairing;
+pub mod proof;
 pub mod token;
+#[cfg(windows)]
+mod windows;
 
-pub use connect::{FrontendEventReader, FrontendRequestWriter, connect, connect_to};
 pub use connect_async::{
     AsyncFrontendEventReader, AsyncFrontendRequestWriter, connect_async, connect_async_to,
 };
-pub use listen::AsyncFrontendListener;
-pub use pairing::{PairingCode, PairingError};
+pub use listen::{AsyncFrontendListener, PREAUTH_CONNECTIONS_MAX, PREAUTH_DEADLINE};
+pub use proof::{PROOF_WITHIN, prove_to_daemon};
 
 #[derive(Debug, Error)]
 pub enum ConnectionError {
@@ -42,20 +78,52 @@ pub enum ConnectionError {
     /// A frontend on this platform cannot dial that kind of endpoint.
     #[error("a frontend here cannot connect to {0}")]
     UnsupportedEndpoint(DaemonEndpoint),
+    /// What answered at the daemon's endpoint did not prove it holds this
+    /// user's IPC token, so it is not this user's hops daemon. The frontend
+    /// hung up having sent it only a random challenge (#96).
+    #[error(
+        "what answers at the hops daemon's endpoint did not prove it is this \
+         user's daemon: {0}. The app sent it nothing secret, and does not \
+         believe anything it says"
+    )]
+    Unproven(String),
 }
 
 #[derive(Debug, Error)]
 pub enum IpcListenerCreationError {
     #[error("could not determine socket-path: `{0}`")]
     SocketPath(#[from] SocketPathError),
-    #[error("service already running!")]
+    /// A hops daemon of this user already holds the endpoint.
+    #[error("a hops daemon is already running for this user")]
     AlreadyRunning,
+    /// Something holds the endpoint that is not this user's hops daemon, or
+    /// cannot be told apart from one, so this daemon cannot listen there.
+    #[error("{endpoint} is held by something that is not this user's hops daemon: {why}. {hint}")]
+    Held {
+        endpoint: DaemonEndpoint,
+        /// What was found there.
+        why: String,
+        /// What to do about it, in words.
+        hint: String,
+    },
     /// The endpoint could not be bound, for a reason other than a daemon
     /// holding it.
     #[error("could not listen on {endpoint}: {source}")]
     Bind {
         endpoint: DaemonEndpoint,
         source: io::Error,
+    },
+    /// A hops daemon from before the named pipe answers where such daemons
+    /// listened ([`DaemonEndpoint::of_older_builds`]). It does not hold this
+    /// build's endpoint, so without this check a second daemon would start
+    /// beside it, with the same identity and config.
+    #[error(
+        "an older hops daemon, from before 0.13, answers on {endpoint}, so this one does not start beside it. {hint}"
+    )]
+    Older {
+        endpoint: DaemonEndpoint,
+        /// What to do about it, in words.
+        hint: String,
     },
     /// The lock that stops a second daemon starting could not be taken, for a
     /// reason other than another daemon holding it.
@@ -113,7 +181,26 @@ pub enum IpcError {
     Listen(#[from] IpcListenerCreationError),
 }
 
-pub const DEFAULT_PORT: u16 = 4242;
+/// The QUIC port hops listens on unless configured otherwise (#16).
+///
+/// 4722 ("GRAB" on a phone keypad) since v0.13, which moved it in the same
+/// breaking change that lets a controlled machine dial out (#15). Above 1024,
+/// so either machine binds it without privileges.
+pub const DEFAULT_PORT: u16 = 4722;
+
+/// The port hops v0.12 and earlier listened on. Nothing listens here now: a
+/// dial that finds no answer on [`DEFAULT_PORT`] asks here only whether an
+/// older hops answers, to say so.
+pub const PORT_BEFORE_V013: u16 = 4242;
+
+/// How the service's [`FrontendEvent::Error`] begins when it made a change and
+/// could not save the config, so the change is gone when it restarts. Shared
+/// with `hops cli`, which fails a command on it.
+pub const NOT_SAVED: &str = "The change was made but not saved";
+/// How the notice begins when a change to trusted devices could not be saved.
+pub const TRUST_NOT_SAVED: &str = "Could not save a change to trusted devices";
+/// How every refusal of a trust grant begins.
+pub const GRANT_REFUSED: &str = "Nothing was trusted";
 
 #[derive(Debug, Default, Eq, Hash, PartialEq, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -198,6 +285,11 @@ pub struct Geometry {
 
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
+    /// What the user calls the device, kept apart from the address it is
+    /// dialled at so a rename never changes where it dials (#13). `None`: it
+    /// goes by its hostname, or by the name its pairing gave it.
+    #[serde(default)]
+    pub label: Option<String>,
     /// hostname of this client
     pub hostname: Option<String>,
     /// fix ips, determined by the user
@@ -219,6 +311,7 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             port: DEFAULT_PORT,
+            label: None,
             hostname: Default::default(),
             fix_ips: Default::default(),
             pos: Default::default(),
@@ -229,6 +322,46 @@ impl Default for ClientConfig {
 }
 
 pub type ClientHandle = u64;
+
+/// A device to add, whole (#32): where it is dialled, on which port, and the
+/// screen edge it sits on.
+///
+/// Adding used to be a blank device the frontend filled in afterwards, one
+/// request per field. Every interruption between the two, a closed window or
+/// a lost connection, left a device with no address saved in the config, and
+/// a frontend that took the next new device for its own configured that one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewDevice {
+    /// The hostname or address typed, or the name a discovered machine
+    /// resolves at.
+    pub hostname: Option<String>,
+    /// Addresses dialled without a lookup: those a discovered machine
+    /// announced.
+    pub fix_ips: Vec<IpAddr>,
+    pub port: u16,
+    pub pos: Position,
+}
+
+impl NewDevice {
+    /// Why this device cannot be added, in words for the person adding it,
+    /// or `None` when it can: it needs somewhere to dial, and a port.
+    pub fn refusal(&self) -> Option<&'static str> {
+        let named = self
+            .hostname
+            .as_deref()
+            .is_some_and(|h| !h.trim().is_empty());
+        if !named && self.fix_ips.is_empty() {
+            return Some("Enter the other machine's hostname or IP address.");
+        }
+        if self.port == 0 {
+            return Some(
+                "That port is not valid. Use a number from 1 to 65535, or leave it \
+                 blank for the default.",
+            );
+        }
+        None
+    }
+}
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ClientState {
@@ -267,16 +400,28 @@ pub struct ClientState {
     /// outgoing client dials), read from the completed TLS handshake. `None`
     /// until a connection completes; then RETAINED as the client's last-known
     /// identity — unlike `peer_commit`/`peer_caps` it is NOT cleared on
-    /// disconnect (it pins the reconnect dial, see `connect`). It is cleared
-    /// only when the target address config changes (hostname / fix_ips) or trust
-    /// in it is revoked. It IS persisted (`[[clients]] fingerprint`) so the device
+    /// disconnect (it pins the reconnect dial, see `connect`). A new hostname
+    /// or address keeps it (#99); it is cleared only when trust in it is
+    /// revoked. It IS persisted (`[[clients]] fingerprint`) so the device
     /// join works from a cold start and the pin survives a restart — meaning a
     /// restart does NOT clear a bad pin, and the on-disk value is validated on
-    /// read (`hops_ipc::pairing::valid_fingerprint`). Also
+    /// read (`hops_ipc::identity::valid_fingerprint`). Also
     /// the join key a frontend uses to correlate this client with its
     /// `authorized_fingerprints` entry (byte-identical to the allowlist key).
     #[serde(default)]
     pub peer_fingerprint: Option<String>,
+    /// The machine this device is pinned to refused this machine's dial as
+    /// one it holds no pairing with: it removed this machine (#184). This
+    /// machine still holds its side, so the device's card says so and offers
+    /// to remove it. Cleared once a link to it is up again.
+    #[serde(default)]
+    pub removed_by_peer: bool,
+    /// The device's machine dials this one to be driven by it (#15): this
+    /// machine never dials it, and waits for it to connect. Set for a device
+    /// with no address that is pinned to its machine, and for one whose
+    /// machine dialled in since the service started.
+    #[serde(default)]
+    pub dials_us: bool,
 }
 
 /// Who caused a connection attempt to be raised.
@@ -316,19 +461,35 @@ pub enum FrontendEvent {
     Enumerate(Vec<(ClientHandle, ClientConfig, ClientState)>),
     /// an error occured
     Error(String),
-    /// capture status
-    CaptureStatus(Status),
-    /// emulation status
-    EmulationStatus(Status),
+    /// Something the daemon did that nobody at this machine asked for and
+    /// nobody here need act on, such as refusing a machine that is not
+    /// paired: a line for the activity log, never the error banner. Anyone on
+    /// the network can cause some of these, and an error surface that cries
+    /// wolf stops being read (#150).
+    ///
+    /// Newer than `Error`; older frontends skip it.
+    Activity(String),
+    /// Whether input capture runs, and why not when it should (#91).
+    CaptureStatus(CaptureState),
+    /// Whether input emulation runs, and why not when it should.
+    EmulationStatus(EmulationState),
     /// authorized public key fingerprints have been updated
     AuthorizedUpdated(HashMap<String, String>),
+    /// What the trust store grants each paired machine, by fingerprint: sent
+    /// with `AuthorizedUpdated` whenever trust changes, and on every sync. A
+    /// fingerprint absent here holds no pairing.
+    ///
+    /// Newer than `AuthorizedUpdated`, which older frontends still read; they
+    /// skip this event.
+    TrustUpdated(HashMap<String, PeerTrust>),
     /// public key fingerprint of this device
     PublicKeyFingerprint(String),
-    /// this device's own pairing code (encoded, ready to share out-of-band), or
-    /// empty if no shareable LAN address is available. See `pairing::PairingCode`.
-    PairingCode(String),
-    /// the set of deliberately-revoked fingerprints changed
-    RevokedUpdated(HashMap<String, RevokedEntry>),
+    /// Whether this machine listens on its port. `false` for a machine that
+    /// only dials out, which binds no port (#15), so its port is not one any
+    /// machine can reach.
+    ///
+    /// Newer than `PortChanged`; older frontends skip it.
+    Listening(bool),
     /// new device connected
     DeviceConnected {
         addr: SocketAddr,
@@ -363,21 +524,178 @@ pub enum FrontendEvent {
         /// only sees `[]` renders the same silence for all three (#141).
         active: bool,
         peers: Vec<DiscoveredDevice>,
+        /// Discovery has run a while and heard no other machine at all,
+        /// paired or not. On macOS that is also how a daemon without the
+        /// Local Network permission looks (#149), so a frontend names the
+        /// setting rather than saying only that nothing is there. Absent
+        /// from an older daemon, which never says it.
+        #[serde(default)]
+        quiet: bool,
     },
     /// failed connection attempt (approval for fingerprint required)
     ConnectionAttempt {
         fingerprint: String,
         origin: AttemptOrigin,
-        /// The address that answered, when we know it. Present for
-        /// `OutboundDial` — the user typed an address and something answered,
-        /// and they cannot judge the fingerprint without seeing which address
-        /// it came from (#93). `None` inbound, because `ListenEvent::Rejected`
-        /// does not carry one (see #83).
+        /// Where the attempt came from, when we know it. For `OutboundDial`,
+        /// the address that answered: the user typed an address and something
+        /// answered, and they cannot judge the fingerprint without seeing
+        /// which address it came from (#93). For `Inbound`, the address the
+        /// refused connection came from (#83).
         addr: Option<SocketAddr>,
     },
     /// Pairing prompts may appear on this machine for this many more seconds.
     /// Zero means the window is closed (#195).
     PairingOpen { seconds: u32 },
+    /// Both machines approved a pairing, and a person must now compare the
+    /// number they arrived at (#11, #167). Sent again when this machine's
+    /// answer is given, and to a frontend that attaches while it is open.
+    PairingCheck {
+        fingerprint: String,
+        /// Where the other machine is, when known.
+        addr: Option<SocketAddr>,
+        check: PairingCheck,
+        /// The person here has confirmed, or picked the right number, and
+        /// this machine now waits for the other.
+        answered: bool,
+    },
+    /// The pairing check for `fingerprint` is over: both machines confirmed
+    /// (`paired`), or it ended and this machine kept nothing. Why it ended is
+    /// said in an `Error` beside it.
+    PairingEnded { fingerprint: String, paired: bool },
+    /// The build this daemon runs. Sent first on every sync, before any
+    /// state, so a frontend that sees state without it knows the daemon
+    /// predates this event.
+    ///
+    /// A daemon can be another build than the app talking to it: launchd
+    /// keeps the previous version's daemon running when the app is replaced
+    /// in place, and it still serves.
+    DaemonBuild(Build),
+    /// The answer to [`FrontendRequest::Barrier`] with the same number: every
+    /// request sent before it on that connection has been handled, and every
+    /// event those requests caused was sent before this one.
+    Barrier(u64),
+    /// The pointer crossed toward the device `handle` sits at, and was left
+    /// on this machine instead, for `reason` (#115). Sent once per device and
+    /// reason while the user keeps pushing at that edge, not per push.
+    CrossingRefused {
+        handle: ClientHandle,
+        reason: CrossingRefusal,
+    },
+}
+
+/// Why a crossing did not take the pointer to the device it was toward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CrossingRefusal {
+    /// There is no connection to the device: it never answered, or its link
+    /// is down. Crossing to it starts a dial.
+    NotConnected,
+    /// The device is connected and says it is not accepting input.
+    NotAcceptingInput,
+    /// This machine may no longer control the device.
+    NotPermitted,
+    /// The device did not acknowledge the crossing in time.
+    Unanswered,
+}
+
+impl Display for CrossingRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotConnected => "not connected",
+            Self::NotAcceptingInput => "not accepting input",
+            Self::NotPermitted => "this machine may no longer control it",
+            Self::Unanswered => "it did not acknowledge the crossing",
+        })
+    }
+}
+
+/// What this machine's trust store grants one paired machine, beyond the
+/// allowlist `FrontendEvent::AuthorizedUpdated` carries.
+///
+/// That allowlist names only the machines that may drive this one. A
+/// pairing this machine only controls is here and nowhere else, so this is
+/// what a frontend lists it from.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerTrust {
+    /// This machine accepts that machine's clipboard.
+    pub clipboard_from: bool,
+    /// This machine sends that machine its clipboard.
+    pub clipboard_to: bool,
+    /// Approved here, and not yet confirmed on both machines, so it grants
+    /// nothing yet (#167). Absent from an older daemon, which has no such
+    /// state.
+    #[serde(default)]
+    pub pending: bool,
+    /// The name the pairing was made under. Empty from an older daemon.
+    #[serde(default)]
+    pub label: String,
+    /// This machine may control that one. False from an older daemon.
+    #[serde(default)]
+    pub we_may_drive: bool,
+    /// Paired with a version of hops before the trust store, and not paired
+    /// since: it grants nothing, in either direction, until it is paired
+    /// again and the direction chosen (#231). False from an older daemon.
+    #[serde(default)]
+    pub pair_again: bool,
+}
+
+/// Which way control goes between two paired machines, as the person
+/// approving the pairing says on its card (#220), from this machine's side.
+///
+/// Asked, never inferred: which machine dialled which says nothing about
+/// which one a person means to control the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Controller {
+    /// This machine controls that one.
+    ThisMachine,
+    /// That machine controls this one.
+    ThatMachine,
+    /// Each controls the other.
+    Both,
+}
+
+impl Controller {
+    /// All three answers, in the order a card offers them.
+    pub const ALL: [Controller; 3] = [
+        Controller::ThisMachine,
+        Controller::ThatMachine,
+        Controller::Both,
+    ];
+
+    /// The answer as a card words it, the same in every frontend.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Controller::ThisMachine => "This machine controls that one",
+            Controller::ThatMachine => "That machine controls this one",
+            Controller::Both => "Each controls the other",
+        }
+    }
+}
+
+/// What a person compares to finish a pairing (#11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PairingCheck {
+    /// This machine added the other. Show this number; the other machine
+    /// asks which of three it sees, and this one confirms too.
+    Show(String),
+    /// This machine is being added. Which of these does the other machine
+    /// show? Only one is right, and a wrong pick ends the attempt.
+    Pick(Vec<String>),
+}
+
+/// Which build a program is: its package version and the commit it was built
+/// from. Two builds are the same only when both match.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Build {
+    /// The package version, as `hops --version` prints it.
+    pub version: String,
+    /// The short commit it was built from, or `unknown`.
+    pub commit: String,
+}
+
+impl Display for Build {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.version, self.commit)
+    }
 }
 
 /// A machine advertising itself on the local network.
@@ -394,17 +712,12 @@ pub struct DiscoveredDevice {
     pub addrs: Vec<SocketAddr>,
 }
 
-/// A fingerprint the user deliberately expelled.
+/// One row of the `[revoked_fingerprints]` table a build before #184 wrote to
+/// `config.toml`: a device it removed.
 ///
-/// Kept so a revoked peer is DISTINGUISHABLE from a stranger. Without it,
-/// re-approving a machine you just kicked out is indistinguishable from
-/// approving a brand-new one — the exact state whose absence has a CVE in
-/// matrix-sdk-crypto (RUSTSEC-2024-0434).
-///
-/// It is NOT an exclusion mechanism and must never be sold as one: a revoked
-/// peer can mint a fresh keypair and return as a stranger for free. What it buys
-/// is that the SAME key can no longer summon an approval dialog — the peer loses
-/// the ability to schedule a security decision.
+/// Read once, when the daemon first makes its trust store, so that device is
+/// not carried forward, and never written again: removing a device now
+/// forgets it, and no record of the removal is kept (#184).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RevokedEntry {
     /// what the device was called when trust was withdrawn
@@ -417,24 +730,46 @@ pub struct RevokedEntry {
 pub enum FrontendRequest {
     /// activate/deactivate client
     Activate(ClientHandle, bool),
-    /// add a new client
-    Create,
+    /// Add a device, all of it at once, and start dialling it (#32). A
+    /// device the daemon cannot dial is refused whole: nothing is added,
+    /// and an `Error` says why.
+    Create(NewDevice),
     /// change the listen port (recreate udp listener)
     ChangePort(u16),
-    /// remove a client
-    Delete(ClientHandle),
+    /// Remove a device, and revoke the machine it is pinned to.
+    ///
+    /// `fingerprint` is the device's pin as the frontend showed it (`None` for
+    /// one never connected). The daemon refuses the request if the device's
+    /// pin is no longer that, so a delete aimed at what the user saw cannot
+    /// revoke a machine the user never saw on that row (#94).
+    Delete {
+        handle: ClientHandle,
+        fingerprint: Option<String>,
+    },
     /// request an enumeration of all clients
     Enumerate(),
     /// resolve dns
     ResolveDns(ClientHandle),
-    /// update hostname
-    UpdateHostname(ClientHandle, Option<String>),
+    /// Name a device: set its label, or clear it with `None`. Changes nothing
+    /// it dials and nothing it is trusted with (#13).
+    UpdateLabel(ClientHandle, Option<String>),
+    /// Set the hostname a device is dialled at. Its pin stays, so only the
+    /// same machine is reached there (#99). `fingerprint` is its pin as the
+    /// frontend showed it, and a mismatch is refused, as for `Delete`.
+    UpdateHostname {
+        handle: ClientHandle,
+        hostname: Option<String>,
+        fingerprint: Option<String>,
+    },
     /// update port
     UpdatePort(ClientHandle, u16),
-    /// update position
+    /// Move a device to another edge. A switched-on device moved onto an
+    /// edge another switched-on device uses trades edges with it (#174).
     UpdatePosition(ClientHandle, Position),
-    /// update spatial layout rect (the drag-to-arrange canvas). Storage only —
-    /// coordinate-based crossing is a separate, not-yet-built behavior change.
+    /// The middle spot on the arrange canvas of the side a device was last
+    /// dropped on. Storage only, for a later layout: nothing reads it, the
+    /// canvas draws each device from its edge, and the edge the pointer
+    /// crosses at is set by `UpdatePosition`, which clears it.
     UpdateGeometry(ClientHandle, Option<Geometry>),
     /// update fix-ips
     UpdateFixIps(ClientHandle, Vec<IpAddr>),
@@ -444,8 +779,23 @@ pub enum FrontendRequest {
     EnableEmulation,
     /// synchronize all state
     Sync,
-    /// authorize fingerprint (description, fingerprint)
-    AuthorizeKey(String, String),
+    /// Approve the pairing prompt the daemon raised for `fingerprint`, with
+    /// the two answers the person approving gave on its card: which way
+    /// control goes (#220), and whether the two machines share a clipboard
+    /// (#182). The pairing grants exactly those directions, and a clipboard
+    /// only on a yes. With no prompt waiting it grants nothing. Refused while
+    /// a peer drives this machine. One of the requests that widen trust; see
+    /// the crate docs.
+    AuthorizeKey {
+        /// What to call the machine.
+        label: String,
+        fingerprint: String,
+        /// Which machine controls which.
+        controller: Controller,
+        /// Share the clipboard, in the directions control goes. No unless
+        /// the person said yes.
+        clipboard: bool,
+    },
     /// remove fingerprint (fingerprint)
     RemoveAuthorizedKey(String),
     /// rename an ALREADY-authorized device: (fingerprint, label)
@@ -457,7 +807,7 @@ pub enum FrontendRequest {
     /// not inserted (#117-adjacent, Layer 1 of CONSENT-ARCHITECTURE.md).
     SetLabel(String, String),
     // NOTE: there is deliberately NO verb here for the enter hook. It is
-    // executed with `sh -c` (src/service.rs), so exposing it on this channel
+    // run as a command (src/enter_hook.rs), so exposing it on this channel
     // made reaching the frontend socket equivalent to arbitrary command
     // execution. `enter_hook` is a CONFIG-FILE-ONLY field; setting it requires
     // write access to the config directory. See issue #56, and the guard test
@@ -470,6 +820,44 @@ pub enum FrontendRequest {
     /// Grants nothing by itself: a prompt still has to be approved, and only
     /// `AuthorizeKey` does that.
     OpenPairing,
+    /// Turn the clipboard off, both ways, for the paired machine with this
+    /// fingerprint: the off arm of the per-device switch (#182). Saved, so it
+    /// stays off across restarts and when the other direction is approved.
+    ///
+    /// Only takes permission away, so, like removal, it is honoured while a
+    /// peer drives this machine. [`FrontendRequest::EnableClipboard`] turns
+    /// it back on.
+    DisableClipboard(String),
+    /// Answer the pairing check for `fingerprint` (#11, #167): the number
+    /// this machine shows, to confirm it, or the one picked from three. The
+    /// daemon compares it with the number it arrived at; a different one ends
+    /// the attempt and keeps no pairing.
+    ///
+    /// Widens trust, so it is refused while a peer drives this machine, as an
+    /// approval is.
+    ConfirmPairing { fingerprint: String, number: String },
+    /// End the pairing check for `fingerprint` without pairing: "none of
+    /// these", or a cancel. Only takes away, so it is always honoured.
+    CancelPairing(String),
+    /// Turn the clipboard back on for the paired machine with this
+    /// fingerprint: the on arm of the per-device switch (#182). Only in the
+    /// directions the pairing drives: that machine's clipboard arrives here
+    /// if it may drive this one, and this machine's goes there if this one
+    /// may drive it. Saved, like `DisableClipboard`. Never grants or changes
+    /// a direction to drive.
+    ///
+    /// Widens a pairing, so, like `AuthorizeKey`, it is refused while a peer
+    /// drives this machine. See the crate docs for the limit that states.
+    EnableClipboard(String),
+    /// Answered with [`FrontendEvent::Barrier`] carrying the same number once
+    /// every request sent before it on this connection has been handled.
+    ///
+    /// Events go to every frontend, so a frontend cannot tell which ones its
+    /// own requests caused. A number it chose itself can: a command that sends
+    /// its requests, then this, knows its requests were read and acted on when
+    /// the number comes back, and that the events before it include theirs.
+    /// Changes nothing.
+    Barrier(u64),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
@@ -488,6 +876,85 @@ impl From<Status> for bool {
     }
 }
 
+/// Whether input capture runs: [`Status`]'s two states, written on the wire
+/// exactly as `Status` writes them, and a third for a capture that should run
+/// and cannot (#91). Capture that failed is not capture switched off: the
+/// user is told why, and what to change.
+///
+/// A frontend older than this skips a `Failed` it cannot read.
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum CaptureState {
+    /// Not running, and nothing is wrong: not started yet, or ended.
+    #[default]
+    Disabled,
+    Enabled,
+    /// It could not start, or it stopped.
+    Failed(CaptureFault),
+}
+
+impl CaptureState {
+    pub fn is_enabled(&self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
+/// Whether input emulation runs, written on the wire as [`Status`] writes
+/// its two states, and a third for emulation that should run and cannot. A
+/// Mac that is only ever controlled needs Accessibility for it, and a bare
+/// "off" did not say so.
+///
+/// A frontend older than this skips a `Failed` it cannot read.
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum EmulationState {
+    /// Not running, and nothing is wrong: not started yet, or ended.
+    #[default]
+    Disabled,
+    Enabled,
+    /// It could not start, or it stopped.
+    Failed(EmulationFault),
+}
+
+impl EmulationState {
+    pub fn is_enabled(&self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
+/// Why emulation could not start, or stopped.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum EmulationFault {
+    /// macOS does not grant hops these permissions.
+    Missing(Vec<Permission>),
+    /// Any other failure, as the backend reported it.
+    Backend(String),
+}
+
+/// Why capture could not start, or stopped.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum CaptureFault {
+    /// macOS does not grant hops these permissions.
+    Missing(Vec<Permission>),
+    /// Any other failure, as the backend reported it.
+    Backend(String),
+}
+
+/// A macOS permission, named as System Settings → Privacy & Security lists
+/// it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+pub enum Permission {
+    Accessibility,
+    InputMonitoring,
+}
+
+impl Display for Permission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Accessibility => "Accessibility",
+            Self::InputMonitoring => "Input Monitoring",
+        })
+    }
+}
+
 #[cfg(unix)]
 const LAN_MOUSE_SOCKET_NAME: &str = "lan-mouse-socket.sock";
 
@@ -497,6 +964,10 @@ pub enum SocketPathError {
     XdgRuntimeDirNotFound(VarError),
     #[error("could not determine $HOME: `{0}`")]
     HomeDirNotFound(VarError),
+    /// The IPC token, which names the daemon's pipe on Windows, could not be
+    /// read or created.
+    #[error("could not read or create the IPC token that names the daemon's pipe: {0}")]
+    Token(io::Error),
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -515,15 +986,6 @@ pub fn default_socket_path() -> Result<PathBuf, SocketPathError> {
         .join(LAN_MOUSE_SOCKET_NAME))
 }
 
-/// The loopback port the daemon listens on where there are no Unix sockets.
-///
-/// One definition for the listener, both connectors and the front door's
-/// probe, so the probe cannot ask a different address from the one the daemon
-/// binds.
-#[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) const TCP_ENDPOINT: SocketAddr =
-    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5252));
-
 /// How long the probe waits on a TCP endpoint before concluding nothing is
 /// there. A listening daemon completes a loopback handshake at once, and a
 /// connect to a closed port is not guaranteed to fail fast, so this bounds
@@ -536,7 +998,19 @@ pub enum DaemonEndpoint {
     /// A Unix domain socket, on macOS and Linux.
     #[cfg(unix)]
     Unix(PathBuf),
-    /// A loopback TCP port, on Windows.
+    /// A named pipe, on Windows: `\\.\pipe\` and a name.
+    ///
+    /// The daemon's pipe is named after the IPC token ([`proof::pipe_name`])
+    /// and grants this user alone.
+    #[cfg(windows)]
+    Pipe(String),
+    /// A loopback TCP port.
+    ///
+    /// No daemon listens on one: on Windows the daemon listened on
+    /// 127.0.0.1:5252 until it moved to a named pipe, which unlike a port
+    /// can say which users may open it (#110). The asks below still reach
+    /// a port: to find a daemon of such a build ([`Self::of_older_builds`]),
+    /// and so a test can stand something up on one and ask it.
     Tcp(SocketAddr),
 }
 
@@ -545,6 +1019,8 @@ impl Display for DaemonEndpoint {
         match self {
             #[cfg(unix)]
             Self::Unix(path) => write!(f, "{}", path.display()),
+            #[cfg(windows)]
+            Self::Pipe(name) => write!(f, "{name}"),
             Self::Tcp(addr) => write!(f, "{addr}"),
         }
     }
@@ -552,12 +1028,15 @@ impl Display for DaemonEndpoint {
 
 impl DaemonEndpoint {
     /// The endpoint this platform's daemon listens on: the one
-    /// [`AsyncFrontendListener::new`] binds and [`connect()`] and
-    /// [`connect_async()`] dial.
+    /// [`AsyncFrontendListener::new`] binds and [`connect_async()`] dials.
     ///
     /// Only the defaults read it. Code that is handed an endpoint, such as
     /// [`AsyncFrontendListener::at`] and [`connect_async_to`], uses that one,
     /// and nothing in the environment can point a frontend elsewhere.
+    ///
+    /// On Windows the pipe is named after the IPC token, which this reads,
+    /// or mints when there is none yet: whichever of the daemon and a
+    /// frontend runs first mints it, and the other reads the same one.
     pub fn of_this_platform() -> Result<Self, SocketPathError> {
         #[cfg(unix)]
         {
@@ -565,16 +1044,38 @@ impl DaemonEndpoint {
         }
         #[cfg(windows)]
         {
-            Ok(Self::Tcp(TCP_ENDPOINT))
+            let token = token::load_or_create().map_err(SocketPathError::Token)?;
+            Ok(Self::Pipe(proof::pipe_name(&token)))
+        }
+    }
+
+    /// Where a daemon of an older build of hops listens that this build's
+    /// endpoint does not reach, on this platform.
+    ///
+    /// On Windows, hops 0.12 and earlier listened on 127.0.0.1:5252, and this
+    /// build on a pipe, so a daemon of either does not see the other. On
+    /// macOS and Linux every build has used the same socket. `None` there.
+    pub fn of_older_builds() -> Option<Self> {
+        #[cfg(windows)]
+        {
+            Some(Self::Tcp(SocketAddr::from(([127, 0, 0, 1], 5252))))
+        }
+        #[cfg(not(windows))]
+        {
+            None
         }
     }
 
     /// Whether something accepts a connection here right now.
     ///
     /// Connects and hangs up without sending anything. The daemon sees a
-    /// frontend that closed before presenting its token, and drops it without
+    /// frontend that closed before it proved anything, and drops it without
     /// logging a warning. A Unix socket whose queue of connections waiting to
-    /// be accepted is full has a listener, and answers.
+    /// be accepted is full has a listener, and answers, as does a pipe whose
+    /// instances are all busy. A pipe held by a process of another user does
+    /// not, whether or not it lets this user open it: only this user's
+    /// daemon counts, and a daemon started beside such a pipe says what
+    /// holds it.
     pub fn answers(&self) -> bool {
         match self {
             #[cfg(unix)]
@@ -582,12 +1083,15 @@ impl DaemonEndpoint {
                 Ok(_) => true,
                 Err(e) => e.kind() == io::ErrorKind::WouldBlock,
             },
+            #[cfg(windows)]
+            Self::Pipe(name) => crate::windows::pipe_answers(name),
             Self::Tcp(addr) => std::net::TcpStream::connect_timeout(addr, PROBE_TIMEOUT).is_ok(),
         }
     }
 
-    /// Whether a daemon serves frontends here: it takes `token` and sends a
-    /// frontend its state, all within `within`.
+    /// Whether a daemon serves frontends here: it proves it holds `token`,
+    /// takes this side's proof, and sends a frontend its state, all within
+    /// `within`.
     ///
     /// Stronger than [`Self::answers`]. A daemon binds its endpoint before it
     /// reads the token, the config and its keys, and one that fails on any of
@@ -600,39 +1104,217 @@ impl DaemonEndpoint {
     /// endpoint, sending a byte at a time or never accepting, the answer comes
     /// by then.
     pub fn serves(&self, token: &str, within: Duration) -> bool {
+        let token = token.to_string();
+        self.ask(within, move |stream, deadline| {
+            Box::pin(state_follows_proof(stream, token, deadline))
+        })
+        .unwrap_or(false)
+    }
+
+    /// Which build the daemon here says it is, asked once within `within`.
+    ///
+    /// With `token`, makes the two-way proof first, and reads what comes back
+    /// until the daemon states its build or `within` is over. A daemon states
+    /// its build first on every sync, but an event it sends to every frontend
+    /// can arrive before that, so no other event ends the ask.
+    ///
+    /// A daemon that sends state and never states its build predates the
+    /// statement: [`StatedBuild::Unstated`]. So does one that hangs up on the
+    /// challenge without answering it, as a daemon from before the two-way
+    /// proof does, and one from before the token, which sends its state to
+    /// anything that connects. `None` when nothing is said by then: nothing
+    /// answers, the daemon is still starting, or its answer does not prove
+    /// `token`, as a daemon of this build holding another token's answer
+    /// does not.
+    pub fn build(&self, token: Option<&str>, within: Duration) -> Option<StatedBuild> {
+        let token = token.map(str::to_string);
+        self.ask(within, move |stream, deadline| {
+            Box::pin(build_follows(stream, token, deadline))
+        })
+        .unwrap_or(None)
+    }
+
+    /// The process listening here, as the kernel reports it for a connection
+    /// made now: its id and the user it runs as.
+    ///
+    /// Taken from the socket, not from anything the process says, so it names
+    /// whatever holds the endpoint, hops or not. Unix sockets on macOS and
+    /// Linux only; elsewhere the error is `Unsupported`.
+    pub fn listener(&self) -> io::Result<Listener> {
+        match self {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            Self::Unix(path) => listener_of(&connect_unix_now(path)?),
+            #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+            Self::Unix(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this system does not say which process listens on a socket",
+            )),
+            #[cfg(windows)]
+            Self::Pipe(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "a user id does not describe who holds a pipe here",
+            )),
+            Self::Tcp(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "a loopback port does not say which process listens on it",
+            )),
+        }
+    }
+
+    /// Connect here once, and run `exchange` on the connection, all within
+    /// `within`.
+    ///
+    /// The asks are called from code that does not run an async runtime, and
+    /// sometimes from a thread that does. The exchange runs on a runtime of
+    /// its own on a thread of its own, which is never inside another, and
+    /// the thread ends by the deadline: every step of the exchange is bounded
+    /// by it, and a connection dropped at the deadline cancels what it was
+    /// waiting on.
+    fn ask<T: Send + 'static>(
+        &self,
+        within: Duration,
+        exchange: impl FnOnce(Box<dyn Duplex>, Instant) -> Exchange<T> + Send + 'static,
+    ) -> io::Result<T> {
         let deadline = Instant::now() + within;
-        let exchange = || -> io::Result<bool> {
-            match self {
-                #[cfg(unix)]
-                Self::Unix(path) => state_follows_token(connect_unix_now(path)?, token, deadline),
-                Self::Tcp(addr) => {
-                    let stream = std::net::TcpStream::connect_timeout(addr, time_left(deadline)?)?;
-                    state_follows_token(stream, token, deadline)
-                }
+        let endpoint = self.clone();
+        std::thread::Builder::new()
+            .name("hops-ipc ask".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(async move {
+                    let stream = endpoint.dial_once(deadline).await?;
+                    exchange(stream, deadline).await
+                })
+            })?
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("the ask ended in a panic")))
+    }
+
+    /// One connection here, made by `deadline`.
+    async fn dial_once(&self, deadline: Instant) -> io::Result<Box<dyn Duplex>> {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(path) => {
+                let stream = connect_unix_now(path)?;
+                stream.set_nonblocking(true)?;
+                Ok(Box::new(tokio::net::UnixStream::from_std(stream)?))
             }
+            #[cfg(windows)]
+            Self::Pipe(name) => Ok(Box::new(crate::windows::open_pipe(name, deadline).await?)),
+            Self::Tcp(addr) => {
+                let stream = std::net::TcpStream::connect_timeout(addr, time_left(deadline)?)?;
+                stream.set_nonblocking(true)?;
+                Ok(Box::new(tokio::net::TcpStream::from_std(stream)?))
+            }
+        }
+    }
+}
+
+/// A connection to a daemon endpoint, whatever carries it.
+trait Duplex: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Duplex for T {}
+
+/// What an ask runs on its connection.
+type Exchange<T> = std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<T>>>>;
+
+/// What a daemon said about its build when asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatedBuild {
+    /// It said which build it is.
+    Is(Build),
+    /// It did not say, in a way only a daemon from before the statement
+    /// behaves: it sent state without saying, or hung up on the two-way
+    /// proof's challenge without answering it.
+    Unstated,
+}
+
+/// The process listening on a daemon endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Listener {
+    /// Its process id.
+    pub pid: u32,
+    /// The user id it runs as.
+    pub uid: u32,
+}
+
+/// The process at the other end of `stream`, a connection to a listener.
+///
+/// Both systems record the listener's credentials when it starts listening
+/// and hand them to every connection, accepted or not.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn listener_of(stream: &std::os::unix::net::UnixStream) -> io::Result<Listener> {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `ucred` is plain data, for which all zeroes is a valid value.
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: `fd` is open, and `cred` and `len` outlive the call and
+        // describe a buffer of `len` bytes.
+        let got = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                std::ptr::addr_of_mut!(cred).cast(),
+                &mut len,
+            )
         };
-        exchange().unwrap_or(false)
+        if got == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let pid = u32::try_from(cred.pid)
+            .ok()
+            .filter(|&pid| pid > 0)
+            .ok_or_else(|| io::Error::other("the socket named no listening process"))?;
+        Ok(Listener { pid, uid: cred.uid })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut pid: libc::pid_t = 0;
+        let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+        // SAFETY: `fd` is open, and `pid` and `len` outlive the call and
+        // describe a buffer of `len` bytes.
+        let got = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
+                std::ptr::addr_of_mut!(pid).cast(),
+                &mut len,
+            )
+        };
+        if got == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let (mut uid, mut gid) = (0, 0);
+        // SAFETY: `fd` is open, and `uid` and `gid` outlive the call.
+        if unsafe { libc::getpeereid(fd, &mut uid, &mut gid) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let pid = u32::try_from(pid)
+            .ok()
+            .filter(|&pid| pid > 0)
+            .ok_or_else(|| io::Error::other("the socket named no listening process"))?;
+        Ok(Listener { pid, uid })
     }
 }
 
-/// A connected stream whose reads and writes can be given a timeout.
-trait Timed: io::Read + io::Write {
-    fn wait_at_most(&self, within: Duration) -> io::Result<()>;
-}
-
-impl Timed for std::net::TcpStream {
-    fn wait_at_most(&self, within: Duration) -> io::Result<()> {
-        self.set_read_timeout(Some(within))?;
-        self.set_write_timeout(Some(within))
-    }
-}
-
-#[cfg(unix)]
-impl Timed for std::os::unix::net::UnixStream {
-    fn wait_at_most(&self, within: Duration) -> io::Result<()> {
-        self.set_read_timeout(Some(within))?;
-        self.set_write_timeout(Some(within))
-    }
+/// What one whole line from a daemon says about its build: `Some(Some(_))`
+/// for a statement, `Some(None)` for any other event, `None` for a line that
+/// is not JSON.
+fn build_in(line: &[u8]) -> Option<Option<Build>> {
+    let event = serde_json::from_slice::<serde_json::Value>(line).ok()?;
+    // Read as JSON rather than as this build's `FrontendEvent`: the daemon may
+    // be another version, whose other events this build cannot parse.
+    Some(
+        event
+            .get("DaemonBuild")
+            .and_then(|build| serde_json::from_value::<Build>(build.clone()).ok()),
+    )
 }
 
 /// How much of one line an ask holds before it concludes no daemon is there.
@@ -651,34 +1333,117 @@ fn time_left(deadline: Instant) -> io::Result<Duration> {
     Ok(left)
 }
 
-/// Present `token` on `stream`, and say whether an event comes back by
-/// `deadline`.
+/// One line read by an ask.
+#[derive(Debug)]
+enum Read {
+    /// A whole line, without its newline.
+    Line(Vec<u8>),
+    /// The connection ended before anything of a line.
+    Closed,
+    /// It ended part-way through a line, the line outgrew
+    /// [`EVENT_LINE_LIMIT`], or the deadline passed.
+    Nothing,
+}
+
+/// The next line from `rx`, waiting no later than `deadline`.
+async fn next_line(rx: &mut (impl AsyncBufRead + Unpin), deadline: Instant) -> Read {
+    let mut line = Vec::new();
+    let mut limited = (&mut *rx).take(EVENT_LINE_LIMIT as u64 + 1);
+    let reading = limited.read_until(b'\n', &mut line);
+    match tokio::time::timeout_at(deadline.into(), reading).await {
+        Ok(Ok(0)) => Read::Closed,
+        Ok(Ok(_)) if line.last() == Some(&b'\n') => {
+            line.pop();
+            Read::Line(line)
+        }
+        _ => Read::Nothing,
+    }
+}
+
+/// Prove `token` to the daemon on `stream`, and say whether an event comes
+/// back by `deadline`.
 ///
 /// Any whole line of JSON counts, not only a [`FrontendEvent`] this build
 /// knows: the daemon may be another version, left running by launchd across
 /// an update, and it still serves.
-fn state_follows_token(mut stream: impl Timed, token: &str, deadline: Instant) -> io::Result<bool> {
-    stream.wait_at_most(time_left(deadline)?)?;
-    stream.write_all(format!("{token}\n").as_bytes())?;
-    let mut line = Vec::new();
-    let mut chunk = [0u8; 4096];
-    loop {
-        // Every read waits only for what is left. A timeout per read let a
-        // peer that sends a byte now and then keep the ask going for good.
-        stream.wait_at_most(time_left(deadline)?)?;
-        let read = match stream.read(&mut chunk) {
-            Ok(0) => return Ok(false),
-            Ok(n) => &chunk[..n],
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
-        if let Some(end) = read.iter().position(|&b| b == b'\n') {
-            line.extend_from_slice(&read[..end]);
-            return Ok(serde_json::from_slice::<serde_json::Value>(&line).is_ok());
+async fn state_follows_proof(
+    stream: Box<dyn Duplex>,
+    token: String,
+    deadline: Instant,
+) -> io::Result<bool> {
+    let (rx, mut tx) = tokio::io::split(stream);
+    let mut rx = tokio::io::BufReader::new(rx);
+    let proven = tokio::time::timeout_at(
+        deadline.into(),
+        proof::prove_to_daemon(&mut rx, &mut tx, &token),
+    )
+    .await;
+    if !matches!(proven, Ok(Ok(()))) {
+        return Ok(false);
+    }
+    Ok(match next_line(&mut rx, deadline).await {
+        Read::Line(line) => serde_json::from_slice::<serde_json::Value>(&line).is_ok(),
+        Read::Closed | Read::Nothing => false,
+    })
+}
+
+/// Prove `token`, if any, on `stream`, and read until the daemon states its
+/// build or `deadline` passes. See [`DaemonEndpoint::build`].
+async fn build_follows(
+    stream: Box<dyn Duplex>,
+    token: Option<String>,
+    deadline: Instant,
+) -> io::Result<Option<StatedBuild>> {
+    let (rx, mut tx) = tokio::io::split(stream);
+    let mut rx = tokio::io::BufReader::new(rx);
+    let mut served = false;
+    let unstated = |served: bool| served.then_some(StatedBuild::Unstated);
+    if let Some(token) = token {
+        let nf = proof::nonce()?;
+        let challenge = proof::challenge_line(&nf);
+        let sent =
+            tokio::time::timeout_at(deadline.into(), tx.write_all(challenge.as_bytes())).await;
+        if !matches!(sent, Ok(Ok(()))) {
+            return Ok(None);
         }
-        line.extend_from_slice(read);
-        if line.len() > EVENT_LINE_LIMIT {
-            return Ok(false);
+        match next_line(&mut rx, deadline).await {
+            // Hung up on the challenge without a word: a daemon from before
+            // the two-way proof, which reads the challenge as a wrong token.
+            Read::Closed => return Ok(Some(StatedBuild::Unstated)),
+            Read::Nothing => return Ok(None),
+            Read::Line(line) => {
+                let text = String::from_utf8_lossy(&line);
+                if let Some(nd) = proof::daemon_proven(&token, &nf, &text) {
+                    let proof = proof::proof_line(&token, &nf, &nd);
+                    let proving = tx.write_all(proof.as_bytes());
+                    if !matches!(
+                        tokio::time::timeout_at(deadline.into(), proving).await,
+                        Ok(Ok(()))
+                    ) {
+                        return Ok(None);
+                    }
+                } else {
+                    // Not a proof of the token. A daemon from before the
+                    // token sends its state to anything that connects; an
+                    // answer made with another token says nothing, and so
+                    // does a daemon too busy to take the connection.
+                    match build_in(&line) {
+                        Some(Some(build)) => return Ok(Some(StatedBuild::Is(build))),
+                        Some(None) => served = true,
+                        None => return Ok(None),
+                    }
+                }
+            }
+        }
+    }
+    loop {
+        match next_line(&mut rx, deadline).await {
+            Read::Line(line) => match build_in(&line) {
+                Some(Some(build)) => return Ok(Some(StatedBuild::Is(build))),
+                Some(None) => served = true,
+                None => {}
+            },
+            Read::Closed | Read::Nothing => return Ok(unstated(served)),
         }
     }
 }
@@ -746,21 +1511,56 @@ fn connect_unix_now(path: &Path) -> io::Result<std::os::unix::net::UnixStream> {
 }
 
 #[cfg(test)]
+mod stand_in {
+    //! The daemon's half of the two-way proof, for a stand-in daemon on a
+    //! blocking loopback connection.
+
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+
+    /// Read a challenge from `reader`, answer it on `writer` with `token`,
+    /// and read the proof. Whether the proof checks against `check`.
+    pub(crate) fn prove(
+        reader: &mut BufReader<TcpStream>,
+        writer: &mut TcpStream,
+        token: &str,
+        check: &str,
+    ) -> bool {
+        let mut challenge = String::new();
+        let _ = reader.read_line(&mut challenge);
+        let Some(nf) = crate::proof::challenge_in(&challenge) else {
+            return false;
+        };
+        let nd = crate::proof::nonce().expect("a nonce");
+        if writer
+            .write_all(crate::proof::answer_line(token, nf, &nd).as_bytes())
+            .is_err()
+        {
+            return false;
+        }
+        let mut proof = String::new();
+        let _ = reader.read_line(&mut proof);
+        crate::proof::frontend_proven(check, nf, &nd, &proof)
+    }
+}
+
+#[cfg(test)]
 mod serves_whatever_its_version {
     //! The front door asks whether a daemon serves after it starts one. The
     //! daemon it reaches may be another build, left running across an update,
     //! whose events this build does not know.
 
     use super::DaemonEndpoint;
-    use std::io::{BufRead, BufReader, Read, Write};
+    use super::stand_in::prove;
+    use std::io::{BufReader, Read, Write};
     use std::time::{Duration, Instant};
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     /// A daemon stand-in on a loopback port that answers one connection with
-    /// `reply` once it has read the token, then stays connected until the
+    /// `reply` once the two-way proof is made, then stays connected until the
     /// asker hangs up, or hangs up itself when `reply` is not a whole line.
-    /// Returns its endpoint and whether the token arrived as a line of its own.
+    /// Returns its endpoint and whether the asker's proof checked.
     fn replying(reply: &'static str) -> (DaemonEndpoint, std::thread::JoinHandle<bool>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
         let endpoint = DaemonEndpoint::Tcp(listener.local_addr().expect("its address"));
@@ -769,14 +1569,13 @@ mod serves_whatever_its_version {
                 return false;
             };
             let mut reader = BufReader::new(stream.try_clone().expect("a second handle"));
-            let mut line = String::new();
-            let _ = reader.read_line(&mut line);
             let mut writer = stream;
+            let proven = prove(&mut reader, &mut writer, TOKEN, TOKEN);
             let _ = writer.write_all(reply.as_bytes());
             if reply.ends_with('\n') {
                 let _ = reader.read_to_end(&mut Vec::new());
             }
-            line == format!("{TOKEN}\n")
+            proven
         });
         (endpoint, peer)
     }
@@ -799,8 +1598,49 @@ mod serves_whatever_its_version {
             ((true, true), (false, true), (false, true)),
             "((event unknown to this build), (not JSON), (no whole line before the \
              hang-up)), each as \
-             (counted as serving, token sent as a line). A daemon of another build \
-             serves all the same; the front door would log it as silent."
+             (counted as serving, the asker's proof checked). A daemon of another \
+             build serves all the same; the front door would log it as silent."
+        );
+    }
+
+    /// A stand-in on a loopback port that reads the challenge, sends `lines`
+    /// without making the proof, and stays connected until the asker hangs
+    /// up.
+    fn unproven(lines: &'static [&'static str]) -> DaemonEndpoint {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        let endpoint = DaemonEndpoint::Tcp(listener.local_addr().expect("its address"));
+        std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = BufReader::new(stream.try_clone().expect("a second handle"));
+            let mut writer = stream;
+            let _ = std::io::BufRead::read_line(&mut reader, &mut String::new());
+            for line in lines {
+                let _ = writer.write_all(line.as_bytes());
+            }
+            let _ = reader.read_to_end(&mut Vec::new());
+        });
+        endpoint
+    }
+
+    /// What does not prove the token does not serve, whatever it sends
+    /// after: the front door would take it for the daemon it started.
+    // LEDGER T9626 | class B | bytes over a real socket + 2 return values
+    #[test]
+    fn an_endpoint_that_does_not_prove_the_token_does_not_serve() {
+        const FORGED: &str = "answer 0000000000000000000000000000000000000000000000000000000000000000 \
+                              1111111111111111111111111111111111111111111111111111111111111111\n";
+        const STATE: &str = "{\"Enumerate\":[]}\n";
+        let within = Duration::from_secs(2);
+        let forged = unproven(&[FORGED, STATE, STATE]).serves(TOKEN, within);
+        let state_at_once = unproven(&[STATE, STATE]).serves(TOKEN, within);
+        assert_eq!(
+            (forged, state_at_once),
+            (false, false),
+            "(a forged answer then state, state in place of an answer). An \
+             endpoint that cannot prove it holds the token was counted as a \
+             daemon serving frontends."
         );
     }
 
@@ -810,14 +1650,15 @@ mod serves_whatever_its_version {
         const TRICKLES_FOR: Duration = Duration::from_secs(5);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
         let endpoint = DaemonEndpoint::Tcp(listener.local_addr().expect("its address"));
-        // Takes the token, then starts a line of JSON and adds a space to it
+        // Makes the proof, then starts a line of JSON and adds a space to it
         // every 50 ms, never ending it, until the asker hangs up.
         let peer = std::thread::spawn(move || {
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
             };
             let _ = stream.set_nodelay(true);
-            let _ = stream.read(&mut [0u8; TOKEN.len() + 1]);
+            let mut reader = BufReader::new(stream.try_clone().expect("a second handle"));
+            prove(&mut reader, &mut stream, TOKEN, TOKEN);
             let began = Instant::now();
             let mut sent = stream.write_all(b"{");
             while sent.is_ok() && began.elapsed() < TRICKLES_FOR {
@@ -845,13 +1686,14 @@ mod serves_whatever_its_version {
     fn a_peer_that_floods_one_line_is_given_up_on_once_it_is_past_any_event() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
         let endpoint = DaemonEndpoint::Tcp(listener.local_addr().expect("its address"));
-        // Takes the token, sends one byte more than any event may have and no
+        // Makes the proof, sends one byte more than any event may have and no
         // newline, then waits for the asker to hang up.
         let peer = std::thread::spawn(move || {
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
             };
-            let _ = stream.read(&mut [0u8; TOKEN.len() + 1]);
+            let mut reader = BufReader::new(stream.try_clone().expect("a second handle"));
+            prove(&mut reader, &mut stream, TOKEN, TOKEN);
             let mut flood = vec![b' '; super::EVENT_LINE_LIMIT + 1];
             flood[0] = b'[';
             if stream.write_all(&flood).is_ok() {
@@ -869,6 +1711,219 @@ mod serves_whatever_its_version {
             "`serves` said {serves} after {took:?} of {within:?}, for a peer that \
              sent more of one line than any event has. Reading on holds all of it \
              in memory for as long as the ask lasts."
+        );
+    }
+}
+
+#[cfg(test)]
+mod asks_a_daemon_its_build {
+    //! The front door restarts the service only when the daemon that answers
+    //! is another build (#222), so what a daemon says about its build decides
+    //! whether it is stopped. A daemon of this build that answers slowly, or
+    //! whose statement comes after another event, must still read as itself.
+
+    use super::stand_in::prove;
+    use super::{Build, DaemonEndpoint, StatedBuild};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::time::{Duration, Instant};
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const OTHER: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+    /// A daemon stand-in on a loopback port. It makes the two-way proof first
+    /// when `proves`, then sends `lines`, then stays connected until the asker
+    /// hangs up.
+    fn saying(proves: bool, lines: &'static [&'static str]) -> DaemonEndpoint {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        let endpoint = DaemonEndpoint::Tcp(listener.local_addr().expect("its address"));
+        std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = BufReader::new(stream.try_clone().expect("a second handle"));
+            let mut writer = stream;
+            if proves {
+                prove(&mut reader, &mut writer, TOKEN, TOKEN);
+            }
+            for line in lines {
+                let _ = writer.write_all(line.as_bytes());
+            }
+            let _ = reader.read_to_end(&mut Vec::new());
+        });
+        endpoint
+    }
+
+    /// A daemon stand-in on a loopback port that reads the challenge and
+    /// then says nothing, staying connected until the asker hangs up: a
+    /// daemon that has bound its endpoint and is still starting.
+    fn challenged_then_silent() -> DaemonEndpoint {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        let endpoint = DaemonEndpoint::Tcp(listener.local_addr().expect("its address"));
+        std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = BufReader::new(stream);
+            let _ = reader.read_line(&mut String::new());
+            let _ = reader.read_to_end(&mut Vec::new());
+        });
+        endpoint
+    }
+
+    const STATED: &str = "{\"DaemonBuild\":{\"version\":\"0.13.0\",\"commit\":\"abcd1234\"}}\n";
+
+    fn stated() -> Option<StatedBuild> {
+        Some(StatedBuild::Is(Build {
+            version: "0.13.0".into(),
+            commit: "abcd1234".into(),
+        }))
+    }
+
+    // LEDGER T2220 | class B | bytes over a real socket + 1 return value
+    #[test]
+    fn a_daemon_that_states_its_build_reads_as_that_build_even_after_another_event() {
+        let within = Duration::from_secs(5);
+        let first = saying(true, &[STATED]).build(Some(TOKEN), within);
+        let began = Instant::now();
+        let after = saying(true, &["{\"Enumerate\":[]}\n", "{\"Other\":1}\n", STATED])
+            .build(Some(TOKEN), within);
+        let took = began.elapsed();
+        assert_eq!(
+            (first, after),
+            (stated(), stated()),
+            "(stated at once, stated after other events). A daemon of this build \
+             read as one that states nothing is restarted by the app."
+        );
+        assert!(
+            took < within / 2,
+            "the statement came at once and the ask still took {took:?} of {within:?}"
+        );
+    }
+
+    // LEDGER T2221 | class B | bytes over a real socket + 1 return value
+    #[test]
+    fn a_daemon_that_sends_state_and_no_build_is_one_from_before_the_statement() {
+        let within = Duration::from_millis(600);
+        let with_token = saying(true, &["{\"Enumerate\":[]}\n"]).build(Some(TOKEN), within);
+        // A daemon from before the token sends its state to any connection.
+        let before_token = saying(false, &["{\"Enumerate\":[]}\n"]).build(None, within);
+        let silent = saying(true, &[]).build(Some(TOKEN), within);
+        let garbage = saying(true, &["not json\n"]).build(Some(TOKEN), within);
+        let unanswered = challenged_then_silent().build(Some(TOKEN), within);
+        assert_eq!(
+            (with_token, before_token, silent, garbage, unanswered),
+            (
+                Some(StatedBuild::Unstated),
+                Some(StatedBuild::Unstated),
+                None,
+                None,
+                None
+            ),
+            "(state and no build, state without a token, nothing after the proof, \
+             not JSON, no answer to the challenge). Only a daemon that sends state \
+             and never says its build is one from before the statement; one that \
+             says nothing may be still starting, and read as older it is restarted."
+        );
+    }
+
+    /// A daemon of this build holding another token answers the challenge
+    /// with a proof that does not check. It has said nothing about its
+    /// build: read as one that states none, it would be restarted by the app.
+    // LEDGER T2253 | class B | bytes over a real socket + 1 return value
+    #[test]
+    fn a_daemon_whose_answer_does_not_prove_the_token_has_said_nothing() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        let endpoint = DaemonEndpoint::Tcp(listener.local_addr().expect("its address"));
+        std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = BufReader::new(stream.try_clone().expect("a second handle"));
+            let mut writer = stream;
+            prove(&mut reader, &mut writer, OTHER, OTHER);
+            let _ = writer.write_all(STATED.as_bytes());
+            let _ = reader.read_to_end(&mut Vec::new());
+        });
+        assert_eq!(
+            endpoint.build(Some(TOKEN), Duration::from_secs(5)),
+            None,
+            "a daemon whose answer did not prove the token was read as a build it \
+             stated or as one that states none, which the app restarts"
+        );
+    }
+
+    /// A daemon too busy to take the connection has said nothing about its
+    /// build: read as one that states none, it would be restarted.
+    // LEDGER T9630 | class B | bytes over a real socket + 1 return value
+    #[test]
+    fn a_daemon_too_busy_to_take_the_ask_has_said_nothing() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        let endpoint = DaemonEndpoint::Tcp(listener.local_addr().expect("its address"));
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.write_all(crate::proof::BUSY_LINE.as_bytes());
+            }
+        });
+        assert_eq!(
+            endpoint.build(Some(TOKEN), Duration::from_secs(5)),
+            None,
+            "a daemon that said it was too busy to take the ask was read as a \
+             build it stated or as one that states none, which the app restarts"
+        );
+    }
+
+    /// A daemon from before the two-way proof reads the challenge as a wrong
+    /// token and hangs up without a word; one from before the token sends
+    /// its state to anything. Both predate the statement of the build, and
+    /// the app may restart the service that runs one (#222).
+    // LEDGER T9621 | class B | bytes over a real socket + 1 return value
+    #[test]
+    fn a_daemon_that_hangs_up_on_the_challenge_predates_the_statement() {
+        let hangs_up = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+            let endpoint = DaemonEndpoint::Tcp(listener.local_addr().expect("its address"));
+            std::thread::spawn(move || {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let _ = BufReader::new(stream).read_line(&mut String::new());
+            });
+            endpoint.build(Some(TOKEN), Duration::from_secs(5))
+        };
+        let before_token =
+            saying(false, &["{\"Enumerate\":[]}\n"]).build(Some(TOKEN), Duration::from_millis(600));
+        assert_eq!(
+            (hangs_up, before_token),
+            (Some(StatedBuild::Unstated), Some(StatedBuild::Unstated)),
+            "(hung up on the challenge, sent state before anything was asked). \
+             Read as saying nothing, a daemon of the build before this one is kept \
+             running after an update, and the app cannot reach it"
+        );
+    }
+
+    /// The listener named is the process that listens, as the kernel says.
+    /// Here it also asks; tests/daemon_build.rs asks a daemon in another
+    /// process.
+    // LEDGER T2222 | class B | 1 return value from a real socket
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_listener_is_the_process_that_listens() {
+        let path = std::path::PathBuf::from(format!("/tmp/h-lsn-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listening = std::os::unix::net::UnixListener::bind(&path).expect("a unix listener");
+        let got = DaemonEndpoint::Unix(path.clone()).listener();
+        drop(listening);
+        let _ = std::fs::remove_file(&path);
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        assert_eq!(
+            got.map_err(|e| e.to_string()),
+            Ok(super::Listener {
+                pid: std::process::id(),
+                uid
+            }),
+            "the front door stops the process this names; naming any other is \
+             stopping the wrong program"
         );
     }
 }
@@ -923,6 +1978,82 @@ mod a_full_accept_queue {
              the front door must not start a daemon beside it, and it takes the \
              token from no one, so it does not serve.",
             (answers, serves)
+        );
+    }
+}
+
+#[cfg(test)]
+mod capture_state_on_the_wire {
+    //! Capture's third state is new; its first two must read as they always
+    //! have, so a frontend and a daemon of different builds still agree on
+    //! them (#91).
+
+    use super::{
+        CaptureFault, CaptureState, EmulationFault, EmulationState, FrontendEvent, Permission,
+        Status,
+    };
+
+    fn wire(event: &FrontendEvent) -> String {
+        serde_json::to_string(event).expect("serializes")
+    }
+
+    // LEDGER T7 | class B | 2 bytes: serde_json of FrontendEvent::CaptureStatus
+    #[test]
+    fn on_and_off_are_written_as_status_writes_them_and_failed_names_the_setting() {
+        let old = |s: Status| {
+            serde_json::to_string(&serde_json::json!({ "CaptureStatus": s })).expect("json")
+        };
+        assert_eq!(
+            (
+                wire(&FrontendEvent::CaptureStatus(CaptureState::Enabled)),
+                wire(&FrontendEvent::CaptureStatus(CaptureState::Disabled)),
+            ),
+            (old(Status::Enabled), old(Status::Disabled)),
+            "an older frontend reads capture's state as a Status"
+        );
+        let failed =
+            FrontendEvent::CaptureStatus(CaptureState::Failed(CaptureFault::Missing(vec![
+                Permission::InputMonitoring,
+            ])));
+        let read: FrontendEvent = serde_json::from_str(&wire(&failed)).expect("reads back");
+        assert!(
+            matches!(
+                read,
+                FrontendEvent::CaptureStatus(CaptureState::Failed(CaptureFault::Missing(ref m)))
+                    if m == &[Permission::InputMonitoring]
+            ),
+            "a failed capture must arrive naming what is missing: {}",
+            wire(&failed)
+        );
+    }
+
+    // LEDGER G2-6 | class B | 2 bytes: serde_json of FrontendEvent::EmulationStatus
+    #[test]
+    fn emulation_on_and_off_are_written_as_status_writes_them() {
+        let old = |s: Status| {
+            serde_json::to_string(&serde_json::json!({ "EmulationStatus": s })).expect("json")
+        };
+        assert_eq!(
+            (
+                wire(&FrontendEvent::EmulationStatus(EmulationState::Enabled)),
+                wire(&FrontendEvent::EmulationStatus(EmulationState::Disabled)),
+            ),
+            (old(Status::Enabled), old(Status::Disabled)),
+            "an older frontend reads emulation's state as a Status"
+        );
+        let failed =
+            FrontendEvent::EmulationStatus(EmulationState::Failed(EmulationFault::Missing(vec![
+                Permission::Accessibility,
+            ])));
+        let read: FrontendEvent = serde_json::from_str(&wire(&failed)).expect("reads back");
+        assert!(
+            matches!(
+                read,
+                FrontendEvent::EmulationStatus(EmulationState::Failed(EmulationFault::Missing(ref m)))
+                    if m == &[Permission::Accessibility]
+            ),
+            "a failed emulation must arrive naming what is missing: {}",
+            wire(&failed)
         );
     }
 }
