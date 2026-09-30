@@ -369,6 +369,10 @@ fn the_scan_sees_the_code_it_guards() {
             "a test-only match arm",
         ),
         (
+            "let r = match v { #[cfg(test)] 0 => 1, _ => { t.unwrap() } };",
+            "a test-only arm before a block arm",
+        ),
+        (
             "#[cfg(test)]\n#[allow(dead_code)]\npub(crate) mod t { fn b() { y.unwrap(); } }\nfn a() { x.unwrap(); }",
             "a test module with more attributes",
         ),
