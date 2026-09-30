@@ -783,7 +783,7 @@ impl Stream for LibeiInputCapture {
 /// what ashpd hands the capture.
 #[cfg(test)]
 mod terse_compositor {
-    use std::{cell::Cell, collections::HashMap, num::NonZeroU32, rc::Rc};
+    use std::{cell::Cell, collections::HashMap, num::NonZeroU32, rc::Rc, time::Duration};
 
     use ashpd::{
         desktop::input_capture::{Activated, Zones},
@@ -917,6 +917,38 @@ mod terse_compositor {
         assert_eq!(release_point(None, None, Position::Left), None);
     }
 
+    // LEDGER | behaviour | release_point on each edge, with and without a cursor
+    /// A release on the wrong side of its barrier crosses straight back to
+    /// the peer, so each edge must land one pixel inside the screen.
+    #[test]
+    fn every_edge_releases_one_pixel_inside_the_screen() {
+        let zones = zones(vec![(1920, 1080, 0, 0)]);
+        let mut next = NonZeroU32::MIN;
+        let edges = [
+            Position::Left,
+            Position::Right,
+            Position::Top,
+            Position::Bottom,
+        ];
+        let (barriers, _) = select_barriers(&zones, &edges, &mut next);
+        let cursor_on_edge = [(0.0, 300.0), (1920.0, 300.0), (700.0, 0.0), (700.0, 1080.0)];
+        let from_cursor = [(1.0, 300.0), (1919.0, 300.0), (700.0, 1.0), (700.0, 1079.0)];
+        let from_middle = [(1.0, 539.5), (1919.0, 539.5), (959.5, 1.0), (959.5, 1079.0)];
+        for (i, pos) in edges.into_iter().enumerate() {
+            let barrier = &barriers[i];
+            assert_eq!(
+                release_point(Some(cursor_on_edge[i]), Some(barrier), pos),
+                Some(from_cursor[i]),
+                "{pos}: released outside the screen from the cursor"
+            );
+            assert_eq!(
+                release_point(None, Some(barrier), pos),
+                Some(from_middle[i]),
+                "{pos}: released outside the screen from the barrier's middle"
+            );
+        }
+    }
+
     // LEDGER | behaviour | select_barriers on decoded Zones at the top of the id range
     #[test]
     fn barrier_ids_start_over_instead_of_running_out() {
@@ -948,14 +980,30 @@ mod terse_compositor {
     async fn dropping_the_capture_unterminated_stops_its_task_instead_of_panicking() {
         tokio::task::LocalSet::new()
             .run_until(async {
+                // A task that ignores cancellation, as one stuck in a portal
+                // call would: only aborting it ends it.
+                let (guard, ended) = owner();
                 let (owner, freed) = owner();
                 let cancel = CancellationToken::new();
-                let task = tokio::task::spawn_local(futures::future::pending());
+                let task = tokio::task::spawn_local(async move {
+                    let _guard = guard;
+                    futures::future::pending::<Result<(), CaptureError>>().await
+                });
                 drop(CaptureTask::new(owner, task, cancel.clone()));
                 assert!(cancel.is_cancelled(), "the task was not told to stop");
                 assert!(
                     !freed.get(),
                     "what the running task points into was freed under it"
+                );
+                let stopped = tokio::time::timeout(Duration::from_secs(30), async {
+                    while !ended.get() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+                assert!(
+                    stopped.is_ok(),
+                    "the task still runs after its capture was dropped"
                 );
             })
             .await;
