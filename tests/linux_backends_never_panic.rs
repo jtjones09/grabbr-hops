@@ -185,40 +185,89 @@ fn char_literal_len(rest: &str) -> Option<usize> {
     (close == '\'').then_some(end + 1)
 }
 
-/// `src` without any item marked `#[cfg(test)]`: from the attribute to the
-/// end of the item's braces, or to its `;` when it has none first. The
-/// item's line breaks stay, so lines keep their numbers.
+/// `src` without its test items: a `#[cfg(test)]`, any further attributes,
+/// then a `mod`, `fn`, `impl`, `use`, `const` or `static` item, removed to
+/// its `;` or the end of its braces. A `#[cfg(test)]` on anything else, a
+/// field, a match arm or a statement, leaves the code in the scan: a false
+/// positive is loud, a skipped line is not. Line breaks stay, so lines keep
+/// their numbers.
 fn without_test_items(file: &str, src: &str) -> String {
     const MARK: &str = "#[cfg(test)]";
     let mut out = String::with_capacity(src.len());
     let mut rest = src;
     while let Some(at) = rest.find(MARK) {
-        out.push_str(&rest[..at]);
-        let item = &rest[at + MARK.len()..];
-        let open = item.find('{');
-        let semi = item.find(';');
-        let end = match (open, semi) {
-            (Some(open), Some(semi)) if semi < open => semi + 1,
-            (Some(open), _) => open + closing_brace(file, &item[open..]),
-            (None, Some(semi)) => semi + 1,
-            (None, None) => panic!("{file}: {MARK} marks nothing"),
-        };
-        push_line_breaks(&mut out, &item[..end]);
-        rest = &item[end..];
+        let after = &rest[at + MARK.len()..];
+        match test_item_len(file, after) {
+            Some(len) => {
+                out.push_str(&rest[..at]);
+                push_line_breaks(&mut out, &after[..len]);
+                rest = &after[len..];
+            }
+            None => {
+                out.push_str(&rest[..at + MARK.len()]);
+                rest = after;
+            }
+        }
     }
     out.push_str(rest);
     out
 }
 
-/// The length of `block` up to and including the brace that closes its
-/// first one.
-fn closing_brace(file: &str, block: &str) -> usize {
+/// The length of the test item `item` starts with, attributes included, or
+/// `None` when what follows the `#[cfg(test)]` is not an item that holds
+/// test code.
+fn test_item_len(file: &str, item: &str) -> Option<usize> {
+    let mut i = 0;
+    let braced = loop {
+        i += item[i..].len() - item[i..].trim_start().len();
+        let rest = &item[i..];
+        if rest.starts_with("#[") {
+            i += 1 + group_len(file, &rest[1..]);
+            continue;
+        }
+        let len = rest
+            .find(|c: char| c != '_' && !c.is_ascii_alphanumeric())
+            .unwrap_or(rest.len());
+        let word = &rest[..len];
+        i += len;
+        match word {
+            "pub" if item[i..].starts_with('(') => i += group_len(file, &item[i..]),
+            "pub" | "async" | "unsafe" => {}
+            // `const fn` is a function, with a body to skip.
+            "const" if item[i..].trim_start().starts_with("fn ") => {}
+            "mod" | "fn" | "impl" => break true,
+            "use" | "const" | "static" => break false,
+            _ => return None,
+        }
+    };
+    // To a `;` outside any brackets or, for an item with a body, the brace
+    // that closes the body.
     let mut depth = 0usize;
-    for (i, c) in block.char_indices() {
+    for (at, c) in item[i..].char_indices() {
         match c {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 && c == '}' && braced {
+                    return Some(i + at + 1);
+                }
+            }
+            ';' if depth == 0 => return Some(i + at + 1),
+            _ => {}
+        }
+    }
+    panic!("{file}: unbalanced brackets after #[cfg(test)]");
+}
+
+/// The length of `group` up to and including the bracket that closes the
+/// one it opens with.
+fn group_len(file: &str, group: &str) -> usize {
+    let mut depth = 0usize;
+    for (i, c) in group.char_indices() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                depth = depth.saturating_sub(1);
                 if depth == 0 {
                     return i + 1;
                 }
@@ -226,7 +275,7 @@ fn closing_brace(file: &str, block: &str) -> usize {
             _ => {}
         }
     }
-    panic!("{file}: unbalanced braces after #[cfg(test)]");
+    panic!("{file}: unbalanced brackets after #[cfg(test)]");
 }
 
 /// What the scan reads of `src`: its non-test code, comments stripped.
@@ -310,6 +359,34 @@ fn the_scan_sees_the_code_it_guards() {
         (
             "#[cfg(test)]\nmod t { fn b() { let s = \"}\"; y.unwrap(); } }\nfn after() { v.unwrap(); }",
             "a brace in a string in a test",
+        ),
+        (
+            "struct P { #[cfg(test)] a: u8, b: u8 }\nfn c() -> u8 { t.unwrap() }",
+            "a test-only field",
+        ),
+        (
+            "let r = match v { #[cfg(test)] 0 => 1, _ => t.unwrap(), };",
+            "a test-only match arm",
+        ),
+        (
+            "#[cfg(test)]\n#[allow(dead_code)]\npub(crate) mod t { fn b() { y.unwrap(); } }\nfn a() { x.unwrap(); }",
+            "a test module with more attributes",
+        ),
+        (
+            "#[cfg(test)] mod t;\nfn a() { x.unwrap(); }",
+            "a test module in its own file",
+        ),
+        (
+            "#[cfg(test)]\nfn h(a: [u8; 2]) { y.unwrap(); }\nfn a() { x.unwrap(); }",
+            "a test helper function",
+        ),
+        (
+            "#[cfg(test)]\nimpl S { fn h() { y.unwrap(); } }\n#[cfg(test)]\nuse a::{b, c};\nfn a() { x.unwrap(); }",
+            "a test impl and use",
+        ),
+        (
+            "#[cfg(test)]\nconst fn h() -> u8 { y.unwrap(); 1 }\nfn a() { x.unwrap(); }\nconst Z: u8 = 1;",
+            "a test const fn",
         ),
     ] {
         let code = kept(sample);
