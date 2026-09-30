@@ -431,40 +431,12 @@ fn every_linux_backend_is_scanned() {
     let mut checked = 0;
     let mut missing = Vec::new();
     for (dir, lib, build) in CRATES {
-        // The cfgs a build script sets for a Linux backend, and `unix`.
-        let mut linux: Vec<&str> = build
-            .split("rustc-check-cfg=cfg(")
-            .skip(1)
-            .filter_map(|s| s.split(')').next())
-            .collect();
-        linux.push("unix");
-        let mut attrs = Vec::new();
-        for line in lib.lines().map(str::trim) {
-            if line.starts_with("//") {
-                continue;
+        for name in linux_modules(lib, &linux_cfgs(build)) {
+            checked += 1;
+            let file = format!("{dir}/src/{name}.rs");
+            if !BACKENDS.iter().any(|(f, _)| *f == file) {
+                missing.push(file);
             }
-            if line.starts_with("#[") {
-                attrs.push(line);
-                continue;
-            }
-            let name = line
-                .strip_prefix("pub ")
-                .unwrap_or(line)
-                .strip_prefix("mod ")
-                .and_then(|m| m.strip_suffix(';'));
-            let gated = attrs.iter().any(|a| {
-                a.starts_with("#[cfg(")
-                    && a.split(|c: char| c != '_' && !c.is_ascii_alphanumeric())
-                        .any(|w| linux.contains(&w))
-            });
-            if let (Some(name), true) = (name, gated) {
-                checked += 1;
-                let file = format!("{dir}/src/{name}.rs");
-                if !BACKENDS.iter().any(|(f, _)| *f == file) {
-                    missing.push(file);
-                }
-            }
-            attrs.clear();
         }
     }
     assert!(
@@ -478,4 +450,115 @@ fn every_linux_backend_is_scanned() {
         "Linux backends the panic scan does not read; add them to BACKENDS:\n{}",
         missing.join("\n")
     );
+
+    for (lib, what) in [
+        ("#[cfg(unix)]\nmod a;\n", "a cfg on its own line"),
+        (
+            "#[cfg(target_os = \"linux\")]\npub mod a;\n",
+            "target_os = \"linux\"",
+        ),
+        (
+            "#[cfg(all(\n    feature = \"x\",\n    unix,\n))]\nmod a;\n",
+            "a cfg over several lines",
+        ),
+        (
+            "#[cfg(unix)] pub(crate) mod a;\n",
+            "a cfg and a module on one line",
+        ),
+        (
+            "#[cfg(unix)]\n#[allow(dead_code)]\nmod a;\n",
+            "a cfg and a further attribute",
+        ),
+    ] {
+        assert_eq!(
+            linux_modules(lib, &linux_cfgs("")),
+            ["a"],
+            "a Linux module declared with {what} is not found"
+        );
+    }
+}
+
+/// The words that make a `#[cfg(...)]` a Linux one: the cfgs `build` sets
+/// for a Linux backend, `unix`, and the `linux` of `target_os = "linux"`.
+fn linux_cfgs(build: &str) -> Vec<&str> {
+    let mut linux: Vec<&str> = build
+        .split("rustc-check-cfg=cfg(")
+        .skip(1)
+        .filter_map(|s| s.split(')').next())
+        .collect();
+    linux.extend(["unix", "linux"]);
+    linux
+}
+
+/// The modules `lib` declares under a `#[cfg(...)]` naming one of `linux`,
+/// with the attribute on the module's line, above it, or over several
+/// lines. A word such as `not(unix)` counts too: a module listed that is
+/// not a backend fails loudly, one missed is never scanned.
+fn linux_modules<'a>(lib: &'a str, linux: &[&str]) -> Vec<&'a str> {
+    let mut found = Vec::new();
+    let mut attrs = Vec::new();
+    // An attribute still open at the end of a line, and its bracket depth.
+    let mut open = String::new();
+    let mut depth = 0i32;
+    let brackets = |s: &str| s.matches('[').count() as i32 - s.matches(']').count() as i32;
+    for line in lib.lines().map(str::trim) {
+        if line.starts_with("//") {
+            continue;
+        }
+        if depth > 0 {
+            open.push(' ');
+            open.push_str(line);
+            depth += brackets(line);
+            if depth <= 0 {
+                attrs.push(std::mem::take(&mut open));
+            }
+            continue;
+        }
+        let mut rest = line;
+        while rest.starts_with("#[") {
+            // The `]` that closes the attribute's `#[`, if on this line.
+            let mut d = 0i32;
+            let close = rest.char_indices().skip(1).find(|&(_, c)| {
+                d += match c {
+                    '[' => 1,
+                    ']' => -1,
+                    _ => 0,
+                };
+                d == 0
+            });
+            match close {
+                Some((end, _)) => {
+                    attrs.push(rest[..=end].to_string());
+                    rest = rest[end + 1..].trim_start();
+                }
+                None => {
+                    open = rest.to_string();
+                    depth = brackets(rest);
+                    rest = "";
+                }
+            }
+        }
+        if rest.is_empty() {
+            continue;
+        }
+        let item = match rest.strip_prefix("pub") {
+            Some(vis) if vis.starts_with('(') => vis.find(')').map_or(vis, |i| &vis[i + 1..]),
+            Some(vis) => vis,
+            None => rest,
+        };
+        let name = item
+            .trim_start()
+            .strip_prefix("mod ")
+            .and_then(|m| m.strip_suffix(';'));
+        let gated = attrs.iter().any(|a| {
+            a.starts_with("#[cfg(")
+                && a.split(|c: char| c != '_' && !c.is_ascii_alphanumeric())
+                    .any(|w| linux.contains(&w))
+        });
+        if let (Some(name), true) = (name, gated) {
+            found.push(name.trim());
+        }
+        attrs.clear();
+    }
+    found
 }
