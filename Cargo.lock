@@ -2350,6 +2350,7 @@ dependencies = [
  "windows 0.61.3",
  "x11rb",
  "yaml-rust2",
+ "zbus",
 ]
 
 [[package]]

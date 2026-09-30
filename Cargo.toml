@@ -118,6 +118,12 @@ input-capture = { path = "crates/input-capture", version = "0.4.0", default-feat
 # secret or may write.
 yaml-rust2 = { version = "0.13", default-features = false }
 
+[target.'cfg(all(unix, not(target_os = "macos")))'.dev-dependencies]
+# A stand-in session bus and desktop portal, for the tests that watch what the
+# portal backends send it (tests/portal). Already in the tree through ashpd;
+# `p2p` lets a test serve a connection.
+zbus = { version = "5.16", default-features = false, features = ["tokio", "p2p"] }
+
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 # Releases the private pasteboard a test marks.
 objc2 = "0.6"
