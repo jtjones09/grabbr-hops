@@ -9,6 +9,7 @@
 //! handshake itself is observed in input-capture and input-emulation, against
 //! a stand-in compositor.
 
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 fn repo() -> PathBuf {
@@ -82,18 +83,22 @@ fn the_shipped_desktop_entry_is_the_one_the_portal_looks_up() {
     assert_eq!(key("Hidden"), None, "a hidden entry is a deleted one");
 }
 
-/// Every string literal in `src`, which is Rust or Slint: both write strings
-/// in double quotes with backslash escapes and comments as `//` and `/* */`.
-fn string_literals(src: &str) -> Vec<String> {
+/// The comments, char literals and string literals in `src`, which is Rust
+/// or Slint: both write strings in double quotes with backslash escapes and
+/// comments as `//` and `/* */`. Each is its byte range and, for a string,
+/// its contents.
+fn lexemes(src: &str) -> Vec<(Range<usize>, Option<String>)> {
     let b = src.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
     while i < b.len() {
+        let start = i;
         match b[i] {
             b'/' if b.get(i + 1) == Some(&b'/') => {
                 while i < b.len() && b[i] != b'\n' {
                     i += 1;
                 }
+                out.push((start..i, None));
             }
             b'/' if b.get(i + 1) == Some(&b'*') => {
                 i += 2;
@@ -101,6 +106,7 @@ fn string_literals(src: &str) -> Vec<String> {
                     i += 1;
                 }
                 i += 2;
+                out.push((start..i.min(b.len()), None));
             }
             // A char literal, so that '"' does not open a string; otherwise a
             // lifetime.
@@ -111,8 +117,10 @@ fn string_literals(src: &str) -> Vec<String> {
                         i += 1;
                     }
                     i += 1;
+                    out.push((start..i.min(b.len()), None));
                 } else if b.get(i + 2) == Some(&b'\'') {
                     i += 3;
+                    out.push((start..i, None));
                 } else {
                     i += 1;
                 }
@@ -129,22 +137,89 @@ fn string_literals(src: &str) -> Vec<String> {
                 let close = format!("\"{}", "#".repeat(hashes));
                 let body = &src[open + 1..];
                 let end = body.find(&close).unwrap_or(body.len());
-                out.push(body[..end].to_owned());
-                i = open + 1 + end + close.len();
+                i = (open + 1 + end + close.len()).min(b.len());
+                out.push((start..i, Some(body[..end].to_owned())));
             }
             b'"' => {
-                let start = i + 1;
                 i += 1;
                 while i < b.len() && b[i] != b'"' {
                     i += if b[i] == b'\\' { 2 } else { 1 };
                 }
-                out.push(String::from_utf8_lossy(&b[start..i.min(b.len())]).into_owned());
-                i += 1;
+                let body = String::from_utf8_lossy(&b[start + 1..i.min(b.len())]).into_owned();
+                i = (i + 1).min(b.len());
+                out.push((start..i, Some(body)));
             }
             _ => i += 1,
         }
     }
     out
+}
+
+/// Every string literal in `src`.
+fn string_literals(src: &str) -> Vec<String> {
+    lexemes(src).into_iter().filter_map(|(_, s)| s).collect()
+}
+
+/// `src` without the items `#[cfg(test)]` marks, wherever they are: a test
+/// module, a test-only function between shipped ones, a field, a statement.
+/// Only the marked item goes; the code after it is still scanned.
+fn without_test_items(src: &str) -> String {
+    // Comments and literals blanked, so every bracket left is code.
+    let mut code = src.as_bytes().to_vec();
+    for (range, _) in lexemes(src) {
+        for c in &mut code[range] {
+            if *c != b'\n' {
+                *c = b' ';
+            }
+        }
+    }
+    const ATTR: &[u8] = b"#[cfg(test)]";
+    let mut kept = String::new();
+    let mut from = 0;
+    let mut i = 0;
+    while i + ATTR.len() <= code.len() {
+        if &code[i..i + ATTR.len()] != ATTR {
+            i += 1;
+            continue;
+        }
+        kept.push_str(&src[from..i]);
+        i = item_end(&code, i + ATTR.len());
+        from = i;
+    }
+    kept.push_str(&src[from..]);
+    kept
+}
+
+/// Where the item that starts at `at` in `code` ends: after its `;` or `,`,
+/// after the block that closes it, or before the bracket that closes what
+/// holds it. A `,` inside `<..>` ends it early, which keeps more to scan,
+/// never less.
+fn item_end(code: &[u8], at: usize) -> usize {
+    let mut depth = 0usize;
+    let mut j = at;
+    while j < code.len() {
+        match code[j] {
+            b'{' | b'(' | b'[' => depth += 1,
+            b'}' | b')' | b']' if depth == 0 => return j,
+            b'}' | b')' | b']' => {
+                depth -= 1;
+                if depth == 0 && code[j] == b'}' {
+                    let next = code[j + 1..]
+                        .iter()
+                        .position(|c| !c.is_ascii_whitespace())
+                        .map(|k| j + 1 + k);
+                    return match next {
+                        Some(k) if matches!(code[k], b';' | b',') => k + 1,
+                        _ => j + 1,
+                    };
+                }
+            }
+            b';' | b',' if depth == 0 => return j + 1,
+            _ => {}
+        }
+        j += 1;
+    }
+    code.len()
 }
 
 /// Source a user can be shown: every `.rs` under `src/` and each crate's
@@ -192,10 +267,7 @@ fn shipped_sources() -> Vec<(PathBuf, String)> {
         .filter(|f| !test_only.contains(f))
         .map(|f| {
             let text = std::fs::read_to_string(&f).unwrap();
-            // Test modules at the end of a file. No trailing newline in the
-            // pattern, so a CRLF checkout splits too.
-            let code = text.split("\n#[cfg(test)]").next().unwrap_or("").to_owned();
-            (f, code)
+            (f, without_test_items(&text))
         })
         .collect()
 }
@@ -255,5 +327,43 @@ fn the_string_scanner_reads_literals_and_skips_comments_and_names() {
             "three \\\" escaped",
             "four\n           lines"
         ]
+    );
+}
+
+// LEDGER T9 | class B | 1 return value: without_test_items, the cut T7 relies on
+/// Shipped code after a test-only item is still scanned; only the item
+/// `#[cfg(test)]` marks is left out.
+#[test]
+fn the_scan_leaves_out_test_items_and_keeps_the_shipped_code_after_them() {
+    let src = r####"
+fn shipped_one() -> &'static str { "one" }
+#[cfg(test)]
+pub(crate) async fn test_only(a: u8) -> &'static str { let _ = '{'; "dropped fn }" }
+fn shipped_two() -> &'static str { "two" }
+#[cfg(test)]
+use helper::{a, b};
+#[cfg(test)]
+mod tests;
+struct S {
+    #[cfg(test)]
+    probe: &'static str,
+    shipped: u8,
+}
+fn shipped_three() {
+    let _ = S { shipped: 3, #[cfg(test)] probe: "dropped field" };
+    #[cfg(test)]
+    record("dropped statement");
+    log("three");
+}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn t() { assert_eq!(f(), "dropped module") }
+}
+fn after_the_tests() -> &'static str { "four" }
+"####;
+    assert_eq!(
+        string_literals(&without_test_items(src)),
+        ["one", "two", "three", "four"]
     );
 }
