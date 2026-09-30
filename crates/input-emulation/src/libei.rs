@@ -54,11 +54,13 @@ pub(crate) struct LibeiEmulation {
 }
 
 /// The RemoteDesktop token file, under `$XDG_CACHE_HOME` or else
-/// `$HOME/.cache`; none when neither is set, which used to panic.
+/// `$HOME/.cache`; none when neither is set, which used to panic. A value
+/// that is empty or relative counts as unset, as the XDG spec says.
 fn token_file_path(cache_home: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
-    let cache_dir = match (cache_home, home) {
-        (Some(cache), _) => PathBuf::from(cache),
-        (None, Some(home)) => PathBuf::from(home).join(".cache"),
+    let absolute = |v: Option<OsString>| v.map(PathBuf::from).filter(|p| p.is_absolute());
+    let cache_dir = match (absolute(cache_home), absolute(home)) {
+        (Some(cache), _) => cache,
+        (None, Some(home)) => home.join(".cache"),
         (None, None) => return None,
     };
     // Keeps the upstream directory name on purpose, like ~/.config/lan-mouse;
@@ -534,5 +536,30 @@ mod tests {
             token_file_path(Some("/c".into()), Some("/home/t".into())),
             Some(PathBuf::from("/c/lan-mouse/remote-desktop.token"))
         );
+    }
+
+    // LEDGER | behaviour | token_file_path with an empty or relative variable
+    /// The XDG spec says to ignore a relative XDG_CACHE_HOME; taking it put
+    /// the token under whatever directory the daemon was started in.
+    #[test]
+    fn a_relative_cache_dir_is_ignored() {
+        use std::path::PathBuf;
+
+        use super::token_file_path;
+
+        let home = Some(PathBuf::from(
+            "/home/t/.cache/lan-mouse/remote-desktop.token",
+        ));
+        assert_eq!(
+            token_file_path(Some("".into()), Some("/home/t".into())),
+            home
+        );
+        assert_eq!(
+            token_file_path(Some("cache".into()), Some("/home/t".into())),
+            home
+        );
+        assert_eq!(token_file_path(Some("".into()), None), None);
+        assert_eq!(token_file_path(None, Some("".into())), None);
+        assert_eq!(token_file_path(None, Some("t".into())), None);
     }
 }
