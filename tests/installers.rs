@@ -362,15 +362,32 @@ fn features_of(call: &str) -> BTreeSet<String> {
 /// installer never runs on a machine it could install onto.
 #[cfg(target_os = "linux")]
 fn install(tag: &str, system: &str, identities: &[(&str, &str)]) -> (Output, String, Scratch) {
+    install_in("checkout", tag, system, identities)
+}
+
+/// [`install`], from a checkout in a directory named `checkout`.
+#[cfg(target_os = "linux")]
+fn install_in(
+    checkout: &str,
+    tag: &str,
+    system: &str,
+    identities: &[(&str, &str)],
+) -> (Output, String, Scratch) {
     let s = Scratch::new(tag);
     let fakes = s.path().join("fakes");
     let tools = s.path().join("tools");
     let log = s.path().join("calls.log");
-    let checkout = s.path().join("checkout");
+    let checkout = s.path().join(checkout);
     let home = s.path().join("home");
     std::fs::create_dir_all(checkout.join("scripts")).unwrap();
+    std::fs::create_dir_all(checkout.join("resources")).unwrap();
     std::fs::create_dir_all(&home).unwrap();
-    for file in ["install.sh", "Cargo.toml", "scripts/macos-app-bundle.sh"] {
+    for file in [
+        "install.sh",
+        "Cargo.toml",
+        "scripts/macos-app-bundle.sh",
+        DESKTOP_ENTRY,
+    ] {
         std::fs::copy(repo().join(file), checkout.join(file)).unwrap();
     }
     system_tools(
@@ -403,6 +420,125 @@ fn install(tag: &str, system: &str, identities: &[(&str, &str)]) -> (Output, Str
     );
     let calls = std::fs::read_to_string(&log).unwrap_or_default();
     (out, calls, s)
+}
+
+/// The desktop entry the portal reads to name hops, as the checkout holds it.
+#[cfg(target_os = "linux")]
+const DESKTOP_ENTRY: &str = "resources/com.grabbr.hops.desktop";
+
+/// The program a desktop entry's `Exec` value runs, read the way the Desktop
+/// Entry spec says and GLib does: the string escapes of the value first,
+/// then `%%` as a literal `%`, then the first argument, in which a quoted
+/// `\`, `"`, `` ` `` and `$` each take a backslash. None if GLib would not
+/// read it as one program.
+#[cfg(target_os = "linux")]
+fn exec_program(value: &str) -> Option<String> {
+    let mut unescaped = String::new();
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            unescaped.push(c);
+            continue;
+        }
+        unescaped.push(match chars.next()? {
+            's' => ' ',
+            'n' => '\n',
+            't' => '\t',
+            'r' => '\r',
+            '\\' => '\\',
+            _ => return None,
+        });
+    }
+    let mut expanded = String::new();
+    let mut chars = unescaped.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' && chars.next()? != '%' {
+            return None;
+        }
+        expanded.push(c);
+    }
+    let mut chars = expanded.chars();
+    if chars.next()? != '"' {
+        let word = expanded.split(' ').next()?;
+        let plain = !word.contains(['"', '\'', '\\', '`', '$']);
+        return plain.then(|| word.to_owned());
+    }
+    let mut program = String::new();
+    loop {
+        match chars.next()? {
+            '"' => break,
+            '`' | '$' => return None,
+            '\\' => match chars.next()? {
+                c @ ('"' | '`' | '$' | '\\') => program.push(c),
+                _ => return None,
+            },
+            c => program.push(c),
+        }
+    }
+    matches!(chars.next(), None | Some(' ')).then_some(program)
+}
+
+// LEDGER T8 | class B | 4 files written: install.sh's desktop entry, and the binary its Exec names
+/// The portal names the caller after the desktop entry whose id it registered
+/// as, and only when that entry's Exec is a program it can find. The daemon
+/// runs from a systemd unit, whose PATH need not hold the checkout, so the
+/// entry must name the binary this install built, whatever the checkout's
+/// path holds: GLib drops an entry whose Exec it cannot parse, silently.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_linux_installer_installs_the_desktop_entry_the_portal_names_hops_by() {
+    for checkout in ["checkout", r#"a "quoted" `odd` $HOME \ 100% checkout"#] {
+        let (out, calls, s) = install_in(checkout, "linux-desktop", "Linux", &[]);
+        assert!(out.status.success(), "{}\n{calls}", text(&out));
+        let installed = s
+            .path()
+            .join("home/.local/share/applications")
+            .join(format!("{}.desktop", input_event::APP_ID));
+        let entry = std::fs::read_to_string(&installed).unwrap_or_else(|e| {
+            panic!(
+                "the installer left no {}: {e}. Without it the portal cannot name \
+                 hops, and the consent prompt asks for an unnamed application",
+                installed.display()
+            )
+        });
+        let bin = s.path().join(checkout).join("target/release/hops");
+        let exec: Vec<&str> = entry.lines().filter(|l| l.starts_with("Exec=")).collect();
+        assert_eq!(exec.len(), 1, "one Exec: {exec:?}");
+        assert_eq!(
+            exec_program(&exec[0]["Exec=".len()..]),
+            Some(bin.to_str().unwrap().to_owned()),
+            "the installed entry must run the binary this install built: {}",
+            exec[0]
+        );
+        assert!(bin.is_file(), "{} is not there", bin.display());
+        let shipped = std::fs::read_to_string(repo().join(DESKTOP_ENTRY)).unwrap();
+        let rest = |t: &str| -> Vec<String> {
+            t.lines()
+                .filter(|l| !l.starts_with("Exec="))
+                .map(str::to_owned)
+                .collect()
+        };
+        assert_eq!(rest(&entry), rest(&shipped), "only Exec may differ");
+    }
+}
+
+// LEDGER T9 | class B | 1 return value: exec_program, the reading T8 relies on
+/// The reading of Exec agrees with the spec's own examples.
+#[cfg(target_os = "linux")]
+#[test]
+fn exec_is_read_as_the_desktop_entry_spec_reads_it() {
+    assert_eq!(exec_program("hops"), Some("hops".into()));
+    assert_eq!(exec_program(r#""/a b/hops""#), Some("/a b/hops".into()));
+    // The spec: four backslashes for one, `\\$` for a dollar sign.
+    assert_eq!(exec_program(r#""/a\\\\b""#), Some(r"/a\b".into()));
+    assert_eq!(exec_program(r#""/a\\$b""#), Some("/a$b".into()));
+    assert_eq!(exec_program(r#""/a\\"b""#), Some(r#"/a"b"#.into()));
+    assert_eq!(exec_program(r#""/100%%""#), Some("/100%".into()));
+    // Unescaped, GLib cannot read them as the path.
+    assert_eq!(exec_program(r#""/a$b""#), None);
+    assert_eq!(exec_program(r#""/100%""#), None);
+    assert_eq!(exec_program(r#""/a\"b""#), None);
+    assert_eq!(exec_program(r#""/a"b""#), None);
 }
 
 // LEDGER T2 | class B | 5 process: install.sh, the cargo, codesign and launchctl calls it makes

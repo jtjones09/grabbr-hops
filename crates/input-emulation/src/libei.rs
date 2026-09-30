@@ -61,6 +61,8 @@ fn get_token_file_path() -> PathBuf {
             PathBuf::from(home).join(".cache")
         });
 
+    // Keeps the upstream directory name on purpose, like ~/.config/lan-mouse;
+    // the identity shown to users is input_event::APP_ID.
     cache_dir.join("lan-mouse").join("remote-desktop.token")
 }
 
@@ -85,6 +87,8 @@ fn write_token(token: &str) -> io::Result<()> {
 }
 
 async fn get_ei_fd() -> Result<(RemoteDesktop, Session<RemoteDesktop>, OwnedFd), ashpd::Error> {
+    // Before any portal call, so the consent prompt can name hops.
+    input_event::portal::register().await;
     let remote_desktop = RemoteDesktop::new().await?;
 
     let restore_token = read_token();
@@ -118,15 +122,23 @@ async fn get_ei_fd() -> Result<(RemoteDesktop, Session<RemoteDesktop>, OwnedFd),
     Ok((remote_desktop, session, fd))
 }
 
+/// Opens the ei connection on `stream` and names hops to the EIS server, which
+/// names the virtual devices it creates for us after it.
+async fn ei_handshake(
+    stream: UnixStream,
+) -> Result<(ei::Context, Connection, EiConvertEventStream), LibeiEmulationCreationError> {
+    stream.set_nonblocking(true)?;
+    let context = ei::Context::new(stream)?;
+    let (conn, events) = context
+        .handshake_tokio(input_event::APP_ID, ContextType::Sender)
+        .await?;
+    Ok((context, conn, events))
+}
+
 impl LibeiEmulation {
     pub(crate) async fn new() -> Result<Self, LibeiEmulationCreationError> {
         let (_remote_desktop, session, eifd) = get_ei_fd().await?;
-        let stream = UnixStream::from(eifd);
-        stream.set_nonblocking(true)?;
-        let context = ei::Context::new(stream)?;
-        let (conn, events) = context
-            .handshake_tokio("de.feschber.LanMouse", ContextType::Sender)
-            .await?;
+        let (context, conn, events) = ei_handshake(UnixStream::from(eifd)).await?;
         let devices = Devices::default();
         let libei_error = Arc::new(AtomicBool::default());
         let error = Arc::new(Mutex::new(None));
@@ -325,7 +337,8 @@ async fn ei_event_handler(
             }
             EiEvent::DeviceAdded(e) => {
                 let device_type = e.device().device_type();
-                log::debug!("device added: {device_type:?}");
+                let name = e.device().name().unwrap_or("");
+                log::debug!("device added: {device_type:?} {name:?}");
                 e.device().device();
                 let device = e.device();
                 if let Some(pointer) = e.device().interface::<Pointer>() {
@@ -388,5 +401,73 @@ async fn ei_event_handler(
             _ => unreachable!("unexpected ei event"),
         }
         context.flush().map_err(|e| io::Error::new(e.kind(), e))?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        os::unix::net::UnixStream,
+        time::{Duration, Instant},
+    };
+
+    use reis::{PendingRequestResult, eis, handshake::EisHandshaker};
+
+    /// Plays the compositor's side of the ei handshake on `socket`, and returns
+    /// the name and context type the client gave, with the context kept open.
+    fn compositor_side(
+        socket: UnixStream,
+    ) -> (Option<String>, eis::handshake::ContextType, eis::Context) {
+        let context = eis::Context::new(socket).expect("an eis context");
+        let mut handshaker = EisHandshaker::new(&context, 1);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            // The socket is non-blocking: 0 is "nothing yet", and a hang-up is
+            // an UnexpectedEof error.
+            match context.read() {
+                Ok(0) => {
+                    assert!(Instant::now() < deadline, "no handshake within 30s");
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => panic!("reading the handshake: {e}"),
+            }
+            while let Some(pending) = context.pending_request() {
+                let PendingRequestResult::Request(request) = pending else {
+                    panic!("the client sent something that is not a request");
+                };
+                if let Some(done) = handshaker
+                    .handle_request(request)
+                    .expect("a valid handshake")
+                {
+                    context.flush().expect("the handshake reply is sent");
+                    return (done.name, done.context_type, context);
+                }
+            }
+        }
+    }
+
+    // LEDGER T3 | class B | 2 frames received by a stand-in EIS server from libei::ei_handshake
+    /// The compositor names the virtual devices after the handshake name, and
+    /// shows them to the user under it.
+    #[tokio::test]
+    async fn the_emulation_handshake_names_hops_to_the_compositor() {
+        let (ours, theirs) = UnixStream::pair().expect("a socket pair");
+        let compositor = std::thread::spawn(move || compositor_side(theirs));
+        let ours = tokio::time::timeout(Duration::from_secs(30), super::ei_handshake(ours))
+            .await
+            .expect("the handshake finished within 30s");
+        let (name, context_type, _context) = compositor.join().expect("the compositor side");
+        if let Err(e) = ours {
+            panic!("the handshake failed on our side: {e}");
+        }
+        assert_eq!(
+            name.as_deref(),
+            Some(input_event::APP_ID),
+            "input emulation names itself to the compositor as something other \
+             than hops, so the devices it is given carry another name"
+        );
+        assert_eq!(context_type, eis::handshake::ContextType::Sender);
     }
 }

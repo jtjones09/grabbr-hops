@@ -25,6 +25,8 @@ repository = "https://github.com/jtjones09/grabbr-hops"
 # the wire protocol (ALPN `grabbr-hop/1`) and the on-disk state dir
 # (`~/.config/lan-mouse/`) keep their old names, for compatibility. One binary
 # does everything: `hops` (front door) / `hops gui` / `hops tui` / `hops daemon`.
+# The paths keep the upstream name on purpose; the identity shown to users is
+# com.grabbr.hops (input_event::APP_ID).
 [[bin]]
 name = "hops"
 path = "src/main.rs"
@@ -115,6 +117,12 @@ input-capture = { path = "crates/input-capture", version = "0.4.0", default-feat
 # tests parse them to run each gate's shell and to read which job holds a
 # secret or may write.
 yaml-rust2 = { version = "0.13", default-features = false }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dev-dependencies]
+# A stand-in session bus and desktop portal, for the tests that watch what the
+# portal backends send it (tests/portal). Already in the tree through ashpd;
+# `p2p` lets a test serve a connection.
+zbus = { version = "5.16", default-features = false, features = ["tokio", "p2p"] }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 # Releases the private pasteboard a test marks.

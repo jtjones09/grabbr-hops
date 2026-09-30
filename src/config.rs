@@ -80,6 +80,8 @@ const LONG_VERSION: &str = concat!(
 const CONFIG_FILE_NAME: &str = "config.toml";
 const CERT_FILE_NAME: &str = "lan-mouse.pem";
 
+// The directory keeps the upstream name on purpose, for config compatibility;
+// the identity shown to users is com.grabbr.hops (input_event::APP_ID).
 fn default_path() -> Result<PathBuf, VarError> {
     #[cfg(unix)]
     let default_path = {

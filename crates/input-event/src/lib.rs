@@ -7,6 +7,16 @@ pub mod scancode;
 #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]
 mod libei;
 
+#[cfg(all(unix, feature = "portal", not(target_os = "macos")))]
+pub mod portal;
+
+/// The name hops gives itself wherever the desktop shows who is asking for
+/// input: the Linux portals and the libei handshake, which names the virtual
+/// devices. It is the macOS bundle identifier and the id of the desktop entry
+/// the Linux release ships. The on-disk state directory keeps its upstream
+/// name for config compatibility; that name is never shown as an identity.
+pub const APP_ID: &str = "com.grabbr.hops";
+
 // FIXME
 pub const BTN_LEFT: u32 = 0x110;
 pub const BTN_RIGHT: u32 = 0x111;

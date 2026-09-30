@@ -78,5 +78,5 @@ x11 = ["dep:x11"]
 # tests. Not in `default` and not in any feature the hops crate exposes: the hops
 # crate turns it on as a dev-dependency only, so no shipped build contains it.
 recording = []
-remote_desktop_portal = ["dep:ashpd"]
-libei = ["dep:reis", "dep:ashpd"]
+remote_desktop_portal = ["dep:ashpd", "input-event/portal"]
+libei = ["dep:reis", "dep:ashpd", "input-event/portal"]

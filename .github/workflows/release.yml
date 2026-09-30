@@ -13,7 +13,9 @@
 #   - hops-windows-x86_64.zip        (GUI build)
 #   - hops-linux-x86_64.tar.gz       (daemon + terminal UI; the Slint GUI on Linux
 #                                     needs desktop libs, so the Linux artifact is
-#                                     TUI-only for a reliable, dependency-light build)
+#                                     TUI-only for a reliable, dependency-light build;
+#                                     with com.grabbr.hops.desktop, which the portal
+#                                     names hops by)
 #   - hops-<target>.cdx.json         (a CycloneDX SBOM for each target compiled)
 #   - SHA256SUMS                     (the SHA-256 of every other asset)
 #
@@ -380,6 +382,8 @@ jobs:
 
           mkdir -p dist
           cp "$bin" dist/hops
+          # Lets the desktop portal name hops in its consent prompt (#113).
+          cp resources/com.grabbr.hops.desktop dist/
 
       # What every archive carries beside the binary: the licence, the
       # third-party notices, and a CycloneDX SBOM per target, all for this
@@ -594,6 +598,10 @@ jobs:
             fi
             local want=("$bin" LICENSE THIRD-PARTY-NOTICES.txt) listed m known
             for t; do want+=("hops-$t.cdx.json"); done
+            # The desktop entry the portal names hops by (#113).
+            case "$archive" in
+              *linux*) want+=(com.grabbr.hops.desktop) ;;
+            esac
             # What is published is exactly what the build meant to ship.
             case "$archive" in
               *.zip) listed="$(unzip -Z1 "$archive")" || { fail "cannot read $archive."; return; } ;;

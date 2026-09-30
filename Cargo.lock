@@ -2350,6 +2350,7 @@ dependencies = [
  "windows 0.61.3",
  "x11rb",
  "yaml-rust2",
+ "zbus",
 ]
 
 [[package]]
@@ -3137,12 +3138,14 @@ dependencies = [
 name = "input-event"
 version = "0.4.0"
 dependencies = [
+ "ashpd",
  "futures-core",
  "log",
  "num_enum",
  "reis",
  "serde",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

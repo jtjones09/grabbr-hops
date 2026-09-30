@@ -898,6 +898,16 @@ done
         assert!(ok, "could not write {archive}");
     }
 
+    /// What an archive holds besides the binary, licence, notices and SBOMs:
+    /// on Linux, the desktop entry the portal names hops by (#113).
+    fn extras(archive: &str) -> Vec<String> {
+        if archive.contains("linux") {
+            vec![format!("{}.desktop", input_event::APP_ID)]
+        } else {
+            Vec::new()
+        }
+    }
+
     /// What a release archive holds: the binary, carrying cargo auditable's
     /// section, the licence, the notices and an SBOM per target.
     fn members(bin: &str, targets: &[&str]) -> Members {
@@ -934,6 +944,9 @@ done
             reset(&dir);
             for (a, bin, targets) in ARCHIVES {
                 let mut m = members(bin, targets);
+                for e in extras(a) {
+                    m.push((e, b"[Desktop Entry]\n".to_vec()));
+                }
                 if a == archive {
                     change(&mut m);
                 }
@@ -948,6 +961,7 @@ done
         for (archive, bin, targets) in ARCHIVES {
             let mut required = vec![bin.to_owned(), LICENSE.to_owned(), NOTICES.to_owned()];
             required.extend(targets.iter().map(|t| sbom(t)));
+            required.extend(extras(archive));
             for missing in &required {
                 let ran = run(archive, &|m| m.retain(|(n, _)| n != missing));
                 assert!(
