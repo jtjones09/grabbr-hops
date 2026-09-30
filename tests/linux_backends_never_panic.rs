@@ -248,8 +248,18 @@ fn test_item_len(file: &str, item: &str) -> Option<usize> {
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => {
                 depth = depth.checked_sub(1)?;
-                if depth == 0 && c == '}' && braced {
-                    return Some(i + at + 1);
+                if depth == 0 && c == '}' {
+                    if braced {
+                        return Some(i + at + 1);
+                    }
+                    // An item that ends at its `;` closes a brace only
+                    // just before it, as in `use a::{b, c};`. A body
+                    // closing anywhere else, as in `const unsafe fn`,
+                    // means this is not such an item, and cutting on to
+                    // the next `;` would hide the code in between.
+                    if !item[i + at + 1..].trim_start().starts_with(';') {
+                        return None;
+                    }
                 }
             }
             ';' if depth == 0 => return Some(i + at + 1),
@@ -391,6 +401,14 @@ fn the_scan_sees_the_code_it_guards() {
         (
             "#[cfg(test)]\nconst fn h() -> u8 { y.unwrap(); 1 }\nfn a() { x.unwrap(); }\nconst Z: u8 = 1;",
             "a test const fn",
+        ),
+        (
+            "#[cfg(test)]\nconst unsafe fn h() {}\nfn a() -> u8 { x.unwrap() }\nconst Z: u8 = 1;",
+            "a test const unsafe fn",
+        ),
+        (
+            "#[cfg(test)]\npub const extern \"C\" fn h() {}\nfn a() -> u8 { x.unwrap() }\nstatic Z: u8 = 1;",
+            "a test const extern fn",
         ),
     ] {
         let code = kept(sample);
