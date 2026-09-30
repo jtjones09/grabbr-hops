@@ -60,7 +60,7 @@ you want to share the keyboard & mouse across.
 | macOS (Intel + Apple Silicon) | `hops-macos-universal.dmg` — open it, drag **hops** to Applications |
 | macOS (CLI / headless) | `hops-macos-universal.tar.gz` — the `hops` binary, with its licence and notices |
 | Windows | `hops-windows-x86_64.zip` |
-| Linux (terminal UI + daemon) | `hops-linux-x86_64.tar.gz` |
+| Linux (terminal UI + daemon) | `hops-linux-x86_64.tar.gz` — with `com.grabbr.hops.desktop`, which lets the input consent prompt name hops ([UPGRADING.md](docs/UPGRADING.md#linux)) |
 
 Each archive also holds `LICENSE`, `THIRD-PARTY-NOTICES.txt` and an SBOM. To check a download, see [Verifying a release](SECURITY.md#verifying-a-release).
 

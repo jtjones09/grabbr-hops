@@ -1,0 +1,11 @@
+# Lets the desktop portal name hops in the prompt that grants it input.
+# Install it as ~/.local/share/applications/com.grabbr.hops.desktop. The
+# portal ignores an entry whose Exec it cannot find: if hops is not on PATH,
+# give Exec the binary's full path. install.sh does both.
+[Desktop Entry]
+Type=Application
+Name=hops
+Comment=Share one keyboard and mouse across machines
+Exec=hops
+Terminal=true
+NoDisplay=true

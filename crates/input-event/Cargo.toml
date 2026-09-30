@@ -15,6 +15,12 @@ thiserror = "2.0.0"
 
 [target.'cfg(all(unix, not(target_os="macos")))'.dependencies]
 reis = { version = "0.5.0", optional = true }
+# The same ashpd as input-capture and input-emulation: one session-bus
+# connection per process, which `portal::register` names (#113).
+ashpd = { version = "0.13.9", default-features = false, features = [
+    "tokio",
+], optional = true }
+tokio = { version = "1.32.0", features = ["sync"], optional = true }
 
 [features]
 default = ["libei"]
@@ -23,3 +29,5 @@ default = ["libei"]
 # Enabling it is still not enough: HOPS_LOG_KEYS must name a duration. See #117.
 keylog = []
 libei = ["dep:reis"]
+# Names hops to xdg-desktop-portal before the first portal call (#113).
+portal = ["dep:ashpd", "dep:tokio"]

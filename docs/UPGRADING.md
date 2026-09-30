@@ -36,3 +36,20 @@ stopped. The steps are in [service/README.md](../service/README.md#windows).
 Replace hops in Applications with the new version and open it. If the
 background service is still running the older build, the app restarts
 it.
+
+## Linux
+
+hops 0.13 names itself `com.grabbr.hops` to the desktop. The input
+devices it creates carry that name instead of the upstream project's, and
+the portal's consent prompt names hops instead of an unnamed application.
+
+The prompt names hops with xdg-desktop-portal 1.20 or later, when
+`com.grabbr.hops.desktop` is installed in `~/.local/share/applications`.
+`install.sh` installs it. From the release archive, copy it there
+yourself, and if `hops` is not on your `PATH`, change its `Exec=` line to
+the binary's full path. Restart hops after installing it.
+
+The portal remembers "allow input control" per application, and 0.12 was
+remembered as an unnamed one. The first start with the name in place
+therefore asks once more. Allow it, and hops is remembered under its own
+name.

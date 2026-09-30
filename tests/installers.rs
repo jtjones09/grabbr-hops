@@ -369,8 +369,14 @@ fn install(tag: &str, system: &str, identities: &[(&str, &str)]) -> (Output, Str
     let checkout = s.path().join("checkout");
     let home = s.path().join("home");
     std::fs::create_dir_all(checkout.join("scripts")).unwrap();
+    std::fs::create_dir_all(checkout.join("resources")).unwrap();
     std::fs::create_dir_all(&home).unwrap();
-    for file in ["install.sh", "Cargo.toml", "scripts/macos-app-bundle.sh"] {
+    for file in [
+        "install.sh",
+        "Cargo.toml",
+        "scripts/macos-app-bundle.sh",
+        DESKTOP_ENTRY,
+    ] {
         std::fs::copy(repo().join(file), checkout.join(file)).unwrap();
     }
     system_tools(
@@ -403,6 +409,49 @@ fn install(tag: &str, system: &str, identities: &[(&str, &str)]) -> (Output, Str
     );
     let calls = std::fs::read_to_string(&log).unwrap_or_default();
     (out, calls, s)
+}
+
+/// The desktop entry the portal reads to name hops, as the checkout holds it.
+#[cfg(target_os = "linux")]
+const DESKTOP_ENTRY: &str = "resources/com.grabbr.hops.desktop";
+
+// LEDGER T6 | class B | 4 files written: install.sh's desktop entry, and the binary its Exec names
+/// The portal names the caller after the desktop entry whose id it registered
+/// as, and only when that entry's Exec is a program it can find. The daemon
+/// runs from a systemd unit, whose PATH need not hold the checkout, so the
+/// entry must name the binary this install built.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_linux_installer_installs_the_desktop_entry_the_portal_names_hops_by() {
+    let (out, calls, s) = install("linux-desktop", "Linux", &[]);
+    assert!(out.status.success(), "{}\n{calls}", text(&out));
+    let installed = s
+        .path()
+        .join("home/.local/share/applications")
+        .join(format!("{}.desktop", input_event::APP_ID));
+    let entry = std::fs::read_to_string(&installed).unwrap_or_else(|e| {
+        panic!(
+            "the installer left no {}: {e}. Without it the portal cannot name \
+             hops, and the consent prompt asks for an unnamed application",
+            installed.display()
+        )
+    });
+    let bin = s.path().join("checkout/target/release/hops");
+    let exec: Vec<&str> = entry.lines().filter(|l| l.starts_with("Exec=")).collect();
+    assert_eq!(
+        exec,
+        [format!("Exec=\"{}\"", bin.display())],
+        "the installed entry must run the binary this install built"
+    );
+    assert!(bin.is_file(), "{} is not there", bin.display());
+    let shipped = std::fs::read_to_string(repo().join(DESKTOP_ENTRY)).unwrap();
+    let rest = |t: &str| -> Vec<String> {
+        t.lines()
+            .filter(|l| !l.starts_with("Exec="))
+            .map(str::to_owned)
+            .collect()
+    };
+    assert_eq!(rest(&entry), rest(&shipped), "only Exec may differ");
 }
 
 // LEDGER T2 | class B | 5 process: install.sh, the cargo, codesign and launchctl calls it makes

@@ -106,6 +106,16 @@ Restart=on-failure
 [Install]
 WantedBy=default.target
 UNIT
+    # The desktop entry lets the portal's consent prompt name hops. The portal
+    # ignores an entry whose Exec it cannot find, so Exec names this build.
+    apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+    mkdir -p "$apps"
+    while IFS= read -r line; do
+      case "$line" in
+        Exec=*) printf 'Exec="%s"\n' "$BIN" ;;
+        *) printf '%s\n' "$line" ;;
+      esac
+    done < "$REPO/resources/com.grabbr.hops.desktop" > "$apps/com.grabbr.hops.desktop"
     systemctl --user daemon-reload
     systemctl --user enable --now hops.service
     echo
