@@ -22,6 +22,9 @@ ashpd = { version = "0.13.9", default-features = false, features = [
 ], optional = true }
 tokio = { version = "1.32.0", features = ["sync"], optional = true }
 
+[target.'cfg(all(unix, not(target_os="macos")))'.dev-dependencies]
+tokio = { version = "1.32.0", features = ["macros", "rt", "sync"] }
+
 [features]
 default = ["libei"]
 # Keystroke logging. OFF by default and absent from every release feature set,
