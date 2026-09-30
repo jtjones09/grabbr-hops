@@ -1,7 +1,8 @@
 # Lets the desktop portal name hops in the prompt that grants it input.
 # Install it as ~/.local/share/applications/com.grabbr.hops.desktop. The
-# portal ignores an entry whose Exec it cannot find: if hops is not on PATH,
-# give Exec the binary's full path. install.sh does both.
+# portal ignores an entry whose Exec it cannot find, and it searches its own
+# PATH (the systemd user manager's), not a shell's: give Exec the binary's
+# absolute path. install.sh does both.
 [Desktop Entry]
 Type=Application
 Name=hops

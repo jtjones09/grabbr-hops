@@ -108,11 +108,15 @@ WantedBy=default.target
 UNIT
     # The desktop entry lets the portal's consent prompt name hops. The portal
     # ignores an entry whose Exec it cannot find, so Exec names this build.
+    # Escaped as the Desktop Entry spec reads a quoted argument: \ " ` $ take
+    # a backslash, the value's own escaping then doubles every backslash, and
+    # % is doubled. An Exec GLib cannot parse drops the entry, silently.
+    exec_bin="$(printf '%s' "$BIN" | sed -e 's/[\\"`$]/\\&/g' -e 's/\\/\\\\/g' -e 's/%/%%/g')"
     apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
     mkdir -p "$apps"
     while IFS= read -r line; do
       case "$line" in
-        Exec=*) printf 'Exec="%s"\n' "$BIN" ;;
+        Exec=*) printf 'Exec="%s"\n' "$exec_bin" ;;
         *) printf '%s\n' "$line" ;;
       esac
     done < "$REPO/resources/com.grabbr.hops.desktop" > "$apps/com.grabbr.hops.desktop"

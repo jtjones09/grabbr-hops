@@ -46,8 +46,11 @@ the portal's consent prompt names hops instead of an unnamed application.
 The prompt names hops with xdg-desktop-portal 1.20 or later, when
 `com.grabbr.hops.desktop` is installed in `~/.local/share/applications`.
 `install.sh` installs it. From the release archive, copy it there
-yourself, and if `hops` is not on your `PATH`, change its `Exec=` line to
-the binary's full path. Restart hops after installing it.
+yourself and change its `Exec=` line to the binary's absolute path, for
+example `Exec="/opt/hops/hops"`. The portal looks a bare `hops` up on its
+own `PATH`, the systemd user manager's rather than your shell's, and
+ignores the entry without a message when it is not found there. Restart
+hops after installing it.
 
 The portal remembers "allow input control" per application, and 0.12 was
 remembered as an unnamed one. The first start with the name in place
