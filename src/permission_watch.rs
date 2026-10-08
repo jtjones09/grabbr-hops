@@ -39,10 +39,10 @@ pub enum Permission {
 }
 
 impl Permission {
-    /// The System Settings list that grants it.
+    /// The System Settings list that grants it, as this Mac names it.
     fn pane(self) -> &'static str {
         match self {
-            Self::Accessibility | Self::PostEvents => "Accessibility",
+            Self::Accessibility | Self::PostEvents => input_event::settings_pane::accessibility(),
             Self::InputMonitoring => "Input Monitoring",
         }
     }
@@ -50,11 +50,10 @@ impl Permission {
 
 impl fmt::Display for Permission {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Accessibility => "Accessibility",
-            Self::InputMonitoring => "Input Monitoring",
-            Self::PostEvents => "Accessibility (to post input)",
-        })
+        match self {
+            Self::Accessibility | Self::InputMonitoring => f.write_str(self.pane()),
+            Self::PostEvents => write!(f, "{} (to post input)", self.pane()),
+        }
     }
 }
 
@@ -519,12 +518,13 @@ mod a_grant_made_while_the_daemon_runs {
     #[test]
     fn what_was_granted_is_named_as_the_settings_that_grant_it() {
         use Permission::{Accessibility, InputMonitoring, PostEvents};
+        let pane = input_event::settings_pane::accessibility();
         for (granted, said) in [
-            (vec![Accessibility], "Accessibility"),
-            (vec![Accessibility, PostEvents], "Accessibility"),
+            (vec![Accessibility], pane.to_string()),
+            (vec![Accessibility, PostEvents], pane.to_string()),
             (
                 vec![Accessibility, InputMonitoring, PostEvents],
-                "Accessibility and Input Monitoring",
+                format!("{pane} and Input Monitoring"),
             ),
         ] {
             assert_eq!(
@@ -624,6 +624,44 @@ mod a_grant_made_while_the_daemon_runs {
             released.load(Ordering::SeqCst),
             "a permission check held the daemon's loop: no other task ran while \
              it waited"
+        );
+    }
+}
+
+#[cfg(test)]
+mod a_permission_is_named_as_this_macos_names_it {
+    use super::{AfterGrant, Permission};
+    use input_event::settings_pane::assume_major;
+
+    // LEDGER T12 | class B | 1 return value: AfterGrant::granted, <Permission as Display>::fmt
+    #[test]
+    fn what_was_granted_is_named_as_macos_26_and_27_name_it() {
+        let said = |major| {
+            assume_major(Some(major));
+            let s = (
+                AfterGrant::Exit(vec![
+                    Permission::Accessibility,
+                    Permission::InputMonitoring,
+                    Permission::PostEvents,
+                ])
+                .granted(),
+                Permission::PostEvents.to_string(),
+            );
+            assume_major(None);
+            s
+        };
+        assert_eq!(
+            [said(26), said(27)],
+            [
+                (
+                    "Accessibility and Input Monitoring".to_string(),
+                    "Accessibility (to post input)".to_string()
+                ),
+                (
+                    "Device Control and Data Access and Input Monitoring".to_string(),
+                    "Device Control and Data Access (to post input)".to_string()
+                ),
+            ]
         );
     }
 }

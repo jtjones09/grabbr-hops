@@ -373,6 +373,19 @@ fn install_in(
     system: &str,
     identities: &[(&str, &str)],
 ) -> (Output, String, Scratch) {
+    install_with(checkout, tag, system, identities, "26.4")
+}
+
+/// [`install_in`], on a macOS whose version `sw_vers -productVersion`
+/// reports as `macos_version`.
+#[cfg(target_os = "linux")]
+fn install_with(
+    checkout: &str,
+    tag: &str,
+    system: &str,
+    identities: &[(&str, &str)],
+    macos_version: &str,
+) -> (Output, String, Scratch) {
     let s = Scratch::new(tag);
     let fakes = s.path().join("fakes");
     let tools = s.path().join("tools");
@@ -394,9 +407,24 @@ fn install_in(
         &tools,
         &[
             "bash", "dirname", "grep", "sed", "mkdir", "cat", "rm", "cp", "chmod", "id", "awk",
+            "cut",
         ],
     );
     stand_in(&fakes, "uname", &format!("echo {system}"));
+    // As macOS 27's sw_vers answers: the options it lists, and for any other
+    // its usage on stdout and exit 1. It has no -productMajorVersion.
+    stand_in(
+        &fakes,
+        "sw_vers",
+        &format!(
+            "case \"$1\" in\n\
+             -productVersion|--productVersion) echo {macos_version} ;;\n\
+             *) echo \"sw_vers: unrecognized option \\`$1'\" >&2\n\
+             echo 'Usage: sw_vers [--help|--productName|--productVersion|--productVersionExtra|--buildVersion]'\n\
+             exit 1 ;;\n\
+             esac"
+        ),
+    );
     recorder(
         &fakes,
         "cargo",
@@ -586,12 +614,67 @@ fn the_installer_builds_and_signs_what_the_release_ships() {
     assert!(calls.contains("launchctl [bootstrap]"), "{calls}");
 
     // launchd creates each job's output file with its own umask; the
-    // installer creates them first, readable by this user alone.
-    for log in ["daemon.log", "gui.log"] {
-        let path = s.path().join("home/hops/logs").join(log);
+    // installer creates them first, readable by this user alone, in the
+    // directory hops itself logs to on macOS, and sends each job's output
+    // there.
+    let home = s.path().join("home");
+    let logs = home.join("Library/Logs/hops");
+    for (label, log) in [
+        ("com.grabbr.hops", "daemon.log"),
+        ("com.grabbr.hops.gui", "gui.log"),
+    ] {
+        let path = logs.join(log);
         let mode = std::fs::metadata(&path)
             .map(|m| m.permissions().mode() & 0o777)
-            .unwrap_or_else(|e| panic!("the installer left no {log}: {e}"));
+            .unwrap_or_else(|e| panic!("the installer left no {}: {e}", path.display()));
         assert_eq!(mode, 0o600, "the installer left {log} {mode:o}");
+        let plist =
+            std::fs::read_to_string(home.join(format!("Library/LaunchAgents/{label}.plist")))
+                .unwrap_or_else(|e| panic!("the installer wrote no {label} plist: {e}"));
+        for key in ["StandardOutPath", "StandardErrorPath"] {
+            assert!(
+                plist.contains(&format!(
+                    "<key>{key}</key><string>{}</string>",
+                    path.display()
+                )),
+                "{label} does not send its {key} to {}: {plist}",
+                path.display()
+            );
+        }
+    }
+    assert!(
+        !home.join("hops").exists(),
+        "the installer created ~/hops, which hops no longer writes to"
+    );
+}
+
+/// The installer names the System Settings list that lets hops move the
+/// pointer as the Mac it runs on names it: macOS 27 renamed Accessibility.
+// LEDGER T7 | class B | 5 process stdout: the installer, with sw_vers stood in
+#[cfg(target_os = "linux")]
+#[test]
+fn the_installer_names_the_list_as_this_macos_does() {
+    for (version, pane, not) in [
+        ("26.4", "Accessibility ", "Device Control"),
+        ("27.2", "Device Control and Data Access", "Accessibility "),
+        ("28.0", "Device Control and Data Access", "Accessibility "),
+    ] {
+        let (out, _calls, _s) = install_with(
+            "checkout",
+            &format!("macos-{version}"),
+            "Darwin",
+            &[],
+            version,
+        );
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{}", text(&out));
+        let line = said
+            .lines()
+            .find(|l| l.contains("to move the cursor"))
+            .unwrap_or_else(|| panic!("macOS {version}: no line names the list:\n{said}"));
+        assert!(
+            line.contains(pane) && !line.contains(not),
+            "macOS {version} must be told to look under {pane:?}: {line:?}"
+        );
     }
 }

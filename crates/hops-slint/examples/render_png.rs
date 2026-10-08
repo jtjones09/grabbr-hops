@@ -84,15 +84,18 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
     ui.set_port("4722".into());
     // PREVIEW_CONTROLLED_MAC=1 shows a Mac that is only controlled: it only
     // dials out, and macOS has not granted hops Accessibility, so emulation
-    // cannot run.
+    // cannot run. The words are the app's own, naming the list as this Mac
+    // does.
     if std::env::var_os("PREVIEW_CONTROLLED_MAC").is_some() {
+        use hops_frontend_core::{
+            AppModel, EmulationFault, EmulationState, FrontendEvent, Permission,
+        };
+        let mut model = AppModel::default();
+        model.apply(FrontendEvent::EmulationStatus(EmulationState::Failed(
+            EmulationFault::Missing(vec![Permission::Accessibility]),
+        )));
         ui.set_emulation("failed".into());
-        ui.set_emulation_problem(
-            "Input emulation cannot run: macOS does not grant hops Accessibility, which \
-             this Mac needs to be controlled from other machines. Turn hops on under \
-             System Settings → Privacy & Security → Accessibility."
-                .into(),
-        );
+        ui.set_emulation_problem(model.emulation_problem().unwrap_or_default().into());
         ui.set_emulation_settings(true);
         ui.set_dials_out_only(true);
     }

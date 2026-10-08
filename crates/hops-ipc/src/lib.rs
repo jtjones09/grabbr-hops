@@ -64,6 +64,8 @@ mod windows;
 pub use connect_async::{
     AsyncFrontendEventReader, AsyncFrontendRequestWriter, connect_async, connect_async_to,
 };
+/// What macOS calls the permissions [`Permission`] displays.
+pub use input_event::settings_pane;
 pub use listen::{AsyncFrontendListener, PREAUTH_CONNECTIONS_MAX, PREAUTH_DEADLINE};
 pub use proof::{PROOF_WITHIN, prove_to_daemon};
 
@@ -938,8 +940,9 @@ pub enum CaptureFault {
     Backend(String),
 }
 
-/// A macOS permission, named as System Settings → Privacy & Security lists
-/// it.
+/// A macOS permission. Written on the wire by its variant name; displayed as
+/// System Settings → Privacy & Security lists it on the Mac the frontend
+/// runs on, which is the daemon's Mac.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub enum Permission {
     Accessibility,
@@ -949,7 +952,7 @@ pub enum Permission {
 impl Display for Permission {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Accessibility => "Accessibility",
+            Self::Accessibility => input_event::settings_pane::accessibility(),
             Self::InputMonitoring => "Input Monitoring",
         })
     }
@@ -2054,6 +2057,39 @@ mod capture_state_on_the_wire {
             ),
             "a failed emulation must arrive naming what is missing: {}",
             wire(&failed)
+        );
+    }
+}
+
+#[cfg(test)]
+mod a_permission_is_named_as_this_macos_names_it {
+    //! macOS 27 renamed Accessibility. A frontend shows a permission by its
+    //! `Display`, so that is where the name for each macOS is checked, on
+    //! any host.
+    use super::Permission;
+    use input_event::settings_pane::assume_major;
+
+    // LEDGER T9 | class B | 1 return value: <Permission as Display>::fmt
+    #[test]
+    fn accessibility_is_device_control_and_data_access_from_macos_27() {
+        let named = |major| {
+            assume_major(Some(major));
+            let said = (
+                Permission::Accessibility.to_string(),
+                Permission::InputMonitoring.to_string(),
+            );
+            assume_major(None);
+            said
+        };
+        assert_eq!(
+            [named(26), named(27)],
+            [
+                ("Accessibility".into(), "Input Monitoring".into()),
+                (
+                    "Device Control and Data Access".into(),
+                    "Input Monitoring".into()
+                ),
+            ]
         );
     }
 }

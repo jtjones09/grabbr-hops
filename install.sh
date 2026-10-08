@@ -41,7 +41,9 @@ case "$(uname -s)" in
     "$REPO/scripts/macos-app-bundle.sh" "$BIN" "$VERSION" "$APP" "" --sign >/dev/null
     BIN="$APP/Contents/MacOS/hops"
     echo "==> Setting up login agents: background receiver + menu-bar tray…"
-    mkdir -p "$HOME/hops/logs" "$HOME/Library/LaunchAgents"
+    # Where hops itself logs on macOS (crates/input-event/src/paths.rs).
+    logs="$HOME/Library/Logs/hops"
+    mkdir -p "$logs" "$HOME/Library/LaunchAgents"
     uid="$(id -u)"
     # Two agents, mirroring the app model: the daemon (headless) and the tray.
     for kind in daemon gui; do
@@ -74,21 +76,29 @@ case "$(uname -s)" in
   <!-- Lists the job under hops in System Settings → Login Items. -->
   <key>AssociatedBundleIdentifiers</key><array><string>com.grabbr.hops</string></array>
   ${session}
-  <key>StandardOutPath</key><string>${HOME}/hops/logs/${log}</string>
-  <key>StandardErrorPath</key><string>${HOME}/hops/logs/${log}</string>
+  <key>StandardOutPath</key><string>${logs}/${log}</string>
+  <key>StandardErrorPath</key><string>${logs}/${log}</string>
 </dict></plist>
 PLIST
       # launchd creates a missing output file with its own umask, readable
       # by every account. Create it first, readable by this user alone.
-      : >> "$HOME/hops/logs/${log}"
-      chmod 600 "$HOME/hops/logs/${log}"
+      : >> "${logs}/${log}"
+      chmod 600 "${logs}/${log}"
       launchctl bootout "gui/${uid}/${label}" 2>/dev/null || true
       launchctl bootstrap "gui/${uid}" "$plist"
     done
     echo
     echo "✅  hops is running (look for the tray icon in your menu bar)."
     echo "⚠️  macOS needs your OK, under System Settings → Privacy & Security:"
-    echo "      Accessibility     → turn on \"hops\" (to move the cursor)"
+    # macOS 27 renamed the Accessibility list
+    # (crates/input-event/src/settings_pane.rs).
+    pane="Accessibility"
+    major="$(sw_vers -productVersion 2>/dev/null | cut -d. -f1 || true)"
+    case "$major" in
+      ''|*[!0-9]*) ;;
+      *) if [ "$major" -ge 27 ]; then pane="Device Control and Data Access"; fi ;;
+    esac
+    printf '      %-17s → turn on "hops" (to move the cursor)\n' "$pane"
     echo "      Input Monitoring  → turn on \"hops\" (to control other machines from this one)"
     echo "      Local Network     → turn on \"hops\" (to find the other machines)"
     open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility" 2>/dev/null || true

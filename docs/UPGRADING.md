@@ -31,11 +31,19 @@ hops uses is in [NETWORK.md](NETWORK.md).
 The 0.12 background service keeps running beside 0.13 until it is
 stopped. The steps are in [service/README.md](../service/README.md#windows).
 
+hops 0.13 no longer writes `%USERPROFILE%\hops\logs`; its logs are in
+`%LOCALAPPDATA%\hops\logs`, and the old folder can be removed. If hops was
+installed with `install.ps1`, run it again first.
+
 ## macOS
 
 Replace hops in Applications with the new version and open it. If the
 background service is still running the older build, the app restarts
 it.
+
+hops 0.13 no longer creates or writes `~/hops/logs`; its logs are in
+`~/Library/Logs/hops`, and the old folder can be removed. If hops was
+installed with `install.sh`, run it again first.
 
 ## Linux
 

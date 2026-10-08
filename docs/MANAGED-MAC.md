@@ -19,9 +19,10 @@ use, and "the Mac" is the managed Mac.
    [Verifying a release](../SECURITY.md#verifying-a-release). The `.tar.gz`
    is not signed; do not use it here.
 2. **Grant Accessibility.** System Settings → Privacy & Security →
-   Accessibility: switch **hops** on. A Mac that is controlled needs it to
-   move the pointer and type; without it the app says Accessibility is
-   missing. Input Monitoring is needed only to read this Mac's own
+   **Accessibility** (called **Device Control and Data Access** on macOS
+   27): switch **hops** on. A Mac that is controlled needs it to move the
+   pointer and type; without it the app says it is missing, by the name
+   this Mac uses. Input Monitoring is needed only to read this Mac's own
    keyboard and mouse, which only a Mac that controls another machine
    does, so a Mac that is only controlled does not need it. If macOS asks
    whether hops may find devices on the local network, allow it.
@@ -76,7 +77,8 @@ It must listen (the default), and let UDP 4722 in from the Mac.
 
 - **macOS.** If the macOS firewall is on, allow hops to accept incoming
   connections. A Mac that controls another machine needs Input
-  Monitoring as well as Accessibility.
+  Monitoring as well as Accessibility (Device Control and Data Access on
+  macOS 27).
 
 The Mac needs to reach UDP 4722 on the controlling machine, outbound. It
 needs nothing inbound.

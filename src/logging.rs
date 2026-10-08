@@ -148,33 +148,13 @@ pub fn file_for(role: &str) -> Option<PathBuf> {
 ///
 /// Per-role rather than one shared file: the daemon and the tray are separate
 /// processes with separate lifetimes, and interleaving them makes both harder
-/// to read. `HOPS_LOG_FILE` overrides it entirely.
+/// to read. `HOPS_LOG_FILE` overrides it entirely. The directory is
+/// [`input_event::paths::log_dir`], which the keystroke log shares.
 fn default_path(role: &str) -> Option<PathBuf> {
     if let Ok(p) = std::env::var("HOPS_LOG_FILE") {
         return Some(PathBuf::from(p));
     }
-    let dir = if cfg!(target_os = "macos") {
-        PathBuf::from(std::env::var("HOME").ok()?)
-            .join("Library")
-            .join("Logs")
-            .join("hops")
-    } else if cfg!(windows) {
-        PathBuf::from(std::env::var("LOCALAPPDATA").ok()?)
-            .join("hops")
-            .join("logs")
-    } else {
-        // $XDG_STATE_HOME is where logs belong on Linux; $HOME/.local/state is
-        // its documented default.
-        std::env::var("XDG_STATE_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                PathBuf::from(std::env::var("HOME").unwrap_or_default())
-                    .join(".local")
-                    .join("state")
-            })
-            .join("hops")
-    };
-    Some(dir.join(format!("{role}.log")))
+    Some(input_event::paths::log_dir()?.join(format!("{role}.log")))
 }
 
 /// Open a log for appending, created readable by this user alone.

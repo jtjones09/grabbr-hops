@@ -8,6 +8,8 @@ repository = "https://github.com/jtjones09/grabbr-hops"
 
 [dependencies]
 futures = "0.3.30"
+# what macOS calls the permissions frontends name (settings_pane)
+input-event = { path = "../input-event", version = "0.4.0", default-features = false }
 getrandom = "0.3"
 log = "0.4.22"
 serde = { version = "1.0", features = ["derive"] }
@@ -33,6 +35,7 @@ windows-sys = { version = "0.61.2", features = [
 ] }
 
 [dev-dependencies]
+input-event = { path = "../input-event", version = "0.4.0", default-features = false, features = ["test-support"] }
 # the IPC auth tests drive a connection over an in-memory duplex
 tokio = { version = "1.32.0", features = ["rt", "macros", "io-util", "time", "test-util"] }
 futures = "0.3.30"

@@ -150,7 +150,7 @@ state other than "connected" is here:
 | compare the number | Pairing is under way and the number is on this screen. Pick the same number on the other machine. |
 | it removed this machine | Remove it here, then pair again. |
 | waiting for its approval | That machine has not approved the pairing or picked its number yet. Open add device on it and finish there. |
-| not accepting input | hops runs there but cannot inject input. It may lack a permission, such as Accessibility on macOS. |
+| not accepting input | hops runs there but cannot inject input. It may lack a permission, such as Accessibility on macOS (called Device Control and Data Access on macOS 27). |
 | paired with an older version: add it again | It was paired by hops 0.12 and is trusted with nothing. Add it again with add device open on both machines, and choose which machine controls which. |
 | unreachable | This machine dialled it and nothing answered. Check that hops runs there and that its firewall lets UDP in on the port hops listens on (4722 unless `port` in `config.toml` says otherwise; `o` in the terminal UI). A machine that cannot accept incoming connections, such as one behind a VPN or security client, is reached over the connection it opens to each machine allowed to control it, which needs this machine's firewall to let UDP in on that port, as in [MANAGED-MAC.md](MANAGED-MAC.md). |
 | waiting for it to dial | That machine opens the connection to this one, and has not yet. Check that hops runs there with this machine switched on, and that this machine's firewall lets UDP in on the port hops listens on. |

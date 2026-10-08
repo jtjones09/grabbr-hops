@@ -58,7 +58,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.grabbr.hops.plist
 ```
 
 macOS input emulation needs a one-time **Accessibility** grant (System Settings →
-Privacy & Security → Accessibility) that can only be given from a logged-in
+Privacy & Security → Accessibility, called **Device Control and Data Access** on
+macOS 27) that can only be given from a logged-in
 session — it can't be pre-granted on a truly headless Mac. Grant it once for the
 hops binary; it persists across reboots as long as the binary keeps a stable
 codesign identity. After re-signing, `launchctl bootout` + `bootstrap` (not

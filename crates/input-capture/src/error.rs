@@ -84,7 +84,7 @@ pub enum Permission {
 impl std::fmt::Display for Permission {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Accessibility => "Accessibility",
+            Self::Accessibility => input_event::settings_pane::accessibility(),
             Self::InputMonitoring => "Input Monitoring",
         })
     }
@@ -246,4 +246,29 @@ pub enum MacosCaptureCreationError {
     #[cfg(target_os = "macos")]
     #[error("failed to get display ids: {0}")]
     ActiveDisplays(CGError),
+}
+
+#[cfg(test)]
+mod a_permission_is_named_as_this_macos_names_it {
+    use super::Permission;
+    use input_event::settings_pane::assume_major;
+
+    // LEDGER T10 | class B | 1 return value: Permission::sentence
+    #[test]
+    fn the_sentence_names_the_list_as_macos_26_and_27_do() {
+        let said = |major| {
+            assume_major(Some(major));
+            let s = Permission::sentence(&[Permission::Accessibility, Permission::InputMonitoring]);
+            assume_major(None);
+            s
+        };
+        assert_eq!(
+            [said(26), said(27)],
+            [
+                "macOS does not grant hops Accessibility and Input Monitoring".to_string(),
+                "macOS does not grant hops Device Control and Data Access and Input Monitoring"
+                    .to_string(),
+            ]
+        );
+    }
 }

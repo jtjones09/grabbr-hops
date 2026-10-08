@@ -1985,7 +1985,7 @@ mod tests {
         assert!(
             screen.contains("emulation: failed")
                 && screen.contains("port: dials out only")
-                && screen.contains("Accessibility"),
+                && screen.contains(hops_ipc::settings_pane::accessibility()),
             "the header must say emulation failed, name what it lacks, and that \
              this machine listens on no port:\n{screen}"
         );

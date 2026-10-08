@@ -65,6 +65,9 @@ windows = { version = "0.61.2", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[dev-dependencies]
+input-event = { path = "../input-event", version = "0.4.0", default-features = false, features = ["test-support"] }
+
 [features]
 default = ["wlroots", "x11", "remote_desktop_portal", "libei"]
 wlroots = [

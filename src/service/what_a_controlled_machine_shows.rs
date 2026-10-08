@@ -61,7 +61,7 @@ fn emulation_refused_its_permission_names_the_permission_and_the_setting() {
             );
             let problem = model.emulation_problem().unwrap_or_default();
             assert!(
-                problem.contains("Accessibility")
+                problem.contains(input_event::settings_pane::accessibility())
                     && problem.contains("System Settings → Privacy & Security"),
                 "the app must name the permission and the way to it: {problem:?}"
             );

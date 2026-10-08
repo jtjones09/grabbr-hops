@@ -240,7 +240,8 @@ fn a_grant_to_a_side_that_stopped_ends_the_daemon_for_launchd_to_start_again() {
         assert!(
             matches!(
                 &ended,
-                Some(Err(ServiceError::PermissionGranted(granted))) if granted == "Accessibility"
+                Some(Err(ServiceError::PermissionGranted(granted)))
+                    if granted == input_event::settings_pane::accessibility()
             ),
             "Accessibility was granted after emulation stopped for want of it, and \
              launchd restarts the daemon only after it fails. The daemon must end with \
@@ -288,7 +289,10 @@ fn a_daemon_started_without_the_permissions_ends_once_they_are_granted() {
             matches!(
                 &ended,
                 Some(Err(ServiceError::PermissionGranted(granted)))
-                    if granted == "Accessibility and Input Monitoring"
+                    if *granted == format!(
+                        "{} and Input Monitoring",
+                        input_event::settings_pane::accessibility()
+                    )
             ),
             "Accessibility and Input Monitoring were granted to a daemon that started \
              without them. It must end with the error that exits 1, so launchd starts \
