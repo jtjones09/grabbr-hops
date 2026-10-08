@@ -1603,10 +1603,11 @@ impl Service {
                     "input emulation fell back to the {name} backend — incoming input \
                      is being DISCARDED"
                 );
+                let pane = input_event::settings_pane::accessibility();
                 self.notify_frontend(FrontendEvent::Error(format!(
                     "This machine cannot inject input (using the \"{name}\" backend), so \
                      nothing a peer sends will do anything. On macOS this is usually a \
-                     missing Accessibility permission for hops."
+                     missing {pane} permission for hops."
                 )));
             }
             EmulationEvent::ConnectionAttempt { fingerprint, addr } => {

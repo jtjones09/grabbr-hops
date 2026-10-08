@@ -94,7 +94,7 @@ pub enum Permission {
 impl std::fmt::Display for Permission {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Accessibility => "Accessibility",
+            Self::Accessibility => input_event::settings_pane::accessibility(),
         })
     }
 }
@@ -216,7 +216,10 @@ pub enum X11EmulationCreationError {
 pub enum MacOSEmulationCreationError {
     #[error("could not create event source")]
     EventSourceCreation,
-    #[error("accessibility permission is required")]
+    #[error(
+        "{} permission is required",
+        input_event::settings_pane::accessibility()
+    )]
     AccessibilityPermission,
     #[error("input control permission is required")]
     InputControlPermission,
@@ -249,7 +252,8 @@ mod a_mac_refused_its_permission {
                 Some(&[Permission::Accessibility][..]),
                 None,
             ),
-            "(no Accessibility, no input control, no event source)"
+            "(no {}, no input control, no event source)",
+            input_event::settings_pane::accessibility()
         );
     }
 }

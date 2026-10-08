@@ -441,7 +441,7 @@ mod a_daemon_ended_for_a_grant_exits_unsuccessfully {
     #[test]
     fn only_a_daemon_that_found_another_of_this_user_exits_0() {
         let granted = daemon_ended(Err(HopsError::Service(ServiceError::PermissionGranted(
-            "Accessibility".into(),
+            input_event::settings_pane::accessibility().into(),
         ))));
         let beside = daemon_ended(Err(HopsError::Service(ServiceError::IpcListen(
             IpcListenerCreationError::AlreadyRunning,

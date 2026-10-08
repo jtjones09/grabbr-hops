@@ -90,7 +90,15 @@ PLIST
     echo
     echo "✅  hops is running (look for the tray icon in your menu bar)."
     echo "⚠️  macOS needs your OK, under System Settings → Privacy & Security:"
-    echo "      Accessibility     → turn on \"hops\" (to move the cursor)"
+    # macOS 27 renamed the Accessibility list
+    # (crates/input-event/src/settings_pane.rs).
+    pane="Accessibility"
+    major="$(sw_vers -productMajorVersion 2>/dev/null || true)"
+    case "$major" in
+      ''|*[!0-9]*) ;;
+      *) if [ "$major" -ge 27 ]; then pane="Device Control and Data Access"; fi ;;
+    esac
+    printf '      %-17s → turn on "hops" (to move the cursor)\n' "$pane"
     echo "      Input Monitoring  → turn on \"hops\" (to control other machines from this one)"
     echo "      Local Network     → turn on \"hops\" (to find the other machines)"
     open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility" 2>/dev/null || true

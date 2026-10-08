@@ -3186,6 +3186,8 @@ mod capture_that_cannot_run {
     #[test]
     fn a_missing_permission_is_named_with_where_to_turn_it_on() {
         let missing = |p: &[Permission]| CaptureState::Failed(CaptureFault::Missing(p.to_vec()));
+        // As this Mac names it: "Device Control and Data Access" from macOS 27.
+        let pane = hops_ipc::settings_pane::accessibility();
         assert_eq!(
             [
                 said(missing(&[Permission::InputMonitoring])),
@@ -3206,13 +3208,12 @@ mod capture_that_cannot_run {
                      System Settings → Privacy & Security → Input Monitoring."
                         .to_string()
                 ),
-                Some(
-                    "Input capture cannot run: macOS does not grant hops Accessibility and \
+                Some(format!(
+                    "Input capture cannot run: macOS does not grant hops {pane} and \
                      Input Monitoring, which this Mac needs to control other machines. Turn \
                      hops on under System Settings → Privacy & Security, in both \
-                     Accessibility and Input Monitoring."
-                        .to_string()
-                ),
+                     {pane} and Input Monitoring."
+                )),
                 Some("Input capture is not running: no backend available".to_string()),
                 None,
                 None,

@@ -2586,7 +2586,8 @@ mod every_pairing_has_a_row {
         let ui = polled_ui(&m, None, Instant::now());
         assert_eq!(ui.emulation, "failed");
         assert!(
-            ui.emulation_problem.contains("Accessibility"),
+            ui.emulation_problem
+                .contains(hops_ipc::settings_pane::accessibility()),
             "{}",
             ui.emulation_problem
         );

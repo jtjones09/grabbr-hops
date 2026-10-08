@@ -2382,6 +2382,7 @@ version = "0.3.0"
 dependencies = [
  "futures",
  "getrandom 0.3.4",
+ "input-event",
  "libc",
  "log",
  "serde",
@@ -3140,6 +3141,7 @@ version = "0.4.0"
 dependencies = [
  "ashpd",
  "futures-core",
+ "libc",
  "log",
  "num_enum",
  "reis",

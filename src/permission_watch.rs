@@ -39,10 +39,10 @@ pub enum Permission {
 }
 
 impl Permission {
-    /// The System Settings list that grants it.
+    /// The System Settings list that grants it, as this Mac names it.
     fn pane(self) -> &'static str {
         match self {
-            Self::Accessibility | Self::PostEvents => "Accessibility",
+            Self::Accessibility | Self::PostEvents => input_event::settings_pane::accessibility(),
             Self::InputMonitoring => "Input Monitoring",
         }
     }
@@ -50,11 +50,10 @@ impl Permission {
 
 impl fmt::Display for Permission {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Accessibility => "Accessibility",
-            Self::InputMonitoring => "Input Monitoring",
-            Self::PostEvents => "Accessibility (to post input)",
-        })
+        match self {
+            Self::Accessibility | Self::InputMonitoring => f.write_str(self.pane()),
+            Self::PostEvents => write!(f, "{} (to post input)", self.pane()),
+        }
     }
 }
 
@@ -519,12 +518,13 @@ mod a_grant_made_while_the_daemon_runs {
     #[test]
     fn what_was_granted_is_named_as_the_settings_that_grant_it() {
         use Permission::{Accessibility, InputMonitoring, PostEvents};
+        let pane = input_event::settings_pane::accessibility();
         for (granted, said) in [
-            (vec![Accessibility], "Accessibility"),
-            (vec![Accessibility, PostEvents], "Accessibility"),
+            (vec![Accessibility], pane.to_string()),
+            (vec![Accessibility, PostEvents], pane.to_string()),
             (
                 vec![Accessibility, InputMonitoring, PostEvents],
-                "Accessibility and Input Monitoring",
+                format!("{pane} and Input Monitoring"),
             ),
         ] {
             assert_eq!(

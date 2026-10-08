@@ -84,7 +84,7 @@ pub enum Permission {
 impl std::fmt::Display for Permission {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Accessibility => "Accessibility",
+            Self::Accessibility => input_event::settings_pane::accessibility(),
             Self::InputMonitoring => "Input Monitoring",
         })
     }

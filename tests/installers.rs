@@ -373,6 +373,19 @@ fn install_in(
     system: &str,
     identities: &[(&str, &str)],
 ) -> (Output, String, Scratch) {
+    install_with(checkout, tag, system, identities, "26")
+}
+
+/// [`install_in`], on a macOS whose major version `sw_vers` reports as
+/// `macos_major`.
+#[cfg(target_os = "linux")]
+fn install_with(
+    checkout: &str,
+    tag: &str,
+    system: &str,
+    identities: &[(&str, &str)],
+    macos_major: &str,
+) -> (Output, String, Scratch) {
     let s = Scratch::new(tag);
     let fakes = s.path().join("fakes");
     let tools = s.path().join("tools");
@@ -397,6 +410,11 @@ fn install_in(
         ],
     );
     stand_in(&fakes, "uname", &format!("echo {system}"));
+    stand_in(
+        &fakes,
+        "sw_vers",
+        &format!("[ \"$1\" = -productMajorVersion ] && echo {macos_major}"),
+    );
     recorder(
         &fakes,
         "cargo",
@@ -618,4 +636,29 @@ fn the_installer_builds_and_signs_what_the_release_ships() {
         !home.join("hops").exists(),
         "the installer created ~/hops, which hops no longer writes to"
     );
+}
+
+/// The installer names the System Settings list that lets hops move the
+/// pointer as the Mac it runs on names it: macOS 27 renamed Accessibility.
+// LEDGER T7 | class B | 5 process stdout: the installer, with sw_vers stood in
+#[cfg(target_os = "linux")]
+#[test]
+fn the_installer_names_the_list_as_this_macos_does() {
+    for (major, pane, not) in [
+        ("26", "Accessibility ", "Device Control"),
+        ("27", "Device Control and Data Access", "Accessibility "),
+    ] {
+        let (out, _calls, _s) =
+            install_with("checkout", &format!("macos-{major}"), "Darwin", &[], major);
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{}", text(&out));
+        let line = said
+            .lines()
+            .find(|l| l.contains("to move the cursor"))
+            .unwrap_or_else(|| panic!("macOS {major}: no line names the list:\n{said}"));
+        assert!(
+            line.contains(pane) && !line.contains(not),
+            "macOS {major} must be told to look under {pane:?}: {line:?}"
+        );
+    }
 }

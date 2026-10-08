@@ -474,10 +474,11 @@ fn guide_to_settings() {
         log::error!("──────────────────────────────────────────────────────────");
         log::error!("hops can't inject input: a macOS permission is missing.");
         log::error!("Enable BOTH for this exact binary, then re-run the launcher:");
-        log::error!("  • Accessibility");
+        let pane = input_event::settings_pane::accessibility();
+        log::error!("  • {pane}");
         log::error!("  • Input Monitoring");
         log::error!("  binary: {exe}");
-        log::error!("Opening System Settings → Privacy & Security → Accessibility…");
+        log::error!("Opening System Settings → Privacy & Security → {pane}…");
         log::error!("──────────────────────────────────────────────────────────");
         if let Ok(mut child) = std::process::Command::new("open")
             .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")

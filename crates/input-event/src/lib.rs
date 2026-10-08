@@ -4,6 +4,7 @@ use std::fmt::{self, Display};
 pub mod error;
 pub mod paths;
 pub mod scancode;
+pub mod settings_pane;
 
 #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]
 mod libei;
