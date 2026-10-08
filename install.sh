@@ -41,7 +41,9 @@ case "$(uname -s)" in
     "$REPO/scripts/macos-app-bundle.sh" "$BIN" "$VERSION" "$APP" "" --sign >/dev/null
     BIN="$APP/Contents/MacOS/hops"
     echo "==> Setting up login agents: background receiver + menu-bar tray…"
-    mkdir -p "$HOME/hops/logs" "$HOME/Library/LaunchAgents"
+    # Where hops itself logs on macOS (crates/input-event/src/paths.rs).
+    logs="$HOME/Library/Logs/hops"
+    mkdir -p "$logs" "$HOME/Library/LaunchAgents"
     uid="$(id -u)"
     # Two agents, mirroring the app model: the daemon (headless) and the tray.
     for kind in daemon gui; do
@@ -74,14 +76,14 @@ case "$(uname -s)" in
   <!-- Lists the job under hops in System Settings → Login Items. -->
   <key>AssociatedBundleIdentifiers</key><array><string>com.grabbr.hops</string></array>
   ${session}
-  <key>StandardOutPath</key><string>${HOME}/hops/logs/${log}</string>
-  <key>StandardErrorPath</key><string>${HOME}/hops/logs/${log}</string>
+  <key>StandardOutPath</key><string>${logs}/${log}</string>
+  <key>StandardErrorPath</key><string>${logs}/${log}</string>
 </dict></plist>
 PLIST
       # launchd creates a missing output file with its own umask, readable
       # by every account. Create it first, readable by this user alone.
-      : >> "$HOME/hops/logs/${log}"
-      chmod 600 "$HOME/hops/logs/${log}"
+      : >> "${logs}/${log}"
+      chmod 600 "${logs}/${log}"
       launchctl bootout "gui/${uid}/${label}" 2>/dev/null || true
       launchctl bootstrap "gui/${uid}" "$plist"
     done

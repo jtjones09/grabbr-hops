@@ -125,7 +125,8 @@ every release feature set — the recording code is not in the binary.
 boolean: `30s`, `10m`, `1h`, capped at one hour. `HOPS_LOG_KEYS=1` reads like
 "on" and is rejected rather than quietly meaning one second.
 
-**Its own file.** `~/hops/logs/keystrokes.log`, mode `0600` on unix. Keystrokes
+**Its own file.** `keystrokes.log`, in the directory in the table above, mode
+`0600` on unix. `HOPS_LOG_FILE` does not move it. Keystrokes
 never enter the general log, so a daemon log stays shareable — you could not
 hand anyone a debug log without handing them your typing.
 

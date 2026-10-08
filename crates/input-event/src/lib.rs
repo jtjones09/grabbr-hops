@@ -2,6 +2,7 @@ pub mod keylog;
 use std::fmt::{self, Display};
 
 pub mod error;
+pub mod paths;
 pub mod scancode;
 
 #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]

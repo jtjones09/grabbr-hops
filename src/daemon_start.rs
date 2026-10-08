@@ -1204,9 +1204,36 @@ fn run_launchctl(args: &[&str]) -> io::Result<LaunchctlRun> {
 #[cfg(all(target_os = "macos", any(feature = "tui", feature = "slint")))]
 fn keep_agent_pointing_here() -> io::Result<AgentFile> {
     let plist = agent_path()?;
-    let logs = home()?.join("hops/logs");
-    let _ = std::fs::create_dir_all(&logs);
-    point_agent_at(&plist, &std::env::current_exe()?, &logs.join("daemon.log"))
+    point_agent_at(&plist, &std::env::current_exe()?, &daemon_output_file()?)
+}
+
+/// Write or repoint this user's launchd plist for the daemon, as the front
+/// door does before it starts the job, without starting anything; the
+/// plist's path. For a test that points `HOME` at a scratch directory.
+#[cfg(all(target_os = "macos", any(feature = "tui", feature = "slint")))]
+pub fn point_launch_agent_here() -> io::Result<PathBuf> {
+    keep_agent_pointing_here().map(|agent| PathBuf::from(agent.path))
+}
+
+/// Where launchd sends the daemon's stdout and stderr: the file the daemon's
+/// own logger writes, as the detached start does elsewhere, with its
+/// directory created. What lands there is what the daemon printed before its
+/// logger started.
+#[cfg_attr(
+    not(all(target_os = "macos", any(feature = "tui", feature = "slint"))),
+    allow(dead_code)
+)]
+fn daemon_output_file() -> io::Result<PathBuf> {
+    let log = crate::logging::file_for("daemon").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "the variable the log directory comes from is not set",
+        )
+    })?;
+    if let Some(dir) = log.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    Ok(log)
 }
 
 /// `$HOME`.
@@ -1404,6 +1431,10 @@ fn fresh_agent(exe: &str, log: &str) -> Plist {
 /// may have set its environment or its log paths. Returns what was wrong with
 /// it, empty when nothing was.
 ///
+/// One log path is changed: output sent to `~/hops/logs`, where hops and its
+/// installer sent it before 0.13, goes to `log`, the daemon's own log. hops
+/// no longer writes to `~/hops`.
+///
 /// The program counts as `exe` when it names the same file, so a link to the
 /// binary is left alone. A path that names no file is always wrong: it is
 /// what launchd is left starting after the app moves.
@@ -1411,7 +1442,7 @@ fn fresh_agent(exe: &str, log: &str) -> Plist {
     not(all(target_os = "macos", any(feature = "tui", feature = "slint"))),
     allow(dead_code)
 )]
-fn repoint(agent: &mut Plist, exe: &Path, exe_text: &str) -> Vec<String> {
+fn repoint(agent: &mut Plist, exe: &Path, exe_text: &str, log: &str) -> Vec<String> {
     use serde_json::{Value, json};
     let mut wrong = Vec::new();
 
@@ -1453,7 +1484,28 @@ fn repoint(agent: &mut Plist, exe: &Path, exe_text: &str) -> Vec<String> {
         apps.push(json!(APP_BUNDLE_ID));
     }
     agent.insert("AssociatedBundleIdentifiers".into(), Value::Array(apps));
+
+    for key in ["StandardOutPath", "StandardErrorPath"] {
+        let Some(old) = agent.get(key).and_then(Value::as_str) else {
+            continue;
+        };
+        if in_retired_log_dir(Path::new(old)) {
+            wrong.push(format!("it sent output to {old}"));
+            agent.insert(key.into(), json!(log));
+        }
+    }
     wrong
+}
+
+/// Whether `file` is in a `hops/logs` directory: `~/hops/logs`, where hops
+/// and its installer sent the daemon's output on macOS before 0.13. The log
+/// directory on macOS is `~/Library/Logs/hops`, which this never matches.
+#[cfg_attr(
+    not(all(target_os = "macos", any(feature = "tui", feature = "slint"))),
+    allow(dead_code)
+)]
+fn in_retired_log_dir(file: &Path) -> bool {
+    file.parent().is_some_and(|dir| dir.ends_with("hops/logs"))
 }
 
 /// Whether `named` names the same file as `exe`: the same path, or one that
@@ -1677,7 +1729,7 @@ fn point_agent_at(path: &Path, exe: &Path, log: &Path) -> io::Result<AgentFile> 
             (written(true), plist)
         }
         OnDisk::Found(mut plist) => {
-            let wrong = repoint(&mut plist, exe, exe_text);
+            let wrong = repoint(&mut plist, exe, exe_text, &log.to_string_lossy());
             if wrong.is_empty() {
                 (written(false), plist)
             } else {
@@ -3978,6 +4030,40 @@ mod the_launch_agent_on_disk {
                 .expect("read")
                 .rewritten,
             "a plist naming hops among other apps reads as out of date"
+        );
+    }
+
+    /// A plist written before 0.13, by hops or its installer, sends the
+    /// daemon's output to `~/hops/logs`. It is sent to the daemon's own log
+    /// instead, so hops writes nothing there.
+    // LEDGER T3 | class B | 4 file on disk, read back with plutil: point_agent_at
+    #[test]
+    fn output_sent_to_home_hops_is_sent_to_the_daemons_log() {
+        let dir = Scratch::new("retired");
+        let exe = dir.exe();
+        let retired = dir.0.join("home/hops/logs/daemon.log");
+        std::fs::write(dir.plist(), v0_12(&exe, &retired)).expect("a v0.12 plist");
+        assert!(
+            point_agent_at(&dir.plist(), &exe, &dir.log())
+                .expect("rewritten")
+                .rewritten
+        );
+        let plist = dir.read();
+        let log = dir.log();
+        let log = log.to_str();
+        assert_eq!(
+            (
+                plist.get("StandardOutPath").and_then(|p| p.as_str()),
+                plist.get("StandardErrorPath").and_then(|p| p.as_str()),
+            ),
+            (log, log),
+            "the daemon's output still goes to ~/hops/logs: {plist:?}"
+        );
+        assert!(
+            !point_agent_at(&dir.plist(), &exe, &dir.log())
+                .expect("read")
+                .rewritten,
+            "a plist sending output to the daemon's log reads as out of date"
         );
     }
 

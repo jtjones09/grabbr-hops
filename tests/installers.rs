@@ -586,12 +586,36 @@ fn the_installer_builds_and_signs_what_the_release_ships() {
     assert!(calls.contains("launchctl [bootstrap]"), "{calls}");
 
     // launchd creates each job's output file with its own umask; the
-    // installer creates them first, readable by this user alone.
-    for log in ["daemon.log", "gui.log"] {
-        let path = s.path().join("home/hops/logs").join(log);
+    // installer creates them first, readable by this user alone, in the
+    // directory hops itself logs to on macOS, and sends each job's output
+    // there.
+    let home = s.path().join("home");
+    let logs = home.join("Library/Logs/hops");
+    for (label, log) in [
+        ("com.grabbr.hops", "daemon.log"),
+        ("com.grabbr.hops.gui", "gui.log"),
+    ] {
+        let path = logs.join(log);
         let mode = std::fs::metadata(&path)
             .map(|m| m.permissions().mode() & 0o777)
-            .unwrap_or_else(|e| panic!("the installer left no {log}: {e}"));
+            .unwrap_or_else(|e| panic!("the installer left no {}: {e}", path.display()));
         assert_eq!(mode, 0o600, "the installer left {log} {mode:o}");
+        let plist =
+            std::fs::read_to_string(home.join(format!("Library/LaunchAgents/{label}.plist")))
+                .unwrap_or_else(|e| panic!("the installer wrote no {label} plist: {e}"));
+        for key in ["StandardOutPath", "StandardErrorPath"] {
+            assert!(
+                plist.contains(&format!(
+                    "<key>{key}</key><string>{}</string>",
+                    path.display()
+                )),
+                "{label} does not send its {key} to {}: {plist}",
+                path.display()
+            );
+        }
     }
+    assert!(
+        !home.join("hops").exists(),
+        "the installer created ~/hops, which hops no longer writes to"
+    );
 }

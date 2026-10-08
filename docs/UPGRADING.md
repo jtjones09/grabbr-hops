@@ -37,6 +37,10 @@ Replace hops in Applications with the new version and open it. If the
 background service is still running the older build, the app restarts
 it.
 
+hops 0.13 no longer creates or writes `~/hops/logs`; its logs are in
+`~/Library/Logs/hops`, and the old folder can be removed. If hops was
+installed with `install.sh`, run it again first.
+
 ## Linux
 
 hops 0.13 names itself `com.grabbr.hops` to the desktop. The input
