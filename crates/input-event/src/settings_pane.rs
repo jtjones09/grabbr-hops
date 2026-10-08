@@ -36,8 +36,27 @@ pub fn major_of(version: &str) -> Option<u32> {
 /// "Accessibility" off macOS, where it is never shown, and when the version
 /// cannot be read.
 pub fn accessibility() -> &'static str {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(major) = ASSUMED.with(std::cell::Cell::get) {
+        return pane_name_for(major);
+    }
     static NAME: OnceLock<&'static str> = OnceLock::new();
     NAME.get_or_init(|| pane_name_for(running_major().unwrap_or(0)))
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static ASSUMED: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Make [`accessibility`] answer, on this thread, as on macOS `major`, or
+/// as on the running Mac again with `None`. For tests, so a test of what a
+/// message says on macOS 27 and on 26 runs the same on any host. Per thread,
+/// since tests run in parallel. Only with the `test-support` feature, which
+/// crates enable for their tests alone, so no shipped build has it.
+#[cfg(any(test, feature = "test-support"))]
+pub fn assume_major(major: Option<u32>) {
+    ASSUMED.with(|assumed| assumed.set(major));
 }
 
 /// The running macOS's major version, from `kern.osproductversion`.
@@ -89,6 +108,16 @@ mod tests {
             ["27.2", "15.7.1", "26", " 28.0\n", "", "x.1"].map(major_of),
             [Some(27), Some(15), Some(26), Some(28), None, None]
         );
+    }
+
+    // LEDGER T8 | class B | 1 return value: accessibility, with assume_major
+    #[test]
+    fn an_assumed_version_names_the_list_on_this_thread() {
+        assume_major(Some(27));
+        assert_eq!(accessibility(), DEVICE_CONTROL);
+        assume_major(Some(26));
+        assert_eq!(accessibility(), ACCESSIBILITY);
+        assume_major(None);
     }
 
     /// The name on this Mac is the one for the version `sw_vers` reports,

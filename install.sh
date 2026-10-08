@@ -93,7 +93,7 @@ PLIST
     # macOS 27 renamed the Accessibility list
     # (crates/input-event/src/settings_pane.rs).
     pane="Accessibility"
-    major="$(sw_vers -productMajorVersion 2>/dev/null || true)"
+    major="$(sw_vers -productVersion 2>/dev/null | cut -d. -f1 || true)"
     case "$major" in
       ''|*[!0-9]*) ;;
       *) if [ "$major" -ge 27 ]; then pane="Device Control and Data Access"; fi ;;

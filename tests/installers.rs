@@ -373,18 +373,18 @@ fn install_in(
     system: &str,
     identities: &[(&str, &str)],
 ) -> (Output, String, Scratch) {
-    install_with(checkout, tag, system, identities, "26")
+    install_with(checkout, tag, system, identities, "26.4")
 }
 
-/// [`install_in`], on a macOS whose major version `sw_vers` reports as
-/// `macos_major`.
+/// [`install_in`], on a macOS whose version `sw_vers -productVersion`
+/// reports as `macos_version`.
 #[cfg(target_os = "linux")]
 fn install_with(
     checkout: &str,
     tag: &str,
     system: &str,
     identities: &[(&str, &str)],
-    macos_major: &str,
+    macos_version: &str,
 ) -> (Output, String, Scratch) {
     let s = Scratch::new(tag);
     let fakes = s.path().join("fakes");
@@ -407,13 +407,23 @@ fn install_with(
         &tools,
         &[
             "bash", "dirname", "grep", "sed", "mkdir", "cat", "rm", "cp", "chmod", "id", "awk",
+            "cut",
         ],
     );
     stand_in(&fakes, "uname", &format!("echo {system}"));
+    // As macOS 27's sw_vers answers: the options it lists, and for any other
+    // its usage on stdout and exit 1. It has no -productMajorVersion.
     stand_in(
         &fakes,
         "sw_vers",
-        &format!("[ \"$1\" = -productMajorVersion ] && echo {macos_major}"),
+        &format!(
+            "case \"$1\" in\n\
+             -productVersion|--productVersion) echo {macos_version} ;;\n\
+             *) echo \"sw_vers: unrecognized option \\`$1'\" >&2\n\
+             echo 'Usage: sw_vers [--help|--productName|--productVersion|--productVersionExtra|--buildVersion]'\n\
+             exit 1 ;;\n\
+             esac"
+        ),
     );
     recorder(
         &fakes,
@@ -644,21 +654,27 @@ fn the_installer_builds_and_signs_what_the_release_ships() {
 #[cfg(target_os = "linux")]
 #[test]
 fn the_installer_names_the_list_as_this_macos_does() {
-    for (major, pane, not) in [
-        ("26", "Accessibility ", "Device Control"),
-        ("27", "Device Control and Data Access", "Accessibility "),
+    for (version, pane, not) in [
+        ("26.4", "Accessibility ", "Device Control"),
+        ("27.2", "Device Control and Data Access", "Accessibility "),
+        ("28.0", "Device Control and Data Access", "Accessibility "),
     ] {
-        let (out, _calls, _s) =
-            install_with("checkout", &format!("macos-{major}"), "Darwin", &[], major);
+        let (out, _calls, _s) = install_with(
+            "checkout",
+            &format!("macos-{version}"),
+            "Darwin",
+            &[],
+            version,
+        );
         let said = String::from_utf8_lossy(&out.stdout);
         assert!(out.status.success(), "{}", text(&out));
         let line = said
             .lines()
             .find(|l| l.contains("to move the cursor"))
-            .unwrap_or_else(|| panic!("macOS {major}: no line names the list:\n{said}"));
+            .unwrap_or_else(|| panic!("macOS {version}: no line names the list:\n{said}"));
         assert!(
             line.contains(pane) && !line.contains(not),
-            "macOS {major} must be told to look under {pane:?}: {line:?}"
+            "macOS {version} must be told to look under {pane:?}: {line:?}"
         );
     }
 }

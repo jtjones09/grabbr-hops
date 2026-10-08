@@ -627,3 +627,41 @@ mod a_grant_made_while_the_daemon_runs {
         );
     }
 }
+
+#[cfg(test)]
+mod a_permission_is_named_as_this_macos_names_it {
+    use super::{AfterGrant, Permission};
+    use input_event::settings_pane::assume_major;
+
+    // LEDGER T12 | class B | 1 return value: AfterGrant::granted, <Permission as Display>::fmt
+    #[test]
+    fn what_was_granted_is_named_as_macos_26_and_27_name_it() {
+        let said = |major| {
+            assume_major(Some(major));
+            let s = (
+                AfterGrant::Exit(vec![
+                    Permission::Accessibility,
+                    Permission::InputMonitoring,
+                    Permission::PostEvents,
+                ])
+                .granted(),
+                Permission::PostEvents.to_string(),
+            );
+            assume_major(None);
+            s
+        };
+        assert_eq!(
+            [said(26), said(27)],
+            [
+                (
+                    "Accessibility and Input Monitoring".to_string(),
+                    "Accessibility (to post input)".to_string()
+                ),
+                (
+                    "Device Control and Data Access and Input Monitoring".to_string(),
+                    "Device Control and Data Access (to post input)".to_string()
+                ),
+            ]
+        );
+    }
+}

@@ -35,6 +35,9 @@ default = ["libei"]
 # so a shipped binary cannot record key content at all — the code is not in it.
 # Enabling it is still not enough: HOPS_LOG_KEYS must name a duration. See #117.
 keylog = []
+# settings_pane::assume_major, for tests in other crates. Only ever named in
+# [dev-dependencies], so no shipped build has it.
+test-support = []
 libei = ["dep:reis"]
 # Names hops to xdg-desktop-portal before the first portal call (#113).
 portal = ["dep:ashpd", "dep:tokio"]

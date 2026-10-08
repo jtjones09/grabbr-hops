@@ -257,3 +257,24 @@ mod a_mac_refused_its_permission {
         );
     }
 }
+
+#[cfg(test)]
+mod a_permission_is_named_as_this_macos_names_it {
+    use super::Permission;
+    use input_event::settings_pane::assume_major;
+
+    // LEDGER T11 | class B | 1 return value: <Permission as Display>::fmt
+    #[test]
+    fn accessibility_is_device_control_and_data_access_from_macos_27() {
+        let said = |major| {
+            assume_major(Some(major));
+            let s = Permission::Accessibility.to_string();
+            assume_major(None);
+            s
+        };
+        assert_eq!(
+            [said(26), said(27)],
+            ["Accessibility", "Device Control and Data Access"]
+        );
+    }
+}

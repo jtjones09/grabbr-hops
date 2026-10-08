@@ -113,7 +113,8 @@ if [ "$SIGN" = "--sign" ]; then
   else
     # Still sealed, so the Info.plist is bound to the bundle.
     echo "warn: no code-signing identity; signing ad hoc. macOS will ask for" \
-      "Accessibility and Input Monitoring again after every rebuild." >&2
+      "Accessibility (Device Control and Data Access on macOS 27) and Input" \
+      "Monitoring again after every rebuild." >&2
     codesign --force --deep --identifier com.grabbr.hops --sign - "$APP" >/dev/null
   fi
 fi

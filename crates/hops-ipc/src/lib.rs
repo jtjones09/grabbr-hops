@@ -2060,3 +2060,36 @@ mod capture_state_on_the_wire {
         );
     }
 }
+
+#[cfg(test)]
+mod a_permission_is_named_as_this_macos_names_it {
+    //! macOS 27 renamed Accessibility. A frontend shows a permission by its
+    //! `Display`, so that is where the name for each macOS is checked, on
+    //! any host.
+    use super::Permission;
+    use input_event::settings_pane::assume_major;
+
+    // LEDGER T9 | class B | 1 return value: <Permission as Display>::fmt
+    #[test]
+    fn accessibility_is_device_control_and_data_access_from_macos_27() {
+        let named = |major| {
+            assume_major(Some(major));
+            let said = (
+                Permission::Accessibility.to_string(),
+                Permission::InputMonitoring.to_string(),
+            );
+            assume_major(None);
+            said
+        };
+        assert_eq!(
+            [named(26), named(27)],
+            [
+                ("Accessibility".into(), "Input Monitoring".into()),
+                (
+                    "Device Control and Data Access".into(),
+                    "Input Monitoring".into()
+                ),
+            ]
+        );
+    }
+}
