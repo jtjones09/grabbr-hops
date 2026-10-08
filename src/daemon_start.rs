@@ -1204,7 +1204,13 @@ fn run_launchctl(args: &[&str]) -> io::Result<LaunchctlRun> {
 #[cfg(all(target_os = "macos", any(feature = "tui", feature = "slint")))]
 fn keep_agent_pointing_here() -> io::Result<AgentFile> {
     let plist = agent_path()?;
-    point_agent_at(&plist, &std::env::current_exe()?, &daemon_output_file()?)
+    let retired = home()?.join("hops").join("logs");
+    point_agent_at(
+        &plist,
+        &std::env::current_exe()?,
+        &daemon_output_file()?,
+        &retired,
+    )
 }
 
 /// Write or repoint this user's launchd plist for the daemon, as the front
@@ -1215,25 +1221,27 @@ pub fn point_launch_agent_here() -> io::Result<PathBuf> {
     keep_agent_pointing_here().map(|agent| PathBuf::from(agent.path))
 }
 
-/// Where launchd sends the daemon's stdout and stderr: the file the daemon's
-/// own logger writes, as the detached start does elsewhere, with its
-/// directory created. What lands there is what the daemon printed before its
-/// logger started.
+/// Where launchd sends the daemon's stdout and stderr: `daemon.log` in the
+/// log directory, the file a launchd-started daemon's own logger writes, with
+/// its directory created. What lands there is what the daemon printed before
+/// its logger started.
+///
+/// Not `logging::file_for`: that honours `HOPS_LOG_FILE` in the environment
+/// of the app writing the plist, which launchd's daemon does not have, and
+/// which may be a relative path.
 #[cfg_attr(
     not(all(target_os = "macos", any(feature = "tui", feature = "slint"))),
     allow(dead_code)
 )]
 fn daemon_output_file() -> io::Result<PathBuf> {
-    let log = crate::logging::file_for("daemon").ok_or_else(|| {
+    let dir = input_event::paths::log_dir().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "the variable the log directory comes from is not set",
         )
     })?;
-    if let Some(dir) = log.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    Ok(log)
+    let _ = std::fs::create_dir_all(&dir);
+    Ok(dir.join("daemon.log"))
 }
 
 /// `$HOME`.
@@ -1431,9 +1439,10 @@ fn fresh_agent(exe: &str, log: &str) -> Plist {
 /// may have set its environment or its log paths. Returns what was wrong with
 /// it, empty when nothing was.
 ///
-/// One log path is changed: output sent to `~/hops/logs`, where hops and its
-/// installer sent it before 0.13, goes to `log`, the daemon's own log. hops
-/// no longer writes to `~/hops`.
+/// One log path is changed: output sent to a file in `retired`, which is
+/// `$HOME/hops/logs`, where hops and its installer sent it before 0.13, goes
+/// to `log`, the daemon's own log. hops no longer writes to `~/hops`. Any
+/// other `hops/logs` directory is someone else's choice and is kept.
 ///
 /// The program counts as `exe` when it names the same file, so a link to the
 /// binary is left alone. A path that names no file is always wrong: it is
@@ -1442,7 +1451,13 @@ fn fresh_agent(exe: &str, log: &str) -> Plist {
     not(all(target_os = "macos", any(feature = "tui", feature = "slint"))),
     allow(dead_code)
 )]
-fn repoint(agent: &mut Plist, exe: &Path, exe_text: &str, log: &str) -> Vec<String> {
+fn repoint(
+    agent: &mut Plist,
+    exe: &Path,
+    exe_text: &str,
+    log: &str,
+    retired: &Path,
+) -> Vec<String> {
     use serde_json::{Value, json};
     let mut wrong = Vec::new();
 
@@ -1489,23 +1504,12 @@ fn repoint(agent: &mut Plist, exe: &Path, exe_text: &str, log: &str) -> Vec<Stri
         let Some(old) = agent.get(key).and_then(Value::as_str) else {
             continue;
         };
-        if in_retired_log_dir(Path::new(old)) {
+        if Path::new(old).parent() == Some(retired) {
             wrong.push(format!("it sent output to {old}"));
             agent.insert(key.into(), json!(log));
         }
     }
     wrong
-}
-
-/// Whether `file` is in a `hops/logs` directory: `~/hops/logs`, where hops
-/// and its installer sent the daemon's output on macOS before 0.13. The log
-/// directory on macOS is `~/Library/Logs/hops`, which this never matches.
-#[cfg_attr(
-    not(all(target_os = "macos", any(feature = "tui", feature = "slint"))),
-    allow(dead_code)
-)]
-fn in_retired_log_dir(file: &Path) -> bool {
-    file.parent().is_some_and(|dir| dir.ends_with("hops/logs"))
 }
 
 /// Whether `named` names the same file as `exe`: the same path, or one that
@@ -1684,12 +1688,13 @@ fn mounted_read_only(path: &Path) -> bool {
 
 /// Make the plist at `path` run `exe` as the daemon: write it when it is
 /// missing or unreadable, change it when it runs another binary or would not
-/// be restarted after a failure, and leave it alone otherwise.
+/// be restarted after a failure, and leave it alone otherwise. Output sent to
+/// `retired` (`$HOME/hops/logs`) is sent to `log` instead (see [`repoint`]).
 #[cfg_attr(
     not(all(target_os = "macos", any(feature = "tui", feature = "slint"))),
     allow(dead_code)
 )]
-fn point_agent_at(path: &Path, exe: &Path, log: &Path) -> io::Result<AgentFile> {
+fn point_agent_at(path: &Path, exe: &Path, log: &Path, retired: &Path) -> io::Result<AgentFile> {
     if let Some(place) = not_installed(exe) {
         log::warn!(
             "not pointing {} at {}, which is on {place}",
@@ -1729,7 +1734,7 @@ fn point_agent_at(path: &Path, exe: &Path, log: &Path) -> io::Result<AgentFile> 
             (written(true), plist)
         }
         OnDisk::Found(mut plist) => {
-            let wrong = repoint(&mut plist, exe, exe_text, &log.to_string_lossy());
+            let wrong = repoint(&mut plist, exe, exe_text, &log.to_string_lossy(), retired);
             if wrong.is_empty() {
                 (written(false), plist)
             } else {
@@ -3861,6 +3866,10 @@ mod the_launch_agent_on_disk {
         fn log(&self) -> PathBuf {
             self.0.join("daemon.log")
         }
+        /// `$HOME/hops/logs`, for a home at `home` in the scratch directory.
+        fn retired(&self) -> PathBuf {
+            self.0.join("home").join("hops").join("logs")
+        }
         fn read(&self) -> serde_json::Map<String, serde_json::Value> {
             match read_agent(&self.plist()).expect("readable") {
                 OnDisk::Found(plist) => plist,
@@ -3883,9 +3892,10 @@ mod the_launch_agent_on_disk {
         let exe = dir.exe();
 
         // Missing: written, and what is written is current.
-        let first = point_agent_at(&dir.plist(), &exe, &dir.log()).expect("written");
+        let first =
+            point_agent_at(&dir.plist(), &exe, &dir.log(), &dir.retired()).expect("written");
         assert!(first.rewritten, "a missing plist was not written");
-        let again = point_agent_at(&dir.plist(), &exe, &dir.log()).expect("read");
+        let again = point_agent_at(&dir.plist(), &exe, &dir.log(), &dir.retired()).expect("read");
         assert!(
             !again.rewritten,
             "the plist this build writes reads as out of date: {:?}",
@@ -3896,7 +3906,7 @@ mod the_launch_agent_on_disk {
         // never restarts a daemon that crashed.
         std::fs::write(dir.plist(), v0_12(&exe, &dir.log())).expect("a v0.12 plist");
         assert!(
-            point_agent_at(&dir.plist(), &exe, &dir.log())
+            point_agent_at(&dir.plist(), &exe, &dir.log(), &dir.retired())
                 .expect("rewritten")
                 .rewritten,
             "a v0.12 plist, `KeepAlive` false, was left as it was"
@@ -3912,7 +3922,7 @@ mod the_launch_agent_on_disk {
         let gone = dir.0.join("old.app/hops");
         std::fs::write(dir.plist(), v0_12(&gone, &dir.log())).expect("a v0.12 plist");
         assert!(
-            point_agent_at(&dir.plist(), &exe, &dir.log())
+            point_agent_at(&dir.plist(), &exe, &dir.log(), &dir.retired())
                 .expect("rewritten")
                 .rewritten,
             "a plist naming a binary that is no longer there was left as it was, so \
@@ -3927,7 +3937,7 @@ mod the_launch_agent_on_disk {
             Some(LAUNCHD_LABEL)
         );
         assert!(
-            !point_agent_at(&dir.plist(), &exe, &dir.log())
+            !point_agent_at(&dir.plist(), &exe, &dir.log(), &dir.retired())
                 .expect("read")
                 .rewritten,
             "a repointed plist still reads as out of date"
@@ -3946,7 +3956,7 @@ mod the_launch_agent_on_disk {
         );
         super::write_agent(&dir.plist(), &plist).expect("written");
         assert!(
-            point_agent_at(&dir.plist(), &exe, &dir.log())
+            point_agent_at(&dir.plist(), &exe, &dir.log(), &dir.retired())
                 .expect("rewritten")
                 .rewritten,
             "a plist naming another copy of hops was left as it was, so launchd \
@@ -3968,7 +3978,7 @@ mod the_launch_agent_on_disk {
         );
         super::write_agent(&dir.plist(), &plist).expect("written");
         assert!(
-            !point_agent_at(&dir.plist(), &exe, &dir.log())
+            !point_agent_at(&dir.plist(), &exe, &dir.log(), &dir.retired())
                 .expect("read")
                 .rewritten,
             "a plist naming a link to this binary was rewritten"
@@ -3986,7 +3996,7 @@ mod the_launch_agent_on_disk {
         let dir = Scratch::new("bundle");
         let exe = dir.exe();
 
-        point_agent_at(&dir.plist(), &exe, &dir.log()).expect("written");
+        point_agent_at(&dir.plist(), &exe, &dir.log(), &dir.retired()).expect("written");
         assert_eq!(
             dir.read().get("AssociatedBundleIdentifiers"),
             Some(&json!(["com.grabbr.hops"])),
@@ -3999,7 +4009,7 @@ mod the_launch_agent_on_disk {
         plist.remove("AssociatedBundleIdentifiers");
         super::write_agent(&dir.plist(), &plist).expect("written");
         assert!(
-            point_agent_at(&dir.plist(), &exe, &dir.log())
+            point_agent_at(&dir.plist(), &exe, &dir.log(), &dir.retired())
                 .expect("rewritten")
                 .rewritten,
             "a plist that names no app was left as it was"
@@ -4017,7 +4027,7 @@ mod the_launch_agent_on_disk {
         );
         super::write_agent(&dir.plist(), &plist).expect("written");
         assert!(
-            point_agent_at(&dir.plist(), &exe, &dir.log())
+            point_agent_at(&dir.plist(), &exe, &dir.log(), &dir.retired())
                 .expect("rewritten")
                 .rewritten
         );
@@ -4026,7 +4036,7 @@ mod the_launch_agent_on_disk {
             Some(&json!(["org.example.other", "com.grabbr.hops"]))
         );
         assert!(
-            !point_agent_at(&dir.plist(), &exe, &dir.log())
+            !point_agent_at(&dir.plist(), &exe, &dir.log(), &dir.retired())
                 .expect("read")
                 .rewritten,
             "a plist naming hops among other apps reads as out of date"
@@ -4044,7 +4054,7 @@ mod the_launch_agent_on_disk {
         let retired = dir.0.join("home/hops/logs/daemon.log");
         std::fs::write(dir.plist(), v0_12(&exe, &retired)).expect("a v0.12 plist");
         assert!(
-            point_agent_at(&dir.plist(), &exe, &dir.log())
+            point_agent_at(&dir.plist(), &exe, &dir.log(), &dir.retired())
                 .expect("rewritten")
                 .rewritten
         );
@@ -4060,11 +4070,43 @@ mod the_launch_agent_on_disk {
             "the daemon's output still goes to ~/hops/logs: {plist:?}"
         );
         assert!(
-            !point_agent_at(&dir.plist(), &exe, &dir.log())
+            !point_agent_at(&dir.plist(), &exe, &dir.log(), &dir.retired())
                 .expect("read")
                 .rewritten,
             "a plist sending output to the daemon's log reads as out of date"
         );
+
+        // Only `$HOME/hops/logs` is retired. Another `hops/logs` directory,
+        // relative or not, and the home of a user named `hops`, are kept.
+        let home_named_hops = Path::new("/Users/hops/hops/logs");
+        for (kept, retired) in [
+            ("/opt/hops/logs/daemon.log".into(), dir.retired()),
+            (
+                dir.0.join("home/src/hops/logs/x.log").display().to_string(),
+                dir.retired(),
+            ),
+            ("hops/logs/daemon.log".into(), dir.retired()),
+            (
+                "/Users/hops/logs/daemon.log".into(),
+                home_named_hops.to_path_buf(),
+            ),
+        ] {
+            let mut plist = dir.read();
+            for key in ["StandardOutPath", "StandardErrorPath"] {
+                plist.insert(key.into(), serde_json::json!(kept));
+            }
+            super::write_agent(&dir.plist(), &plist).expect("written");
+            assert!(
+                !point_agent_at(&dir.plist(), &exe, &dir.log(), &retired)
+                    .expect("read")
+                    .rewritten,
+                "{kept} is not $HOME/hops/logs, yet the plist was rewritten"
+            );
+            assert_eq!(
+                dir.read().get("StandardOutPath").and_then(|p| p.as_str()),
+                Some(kept.as_str())
+            );
+        }
     }
 
     /// The dev launcher and the installer write their own plists, with an
@@ -4096,7 +4138,7 @@ mod the_launch_agent_on_disk {
         )
         .expect("a launcher's plist");
         assert!(
-            point_agent_at(&dir.plist(), &exe, &dir.log())
+            point_agent_at(&dir.plist(), &exe, &dir.log(), &dir.retired())
                 .expect("rewritten")
                 .rewritten
         );
@@ -4118,7 +4160,7 @@ mod the_launch_agent_on_disk {
         // And a file that is not a plist at all is replaced by a whole one.
         std::fs::write(dir.plist(), b"not a plist {").expect("junk");
         assert!(
-            point_agent_at(&dir.plist(), &exe, &dir.log())
+            point_agent_at(&dir.plist(), &exe, &dir.log(), &dir.retired())
                 .expect("rewritten")
                 .rewritten
         );
@@ -4146,12 +4188,12 @@ mod the_launch_agent_on_disk {
         let exe = dir.exe();
 
         // A new agent: the file is there before launchd opens it.
-        point_agent_at(&dir.plist(), &exe, &dir.log()).expect("written");
+        point_agent_at(&dir.plist(), &exe, &dir.log(), &dir.retired()).expect("written");
         assert_eq!(mode(&dir.log()), 0o600, "a new output file was left open");
 
         // A current agent, with the file an earlier start left readable.
         std::fs::set_permissions(dir.log(), std::fs::Permissions::from_mode(0o644)).expect("chmod");
-        let again = point_agent_at(&dir.plist(), &exe, &dir.log()).expect("read");
+        let again = point_agent_at(&dir.plist(), &exe, &dir.log(), &dir.retired()).expect("read");
         assert!(!again.rewritten, "{:?}", dir.read());
         assert_eq!(
             mode(&dir.log()),
@@ -4189,7 +4231,7 @@ mod a_launch_agent_is_never_pointed_at_a_disk_image {
             let exe = PathBuf::from(exe);
 
             let _ = std::fs::remove_file(&plist);
-            let refused = point_agent_at(&plist, &exe, &log)
+            let refused = point_agent_at(&plist, &exe, &log, &dir.join("hops/logs"))
                 .expect_err("a LaunchAgent was pointed at a disk image");
             let why = refused.to_string();
             assert!(
@@ -4200,7 +4242,7 @@ mod a_launch_agent_is_never_pointed_at_a_disk_image {
 
             // The agent of the copy in Applications stays as it was.
             std::fs::write(&plist, installed).expect("an installed plist");
-            assert!(point_agent_at(&plist, &exe, &log).is_err());
+            assert!(point_agent_at(&plist, &exe, &log, &dir.join("hops/logs")).is_err());
             assert_eq!(
                 std::fs::read(&plist).expect("read"),
                 installed,
@@ -4272,7 +4314,12 @@ mod a_launch_agent_is_never_pointed_at_a_disk_image {
         let through = link.join(real.strip_prefix("/").expect("an absolute path"));
         let plist = dir.join("com.grabbr.hops.plist");
 
-        let pointed = point_agent_at(&plist, &through, &dir.join("daemon.log"));
+        let pointed = point_agent_at(
+            &plist,
+            &through,
+            &dir.join("daemon.log"),
+            &dir.join("hops/logs"),
+        );
         assert!(
             pointed.is_ok() && plist.exists(),
             "{} is on the startup disk, and was refused: {pointed:?}",

@@ -126,7 +126,9 @@ boolean: `30s`, `10m`, `1h`, capped at one hour. `HOPS_LOG_KEYS=1` reads like
 "on" and is rejected rather than quietly meaning one second.
 
 **Its own file.** `keystrokes.log`, in the directory in the table above, mode
-`0600` on unix. `HOPS_LOG_FILE` does not move it. Keystrokes
+`0600` on unix. `HOPS_LOG_FILE` does not move it. It sits beside the other
+logs, so leave `keystrokes.log` out when attaching the log folder to a report:
+it must never be shared. Keystrokes
 never enter the general log, so a daemon log stays shareable — you could not
 hand anyone a debug log without handing them your typing.
 

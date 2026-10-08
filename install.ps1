@@ -31,14 +31,16 @@ Pop-Location
 if (-not (Test-Path $bin)) { throw "build did not produce $bin" }
 
 $work = Join-Path $env:USERPROFILE 'hops'
-New-Item -ItemType Directory -Force -Path (Join-Path $work 'logs') | Out-Null
+New-Item -ItemType Directory -Force -Path $work | Out-Null
 
-# Daemon: a .cmd sets the log + runs it; a .vbs launches that .cmd hidden (no
-# console flash). Tray: a .vbs launches `hops gui --hidden`.
+# Daemon: a .cmd sets the log level + runs it; a .vbs launches that .cmd hidden
+# (no console flash). Tray: a .vbs launches `hops gui --hidden`. hops opens its
+# own log (%LOCALAPPDATA%\hops\logs), capped and rotated, so its output is not
+# redirected anywhere.
 Set-Content -Encoding ASCII (Join-Path $work 'hops-daemon.cmd') @"
 @echo off
 set "HOPS_LOG_LEVEL=info"
-"$bin" daemon >> "%USERPROFILE%\hops\logs\daemon.log" 2>&1
+"$bin" daemon
 "@
 Set-Content -Encoding ASCII (Join-Path $work 'hops-daemon.vbs') @"
 Set s = CreateObject("WScript.Shell")

@@ -60,6 +60,10 @@ fn every_log_lands_in_the_platform_log_directory_and_none_in_home_hops() {
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::remove_file(&expected);
+        // The app's own HOPS_LOG_FILE is not the daemon's: launchd starts
+        // the daemon without it, so the daemon logs to the directory.
+        // SAFETY: the only test in this binary; the logger is already open.
+        unsafe { std::env::set_var("HOPS_LOG_FILE", scratch.0.join("app.log")) };
         let plist = hops::daemon_start::point_launch_agent_here().expect("a plist");
         assert!(plist.starts_with(&home), "{}", plist.display());
         let out = std::process::Command::new("plutil")
