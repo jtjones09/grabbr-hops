@@ -65,7 +65,7 @@ you want to share the keyboard & mouse across.
 Each archive also holds `LICENSE`, `THIRD-PARTY-NOTICES.txt` and an SBOM. To check a download, see [Verifying a release](SECURITY.md#verifying-a-release).
 
 First-launch notes:
-- **macOS** — the `.dmg` is **signed & notarized by Apple**, so it opens with no Gatekeeper warning. On first run, switch **hops** on under System Settings → Privacy & Security, in **Accessibility** (called **Device Control and Data Access** on macOS 27; to move the cursor), **Input Monitoring** (to control other machines from this Mac; hops asks when you turn input on) and **Local Network** (to find your other machines). *(The bare `.tar.gz` CLI binary is unsigned — right-click it → **Open** the first time.)*
+- **macOS** — the `.dmg` is **signed & notarized by Apple**, so it opens with no Gatekeeper warning. On first run, switch **hops** on under System Settings → Privacy & Security, in **Accessibility** (called **Device Control and Data Access** on macOS 27; to move the cursor), **Input Monitoring** (to control other machines from this Mac; hops asks when you turn input on) and **Local Network** (to find your other machines). Keep **hops** switched on under System Settings → General → **Login Items & Extensions** → **Allow in the Background**, so it starts when you log in. *(The bare `.tar.gz` CLI binary is unsigned — right-click it → **Open** the first time.)*
 - **Windows** — not code-signed yet, so SmartScreen shows a **one-time** warning: click **More info → Run anyway**, and allow it on your **private** network if the firewall asks.
 
 <details>
