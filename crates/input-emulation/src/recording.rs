@@ -45,6 +45,8 @@ struct Log {
     /// Creating a backend fails as a system withholding its permission
     /// does.
     refused: bool,
+    /// Needs Accessibility while it runs, as the macOS backend does.
+    as_mac: bool,
 }
 
 type Shared = Arc<Mutex<Log>>;
@@ -80,6 +82,7 @@ impl Recording {
             button_scope,
             consume_takes: None,
             refused: false,
+            as_mac: false,
         }));
         REGISTRY
             .lock()
@@ -104,6 +107,12 @@ impl Recording {
     /// waiting on a real device.
     pub fn consume_takes(&self, how_long: std::time::Duration) {
         self.log.lock().expect("recording log").consume_takes = Some(how_long);
+    }
+
+    /// Make every backend created from this one need Accessibility while
+    /// it runs, as the macOS backend does.
+    pub fn needs_accessibility(&self) {
+        self.log.lock().expect("recording log").as_mac = true;
     }
 
     /// Make creating a backend fail as it does on a Mac that has not
@@ -199,5 +208,13 @@ impl Emulation for RecordingEmulation {
 
     fn button_scope(&self) -> ButtonScope {
         self.log.lock().expect("recording log").button_scope
+    }
+
+    fn needs(&self) -> &'static [crate::error::Permission] {
+        if self.log.lock().expect("recording log").as_mac {
+            &[crate::error::Permission::Accessibility]
+        } else {
+            &[]
+        }
     }
 }

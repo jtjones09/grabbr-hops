@@ -79,10 +79,12 @@ impl System {
     }
 }
 
-/// The scratch directory, removed with it.
+/// The scratch directory, removed with it, and the recording an emulation
+/// stand-in writes to, kept for as long as the daemon runs.
 struct Scratch {
     dir: PathBuf,
     endpoint: DaemonEndpoint,
+    _recording: Option<input_emulation::recording::Recording>,
 }
 
 impl Drop for Scratch {
@@ -99,20 +101,40 @@ enum Backends {
     /// Ones that fail as they are created, as the macOS ones do while a
     /// permission is missing: neither side ever says it started or stopped.
     NeverCreated,
+    /// Dummy capture, and emulation that needs Accessibility while it runs,
+    /// as the macOS backend does.
+    MacEmulation,
 }
 
 impl Backends {
-    fn chosen(self) -> (input_capture::Backend, input_emulation::Backend) {
+    fn chosen(
+        self,
+    ) -> (
+        input_capture::Backend,
+        input_emulation::Backend,
+        Option<input_emulation::recording::Recording>,
+    ) {
         match self {
             Self::Dummy => (
                 input_capture::Backend::Dummy,
                 input_emulation::Backend::Dummy,
+                None,
             ),
             // Each names a script that is gone by the time it is created.
             Self::NeverCreated => (
                 input_capture::scripted::Script::new().backend(),
                 input_emulation::recording::Recording::new().backend(),
+                None,
             ),
+            Self::MacEmulation => {
+                let recording = input_emulation::recording::Recording::new();
+                recording.needs_accessibility();
+                (
+                    input_capture::Backend::Dummy,
+                    recording.backend(),
+                    Some(recording),
+                )
+            }
         }
     }
 }
@@ -136,16 +158,17 @@ async fn daemon(
     )
     .expect("a config");
     let endpoint = DaemonEndpoint::Unix(dir.join("s.sock"));
+    let (capture, emulation, recording) = backends.chosen();
     let scratch = Scratch {
         dir: dir.clone(),
         endpoint: endpoint.clone(),
+        _recording: recording,
     };
     let frontends = AsyncFrontendListener::at_with_token_file(&endpoint, &dir.join("ipc-token"))
         .await
         .expect("the scratch endpoint");
     let config = crate::config::Config::in_scratch(&config, &dir.join("hops.pem"))
         .expect("the scratch config");
-    let (capture, emulation) = backends.chosen();
     let mut service = Service::with_backends(config, frontends, Some(capture), Some(emulation))
         .await
         .expect("a daemon in the scratch directory");
@@ -226,6 +249,18 @@ impl Frontend {
             }
         }
         None
+    }
+
+    /// Whether it is told emulation runs before the daemon hangs up.
+    async fn emulation_enabled(&mut self) -> bool {
+        while let Ok(Some(line)) = self.lines.next_line().await {
+            if let Ok(FrontendEvent::EmulationStatus(EmulationState::Enabled)) =
+                serde_json::from_str(&line)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// The next error notice it is sent; `None` once the daemon hangs up.
@@ -380,7 +415,7 @@ fn a_grant_to_a_daemon_launchd_does_not_restart_is_told_and_the_daemon_runs_on()
 fn sides_that_run_are_watched_only_for_what_they_would_lose() {
     run_local(async {
         let system = System::new(&[Permission::InputMonitoring, Permission::PostEvents]);
-        let (mut service, _scratch) = daemon("runs", &system, true, Backends::Dummy).await;
+        let (mut service, _scratch) = daemon("runs", &system, true, Backends::MacEmulation).await;
         until_both_run(&mut service).await;
 
         let granter = async {
@@ -424,7 +459,7 @@ fn sides_that_run_are_watched_only_for_what_they_would_lose() {
 fn accessibility_switched_off_while_emulation_runs_reaches_the_app_and_its_grant_restarts() {
     run_local(async {
         let system = System::new(&[]);
-        let (mut service, scratch) = daemon("revoke", &system, true, Backends::Dummy).await;
+        let (mut service, scratch) = daemon("revoke", &system, true, Backends::MacEmulation).await;
         until_both_run(&mut service).await;
 
         let told = RefCell::new(None);
@@ -461,6 +496,76 @@ fn accessibility_switched_off_while_emulation_runs_reaches_the_app_and_its_grant
             "Accessibility was switched on again; the daemon must end with the error \
              that exits 1, so launchd starts it with the grant. It ended with \
              {ended:?} (None: it did not end)."
+        );
+    });
+}
+
+/// Emulation through `dummy`, chosen on purpose, needs no permission and
+/// posts nothing, so a refused probe must not stop it: it starts and stays
+/// running on a Mac that does not grant hops Accessibility.
+// LEDGER T2438 | class B | 6 Service::emulation_status + 2 what a frontend is told over the real IPC socket
+#[test]
+fn dummy_emulation_keeps_running_without_accessibility() {
+    run_local(async {
+        let system = System::new(&[Permission::Accessibility, Permission::PostEvents]);
+        let (mut service, scratch) = daemon("dummy", &system, true, Backends::Dummy).await;
+        until_both_run(&mut service).await;
+
+        let failed = RefCell::new(None);
+        let watched = async {
+            let mut frontend = Frontend::connect(&scratch).await;
+            *failed.borrow_mut() = frontend.emulation_failed().await;
+        };
+        let ended = tokio::select! {
+            ended = service.run() => Some(ended),
+            _ = watched => None,
+            _ = tokio::time::sleep(NOTHING_FOR) => None,
+        };
+        let running = service.emulation_status.is_enabled();
+        if ended.is_none() {
+            shut_down(service).await;
+        }
+        assert_eq!(
+            (ended.is_some(), running, failed.into_inner()),
+            (false, true, None),
+            "(the daemon ended, emulation still runs, the failure the app was told) \
+             for dummy emulation on a Mac without Accessibility. Ended with {ended:?}."
+        );
+    });
+}
+
+/// Accessibility switched back on, and launchd did not start this daemon:
+/// emulation, which stopped for want of it, starts again in this process,
+/// as "enable input" would start it.
+// LEDGER T2439 | class B | 2 EmulationStatus over the real IPC socket + 1 Service::run still running
+#[test]
+fn a_grant_to_a_daemon_launchd_does_not_restart_starts_emulation_again() {
+    run_local(async {
+        let system = System::new(&[]);
+        let (mut service, scratch) = daemon("again", &system, false, Backends::MacEmulation).await;
+        until_both_run(&mut service).await;
+
+        let script = async {
+            let mut frontend = Frontend::connect(&scratch).await;
+            system.asked_at_least(2).await;
+            system.deny(Permission::Accessibility);
+            let failed = frontend.emulation_failed().await;
+            system.grant_all();
+            (failed, frontend.emulation_enabled().await)
+        };
+        let (failed, enabled) = tokio::select! {
+            ended = service.run() => panic!(
+                "the daemon ended ({ended:?}) although nothing would start it again"
+            ),
+            seen = script => seen,
+            _ = tokio::time::sleep(DEADLINE) => (None, false),
+        };
+        shut_down(service).await;
+        assert_eq!(
+            (failed.is_some(), enabled),
+            (true, true),
+            "(emulation was stopped for want of Accessibility, it ran again once \
+             granted) in a daemon launchd does not restart"
         );
     });
 }

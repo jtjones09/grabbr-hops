@@ -28,6 +28,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use input_event::accessibility::REFUSALS_BEFORE_REVOKED;
 use tokio::task::JoinHandle;
 use tokio::time::{Interval, MissedTickBehavior};
 
@@ -169,13 +170,15 @@ pub struct PermissionWatch {
     /// missing: `None` until a check has run since it stopped. A side found
     /// missing nothing stopped for another reason, and is not watched.
     waiting: BTreeMap<Side, Option<BTreeSet<Permission>>>,
-    /// Sides that run, each watched for [`Side::watched_while_running`].
-    running: BTreeSet<Side>,
+    /// Sides that run through a backend that needs a permission, each
+    /// watched for [`Side::watched_while_running`], with how many checks
+    /// in a row have found one gone.
+    running: BTreeMap<Side, u32>,
     /// What a check found and the daemon has not yet been handed.
     found: VecDeque<Change>,
     ticks: Option<Interval>,
     /// A check running off the loop, kept across a `select!` that drops
-    /// [`Self::granted`] before it resolves.
+    /// [`Self::changed`] before it resolves.
     pending: Option<JoinHandle<Checked>>,
     /// Whether this system has such permissions at all.
     enabled: bool,
@@ -193,7 +196,7 @@ impl PermissionWatch {
             restarts,
             every,
             waiting: BTreeMap::new(),
-            running: BTreeSet::new(),
+            running: BTreeMap::new(),
             found: VecDeque::new(),
             ticks: None,
             pending: None,
@@ -241,11 +244,14 @@ impl PermissionWatch {
         }
     }
 
-    /// `side` is running: watch it for what it would lose.
-    pub fn started(&mut self, side: Side) {
+    /// `side` is running. Through a backend that `needs_permissions`, it
+    /// is watched for what it would lose; one that needs none, such as
+    /// `dummy` chosen on purpose, has nothing to lose and is not watched.
+    pub fn started(&mut self, side: Side, needs_permissions: bool) {
         self.waiting.remove(&side);
-        if self.enabled {
-            self.running.insert(side);
+        self.running.remove(&side);
+        if self.enabled && needs_permissions {
+            self.running.insert(side, 0);
         }
         if !self.watching() {
             self.pending = None;
@@ -257,7 +263,7 @@ impl PermissionWatch {
         !self.waiting.is_empty()
             || self
                 .running
-                .iter()
+                .keys()
                 .any(|side| !side.watched_while_running().is_empty())
     }
 
@@ -291,7 +297,7 @@ impl PermissionWatch {
                     .flat_map(|side| side.needs().iter().copied())
                     .chain(
                         self.running
-                            .iter()
+                            .keys()
                             .flat_map(|side| side.watched_while_running().iter().copied()),
                     )
                     .collect();
@@ -327,10 +333,12 @@ impl PermissionWatch {
         }
     }
 
-    /// Each running side that one check found has lost a permission stops
-    /// being watched as running, and waits for the grant instead.
+    /// Each running side that [`REFUSALS_BEFORE_REVOKED`] checks in a row
+    /// found has lost a permission stops being watched as running, and
+    /// waits for the grant instead. A check that finds it all there starts
+    /// the count again.
     fn revoke(&mut self, answers: &BTreeMap<Permission, bool>) {
-        let running: Vec<Side> = self.running.iter().copied().collect();
+        let running: Vec<Side> = self.running.keys().copied().collect();
         for side in running {
             let missing: Vec<Permission> = side
                 .watched_while_running()
@@ -338,7 +346,20 @@ impl PermissionWatch {
                 .copied()
                 .filter(|p| answers.get(p) == Some(&false))
                 .collect();
+            let Some(refused) = self.running.get_mut(&side) else {
+                continue;
+            };
             if missing.is_empty() {
+                *refused = 0;
+                continue;
+            }
+            *refused += 1;
+            if *refused < REFUSALS_BEFORE_REVOKED {
+                log::debug!(
+                    "permission watch: {side} found without {}; acted on if the next \
+                     check finds the same",
+                    named(&missing)
+                );
                 continue;
             }
             self.running.remove(&side);
@@ -471,9 +492,16 @@ mod tcc {
     /// Logged when its answer changes, not on every check: emulation
     /// that runs is checked every few seconds for as long as it runs.
     pub(super) fn granted(permission: Permission) -> bool {
-        static LAST: [LastAnswer; 3] = [LastAnswer::new(), LastAnswer::new(), LastAnswer::new()];
+        static ACCESSIBILITY: LastAnswer = LastAnswer::new();
+        static INPUT_MONITORING: LastAnswer = LastAnswer::new();
+        static POST_EVENTS: LastAnswer = LastAnswer::new();
+        let last = match permission {
+            Permission::Accessibility => &ACCESSIBILITY,
+            Permission::InputMonitoring => &INPUT_MONITORING,
+            Permission::PostEvents => &POST_EVENTS,
+        };
         let granted = super::answer(permission, preflight, accessibility::create_active_tap);
-        if LAST[permission as usize].changed(granted) {
+        if last.changed(granted) {
             log::debug!(
                 "permission watch: {permission:?} {}; preflight says {}",
                 if granted { "granted" } else { "missing" },
@@ -683,7 +711,7 @@ mod a_grant_made_while_the_daemon_runs {
         let got = runtime().block_on(async {
             let unneeded = tokio::time::timeout(NOTHING_FOR, unneeded.changed()).await;
             let first = tokio::time::timeout(NOTHING_FOR, recovered.changed()).await;
-            recovered.started(Side::Capture);
+            recovered.started(Side::Capture, false);
             missing.grant();
             let after = tokio::time::timeout(NOTHING_FOR, recovered.changed()).await;
             (unneeded.is_err(), first.is_err(), after.is_err())
@@ -806,7 +834,7 @@ mod a_grant_made_while_the_daemon_runs {
     fn accessibility_taken_from_running_emulation_is_found_and_so_is_its_grant() {
         let system = System::new(&[]);
         let mut watch = watch(&system, true);
-        watch.started(Side::Emulation);
+        watch.started(Side::Emulation, true);
         let got = runtime().block_on(async {
             let unchanged = tokio::time::timeout(NOTHING_FOR, watch.changed()).await;
             let checked = system.asked.load(Ordering::SeqCst);
@@ -860,13 +888,56 @@ mod a_grant_made_while_the_daemon_runs {
         };
         let mut watch = PermissionWatch::new(probe, Arc::new(|| false), EVERY);
         watch.stopped(Side::Capture);
-        watch.started(Side::Emulation);
+        watch.started(Side::Emulation, true);
         let _ =
             runtime().block_on(async { tokio::time::timeout(NOTHING_FOR, watch.changed()).await });
         let masks = masks.lock().expect("masks").clone();
         assert!(
             masks.len() > 2 && masks.iter().all(|&m| m == 0),
             "every probe tap must ask for no events (mask 0); masks asked: {masks:?}"
+        );
+    }
+
+    // LEDGER T2440 | class B | 1 return value of PermissionWatch::changed
+    /// One refused probe while emulation runs stops nothing: it may be
+    /// spurious, and acting on it would stop emulation and, once the next
+    /// check answers, restart the daemon for nothing.
+    #[test]
+    fn a_single_refusal_while_emulation_runs_stops_nothing() {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let probe = {
+            let asked = asked.clone();
+            // Refused once, on the third check.
+            Arc::new(move |_| asked.fetch_add(1, Ordering::SeqCst) != 2)
+        };
+        let mut watch = PermissionWatch::new(probe, Arc::new(|| true), EVERY);
+        watch.started(Side::Emulation, true);
+        let got =
+            runtime().block_on(async { tokio::time::timeout(NOTHING_FOR, watch.changed()).await });
+        assert!(
+            asked.load(Ordering::SeqCst) > 4 && got.is_err(),
+            "one refusal, then granted on every check after it ({} checks): \
+             nothing may change, it gave {got:?}",
+            asked.load(Ordering::SeqCst)
+        );
+    }
+
+    // LEDGER T2441 | class B | 1 return value of PermissionWatch::changed + 6 probe calls
+    /// Emulation through a backend that needs no permission, such as
+    /// `dummy` chosen on purpose, is not watched: a refused probe must not
+    /// stop it.
+    #[test]
+    fn emulation_through_a_backend_that_needs_nothing_is_not_watched() {
+        let system = System::new(&[Permission::Accessibility, Permission::PostEvents]);
+        let mut watch = watch(&system, true);
+        watch.started(Side::Emulation, false);
+        let got =
+            runtime().block_on(async { tokio::time::timeout(NOTHING_FOR, watch.changed()).await });
+        assert_eq!(
+            (got.is_err(), system.asked.load(Ordering::SeqCst)),
+            (true, 0),
+            "(nothing changed, checks made) for emulation that needs no permission; \
+             it gave {got:?}"
         );
     }
 }

@@ -7,8 +7,8 @@
 //! Every file is in a scratch directory, the QUIC listener is on loopback,
 //! capture is a scripted backend that macOS-style permissions can refuse or
 //! be taken from, emulation is the dummy backend, and discovery is off or
-//! fed by the test. The permission watch finds nothing missing and launchd
-//! never restarts the daemon, so nothing restarts.
+//! fed by the test. The permission watch never finds anything granted, so
+//! nothing restarts.
 //!
 //! What a frontend is told is read as JSON, as a frontend of any build reads
 //! it.
@@ -86,11 +86,10 @@ async fn daemon_among(
     )
     .await
     .expect("a daemon in the scratch directory");
-    // Never restarted, and the watch finds nothing missing: what macOS
-    // withholds here is the scripted backends' to say. This machine's grants
-    // and launchd stay out of it.
+    // Never granted and never restarted: this machine's grants and launchd
+    // stay out of it.
     service.permission_watch = PermissionWatch::new(
-        Arc::new(|_| true),
+        Arc::new(|_| false),
         Arc::new(|| false),
         Duration::from_secs(3600),
     );

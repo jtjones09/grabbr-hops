@@ -152,8 +152,11 @@ pub(crate) enum EmulationEvent {
     PortChanged(Result<u16, ListenerCreationError>),
     /// emulation was disabled
     EmulationDisabled,
-    /// emulation was enabled
-    EmulationEnabled,
+    /// Emulation was enabled, through a backend that `needs` these
+    /// permissions while it runs (#240): none for `dummy`.
+    EmulationEnabled {
+        needs: &'static [input_emulation::Permission],
+    },
     /// Emulation could not start, or stopped with an error: why, and the
     /// permission to grant when that is why.
     EmulationFailed(hops_ipc::EmulationFault),
@@ -744,7 +747,7 @@ impl EmulationProxy {
 
     async fn event(&mut self) -> EmulationEvent {
         let event = self.event_rx.recv().await.expect("channel closed");
-        if let EmulationEvent::EmulationEnabled = event {
+        if let EmulationEvent::EmulationEnabled { .. } = event {
             self.emulation_active.replace(true);
         }
         if let EmulationEvent::EmulationDisabled = event {
@@ -1028,7 +1031,9 @@ impl EmulationTask {
         // used to send enabled and disabled events
         let _emulation_guard = DropGuard::new(
             self.event_tx.clone(),
-            EmulationEvent::EmulationEnabled,
+            EmulationEvent::EmulationEnabled {
+                needs: emulation.needs(),
+            },
             EmulationEvent::EmulationDisabled,
         );
 
@@ -1360,7 +1365,7 @@ mod tests {
                 trust(&us, &[&peer], crate::trust::Caps::INBOUND),
             );
             tokio::time::timeout(Duration::from_secs(10), async {
-                while !matches!(proxy.event().await, EmulationEvent::EmulationEnabled) {}
+                while !matches!(proxy.event().await, EmulationEvent::EmulationEnabled { .. }) {}
             })
             .await
             .expect("emulation to start");
@@ -1419,7 +1424,7 @@ mod tests {
                 trust(&us, &[&peer], crate::trust::Caps::INBOUND),
             );
             tokio::time::timeout(Duration::from_secs(10), async {
-                while !matches!(proxy.event().await, EmulationEvent::EmulationEnabled) {}
+                while !matches!(proxy.event().await, EmulationEvent::EmulationEnabled { .. }) {}
             })
             .await
             .expect("emulation to start");
@@ -1475,7 +1480,7 @@ mod tests {
                 trust(&us, &[&peer], crate::trust::Caps::INBOUND),
             );
             tokio::time::timeout(Duration::from_secs(10), async {
-                while !matches!(proxy.event().await, EmulationEvent::EmulationEnabled) {}
+                while !matches!(proxy.event().await, EmulationEvent::EmulationEnabled { .. }) {}
             })
             .await
             .expect("emulation to start");

@@ -22,18 +22,19 @@
 /// The events the probe tap asks for: none (`CGEventMask` 0).
 pub const PROBE_MASK: u64 = 0;
 
+/// How many probes in a row must be refused before a running capture or
+/// emulation is stopped for a revocation. One refusal is not acted on, so a
+/// single spurious one (a session switch, sleep and wake, WindowServer
+/// starting again; whether any of these refuses is unverified) costs
+/// nothing; a revocation is acted on one check later, within about 4 s at
+/// one check every 2 s. A grant is acted on at once.
+pub const REFUSALS_BEFORE_REVOKED: u32 = 2;
+
 /// Whether `tap`, which creates an active event tap for the events in a
 /// mask and reports whether macOS allowed it, is allowed the probe tap. The
 /// one place the probe's mask is chosen, whoever creates the tap.
 pub fn permitted_by(tap: impl FnOnce(u64) -> bool) -> bool {
     tap(PROBE_MASK)
-}
-
-/// Whether macOS grants this process Accessibility, by the probe tap.
-/// Silent: raises no prompt.
-#[cfg(target_os = "macos")]
-pub fn active_tap_permitted() -> bool {
-    permitted_by(create_active_tap)
 }
 
 /// Creates an active tap for the events in `mask` at the tail of the

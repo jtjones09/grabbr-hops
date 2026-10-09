@@ -61,7 +61,7 @@ use core_graphics::{
     event_source::{CGEventSource, CGEventSourceStateID},
 };
 use futures_core::Stream;
-use input_event::accessibility::{self, LastAnswer};
+use input_event::accessibility::{self, LastAnswer, REFUSALS_BEFORE_REVOKED};
 use input_event::{
     BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
 };
@@ -1644,6 +1644,10 @@ struct Watched<H: Fn()> {
 /// goes on the capture's stream, which ends the session and tells the
 /// daemon which setting to change. Ends then, or once the capture is dropped.
 ///
+/// Accessibility counts as gone once [`REFUSALS_BEFORE_REVOKED`] probes in
+/// a row are refused; until then a refusal is neither acted on nor kept for
+/// the tap callbacks. Input Monitoring's preflight check is acted on at once.
+///
 /// The checks run on a blocking thread, so a slow answer from the system
 /// never holds the daemon's loop.
 async fn watch_grants<H: Fn() + 'static>(
@@ -1655,6 +1659,8 @@ async fn watch_grants<H: Fn() + 'static>(
 ) {
     let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Probes refused in a row.
+    let mut refused = 0;
     loop {
         // The nudges close once the tap's thread has ended and dropped it.
         let (check, tap_gone) = tokio::select! {
@@ -1668,7 +1674,7 @@ async fn watch_grants<H: Fn() + 'static>(
             .collect();
         let probe = probe.clone();
         let to_ask = asked.clone();
-        let missing = tokio::task::spawn_blocking(move || {
+        let mut missing = tokio::task::spawn_blocking(move || {
             to_ask
                 .into_iter()
                 .filter(|&p| !probe(p))
@@ -1676,8 +1682,22 @@ async fn watch_grants<H: Fn() + 'static>(
         })
         .await
         .unwrap_or_default();
-        log::debug!("capture permission check ({check:?}): asked {asked:?}, missing {missing:?}");
-        watched.grants.record(&asked, &missing);
+        log::trace!("capture permission check ({check:?}): asked {asked:?}, missing {missing:?}");
+        let mut known = asked;
+        if missing.contains(&Permission::Accessibility) {
+            refused += 1;
+            if refused < REFUSALS_BEFORE_REVOKED {
+                log::debug!(
+                    "capture: the probe tap was refused; acted on if the next check \
+                     finds the same"
+                );
+                missing.retain(|&p| p != Permission::Accessibility);
+                known.retain(|&p| p != Permission::Accessibility);
+            }
+        } else if known.contains(&Permission::Accessibility) {
+            refused = 0;
+        }
+        watched.grants.record(&known, &missing);
         if !missing.is_empty() {
             (watched.halt)();
             let fault = CaptureError::MissingPermissions(missing);
@@ -2080,6 +2100,36 @@ mod a_permission_lost_while_capture_runs {
             masks.len() > 2 && masks.iter().all(|&m| m == 0),
             "every probe tap must ask for no events (mask 0); masks asked: {masks:?}"
         );
+    }
+
+    // LEDGER T2442 | class B | 1 Stream::next of the capture + 6 halt never invoked by watch_grants
+    /// One refused probe stops nothing: capture runs on and its taps stay.
+    #[test]
+    fn a_single_refused_probe_stops_nothing() {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let probe: Probe = {
+            let asked = asked.clone();
+            // Accessibility refused once, on its third probe.
+            Arc::new(move |p| {
+                p != Permission::Accessibility || asked.fetch_add(1, Ordering::SeqCst) != 2
+            })
+        };
+        let halted = Arc::new(AtomicBool::new(false));
+        run_local(async {
+            let halting = halted.clone();
+            let (mut capture, _nudge) =
+                capture_halted_by(probe, Duration::from_millis(20), move || {
+                    halting.store(true, Ordering::SeqCst)
+                });
+            let next = tokio::time::timeout(Duration::from_millis(400), capture.next()).await;
+            assert!(
+                asked.load(Ordering::SeqCst) > 4 && next.is_err() && !halted.load(Ordering::SeqCst),
+                "one refusal, then granted on every probe after it ({} probes): capture \
+                 must run on with its taps; the stream yielded {next:?}, halted: {}",
+                asked.load(Ordering::SeqCst),
+                halted.load(Ordering::SeqCst)
+            );
+        });
     }
 
     // LEDGER T2411 | class B | 6 halt invoked by watch_grants
@@ -2804,12 +2854,12 @@ mod the_tap_callbacks {
 
     // LEDGER T2432 | class B | 1 Stream::next of the capture watch_grants feeds + 6 FakeTaps state after its halt
     /// The pointer is on this Mac, nothing crossed, everything is granted:
-    /// only the listen tap is in. Accessibility is switched off. On the next
-    /// tick every tap comes down, and then the stream names Accessibility
-    /// (#240). The probe used not to run while the pointer was here, so
+    /// only the listen tap is in. Accessibility is switched off. On the
+    /// second tick in a row that finds it gone every tap comes down, and
+    /// then the stream names Accessibility (#240). The probe used not to run while the pointer was here, so
     /// capture read as running with the grant gone.
     #[test]
-    fn accessibility_switched_off_with_the_pointer_here_ends_capture_on_the_next_tick() {
+    fn accessibility_switched_off_with_the_pointer_here_ends_capture_on_the_second_tick() {
         use super::{Probe, Watched, watch_grants};
         use std::cell::RefCell;
         use std::rc::Rc;
@@ -2890,8 +2940,9 @@ mod the_tap_callbacks {
         );
         assert_eq!(
             asked_after.load(Ordering::SeqCst),
-            1,
-            "capture must end on the first tick that finds Accessibility gone"
+            2,
+            "capture must end on the second tick in a row that finds Accessibility \
+             gone, and not before"
         );
     }
 }

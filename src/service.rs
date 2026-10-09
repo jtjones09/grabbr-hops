@@ -1233,13 +1233,23 @@ impl Service {
             AfterGrant::Exit(_) => Some(granted),
             AfterGrant::Tell(_) => {
                 log::warn!(
-                    "macOS now grants hops {granted}, which takes effect once the hops \
-                     service restarts; launchd did not start this daemon, so it cannot \
-                     restart itself"
+                    "macOS now grants hops {granted}; trying again with it. launchd did \
+                     not start this daemon, so it cannot restart itself: a side whose \
+                     check still reads the old answer starts once the service restarts"
                 );
+                // As "enable input" does. Emulation's check, and capture's
+                // for Accessibility, see the grant in this process; Input
+                // Monitoring's may not until it restarts.
+                if !self.capture_status.is_enabled() {
+                    self.capture.reenable();
+                }
+                if !self.emulation_status.is_enabled() {
+                    self.emulation.reenable();
+                }
                 self.notify_frontend(FrontendEvent::Error(format!(
-                    "macOS now grants hops {granted}. It takes effect once the hops \
-                     service restarts: stop it and start it again."
+                    "macOS now grants hops {granted}. hops is trying again with it; if \
+                     a banner remains, it clears once the hops service restarts: stop \
+                     it and start it again."
                 )));
                 None
             }
@@ -1256,8 +1266,21 @@ impl Service {
             crate::permission_watch::named(missing)
         );
         if side == Side::Emulation {
-            self.emulation
-                .stop_for_missing(vec![input_emulation::Permission::Accessibility]);
+            // Posting events is granted with Accessibility: the one
+            // permission emulation names.
+            let mut named = Vec::new();
+            for permission in missing {
+                let p = match permission {
+                    Permission::Accessibility | Permission::PostEvents => {
+                        input_emulation::Permission::Accessibility
+                    }
+                    Permission::InputMonitoring => continue,
+                };
+                if !named.contains(&p) {
+                    named.push(p);
+                }
+            }
+            self.emulation.stop_for_missing(named);
         }
     }
 
@@ -1688,8 +1711,9 @@ impl Service {
                     self.emulation_status.clone(),
                 ));
             }
-            EmulationEvent::EmulationEnabled => {
-                self.permission_watch.started(Side::Emulation);
+            EmulationEvent::EmulationEnabled { needs } => {
+                self.permission_watch
+                    .started(Side::Emulation, !needs.is_empty());
                 self.emulation_status = EmulationState::Enabled;
                 self.notify_frontend(FrontendEvent::EmulationStatus(
                     self.emulation_status.clone(),
@@ -1774,7 +1798,8 @@ impl Service {
                 self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status.clone()));
             }
             ICaptureEvent::CaptureEnabled => {
-                self.permission_watch.started(Side::Capture);
+                // Capture's backend checks its own permissions while it runs.
+                self.permission_watch.started(Side::Capture, false);
                 self.capture_status = CaptureState::Enabled;
                 self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status.clone()));
             }
