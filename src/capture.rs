@@ -11,7 +11,7 @@ use hops_ipc::CrossingRefusal;
 use hops_proto::{ProtoEvent, caps};
 use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Permission,
-    Position,
+    Position, Restart,
 };
 use input_event::{Event, KeyboardEvent, PointerEvent, scancode};
 use local_channel::mpsc::{Receiver, Sender, channel};
@@ -66,7 +66,9 @@ const UNANSWERED_BACKOFF: Duration = Duration::from_secs(5);
 
 /// How long capture that the system interrupted waits before it starts
 /// again on its own the first time (#240). Each interruption soon after a
-/// restart doubles the wait, up to [`RESTART_AFTER_AT_MOST`].
+/// restart doubles the wait, up to [`RESTART_AFTER_AT_MOST`]; but after
+/// secure input took the pointer back, the wait is always this, so capture
+/// is never off for long after an unlock.
 const RESTART_AFTER: Duration = Duration::from_secs(1);
 
 /// The longest wait before an interrupted capture starts again.
@@ -427,10 +429,18 @@ impl CaptureTask {
                         .event_tx
                         .send(ICaptureEvent::CaptureFailed(fault_of(&e)));
                 }
-                if e.restarts_on_its_own() {
-                    let wait = restart_wait(waited, started.elapsed(), self.timing.restart_after);
+                let wait = match e.restart() {
+                    Some(Restart::Soon) => Some(self.timing.restart_after),
+                    Some(Restart::Backoff) => {
+                        let wait =
+                            restart_wait(waited, started.elapsed(), self.timing.restart_after);
+                        waited = Some(wait);
+                        Some(wait)
+                    }
+                    None => None,
+                };
+                if let Some(wait) = wait {
                     log::info!("input capture starts again in {wait:?}");
-                    waited = Some(wait);
                     restart_at = Some(tokio::time::Instant::now() + wait);
                 }
             }
@@ -1736,6 +1746,73 @@ mod release_mid_drag {
             v.cross(true).await;
 
             v.capture.terminate().await;
+        });
+    }
+
+    // LEDGER T2419 | class B | 2 frames received by listen::LanMouseListener
+    /// Secure input taking the pointer back (a screen lock while it is on the
+    /// peer) restarts capture after the same short wait however often it
+    /// happens: a growing wait would leave capture off for up to a minute
+    /// after an unlock (#240).
+    #[test]
+    fn capture_after_secure_input_starts_again_without_a_growing_wait() {
+        run_local(async {
+            let restart_after = Duration::from_millis(300);
+            let mut v = Visit::start_with(
+                true,
+                Timing {
+                    restart_after,
+                    ..PATIENT
+                },
+            )
+            .await;
+            let mut waits = Vec::new();
+            for leaves in 1..=4 {
+                v.script.secure_input();
+                assert!(
+                    v.leaves(leaves, Duration::from_secs(10)).await,
+                    "secure input ended visit {leaves}, and the peer was sent no Leave: {:?}",
+                    v.frames()
+                );
+                let started = tokio::time::Instant::now();
+                v.cross(true).await;
+                waits.push(started.elapsed());
+            }
+            // Doubling from 300 ms, the fourth wait would be 2.4 s.
+            assert!(
+                waits.iter().all(|w| *w < Duration::from_millis(1500)),
+                "each restart after secure input must take the same short wait; the \
+                 waits until the pointer crossed again were {waits:?}"
+            );
+
+            v.capture.terminate().await;
+        });
+    }
+
+    // LEDGER T2416 | class B | 6 Script::releases / held after InputCapture::poll_next
+    /// A crossing for an edge no client takes reaches the stream with no
+    /// handle to deliver it to. Nothing would then see the release bind while
+    /// the backend held the pointer, so it is given back at once (#240).
+    #[test]
+    fn a_crossing_no_client_takes_is_given_back_at_once() {
+        run_local(async {
+            let script = Script::new();
+            let mut capture = InputCapture::new(Some(script.backend()))
+                .await
+                .expect("the scripted backend");
+            script.push(Position::Left, CaptureEvent::Begin);
+            let next = tokio::time::timeout(Duration::from_millis(300), capture.next()).await;
+            assert!(
+                next.is_err(),
+                "no client takes it: nothing to yield, got {next:?}"
+            );
+            assert!(
+                script.unclaimed_releases() == 1 && !script.held(),
+                "a crossing no client takes must be released at once (released: {}, \
+                 held: {})",
+                script.unclaimed_releases(),
+                script.held()
+            );
         });
     }
 

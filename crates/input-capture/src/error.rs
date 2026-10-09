@@ -73,6 +73,23 @@ pub enum CaptureError {
     /// on its own after a delay (#240).
     #[error("input capture was interrupted ({0}); it starts again shortly")]
     Interrupted(String),
+    /// Secure input (a password field, the lock screen) disabled the tap
+    /// that held the pointer on another machine; the pointer came back.
+    /// Capture starts again after a short fixed wait, however often this
+    /// happens, so it is never off for long after an unlock (#240).
+    #[error(
+        "secure input took the pointer back from another machine; input capture starts again shortly"
+    )]
+    SecureInput,
+}
+
+/// How capture that ended starts again without the user asking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Restart {
+    /// After a short fixed wait: the cause passes on its own.
+    Soon,
+    /// After a wait that grows while the cause keeps recurring.
+    Backoff,
 }
 
 /// An OS permission capture needs, named as macOS lists it under System
@@ -142,11 +159,15 @@ impl InputCaptureError {
         matches!(self, Self::Create(e) if e.cancelled_by_user())
     }
 
-    /// Whether capture ended for a reason that passes, so it should be
-    /// started again without the user asking. A missing permission is not
-    /// one: the permission watch picks up its grant.
-    pub fn restarts_on_its_own(&self) -> bool {
-        matches!(self, Self::Capture(CaptureError::Interrupted(_)))
+    /// How capture that ended for a reason that passes starts again without
+    /// the user asking; `None` for any other end. A missing permission is
+    /// not such a reason: the permission watch picks up its grant.
+    pub fn restart(&self) -> Option<Restart> {
+        match self {
+            Self::Capture(CaptureError::Interrupted(_)) => Some(Restart::Backoff),
+            Self::Capture(CaptureError::SecureInput) => Some(Restart::Soon),
+            _ => None,
+        }
     }
 }
 
