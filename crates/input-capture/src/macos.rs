@@ -42,7 +42,7 @@ use bitflags::bitflags;
 use core_foundation::{
     base::{CFRelease, TCFType, kCFAllocatorDefault},
     date::CFTimeInterval,
-    mach_port::{CFMachPortInvalidate, CFMachPortRef},
+    mach_port::CFMachPortInvalidate,
     number::{CFBooleanRef, kCFBooleanTrue},
     runloop::{CFRunLoop, CFRunLoopSource, kCFRunLoopCommonModes},
     string::{CFStringCreateWithCString, CFStringRef, kCFStringEncodingUTF8},
@@ -61,6 +61,7 @@ use core_graphics::{
     event_source::{CGEventSource, CGEventSourceStateID},
 };
 use futures_core::Stream;
+use input_event::accessibility::{self, LastAnswer, REFUSALS_BEFORE_REVOKED};
 use input_event::{
     BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
 };
@@ -1422,9 +1423,8 @@ pub struct MacOSInputCapture {
 
 impl MacOSInputCapture {
     pub async fn new() -> Result<Self, MacosCaptureCreationError> {
-        // Asked once as capture starts: every permission, the active-tap
-        // probe included. The pointer is on this Mac, so the probe tap is the
-        // only active tap in the process.
+        // Asked once as capture starts: every permission, the probe tap
+        // included, which asks for no events.
         let probe: Probe = Arc::new(granted);
         let grants = Arc::new(Grants::default());
         let missing = missing_permissions(&probe);
@@ -1487,11 +1487,7 @@ impl MacOSInputCapture {
             GRANTS_EVERY,
             recheck_rx,
             stream,
-            Watched {
-                grants,
-                capturing,
-                halt,
-            },
+            Watched { grants, halt },
         ));
 
         let bounds_shared = shared.clone();
@@ -1562,86 +1558,41 @@ type Probe = Arc<dyn Fn(Permission) -> bool + Send + Sync>;
 /// raises a prompt; the app asks instead (#169). Both are required: a tap
 /// that starts without Input Monitoring may be sent no keys.
 ///
-/// Accessibility is answered by [`active_tap_permitted`], not by
-/// `AXIsProcessTrusted`, which can keep its first answer for the life of
-/// the process on macOS 27, for a revocation and for a grant (#240). The
-/// latter is still logged beside it, so a disagreement shows in the log.
-/// With `HOPS_PROBE_MASK0` set, a probe that asks for no events at all is
-/// also made and logged, to learn whether macOS refuses that one too.
+/// Accessibility is answered by the probe tap
+/// ([`input_event::accessibility`]), not by `AXIsProcessTrusted`, which can
+/// keep its first answer for the life of the process on macOS 27, for a
+/// revocation and for a grant (#240). The latter is logged beside it when
+/// the probe's answer changes, so a disagreement shows in the log.
 fn granted(permission: Permission) -> bool {
-    match permission {
-        Permission::Accessibility => {
-            let started = Instant::now();
-            let tap = active_tap_permitted();
-            let took = started.elapsed();
-            // SAFETY: takes no arguments and only reads this process's grant.
-            let ax = unsafe { AXIsProcessTrusted() } != 0;
-            log::debug!(
-                "Accessibility probe: active tap {} in {took:?}; AXIsProcessTrusted says {ax}",
-                if tap { "permitted" } else { "refused" }
-            );
-            if std::env::var_os("HOPS_PROBE_MASK0").is_some() {
-                let started = Instant::now();
-                let empty = probe_active_tap(0);
-                log::debug!(
-                    "Accessibility probe with no events asked for: active tap {} in {:?}",
-                    if empty { "permitted" } else { "refused" },
-                    started.elapsed()
-                );
-            }
-            tap
-        }
+    static LAST: LastAnswer = LastAnswer::new();
+    let started = Instant::now();
+    let granted = answer(permission, accessibility::create_active_tap, || {
         // SAFETY: takes no arguments and only reads this process's grant.
-        Permission::InputMonitoring => unsafe { CGPreflightListenEventAccess() },
-    }
-}
-
-/// Whether macOS lets this process install an active event tap, which it
-/// does only with Accessibility: creates one for key-down events at the tail
-/// of the session's taps, then disables, invalidates and releases it.
-///
-/// The probe tap is live, in the path of key-down events, from its creation
-/// until it is disabled a few instructions later. It is never added to a run
-/// loop, so a key-down that reaches it in that window waits for it until it
-/// is disabled. Capture asks it only as it starts and while the pointer is
-/// on another machine, when its own active tap is in the path anyway; the
-/// permission watch asks it only while a permission is missing.
-pub fn active_tap_permitted() -> bool {
-    const KEY_DOWN_MASK: u64 = 1 << 10; // CGEventMaskBit(kCGEventKeyDown)
-    probe_active_tap(KEY_DOWN_MASK)
-}
-
-fn probe_active_tap(mask: u64) -> bool {
-    extern "C" fn pass(
-        _proxy: CGEventTapProxy,
-        _ty: u32,
-        event: *mut c_void,
-        _info: *mut c_void,
-    ) -> *mut c_void {
-        event
-    }
-    const SESSION: u32 = 1; // kCGSessionEventTap
-    const TAIL_APPEND: u32 = 1; // kCGTailAppendEventTap
-    const ACTIVE: u32 = 0; // kCGEventTapOptionDefault
-    // SAFETY: creates a tap whose callback never runs (its port is never
-    // scheduled), then disables, invalidates and releases the port it
-    // returned, which this function alone holds.
-    unsafe {
-        let port = CGEventTapCreate(
-            SESSION,
-            TAIL_APPEND,
-            ACTIVE,
-            mask,
-            pass,
-            std::ptr::null_mut(),
+        unsafe { CGPreflightListenEventAccess() }
+    });
+    if permission == Permission::Accessibility && LAST.changed(granted) {
+        // SAFETY: takes no arguments and only reads this process's grant.
+        let ax = unsafe { AXIsProcessTrusted() } != 0;
+        log::debug!(
+            "Accessibility probe: active tap {} in {:?}; AXIsProcessTrusted says {ax}",
+            if granted { "permitted" } else { "refused" },
+            started.elapsed()
         );
-        if port.is_null() {
-            return false;
-        }
-        CGEventTapEnable(port as *mut c_void, false);
-        CFMachPortInvalidate(port);
-        CFRelease(port as *const c_void);
-        true
+    }
+    granted
+}
+
+/// Whether `permission` is granted: Accessibility by whether `tap` is
+/// allowed the probe tap, which asks for no events; Input Monitoring by
+/// `listen`, its preflight check.
+fn answer(
+    permission: Permission,
+    tap: impl FnOnce(u64) -> bool,
+    listen: impl FnOnce() -> bool,
+) -> bool {
+    match permission {
+        Permission::Accessibility => accessibility::permitted_by(tap),
+        Permission::InputMonitoring => listen(),
     }
 }
 
@@ -1661,30 +1612,27 @@ enum Check {
 }
 
 /// Whether a check made for `check` asks about `permission`. Accessibility
-/// is asked through the active-tap probe, so only on a tick, and only while
-/// the pointer is on another machine (`capturing`), when capture's own
-/// active tap is in the path anyway. Never on a disable notice: that is the
-/// moment a revocation may be under way, when no new active tap may appear.
-/// While the pointer is here, a revocation meets only the listen-only tap,
-/// and the next crossing finds the active tap refused.
-fn asks(permission: Permission, check: Check, capturing: bool) -> bool {
+/// is asked through the probe tap on every tick, in every state: with the
+/// pointer here or on another machine, granted or not. The probe asks for
+/// no events, so no event waits on it (#240). Never on a disable notice:
+/// that is the moment a revocation may be under way, and the next tick, at
+/// most [`GRANTS_EVERY`] away, asks anyway.
+fn asks(permission: Permission, check: Check) -> bool {
     match permission {
         Permission::InputMonitoring => true,
-        Permission::Accessibility => check == Check::Tick && capturing,
+        Permission::Accessibility => check == Check::Tick,
     }
 }
 
 /// How often capture asks, while it runs, whether macOS still grants what it
-/// needs. While the active tap is installed this is what bounds how long it
-/// can outlive a revocation that sends no disable notice.
+/// needs. This bounds how long capture can outlive a revocation that sends
+/// no disable notice, with the pointer here or on another machine.
 const GRANTS_EVERY: Duration = Duration::from_secs(2);
 
 /// What the permission watch shares with the tap thread.
 struct Watched<H: Fn()> {
     /// Where each check's answer is kept for the tap callbacks.
     grants: Arc<Grants>,
-    /// Whether the active tap is installed.
-    capturing: Arc<AtomicBool>,
     /// Removes every tap.
     halt: H,
 }
@@ -1695,6 +1643,10 @@ struct Watched<H: Fn()> {
 /// the tap callbacks. Once one is gone, every tap is removed and the error
 /// goes on the capture's stream, which ends the session and tells the
 /// daemon which setting to change. Ends then, or once the capture is dropped.
+///
+/// Accessibility counts as gone once [`REFUSALS_BEFORE_REVOKED`] probes in
+/// a row are refused; until then a refusal is neither acted on nor kept for
+/// the tap callbacks. Input Monitoring's preflight check is acted on at once.
 ///
 /// The checks run on a blocking thread, so a slow answer from the system
 /// never holds the daemon's loop.
@@ -1707,6 +1659,8 @@ async fn watch_grants<H: Fn() + 'static>(
 ) {
     let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Probes refused in a row.
+    let mut refused = 0;
     loop {
         // The nudges close once the tap's thread has ended and dropped it.
         let (check, tap_gone) = tokio::select! {
@@ -1714,14 +1668,13 @@ async fn watch_grants<H: Fn() + 'static>(
             nudge = recheck.recv() => (Check::Disabled, nudge.is_none()),
             _ = faults.tx.closed() => return,
         };
-        let capturing = watched.capturing.load(Ordering::SeqCst);
         let asked: Vec<Permission> = ALL_PERMISSIONS
             .into_iter()
-            .filter(|&p| asks(p, check, capturing))
+            .filter(|&p| asks(p, check))
             .collect();
         let probe = probe.clone();
         let to_ask = asked.clone();
-        let missing = tokio::task::spawn_blocking(move || {
+        let mut missing = tokio::task::spawn_blocking(move || {
             to_ask
                 .into_iter()
                 .filter(|&p| !probe(p))
@@ -1729,8 +1682,22 @@ async fn watch_grants<H: Fn() + 'static>(
         })
         .await
         .unwrap_or_default();
-        log::debug!("capture permission check ({check:?}): asked {asked:?}, missing {missing:?}");
-        watched.grants.record(&asked, &missing);
+        log::trace!("capture permission check ({check:?}): asked {asked:?}, missing {missing:?}");
+        let mut known = asked;
+        if missing.contains(&Permission::Accessibility) {
+            refused += 1;
+            if refused < REFUSALS_BEFORE_REVOKED {
+                log::debug!(
+                    "capture: the probe tap was refused; acted on if the next check \
+                     finds the same"
+                );
+                missing.retain(|&p| p != Permission::Accessibility);
+                known.retain(|&p| p != Permission::Accessibility);
+            }
+        } else if known.contains(&Permission::Accessibility) {
+            refused = 0;
+        }
+        watched.grants.record(&known, &missing);
         if !missing.is_empty() {
             (watched.halt)();
             let fault = CaptureError::MissingPermissions(missing);
@@ -1837,17 +1804,6 @@ extern "C" {
     /// Enable or disable an event tap. Thread-safe. The `tap` argument is a
     /// `CFMachPortRef`.
     fn CGEventTapEnable(tap: *mut c_void, enable: bool);
-
-    /// Quartz Event Services. Declared here for the permission probe, which
-    /// must not schedule the port the way `CGEventTap::new` lets it.
-    fn CGEventTapCreate(
-        tap: u32,
-        place: u32,
-        options: u32,
-        events_of_interest: u64,
-        callback: extern "C" fn(CGEventTapProxy, u32, *mut c_void, *mut c_void) -> *mut c_void,
-        user_info: *mut c_void,
-    ) -> CFMachPortRef;
 
     /// Register a callback invoked when the display configuration
     /// changes (monitor add/remove, resolution change, mirror,
@@ -1959,17 +1915,6 @@ mod a_permission_lost_while_capture_runs {
         every: Duration,
         halt: impl Fn() + 'static,
     ) -> (MacOSInputCapture, mpsc::Sender<()>) {
-        capture_watching(probe, every, Arc::new(AtomicBool::new(false)), halt)
-    }
-
-    /// As [`capture_halted_by`], the pointer on another machine while
-    /// `capturing` holds.
-    fn capture_watching(
-        probe: Probe,
-        every: Duration,
-        capturing: Arc<AtomicBool>,
-        halt: impl Fn() + 'static,
-    ) -> (MacOSInputCapture, mpsc::Sender<()>) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let depth = Arc::new(AtomicUsize::new(0));
         let (recheck_tx, recheck_rx) = mpsc::channel(1);
@@ -1984,7 +1929,6 @@ mod a_permission_lost_while_capture_runs {
             faults,
             Watched {
                 grants: Arc::new(Grants::default()),
-                capturing,
                 halt,
             },
         ));
@@ -2065,27 +2009,24 @@ mod a_permission_lost_while_capture_runs {
     }
 
     // LEDGER T2417 | class B | 1 return value of asks(); 6 probe calls made by watch_grants
-    /// The active-tap probe is itself an active tap. It is asked on a tick
-    /// while the pointer is on another machine, when capture's own active tap
-    /// is in the path anyway, and at no other time: not while the pointer is
-    /// here and everything is granted, and never on a disable notice, which
+    /// The probe tap asks for no events, so it is asked on every tick in
+    /// every state, the pointer here and everything granted included, and
+    /// a revocation is seen within a tick. Never on a disable notice, which
     /// is when a revocation may be under way (#240).
     #[test]
-    fn the_active_tap_probe_runs_only_on_a_tick_while_the_pointer_is_away() {
+    fn the_probe_tap_runs_on_every_tick_and_never_on_a_disable_notice() {
         use Permission::{Accessibility, InputMonitoring};
         assert_eq!(
             [
-                asks(Accessibility, Check::Tick, false),
-                asks(Accessibility, Check::Disabled, false),
-                asks(Accessibility, Check::Disabled, true),
-                asks(Accessibility, Check::Tick, true),
+                asks(Accessibility, Check::Tick),
+                asks(Accessibility, Check::Disabled)
             ],
-            [false, false, false, true]
+            [true, false]
         );
         assert!(
             [Check::Tick, Check::Disabled]
                 .into_iter()
-                .all(|c| asks(InputMonitoring, c, false) && asks(InputMonitoring, c, true)),
+                .all(|c| asks(InputMonitoring, c)),
             "Input Monitoring is a preflight check, asked every time"
         );
 
@@ -2101,43 +2042,92 @@ mod a_permission_lost_while_capture_runs {
             probe
         };
         run_local(async {
-            let capturing = Arc::new(AtomicBool::new(false));
-            let (_capture, nudge) = capture_watching(
-                counting.clone(),
-                Duration::from_millis(20),
-                capturing.clone(),
-                || {},
-            );
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            nudge.send(()).await.expect("the watch runs");
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            assert_eq!(
-                probed.load(Ordering::SeqCst),
-                0,
-                "the pointer is here and everything is granted: ten ticks and a \
-                 disable notice, and the probe must not have run once"
-            );
-            capturing.store(true, Ordering::SeqCst);
+            let (_capture, _nudge) =
+                capture_halted_by(counting.clone(), Duration::from_millis(20), || {});
             tokio::time::sleep(Duration::from_millis(200)).await;
             assert!(
                 probed.load(Ordering::SeqCst) > 0,
-                "the pointer is on another machine: each tick probes"
+                "everything is granted and nothing crossed: each tick must still \
+                 probe, or a revocation goes unseen until the next crossing"
             );
         });
 
         probed.store(0, Ordering::SeqCst);
         run_local(async {
-            let capturing = Arc::new(AtomicBool::new(true));
             // No tick falls inside the test: only the disable notice checks.
-            let (_capture, nudge) =
-                capture_watching(counting, Duration::from_secs(3600), capturing, || {});
+            let (_capture, nudge) = capture_halted_by(counting, Duration::from_secs(3600), || {});
             nudge.send(()).await.expect("the watch runs");
             tokio::time::sleep(Duration::from_millis(100)).await;
             assert_eq!(
                 probed.load(Ordering::SeqCst),
                 0,
-                "a disable notice while the pointer is away must not create a new \
-                 active tap: that is the moment a revocation may be under way"
+                "a disable notice must not create a new active tap: that is the \
+                 moment a revocation may be under way"
+            );
+        });
+    }
+
+    // LEDGER T2433 | class B | 6 tap masks requested through answer() by missing_permissions and watch_grants
+    /// The probe tap capture creates, as it starts and on every tick, asks
+    /// for no events. A key-down probe put an active tap in the key-down
+    /// path every time it ran.
+    #[test]
+    fn every_probe_capture_makes_asks_for_no_events() {
+        let masks = Arc::new(Mutex::new(Vec::new()));
+        let recording: Probe = {
+            let masks = masks.clone();
+            Arc::new(move |p| {
+                super::answer(
+                    p,
+                    |mask| {
+                        masks.lock().expect("masks").push(mask);
+                        true
+                    },
+                    || true,
+                )
+            })
+        };
+        // As capture starts.
+        assert!(super::missing_permissions(&recording).is_empty());
+        run_local(async {
+            let (_capture, nudge) = capture_halted_by(recording, Duration::from_millis(20), || {});
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            nudge.send(()).await.expect("the watch runs");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+        let masks = masks.lock().expect("masks").clone();
+        assert!(
+            masks.len() > 2 && masks.iter().all(|&m| m == 0),
+            "every probe tap must ask for no events (mask 0); masks asked: {masks:?}"
+        );
+    }
+
+    // LEDGER T2442 | class B | 1 Stream::next of the capture + 6 halt never invoked by watch_grants
+    /// One refused probe stops nothing: capture runs on and its taps stay.
+    #[test]
+    fn a_single_refused_probe_stops_nothing() {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let probe: Probe = {
+            let asked = asked.clone();
+            // Accessibility refused once, on its third probe.
+            Arc::new(move |p| {
+                p != Permission::Accessibility || asked.fetch_add(1, Ordering::SeqCst) != 2
+            })
+        };
+        let halted = Arc::new(AtomicBool::new(false));
+        run_local(async {
+            let halting = halted.clone();
+            let (mut capture, _nudge) =
+                capture_halted_by(probe, Duration::from_millis(20), move || {
+                    halting.store(true, Ordering::SeqCst)
+                });
+            let next = tokio::time::timeout(Duration::from_millis(400), capture.next()).await;
+            assert!(
+                asked.load(Ordering::SeqCst) > 4 && next.is_err() && !halted.load(Ordering::SeqCst),
+                "one refusal, then granted on every probe after it ({} probes): capture \
+                 must run on with its taps; the stream yielded {next:?}, halted: {}",
+                asked.load(Ordering::SeqCst),
+                halted.load(Ordering::SeqCst)
             );
         });
     }
@@ -2859,6 +2849,100 @@ mod the_tap_callbacks {
                     if missing == &[Permission::Accessibility]
             ),
             "got {items:?}"
+        );
+    }
+
+    // LEDGER T2432 | class B | 1 Stream::next of the capture watch_grants feeds + 6 FakeTaps state after its halt
+    /// The pointer is on this Mac, nothing crossed, everything is granted:
+    /// only the listen tap is in. Accessibility is switched off. On the
+    /// second tick in a row that finds it gone every tap comes down, and
+    /// then the stream names Accessibility (#240). The probe used not to run while the pointer was here, so
+    /// capture read as running with the grant gone.
+    #[test]
+    fn accessibility_switched_off_with_the_pointer_here_ends_capture_on_the_second_tick() {
+        use super::{Probe, Watched, watch_grants};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::sync::atomic::Ordering;
+
+        let mut rig = rig();
+        let mut capture = rig.capture();
+        let Rig {
+            core,
+            taps,
+            tx,
+            grants,
+            capturing,
+            ..
+        } = rig;
+        let core = Rc::new(RefCell::new(core));
+        let granted = Arc::new(AtomicBool::new(true));
+        let asked_after = Arc::new(AtomicUsize::new(0));
+        let probe: Probe = {
+            let (granted, asked_after) = (granted.clone(), asked_after.clone());
+            Arc::new(move |p| {
+                if p != Permission::Accessibility {
+                    return true;
+                }
+                let now = granted.load(Ordering::SeqCst);
+                if !now {
+                    asked_after.fetch_add(1, Ordering::SeqCst);
+                }
+                now
+            })
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        tokio::task::LocalSet::new().block_on(&rt, async {
+            let (_nudge, recheck) = mpsc::channel(1);
+            let halting = core.clone();
+            tokio::task::spawn_local(watch_grants(
+                probe,
+                Duration::from_millis(20),
+                recheck,
+                tx,
+                Watched {
+                    grants,
+                    // As the tap thread does on the halt command.
+                    halt: move || {
+                        halting
+                            .borrow_mut()
+                            .command(TapCommand::Halt, Instant::now())
+                    },
+                },
+            ));
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                capture.next().now_or_never().is_none()
+                    && taps.state().listen
+                    && !capturing.load(Ordering::SeqCst),
+                "precondition: capture runs with the pointer here and only the listen tap in"
+            );
+            granted.store(false, Ordering::SeqCst);
+            let next = tokio::time::timeout(Duration::from_secs(5), capture.next()).await;
+            assert!(
+                matches!(
+                    &next,
+                    Ok(Some(Err(CaptureError::MissingPermissions(missing))))
+                        if missing == &[Permission::Accessibility]
+                ),
+                "Accessibility was switched off with the pointer on this Mac. The \
+                 capture's stream must name it, or the app shows capture on while \
+                 macOS has taken the grant; it yielded {next:?} (Err(Elapsed): nothing)"
+            );
+        });
+        let s = taps.state();
+        assert!(
+            s.torn_down && !s.listen && !s.active,
+            "the stream named the missing permission, but the taps were not taken down: {s:?}"
+        );
+        assert_eq!(
+            asked_after.load(Ordering::SeqCst),
+            2,
+            "capture must end on the second tick in a row that finds Accessibility \
+             gone, and not before"
         );
     }
 }

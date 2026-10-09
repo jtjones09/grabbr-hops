@@ -21,11 +21,6 @@ mod libei;
 #[cfg(target_os = "macos")]
 mod macos;
 
-/// Whether macOS lets this process install an active event tap: the check
-/// for Accessibility that does not go stale in a running process (#240).
-#[cfg(target_os = "macos")]
-pub use macos::active_tap_permitted;
-
 #[cfg(layer_shell)]
 mod layer_shell;
 

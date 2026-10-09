@@ -25,6 +25,13 @@ pub enum InputEmulationError {
         .0.iter().map(ToString::to_string).collect::<Vec<_>>().join(" and ")
     )]
     Withheld(Vec<Permission>),
+    /// The system took these permissions away while emulation ran, and
+    /// drops what it posts without an error (#240).
+    #[error(
+        "the system no longer grants hops {}; input emulation stopped",
+        .0.iter().map(ToString::to_string).collect::<Vec<_>>().join(" and ")
+    )]
+    Revoked(Vec<Permission>),
 }
 
 #[cfg(any(libei, rdp))]
@@ -105,7 +112,7 @@ impl InputEmulationError {
     pub fn missing_permissions(&self) -> Option<&[Permission]> {
         match self {
             Self::Create(e) => e.missing_permissions(),
-            Self::Withheld(missing) => Some(missing),
+            Self::Withheld(missing) | Self::Revoked(missing) => Some(missing),
             _ => None,
         }
     }

@@ -489,6 +489,12 @@ impl InputEmulation {
                 .is_some_and(|p| !p.is_empty())
     }
 
+    /// The permissions the system can take from this backend while it
+    /// runs; see [`Emulation::needs`].
+    pub fn needs(&self) -> &'static [Permission] {
+        self.emulation.needs()
+    }
+
     /// Whether any handle holds a key or a button down on this machine. While
     /// one does, the backend may repeat the key with no event arriving.
     pub fn holds_anything(&self) -> bool {
@@ -528,6 +534,13 @@ trait Emulation: Send {
     /// devices and one that shares a device need opposite release rules, so
     /// each backend states which it is, with its reason, where it injects.
     fn button_scope(&self) -> ButtonScope;
+    /// The permissions the system can take from this backend while it
+    /// runs, after which what it posts is dropped without an error (#240).
+    /// None by default: only a backend that needs one says so, and nothing
+    /// is checked on behalf of one that does not, such as `dummy`.
+    fn needs(&self) -> &'static [Permission] {
+        &[]
+    }
     /// Adaptive-edge signal (see [`InputEmulation::take_edge_push`]). Backends
     /// without a detector keep the default: never signals.
     fn take_edge_push(&mut self) -> Option<EdgeSide> {

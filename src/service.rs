@@ -11,7 +11,7 @@ use crate::{
     enter_hook,
     hop_log::Lifecycle,
     listen::{ClipboardSenderListen, LanMouseListener, ListenerCreationError},
-    permission_watch::{AfterGrant, PermissionWatch, Side},
+    permission_watch::{AfterGrant, Change, Permission, PermissionWatch, Side},
     prompt_gate::{Admit, PromptGate},
 };
 use futures::StreamExt;
@@ -1174,12 +1174,17 @@ impl Service {
                 _ = tokio::time::sleep_until(
                     self.removal_check.unwrap_or_else(tokio::time::Instant::now)
                 ), if self.removal_check.is_some() => self.check_removals(),
-                after = self.permission_watch.granted() => {
-                    if let Some(granted) = self.after_permission_granted(after) {
-                        restart_for = Some(granted);
-                        break;
+                change = self.permission_watch.changed() => match change {
+                    Change::Granted(after) => {
+                        if let Some(granted) = self.after_permission_granted(after) {
+                            restart_for = Some(granted);
+                            break;
+                        }
                     }
-                }
+                    Change::Revoked { side, missing } => {
+                        self.after_permission_revoked(side, &missing)
+                    }
+                },
                 why = stop.next() => {
                     log::info!("{why} received");
                     break;
@@ -1228,16 +1233,54 @@ impl Service {
             AfterGrant::Exit(_) => Some(granted),
             AfterGrant::Tell(_) => {
                 log::warn!(
-                    "macOS now grants hops {granted}, which takes effect once the hops \
-                     service restarts; launchd did not start this daemon, so it cannot \
-                     restart itself"
+                    "macOS now grants hops {granted}; trying again with it. launchd did \
+                     not start this daemon, so it cannot restart itself: a side whose \
+                     check still reads the old answer starts once the service restarts"
                 );
+                // As "enable input" does. Emulation's check, and capture's
+                // for Accessibility, see the grant in this process; Input
+                // Monitoring's may not until it restarts.
+                if !self.capture_status.is_enabled() {
+                    self.capture.reenable();
+                }
+                if !self.emulation_status.is_enabled() {
+                    self.emulation.reenable();
+                }
                 self.notify_frontend(FrontendEvent::Error(format!(
-                    "macOS now grants hops {granted}. It takes effect once the hops \
-                     service restarts: stop it and start it again."
+                    "macOS now grants hops {granted}. hops is trying again with it; if \
+                     a banner remains, it clears once the hops service restarts: stop \
+                     it and start it again."
                 )));
                 None
             }
+        }
+    }
+
+    /// macOS took a permission from a side that runs (#240). Emulation
+    /// stops, so that it reports the permission to grant rather than keep a
+    /// backend whose events macOS drops without a word. Capture stops on its
+    /// own, from its backend's check, and is never reported here.
+    fn after_permission_revoked(&mut self, side: Side, missing: &[Permission]) {
+        log::warn!(
+            "macOS no longer grants hops {}; {side} stops until it is granted again",
+            crate::permission_watch::named(missing)
+        );
+        if side == Side::Emulation {
+            // Posting events is granted with Accessibility: the one
+            // permission emulation names.
+            let mut named = Vec::new();
+            for permission in missing {
+                let p = match permission {
+                    Permission::Accessibility | Permission::PostEvents => {
+                        input_emulation::Permission::Accessibility
+                    }
+                    Permission::InputMonitoring => continue,
+                };
+                if !named.contains(&p) {
+                    named.push(p);
+                }
+            }
+            self.emulation.stop_for_missing(named);
         }
     }
 
@@ -1668,8 +1711,9 @@ impl Service {
                     self.emulation_status.clone(),
                 ));
             }
-            EmulationEvent::EmulationEnabled => {
-                self.permission_watch.started(Side::Emulation);
+            EmulationEvent::EmulationEnabled { needs } => {
+                self.permission_watch
+                    .started(Side::Emulation, !needs.is_empty());
                 self.emulation_status = EmulationState::Enabled;
                 self.notify_frontend(FrontendEvent::EmulationStatus(
                     self.emulation_status.clone(),
@@ -1754,7 +1798,8 @@ impl Service {
                 self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status.clone()));
             }
             ICaptureEvent::CaptureEnabled => {
-                self.permission_watch.started(Side::Capture);
+                // Capture's backend checks its own permissions while it runs.
+                self.permission_watch.started(Side::Capture, false);
                 self.capture_status = CaptureState::Enabled;
                 self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status.clone()));
             }

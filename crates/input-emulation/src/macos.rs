@@ -443,18 +443,48 @@ impl Drop for MacOSEmulation {
 }
 
 fn request_macos_emulation_permissions() -> Result<(), MacOSEmulationCreationError> {
-    // Request both permissions up front so the user sees both TCC prompts
-    // on the first launch. See the matching comment in crates/input-capture/src/
-    // macos.rs::request_macos_capture_permissions for the rationale.
-    let accessibility = request_accessibility_permission();
-    let input_control = request_input_control_permission();
-
-    if !accessibility {
+    let result = emulation_permissions(
+        request_accessibility_permission,
+        input_event::accessibility::create_active_tap,
+        request_input_control_permission,
+    );
+    if result.is_err() {
         guide_to_settings();
+    }
+    result
+}
+
+/// Whether emulation may start: Accessibility by the probe tap `tap`
+/// creates, posting events by `post` or by Accessibility, which grants it.
+///
+/// `prompt` is asked first, and both up front, so the user sees both TCC
+/// prompts on the first launch. See the matching comment in
+/// crates/input-capture/src/macos.rs::request_macos_capture_permissions for
+/// the rationale. Its own answer can be stale in a running process, which
+/// is where emulation starts again after a failure (#240), so the probe,
+/// asked afresh, decides, as the daemon's permission watch reads it.
+fn emulation_permissions(
+    prompt: impl FnOnce() -> bool,
+    tap: impl FnOnce(u64) -> bool,
+    post: impl FnOnce() -> bool,
+) -> Result<(), MacOSEmulationCreationError> {
+    let trusted = prompt();
+    let accessibility = input_event::accessibility::permitted_by(tap);
+    if trusted != accessibility {
+        log::debug!(
+            "Accessibility: probe tap {}, AXIsProcessTrusted says {trusted}",
+            if accessibility {
+                "permitted"
+            } else {
+                "refused"
+            }
+        );
+    }
+    let input_control = post() || accessibility;
+    if !accessibility {
         return Err(MacOSEmulationCreationError::AccessibilityPermission);
     }
     if !input_control {
-        guide_to_settings();
         return Err(MacOSEmulationCreationError::InputControlPermission);
     }
     Ok(())
@@ -2261,6 +2291,12 @@ impl Emulation for MacOSEmulation {
     fn button_scope(&self) -> ButtonScope {
         ButtonScope::Machine
     }
+
+    /// Posting events needs Accessibility, and macOS drops what is posted
+    /// without it, without an error.
+    fn needs(&self) -> &'static [crate::error::Permission] {
+        &[crate::error::Permission::Accessibility]
+    }
 }
 
 /// What [`update_modifiers`] decided a decoded key is, and what the caller
@@ -2868,6 +2904,38 @@ mod decision_guards {
              `panic = \"abort\"` set for release builds, a single crafted value \
              from an admitted peer takes the whole receiver down with every key \
              it was holding still latched."
+        );
+    }
+}
+
+#[cfg(test)]
+mod the_check_emulation_starts_with {
+    use super::{MacOSEmulationCreationError, emulation_permissions};
+    use std::cell::RefCell;
+
+    // LEDGER T2443 | class B | 1 return value of emulation_permissions, with the masks asked recorded
+    /// The probe tap decides, whatever the prompting check says, and asks
+    /// for no events (#240).
+    #[test]
+    fn the_probe_tap_decides_and_asks_for_no_events() {
+        let masks = RefCell::new(Vec::new());
+        let start = |trusted: bool, permitted: bool| {
+            emulation_permissions(
+                || trusted,
+                |mask| {
+                    masks.borrow_mut().push(mask);
+                    permitted
+                },
+                || false,
+            )
+            .map_err(|e| matches!(e, MacOSEmulationCreationError::AccessibilityPermission))
+        };
+        let got = [start(true, true), start(true, false), start(false, true)];
+        assert_eq!(
+            (got, masks.into_inner()),
+            ([Ok(()), Err(true), Ok(())], vec![0, 0, 0]),
+            "(may emulation start: probe and prompt agree, probe refused with a stale \
+             prompt, probe permitted with a stale prompt; masks asked)"
         );
     }
 }

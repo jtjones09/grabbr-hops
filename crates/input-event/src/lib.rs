@@ -1,6 +1,7 @@
 pub mod keylog;
 use std::fmt::{self, Display};
 
+pub mod accessibility;
 pub mod error;
 pub mod paths;
 pub mod scancode;
