@@ -11,7 +11,7 @@ use hops_ipc::CrossingRefusal;
 use hops_proto::{ProtoEvent, caps};
 use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Permission,
-    Position,
+    Position, Restart,
 };
 use input_event::{Event, KeyboardEvent, PointerEvent, scancode};
 use local_channel::mpsc::{Receiver, Sender, channel};
@@ -64,12 +64,28 @@ const ACK_DEADLINE: Duration = Duration::from_secs(1);
 /// edge froze the pointer for [`ACK_DEADLINE`] out of every push.
 const UNANSWERED_BACKOFF: Duration = Duration::from_secs(5);
 
+/// How long capture that the system interrupted waits before it starts
+/// again on its own the first time (#240). Each interruption soon after a
+/// restart doubles the wait, up to [`RESTART_AFTER_AT_MOST`]; but after
+/// secure input took the pointer back, the wait is always this, so capture
+/// is never off for long after an unlock.
+const RESTART_AFTER: Duration = Duration::from_secs(1);
+
+/// The longest wait before an interrupted capture starts again.
+const RESTART_AFTER_AT_MOST: Duration = Duration::from_secs(60);
+
+/// A capture that ran this long before it was interrupted starts the waits
+/// over from [`RESTART_AFTER`].
+const RAN_LONG_ENOUGH: Duration = Duration::from_secs(60);
+
 /// How long a crossing waits, and for what: [`ACK_DEADLINE`] and
-/// [`UNANSWERED_BACKOFF`] outside tests.
+/// [`UNANSWERED_BACKOFF`] outside tests; and how long an interrupted
+/// capture waits before it starts again, [`RESTART_AFTER`].
 #[derive(Clone, Copy, Debug)]
 struct Timing {
     ack_deadline: Duration,
     unanswered_backoff: Duration,
+    restart_after: Duration,
 }
 
 impl Default for Timing {
@@ -77,7 +93,18 @@ impl Default for Timing {
         Self {
             ack_deadline: ACK_DEADLINE,
             unanswered_backoff: UNANSWERED_BACKOFF,
+            restart_after: RESTART_AFTER,
         }
+    }
+}
+
+/// The wait before an interrupted capture starts again: `restart_after`
+/// the first time, or after a capture that ran [`RAN_LONG_ENOUGH`]; double
+/// the previous wait otherwise, up to [`RESTART_AFTER_AT_MOST`].
+fn restart_wait(previous: Option<Duration>, ran: Duration, restart_after: Duration) -> Duration {
+    match previous {
+        Some(previous) if ran < RAN_LONG_ENOUGH => (previous * 2).min(RESTART_AFTER_AT_MOST),
+        _ => restart_after,
     }
 }
 
@@ -385,7 +412,13 @@ impl CaptureTask {
     }
 
     async fn run(mut self) {
+        let mut waited: Option<Duration> = None;
         loop {
+            let started = tokio::time::Instant::now();
+            // When to start again without being asked: only after the system
+            // interrupted capture for a reason that passes (#240). A missing
+            // permission waits for the permission watch or the user.
+            let mut restart_at = None;
             if let Err(e) = self.do_capture().await {
                 log::warn!("input capture exited: {e}");
                 // Declining the portal's request switches capture off. Any
@@ -396,9 +429,25 @@ impl CaptureTask {
                         .event_tx
                         .send(ICaptureEvent::CaptureFailed(fault_of(&e)));
                 }
+                let wait = match e.restart() {
+                    Some(Restart::Soon) => Some(self.timing.restart_after),
+                    Some(Restart::Backoff) => {
+                        let wait =
+                            restart_wait(waited, started.elapsed(), self.timing.restart_after);
+                        waited = Some(wait);
+                        Some(wait)
+                    }
+                    None => None,
+                };
+                if let Some(wait) = wait {
+                    log::info!("input capture starts again in {wait:?}");
+                    restart_at = Some(tokio::time::Instant::now() + wait);
+                }
             }
             loop {
                 tokio::select! {
+                    _ = tokio::time::sleep_until(restart_at.unwrap_or_else(tokio::time::Instant::now)),
+                        if restart_at.is_some() => break,
                     r = self.request_rx.recv() => match r.expect("channel closed") {
                         CaptureRequest::Reenable => break,
                         CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
@@ -1256,6 +1305,7 @@ mod release_mid_drag {
     pub(super) const PATIENT: Timing = Timing {
         ack_deadline: Duration::from_secs(3600),
         unanswered_backoff: Duration::from_secs(3600),
+        restart_after: Duration::from_millis(50),
     };
 
     /// How the receiver answers the sender.
@@ -1672,6 +1722,132 @@ mod release_mid_drag {
         });
     }
 
+    // LEDGER T2413 | class B | 2 frames received by listen::LanMouseListener
+    /// The system interrupting capture mid-drag (a screen lock while the
+    /// pointer is on the peer, a tap timing out again and again) ends the
+    /// visit like any failure, and capture then starts again by itself: the
+    /// next push at the edge crosses (#240).
+    #[test]
+    fn an_interrupted_capture_lets_go_of_the_peer_and_starts_again_on_its_own() {
+        run_local(async {
+            let mut v = Visit::start(true).await;
+            v.press(BTN_LEFT).await;
+
+            v.script.interrupt();
+
+            assert!(
+                v.leaves(1, Duration::from_secs(10)).await && v.up_before_leave(),
+                "capture was interrupted mid-drag and the peer was sent no button-up \
+                 and Leave: {:?}",
+                v.frames()
+            );
+            // Panics with "never crossed" unless capture came back by itself:
+            // nothing here asks it to.
+            v.cross(true).await;
+
+            v.capture.terminate().await;
+        });
+    }
+
+    // LEDGER T2419 | class B | 2 frames received by listen::LanMouseListener
+    /// Secure input taking the pointer back (a screen lock while it is on the
+    /// peer) restarts capture after the same short wait however often it
+    /// happens: a growing wait would leave capture off for up to a minute
+    /// after an unlock (#240).
+    #[test]
+    fn capture_after_secure_input_starts_again_without_a_growing_wait() {
+        run_local(async {
+            let restart_after = Duration::from_millis(300);
+            let mut v = Visit::start_with(
+                true,
+                Timing {
+                    restart_after,
+                    ..PATIENT
+                },
+            )
+            .await;
+            let mut waits = Vec::new();
+            for leaves in 1..=4 {
+                v.script.secure_input();
+                assert!(
+                    v.leaves(leaves, Duration::from_secs(10)).await,
+                    "secure input ended visit {leaves}, and the peer was sent no Leave: {:?}",
+                    v.frames()
+                );
+                let started = tokio::time::Instant::now();
+                v.cross(true).await;
+                waits.push(started.elapsed());
+            }
+            // Doubling from 300 ms, the fourth wait would be 2.4 s.
+            assert!(
+                waits.iter().all(|w| *w < Duration::from_millis(1500)),
+                "each restart after secure input must take the same short wait; the \
+                 waits until the pointer crossed again were {waits:?}"
+            );
+
+            v.capture.terminate().await;
+        });
+    }
+
+    // LEDGER T2416 | class B | 6 Script::releases / held after InputCapture::poll_next
+    /// A crossing for an edge no client takes reaches the stream with no
+    /// handle to deliver it to. Nothing would then see the release bind while
+    /// the backend held the pointer, so it is given back at once (#240).
+    #[test]
+    fn a_crossing_no_client_takes_is_given_back_at_once() {
+        run_local(async {
+            let script = Script::new();
+            let mut capture = InputCapture::new(Some(script.backend()))
+                .await
+                .expect("the scripted backend");
+            script.push(Position::Left, CaptureEvent::Begin);
+            let next = tokio::time::timeout(Duration::from_millis(300), capture.next()).await;
+            assert!(
+                next.is_err(),
+                "no client takes it: nothing to yield, got {next:?}"
+            );
+            assert!(
+                script.unclaimed_releases() == 1 && !script.held(),
+                "a crossing no client takes must be released at once (released: {}, \
+                 held: {})",
+                script.unclaimed_releases(),
+                script.held()
+            );
+        });
+    }
+
+    // LEDGER T2414 | class B | 2 frames received by listen::LanMouseListener
+    /// A permission taken away is not a reason that passes: capture stays
+    /// down until the permission watch or the user starts it, rather than
+    /// trying again and again without the permission.
+    #[test]
+    fn a_capture_that_lost_a_permission_does_not_start_again_on_its_own() {
+        run_local(async {
+            let mut v = Visit::start(true).await;
+            v.script.revoke(&[Permission::Accessibility]);
+            assert!(
+                v.leaves(1, Duration::from_secs(10)).await,
+                "precondition: the visit ended: {:?}",
+                v.frames()
+            );
+            let enter = ProtoEvent::Enter(hops_proto::Position::Right);
+            let entered = v.count(&enter);
+            // Ten times the wait an interrupted capture would take.
+            for _ in 0..25 {
+                v.script.push(Position::Left, CaptureEvent::Begin);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(
+                v.count(&enter),
+                entered,
+                "capture lost a permission and started again without it: {:?}",
+                v.frames()
+            );
+
+            v.capture.terminate().await;
+        });
+    }
+
     // LEDGER T16 | class B | 2 frames received by listen::LanMouseListener
     /// Switching off the client the cursor is on: nothing more is sent to it,
     /// so it must be let go first. In the service's order: the client list
@@ -1865,7 +2041,7 @@ mod a_refused_crossing {
     /// The real Ack deadline, and a backoff no loaded run outlasts.
     const REAL_DEADLINE: Timing = Timing {
         ack_deadline: ACK_DEADLINE,
-        unanswered_backoff: PATIENT.unanswered_backoff,
+        ..PATIENT
     };
 
     /// What the capture task has told the service so far.
@@ -2673,7 +2849,7 @@ mod a_refused_crossing {
             for deadline in [1, 4, 16].map(Duration::from_secs) {
                 let timing = Timing {
                     ack_deadline: deadline,
-                    unanswered_backoff: PATIENT.unanswered_backoff,
+                    ..PATIENT
                 };
                 let mut v = Visit::connect(answers, timing).await;
                 match v.cross_timed().await {
@@ -2709,6 +2885,7 @@ mod a_refused_crossing {
             let timing = Timing {
                 ack_deadline: ACK_DEADLINE,
                 unanswered_backoff: Duration::from_millis(200),
+                ..PATIENT
             };
             let mut v = Visit::start_with(false, timing).await;
             wait_until("the first crossing to be given up on", PATIENCE, || {

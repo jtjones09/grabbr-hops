@@ -11,7 +11,7 @@ use futures_core::Stream;
 
 use input_event::{Event, KeyboardEvent, scancode};
 
-pub use error::{CaptureCreationError, CaptureError, InputCaptureError, Permission};
+pub use error::{CaptureCreationError, CaptureError, InputCaptureError, Permission, Restart};
 
 pub mod error;
 
@@ -20,6 +20,11 @@ mod libei;
 
 #[cfg(target_os = "macos")]
 mod macos;
+
+/// Whether macOS lets this process install an active event tap: the check
+/// for Accessibility that does not go stale in a running process (#240).
+#[cfg(target_os = "macos")]
+pub use macos::active_tap_permitted;
 
 #[cfg(layer_shell)]
 mod layer_shell;
@@ -294,7 +299,19 @@ impl Stream for InputCapture {
             .unwrap_or(0);
 
         match len {
-            0 => Poll::Pending,
+            0 => {
+                // A crossing no client takes: no handle receives its events,
+                // so the release bind could never be seen while the backend
+                // holds the pointer. Give it back at once (#240).
+                if event == CaptureEvent::Begin {
+                    log::warn!("a crossing at the {pos} edge that no client takes: releasing it");
+                    self.capture.release_unclaimed();
+                }
+                // The backend was polled to Ready, so nothing will wake this
+                // task for its next event unless it is polled again.
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
             1 => Poll::Ready(Some(Ok((
                 self.position_map.get(&pos).expect("no id")[0],
                 event,
@@ -343,6 +360,11 @@ trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + U
 
     /// release mouse
     async fn release(&mut self) -> Result<(), CaptureError>;
+
+    /// Give the pointer back now, without waiting: a crossing reached the
+    /// stream for an edge no client takes any more. Backends that cannot
+    /// hold the pointer without a client do nothing.
+    fn release_unclaimed(&mut self) {}
 
     /// destroy the input capture
     async fn terminate(&mut self) -> Result<(), CaptureError>;

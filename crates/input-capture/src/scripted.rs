@@ -35,6 +35,8 @@ pub struct ScriptId(u64);
 enum Item {
     Event(Position, CaptureEvent),
     Fail,
+    Interrupt,
+    SecureInput,
     Revoke(Vec<Permission>),
 }
 
@@ -49,6 +51,8 @@ struct Shared {
     held: Arc<AtomicBool>,
     /// How many times the backend was told to release.
     releases: Arc<AtomicUsize>,
+    /// How many times it gave back a crossing no client took.
+    unclaimed: Arc<AtomicUsize>,
     /// The permissions the backend is refused at creation, as macOS refuses one.
     withheld: Arc<Mutex<Vec<Permission>>>,
 }
@@ -93,6 +97,11 @@ impl Script {
         self.shared.releases.load(Ordering::SeqCst)
     }
 
+    /// How many times the backend gave back a crossing no client took.
+    pub fn unclaimed_releases(&self) -> usize {
+        self.shared.unclaimed.load(Ordering::SeqCst)
+    }
+
     /// The backend to hand to `InputCapture::new`.
     pub fn backend(&self) -> Backend {
         Backend::Scripted(self.id)
@@ -107,6 +116,19 @@ impl Script {
     /// does when its event tap or portal session dies.
     pub fn fail(&self) {
         let _ = self.tx.send(Item::Fail);
+    }
+
+    /// Interrupt the backend: its stream yields the error a macOS backend
+    /// yields when the system disabled its event tap for a reason that
+    /// passes, after which capture starts again on its own.
+    pub fn interrupt(&self) {
+        let _ = self.tx.send(Item::Interrupt);
+    }
+
+    /// End the backend as secure input does when it takes the pointer back
+    /// from another machine: capture starts again after a short fixed wait.
+    pub fn secure_input(&self) {
+        let _ = self.tx.send(Item::SecureInput);
     }
 
     /// Refuse every backend created from now on for want of `missing`, as
@@ -198,6 +220,11 @@ impl Capture for ScriptedCapture {
         Ok(())
     }
 
+    fn release_unclaimed(&mut self) {
+        self.shared.held.store(false, Ordering::SeqCst);
+        self.shared.unclaimed.fetch_add(1, Ordering::SeqCst);
+    }
+
     async fn terminate(&mut self) -> Result<(), CaptureError> {
         self.shared.held.store(false, Ordering::SeqCst);
         Ok(())
@@ -221,6 +248,10 @@ impl Stream for ScriptedCapture {
                     Item::Fail => Err(CaptureError::Io(std::io::Error::other(
                         "scripted: failure requested by the test",
                     ))),
+                    Item::Interrupt => Err(CaptureError::Interrupted(
+                        "scripted: interruption requested by the test".to_string(),
+                    )),
+                    Item::SecureInput => Err(CaptureError::SecureInput),
                     Item::Revoke(missing) => Err(CaptureError::MissingPermissions(missing)),
                 })
             }),
