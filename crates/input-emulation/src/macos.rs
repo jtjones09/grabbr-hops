@@ -446,8 +446,24 @@ fn request_macos_emulation_permissions() -> Result<(), MacOSEmulationCreationErr
     // Request both permissions up front so the user sees both TCC prompts
     // on the first launch. See the matching comment in crates/input-capture/src/
     // macos.rs::request_macos_capture_permissions for the rationale.
-    let accessibility = request_accessibility_permission();
-    let input_control = request_input_control_permission();
+    //
+    // The prompt's own answer can be stale in a running process, which is
+    // where emulation starts again after a failure (#240). The probe tap is
+    // asked afresh and decides; posting events is granted with it, as the
+    // daemon's permission watch reads it.
+    let trusted = request_accessibility_permission();
+    let accessibility = input_event::accessibility::active_tap_permitted();
+    if trusted != accessibility {
+        log::debug!(
+            "Accessibility: probe tap {}, AXIsProcessTrusted says {trusted}",
+            if accessibility {
+                "permitted"
+            } else {
+                "refused"
+            }
+        );
+    }
+    let input_control = request_input_control_permission() || accessibility;
 
     if !accessibility {
         guide_to_settings();

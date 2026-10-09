@@ -66,7 +66,9 @@ impl Daemon {
     ) -> Self {
         let mut daemon = Self::build(tag, tables, capture, emulation).await;
         daemon.service.permission_watch = crate::permission_watch::PermissionWatch::at_daemon_start(
-            Arc::new(|_| false),
+            // Everything granted: nothing waits for a grant, and emulation
+            // that runs never loses one.
+            Arc::new(|_| true),
             Arc::new(|| false),
             Duration::from_secs(3600),
         );
@@ -100,7 +102,9 @@ impl Daemon {
         )
         .await;
         daemon.service.permission_watch = crate::permission_watch::PermissionWatch::at_daemon_start(
-            Arc::new(|_| false),
+            // Everything granted: nothing waits for a grant, and emulation
+            // that runs never loses one.
+            Arc::new(|_| true),
             Arc::new(|| false),
             Duration::from_secs(3600),
         );
@@ -155,7 +159,9 @@ impl Daemon {
         )
         .await;
         daemon.service.permission_watch = crate::permission_watch::PermissionWatch::at_daemon_start(
-            Arc::new(|_| false),
+            // Everything granted: nothing waits for a grant, and emulation
+            // that runs never loses one.
+            Arc::new(|_| true),
             Arc::new(|| false),
             Duration::from_secs(3600),
         );

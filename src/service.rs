@@ -11,7 +11,7 @@ use crate::{
     enter_hook,
     hop_log::Lifecycle,
     listen::{ClipboardSenderListen, LanMouseListener, ListenerCreationError},
-    permission_watch::{AfterGrant, PermissionWatch, Side},
+    permission_watch::{AfterGrant, Change, Permission, PermissionWatch, Side},
     prompt_gate::{Admit, PromptGate},
 };
 use futures::StreamExt;
@@ -1174,12 +1174,17 @@ impl Service {
                 _ = tokio::time::sleep_until(
                     self.removal_check.unwrap_or_else(tokio::time::Instant::now)
                 ), if self.removal_check.is_some() => self.check_removals(),
-                after = self.permission_watch.granted() => {
-                    if let Some(granted) = self.after_permission_granted(after) {
-                        restart_for = Some(granted);
-                        break;
+                change = self.permission_watch.changed() => match change {
+                    Change::Granted(after) => {
+                        if let Some(granted) = self.after_permission_granted(after) {
+                            restart_for = Some(granted);
+                            break;
+                        }
                     }
-                }
+                    Change::Revoked { side, missing } => {
+                        self.after_permission_revoked(side, &missing)
+                    }
+                },
                 why = stop.next() => {
                     log::info!("{why} received");
                     break;
@@ -1238,6 +1243,21 @@ impl Service {
                 )));
                 None
             }
+        }
+    }
+
+    /// macOS took a permission from a side that runs (#240). Emulation
+    /// stops, so that it reports the permission to grant rather than keep a
+    /// backend whose events macOS drops without a word. Capture stops on its
+    /// own, from its backend's check, and is never reported here.
+    fn after_permission_revoked(&mut self, side: Side, missing: &[Permission]) {
+        log::warn!(
+            "macOS no longer grants hops {}; {side} stops until it is granted again",
+            crate::permission_watch::named(missing)
+        );
+        if side == Side::Emulation {
+            self.emulation
+                .stop_for_missing(vec![input_emulation::Permission::Accessibility]);
         }
     }
 

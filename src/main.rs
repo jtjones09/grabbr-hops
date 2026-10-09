@@ -54,6 +54,12 @@ fn main() {
             eprintln!("{e}");
             process::exit(1);
         }
+        // A grant ends the daemon on purpose, so that launchd starts it again
+        // with the grant (#221): the exit is unsuccessful, the event normal.
+        Err(e @ HopsError::Service(ServiceError::PermissionGranted(_))) => {
+            log::info!("{e}");
+            process::exit(1);
+        }
         Err(e) => {
             log::error!("{e}");
             process::exit(1);

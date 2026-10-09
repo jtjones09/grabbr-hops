@@ -67,9 +67,10 @@ async fn daemon(tag: &str, script: &Script, port: u16) -> (Service, Scratch) {
     )
     .await
     .expect("a daemon in the scratch directory");
-    // Not this machine's permissions: nothing here is about them.
+    // Not this machine's permissions: nothing here is about them. Everything
+    // granted, so nothing waits for a grant and nothing that runs loses one.
     service.permission_watch = PermissionWatch::at_daemon_start(
-        Arc::new(|_| false),
+        Arc::new(|_| true),
         Arc::new(|| false),
         Duration::from_secs(3600),
     );

@@ -196,6 +196,8 @@ pub(crate) enum EmulationEvent {
 
 enum EmulationRequest {
     Reenable,
+    /// The system took these permissions while emulation ran (#240).
+    StopForMissing(Vec<input_emulation::Permission>),
     Release(SocketAddr),
     ChangePort(u16),
     Terminate,
@@ -257,6 +259,16 @@ impl Emulation {
     pub(crate) fn reenable(&self) {
         self.request_tx
             .send(EmulationRequest::Reenable)
+            .expect("channel closed");
+    }
+
+    /// The system no longer grants `missing`, and what emulation posts is
+    /// dropped without a word (#240). Emulation stops at once, letting go of
+    /// nothing more, and reports them as missing; it starts again only when
+    /// asked, as after any failure.
+    pub(crate) fn stop_for_missing(&self, missing: Vec<input_emulation::Permission>) {
+        self.request_tx
+            .send(EmulationRequest::StopForMissing(missing))
             .expect("channel closed");
     }
 
@@ -560,6 +572,7 @@ impl ListenTask {
                 request = self.request_rx.recv() => match request.expect("channel closed") {
                     // reenable emulation
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
+                    EmulationRequest::StopForMissing(missing) => self.emulation_proxy.stop_for_missing(missing),
                     // notify the other end that we hit a barrier (should release capture)
                     EmulationRequest::Release(addr) => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
                     EmulationRequest::ChangePort(port) => {
@@ -638,6 +651,8 @@ enum ProxyRequest {
     Remove(SocketAddr),
     Terminate,
     Reenable,
+    /// End the session: the system no longer grants these.
+    StopForMissing(Vec<input_emulation::Permission>),
 }
 
 /// Diagnostic counters for the network→injection queue: input events enqueued
@@ -760,6 +775,14 @@ impl EmulationProxy {
     fn reenable(&self) {
         self.request_tx
             .send(ProxyRequest::Reenable)
+            .expect("channel closed");
+    }
+
+    /// Nothing more is queued from here; the session ends with `missing`.
+    fn stop_for_missing(&self, missing: Vec<input_emulation::Permission>) {
+        self.emulation_active.replace(false);
+        self.request_tx
+            .send(ProxyRequest::StopForMissing(missing))
             .expect("channel closed");
     }
 
@@ -957,7 +980,9 @@ impl EmulationTask {
                     ProxyRequest::Terminate => return,
                     // emulation inactive => drop, but keep the backlog counter honest
                     ProxyRequest::Input(..) => self.metrics.on_inject(),
-                    ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::Remove(..) | ProxyRequest::StopForMissing(..) => {
+                        /* emulation inactive => ignore */
+                    }
                 }
             }
         }
@@ -1059,8 +1084,8 @@ impl EmulationTask {
             for _ in 0..SORT_BATCH {
                 match self.request_rx.recv().now_or_never() {
                     Some(request) => {
-                        if self.sort(request.expect("channel closed")) {
-                            return Ok(());
+                        if let Some(end) = self.sort(request.expect("channel closed")) {
+                            return end;
                         }
                     }
                     None => break,
@@ -1160,8 +1185,8 @@ impl EmulationTask {
                     }
                 }
                 e = self.request_rx.recv() => {
-                    if self.sort(e.expect("channel closed")) {
-                        break Ok(());
+                    if let Some(end) = self.sort(e.expect("channel closed")) {
+                        break end;
                     }
                 }
             }
@@ -1176,8 +1201,10 @@ impl EmulationTask {
         self.driven.let_go(was_held, emulation.holds_anything());
     }
 
-    /// File one request into its peer's queue. True for `Terminate`.
-    fn sort(&mut self, request: ProxyRequest) -> bool {
+    /// File one request into its peer's queue. `Some` with how the session
+    /// ends, for `Terminate` and `StopForMissing`: what is still queued is
+    /// then dropped, not injected.
+    fn sort(&mut self, request: ProxyRequest) -> Option<Result<(), InputEmulationError>> {
         match request {
             ProxyRequest::Input(event, addr, peer) => {
                 let (merged, waiting) = self.queued.push(addr, Queued::Input(event, peer));
@@ -1189,14 +1216,17 @@ impl EmulationTask {
                 if waiting >= PEER_QUEUE_LIMIT {
                     self.pressure.hold(addr);
                 }
-                false
+                None
             }
             ProxyRequest::Remove(addr) => {
                 self.queued.push(addr, Queued::Remove);
-                false
+                None
             }
-            ProxyRequest::Terminate => true,
-            ProxyRequest::Reenable => false,
+            ProxyRequest::Terminate => Some(Ok(())),
+            ProxyRequest::Reenable => None,
+            ProxyRequest::StopForMissing(missing) => {
+                Some(Err(InputEmulationError::Revoked(missing)))
+            }
         }
     }
 }
@@ -1226,6 +1256,7 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
             ProxyRequest::Input(..) => continue,
             ProxyRequest::Remove(_) => continue,
             ProxyRequest::Reenable => continue,
+            ProxyRequest::StopForMissing(_) => continue,
         }
     }
 }
@@ -3225,6 +3256,59 @@ mod held_input_is_released {
                 "the left button was released at the Leave, and the peer's late \
                  up was injected as a second one: {:?}",
                 s.recording.calls()
+            );
+        });
+    }
+
+    // LEDGER T2436 | class B | 1 Emulation::event + 6 Recording::calls() after Emulation::stop_for_missing
+    /// macOS took Accessibility while a peer drives this machine. What
+    /// emulation posts from then on is dropped without an error, so it must
+    /// stop, report the permission, and inject nothing the peer sends after
+    /// (#240).
+    #[test]
+    fn emulation_stopped_for_a_missing_permission_says_so_and_injects_nothing_more() {
+        run_local(async {
+            let mut s = session().await;
+            s.inject(key(KEY_A, 1)).await;
+            s.inject(key(KEY_A, 0)).await;
+
+            s.emulation
+                .stop_for_missing(vec![input_emulation::Permission::Accessibility]);
+            let reported = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let EmulationEvent::EmulationFailed(fault) = s.emulation.event().await {
+                        return fault;
+                    }
+                }
+            })
+            .await;
+            // The peer may already have been told emulation is off, and
+            // refuse to send: either way nothing may reach the backend.
+            for event in [key(KEY_B, 1), key(KEY_B, 0)] {
+                let _ = s
+                    .dialer()
+                    .conn
+                    .send(ProtoEvent::Input(event), s.dialer().handle)
+                    .await;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            let injected_after: Vec<Event> = [key(KEY_B, 1), key(KEY_B, 0)]
+                .into_iter()
+                .filter(|&e| !s.consumed(e).is_empty())
+                .collect();
+            assert_eq!(
+                (reported.ok(), injected_after),
+                (
+                    Some(hops_ipc::EmulationFault::Missing(vec![
+                        hops_ipc::Permission::Accessibility
+                    ])),
+                    vec![]
+                ),
+                "(what emulation reported, what the peer sent after the stop that \
+                 reached the backend). It must report the permission macOS took, which \
+                 puts the banner up in the app (None: no failure reported), and inject \
+                 nothing more"
             );
         });
     }
