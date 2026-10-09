@@ -35,6 +35,7 @@ pub struct ScriptId(u64);
 enum Item {
     Event(Position, CaptureEvent),
     Fail,
+    Interrupt,
     Revoke(Vec<Permission>),
 }
 
@@ -107,6 +108,13 @@ impl Script {
     /// does when its event tap or portal session dies.
     pub fn fail(&self) {
         let _ = self.tx.send(Item::Fail);
+    }
+
+    /// Interrupt the backend: its stream yields the error a macOS backend
+    /// yields when the system disabled its event tap for a reason that
+    /// passes, after which capture starts again on its own.
+    pub fn interrupt(&self) {
+        let _ = self.tx.send(Item::Interrupt);
     }
 
     /// Refuse every backend created from now on for want of `missing`, as
@@ -221,6 +229,9 @@ impl Stream for ScriptedCapture {
                     Item::Fail => Err(CaptureError::Io(std::io::Error::other(
                         "scripted: failure requested by the test",
                     ))),
+                    Item::Interrupt => Err(CaptureError::Interrupted(
+                        "scripted: interruption requested by the test".to_string(),
+                    )),
                     Item::Revoke(missing) => Err(CaptureError::MissingPermissions(missing)),
                 })
             }),

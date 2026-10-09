@@ -68,6 +68,11 @@ pub enum CaptureError {
     /// The OS took away a permission capture needs while it ran (#79).
     #[error("{}", Permission::sentence(.0))]
     MissingPermissions(Vec<Permission>),
+    /// The system stopped capture for a reason that passes, such as a
+    /// screen lock or an event tap disabled too often; capture starts again
+    /// on its own after a delay (#240).
+    #[error("input capture was interrupted ({0}); it starts again shortly")]
+    Interrupted(String),
 }
 
 /// An OS permission capture needs, named as macOS lists it under System
@@ -135,6 +140,13 @@ impl InputCaptureError {
     /// it off rather than a failure.
     pub fn cancelled_by_user(&self) -> bool {
         matches!(self, Self::Create(e) if e.cancelled_by_user())
+    }
+
+    /// Whether capture ended for a reason that passes, so it should be
+    /// started again without the user asking. A missing permission is not
+    /// one: the permission watch picks up its grant.
+    pub fn restarts_on_its_own(&self) -> bool {
+        matches!(self, Self::Capture(CaptureError::Interrupted(_)))
     }
 }
 

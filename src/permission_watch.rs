@@ -324,6 +324,30 @@ impl PermissionWatch {
     }
 }
 
+/// Whether `permission` is granted, from macOS's preflight checks and the
+/// active-tap probe (`tap`).
+///
+/// `AXIsProcessTrusted` and the `CGPreflight*` checks can keep their first
+/// answer for the life of a running process on macOS 27, so a grant made in
+/// System Settings went unseen until a manual restart (#240). Whether
+/// macOS lets the process create an active event tap is asked afresh each
+/// time, and it does only with Accessibility. So it answers Accessibility,
+/// and posting events, which Accessibility grants, is granted when either
+/// says so. Input Monitoring has no such probe: a listen-only tap is let
+/// through by Accessibility too.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn answer(
+    permission: Permission,
+    preflight: impl Fn(Permission) -> bool,
+    tap: impl Fn() -> bool,
+) -> bool {
+    match permission {
+        Permission::Accessibility => tap(),
+        Permission::PostEvents => preflight(Permission::PostEvents) || tap(),
+        Permission::InputMonitoring => preflight(Permission::InputMonitoring),
+    }
+}
+
 /// The silent checks the capture and emulation backends make.
 #[cfg(target_os = "macos")]
 mod tcc {
@@ -341,9 +365,10 @@ mod tcc {
         fn CGPreflightPostEventAccess() -> bool;
     }
 
-    pub(super) fn granted(permission: Permission) -> bool {
+    /// What the preflight checks say. None raises a prompt.
+    fn preflight(permission: Permission) -> bool {
         // SAFETY: each takes no arguments and only reads this process's
-        // permission; none raises a prompt.
+        // permission.
         unsafe {
             match permission {
                 Permission::Accessibility => AXIsProcessTrusted() != 0,
@@ -351,6 +376,16 @@ mod tcc {
                 Permission::PostEvents => CGPreflightPostEventAccess(),
             }
         }
+    }
+
+    pub(super) fn granted(permission: Permission) -> bool {
+        let granted = super::answer(permission, preflight, input_capture::active_tap_permitted);
+        log::debug!(
+            "permission watch: {permission:?} {}; preflight says {}",
+            if granted { "granted" } else { "missing" },
+            preflight(permission)
+        );
+        granted
     }
 }
 
@@ -360,7 +395,7 @@ mod a_grant_made_while_the_daemon_runs {
     //! with a generous deadline; what must not is watched for a window that
     //! holds many checks.
 
-    use super::{AfterGrant, Permission, PermissionWatch, Side};
+    use super::{AfterGrant, Permission, PermissionWatch, Side, answer};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -624,6 +659,45 @@ mod a_grant_made_while_the_daemon_runs {
             released.load(Ordering::SeqCst),
             "a permission check held the daemon's loop: no other task ran while \
              it waited"
+        );
+    }
+    // LEDGER T2412 | class B | 1 return value of PermissionWatch::granted over answer()
+    /// macOS 27 left every preflight check at its first answer in a running
+    /// daemon: Accessibility granted in System Settings was never seen (#240).
+    /// The tap probe sees it.
+    #[test]
+    fn a_grant_the_preflight_checks_never_see_is_seen_by_the_tap_probe() {
+        let tap = Arc::new(AtomicBool::new(false));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let probe = {
+            let (tap, asked) = (tap.clone(), asked.clone());
+            Arc::new(move |p| {
+                asked.fetch_add(1, Ordering::SeqCst);
+                // Stale: every preflight check still says no.
+                answer(p, |_| false, || tap.load(Ordering::SeqCst))
+            })
+        };
+        let mut watch = PermissionWatch::new(probe, Arc::new(|| true), EVERY);
+        watch.stopped(Side::Emulation);
+        let got = runtime().block_on(async {
+            let (granter, asked) = (tap.clone(), asked.clone());
+            tokio::spawn(async move {
+                while asked.load(Ordering::SeqCst) < 6 {
+                    tokio::time::sleep(EVERY).await;
+                }
+                granter.store(true, Ordering::SeqCst);
+            });
+            tokio::time::timeout(DEADLINE, watch.granted()).await
+        });
+        assert_eq!(
+            got,
+            Ok(AfterGrant::Exit(vec![
+                Permission::Accessibility,
+                Permission::PostEvents
+            ])),
+            "Accessibility was granted while the daemon ran and the preflight checks \
+             never said so. The tap probe must answer, so launchd restarts the daemon \
+             with the grant (Err(Elapsed): never noticed)"
         );
     }
 }
