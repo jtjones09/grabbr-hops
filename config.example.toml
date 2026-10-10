@@ -3,11 +3,25 @@
 # configure release bind
 release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
 
-# optional port (defaults to 4242)
-port = 4242
+# optional port (defaults to 4722; hops before v0.13 used 4242, and a
+# machine still set to 4242 is not reached by one that dials 4722)
+# port = 4722
 
-# list of authorized tls certificate fingerprints that
-# are accepted for incoming traffic
+# optional: set to false so that this machine listens on no port. It is
+# controlled over the connection it opens to each machine that controls
+# it, which it does whether or not it listens, so a machine behind a VPN
+# or security client that drops incoming connections works either way.
+# listen = false
+
+# optional: set to false to stop announcing this machine on the local
+# network (its hostname, addresses and key fingerprint) and looking for
+# others; devices are then added by address. See docs/NETWORK.md.
+# discovery = false
+
+# the machines allowed to control this one, written by hops as a record.
+# Adding a line trusts nothing: pairings are kept in a signed trust file
+# beside this one. Removing a line removes that machine here too. A list
+# written by hops 0.12 shows each machine as one to pair again.
 [authorized_fingerprints]
 "bc:05:ab:7a:a4:de:88:8c:2f:92:ac:bc:b8:49:b8:24:0d:44:b3:e6:a4:ef:d7:0b:6c:69:6d:77:53:0b:14:80" = "iridium"
 
@@ -17,10 +31,18 @@ port = 4242
 position = "right"
 # hostname
 hostname = "iridium"
+# optional: what the device is called, apart from where it is dialled
+label = "studio"
 # activate this client immediately when hops is started
 activate_on_startup = true
 # optional list of (known) ip addresses
 ips = ["192.168.178.156"]
+# optional: a program to run, with its arguments, each time the pointer
+# crosses to this device. It is run directly, not through a shell, so `;`,
+# pipes, globs and variables are passed to it as they are; name a shell to
+# use them, as in "sh -c 'date >> ~/crossings.log'". It runs as you, and not
+# at all when hops itself runs as an administrator or root.
+# enter_hook = "notify-send hops 'entered iridium'"
 
 # define a client on the left side with IP address 192.168.178.189
 [[clients]]
@@ -30,5 +52,5 @@ position = "left"
 hostname = "thorium"
 # ips for ethernet and wifi
 ips = ["192.168.178.189", "192.168.178.172"]
-# optional port
-port = 4242
+# optional port (defaults to 4722)
+# port = 4722

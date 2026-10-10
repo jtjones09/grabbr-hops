@@ -10,7 +10,8 @@
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.grabbr.hops.plist
 
   IMPORTANT — one-time interactive grant: macOS input emulation requires an
-  Accessibility permission (System Settings → Privacy & Security → Accessibility)
+  Accessibility permission (System Settings → Privacy & Security → Accessibility,
+  called Device Control and Data Access on macOS 27)
   that can only be granted from a logged-in session; it can't be pre-granted on a
   truly headless box. Grant it once for the hops binary, and it persists across
   reboots (bound to the binary's code signature — keep a stable codesign identity).
@@ -34,6 +35,9 @@
     <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
     <key>ThrottleInterval</key><integer>10</integer>
     <key>ProcessType</key><string>Interactive</string>
+    <!-- Lists the job under hops in System Settings → Login Items. -->
+    <key>AssociatedBundleIdentifiers</key>
+    <array><string>com.grabbr.hops</string></array>
     <key>EnvironmentVariables</key>
     <dict><key>HOPS_LOG_LEVEL</key><string>info</string></dict>
     <key>StandardOutPath</key><string>/tmp/hops-daemon.log</string>

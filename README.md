@@ -20,7 +20,11 @@ part of the **grabbr** suite · repo: **grabbr-hops** · a fork of
   (quinn + rustls). Peers are pinned by public-key fingerprint, so only machines
   you've explicitly paired can connect (see [Security](#security)).
 - **Explicit pairing** — a new machine shows up as a pairing request with its
-  fingerprint; you name it and approve it once, and the trust persists.
+  fingerprint, and only while add device is open; you approve it on both
+  machines, saying which machine controls which and whether to share the
+  clipboard (off unless you say so), then compare a six-digit number (the
+  machine you added from shows it, the other picks it from three), and the
+  trust persists.
 - **Three ways to drive it** — a native **GUI**, a **terminal UI** for SSH /
   keyboard-driven use, and a **system-tray** icon; all attach to the same
   background daemon.
@@ -54,12 +58,14 @@ you want to share the keyboard & mouse across.
 | OS | File |
 | --- | --- |
 | macOS (Intel + Apple Silicon) | `hops-macos-universal.dmg` — open it, drag **hops** to Applications |
-| macOS (CLI / headless) | `hops-macos-universal.tar.gz` — just the `hops` binary |
+| macOS (CLI / headless) | `hops-macos-universal.tar.gz` — the `hops` binary, with its licence and notices |
 | Windows | `hops-windows-x86_64.zip` |
-| Linux (terminal UI + daemon) | `hops-linux-x86_64.tar.gz` |
+| Linux (terminal UI + daemon) | `hops-linux-x86_64.tar.gz` — with `com.grabbr.hops.desktop`, which lets the input consent prompt name hops ([UPGRADING.md](docs/UPGRADING.md#linux)) |
+
+Each archive also holds `LICENSE`, `THIRD-PARTY-NOTICES.txt` and an SBOM. To check a download, see [Verifying a release](SECURITY.md#verifying-a-release).
 
 First-launch notes:
-- **macOS** — the `.dmg` is **signed & notarized by Apple**, so it opens with no Gatekeeper warning. On first run, switch **hops** on under System Settings → Privacy & Security → **Accessibility** (it can't move your cursor without it). *(The bare `.tar.gz` CLI binary is unsigned — right-click it → **Open** the first time.)*
+- **macOS** — the `.dmg` is **signed & notarized by Apple**, so it opens with no Gatekeeper warning. On first run, switch **hops** on under System Settings → Privacy & Security, in **Accessibility** (called **Device Control and Data Access** on macOS 27; to move the cursor), **Input Monitoring** (to control other machines from this Mac; hops asks when you turn input on) and **Local Network** (to find your other machines). Keep **hops** switched on under System Settings → General → **Login Items & Extensions** → **Allow in the Background**, so it starts when you log in. *(The bare `.tar.gz` CLI binary is unsigned — right-click it → **Open** the first time.)*
 - **Windows** — not code-signed yet, so SmartScreen shows a **one-time** warning: click **More info → Run anyway**, and allow it on your **private** network if the firewall asks.
 
 <details>
@@ -77,7 +83,10 @@ On **Windows**: `powershell -ExecutionPolicy Bypass -File .\install.ps1`
 That builds hops and starts it in your menu bar / system tray at login. Or just
 build and run the binary directly:
 ```sh
+# macOS / Windows
 cargo build --release --no-default-features --features "tui slint"
+# Linux: the input backends are features, so name them (or keep the defaults)
+cargo build --release --no-default-features --features "tui libei_capture libei_emulation layer_shell_capture wlroots_emulation x11_capture x11_emulation rdp_emulation"
 ./target/release/hops           # hops.exe on Windows
 ```
 </details>
@@ -85,18 +94,26 @@ cargo build --release --no-default-features --features "tui slint"
 ## Connect two machines
 
 1. Both machines are running hops now.
-2. On one, open the window (click the tray icon) → **+ add** the other machine:
-   its IP address and which screen edge it sits on (left/right/top/bottom).
-3. The first connection shows a **pairing request** with a fingerprint — name it
-   and hit **trust & name**. Just once per pair.
-4. Move your cursor off that edge — it hops over. Keyboard, scroll, and modifier
+2. On both, open **+ add**: a machine shows a pairing request only for two
+   minutes after add was opened on it. On one, add the other machine: its IP
+   address and which screen edge it sits on (left/right/top/bottom).
+3. Each machine shows a **pairing request** with a fingerprint. On both, choose
+   which machine is in control (this one, that one, or both) and whether to
+   share the clipboard, name it, and hit **trust & name**.
+4. The machine you added from shows a six-digit number; the other asks which of
+   three numbers it sees. Pick it there and **confirm** here. A wrong pick ends
+   the attempt and nothing is trusted. Just once per pair.
+5. Move your cursor off that edge — it hops over. Keyboard, scroll, and modifier
    keys follow.
+
+Upgrading from 0.12? Update every machine and pair each again: see
+[docs/UPGRADING.md](docs/UPGRADING.md).
 
 ## Other ways to run it
 
 - **Terminal UI** (keyboard-driven, great over SSH): `hops tui`.
-- **Headless / servers** (no GUI, controlled over the network): build with
-  `--no-default-features` and use the service units + guide in
+- **Headless / servers** (no GUI, controlled over the network): build without
+  `slint` and use the service units + guide in
   [service/README.md](service/README.md).
 - **Linux backends / advanced:** input capture & emulation backends are cargo
   features (`layer_shell_capture`, `x11_capture`, `libei_*`, …) — see `Cargo.toml`.
@@ -141,9 +158,23 @@ usual.
 - **Identity:** each machine holds a self-signed keypair; peers are verified by
   the **fingerprint of the public key**, not by a CA. rustls' certificate check
   is delegated to fingerprint pinning, so a machine is trusted only after you
-  approve its fingerprint (trust on first use, with explicit consent).
+  approve its fingerprint on both machines and confirm the number both arrive
+  at, which is bound to that connection's TLS session (trust on first use,
+  with explicit consent). A machine in the middle would show a different
+  number; the number does not vouch for the machine you chose to add.
 - **No cloud, no accounts:** machines connect directly over your LAN. There is no
   relay and no telemetry.
+- **Network:** UDP 4722 between machines, and multicast DNS to find them.
+  Which machine connects to which, and how to turn listening and discovery
+  off, are in [docs/NETWORK.md](docs/NETWORK.md). A machine behind a VPN or
+  security client that drops incoming connections can dial out instead:
+  [docs/MANAGED-MAC.md](docs/MANAGED-MAC.md).
+- **Removal:** removing a device ends its pairing at once and tells it if it is
+  connected. hops keeps no record of it; to use it again, pair again.
+
+What pairing cannot protect against, such as another program running as your
+user, and how to remove a lost machine or recover one that no longer connects,
+are in [docs/SECURITY.md](docs/SECURITY.md).
 
 Trust, config, and the keypair live in `~/.config/lan-mouse/` (Linux/macOS) or
 `%LOCALAPPDATA%\lan-mouse\` (Windows).
@@ -159,4 +190,6 @@ what this fork changes are in [NOTICE.md](NOTICE.md). All original copyright is
 preserved in the git history.
 
 Licensed under the **GNU General Public License v3.0 or later** — see
-[LICENSE](LICENSE).
+[LICENSE](LICENSE). Builds with the graphical interface include Slint, used
+under GPL-3.0-only, so those binaries are distributed under GPL-3.0 only (see
+[NOTICE.md](NOTICE.md)).

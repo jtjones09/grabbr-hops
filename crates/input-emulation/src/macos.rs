@@ -68,9 +68,6 @@ pub(crate) struct MacOSEmulation {
     vm_guest_cache: Cell<Option<(Instant, bool)>>,
     /// Last focused-window owner name we logged, so we log only on change.
     last_owner: RefCell<Option<String>>,
-    /// IOPMAssertion id that keeps this Mac from idle-sleeping while it is the
-    /// receiver (an asleep Mac is unreachable over the KVM). None if not held.
-    power_assertion: Option<u32>,
     /// Reusable IOPMAssertionDeclareUserActivity id (0 = none yet) — wakes the
     /// display on incoming remote input (synthetic CGEvents alone don't wake it).
     user_activity_id: Cell<u32>,
@@ -126,7 +123,7 @@ unsafe impl Send for MacOSEmulation {}
 
 impl MacOSEmulation {
     pub(crate) fn new() -> Result<Self, MacOSEmulationCreationError> {
-        request_macos_emulation_permissions()?;
+        check_macos_emulation_permissions()?;
 
         let event_source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .map_err(|_| MacOSEmulationCreationError::EventSourceCreation)?;
@@ -152,7 +149,6 @@ impl MacOSEmulation {
             hid_modifiers,
             vm_guest_cache: Cell::new(None),
             last_owner: RefCell::new(None),
-            power_assertion: create_power_assertion(),
             user_activity_id: Cell::new(0),
             last_user_activity: Cell::new(None),
             edge_pressure: EdgePressureDetector::from_env(),
@@ -443,63 +439,85 @@ impl Drop for MacOSEmulation {
         if let Some(connect) = self.hid_connect {
             unsafe { IOServiceClose(connect) };
         }
-        // Release the power assertion so the Mac can sleep normally again.
-        if let Some(id) = self.power_assertion {
-            unsafe { IOPMAssertionRelease(id) };
-        }
     }
 }
 
-fn request_macos_emulation_permissions() -> Result<(), MacOSEmulationCreationError> {
-    // Request both permissions up front so the user sees both TCC prompts
-    // on the first launch. See the matching comment in crates/input-capture/src/
-    // macos.rs::request_macos_capture_permissions for the rationale.
-    let accessibility = request_accessibility_permission();
-    let input_control = request_input_control_permission();
+fn check_macos_emulation_permissions() -> Result<(), MacOSEmulationCreationError> {
+    let result = emulation_permissions(
+        &input_event::accessibility::GATE,
+        accessibility_trusted,
+        input_event::accessibility::create_active_tap,
+        request_input_control_permission,
+    );
+    if result.is_err() {
+        report_missing();
+    }
+    result
+}
 
+/// Whether emulation may start: Accessibility through `gate`, posting
+/// events by `post` or by Accessibility, which grants it.
+///
+/// Every check is silent. `trusted` is handed the prompt option, always
+/// false: under launchd macOS shows the daemon no prompt, so the app asks
+/// instead, when the user clicks enable input (#243). While `gate` is
+/// closed its answer decides and no tap is created, since creating one
+/// without Accessibility can raise macOS's dialog before the user has
+/// asked (#243). Once open, the probe tap `tap` creates decides: `trusted`
+/// can be stale in a running process, which is where emulation starts
+/// again after a failure (#240); it is logged beside the probe when they
+/// disagree.
+fn emulation_permissions(
+    gate: &input_event::accessibility::Gate,
+    trusted: impl FnOnce(bool) -> bool,
+    tap: impl FnOnce(u64) -> bool,
+    post: impl FnOnce() -> bool,
+) -> Result<(), MacOSEmulationCreationError> {
+    let trusted = trusted(false);
+    let accessibility = gate.accessibility("emulation", || trusted, tap);
+    if trusted != accessibility {
+        log::debug!(
+            "Accessibility: probe tap {}, AXIsProcessTrusted says {trusted}",
+            if accessibility {
+                "permitted"
+            } else {
+                "refused"
+            }
+        );
+    }
+    let input_control = post() || accessibility;
     if !accessibility {
-        guide_to_settings();
         return Err(MacOSEmulationCreationError::AccessibilityPermission);
     }
     if !input_control {
-        guide_to_settings();
         return Err(MacOSEmulationCreationError::InputControlPermission);
     }
     Ok(())
 }
 
-/// On a missing grant, print an actionable message naming the exact binary and
-/// open the right System Settings pane — once per process. A backgrounded CLI's
-/// TCC dialog is unreliable, so we steer the user straight to the toggle instead
-/// of relying on a prompt that may never surface.
-fn guide_to_settings() {
+/// On a missing grant, name the list and the exact binary, once per
+/// process. Nothing is opened from here: the daemon runs in the background,
+/// so the app asks macOS and opens System Settings when the user acts
+/// (#243).
+fn report_missing() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         let exe = std::env::current_exe()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "the hops binary".into());
-        log::error!("──────────────────────────────────────────────────────────");
-        log::error!("hops can't inject input: a macOS permission is missing.");
-        log::error!("Enable BOTH for this exact binary, then re-run the launcher:");
-        log::error!("  • Accessibility");
-        log::error!("  • Input Monitoring");
-        log::error!("  binary: {exe}");
-        log::error!("Opening System Settings → Privacy & Security → Accessibility…");
-        log::error!("──────────────────────────────────────────────────────────");
-        if let Ok(mut child) = std::process::Command::new("open")
-            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
-            .spawn()
-        {
-            let _ = child.wait(); // reap; `open` hands off to launchd and exits promptly
-        }
+        let pane = input_event::settings_pane::accessibility();
+        log::warn!(
+            "hops can't inject input: macOS does not grant it {pane}. Click enable input \
+             in the hops app, or turn hops on under System Settings → Privacy & Security \
+             → {pane}; binary: {exe}"
+        );
     });
 }
 
-fn request_accessibility_permission() -> bool {
-    // Fire the one-time system Accessibility prompt if not yet granted, then
-    // return the current trust state. Ported from the GUI's macos_privacy so a
-    // headless / TUI daemon is self-granting — there's no GUI to own the prompt.
+/// `AXIsProcessTrustedWithOptions` with `kAXTrustedCheckOptionPrompt` set
+/// to `prompt`: whether this process has Accessibility.
+fn accessibility_trusted(prompt: bool) -> bool {
     use core_foundation::base::TCFType;
     use core_foundation::boolean::CFBoolean;
     use core_foundation::dictionary::CFDictionary;
@@ -507,7 +525,7 @@ fn request_accessibility_permission() -> bool {
     // kAXTrustedCheckOptionPrompt == CFSTR("AXTrustedCheckOptionPrompt")
     let key = CFString::from_static_string("AXTrustedCheckOptionPrompt");
     let options =
-        CFDictionary::from_CFType_pairs(&[(key.as_CFType(), CFBoolean::true_value().as_CFType())]);
+        CFDictionary::from_CFType_pairs(&[(key.as_CFType(), CFBoolean::from(prompt).as_CFType())]);
     // SAFETY: `options` outlives the synchronous call. Normalize the `Boolean`
     // (u8) result with != 0 — materializing a non-canonical byte as Rust `bool` is UB.
     unsafe { AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef() as *const c_void) != 0 }
@@ -606,16 +624,6 @@ extern "C" {
         event_flags: u32,
         options: u32,
     ) -> i32;
-    // Power management: hold an assertion so this Mac doesn't idle-sleep while it
-    // is the KVM receiver — an asleep Mac suspends this process and is unreachable
-    // over the network until a hardware wake (lid-lift).
-    fn IOPMAssertionCreateWithName(
-        assertion_type: core_foundation::string::CFStringRef,
-        level: u32,
-        name: core_foundation::string::CFStringRef,
-        assertion_id: *mut u32,
-    ) -> i32;
-    fn IOPMAssertionRelease(assertion_id: u32) -> i32;
     // Wake the display + reset the idle-sleep timer on incoming remote input.
     // Synthetic CGEvents deliver input to the system but do NOT wake a sleeping
     // display — only real HID activity or this call does.
@@ -628,59 +636,6 @@ extern "C" {
 
 extern "C" {
     static mach_task_self_: u32;
-}
-
-/// Hold an IOPMAssertion so this Mac doesn't idle-sleep while it is the KVM
-/// receiver. A fully-asleep Mac suspends hops and is unreachable over the
-/// KVM (only a hardware wake / lid-lift brings it back — the exact symptom).
-///
-/// Default = prevent SYSTEM idle-sleep (`PreventUserIdleSystemSleep`): the
-/// system stays awake + reachable while the DISPLAY is free to blank — so the
-/// screen goes black, you cross over, and incoming input wakes it (see
-/// `declare_user_activity`). This is the Synergy-equivalent behavior, validated
-/// on AC (where `pmset sleep` is 0 anyway). `GRABBR_KEEP_AWAKE=display` keeps the
-/// display on too (heavier; screen never blanks); `=off` holds no assertion at
-/// all (lets the Mac truly sleep — only useful with a WoL-capable wired NIC,
-/// which USB-bridged dock ethernet is not).
-fn create_power_assertion() -> Option<u32> {
-    use core_foundation::base::TCFType;
-    use core_foundation::string::CFString;
-    let assertion_type = match std::env::var("GRABBR_KEEP_AWAKE").as_deref() {
-        // Opt out entirely (let the Mac truly sleep, e.g. for a WoL-capable NIC).
-        Ok("off") => {
-            log::info!("GRABBR_KEEP_AWAKE=off — holding no power assertion; the Mac may sleep");
-            return None;
-        }
-        // Keep the display on too — the screen never blanks (heavier; opt-in).
-        Ok("display") => "PreventUserIdleDisplaySleep",
-        // Default: system stays awake, display free to blank (screen goes black,
-        // incoming input wakes it). Synergy-equivalent.
-        _ => "PreventUserIdleSystemSleep",
-    };
-    let kind = CFString::new(assertion_type);
-    let name = CFString::new("hops KVM receiver active");
-    let mut id: u32 = 0;
-    const LEVEL_ON: u32 = 255; // kIOPMAssertionLevelOn
-    // SAFETY: the CFStrings outlive the synchronous call; `id` is a valid out-ptr.
-    let result = unsafe {
-        IOPMAssertionCreateWithName(
-            kind.as_concrete_TypeRef(),
-            LEVEL_ON,
-            name.as_concrete_TypeRef(),
-            &mut id,
-        )
-    };
-    if result == 0 {
-        log::info!(
-            "holding power assertion ({assertion_type}) to keep this Mac reachable over the KVM"
-        );
-        Some(id)
-    } else {
-        log::warn!(
-            "could not hold a power assertion ({result:#x}); the Mac may sleep and become unreachable"
-        );
-        None
-    }
 }
 
 /// Opens a connection to `IOHIDSystem` for `IOHIDPostEvent`.
@@ -808,7 +763,7 @@ fn post_hid_media_key(connect: u32, nx_keytype: u8, down: bool) -> bool {
         )
     };
     if kr != 0 {
-        log::warn!("IOHIDPostEvent(media key {nx_keytype}) failed: kr=0x{kr:x}");
+        log::warn!("IOHIDPostEvent(media key) failed: kr=0x{kr:x}");
     }
     kr == 0
 }
@@ -1876,8 +1831,9 @@ impl Emulation for MacOSEmulation {
     ) -> Result<(), EmulationError> {
         log::trace!("{event:?}");
         // Wake a sleeping display on any incoming remote input (throttled). The
-        // system stays awake via the power assertion, but synthetic CGEvents
-        // don't wake the screen by themselves — this does.
+        // system stays awake via the power assertion the daemon holds while a
+        // paired device may control this Mac (`macos_keep_awake`), but
+        // synthetic CGEvents don't wake the screen by themselves — this does.
         self.declare_user_activity();
         match event {
             Event::Pointer(pointer_event) => {
@@ -2209,7 +2165,7 @@ impl Emulation for MacOSEmulation {
                                 post_hid_media_key(connect, nx_keytype, state == 1);
                             }
                             None => {
-                                log::debug!("media key {key} dropped: no IOHIDSystem connection")
+                                log::debug!("media key dropped: no IOHIDSystem connection")
                             }
                         }
                         return Ok(());
@@ -2329,6 +2285,12 @@ impl Emulation for MacOSEmulation {
     /// local user holds, is not published and not checked.
     fn button_scope(&self) -> ButtonScope {
         ButtonScope::Machine
+    }
+
+    /// Posting events needs Accessibility, and macOS drops what is posted
+    /// without it, without an error.
+    fn needs(&self) -> &'static [crate::error::Permission] {
+        &[crate::error::Permission::Accessibility]
     }
 }
 
@@ -2937,6 +2899,111 @@ mod decision_guards {
              `panic = \"abort\"` set for release builds, a single crafted value \
              from an admitted peer takes the whole receiver down with every key \
              it was holding still latched."
+        );
+    }
+}
+
+#[cfg(test)]
+mod the_check_emulation_starts_with {
+    use super::{MacOSEmulationCreationError, emulation_permissions};
+    use input_event::accessibility::Gate;
+    use std::cell::RefCell;
+
+    /// A gate the user has opened, so the probe tap may be created.
+    fn consented() -> Gate {
+        let gate = Gate::new();
+        gate.consent();
+        gate
+    }
+
+    // LEDGER T2443 | class B | 1 return value of emulation_permissions, with the masks asked recorded
+    /// The probe tap decides, whatever AXIsProcessTrusted says, and asks
+    /// for no events (#240).
+    #[test]
+    fn the_probe_tap_decides_and_asks_for_no_events() {
+        let masks = RefCell::new(Vec::new());
+        let open = consented();
+        let start = |trusted: bool, permitted: bool| {
+            emulation_permissions(
+                &open,
+                |_| trusted,
+                |mask| {
+                    masks.borrow_mut().push(mask);
+                    permitted
+                },
+                || false,
+            )
+            .map_err(|e| matches!(e, MacOSEmulationCreationError::AccessibilityPermission))
+        };
+        let got = [start(true, true), start(true, false), start(false, true)];
+        assert_eq!(
+            (got, masks.into_inner()),
+            ([Ok(()), Err(true), Ok(())], vec![0, 0, 0]),
+            "(may emulation start: probe and AX check agree, probe refused with a stale \
+             AX check, probe permitted with a stale AX check; masks asked)"
+        );
+    }
+
+    // LEDGER T2452 | class B | 1 return value of emulation_permissions + 6 stand-in taps created
+    /// Emulation started on a Mac whose silent check says Accessibility is
+    /// missing creates no tap until the user asks, and reports
+    /// Accessibility missing (#243); after the ask the probe decides. A
+    /// fresh process the silent check says has it probes at once.
+    #[test]
+    fn emulation_started_without_the_grant_creates_no_tap() {
+        let taps = RefCell::new(0);
+        let start = |gate: &Gate, trusted: bool| {
+            emulation_permissions(
+                gate,
+                |_| trusted,
+                |_| {
+                    *taps.borrow_mut() += 1;
+                    true
+                },
+                || false,
+            )
+            .map_err(|e| matches!(e, MacOSEmulationCreationError::AccessibilityPermission))
+        };
+        let gate = Gate::new();
+        let at_launch: Vec<_> = (0..5).map(|_| start(&gate, false)).collect();
+        let before = *taps.borrow();
+        gate.consent();
+        let asked = start(&gate, false);
+        let granted = start(&Gate::new(), true);
+        assert_eq!(
+            (at_launch, before, asked, granted, *taps.borrow()),
+            (vec![Err(true); 5], 0, Ok(()), Ok(()), 2),
+            "(starts before the user asked, taps created by them, start after the \
+             ask, start in a process the silent check says is granted, taps in all)"
+        );
+    }
+
+    // LEDGER T2435 | class B | 1 return value of emulation_permissions, with the prompt options passed recorded
+    /// The daemon's check never asks macOS to prompt, granted or not: under
+    /// launchd no prompt shows, and the app asks instead (#243). The probe
+    /// still decides.
+    #[test]
+    fn the_check_never_asks_to_prompt() {
+        let options = RefCell::new(Vec::new());
+        let open = consented();
+        let start = |permitted: bool| {
+            emulation_permissions(
+                &open,
+                |prompt| {
+                    options.borrow_mut().push(prompt);
+                    false
+                },
+                |_| permitted,
+                || false,
+            )
+            .is_ok()
+        };
+        let got = [start(true), start(false)];
+        assert_eq!(
+            (got, options.into_inner()),
+            ([true, false], vec![false, false]),
+            "(may emulation start with the probe permitted, refused; the prompt \
+             option each check passed)"
         );
     }
 }

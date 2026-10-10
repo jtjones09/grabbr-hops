@@ -7,22 +7,35 @@ license = "GPL-3.0-or-later"
 repository = "https://github.com/jtjones09/grabbr-hops"
 
 [dependencies]
-base64 = "0.22"
 futures = "0.3.30"
+# what macOS calls the permissions frontends name (settings_pane)
+input-event = { path = "../input-event", version = "0.4.0", default-features = false }
 getrandom = "0.3"
 log = "0.4.22"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.107"
 sha2 = "0.10.8"
 thiserror = "2.0.0"
-tokio = { version = "1.32.0", features = ["macros", "net", "io-util", "time"] }
+tokio = { version = "1.32.0", features = ["macros", "net", "io-util", "rt", "time"] }
 tokio-stream = { version = "0.1.15", features = ["io-util"] }
 
 [target.'cfg(unix)'.dependencies]
 # geteuid, to say whose lock file stops the daemon starting
 libc = "0.2.148"
 
+[target.'cfg(windows)'.dependencies]
+# the daemon's pipe: who may open it, and which process holds it
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
+input-event = { path = "../input-event", version = "0.4.0", default-features = false, features = ["test-support"] }
 # the IPC auth tests drive a connection over an in-memory duplex
-tokio = { version = "1.32.0", features = ["rt", "macros", "io-util", "time"] }
+tokio = { version = "1.32.0", features = ["rt", "macros", "io-util", "time", "test-util"] }
 futures = "0.3.30"

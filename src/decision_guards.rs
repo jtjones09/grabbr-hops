@@ -135,6 +135,13 @@ mod a_grant_carries_only_the_direction_that_was_approved {
     //! 2026-07-24 entry still states "one approval establishes trust in BOTH
     //! directions" as a goal. That clause is superseded. Trust is per-machine
     //! AND per-direction.
+    //!
+    //! **Amended 2026-09-26 (#220).** The direction is no longer taken from
+    //! how the other machine arrived: the person approving chooses it on the
+    //! card (this machine controls that one, that one controls this one, or
+    //! both), and the lease records the choice as its origin, which the store
+    //! checks. What stands from #130: nothing grants a direction nobody was
+    //! asked about.
 
     use crate::trust::{Caps, Origin, TrustStore};
 
@@ -201,21 +208,34 @@ mod a_grant_carries_only_the_direction_that_was_approved {
     }
 
     /// The two tests above ask the store. This asks the grant the door makes
-    /// (`Service::add_authorized_key` through `service::grant_for_attempt`):
-    /// the direction comes from the attempt the user approved, and an approval
-    /// with no attempt behind it grants nothing.
-    // LEDGER T11 | class B | 1 return value + 6 struct state: service::grant_for_attempt, TrustStore::capabilities
+    /// (`Service::add_authorized_key` through `service::grant_for_attempt`).
+    ///
+    /// **Amended 2026-09-26 (#220).** The direction is what the person
+    /// approving chose on the card, never how the other machine arrived:
+    /// either attempt can be approved in any direction, and the lease drives
+    /// in exactly that one, recorded as the origin the store checks. The
+    /// clipboard is shared only on a yes, the way control goes (#182). An
+    /// approval with no attempt behind it still grants nothing.
+    // LEDGER T11 | class B | 1 return value + 6 struct state: service::grant_for_attempt, TrustStore::capabilities, TrustStore::lease
     #[test]
-    fn the_grant_door_mints_the_direction_it_observed_and_nothing_without_an_attempt() {
+    fn the_grant_door_mints_the_direction_the_person_chose_and_nothing_without_an_attempt() {
         use crate::service::{GrantRefused, grant_for_attempt};
-        use hops_ipc::AttemptOrigin;
+        use crate::trust::{drive_of, existing_pairing_clipboard};
+        use hops_ipc::{AttemptOrigin, Controller};
 
         let peer = fp32(0x44);
         let fresh = || TrustStore::new(&fp32(0x01), 0).expect("our own fingerprint");
 
         let mut store = fresh();
         assert_eq!(
-            grant_for_attempt(&mut store, &peer, "no prompt behind this", None),
+            grant_for_attempt(
+                &mut store,
+                &peer,
+                "no prompt behind this",
+                None,
+                Controller::Both,
+                true
+            ),
             Err(GrantRefused::NoAttempt),
             "an approval with no pending attempt must be refused"
         );
@@ -225,26 +245,84 @@ mod a_grant_carries_only_the_direction_that_was_approved {
             "and it must grant nothing"
         );
 
-        let mut store = fresh();
-        grant_for_attempt(&mut store, &peer, "knocked", Some(AttemptOrigin::Inbound))
-            .expect("grant");
-        assert!(
-            store.may_drive_us(&peer) && !store.we_may_drive(&peer),
-            "an approved inbound knock must grant inbound and only inbound (#130)"
-        );
+        for arrived in [AttemptOrigin::Inbound, AttemptOrigin::OutboundDial] {
+            for chosen in Controller::ALL {
+                for clipboard in [false, true] {
+                    let mut store = fresh();
+                    grant_for_attempt(&mut store, &peer, "desk", Some(arrived), chosen, clipboard)
+                        .expect("grant");
+                    assert_eq!(
+                        store.capabilities(&peer),
+                        Caps::NONE,
+                        "an approval alone grants nothing until both machines confirm \
+                         the number (#167)"
+                    );
+                    store.confirm(&peer).expect("confirm");
+                    let drive = drive_of(chosen);
+                    let shared = if clipboard {
+                        existing_pairing_clipboard(drive)
+                    } else {
+                        Caps::NONE
+                    };
+                    assert_eq!(
+                        (
+                            store.capabilities(&peer),
+                            store.lease(&peer).map(|l| l.origin)
+                        ),
+                        (drive | shared, Some(Origin::Chosen(chosen))),
+                        "approving a {arrived:?} attempt as {chosen:?}, clipboard \
+                         {clipboard}: the pairing grants something other than what the \
+                         person chose, or does not record the choice. Which machine \
+                         dialled says nothing about which way control goes (#220), and \
+                         the clipboard is shared only on a yes (#182)."
+                    );
+                }
+            }
+        }
+    }
 
-        let mut store = fresh();
-        grant_for_attempt(
-            &mut store,
-            &peer,
-            "dialled",
-            Some(AttemptOrigin::OutboundDial),
-        )
-        .expect("grant");
-        assert!(
-            store.we_may_drive(&peer) && !store.may_drive_us(&peer),
-            "an approved outbound dial must grant outbound and only outbound (#130)"
-        );
+    /// The store is the last place that can refuse a direction nobody chose,
+    /// and it does at both of its doors: a grant, and a record replayed off
+    /// disk (#220).
+    // LEDGER T11b | class B | 1 error: TrustStore::issue_with_origin, TrustStore::admit
+    #[test]
+    fn a_lease_recorded_as_chosen_drives_in_exactly_that_direction() {
+        use crate::trust::{Expiry, Lease, TrustError};
+        use hops_ipc::Controller;
+
+        let ours = fp32(0x01);
+        let peer = fp32(0x45);
+        for (chosen, caps) in [
+            (Controller::ThisMachine, Caps::DRIVE_ME),
+            (Controller::ThisMachine, Caps::DRIVE_ME | Caps::I_MAY_DRIVE),
+            (Controller::ThatMachine, Caps::I_MAY_DRIVE),
+            (Controller::Both, Caps::DRIVE_ME),
+            (Controller::Both, Caps::CLIPBOARD_FROM),
+        ] {
+            let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
+            let granted = store.issue_with_origin(&peer, "desk", caps, Origin::Chosen(chosen));
+            assert!(
+                matches!(granted, Err(TrustError::NotAsChosen { .. })),
+                "a grant recorded as {chosen:?} carrying {caps:?} was not refused: \
+                 {granted:?}"
+            );
+            let replayed = store.admit(Lease {
+                peer: peer.clone(),
+                issued_to: ours.clone(),
+                label: "desk".into(),
+                caps,
+                origin: Origin::Chosen(chosen),
+                issued_at: 1,
+                expiry: Expiry::Never,
+                clipboard_chosen: true,
+                confirmed: true,
+            });
+            assert!(
+                matches!(replayed, Err(TrustError::NotAsChosen { .. })),
+                "a record recorded as {chosen:?} carrying {caps:?} was loaded: {replayed:?}"
+            );
+            assert!(store.capabilities(&peer).is_empty());
+        }
     }
 
     /// The property the two verifiers must keep, checked by calling both of
@@ -261,7 +339,6 @@ mod a_grant_carries_only_the_direction_that_was_approved {
         use rustls::client::danger::ServerCertVerifier;
         use rustls::pki_types::{ServerName, UnixTime};
         use rustls::server::danger::ClientCertVerifier;
-        use std::collections::VecDeque;
         use std::sync::{Arc, Mutex, RwLock};
 
         crate::transport::install_crypto_provider();
@@ -273,12 +350,12 @@ mod a_grant_carries_only_the_direction_that_was_approved {
         // A receiver we confirmed our own dial reached: outbound only.
         let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
         store
-            .issue(&peer_fp, "a receiver", Caps::OUTBOUND)
+            .issue_confirmed(&peer_fp, "a receiver", Caps::OUTBOUND)
             .expect("issue an outbound-only lease");
         let trust = Arc::new(RwLock::new(store));
 
         let outbound = FpServerVerifier::new(trust.clone(), Arc::new(Mutex::new(None)));
-        let inbound = FpClientVerifier::new(trust, Arc::new(Mutex::new(VecDeque::new())));
+        let inbound = FpClientVerifier::new(trust, Arc::new(Mutex::new(None)));
         let now = UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_700_000_000));
 
         assert!(
@@ -306,20 +383,24 @@ mod a_grant_carries_only_the_direction_that_was_approved {
 }
 
 mod an_upgrade_mints_no_permission_the_old_config_never_granted {
-    //! **Decided 2026-09-05 (#130).** The carried-forward over-grant retires at
-    //! migration; the upgrade must not create a direction the user never gave.
+    //! **Decided 2026-09-05 (#130), narrowed 2026-09-29 (#231).** The upgrade
+    //! must not create a direction the user never gave.
     //!
-    //! **Why.** `[authorized_fingerprints]` membership was *necessary and not
-    //! sufficient* for outbound: a dial also needed a `[[clients]]` entry aimed
-    //! at that peer. A fingerprint that was allowlisted and never a dial target
-    //! held outbound permission in theory and never once in practice. Minting
-    //! it at upgrade would be a capability the user never granted, created by
-    //! the very code that claims to retire that defect.
+    //! **Why.** `[authorized_fingerprints]` fed both verifiers and never said
+    //! which machine controls which. #130 stopped minting outbound for a
+    //! fingerprint no `[[clients]]` entry dialled, and carried inbound forward
+    //! for all of them. #231 found that still a guess: v0.12.0 wrote no
+    //! fingerprint on a `[[clients]]` entry, so no listed machine was ever
+    //! known to be dialled, and every controller lost its grant while every
+    //! controlled machine gained one. Option B was taken: a machine the old
+    //! config listed grants nothing, in either direction, and is listed to be
+    //! paired again, where the pairing card asks the direction (#220).
     //!
-    //! **What makes this urgent rather than theoretical.** Two migrations exist
-    //! in this tree, they disagree, and the tested one is not the one that runs.
+    //! The half of #130 this keeps, no outbound minted at upgrade, holds
+    //! trivially; these tests still assert it by name so a regression that
+    //! mints it again fails here and says which decision it breaks.
 
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
 
     use crate::trust::{Caps, TrustStore, system_seconds};
     use crate::trust_file::rebuild;
@@ -327,11 +408,9 @@ mod an_upgrade_mints_no_permission_the_old_config_never_granted {
 
     use super::fp32;
 
-    /// Migration stamps `issued_at` from the caller and the store enforces
-    /// expiry against `max(system clock, floor)`. A hardcoded timestamp is
-    /// therefore a lease that has already lapsed by the time anyone runs this,
-    /// and the guard then fails for the wrong reason — which is worse than not
-    /// having it, because the message would name #130 for a clock problem.
+    /// Migration stamps its time from the caller and the store enforces
+    /// against `max(system clock, floor)`, so a hardcoded time would be
+    /// measuring the machine the test runs on.
     fn upgrading_now() -> u64 {
         system_seconds()
     }
@@ -343,111 +422,277 @@ mod an_upgrade_mints_no_permission_the_old_config_never_granted {
             .collect()
     }
 
-    /// **RED TODAY (#130).**
-    ///
-    /// This was RED when written: the migration the daemon ran handed every
-    /// carried-forward fingerprint both directions unconditionally, for four
-    /// hundred days. That duplicate has been deleted and the daemon now
-    /// migrates through the store.
+    // LEDGER R231-4 | class B | 1 return value: TrustStore::migrate_from_config, trust_file::rebuild, capabilities, to_pair_again
+    /// A machine the old config listed gets no permission, in either
+    /// direction and through the disk round trip every later start makes,
+    /// and stays listed to be paired again.
     #[test]
-    fn a_fingerprint_the_old_config_never_dialled_gets_no_outbound_permission() {
+    fn a_fingerprint_the_old_config_listed_gets_no_permission_either_way() {
         let ours = fp32(0x01);
-        let never_dialled = fp32(0x44);
+        let listed = fp32(0x44);
 
         let now = upgrading_now();
         let mut migrated = TrustStore::new(&ours, 0).expect("our own fingerprint");
         migrated.migrate_from_config(
-            &old_allowlist(&[(&never_dialled, "a box that only ever knocked")]),
+            &old_allowlist(&[(&listed, "a box the old list named")]),
             &HashMap::<String, RevokedEntry>::new(),
-            &HashSet::new(),
             now,
         );
-        // Through disk, because the round trip is where an upgrade actually
-        // lands and where a widening would show up.
         let (store, refused) = rebuild(&ours, now, &crate::trust_file::records_of(&migrated))
             .expect("rebuild the migrated store");
 
         assert!(
             refused.is_empty(),
             "the migrated records did not survive their own rebuild: {refused:?}. \
-             An upgrade that cannot load what it just wrote locks the user out."
+             An upgrade that cannot load what it just wrote loses the list of \
+             machines to pair again."
         );
-        assert!(
-            store.may_drive_us(&never_dialled),
-            "the upgrade dropped an inbound grant that was live yesterday. \
-             Carrying inbound forward is the whole reason migration exists — \
-             without it every paired machine silently stops working on upgrade."
-        );
-        assert!(
-            !store.we_may_drive(&never_dialled),
-            "the upgrade MINTED outbound permission for a fingerprint the old \
-             config never dialled (#130). Old membership was necessary and not \
-             sufficient for outbound — a dial also needed a [[clients]] entry — \
-             so this is a capability the user never granted, created at upgrade \
-             time by the code whose job is to retire exactly this defect. \
-             Restricting to the dialled set is not a narrowing anyone can feel: \
-             the mouse keeps crossing to precisely the machines it crossed to \
-             yesterday."
-        );
+        for (name, s) in [
+            ("in the upgrade's run", &migrated),
+            ("at a later start", &store),
+        ] {
+            assert!(
+                !s.we_may_drive(&listed),
+                "{name}: the upgrade MINTED outbound permission (#130). The old list \
+                 never said this machine may control that one."
+            );
+            assert!(
+                !s.may_drive_us(&listed),
+                "{name}: the upgrade granted inbound to a machine the old list named \
+                 (#231). The list fed both directions and said nothing of which one \
+                 was meant, so granting inbound is a guess, and for every machine \
+                 that controlled another it is the wrong one."
+            );
+            assert_eq!(
+                s.capabilities(&listed),
+                Caps::NONE,
+                "{name}: clipboard granted"
+            );
+            assert!(
+                s.to_pair_again(&listed).is_some(),
+                "{name}: the machine the old list named is not listed to be paired \
+                 again, so the app cannot show it or offer to pair it (#231)"
+            );
+        }
     }
 
-    /// **RED TODAY (#130).** Two migrations, one rule.
-    ///
-    /// `TrustStore::migrate_from_config` gets this right and has zero
-    /// production callers. `trust_file::migrate` gets it wrong and is the one
-    /// the daemon runs. Their own tests pass in isolation, which is why nobody
-    /// noticed: the guarded one is dead code.
-    ///
-    /// This asserts they AGREE, because "two files disagree and each is
-    /// internally consistent" is the failure a per-file test can never see.
-    /// The duplicate this guard was written to catch has since been deleted, so
-    /// the assertion changed from "the two agree" to "the one that survives is
-    /// the one with the rule". Kept rather than removed: the failure it guards
-    /// against is a second migration reappearing, and a test named for the rule
-    /// still fails if the surviving one starts granting outbound to everything.
+    // LEDGER R231-5 | class B | 1 return value: TrustStore::migrate_from_config, trust_file::rebuild, capabilities
+    /// One migration, one rule: whether or not a `[[clients]]` entry was
+    /// aimed at a listed machine, it is granted nothing, and sealing and
+    /// reloading changes that for none of them.
     #[test]
-    fn there_is_one_migration_and_it_grants_outbound_only_to_a_dialled_peer() {
+    fn there_is_one_migration_and_it_grants_nothing() {
         let ours = fp32(0x01);
-        let dialled = fp32(0x55);
-        let never_dialled = fp32(0x66);
+        let (receiver, knocker) = (fp32(0x55), fp32(0x66));
         let now = upgrading_now();
 
-        let authorized =
-            old_allowlist(&[(&dialled, "the receiver"), (&never_dialled, "a knocker")]);
-        let revoked = HashMap::<String, RevokedEntry>::new();
-
         let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
-        let dial_targets: HashSet<String> = [dialled.clone()].into_iter().collect();
-        store.migrate_from_config(&authorized, &revoked, &dial_targets, now);
-
-        assert!(
-            store.capabilities(&dialled).contains(Caps::I_MAY_DRIVE),
-            "a fingerprint the old config actually dialled must keep outbound, \
-             or the mouse stops crossing to a machine it crossed to yesterday"
+        store.migrate_from_config(
+            &old_allowlist(&[(&receiver, "the receiver"), (&knocker, "a knocker")]),
+            &HashMap::<String, RevokedEntry>::new(),
+            now,
         );
-        assert!(
-            !store
-                .capabilities(&never_dialled)
-                .contains(Caps::I_MAY_DRIVE),
-            "a fingerprint that was allowlisted but never dialled must NOT get \
-             outbound at upgrade. Allowlist membership was necessary and not \
-             sufficient for a dial, so minting it now creates a capability the \
-             user never granted, at upgrade, by the code that exists to retire \
-             exactly that defect"
-        );
-        assert!(
-            store.capabilities(&never_dialled).contains(Caps::DRIVE_ME),
-            "it must still keep inbound, or an upgrade silently drops peers"
-        );
-
-        // The round trip through disk must not widen anything.
         let (reloaded, _) =
             rebuild(&ours, now, &crate::trust_file::records_of(&store)).expect("rebuild");
-        for fp in [&dialled, &never_dialled] {
+        for fp in [&receiver, &knocker] {
+            assert_eq!(
+                store.capabilities(fp),
+                Caps::NONE,
+                "the upgrade granted {fp} something the old list cannot say (#130, #231)"
+            );
             assert_eq!(
                 reloaded.capabilities(fp),
-                store.capabilities(fp),
-                "sealing and reloading changed what {fp} is permitted"
+                Caps::NONE,
+                "sealing and reloading granted {fp} something"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #186 — pairings made before #182 keep the clipboard direction their lease
+// grants
+// ---------------------------------------------------------------------------
+
+mod pairings_made_before_182_keep_the_clipboard_direction_their_lease_grants {
+    //! **Decided 2026-09-16 (#186).** A pairing made before #182 asks about the
+    //! clipboard keeps what its lease already carries: text copied on the
+    //! machine doing the driving reaches the machine being driven, and nothing
+    //! flows the other way. Nothing on disk changes; enforcement starts
+    //! reading bits that were already there.
+    //!
+    //! **Why not the alternatives.** Keeping both directions leaves a flow
+    //! nobody granted. Switching it off for every existing pairing breaks
+    //! working setups silently.
+    //!
+    //! The choice is one function, `trust::existing_pairing_clipboard`, which
+    //! the on arm of the per-device switch also turns a clipboard back on by, and
+    //! this runs both machines' real transports over loopback, so swapping the
+    //! direction there fails here.
+    //!
+    //! **Narrowed 2026-09-29 (#231).** A pairing carried forward from a v0.12
+    //! config was one of these, and no longer is: the #231 decision grants such
+    //! a pairing nothing, the clipboard included, until it is paired again.
+    //! Its cases left this guard with that decision. A v0.12 pairing granting
+    //! a clipboard is caught by
+    //! `an_upgrade_mints_no_permission_the_old_config_never_granted` and by
+    //! `service::upgraded_from_v0_12`.
+
+    use crate::test_harness::{
+        ARRIVES_WITHIN, Machine, NEVER_WITHIN, applied_within, clipboard_pair, machine, run_local,
+    };
+    use crate::trust::{Caps, TrustStore, existing_pairing_clipboard};
+    use crate::trust_file::{
+        DiskCap, DiskOrigin, DiskState, LeaseRecord, expiry_older_builds_accept, rebuild,
+        records_of,
+    };
+
+    /// Through disk, as every start after the one that made the pairing
+    /// loads it. The start that made it runs on the store in memory, so each
+    /// pairing is checked both ways.
+    fn reloaded(store: &TrustStore) -> TrustStore {
+        let (loaded, refused) =
+            rebuild(store.ours(), store.now(), &records_of(store)).expect("rebuild");
+        assert!(
+            refused.is_empty(),
+            "the store refused its own records: {refused:?}"
+        );
+        loaded
+    }
+
+    /// Paired on a build with the trust store and before #182: each machine
+    /// approved the other's prompt once, and the grant was shaped by how the
+    /// other machine arrived, its clipboard following the drive bits, which
+    /// is what such a build wrote. Nobody chose a clipboard.
+    fn approved(driven: &Machine, driver: &Machine) -> (TrustStore, TrustStore) {
+        let before_182 = |me: &Machine, peer: &Machine, drive: Caps| {
+            let mut store = TrustStore::new(&me.fingerprint, 0).expect("ours");
+            store
+                .issue(
+                    &peer.fingerprint,
+                    "peer",
+                    drive | existing_pairing_clipboard(drive),
+                )
+                .expect("grant");
+            store.confirm(&peer.fingerprint).expect("confirm");
+            store
+        };
+        (
+            before_182(driven, driver, Caps::DRIVE_ME),
+            before_182(driver, driven, Caps::I_MAY_DRIVE),
+        )
+    }
+
+    // LEDGER T1861 | class B | 1 return value: ClipboardInbox::next over the queue transport::clipboard_accept_loop fills; ClipboardSender::broadcast, ClipboardSenderListen::broadcast, grant_for_attempt, trust_file::rebuild
+    /// A pairing approved before #182 keeps its clipboard the way control
+    /// goes, and only that way, in the run that approved it and at every
+    /// later start (#186). Pairings carried forward from a v0.12 config are
+    /// not among them since #231, which grants those nothing until they are
+    /// paired again; the guards named in this module's docs hold that.
+    #[test]
+    fn existing_pairings_keep_their_clipboard_direction() {
+        run_local(async {
+            type Pairing = fn(&Machine, &Machine) -> (TrustStore, TrustStore);
+            let pairings: [(&str, Pairing, bool); 2] = [
+                ("approved, in the run that approved it", approved, false),
+                ("approved, loaded at a later start", approved, true),
+            ];
+            for (how, pair_up, reload) in pairings {
+                let (driven, driver) = (machine(), machine());
+                let (mut on_driven, mut on_driver) = pair_up(&driven, &driver);
+                if reload {
+                    (on_driven, on_driver) = (reloaded(&on_driven), reloaded(&on_driver));
+                }
+                let mut pair = clipboard_pair(driven, on_driven, driver, on_driver).await;
+                // What each machine's service would apply, through the check
+                // it makes first.
+                let (mut on_driven, mut on_driver) = pair.inboxes();
+
+                pair.driver_sends
+                    .broadcast("copied on the driver".to_string())
+                    .await;
+                assert_eq!(
+                    applied_within(&mut on_driven, ARRIVES_WITHIN)
+                        .await
+                        .as_deref(),
+                    Some("copied on the driver"),
+                    "{how}: text copied on the machine doing the driving no longer \
+                     reaches the machine it drives. #186 keeps that direction for \
+                     every existing pairing; losing it breaks a working setup with \
+                     nothing on screen to explain it."
+                );
+
+                pair.driven_sends
+                    .broadcast("copied on the driven machine".to_string())
+                    .await;
+                assert_eq!(
+                    applied_within(&mut on_driver, NEVER_WITHIN)
+                        .await
+                        .as_deref(),
+                    None,
+                    "{how}: text copied on the machine being driven reached the \
+                     machine driving it. Nobody granted that direction: the lease \
+                     carries clipboard from the driver to the driven machine only, \
+                     and #186 stops the reverse (issues #182, #186)."
+                );
+            }
+        });
+    }
+
+    // LEDGER E2b-5 | class B | 1 return value: trust_file::rebuild, trust_file::records_of, TrustStore::capabilities
+    /// A store an earlier build saved, each of its pairings made before #182:
+    /// loaded by this build and saved again, every record is as it was, and
+    /// each still grants the clipboard its drive bits did (#186). #220 and
+    /// #182 change what a new pairing is, never what an old one holds.
+    #[test]
+    fn a_store_saved_before_182_loads_and_saves_unchanged() {
+        let ours = machine().fingerprint;
+        let issued_at = 1_780_000_000;
+        let record = |origin: DiskOrigin, caps: Vec<DiskCap>| LeaseRecord {
+            fingerprint: machine().fingerprint,
+            label: format!("{origin:?}"),
+            state: DiskState::Active,
+            origin,
+            issued_at,
+            expires_at: Some(expiry_older_builds_accept(issued_at)),
+            revoked_at: None,
+            caps,
+            confirmed: true,
+            clipboard: None,
+        };
+        let mut saved = vec![
+            record(DiskOrigin::Inbound, vec![DiskCap::Inbound]),
+            record(DiskOrigin::OutboundDial, vec![DiskCap::Outbound]),
+            record(
+                DiskOrigin::Migrated,
+                vec![DiskCap::Inbound, DiskCap::Outbound],
+            ),
+        ];
+        saved.sort_by(|a, b| a.fingerprint.cmp(&b.fingerprint));
+        let (store, refused) = rebuild(&ours, issued_at + 60, &saved).expect("rebuild");
+        assert!(
+            refused.is_empty(),
+            "an older build's store was refused: {refused:?}"
+        );
+        let mut again = records_of(&store);
+        again.sort_by(|a, b| a.fingerprint.cmp(&b.fingerprint));
+        assert_eq!(
+            again, saved,
+            "this build rewrote a pairing an older build saved. The upgrade writes \
+             nothing new and rewrites no lease (#186)."
+        );
+        for r in &saved {
+            let drive = r.caps.iter().fold(Caps::NONE, |acc, c| {
+                acc | match c {
+                    DiskCap::Inbound => Caps::DRIVE_ME,
+                    DiskCap::Outbound => Caps::I_MAY_DRIVE,
+                }
+            });
+            assert_eq!(
+                store.capabilities(&r.fingerprint),
+                drive | existing_pairing_clipboard(drive),
+                "a pairing made before #182 ({:?}) lost, or gained, clipboard it held",
+                r.origin
             );
         }
     }
@@ -471,10 +716,11 @@ mod no_pairing_expires_until_renewal_exists {
     //! store schema together, and this guard with them, in the same commit.
     //!
     //! **A stored term needs a new schema, not only a changed `rebuild`.**
-    //! Every `expires_at` in a schema-v1 store is a placeholder and must never
-    //! be enforced. This build writes 400 days after pairing for a lease that
-    //! does not lapse, so a build from before #183 still starts, and nothing
-    //! tells that date apart from a real 400-day term. A build that enforced it
+    //! Every `expires_at` in a store, version 1 or 2, is a placeholder and
+    //! must never be enforced. This build writes 400 days after pairing for a
+    //! lease that does not lapse, the date version 1 stores carried for a
+    //! build from before #183, and nothing tells that date apart from a real
+    //! 400-day term. A build that enforced it
     //! would end every pairing made under this build at day 400, the outage
     //! #183 removes. Enforcing a stored term (#185) takes a `SCHEMA_VERSION`
     //! bump or a new field.
@@ -493,7 +739,7 @@ mod no_pairing_expires_until_renewal_exists {
     //! Leases already sealed with a 30-day or 400-day term are covered by
     //! `trust_file`'s `a_sealed_store_holding_thirty_and_four_hundred_day_terms_…`.
 
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex, RwLock};
     use std::time::Duration;
@@ -529,8 +775,7 @@ mod no_pairing_expires_until_renewal_exists {
         let mut admitted = Vec::new();
         let tls_now =
             UnixTime::since_unix_epoch(Duration::from_secs(receiving.read().expect("lock").now()));
-        let inbound =
-            FpClientVerifier::new(receiving.clone(), Arc::new(Mutex::new(VecDeque::new())));
+        let inbound = FpClientVerifier::new(receiving.clone(), Arc::new(Mutex::new(None)));
         if inbound.verify_client_cert(peer, &[], tls_now).is_ok() {
             admitted.push(DOORS[0]);
         }
@@ -566,6 +811,8 @@ mod no_pairing_expires_until_renewal_exists {
             &peer_fp,
             "a sender",
             Some(AttemptOrigin::Inbound),
+            hops_ipc::Controller::ThatMachine,
+            false,
         )
         .expect("the grant door grants an approved inbound attempt");
         let mut sending = TrustStore::new(&super::fp32(0x02), 0).expect("ours");
@@ -574,8 +821,13 @@ mod no_pairing_expires_until_renewal_exists {
             &peer_fp,
             "a receiver",
             Some(AttemptOrigin::OutboundDial),
+            hops_ipc::Controller::ThisMachine,
+            false,
         )
         .expect("the grant door grants an approved outbound dial");
+        // and both machines confirmed the number (#167)
+        receiving.confirm(&peer_fp).expect("confirm");
+        sending.confirm(&peer_fp).expect("confirm");
 
         let mut refused = Vec::new();
 
@@ -636,6 +888,8 @@ mod no_pairing_expires_until_renewal_exists {
                         &peer_fp,
                         "a sender",
                         Some(AttemptOrigin::Inbound),
+                        hops_ipc::Controller::ThatMachine,
+                        false,
                     )
                     .expect("grant");
                     grant_for_attempt(
@@ -643,8 +897,12 @@ mod no_pairing_expires_until_renewal_exists {
                         &peer_fp,
                         "a receiver",
                         Some(AttemptOrigin::OutboundDial),
+                        hops_ipc::Controller::ThisMachine,
+                        false,
                     )
                     .expect("grant");
+                    receiving.confirm(&peer_fp).expect("confirm");
+                    sending.confirm(&peer_fp).expect("confirm");
                 }
                 Some(term) => {
                     receiving
@@ -667,8 +925,8 @@ mod no_pairing_expires_until_renewal_exists {
             DOORS,
             "precondition: a live pairing gets through every door"
         );
-        receiving.write().expect("lock").revoke(&peer_fp);
-        sending.write().expect("lock").revoke(&peer_fp);
+        receiving.write().expect("lock").forget(&peer_fp);
+        sending.write().expect("lock").forget(&peer_fp);
         let admitted = doors_that_admit(&peer, &receiving, &sending);
         assert!(
             admitted.is_empty(),
@@ -703,645 +961,664 @@ mod no_pairing_expires_until_renewal_exists {
     }
 }
 
-mod a_build_from_before_183_still_starts_on_a_store_this_build_saves {
-    //! A build from before #183 keeps starting on a trust store this build
-    //! writes. No release reads a trust store; the older builds are builds of
-    //! main from #158 up to #183, and one of those and this build can run
-    //! against one config directory, so a store this build saves must not stop
-    //! the older one.
+mod a_build_before_schema_2_refuses_this_store_and_leaves_it_unchanged {
+    //! **Decided 2026-09-17 (#187).** The trust file's schema moves once:
+    //! each lease records whether both machines confirmed it and, once chosen,
+    //! its clipboard. Builds of main from #158 up read only version 1, and
+    //! they refuse to start on the new store until they are updated. A copy of
+    //! the version 1 files is kept at migration for them, and deleted at the
+    //! first removal after it.
     //!
-    //! **What that build checks**, reproduced below from its
-    //! `trust_file::validate` and `trust_file::rebuild` (through
-    //! `Lease::canonicalized`). At startup every active lease carries an
-    //! `expires_at`, or the whole file is refused and the daemon does not
-    //! start. At rebuild `issued_at < expires_at <= issued_at + 400 days` and
-    //! the lease names a capability, or that lease is dropped and erased at
-    //! that build's next save.
+    //! **Why this guard replaces the one before it.** That guard held the
+    //! opposite rule, #183's: an older build must keep starting on a store
+    //! this build saves, which pushed toward a second signed file kept in step
+    //! with the first. The decision reversed it. What still has to hold is
+    //! that an older build fails safely and can be brought back:
     //!
-    //! **Not promised.** That build still enforces the date it is handed: it
-    //! stops admitting a pairing 400 days after the pairing was made, while
-    //! this build keeps admitting it. It also means running this build once
-    //! brings back, on that build, a pairing whose shorter term had lapsed
-    //! there: the next save dates it 400 days after pairing, so that build
-    //! admits it again until then. The load log names each such pairing.
+    //! * it refuses `trust.toml` as not a store it wrote, rather than reading
+    //!   part of it, and writes nothing while refusing, so the newer build
+    //!   still starts on the same files afterwards;
+    //! * it parses the floor, so moving `trust.toml` aside is enough for it to
+    //!   start again;
+    //! * it accepts the copies once they are put back in place, with the
+    //!   pairings they held.
     //!
-    //! The saved date is a placeholder no later build may enforce; see
-    //! `no_pairing_expires_until_renewal_exists`.
+    //! **The older build is frozen here**, reproduced from `trust_file::open`
+    //! as it was before version 2 and from the daemon's start, which refuses
+    //! on an error from `open` and writes only when no store is found. It must
+    //! not follow later changes to `trust_file`: the builds it stands for will
+    //! never change.
 
-    use std::collections::{HashMap, HashSet};
-    use std::path::PathBuf;
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    use hops_ipc::pairing::canonical_fingerprint;
+    use serde::{Deserialize, Serialize};
 
-    use crate::authority::{AUTHORITY_KEY_FILE_NAME, Authority, SoftwareAuthority};
-    use crate::trust::{Caps, Expiry, Lease, Origin, TrustStore};
+    use crate::authority::{AUTHORITY_KEY_FILE_NAME, Authority, SignatureAlg, SoftwareAuthority};
+    use crate::trust::TrustStore;
     use crate::trust_file::{
-        DiskCap, DiskOrigin, DiskState, LeaseRecord, Loaded, TrustFile, rebuild, records_of,
-        stored_terms,
+        FLOOR_FILE_NAME, FLOOR_V1_COPY_NAME, Loaded, TRUST_FILE_NAME, TRUST_V1_COPY_NAME,
+        TrustFile, records_of, start,
     };
 
     use super::fp32;
 
-    const DAY: u64 = 86_400;
-    /// `trust::MAX_TERM_SECS` in every build with a trust store (#158) and
-    /// from before #183. It never changed in that range.
-    const OLDER_BUILD_CEILING_SECS: u64 = 400 * DAY;
+    /// The older build: its on-disk shapes, byte for byte what it parses.
+    mod older {
+        use super::*;
 
-    /// That build's `validate`. An `Err` is a daemon that does not start.
-    fn older_build_starts_on(leases: &[LeaseRecord]) -> Result<(), String> {
-        let mut seen = HashSet::new();
-        for l in leases {
-            if !seen.insert(l.fingerprint.as_str()) {
-                return Err(format!("two leases name {}", l.fingerprint));
+        pub const TRUST_DOMAIN: &[u8] = b"hops.trust-store.v1\x00";
+        pub const FLOOR_DOMAIN: &[u8] = b"hops.trust-floor.v1\x00";
+        pub const SEPARATOR: &str = "\n[signature]\n";
+
+        #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+        #[serde(rename_all = "kebab-case")]
+        pub enum Cap {
+            Inbound,
+            Outbound,
+        }
+
+        #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+        #[serde(rename_all = "kebab-case")]
+        pub enum State {
+            Active,
+            Revoked,
+        }
+
+        #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+        #[serde(rename_all = "kebab-case")]
+        pub enum Origin {
+            Inbound,
+            OutboundDial,
+            Migrated,
+        }
+
+        #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+        #[serde(deny_unknown_fields)]
+        pub struct Lease {
+            pub fingerprint: String,
+            pub label: String,
+            pub state: State,
+            pub origin: Origin,
+            pub issued_at: u64,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub expires_at: Option<u64>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub revoked_at: Option<u64>,
+            pub caps: Vec<Cap>,
+        }
+
+        #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+        #[serde(deny_unknown_fields)]
+        pub struct AuthorityBlock {
+            pub alg: String,
+            pub public_key: String,
+        }
+
+        #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+        #[serde(deny_unknown_fields)]
+        pub struct TrustBody {
+            pub version: u32,
+            pub serial: u64,
+            pub written_at: u64,
+            pub authority: AuthorityBlock,
+            #[serde(default)]
+            pub leases: Vec<Lease>,
+        }
+
+        #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+        #[serde(deny_unknown_fields)]
+        pub struct FloorBody {
+            pub version: u32,
+            pub seconds: u64,
+            pub serial: u64,
+            pub authority: AuthorityBlock,
+        }
+
+        #[derive(Deserialize)]
+        struct SignatureBlock {
+            value: String,
+        }
+
+        #[derive(Deserialize)]
+        struct JustTheAuthority {
+            authority: AuthorityBlock,
+        }
+
+        fn hex(bytes: &[u8]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+
+        fn unhex(s: &str) -> Option<Vec<u8>> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+                .collect()
+        }
+
+        pub fn authority_block(auth: &dyn Authority) -> AuthorityBlock {
+            AuthorityBlock {
+                alg: auth.algorithm().as_str().to_owned(),
+                public_key: hex(auth.public_key()),
             }
-            match l.state {
-                DiskState::Active => {
-                    if canonical_fingerprint(&l.fingerprint).as_deref()
-                        != Some(l.fingerprint.as_str())
-                    {
-                        return Err(format!("{} is not a canonical fingerprint", l.fingerprint));
-                    }
-                    if l.expires_at.is_none() {
-                        return Err(format!("the lease for {} never expires", l.fingerprint));
-                    }
+        }
+
+        fn seal<T: Serialize>(body: &T, domain: &[u8], auth: &dyn Authority) -> String {
+            let text = toml_edit::ser::to_string_pretty(body).expect("serialise");
+            let text = text.trim_end_matches('\n').to_owned();
+            let mut msg = domain.to_vec();
+            msg.extend_from_slice(text.as_bytes());
+            let sig = auth.sign(&msg).expect("sign");
+            format!("{text}{SEPARATOR}value = \"{}\"\n", hex(&sig))
+        }
+
+        /// Its `read_sealed`: absent is `None`; another authority, a bad
+        /// signature or an unreadable body is an error naming the file.
+        fn read_sealed<T: serde::de::DeserializeOwned>(
+            path: &Path,
+            domain: &[u8],
+            expect: &AuthorityBlock,
+        ) -> Result<Option<T>, String> {
+            let text = match std::fs::read_to_string(path) {
+                Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(format!("{}: {e}", path.display())),
+            };
+            let untrusted = |why: String| format!("{} is untrusted: {why}", path.display());
+            let (body, tail) = text
+                .rsplit_once(SEPARATOR)
+                .ok_or_else(|| untrusted("no signature block".into()))?;
+            let declared: JustTheAuthority =
+                toml_edit::de::from_str(body).map_err(|e| untrusted(format!("{e}")))?;
+            if declared.authority != *expect {
+                return Err(untrusted("another authority".into()));
+            }
+            let block: SignatureBlock =
+                toml_edit::de::from_str(tail).map_err(|e| untrusted(format!("{e}")))?;
+            let sig = unhex(&block.value).ok_or_else(|| untrusted("signature not hex".into()))?;
+            let key = unhex(&expect.public_key).ok_or_else(|| untrusted("key not hex".into()))?;
+            let alg = SignatureAlg::parse(&expect.alg).map_err(|e| untrusted(format!("{e}")))?;
+            let mut msg = domain.to_vec();
+            msg.extend_from_slice(body.as_bytes());
+            crate::authority::verify(alg, &key, &msg, &sig)
+                .map_err(|_| untrusted("edited".into()))?;
+            toml_edit::de::from_str(body)
+                .map(Some)
+                .map_err(|e| untrusted(format!("unreadable body: {e}")))
+        }
+
+        /// Its `TrustFile::open`: the floor, then the store, its version, the
+        /// rollback check and the structural checks. `Ok(None)` is no store.
+        pub fn open(dir: &Path, auth: &dyn Authority) -> Result<Option<Vec<Lease>>, String> {
+            let expect = authority_block(auth);
+            let floor: Option<FloorBody> =
+                read_sealed(&dir.join(FLOOR_FILE_NAME), FLOOR_DOMAIN, &expect)?;
+            let floor_serial = floor.map_or(0, |f| f.serial);
+            let trust_path = dir.join(TRUST_FILE_NAME);
+            let Some(body) = read_sealed::<TrustBody>(&trust_path, TRUST_DOMAIN, &expect)? else {
+                return Ok(None);
+            };
+            if body.version != 1 {
+                return Err(format!(
+                    "{} is untrusted: schema version {}",
+                    trust_path.display(),
+                    body.version
+                ));
+            }
+            if body.serial < floor_serial {
+                return Err(format!("{} is untrusted: a rollback", trust_path.display()));
+            }
+            let mut seen = std::collections::HashSet::new();
+            for l in &body.leases {
+                if !seen.insert(l.fingerprint.clone()) {
+                    return Err(format!(
+                        "{} is untrusted: a duplicate",
+                        trust_path.display()
+                    ));
                 }
-                DiskState::Revoked => {
-                    if !l.caps.is_empty() {
-                        return Err(format!(
-                            "{} is revoked but still carries capabilities",
-                            l.fingerprint
-                        ));
-                    }
+                if l.state == State::Revoked && !l.caps.is_empty() {
+                    return Err(format!(
+                        "{} is untrusted: a revoked grant",
+                        trust_path.display()
+                    ));
+                }
+            }
+            Ok(Some(body.leases))
+        }
+
+        /// Its save: the store, then the floor, each sealed.
+        pub fn save(dir: &Path, auth: &dyn Authority, serial: u64, leases: Vec<Lease>) {
+            let body = TrustBody {
+                version: 1,
+                serial,
+                written_at: crate::trust::system_seconds(),
+                authority: authority_block(auth),
+                leases,
+            };
+            let floor = FloorBody {
+                version: 1,
+                seconds: body.written_at,
+                serial,
+                authority: authority_block(auth),
+            };
+            std::fs::write(dir.join(TRUST_FILE_NAME), seal(&body, TRUST_DOMAIN, auth))
+                .expect("write the store");
+            std::fs::write(dir.join(FLOOR_FILE_NAME), seal(&floor, FLOOR_DOMAIN, auth))
+                .expect("write the floor");
+        }
+
+        /// Its daemon's start: an error from `open` stops it before any
+        /// write; with no store it migrates and saves one.
+        pub fn start(dir: &Path, auth: &dyn Authority) -> Result<Vec<Lease>, String> {
+            match open(dir, auth)? {
+                Some(leases) => Ok(leases),
+                None => {
+                    save(dir, auth, 1, Vec::new());
+                    Ok(Vec::new())
                 }
             }
         }
-        Ok(())
     }
 
-    /// What that build's `rebuild` makes of the rows: each admitted lease's
-    /// window `[issued_at, expires_at)`, each removal, and each row it drops.
-    struct OlderBuildStore {
-        windows: HashMap<String, (u64, u64)>,
-        removed: HashSet<String>,
-        dropped: Vec<String>,
-    }
-
-    fn older_build_rebuild(leases: &[LeaseRecord]) -> OlderBuildStore {
-        let mut out = OlderBuildStore {
-            windows: HashMap::new(),
-            removed: HashSet::new(),
-            dropped: Vec::new(),
-        };
-        for l in leases {
-            match l.state {
-                DiskState::Revoked => {
-                    out.removed.insert(l.fingerprint.clone());
-                }
-                DiskState::Active => {
-                    let Some(not_after) = l.expires_at else {
-                        out.dropped.push(format!("{}: no expiry", l.fingerprint));
-                        continue;
-                    };
-                    if not_after <= l.issued_at {
-                        out.dropped
-                            .push(format!("{}: an empty term", l.fingerprint));
-                    } else if not_after - l.issued_at > OLDER_BUILD_CEILING_SECS {
-                        out.dropped.push(format!(
-                            "{}: a term of {}s, over the {OLDER_BUILD_CEILING_SECS}s ceiling",
-                            l.fingerprint,
-                            not_after - l.issued_at
-                        ));
-                    } else if l.caps.is_empty() {
-                        out.dropped
-                            .push(format!("{}: no capabilities", l.fingerprint));
-                    } else {
-                        out.windows
-                            .insert(l.fingerprint.clone(), (l.issued_at, not_after));
-                    }
-                }
-            }
-        }
-        out
-    }
-
-    fn scratch_dir() -> PathBuf {
+    fn scratch_dir(tag: &str) -> PathBuf {
         let mut d = std::env::temp_dir();
-        d.push(format!("hops-guard-older-build-{}", std::process::id()));
+        d.push(format!("hops-guard-schema-2-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).expect("mkdir");
         d
     }
 
-    /// Every kind of row this build saves goes through the real save and the
-    /// real open, then through the older build's checks.
-    // LEDGER T3 | class B | 4 file on disk: trust_file::records_of, TrustFile::save, TrustFile::open
-    #[test]
-    fn a_store_this_build_saves_passes_every_check_a_build_from_before_183_makes() {
-        let dir = scratch_dir();
-        let authority: Arc<dyn Authority> = Arc::new(
-            SoftwareAuthority::load_or_generate(&dir.join(AUTHORITY_KEY_FILE_NAME))
+    /// A scratch directory holding a machine's trust authority.
+    fn scratch(tag: &str) -> (PathBuf, Arc<dyn Authority>) {
+        let d = scratch_dir(tag);
+        let auth: Arc<dyn Authority> = Arc::new(
+            SoftwareAuthority::load_or_generate(&d.join(AUTHORITY_KEY_FILE_NAME))
                 .expect("authority"),
         );
-        let (mut file, _) = TrustFile::open(&dir, authority.clone()).expect("open");
-        let now = file.now();
+        (d, auth)
+    }
 
-        let ours = fp32(0x01);
-        let (sender, receiver, carried, removed, old) =
-            (fp32(0x11), fp32(0x12), fp32(0x13), fp32(0x14), fp32(0x15));
-        let mut store = TrustStore::new(&ours, now).expect("ours");
-        store
-            .issue(&sender, "approved inbound", Caps::INBOUND)
-            .expect("issue");
-        store
-            .issue(&receiver, "approved outbound", Caps::OUTBOUND)
-            .expect("issue");
-        store.migrate_from_config(
-            &HashMap::from([(carried.clone(), "carried forward".to_string())]),
-            &HashMap::new(),
-            &HashSet::new(),
-            now,
-        );
-        store
-            .issue(&removed, "removed", Caps::INBOUND)
-            .expect("issue");
-        store.revoke(&removed);
-        // Paired two years ago and still trusted here: the date saved for it
-        // is already behind, and that build must still start.
-        store
-            .admit(Lease {
-                peer: old.clone(),
-                issued_to: ours.clone(),
-                label: "paired two years ago".into(),
-                caps: Caps::INBOUND,
-                origin: Origin::Inbound,
-                issued_at: now - 2 * 365 * DAY,
-                expiry: Expiry::Never,
-            })
-            .expect("admit");
+    /// Every file either build reads or writes, by name, as bytes.
+    fn files(dir: &Path) -> BTreeMap<&'static str, Option<Vec<u8>>> {
+        [
+            TRUST_FILE_NAME,
+            FLOOR_FILE_NAME,
+            TRUST_V1_COPY_NAME,
+            FLOOR_V1_COPY_NAME,
+        ]
+        .into_iter()
+        .map(|name| (name, std::fs::read(dir.join(name)).ok()))
+        .collect()
+    }
+
+    fn lease(fp: &str, state: older::State, caps: &[older::Cap]) -> older::Lease {
+        older::Lease {
+            fingerprint: fp.to_owned(),
+            label: format!("device {}", &fp[..2]),
+            state,
+            origin: older::Origin::Migrated,
+            issued_at: 1_788_579_979,
+            expires_at: (state == older::State::Active).then_some(1_788_579_979 + 400 * 86_400),
+            revoked_at: (state == older::State::Revoked).then_some(1_788_579_979),
+            caps: caps.to_vec(),
+        }
+    }
+
+    // LEDGER E2A-8 | class B | 4 file on disk: TrustFile::open, trust_file::start, TrustFile::save, and a frozen older build's open, save and start
+    #[test]
+    fn a_build_before_schema_2_refuses_this_store_and_leaves_it_unchanged() {
+        use older::{Cap, State};
+
+        // A store holding no pairing is refused, by its version alone.
+        let (empty, auth) = scratch("empty");
+        let (mut file, _) = TrustFile::open(&empty, auth.clone()).expect("open");
+        file.save(&records_of(
+            &TrustStore::new(&fp32(0x01), file.now()).expect("ours"),
+        ))
+        .expect("save an empty store");
         assert!(
-            store.may_drive_us(&old),
-            "precondition: this build trusts the old pairing"
+            older::start(&empty, auth.as_ref()).is_err(),
+            "a build that reads only version 1 started on an empty store this build \
+             saved: the version must say it is not a store that build can read"
         );
 
-        file.save(&records_of(&store)).expect("save");
-        let (_, loaded) = TrustFile::open(&dir, authority).expect("reopen");
+        // A store an older build wrote, and this build's first start on it.
+        // It holds no removal: one is dropped at that start, and the copy
+        // holding it goes with it, so no removed device survives there
+        // (#184; `trust_file`'s
+        // `a_removal_an_earlier_build_kept_is_dropped_and_that_device_pairs_again`).
+        let (dir, auth) = scratch("migrated");
+        let held = vec![
+            lease(&fp32(0x11), State::Active, &[Cap::Inbound]),
+            lease(&fp32(0x12), State::Active, &[Cap::Outbound]),
+        ];
+        older::save(&dir, auth.as_ref(), 4, held.clone());
+        assert_eq!(
+            older::start(&dir, auth.as_ref()).as_ref(),
+            Ok(&held),
+            "precondition: the older build starts on its own store"
+        );
+        let (mut file, loaded) = TrustFile::open(&dir, auth.clone()).expect("this build opens it");
         let Loaded::Present { leases, .. } = loaded else {
             panic!("the store must be found");
         };
+        start(&mut file, &fp32(0x01), &leases).expect("this build starts");
 
-        if let Err(why) = older_build_starts_on(&leases) {
-            panic!(
-                "a build from before #183 refuses to start on a store this build \
-                 saved: {why}. Every active lease needs an expires_at that build \
-                 accepts, even though this build ignores it."
-            );
+        // The older build refuses the store this build saved, blames the
+        // store and not the floor, and writes nothing.
+        let before = files(&dir);
+        let refused = older::start(&dir, auth.as_ref());
+        let store_path = dir.join(TRUST_FILE_NAME).display().to_string();
+        match &refused {
+            Err(why) if why.starts_with(&format!("{store_path} is untrusted")) => {}
+            other => panic!(
+                "a build that reads only version 1 must refuse {TRUST_FILE_NAME} as a \
+                 store it did not write, and parse the floor on the way; it gave {other:?}"
+            ),
         }
-        let older = older_build_rebuild(&leases);
-        assert!(
-            older.dropped.is_empty(),
-            "a build from before #183 drops these pairings and erases them at its \
-             next save, taking them from this build too: {:?}",
-            older.dropped
+        assert_eq!(
+            files(&dir),
+            before,
+            "the older build changed a file while refusing, so this build may no longer \
+             start on them"
         );
-        for fp in [&sender, &receiver, &carried, &old] {
-            assert!(
-                older.windows.contains_key(fp.as_str()),
-                "{fp} is missing from what that build admits"
-            );
-        }
+        let (_, reopened) = TrustFile::open(&dir, auth.clone()).expect("this build reopens it");
         assert!(
-            older.removed.contains(&removed),
-            "a device removed here must stay removed there"
-        );
-        for fp in [&sender, &receiver, &carried] {
-            let (from, until) = older.windows[fp.as_str()];
-            assert!(from <= now + DAY, "precondition: {fp} was paired today");
-            let last_day = from + OLDER_BUILD_CEILING_SECS - 1;
-            assert!(
-                last_day < until,
-                "that build stops admitting {fp}, paired today, at {until}, before \
-                 {last_day}: it must get the whole 400 days that build allows"
-            );
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Pairings whose 30-day term had lapsed on that build. The load log names
-    /// each one and says what that build does with it once this build saves;
-    /// that build's own rebuild of the saved rows is the check on the claim.
-    // LEDGER T9 | class B | 1 return value: trust_file::rebuild, trust_file::stored_terms, StoredTerms::log_lines, trust_file::records_of
-    #[test]
-    fn the_load_log_says_what_that_build_does_with_a_lapsed_pairing_once_this_build_saves() {
-        let ours = fp32(0x01);
-        let now = crate::trust::system_seconds();
-        let (recent, old) = (fp32(0x21), fp32(0x22));
-        let written_by_that_build = |fp: &str, label: &str, issued_at: u64| LeaseRecord {
-            fingerprint: fp.to_owned(),
-            label: label.into(),
-            state: DiskState::Active,
-            origin: DiskOrigin::Inbound,
-            issued_at,
-            expires_at: Some(issued_at + 30 * DAY),
-            revoked_at: None,
-            caps: vec![DiskCap::Inbound],
-        };
-        let rows = vec![
-            written_by_that_build(&recent, "lapsed ten days ago", now - 40 * DAY),
-            written_by_that_build(&old, "paired two years ago", now - 2 * 365 * DAY),
-        ];
-        let admits_now = |older: &OlderBuildStore, fp: &str| {
-            older
-                .windows
-                .get(fp)
-                .is_some_and(|&(from, until)| from <= now && now < until)
-        };
-        let before = older_build_rebuild(&rows);
-        for fp in [&recent, &old] {
-            assert!(
-                !admits_now(&before, fp),
-                "precondition: that build had stopped admitting {fp}"
-            );
-        }
-
-        let (store, refused) = rebuild(&ours, now, &rows).expect("rebuild");
-        assert!(refused.is_empty(), "refused on load: {refused:?}");
-        let lines = stored_terms(&rows, &store).log_lines();
-        let after = older_build_rebuild(&records_of(&store));
-        assert!(
-            admits_now(&after, &recent) && !admits_now(&after, &old),
-            "precondition: once this build saves, that build admits the recent \
-             pairing again and goes on refusing the old one"
+            matches!(reopened, Loaded::Present { .. }),
+            "this build no longer finds its store after the older build refused it"
         );
 
-        for fp in [&recent, &old] {
-            let Some((_, warn)) = lines
-                .iter()
-                .find(|(level, line)| *level == log::Level::Warn && line.contains(fp.as_str()))
-            else {
-                panic!("{fp} works again here and is not named at warn: {lines:#?}");
-            };
-            let admits = admits_now(&after, fp);
-            assert!(
-                warn.contains("admits it again") == admits
-                    && warn.contains("goes on refusing") == !admits,
-                "the load log says of {fp}:\n  {warn}\nbut once this build saves, that \
-                 build {} it",
-                if admits { "admits" } else { "refuses" }
-            );
+        // The copies, put back in place, are a store the older build starts on.
+        let restored = scratch_dir("restored");
+        std::fs::copy(
+            dir.join(AUTHORITY_KEY_FILE_NAME),
+            restored.join(AUTHORITY_KEY_FILE_NAME),
+        )
+        .expect("the same machine");
+        for (copy, name) in [
+            (TRUST_V1_COPY_NAME, TRUST_FILE_NAME),
+            (FLOOR_V1_COPY_NAME, FLOOR_FILE_NAME),
+        ] {
+            std::fs::copy(dir.join(copy), restored.join(name)).expect("put the copy back");
+        }
+        assert_eq!(
+            older::start(&restored, auth.as_ref()).as_ref(),
+            Ok(&held),
+            "the version 1 copies, restored, are not the store the older build wrote"
+        );
+
+        // With trust.toml moved aside, the older build starts again on the
+        // floor this build wrote.
+        std::fs::rename(dir.join(TRUST_FILE_NAME), dir.join("trust.toml.aside"))
+            .expect("move the store aside");
+        assert_eq!(
+            older::open(&dir, auth.as_ref()),
+            Ok(None),
+            "with {TRUST_FILE_NAME} moved aside, a build that reads only version 1 must \
+             find no store and start fresh; it cannot read the floor this build wrote"
+        );
+
+        for d in [dir, restored, empty] {
+            let _ = std::fs::remove_dir_all(d);
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// expulsion is permanent — the rule this project has now rebuilt three times
+// removing a device forgets it
 // ---------------------------------------------------------------------------
 
-mod an_expelled_fingerprint_is_never_re_authorised {
-    //! **Decided 2026-08-19.** No code path re-authorises a fingerprint that
-    //! carries a denial. No restore verb exists in the IPC enum, the CLI, or
-    //! any frontend. Recovery is the other machine generating a NEW identity
-    //! and pairing from scratch.
+mod removing_a_device_forgets_it {
+    //! **Decided 2026-09-16 (#184), correcting how 2026-08-19 was built.**
+    //! Removing a device drops its lease, its address and any record of its
+    //! identity. There is no tombstone, no restore verb and no reset: the
+    //! machine is unknown again, and adding it back is an ordinary pairing.
     //!
-    //! **This reverses an earlier decision, and the direction matters.** On
-    //! 2026-08-05 re-trust was a distinct verb with a confirm step. On
-    //! 2026-08-19 that clause — and only that clause — was overturned. Anyone
-    //! citing the August 5th entry to justify a restore path, a suspend state,
-    //! or a `Restored` origin is citing a decision that was reversed two weeks
-    //! later. The rest of the August 5th entry still stands.
+    //! **What stands in for the tombstone.** A removed machine returns only
+    //! through the full pairing: a prompt, which appears only after someone
+    //! opened add device on this machine (#195); an approval here, which
+    //! grants nothing on its own; and the same number confirmed on both
+    //! machines (#11, #167).
     //!
-    //! **Why the rule is worth a test.** A stored one-request path from
-    //! expelled back to full keyboard control is a capability sitting in the
-    //! daemon for a convenience worth almost nothing, since re-pairing is a
-    //! single approval. The reason to remove it was never that it was
-    //! reachable — it was that it existed at all.
+    //! **Superseded, and it is not a tidy-up to bring back.** The rule these
+    //! guards replace recorded the removed identity for good, so that machine
+    //! could only come back under a new one, and the app told people to
+    //! reinstall to get one. Recording removals again reverses the 2026-09-16
+    //! decision: take it to the decision record first.
 
-    use crate::trust::{Caps, Denial, Expiry, Lease, Origin, TrustStore};
+    use crate::service::{GrantRefused, grant_for_attempt};
+    use crate::trust::{Caps, TrustStore};
+    use hops_ipc::AttemptOrigin;
 
     use super::fp32;
 
-    fn expelled_store() -> (TrustStore, String, String) {
-        let ours = fp32(0x01);
-        let peer = fp32(0x77);
-        let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
+    fn paired_with(peer: &str, kept: &str) -> TrustStore {
+        let mut store = TrustStore::new(&fp32(0x01), 0).expect("our own fingerprint");
         store
-            .issue(&peer, "a machine", Caps::INBOUND)
+            .issue_confirmed(peer, "the sold laptop", Caps::KNOWN)
             .expect("issue");
-        store.revoke(&peer);
-        (store, ours, peer)
+        store
+            .issue_confirmed(kept, "the desk mac", Caps::INBOUND)
+            .expect("issue");
+        store
     }
 
-    /// The whole public surface of the store, tried one verb at a time against
-    /// a removed device.
-    ///
-    /// Written as an enumeration rather than as one test per verb on purpose:
-    /// the failure mode is a NEW verb, added next month, that happens to clear
-    /// a denial. A test per existing verb passes happily on the day that lands.
-    /// This one at least fails the moment an existing verb starts laundering,
-    /// and its name tells whoever adds the new verb what the rule is.
+    /// Nothing about a removed device is left anywhere the store answers
+    /// from or writes to: not a lease, not its name, not a row on disk, not
+    /// the allowlist cache an older build reads.
+    // LEDGER R184-2 | class B | 1 return value + 6 struct state: TrustStore::forget, records_of, config_cache
     #[test]
-    fn no_verb_in_the_trust_store_can_lift_a_removal() {
-        let (mut store, ours, peer) = expelled_store();
+    fn removal_leaves_no_record_of_the_device() {
+        let (peer, kept) = (fp32(0x77), fp32(0x78));
+        let mut store = paired_with(&peer, &kept);
 
-        /// One attempt to lift a removal: the verb's name, and the call.
-        type Attempt = (&'static str, Box<dyn FnOnce(&mut TrustStore)>);
+        assert!(store.forget(&peer), "the removal found nothing to remove");
 
-        let attempts: Vec<Attempt> = vec![
-            (
-                "issue",
-                Box::new(|s: &mut TrustStore| {
-                    let _ = s.issue(&fp32(0x77), "back please", Caps::KNOWN);
-                }),
-            ),
-            (
-                "issue_with_origin",
-                Box::new(|s: &mut TrustStore| {
-                    let _ = s.issue_with_origin(
-                        &fp32(0x77),
-                        "back please",
-                        Caps::KNOWN,
-                        Origin::Inbound,
-                    );
-                }),
-            ),
-            (
-                "renew",
-                Box::new(|s: &mut TrustStore| {
-                    let _ = s.renew(&fp32(0x77));
-                }),
-            ),
-            (
-                "set_label",
-                Box::new(|s: &mut TrustStore| {
-                    let _ = s.set_label(&fp32(0x77), "renamed");
-                }),
-            ),
-            (
-                "drop_capabilities",
-                Box::new(|s: &mut TrustStore| {
-                    let _ = s.drop_capabilities(&fp32(0x77), Caps::NONE);
-                }),
-            ),
-            (
-                "admit (the disk-replay door)",
-                Box::new(move |s: &mut TrustStore| {
-                    let _ = s.admit(Lease {
-                        peer: fp32(0x77),
-                        issued_to: fp32(0x01),
-                        label: "replayed off disk".to_string(),
-                        caps: Caps::KNOWN,
-                        origin: Origin::Inbound,
-                        issued_at: 0,
-                        expiry: Expiry::Never,
-                    });
-                }),
-            ),
-            (
-                "admit_denial (a second removal)",
-                Box::new(|s: &mut TrustStore| {
-                    s.admit_denial(
-                        &fp32(0x77),
-                        Denial {
-                            label: "again".to_string(),
-                            at: 1,
-                        },
-                    );
-                }),
-            ),
+        assert!(
+            !store.is_known(&peer),
+            "the store still holds a record of a removed device. Removing a \
+             device forgets it (decided 2026-09-16, #184): no tombstone, no \
+             name, nothing a reset would have to undo."
+        );
+        assert_eq!(store.label(&peer), None, "its name was kept");
+        assert!(
+            store.entries().all(|(fp, _)| fp != peer),
+            "a record of it is still listed"
+        );
+        assert!(
+            crate::trust_file::records_of(&store)
+                .iter()
+                .all(|r| r.fingerprint != peer),
+            "the store would write a record of it to disk"
+        );
+        assert!(
+            !store.config_cache().contains_key(&peer),
+            "the config file would still list it"
+        );
+        assert!(
+            store.may_drive_us(&kept),
+            "removing one device took another's pairing with it"
+        );
+    }
+
+    /// A removed device comes back through the full pairing and no other
+    /// way. Every verb short of it leaves the device with nothing; the grant
+    /// door refuses without a prompt a pairing window admitted; an approval
+    /// grants nothing until both machines confirm the number.
+    ///
+    /// Written as an enumeration so a verb added next month that hands a
+    /// removed device something short of the pairing fails here by name.
+    // LEDGER R184-3 | class B | 1 return value: TrustStore verbs, service::grant_for_attempt
+    #[test]
+    fn a_removed_device_returns_only_through_the_full_pairing() {
+        let (peer, kept) = (fp32(0x77), fp32(0x78));
+
+        type Verb = (&'static str, fn(&mut TrustStore, &str));
+        let verbs: [Verb; 7] = [
+            ("renew", |s, fp| {
+                let _ = s.renew(fp);
+            }),
+            ("set_label", |s, fp| {
+                let _ = s.set_label(fp, "back please");
+            }),
+            ("drop_capabilities", |s, fp| {
+                let _ = s.drop_capabilities(fp, Caps::NONE);
+            }),
+            ("disable_clipboard", |s, fp| {
+                let _ = s.disable_clipboard(fp);
+            }),
+            ("enable_clipboard", |s, fp| {
+                let _ = s.enable_clipboard(fp);
+            }),
+            ("confirm", |s, fp| {
+                let _ = s.confirm(fp);
+            }),
+            ("forget_unconfirmed", |s, fp| {
+                let _ = s.forget_unconfirmed(fp);
+            }),
         ];
-
-        for (verb, apply) in attempts {
-            apply(&mut store);
-            assert_eq!(
-                store.capabilities(&peer),
-                Caps::NONE,
-                "`{verb}` re-authorised a removed device. Removal is permanent \
-                 (decided 2026-08-19, reversing the 2026-08-05 restore verb). \
-                 The recovery path is the other machine generating a NEW \
-                 identity and pairing from scratch — a single approval. A \
-                 one-request route from expelled back to full keyboard control \
-                 is a capability sitting in the daemon for nothing. This has \
-                 been rebuilt twice already after the objection was answered; \
-                 if you are here because a restore feature was requested, the \
-                 answer is a new identity, not a new verb."
-            );
+        for (verb, apply) in verbs {
+            let mut store = paired_with(&peer, &kept);
+            store.forget(&peer);
+            apply(&mut store, &peer);
             assert!(
-                store.is_denied(&peer),
-                "`{verb}` erased the removal record for {peer}. The tombstone is \
-                 what keeps an expelled machine distinguishable from a stranger \
-                 on its next dial; without it the peer is simply unknown again \
-                 and one click from readmitted."
-            );
-            assert!(
-                !store.may_drive_us(&peer) && !store.we_may_drive(&peer),
-                "`{verb}` left {peer} able to drive a machine in some direction \
-                 after removal, on a store owned by {ours}."
+                !store.is_known(&peer) && store.capabilities(&peer) == Caps::NONE,
+                "`{verb}` gave a removed device a record or a capability without \
+                 the full pairing (#184, #195, #167)"
             );
         }
-    }
 
-    /// The grant door's *return value*, not just its effect. A door that
-    /// silently no-ops looks identical to a door that worked, and the UI would
-    /// then show a device the daemon does not trust.
-    #[test]
-    fn granting_to_a_removed_device_fails_loudly_rather_than_quietly() {
-        use crate::trust::TrustError;
-        let (mut store, _, peer) = expelled_store();
-        match store.issue(&peer, "back please", Caps::INBOUND) {
-            Err(TrustError::Expelled { fingerprint }) => assert_eq!(fingerprint, peer),
-            other => panic!(
-                "granting to a removed device returned {other:?}. It must return \
-                 TrustError::Expelled so the caller can tell the user that \
-                 identity is dead and the machine needs a new one. A silent \
-                 no-op leaves the frontend showing a grant that did not happen."
-            ),
-        }
-    }
-
-    /// **Decided 2026-08-30.** No commit adds a restore or suspend path while
-    /// the written tombstone rationale is still present in the source.
-    ///
-    /// **This one is a text invariant, deliberately.** The rule IS about a
-    /// comment: the mechanism is that an author who wants the restore path back
-    /// must consciously delete a paragraph explaining why it is gone, which
-    /// turns a silent regression into a deliberate act someone has to justify
-    /// in a diff. There is nothing to call. The scan runs over `trust.rs` and
-    /// `trust_file.rs`, never over this file.
-    #[test]
-    fn the_negative_space_comment_that_makes_a_rebuild_deliberate_is_still_there() {
-        for (file, src) in [
-            ("src/trust.rs", include_str!("trust.rs")),
-            ("src/trust_file.rs", include_str!("trust_file.rs")),
-        ] {
-            assert!(
-                src.contains("No `Restored`"),
-                "{file} no longer carries the `No \\`Restored\\`` note beside its \
-                 origin enum. That note is not decoration: it is the thing an \
-                 author has to delete on purpose before adding the variant back, \
-                 which is what converts a silent regression into a reviewable \
-                 act. If you removed it because you are adding a restore path, \
-                 the 2026-08-19 decision says the path may not exist — take it \
-                 to the decision record first."
-            );
-        }
-        let door = include_str!("trust.rs");
+        let mut store = paired_with(&peer, &kept);
+        store.forget(&peer);
         assert!(
-            door.contains("There is deliberately no restore verb anywhere"),
-            "src/trust.rs no longer states, at the admit door, that no restore \
-             verb exists above it. The door is the only place a reader learns \
-             that the refusal is intentional rather than an oversight — and an \
-             oversight is what somebody tidies up."
+            matches!(
+                grant_for_attempt(
+                    &mut store,
+                    &peer,
+                    "back please",
+                    None,
+                    hops_ipc::Controller::ThatMachine,
+                    false
+                ),
+                Err(GrantRefused::NoAttempt)
+            ),
+            "the grant door approved a removed device with no prompt a pairing \
+             window admitted (#195)"
         );
-    }
+        assert!(!store.is_known(&peer), "a refused grant left a record");
 
-    /// **RED TODAY.** A text invariant, and the right instrument for it: the
-    /// defect is prose, not behaviour.
-    ///
-    /// The executable code obeys the 2026-08-19 decision. The documentation
-    /// around it teaches the 2026-08-05 rule that was overturned — including
-    /// two rustdoc intra-doc links to `TrustStore::restore`, a method that does
-    /// not exist, in the module header, which is the first thing any reader
-    /// sees. That prose is the reseeding mechanism this whole exercise exists
-    /// to stop: the assistant that rebuilt `restore()` was working from a
-    /// framing it had constructed in between reading the record and writing the
-    /// code, and the framing is sitting in the file, naming the verb.
-    ///
-    /// A guard cannot outrank documentation that tells the next reader the
-    /// guard is wrong.
-    #[test]
-    fn no_shipped_prose_teaches_the_superseded_rule_that_removal_is_reversible() {
-        // Precise phrases, not the bare word: legitimate uses exist nearby —
-        // "no restore verb", "a dotfiles restore could launder", "irreversible",
-        // and the TUI's own `the_footer_advertises_no_restore` guard. Each
-        // needle below was checked to match only sites that assert the
-        // SUPERSEDED position as current design.
-        const FORBIDDEN: &[(&str, &str)] = &[
-            (
-                "`TrustStore::restore`",
-                "a rustdoc link to a method that does not exist, offered as the verb that undoes a removal",
-            ),
-            (
-                "makes removal reversible",
-                "states the overturned 2026-08-05 position as current design",
-            ),
-            (
-                "removal is reversible",
-                "states the overturned 2026-08-05 position as current design",
-            ),
-            (
-                "restore it before granting",
-                "a user-facing error string pointing at an affordance that does not exist",
-            ),
-            (
-                "so `restore`",
-                "a guard's own failure message arguing that the forbidden verb is legitimate",
-            ),
-            (
-                "what makes it reversible",
-                "states the overturned 2026-08-05 position as current design",
-            ),
-            (
-                "user can now restore",
-                "the migration doc comment asserting the reversed rule",
-            ),
-        ];
-
-        // Whole-file, including test modules, ON PURPOSE: one of the offenders
-        // is a guard's own failure message, and a failure message read by
-        // somebody about to delete the guard is exactly where this rule matters
-        // most.
-        let mut offenders = Vec::new();
-        for (file, src) in [
-            ("src/trust.rs", include_str!("trust.rs")),
-            ("src/trust_file.rs", include_str!("trust_file.rs")),
-            ("src/service.rs", include_str!("service.rs")),
-        ] {
-            for (needle, why) in FORBIDDEN {
-                for (line, text) in super::scan::hits(src, needle) {
-                    offenders.push(format!("{file}:{line} — {why}\n      {text}"));
-                }
-            }
-        }
-
-        assert!(
-            offenders.is_empty(),
-            "shipped prose still teaches that a removed device can be restored, \
-             in {} place(s):\n\n    {}\n\n\
-             Removal is permanent — decided 2026-08-19, REVERSING the 2026-08-05 \
-             entry that made re-trust a distinct verb. The code already obeys \
-             this; only the words disagree, and the words are what the next \
-             author reads. The restore path has been built twice against an \
-             objection that had already been answered, both times by someone \
-             working from a framing built between reading the record and writing \
-             the code. Two of these are broken rustdoc intra-doc links, so \
-             `cargo doc` will not resolve them either. Rewrite the prose to say \
-             what the code does: a denial outranks the lease it sits beside, and \
-             the machine returns by generating a new identity.",
-            offenders.len(),
-            offenders.join("\n    ")
-        );
-    }
-
-    /// **Decided 2026-08-05, still standing.** A revoked fingerprint produces
-    /// no approval prompt, inbound or outbound.
-    ///
-    /// **Why.** Revocation cut the session, the peer reconnected, and its
-    /// failed handshake raised the approval prompt — one click restored full
-    /// control, at a moment the peer chose, repeatable until a misclick.
-    /// Revocation cannot keep an attacker out (it can re-key); what it can do
-    /// is stop the attacker choosing the moment you are asked.
-    ///
-    /// This calls both predicates because the production path
-    /// (`raise_connection_attempt`) gates on `denial()` while the store exposes
-    /// `may_prompt()` — two answers to one question, and the audit found
-    /// `may_prompt` has no production caller. If they ever disagree, one of
-    /// them is a prompt gate that is not gating.
-    #[test]
-    fn a_removed_device_can_never_put_a_prompt_on_the_screen_and_a_lapsed_one_still_can() {
-        use crate::trust::{MAX_TERM_SECS, Term};
-
-        let ours = fp32(0x01);
-        let expelled = fp32(0x88);
-        let lapsed = fp32(0x99);
-        let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
-
-        store
-            .issue(&expelled, "removed", Caps::INBOUND)
-            .expect("issue");
-        store.revoke(&expelled);
-
-        store
-            .issue_with_term(&lapsed, "lapsed", Caps::INBOUND, Term::Secs(10))
-            .expect("issue");
-
-        assert!(
-            !store.may_prompt(&expelled),
-            "a removed device may raise an approval prompt. That is the whole \
-             readmission loop: revoke cuts the session, the peer redials, its \
-             failed handshake raises a dialog, and one click hands back full \
-             keyboard control — at a moment the peer picked, repeatable until a \
-             misclick."
-        );
+        grant_for_attempt(
+            &mut store,
+            &peer,
+            "back please",
+            Some(AttemptOrigin::Inbound),
+            hops_ipc::Controller::ThatMachine,
+            false,
+        )
+        .expect("a prompt a window admitted is approved like any first contact");
         assert_eq!(
-            store.denial(&expelled).is_some(),
-            !store.may_prompt(&expelled),
-            "the store's `may_prompt` and the `denial()` lookup that \
-             `Service::raise_connection_attempt` actually uses disagree about \
-             {expelled}. Two predicates, one question, and only one of them is \
-             wired to the screen — so the tested one can be right while the \
-             running one is wrong."
+            store.capabilities(&peer),
+            Caps::NONE,
+            "an approval alone gave a removed device back its pairing: the \
+             number was never confirmed (#11, #167)"
+        );
+        assert!(
+            store.awaits(&peer, Caps::DRIVE_ME),
+            "the approval does not let the number be compared"
+        );
+        store
+            .confirm(&peer)
+            .expect("both machines confirmed the number");
+        assert!(
+            store.may_drive_us(&peer),
+            "the full pairing did not pair a removed device again (#161)"
+        );
+    }
+
+    /// What a pairing card recorded goes with the removal (#184, #220): a
+    /// machine paired as each controlling the other with the clipboard
+    /// shared, removed, and paired again as controlling this one with the
+    /// clipboard off, holds exactly the second card's answers. A grant to a
+    /// pairing in force adds to it (#166), so a removal that left anything
+    /// in force would hand the old direction and clipboard back.
+    // LEDGER R184-18 | class B | 1 return value + 6 struct state: TrustStore::forget, service::grant_for_attempt, TrustStore::lease
+    #[test]
+    fn a_removal_drops_what_the_pairing_card_recorded() {
+        use crate::trust::{Origin, drive_of};
+        use hops_ipc::Controller;
+        let (peer, kept) = (fp32(0x77), fp32(0x78));
+        let mut store = paired_with(&peer, &kept);
+        store.forget(&peer);
+
+        grant_for_attempt(
+            &mut store,
+            &peer,
+            "desk",
+            Some(AttemptOrigin::OutboundDial),
+            Controller::Both,
+            true,
+        )
+        .expect("the first card's approval");
+        store.confirm(&peer).expect("both machines confirmed");
+        assert!(
+            store.we_may_drive(&peer) && store.may_drive_us(&peer) && store.clipboard_from(&peer),
+            "precondition: the first card paired both ways with the clipboard shared"
         );
 
-        // Roll the clock past the lease. `Clock` is max(reading, floor), so
-        // observe() is how time moves for the store.
-        store.clock().observe(MAX_TERM_SECS);
+        assert!(store.forget(&peer), "the removal found nothing to remove");
+        grant_for_attempt(
+            &mut store,
+            &peer,
+            "desk",
+            Some(AttemptOrigin::Inbound),
+            Controller::ThatMachine,
+            false,
+        )
+        .expect("a removed machine is approved like any first contact");
+        assert_eq!(
+            store.capabilities(&peer),
+            Caps::NONE,
+            "the second approval granted something before its number was confirmed"
+        );
+        store.confirm(&peer).expect("both machines confirmed again");
+        assert_eq!(
+            (
+                store.capabilities(&peer),
+                store.lease(&peer).map(|l| l.origin),
+            ),
+            (
+                drive_of(Controller::ThatMachine),
+                Some(Origin::Chosen(Controller::ThatMachine))
+            ),
+            "the pairing after a removal kept something the removed pairing's card \
+             chose: a direction or a clipboard nobody chose this time"
+        );
+    }
+
+    /// A removal an earlier build kept on file is not carried into the store
+    /// this build answers from (#184, #161).
+    // LEDGER R184-4 | class B | 1 return value: trust_file::rebuild
+    #[test]
+    fn a_removal_an_earlier_build_kept_is_not_carried_forward() {
+        use crate::trust_file::{DiskOrigin, DiskState, LeaseRecord, rebuild};
+        let peer = fp32(0x77);
+        let kept = LeaseRecord {
+            fingerprint: peer.clone(),
+            label: "the sold laptop".into(),
+            state: DiskState::Revoked,
+            origin: DiskOrigin::Migrated,
+            issued_at: 1,
+            expires_at: None,
+            revoked_at: Some(1),
+            caps: Vec::new(),
+            confirmed: true,
+            clipboard: None,
+        };
+        let (store, _) = rebuild(&fp32(0x01), 2, &[kept]).expect("rebuild");
         assert!(
-            store.may_prompt(&lapsed),
-            "a device whose lease merely LAPSED was refused a prompt. A lapse is \
-             not an expulsion: a lapsed machine may knock again and be renewed, \
-             an expelled one may not even ask. Collapsing the two makes expiry \
-             indistinguishable from removal, and then nobody dares let a lease \
-             expire."
+            !store.is_known(&peer),
+            "a removal an earlier build recorded is still in force here"
         );
     }
 }
@@ -1354,7 +1631,9 @@ mod taking_trust_away_is_never_gated_the_way_giving_it_is {
     //! **Decided 2026-08-05, two rules.** (1) A trust grant is refused while a
     //! peer is injecting input into this machine. (2) Revoke and delete succeed
     //! while a peer is driving this machine — the quiet window gates grants
-    //! only.
+    //! only. Turning a pairing's clipboard off (#182) takes permission away
+    //! too, and is held to the same rule; turning it on widens, and is gated
+    //! like a grant (#107).
     //!
     //! **Why the asymmetry is deliberate.** On a KVM the pointer is not proof
     //! of local presence: a peer that still holds control can move the cursor
@@ -1370,7 +1649,7 @@ mod taking_trust_away_is_never_gated_the_way_giving_it_is {
 
     use super::fp32;
 
-    /// The structural half, checked by calling the store: revocation takes no
+    /// The structural half, checked by calling the store: removal takes no
     /// authority and cannot fail, so there is nothing for a future gate to hook
     /// into without changing the signature — which a reviewer would see.
     #[test]
@@ -1379,27 +1658,28 @@ mod taking_trust_away_is_never_gated_the_way_giving_it_is {
         let peer = fp32(0xaa);
         let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
         store
-            .issue(&peer, "driving me right now", Caps::KNOWN)
+            .issue_confirmed(&peer, "driving me right now", Caps::KNOWN)
             .expect("issue");
 
-        // No Result, no authority argument, no clock argument: `revoke` returns
-        // the label it removed and nothing else can be threaded into it.
-        let label: String = store.revoke(&peer);
+        // No Result, no authority argument, no clock argument: `forget`
+        // returns whether there was a record and nothing else can be threaded
+        // into it.
+        let removed: bool = store.forget(&peer);
 
-        assert_eq!(label, "driving me right now");
+        assert!(removed, "the removal found nothing");
         assert_eq!(
             store.capabilities(&peer),
             Caps::NONE,
-            "revoke left capabilities behind. Revocation must be reachable and \
+            "removal left capabilities behind. Removal must be reachable and \
              total from a machine that is CURRENTLY being driven by the peer \
-             being revoked — that is the moment it exists for."
+             being removed — that is the moment it exists for."
         );
 
-        // Revoking something already revoked, and something never known, must
+        // Removing something already removed, and something never known, must
         // also not fail: a user hammering the button while a peer drives them
         // must not hit an error path.
-        let _ = store.revoke(&peer);
-        let _ = store.revoke(&fp32(0xbb));
+        let _ = store.forget(&peer);
+        let _ = store.forget(&fp32(0xbb));
     }
 
     /// **Text invariant, and it is about placement rather than behaviour.**
@@ -1413,9 +1693,11 @@ mod taking_trust_away_is_never_gated_the_way_giving_it_is {
     /// this becomes a real behavioural test the moment the gate is a free
     /// function over an "am I being driven" predicate.
     ///
-    /// Scans `service.rs`, never this file.
+    /// Scans `service.rs`, never this file. What the gated arms do while a
+    /// peer drives is observed, not scanned, by
+    /// `a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_on`.
     #[test]
-    fn only_the_grant_arm_consults_the_quiet_window() {
+    fn only_the_arms_that_widen_trust_consult_the_quiet_window() {
         let src = super::scan::code_only(include_str!("service.rs"));
         let gate = "refuse_while_remotely_driven";
 
@@ -1439,12 +1721,12 @@ mod taking_trust_away_is_never_gated_the_way_giving_it_is {
              against state only it holds."
         );
 
-        // The one arm that MUST consult the gate.
-        {
-            const GRANT: &str = "FrontendRequest::AuthorizeKey";
+        // The arms that MUST consult the gate: they widen trust. Confirming
+        // a pairing's number is what makes an approval grant (#167).
+        for arm in ["AuthorizeKey", "EnableClipboard", "ConfirmPairing"] {
             let at = dispatch
-                .find(GRANT)
-                .unwrap_or_else(|| panic!("{GRANT} must be dispatched; update this guard"));
+                .find(&format!("FrontendRequest::{arm}"))
+                .unwrap_or_else(|| panic!("{arm} must be dispatched; update this guard"));
             let after = &dispatch[at..];
             let arm_end = after[1..]
                 .find("FrontendRequest::")
@@ -1452,16 +1734,21 @@ mod taking_trust_away_is_never_gated_the_way_giving_it_is {
                 .unwrap_or(after.len());
             assert!(
                 after[..arm_end].contains(gate),
-                "the AuthorizeKey arm no longer refuses while a peer is driving \
-                 this machine. On a KVM the pointer is not proof of local \
-                 presence: the peer holding your keyboard can move the cursor \
-                 onto the approval button and click it, manufacturing its own \
-                 consent. Granting trust is the one verb a remote peer can \
-                 usefully click for itself."
+                "the {arm} arm no longer refuses while a peer is driving this \
+                 machine. On a KVM the pointer is not proof of local presence: \
+                 the peer holding your keyboard can move the cursor onto the \
+                 approval button and click it, manufacturing its own consent. \
+                 Widening trust is what a remote peer can usefully click for \
+                 itself."
             );
         }
 
-        for arm in ["RemoveAuthorizedKey", "Delete"] {
+        for arm in [
+            "RemoveAuthorizedKey",
+            "Delete",
+            "DisableClipboard",
+            "CancelPairing",
+        ] {
             let at = dispatch
                 .find(&format!("FrontendRequest::{arm}"))
                 .unwrap_or_else(|| panic!("{arm} must be dispatched; update this guard"));
@@ -1511,11 +1798,11 @@ mod removing_a_device_takes_its_key_and_not_merely_its_address {
         let peer = fp32(0xcc);
         let mut store = TrustStore::new(&ours, 0).expect("our own fingerprint");
         store
-            .issue(&peer, "the sold laptop", Caps::KNOWN)
+            .issue_confirmed(&peer, "the sold laptop", Caps::KNOWN)
             .expect("issue");
         assert!(store.may_drive_us(&peer), "precondition: it was trusted");
 
-        store.revoke(&peer);
+        store.forget(&peer);
 
         assert_eq!(
             store.capabilities(&peer),
@@ -1527,10 +1814,8 @@ mod removing_a_device_takes_its_key_and_not_merely_its_address {
              their keyboard and mouse."
         );
         assert!(
-            store.is_denied(&peer),
-            "a removed device left no expulsion record, so on its next dial it \
-             is a stranger rather than a machine you already threw out — and a \
-             stranger is one click from readmitted."
+            !store.is_known(&peer),
+            "a removed device left a record behind; removing it forgets it (#184)"
         );
     }
 
@@ -1551,7 +1836,7 @@ mod removing_a_device_takes_its_key_and_not_merely_its_address {
             .unwrap_or(rest.len());
         let body = &rest[..end];
 
-        for forbidden in ["remove_authorized_key", "revoke("] {
+        for forbidden in ["remove_authorized_key", ".forget("] {
             assert!(
                 !body.contains(forbidden),
                 "remove_client() calls `{forbidden}`. remove_client is ALSO called \
@@ -1565,73 +1850,825 @@ mod removing_a_device_takes_its_key_and_not_merely_its_address {
     }
 }
 
+mod an_edited_device_still_dials_only_the_machine_it_is_pinned_to {
+    //! **Decided 2026-09-26 (#99).** Editing a device's address or hostname
+    //! keeps its fingerprint pin. The machine answering at the new address
+    //! has to present the same fingerprint; a different machine is refused.
+    //! This reverses the clearing that went with #22.
+    //!
+    //! **Why.** The pin is the only thing that says "this device is that
+    //! machine". Without it a dial accepts any machine this one may drive, so
+    //! clearing it on an edit widened the check from one machine to all of
+    //! them, and the dial then pinned and saved whichever answered, with no
+    //! prompt and the old name still on the card. An address says where to
+    //! dial, never who is trusted there.
+
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        time::Duration,
+    };
+
+    use hops_ipc::Position;
+    use hops_proto::ProtoEvent;
+
+    use crate::client::ClientManager;
+    use crate::test_harness::{Dialer, Door, Machine, dialer, door, machine, run_local, trust};
+    use crate::trust::Caps;
+
+    use super::fp32;
+
+    const PATIENCE: Duration = Duration::from_secs(10);
+
+    /// Somewhere nothing answers (TEST-NET-1), where the device was before.
+    const OLD_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+
+    /// A device pinned to `pinned`, at [`OLD_ADDRESS`] on `door`'s port, then
+    /// moved to the address `door` answers on, and dialled.
+    async fn moved_to(
+        door: &Door,
+        sender: &Machine,
+        pinned: &Machine,
+        known: &[&Machine],
+    ) -> Dialer {
+        let d = dialer(
+            sender,
+            trust(sender, known, Caps::OUTBOUND),
+            door.port,
+            Position::Left,
+        );
+        d.clients.set_fix_ips(d.handle, vec![OLD_ADDRESS]);
+        d.clients
+            .set_peer_fingerprint(d.handle, Some(pinned.fingerprint.clone()));
+        d.clients
+            .set_fix_ips(d.handle, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+        let _ = d.conn.send(ProtoEvent::Ping, d.handle).await;
+        let started = tokio::time::Instant::now();
+        while door.closed() == 0
+            && d.conn.active_addr(d.handle).is_none()
+            && started.elapsed() < PATIENCE
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        d
+    }
+
+    /// The rule itself, for both edits, at the one place that holds the pin.
+    #[test]
+    fn a_new_address_or_name_leaves_the_pin_where_it_was() {
+        let clients = ClientManager::default();
+        let handle = clients.add_client();
+        let pin = fp32(0xd1);
+        clients.set_peer_fingerprint(handle, Some(pin.clone()));
+
+        clients.set_fix_ips(handle, vec![OLD_ADDRESS]);
+        assert_eq!(
+            clients.peer_fingerprint(handle),
+            Some(pin.clone()),
+            "a new address cleared the device's pin, so its next dial accepts any \
+             machine this one may drive and pins whichever answers (#99)"
+        );
+        clients.set_hostname(handle, Some("desk mac.invalid".into()));
+        assert_eq!(
+            clients.peer_fingerprint(handle),
+            Some(pin),
+            "a new hostname cleared the device's pin, so its next dial accepts \
+             any machine this one may drive and pins whichever answers (#99)"
+        );
+    }
+
+    /// A different machine answering at the new address is refused, though
+    /// this machine may drive it.
+    #[test]
+    fn another_machine_at_the_new_address_is_refused() {
+        run_local(async {
+            let (sender, desk, other) = (machine(), machine(), machine());
+            let answering = door(&other);
+            answering.open();
+            let d = moved_to(&answering, &sender, &desk, &[&desk, &other]).await;
+
+            assert_eq!(
+                (
+                    d.conn.active_addr(d.handle).is_some(),
+                    d.clients.peer_fingerprint(d.handle) == Some(desk.fingerprint.clone()),
+                    answering.streams(),
+                ),
+                (false, true, 0),
+                "(linked, still pinned to the desk, streams opened): the device \
+                 was pinned to the desk and moved to an address where another \
+                 machine this one may drive answers. That machine has to be \
+                 refused and the pin kept (#99); a link or a new pin means input \
+                 meant for the desk goes to it."
+            );
+            assert!(
+                answering.closed() > 0,
+                "the other machine's connection was left open"
+            );
+        });
+    }
+
+    /// The same machine at its new address is still reached: keeping the pin
+    /// does not stop an address edit from working.
+    #[test]
+    fn the_same_machine_at_the_new_address_is_reached() {
+        run_local(async {
+            let (sender, desk) = (machine(), machine());
+            let answering = door(&desk);
+            answering.open();
+            let d = moved_to(&answering, &sender, &desk, &[&desk]).await;
+
+            assert!(
+                d.conn.active_addr(d.handle).is_some(),
+                "the device was moved to the address its own machine answers on, \
+                 and no link came up"
+            );
+            assert_eq!(
+                d.clients.peer_fingerprint(d.handle),
+                Some(desk.fingerprint),
+                "the device's pin changed on reaching its own machine"
+            );
+        });
+    }
+}
+
 // ---------------------------------------------------------------------------
 // no UI is trusted; nothing reaches a shell
 // ---------------------------------------------------------------------------
 
-mod no_frontend_can_cause_a_trust_write {
-    //! **Decided 2026-08-30 (#107).** No frontend — Slint, TUI, CLI, or a
-    //! served page — can cause a trust write; a privileged verb is not
-    //! serialisable over the frontend IPC socket.
+mod a_frontend_widens_trust_only_by_approving_a_prompt_or_turning_the_clipboard_on {
+    //! **Decided 2026-09-26 (#107): retired, as a stated limit.** It replaces
+    //! 2026-08-30's rule that no frontend can cause a trust write, whose two
+    //! guards stood red until the grant verb left the IPC channel. It stays.
     //!
-    //! **Why.** lan-mouse assumed the frontend is trusted; hops does not.
-    //! `Create`, then `UpdateFixIps(attacker_ip)`, then `Activate` makes the
-    //! daemon dial an attacker and raise a genuine approval prompt for a
-    //! fingerprint the attacker chose, at a moment the attacker chose.
+    //! **The limit.** Three frontend requests widen trust, and nothing else
+    //! a frontend can send does: `AuthorizeKey`, which approves a prompt the
+    //! daemon raised for a machine that arrived while the pairing window was
+    //! open, with the card's answers, which way control goes (#220) and a yes
+    //! or no to the clipboard (#182), so a yes is refused while driven with
+    //! the approval it is part of; `ConfirmPairing`, which answers the number that approval's
+    //! pairing compares, and without which the approval grants nothing
+    //! (#167); and `EnableClipboard`, which turns a paired machine's
+    //! clipboard back on in the directions it already drives. The daemon
+    //! refuses all three while a peer is driving this machine, so the machine
+    //! holding the keyboard and pointer cannot click its own approval. Driven
+    //! means crossed onto this machine or holding a key or button down here,
+    //! and for a quiet window after the peer's last input, which includes a
+    //! button let go for it when its session ends: that up completes a click.
+    //!
+    //! **Why it is a limit and not a boundary.** Anything running as the user
+    //! can read the IPC token, send all three, open add device and add a device to
+    //! dial, and re-sign the trust store on disk (`src/authority.rs`). The
+    //! channel cannot defend against that program, so the rule is stated
+    //! where a reader finds it (the `hops_ipc` crate docs) and pinned here, so
+    //! a fourth widening request, or any of the three without the driving
+    //! check, fails a test instead of passing review.
+    //!
+    //! **Behavioural.** The whole daemon runs in this process with a real
+    //! frontend on its IPC socket and real peers on loopback QUIC: one drives
+    //! it, two knock while add device is open, and one of those compares its
+    //! number. The store read is the daemon's own.
+    #![cfg(unix)]
 
-    /// **RED TODAY (#107).**
-    ///
-    /// Type-level and behavioural: it constructs the verb and serialises it. If
-    /// `AuthorizeKey` cannot be built and put on the wire, this stops compiling
-    /// — which is the point. The failure message tells you to delete the test
-    /// along with the variant.
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::time::Duration;
+
+    use hops_ipc::{ClientHandle, FrontendEvent, FrontendRequest, Position};
+    use hops_proto::ProtoEvent;
+    use input_emulation::recording::{Recorded, Recording};
+    use input_event::{BTN_LEFT, Event, KeyboardEvent, PointerEvent, scancode};
+
+    use crate::service::in_process::{
+        DEADLINE, Daemon, compare_number, prompt_from, trusting, until_paired,
+    };
+    use crate::test_harness::{dialer, machine, run_local};
+    use crate::transport::Trust;
+    use crate::trust::Caps;
+
+    /// Whether a request can widen trust. There is no wildcard: a new request
+    /// fails to compile here until it is placed on one side, and one placed
+    /// on the `false` side must be in [`every_other_request`] as well, which
+    /// `every_request_is_sent_by_the_sweep` checks.
+    fn widens(request: &FrontendRequest) -> bool {
+        use FrontendRequest as R;
+        match request {
+            R::AuthorizeKey { .. } | R::EnableClipboard(_) | R::ConfirmPairing { .. } => true,
+            R::Activate(..)
+            | R::Create(_)
+            | R::ChangePort(_)
+            | R::Delete { .. }
+            | R::Enumerate()
+            | R::ResolveDns(_)
+            | R::UpdateHostname { .. }
+            | R::UpdateLabel(..)
+            | R::UpdatePort(..)
+            | R::UpdatePosition(..)
+            | R::UpdateGeometry(..)
+            | R::UpdateFixIps(..)
+            | R::EnableCapture
+            | R::EnableEmulation
+            | R::Sync
+            | R::RemoveAuthorizedKey(_)
+            | R::SetLabel(..)
+            | R::SaveConfiguration
+            | R::OpenPairing
+            | R::DisableClipboard(_)
+            | R::CancelPairing(_)
+            | R::Barrier(_) => false,
+        }
+    }
+
+    /// One of every request that does not widen trust, each aimed where a
+    /// widening would show: at the machine whose prompt is waiting, at the
+    /// paired machine whose clipboard is off, and at a device added here,
+    /// which is pointed at a port nothing answers on. The one removal is aimed
+    /// at a machine never paired, so the pairings above are still there to
+    /// widen afterwards.
+    fn every_other_request(
+        stranger: &str,
+        paired: &str,
+        added: ClientHandle,
+        port: u16,
+        nowhere: u16,
+    ) -> Vec<FrontendRequest> {
+        use FrontendRequest as R;
+        let loopback = std::net::IpAddr::from([127, 0, 0, 1]);
+        vec![
+            R::OpenPairing,
+            R::UpdateLabel(added, Some("renamed".into())),
+            R::UpdateFixIps(added, vec![loopback]),
+            R::UpdatePort(added, nowhere),
+            R::UpdateHostname {
+                handle: added,
+                hostname: None,
+                fingerprint: None,
+            },
+            R::UpdatePosition(added, Position::Right),
+            R::UpdateGeometry(added, None),
+            R::Activate(added, true),
+            R::ResolveDns(added),
+            R::Enumerate(),
+            R::Sync,
+            R::ChangePort(port),
+            R::EnableCapture,
+            R::EnableEmulation,
+            R::SetLabel(stranger.to_owned(), "a stranger, renamed".to_owned()),
+            R::SetLabel(paired.to_owned(), "desk mac, renamed".to_owned()),
+            R::DisableClipboard(paired.to_owned()),
+            R::DisableClipboard(stranger.to_owned()),
+            R::CancelPairing(stranger.to_owned()),
+            R::CancelPairing(paired.to_owned()),
+            R::SaveConfiguration,
+            R::Barrier(u64::MAX),
+            R::Activate(added, false),
+            R::Delete {
+                handle: added,
+                fingerprint: None,
+            },
+            R::RemoveAuthorizedKey(super::fp32(0x5e)),
+        ]
+    }
+
+    /// A device added here, pointed at `port` on loopback, where nothing
+    /// answers when `port` is the sweep's `nowhere`.
+    fn new_device(port: u16) -> hops_ipc::NewDevice {
+        hops_ipc::NewDevice {
+            hostname: None,
+            fix_ips: vec![std::net::IpAddr::from([127, 0, 0, 1])],
+            port,
+            pos: Position::Left,
+        }
+    }
+
+    /// What the daemon's store grants each machine it holds a pairing for.
+    fn granted(trust: &Trust) -> BTreeMap<String, Caps> {
+        trust.read().expect("lock").pairings().into_iter().collect()
+    }
+
+    /// The machines approved here whose number is not yet confirmed: they
+    /// are admitted at TLS, far enough to compare it (#167). A request that
+    /// adds one has widened trust as surely as one that adds a pairing.
+    fn waiting(trust: &Trust) -> BTreeSet<String> {
+        trust
+            .read()
+            .expect("lock")
+            .unconfirmed()
+            .into_iter()
+            .collect()
+    }
+
+    /// The notices that refused a request because this machine was driven.
+    fn refusals(events: &[FrontendEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                FrontendEvent::Error(text) if text.contains("controlled remotely") => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The name a request goes by on the IPC channel.
+    fn name(request: &FrontendRequest) -> String {
+        match serde_json::to_value(request).expect("a request serialises") {
+            serde_json::Value::String(name) => name,
+            serde_json::Value::Object(map) if map.len() == 1 => {
+                map.into_iter().next().expect("one entry").0
+            }
+            other => panic!("a request serialised as neither a name nor one entry: {other}"),
+        }
+    }
+
+    /// Every request the IPC channel carries, by name: the decoder lists them
+    /// when it is handed one it does not know.
+    fn every_request_name() -> BTreeSet<String> {
+        let refused = serde_json::from_str::<FrontendRequest>("\"NoSuchRequest\"")
+            .expect_err("no request is called NoSuchRequest")
+            .to_string();
+        let (_, expected) = refused
+            .split_once("expected one of")
+            .unwrap_or_else(|| panic!("the decoder no longer lists the requests: {refused}"));
+        expected
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    // LEDGER EN-5 | class B | 1 return value: the requests the IPC decoder accepts, against the guard's own tables
+    /// The sweep below proves nothing about a request it never sends. Every
+    /// request is one of the three that widen, `Create` (sent first for the
+    /// handle the others aim at), or in [`every_other_request`].
     #[test]
-    #[ignore = "RED: AuthorizeKey is still a frontend IPC verb. Closed by #107. Kept red-and-visible rather than deleted: this is the decision with the fullest documented attack chain behind it."]
-    fn no_privileged_verb_can_be_serialised_over_the_frontend_socket() {
-        use hops_ipc::FrontendRequest;
-
-        let grant = FrontendRequest::AuthorizeKey("a device".to_string(), super::fp32(0xdd));
-        let on_the_wire = serde_json::to_string(&grant).expect("serialise");
-
-        assert!(
-            !on_the_wire.contains("AuthorizeKey"),
-            "the trust grant is still a frontend IPC verb, serialisable as \
-             {on_the_wire} (#107). Anything that can write a line to that socket \
-             can grant keyboard control of this machine — and the full chain is \
-             intact beside it: Create, then UpdateFixIps(attacker_ip), then \
-             Activate makes the daemon dial an address of the attacker's \
-             choosing and raise a GENUINE approval prompt for a fingerprint the \
-             attacker chose, at a moment the attacker chose. When the grant verb \
-             moves off this socket, delete the variant and this test together."
+    fn every_request_is_sent_by_the_sweep() {
+        use FrontendRequest as R;
+        let fp = super::fp32(0x5f);
+        let widening = [
+            crate::test_harness::approval("", &fp, hops_ipc::Controller::Both),
+            R::ConfirmPairing {
+                fingerprint: fp.clone(),
+                number: String::new(),
+            },
+            R::EnableClipboard(fp.clone()),
+        ];
+        assert!(widening.iter().all(widens));
+        let others = every_other_request(&fp, &fp, 0, 1, 2);
+        let mut sent: BTreeSet<String> = others.iter().map(name).collect();
+        sent.extend(widening.iter().map(name));
+        sent.insert(name(&R::Create(new_device(1))));
+        assert_eq!(
+            sent,
+            every_request_name(),
+            "a request the IPC channel carries is missing from every_other_request, \
+             so the sweep never checks whether it widens trust. Add it there, aimed \
+             where a widening would show."
         );
     }
 
-    /// **Also RED TODAY, and the reason the #130 door cannot be fixed in
-    /// isolation.** The approval message carries a description and a
-    /// fingerprint and nothing else — so the wire itself cannot say whether the
-    /// user was answering an inbound knock or their own outbound dial, and the
-    /// door has no origin to derive capabilities from.
-    ///
-    /// This is why `approving_our_own_dial_never_lets_that_machine_type_into_this_one`
-    /// is red: the information needed to fix it does not reach the door.
+    /// The daemon's quiet window: requests are refused for this long after
+    /// a peer's last input.
+    const QUIET: Duration = Duration::from_secs(2);
+
+    // LEDGER DR-1 | class B | 5 process-in-test + 1 struct state: FrontendRequest over the daemon's IPC socket, a peer holding a key and then a button over loopback QUIC, the daemon's trust store
+    /// A peer that holds a key or a button is driving this machine however
+    /// long ago it last sent anything. A held key repeats here with nothing
+    /// more sent; a held button comes up when the peer leaves, completing a
+    /// click on whatever it was pressed over. Both keep turning a clipboard on
+    /// refused, and so the other two widening requests, which share the check.
     #[test]
-    #[ignore = "RED: FrontendRequest::AuthorizeKey carries no origin, so the wire cannot express which act was approved. Closed by #107, which moves the grant verb off IPC entirely. The store now refuses an incoherent grant, so this is a wire gap rather than a live over-grant."]
-    fn an_approval_says_which_act_it_is_approving() {
-        use hops_ipc::FrontendRequest;
+    fn a_held_key_or_a_button_let_go_as_the_peer_leaves_keeps_widening_refused() {
+        run_local(async {
+            let (desk, laptop) = (machine(), machine());
+            // Each may drive this machine and send it its clipboard, as a
+            // pairing made before the clipboard was asked about grants.
+            let from = Caps::DRIVE_ME | Caps::CLIPBOARD_FROM;
+            let recording = Recording::new();
+            let daemon = Daemon::start_paired(
+                "held",
+                "",
+                &[
+                    (&desk.fingerprint, "desk mac", from),
+                    (&laptop.fingerprint, "laptop", from),
+                ],
+                input_capture::Backend::Dummy,
+                recording.backend(),
+            )
+            .await;
+            let (ours, port, trust, ipc) = (
+                daemon.fingerprint(),
+                daemon.port(),
+                daemon.trust(),
+                daemon.ipc(),
+            );
+            let laptop_fp = laptop.fingerprint.clone();
+            let recording = &recording;
+            let injected = |event: Event| {
+                move || {
+                    recording
+                        .calls()
+                        .iter()
+                        .any(|c| matches!(c, Recorded::Consume(e, _) if *e == event))
+                }
+            };
+            let key = |state| {
+                Event::Keyboard(KeyboardEvent::Key {
+                    time: 0,
+                    key: scancode::Linux::KeyA as u32,
+                    state,
+                })
+            };
+            let button = |state| {
+                Event::Pointer(PointerEvent::Button {
+                    time: 0,
+                    button: BTN_LEFT,
+                    state,
+                })
+            };
 
-        let grant = FrontendRequest::AuthorizeKey("a device".to_string(), super::fp32(0xdd));
-        let on_the_wire = serde_json::to_string(&grant).expect("serialise");
+            daemon
+                .run_while(async {
+                    use crate::test_harness::wait_until;
+                    use FrontendRequest as R;
+                    let mut app = ipc.connect().await;
+                    app.exchange(&[R::DisableClipboard(laptop_fp.clone())])
+                        .await;
+                    let enable = [R::EnableClipboard(laptop_fp.clone())];
+                    let clipboard_on = || trust.read().expect("lock").clipboard_from(&laptop_fp);
+                    assert!(!clipboard_on(), "precondition: the clipboard is off");
 
-        assert!(
-            on_the_wire.contains("Inbound")
-                || on_the_wire.contains("OutboundDial")
-                || on_the_wire.contains("origin"),
-            "the approval message {on_the_wire} carries no origin, so the grant \
-             door cannot tell an inbound knock from our own dial and hardcodes \
-             one direction for both (#130). Direction is a capability; a message \
-             that cannot express which act was approved cannot mint the right \
-             one."
-        );
+                    let driver = dialer(&desk, trusting(&desk, &ours), port, Position::Left);
+                    driver.until_alive().await;
+                    driver
+                        .send(ProtoEvent::Enter(hops_proto::Position::Right))
+                        .await;
+                    // Input sent before the crossing lands is dropped, so the
+                    // key goes down again until it is injected.
+                    let deadline = tokio::time::Instant::now() + DEADLINE;
+                    while !injected(key(1))() {
+                        assert!(
+                            tokio::time::Instant::now() < deadline,
+                            "the key-down was never injected"
+                        );
+                        driver.send(ProtoEvent::Input(key(1))).await;
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+
+                    // Held past the quiet window, with nothing more sent.
+                    tokio::time::sleep(QUIET + Duration::from_millis(500)).await;
+                    let events = app.exchange(&enable).await;
+                    assert!(
+                        !clipboard_on() && refusals(&events).len() == 1,
+                        "a peer holding a key down here turned a clipboard on once \
+                         its last event was older than the quiet window. The key \
+                         repeats here with nothing more sent; the peer is still \
+                         driving. The app was told {:?}",
+                        refusals(&events)
+                    );
+
+                    // Let go, with the pointer left here and idle past the
+                    // quiet window: still crossed in, so still driving. The
+                    // local mouse is refused too, so the notice has to say
+                    // what ends it.
+                    driver.send(ProtoEvent::Input(key(0))).await;
+                    wait_until("the key is let go", DEADLINE, injected(key(0))).await;
+                    tokio::time::sleep(QUIET + Duration::from_millis(500)).await;
+                    let events = app.exchange(&enable).await;
+                    let told = refusals(&events);
+                    assert!(
+                        !clipboard_on() && told.len() == 1,
+                        "a peer crossed in with its pointer idle here turned a \
+                         clipboard on: the app was told {told:?}"
+                    );
+                    assert!(
+                        told[0].contains("pointer back"),
+                        "refused while a peer is crossed in, and the notice does not \
+                         say to move the pointer back to the machine controlling \
+                         this one, the only thing that ends the refusal: {:?}",
+                        told[0]
+                    );
+
+                    // Pressed over the approval, held past the quiet window,
+                    // then let go by the peer leaving.
+                    driver.send(ProtoEvent::Input(button(1))).await;
+                    wait_until("the button goes down", DEADLINE, injected(button(1))).await;
+                    tokio::time::sleep(QUIET + Duration::from_millis(500)).await;
+                    driver.send(ProtoEvent::Leave(0)).await;
+                    wait_until("the button is let go", DEADLINE, injected(button(0))).await;
+                    let let_go = tokio::time::Instant::now();
+                    let events = app.exchange(&enable).await;
+                    // The Leave and the button-up it lets go of both count as
+                    // the peer's input, so this cannot tell them apart; the
+                    // emulation tests do (DR-5, DR-7). Only a request handled
+                    // inside the window after them says anything, and a
+                    // machine too loaded for that skips the check, saying so.
+                    if let_go.elapsed() >= QUIET {
+                        eprintln!(
+                            "skipped: the request after the let-go was handled \
+                             {:?} later, outside the quiet window",
+                            let_go.elapsed()
+                        );
+                    } else {
+                        assert!(
+                            !clipboard_on() && refusals(&events).len() == 1,
+                            "the button a peer held came up as it left, completing a \
+                             click, and a clipboard was turned on right after it: the \
+                             let-go was not counted as the peer's input. The app was \
+                             told {:?}",
+                            refusals(&events)
+                        );
+                    }
+
+                    // And once the quiet window has passed, it is honoured.
+                    let deadline = tokio::time::Instant::now() + DEADLINE;
+                    while !clipboard_on() {
+                        assert!(
+                            tokio::time::Instant::now() < deadline,
+                            "turning a clipboard on was still refused long after the \
+                             peer left and let go of everything"
+                        );
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        app.exchange(&enable).await;
+                    }
+                })
+                .await;
+        });
+    }
+
+    // LEDGER EN-3 | class B | 5 process-in-test + 1 struct state: FrontendRequest over the daemon's IPC socket, a peer driving it over loopback QUIC, the daemon's trust store
+    #[test]
+    fn only_approving_a_prompt_or_turning_the_clipboard_on_widens_trust_and_neither_while_driven() {
+        run_local(async {
+            let (desk, laptop, stranger, newcomer) = (machine(), machine(), machine(), machine());
+            // Each may drive this machine and send it its clipboard, as a
+            // pairing made before the clipboard was asked about grants.
+            let from = Caps::DRIVE_ME | Caps::CLIPBOARD_FROM;
+            let recording = Recording::new();
+            let daemon = Daemon::start_paired(
+                "widen",
+                "",
+                &[
+                    (&desk.fingerprint, "desk mac", from),
+                    (&laptop.fingerprint, "laptop", from),
+                ],
+                input_capture::Backend::Dummy,
+                recording.backend(),
+            )
+            .await;
+            let (ours, port, trust, ipc) = (
+                daemon.fingerprint(),
+                daemon.port(),
+                daemon.trust(),
+                daemon.ipc(),
+            );
+            // Held for the whole test, so nothing else can answer on it.
+            let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("a silent port");
+            let nowhere = silent.local_addr().expect("its address").port();
+            let (desk_fp, laptop_fp, stranger_fp, newcomer_fp) = (
+                desk.fingerprint.clone(),
+                laptop.fingerprint.clone(),
+                stranger.fingerprint.clone(),
+                newcomer.fingerprint.clone(),
+            );
+
+            daemon
+                .run_while(async {
+                    use FrontendRequest as R;
+                    let mut app = ipc.connect().await;
+                    app.exchange(&[
+                        R::OpenPairing,
+                        R::DisableClipboard(desk_fp.clone()),
+                        R::DisableClipboard(laptop_fp.clone()),
+                    ])
+                    .await;
+                    prompt_from(&mut app, &stranger, port, &ours).await;
+                    // A second machine is approved while nobody drives this
+                    // one, and compares its number: what is left is the answer
+                    // that makes its approval grant (#167).
+                    prompt_from(&mut app, &newcomer, port, &ours).await;
+                    app.exchange(&[crate::test_harness::approval(
+                        "newcomer",
+                        &newcomer_fp,
+                        hops_ipc::Controller::ThatMachine,
+                    )])
+                    .await;
+                    let comparing = compare_number(&mut app, &newcomer, port, &ours).await;
+                    let before = granted(&trust);
+                    let waiting_before = waiting(&trust);
+                    assert!(
+                        !before[&desk_fp].intersects(Caps::CLIPBOARD)
+                            && !before.contains_key(&stranger_fp)
+                            && !before.contains_key(&newcomer_fp),
+                        "precondition: the paired machine's clipboard is off and the \
+                         prompting ones hold nothing: {before:?}"
+                    );
+                    assert_eq!(
+                        waiting_before,
+                        BTreeSet::from([newcomer_fp.clone()]),
+                        "precondition: only the approved machine waits for its number"
+                    );
+
+                    // Driven: the paired machine crosses onto this one and keeps
+                    // moving the pointer while all three widening requests are sent.
+                    let driver = dialer(&desk, trusting(&desk, &ours), port, Position::Left);
+                    driver.until_alive().await;
+                    driver
+                        .send(ProtoEvent::Enter(hops_proto::Position::Right))
+                        .await;
+                    let motion = Event::Pointer(PointerEvent::Motion {
+                        time: 0,
+                        dx: 1.0,
+                        dy: 0.0,
+                    });
+                    let driving = async {
+                        loop {
+                            driver.send(ProtoEvent::Input(motion)).await;
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    };
+                    let asked = async {
+                        crate::test_harness::wait_until("the pointer moves", DEADLINE, || {
+                            recording
+                                .calls()
+                                .iter()
+                                .any(|c| matches!(c, Recorded::Consume(e, _) if *e == motion))
+                        })
+                        .await;
+                        app.exchange(&[
+                            R::AuthorizeKey {
+                                label: "new laptop".to_owned(),
+                                fingerprint: stranger_fp.clone(),
+                                controller: hops_ipc::Controller::ThatMachine,
+                                clipboard: true,
+                            },
+                            R::EnableClipboard(desk_fp.clone()),
+                            R::ConfirmPairing {
+                                fingerprint: newcomer_fp.clone(),
+                                number: comparing.number.clone(),
+                            },
+                        ])
+                        .await
+                    };
+                    let events = tokio::select! {
+                        () = driving => unreachable!("the driver stops only with the test"),
+                        events = asked => events,
+                    };
+                    assert_eq!(
+                        granted(&trust),
+                        before,
+                        "a request sent while a peer drove this machine widened trust. \
+                         On a KVM the pointer is not proof that anyone is at this \
+                         machine: the peer holding it can move it onto the approval \
+                         and click, manufacturing its own consent. Refusals: {:?}",
+                        refusals(&events)
+                    );
+                    assert_eq!(
+                        waiting(&trust),
+                        waiting_before,
+                        "a request sent while a peer drove this machine approved a machine \
+                         to compare a number. Refusals: {:?}",
+                        refusals(&events)
+                    );
+                    let refused = refusals(&events);
+                    let grants = refused
+                        .iter()
+                        .filter(|r| r.starts_with(hops_ipc::GRANT_REFUSED))
+                        .count();
+                    assert!(
+                        refused.len() == 3 && grants == 1,
+                        "all three widening requests must be refused, each saying why, while \
+                         a peer drives this machine, and only the grant's refusal may begin \
+                         as a refused grant: `hops cli authorize-key` reads any notice \
+                         that does as its own grant refused. The app was told {refused:?}"
+                    );
+
+                    // No longer driven: once the peer has left and the quiet
+                    // window has passed, a widening request on a third pairing
+                    // is honoured. A peer crossed onto this machine drives it
+                    // until it leaves, however long it is still.
+                    driver.send(ProtoEvent::Leave(0)).await;
+                    let deadline = tokio::time::Instant::now() + DEADLINE;
+                    while !trust.read().expect("lock").clipboard_from(&laptop_fp) {
+                        assert!(
+                            tokio::time::Instant::now() < deadline,
+                            "turning a clipboard on was still refused long after the \
+                             peer stopped driving"
+                        );
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        app.exchange(&[R::EnableClipboard(laptop_fp.clone())]).await;
+                    }
+                    // Long enough for a confirmation that was honoured to have
+                    // finished the pairing: the other machine's answer is read
+                    // after the request is handled, not before.
+                    assert!(
+                        !granted(&trust).contains_key(&newcomer_fp),
+                        "the number answered while a peer drove this machine finished \
+                         the pairing"
+                    );
+                    let before = granted(&trust);
+                    let waiting_before = waiting(&trust);
+
+                    // Everything else, aimed where a widening would show.
+                    let created = app.exchange(&[R::Create(new_device(nowhere))]).await;
+                    let added = created
+                        .iter()
+                        .find_map(|e| match e {
+                            FrontendEvent::Created(handle, ..) => Some(*handle),
+                            _ => None,
+                        })
+                        .expect("a device added from the app is announced");
+                    let others = every_other_request(&stranger_fp, &desk_fp, added, port, nowhere);
+                    assert!(
+                        !others.iter().any(widens),
+                        "every_other_request holds a request that widens trust"
+                    );
+                    // Turning a clipboard on for a machine that is not paired,
+                    // one prompting and one never seen, widens nothing either.
+                    let unpaired = [
+                        R::EnableClipboard(stranger_fp.clone()),
+                        R::EnableClipboard(super::fp32(0x5f)),
+                    ];
+                    // One at a time, checked after each: a later request that
+                    // narrows must not hide an earlier one that widened.
+                    for request in unpaired.into_iter().chain(others) {
+                        app.exchange(std::slice::from_ref(&request)).await;
+                        let admitted: Vec<_> = waiting(&trust)
+                            .difference(&waiting_before)
+                            .cloned()
+                            .collect();
+                        assert!(
+                            admitted.is_empty(),
+                            "{request:?} approved {admitted:?} to compare a number. Only \
+                             approving a prompt may."
+                        );
+                        let after = granted(&trust);
+                        let widened: Vec<_> = after
+                            .iter()
+                            .filter(|(fp, caps)| {
+                                !before.get(*fp).is_some_and(|b| b.contains(**caps))
+                            })
+                            .collect();
+                        assert!(
+                            widened.is_empty(),
+                            "{request:?} widened trust: {widened:?} (before: {before:?}). \
+                             Only approving a prompt, confirming its number, and turning \
+                             on the clipboard of a paired machine, may. \
+                             A same-user program holding the IPC token can send any of \
+                             them, and the stated limit is that it can do exactly those \
+                             things to trust, none while this machine is driven. Another \
+                             is a new verb for that program; if one is genuinely \
+                             needed, it goes through the driving check and into the \
+                             stated limit in the same change."
+                        );
+                    }
+
+                    // And the three that widen, do: the steps above could have
+                    // seen a widening. An approval pairs once both machines
+                    // confirm its number (#167).
+                    app.exchange(&[
+                        R::AuthorizeKey {
+                            label: "new laptop".to_owned(),
+                            fingerprint: stranger_fp.clone(),
+                            controller: hops_ipc::Controller::ThatMachine,
+                            clipboard: true,
+                        },
+                        R::EnableClipboard(desk_fp.clone()),
+                        R::ConfirmPairing {
+                            fingerprint: newcomer_fp.clone(),
+                            number: comparing.number.clone(),
+                        },
+                    ])
+                    .await;
+                    let knocked = compare_number(&mut app, &stranger, port, &ours).await;
+                    app.exchange(&[R::ConfirmPairing {
+                        fingerprint: stranger_fp.clone(),
+                        number: knocked.number.clone(),
+                    }])
+                    .await;
+                    until_paired(&trust, &stranger_fp).await;
+                    until_paired(&trust, &newcomer_fp).await;
+                    let now = granted(&trust);
+                    assert_eq!(
+                        now.get(&newcomer_fp).copied(),
+                        Some(Caps::INBOUND),
+                        "confirming the number of an approval made while nobody drove \
+                         this machine must pair the machine that knocked"
+                    );
+                    assert_eq!(
+                        (now.get(&stranger_fp).copied(), now.get(&desk_fp).copied()),
+                        (
+                            Some(Caps::DRIVE_ME | Caps::CLIPBOARD_FROM),
+                            Some(Caps::DRIVE_ME | Caps::CLIPBOARD_FROM)
+                        ),
+                        "approving the prompt as the machine that controls this one, \
+                         with a yes to the clipboard, must pair it so and share the \
+                         clipboard the way control goes (#220, #182); and turning the \
+                         clipboard on must give the paired machine the clipboard its \
+                         drive bits allow and nothing else"
+                    );
+                })
+                .await;
+        });
     }
 }
 
@@ -1655,7 +2692,7 @@ mod every_trust_mutation_happens_at_a_named_door {
 
     const DOORS: &[&str] = &[
         "fn add_authorized_key",    // grant
-        "fn remove_authorized_key", // revoke + tombstone
+        "fn remove_authorized_key", // removal: forgets the device (#184)
         "fn set_label",             // rename; refuses unknown fingerprints
         "fn handle_config_change",  // reload: the config file is a door too
         "fn new",                   // startup load
@@ -1664,6 +2701,24 @@ mod every_trust_mutation_happens_at_a_named_door {
         // opens: it mints nothing, narrows only, and runs on a timer. Listed so
         // the addition is visible in the diff rather than discovered later.
         "fn sweep_lapsed_leases",
+        // Added with the clipboard off switch (#182, #187). It narrows only,
+        // dropping the clipboard bits of one lease, and needs no authority.
+        "fn disable_clipboard",
+        // Added with pick-the-number pairing (#11, #167). The one door that
+        // makes an approval grant: both machines confirmed the number. It
+        // cannot create a lease, only confirm one an approval here issued.
+        "fn settle_pairing",
+        // Drops a lease an approval here issued that was never confirmed:
+        // a wrong pick, a cancel, a close, or no number in time. Narrows only.
+        "fn forget_pairing",
+        // Added with the on arm (#182, #107). It widens one lease's clipboard
+        // to what its drive bits allow, and its caller refuses it while a peer
+        // drives this machine.
+        "fn enable_clipboard",
+        // Added with #184. A paired machine removed this one and said so on a
+        // live link that proved its identity, so this one forgets it too. It
+        // narrows only, and only the pairing with the machine that said so.
+        "fn forget_machine_that_removed_this_one",
     ];
 
     /// The needle a scan must actually find. If the store is renamed again,
@@ -1833,20 +2888,21 @@ mod discovery_can_fail_without_taking_anything_with_it {
 
 mod typing_an_address_still_pairs_a_device {
     //! **Decided 2026-09-01.** Typing a peer's address remains a working way to
-    //! pair a device, and no discovery or pairing-code work removes it or puts
-    //! a precondition in front of it.
+    //! pair a device, and no discovery work removes it or puts a precondition
+    //! in front of it.
     //!
     //! **Why, with the measurement.** The "easy" path measured harder than the
-    //! fallback: the pairing code is 228-415 characters and needs a text
-    //! channel between two machines that do not yet share a keyboard — which is
-    //! the thing being set up. Typing an address is 15 characters. User flows
-    //! are a fallback ladder, and the bottom rung is the one that always works.
+    //! fallback: the pairing code, since retired (#14), was 228-415 characters
+    //! and needed a text channel between two machines that do not yet share a
+    //! keyboard — which is the thing being set up. Typing an address is 15
+    //! characters. User flows are a fallback ladder, and the bottom rung is the
+    //! one that always works.
 
     use crate::client::ClientManager;
     use hops_ipc::Position;
 
     /// Calls the client model with nothing but a typed address — no discovery
-    /// result, no pairing code, no fingerprint known in advance — and checks a
+    /// result, no fingerprint known in advance — and checks a
     /// dialable client comes out the far side.
     #[test]
     fn a_client_can_be_created_from_a_typed_address_alone() {
@@ -2003,8 +3059,15 @@ mod the_wire_contract_is_frozen {
     //! **Decided 2026-07-04.** The wire ALPN stays the exact byte string
     //! `grabbr-hop/1`.
     //!
-    //! **Decided 2026-07-28.** The QUIC listen port stays 4242, and moving to
-    //! 443 may never be scheduled as a traversal requirement.
+    //! **Amended 2026-09-26 (#15).** A second ALPN, `grabbr-hop/1-driven`,
+    //! sits beside it, for a machine that dials the machine that controls it,
+    //! so each side knows its role when the handshake ends. A v0.12 peer
+    //! refuses it. The two are the whole list a listener serves.
+    //!
+    //! **Decided 2026-07-28, corrected 2026-09-15 (#16).** Traversal is about
+    //! connection direction, not the port, so 443 may never be scheduled as a
+    //! traversal requirement. The default port moves from 4242, inherited from
+    //! upstream, to 4722, in the same release as #15, as one breaking change.
     //!
     //! **Decided 2026-08-24.** Capability flag bits are never reassigned or
     //! removed, and a peer that advertises no capabilities is handled as having
@@ -2042,15 +3105,14 @@ mod the_wire_contract_is_frozen {
     /// **What it does not prove.** `listen::server_config` and
     /// `connect::client_config` are private, so this builds both ends itself
     /// from `transport::ALPN`. It therefore demonstrates the CONSEQUENCE of a
-    /// rename; the test above is what pins the production value. A change that
-    /// made the real server offer two ALPNs during a migration would slip past
-    /// this one — that needs the config builders to be reachable.
+    /// rename; the test above is what pins the production value, and
+    /// `the_production_listener_completes_a_handshake_for_the_two_alpns_and_no_other`
+    /// runs the real server config.
     #[test]
     fn a_peer_offering_a_different_alpn_cannot_complete_a_handshake() {
         use crate::transport::{self, FpClientVerifier, FpServerVerifier};
         use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
         use quinn::{ClientConfig, Endpoint, ServerConfig};
-        use std::collections::VecDeque;
         use std::net::SocketAddr;
         use std::sync::{Arc, Mutex, RwLock};
         use std::time::Duration;
@@ -2072,13 +3134,13 @@ mod the_wire_contract_is_frozen {
             // refuse the handshake is the protocol name.
             let server_trust = {
                 let mut s = crate::trust::TrustStore::new(&server_fp, 0).expect("ours");
-                s.issue(&client_fp, "peer", crate::trust::Caps::KNOWN)
+                s.issue_confirmed(&client_fp, "peer", crate::trust::Caps::KNOWN)
                     .expect("issue");
                 Arc::new(RwLock::new(s))
             };
             let client_trust = {
                 let mut s = crate::trust::TrustStore::new(&client_fp, 0).expect("ours");
-                s.issue(&server_fp, "peer", crate::trust::Caps::KNOWN)
+                s.issue_confirmed(&server_fp, "peer", crate::trust::Caps::KNOWN)
                     .expect("issue");
                 Arc::new(RwLock::new(s))
             };
@@ -2086,7 +3148,7 @@ mod the_wire_contract_is_frozen {
             let mut server_crypto = rustls::ServerConfig::builder()
                 .with_client_cert_verifier(Arc::new(FpClientVerifier::new(
                     server_trust,
-                    Arc::new(Mutex::new(VecDeque::new())),
+                    Arc::new(Mutex::new(None)),
                 )))
                 .with_single_cert(vec![server.cert.clone()], server.key.clone_key())
                 .expect("server cert");
@@ -2157,21 +3219,137 @@ mod the_wire_contract_is_frozen {
         });
     }
 
+    /// Reads the real constants. The values ARE the rule.
     #[test]
-    fn the_quic_listen_port_is_still_4242() {
+    fn the_quic_listen_port_is_4722_and_the_alpns_are_the_pair_both_ends_serve() {
         assert_eq!(
             hops_ipc::DEFAULT_PORT,
-            4242,
-            "the default QUIC port moved. 4242 is arbitrary, inherited from \
-             upstream, and deliberately not worth changing: it is above 1024, so \
-             either machine binds it unprivileged and the macOS TCC-versus-root \
-             conflict never arises. If this moved to 443 to 'fix traversal', it \
-             fixes nothing — traversal was MEASURED to be about connection \
-             direction, not the port: the SASE client is stateful and blocks \
-             unsolicited inbound flows, not ports. Moving to 443 re-imports the \
-             privileged-bind conflict plus installer work to solve a problem \
-             that does not exist."
+            4722,
+            "the default QUIC port moved off 4722. It moved from 4242 once, in the \
+             release that let a controlled machine dial out (#15, #16), as one \
+             breaking change both machines take together. It is above 1024, so \
+             either machine binds it unprivileged. If it moved to 443 to 'fix \
+             traversal', that fixes nothing: traversal was MEASURED to be about \
+             connection direction, not the port."
         );
+        assert_eq!(
+            hops_ipc::PORT_BEFORE_V013,
+            4242,
+            "the port older versions listened on is what a dial that finds nothing \
+             asks, to say an older hops is there. It is a fact about v0.12, not a \
+             setting."
+        );
+        assert_eq!(
+            crate::transport::ALPN_DRIVEN,
+            b"grabbr-hop/1-driven",
+            "the ALPN a controlled machine dials with changed. Like grabbr-hop/1, \
+             it is a wire identifier every deployed peer must match byte for byte."
+        );
+        assert_eq!(
+            crate::transport::served_alpns(),
+            vec![
+                crate::transport::ALPN.to_vec(),
+                crate::transport::ALPN_DRIVEN.to_vec()
+            ],
+            "a listener serves exactly the two ALPNs, the forward one first. The \
+             order is how rustls chooses for a client offering both, and the \
+             certificate resolver mirrors it to pick the question the TLS door \
+             asks: a third, or a new order, changes which question is asked."
+        );
+    }
+
+    /// The consequence, on the production listener config: a dialler
+    /// offering either ALPN completes a handshake, and one offering anything
+    /// else does not.
+    #[test]
+    fn the_production_listener_completes_a_handshake_for_the_two_alpns_and_no_other() {
+        use crate::transport::{self, Dialler};
+        use std::net::SocketAddr;
+        use std::sync::{Arc, Mutex, RwLock};
+        use std::time::Duration;
+
+        transport::install_crypto_provider();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let server = super::a_test_identity();
+            let client = super::a_test_identity();
+            let server_fp = transport::fingerprint_of(&server.cert);
+            let client_fp = transport::fingerprint_of(&client.cert);
+            let trusting = |ours: &str, theirs: &str| {
+                let mut s = crate::trust::TrustStore::new(ours, 0).expect("ours");
+                s.issue_confirmed(theirs, "peer", crate::trust::Caps::KNOWN)
+                    .expect("issue");
+                Arc::new(RwLock::new(s))
+            };
+            let cfg = crate::listen::server_config(
+                &server,
+                trusting(&server_fp, &client_fp),
+                Default::default(),
+            )
+            .expect("the production server config");
+            let endpoint = quinn::Endpoint::server(cfg, "127.0.0.1:0".parse().expect("addr"))
+                .expect("server endpoint");
+            let addr = endpoint.local_addr().expect("local addr");
+            tokio::spawn(async move {
+                while let Some(incoming) = endpoint.accept().await {
+                    tokio::spawn(async move {
+                        if let Ok(conn) = incoming.await {
+                            conn.closed().await;
+                        }
+                    });
+                }
+            });
+            let client_trust = trusting(&client_fp, &server_fp);
+            let dial = |alpn: &[u8], role: Dialler| {
+                let mut crypto = rustls::ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(
+                        transport::FpServerVerifier::for_role(
+                            client_trust.clone(),
+                            Arc::new(Mutex::new(None)),
+                            role,
+                        ),
+                    ))
+                    .with_client_auth_cert(vec![client.cert.clone()], client.key.clone_key())
+                    .expect("client auth");
+                crypto.alpn_protocols = vec![alpn.to_vec()];
+                let cfg = quinn::ClientConfig::new(Arc::new(
+                    quinn::crypto::rustls::QuicClientConfig::try_from(crypto).expect("quic client"),
+                ));
+                let ep =
+                    quinn::Endpoint::client("127.0.0.1:0".parse::<SocketAddr>().expect("addr"))
+                        .expect("client endpoint");
+                (ep, cfg)
+            };
+            for (alpn, role, completes) in [
+                (transport::ALPN, Dialler::Drives, true),
+                (transport::ALPN_DRIVEN, Dialler::IsDriven, true),
+                (&b"grabbr-hop/2"[..], Dialler::Drives, false),
+                (&b"hops/1"[..], Dialler::Drives, false),
+            ] {
+                let (ep, cfg) = dial(alpn, role);
+                let done = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    ep.connect_with(cfg, addr, "grabbr").expect("connect"),
+                )
+                .await;
+                assert_eq!(
+                    matches!(done, Ok(Ok(_))),
+                    completes,
+                    "a dialler offering `{}` {} a handshake with the production \
+                     listener",
+                    String::from_utf8_lossy(alpn),
+                    if completes {
+                        "could not complete"
+                    } else {
+                        "completed"
+                    }
+                );
+            }
+        });
     }
 
     /// Reads the real constants. Append-only means the VALUES are the contract,
@@ -2597,6 +3775,10 @@ mod the_front_door_starts_a_daemon_only_when_none_answers {
     //! beside the one serving input, and that one loaded the identity key
     //! before it found the IPC port taken.
     //!
+    //! **Amended 2026-09-26 (#222):** the app may also restart the service
+    //! it installed when the daemon that answers is another build, or states
+    //! none. That case, and nothing else, is guarded in the next module.
+    //!
     //! The rule has two halves, tested where each one lives:
     //!
     //! * **Started only when none answers.** The decision, here, against real
@@ -2669,8 +3851,9 @@ mod the_front_door_starts_a_daemon_only_when_none_answers {
         }
     }
 
-    /// The Windows transport, checked on every platform: there the daemon's
-    /// IPC listener is a loopback TCP port.
+    /// A daemon answering on loopback TCP, the transport Windows used before
+    /// its pipe, is left alone rather than a second started. Checked on every
+    /// platform.
     // LEDGER T1 | class B | 1 return value
     #[test]
     fn a_daemon_answering_on_loopback_tcp_is_left_alone() {
@@ -2846,6 +4029,140 @@ mod the_front_door_starts_a_daemon_only_when_none_answers {
                      door's own check."
                 );
             }
+        }
+    }
+}
+
+mod the_front_door_restarts_only_an_outdated_service_it_installed {
+    //! **Decided 2026-09-26 (#222), amending 2026-09-16 (#159).** The app may
+    //! restart the service it installed when the daemon that answers is a
+    //! different build from the app, or reports no build. A daemon of the same
+    //! build is never restarted by the app, and a daemon the service did not
+    //! start (one run from a terminal, say) is never restarted: the app says
+    //! so instead.
+    //!
+    //! **Why.** An app replaced in place attaches to whatever daemon answers.
+    //! Without this the previous release's daemon went on serving the new app
+    //! until the next login, with its fixes, security fixes included, not
+    //! running. And a restart is not free: it drops every connected peer and
+    //! any key held on this machine, which is why a daemon of this build is
+    //! never touched.
+
+    use crate::daemon_start::{Origin, Verdict, verdict};
+    use hops_ipc::{Build, StatedBuild};
+    use std::cell::Cell;
+
+    fn build(version: &str, commit: &str) -> Build {
+        Build {
+            version: version.into(),
+            commit: commit.into(),
+        }
+    }
+
+    /// The decision itself, for every kind of daemon that can answer.
+    // LEDGER T2223 | class B | 1 return value: daemon_start::verdict
+    #[test]
+    fn only_another_build_that_the_service_started_is_restarted() {
+        let this = build("0.13.0", "abcd123");
+        let same = StatedBuild::Is(this.clone());
+        let same_version_other_commit = StatedBuild::Is(build("0.13.0", "ffff000"));
+        let older = StatedBuild::Is(build("0.12.0", "1111111"));
+        let terminal = || Origin::Other("it was started from a terminal".into());
+
+        let asked = Cell::new(0);
+        let service = || {
+            asked.set(asked.get() + 1);
+            Origin::Service(4444)
+        };
+        assert_eq!(
+            (verdict(&this, Some(&same), service), asked.get()),
+            (Verdict::Keep, 0),
+            "a daemon of this build must be kept without even asking who started \
+             it. Restarting it drops every peer and every held key for nothing."
+        );
+        for (what, stated) in [
+            (
+                "another commit of the same version",
+                &same_version_other_commit,
+            ),
+            ("an older release", &older),
+            ("a daemon that states no build", &StatedBuild::Unstated),
+        ] {
+            assert_eq!(
+                verdict(&this, Some(stated), || Origin::Service(4444)),
+                Verdict::Restart(4444),
+                "{what}, started by the hops service, was not restarted. It goes on \
+                 serving the new app with the old build's code."
+            );
+            assert_eq!(
+                verdict(&this, Some(stated), terminal),
+                Verdict::LeaveOutdated("it was started from a terminal".into()),
+                "{what}, NOT started by the hops service, must be left running with \
+                 the reason: the app has no business stopping it."
+            );
+        }
+        assert_eq!(
+            verdict(&this, None, || Origin::Service(4444)),
+            Verdict::Keep,
+            "a daemon that said nothing may be one of this build still starting"
+        );
+    }
+
+    /// A backstop over `src/daemon_start.rs` as source text, for what the
+    /// behavioural tests cannot show: that nothing ELSE in the front door can
+    /// stop a daemon. Every way of stopping one there (a launchd bootout,
+    /// `stop`, `unload`, `remove` or `kill`, a `kickstart -k`, a signal, a
+    /// `kill` command) must sit inside `stop_service_daemon`, whose
+    /// callers are the restart of an outdated service and the reload of a
+    /// rewritten plist. Scans product code with comments stripped, never this
+    /// file. Paired with T2223 above and T2225 in `daemon_start`, which run the
+    /// restart and the start against a scripted `launchctl`.
+    // LEDGER T2226 | class S | source text | pair T2223, T2225
+    #[test]
+    fn nothing_but_the_one_stop_function_can_stop_a_daemon() {
+        const ALLOWED_IN: &str = "fn stop_service_daemon";
+        let code = super::scan::code_only(include_str!("daemon_start.rs"));
+        assert!(
+            code.contains(&format!("{ALLOWED_IN}(")),
+            "`{ALLOWED_IN}` is gone from src/daemon_start.rs, so this check compares \
+             nothing. If it was renamed, point the check at the new name."
+        );
+        for stop in [
+            "bootout",
+            "\"-k\"",
+            "kickstart -k",
+            "kill(",
+            "\"kill\"",
+            "\"stop\"",
+            "\"unload\"",
+            "\"remove\"",
+            "pidfd_send_signal",
+            "SIGTERM",
+            "SIGKILL",
+            "SIGINT",
+            "SIGQUIT",
+            "TerminateProcess",
+            "taskkill",
+        ] {
+            for (at, _) in code.match_indices(stop) {
+                let inside = super::scan::enclosing_fn(&code, at);
+                assert_eq!(
+                    inside, ALLOWED_IN,
+                    "src/daemon_start.rs has `{stop}` in `{inside}`. The front door \
+                     stops a daemon only through `stop_service_daemon`, to restart a \
+                     service running another build or reload a rewritten plist. A \
+                     stop anywhere else can end the daemon serving input, of this \
+                     build, which the app must never restart."
+                );
+            }
+        }
+        let main = super::scan::without_comments(include_str!("main.rs"));
+        for stop in ["bootout", "kill(", "SIGTERM", "TerminateProcess"] {
+            assert!(
+                !main.contains(stop),
+                "src/main.rs has `{stop}`. Stopping a daemon belongs in \
+                 `stop_service_daemon`, behind the build check."
+            );
         }
     }
 }
@@ -3086,5 +4403,966 @@ mod discovery_is_declared_to_the_operating_system {
             "NSBonjourServices takes the bare service type. Leaving the trailing \
              `.local.` on it makes the declaration silently fail to match."
         );
+    }
+}
+
+mod no_log_line_in_the_input_path_names_a_key {
+    //! **#117.** A log line may say that a key went down or up, never which
+    //! key. Raising the log level to look at a handshake must not record what
+    //! someone types, and a warn line is written with no level raised at all.
+    //! Key identity goes to the opt-in, time-boxed `keylog` file instead.
+    //!
+    //! **Why a text scan.** The type every event log line prints through is
+    //! covered by calling it (`input_event`'s `no_key_identity` tests), and
+    //! the daemon's own lines by running two machines over loopback
+    //! (`a_key_released_at_teardown_is_not_named_in_the_log`,
+    //! `keys_captured_and_sent_are_not_named_in_the_log`). What is left are
+    //! the platform backends: wlroots, libei, the Windows hook and the macOS
+    //! HID path compile only on their own OS and act only in a live session,
+    //! so no test here can run them. For those, this checks that no log call
+    //! formats a variable that holds a key.
+
+    /// Names that hold a key, a scancode, a keysym, a modifier set, or a raw
+    /// libei event (whose Debug prints the key).
+    const KEY_HOLDERS: &[&str] = &[
+        "key",
+        "keys",
+        "keycode",
+        "key_code",
+        "linux_keycode",
+        "scancode",
+        "scan_code",
+        "scan",
+        "win_scan_code",
+        "linux_scan_code",
+        "linux_scancode",
+        "windows_scancode",
+        "scanCode",
+        "vkCode",
+        "vk",
+        "nx_keytype",
+        "keysym",
+        "mods",
+        "ei_event",
+    ];
+
+    /// Every source file on the input path that logs.
+    const FILES: &[(&str, &str)] = &[
+        (
+            "crates/input-capture/src/lib.rs",
+            include_str!("../crates/input-capture/src/lib.rs"),
+        ),
+        (
+            "crates/input-capture/src/libei.rs",
+            include_str!("../crates/input-capture/src/libei.rs"),
+        ),
+        (
+            "crates/input-capture/src/macos.rs",
+            include_str!("../crates/input-capture/src/macos.rs"),
+        ),
+        (
+            "crates/input-capture/src/layer_shell.rs",
+            include_str!("../crates/input-capture/src/layer_shell.rs"),
+        ),
+        (
+            "crates/input-capture/src/windows/event_thread.rs",
+            include_str!("../crates/input-capture/src/windows/event_thread.rs"),
+        ),
+        (
+            "crates/input-capture/src/event_queue.rs",
+            include_str!("../crates/input-capture/src/event_queue.rs"),
+        ),
+        (
+            "crates/input-emulation/src/lib.rs",
+            include_str!("../crates/input-emulation/src/lib.rs"),
+        ),
+        (
+            "crates/input-emulation/src/dummy.rs",
+            include_str!("../crates/input-emulation/src/dummy.rs"),
+        ),
+        (
+            "crates/input-emulation/src/libei.rs",
+            include_str!("../crates/input-emulation/src/libei.rs"),
+        ),
+        (
+            "crates/input-emulation/src/macos.rs",
+            include_str!("../crates/input-emulation/src/macos.rs"),
+        ),
+        (
+            "crates/input-emulation/src/windows.rs",
+            include_str!("../crates/input-emulation/src/windows.rs"),
+        ),
+        (
+            "crates/input-emulation/src/wlroots.rs",
+            include_str!("../crates/input-emulation/src/wlroots.rs"),
+        ),
+        (
+            "crates/input-emulation/src/xdg_desktop_portal.rs",
+            include_str!("../crates/input-emulation/src/xdg_desktop_portal.rs"),
+        ),
+        (
+            "crates/input-event/src/keylog.rs",
+            include_str!("../crates/input-event/src/keylog.rs"),
+        ),
+        ("src/capture.rs", include_str!("capture.rs")),
+        ("src/emulation.rs", include_str!("emulation.rs")),
+        ("src/connect.rs", include_str!("connect.rs")),
+        ("src/listen.rs", include_str!("listen.rs")),
+    ];
+
+    const LEVELS: &[&str] = &["trace!(", "debug!(", "info!(", "warn!(", "error!(", "log!("];
+
+    /// Each `log::…!( … )` call in `code`: its line and the text between the
+    /// parentheses. `Err` names a call whose closing parenthesis was not found,
+    /// which would otherwise hide every call after it.
+    fn log_calls(code: &str) -> Result<Vec<(usize, &str)>, usize> {
+        let mut calls = vec![];
+        for (at, _) in code.match_indices("log::") {
+            let rest = &code[at + "log::".len()..];
+            let Some(level) = LEVELS.iter().find(|l| rest.starts_with(**l)) else {
+                continue;
+            };
+            let line = code[..at].matches('\n').count() + 1;
+            let open = at + "log::".len() + level.len();
+            let close = closing(&code[open..]).ok_or(line)?;
+            calls.push((line, &code[open..open + close]));
+        }
+        Ok(calls)
+    }
+
+    /// Offset of the `)` closing an already-open parenthesis, outside strings.
+    fn closing(s: &str) -> Option<usize> {
+        let (mut depth, mut in_str, mut escaped) = (0usize, false, false);
+        for (i, c) in s.char_indices() {
+            if in_str {
+                match c {
+                    _ if escaped => escaped = false,
+                    '\\' => escaped = true,
+                    '"' => in_str = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                '"' => in_str = true,
+                '(' | '[' | '{' => depth += 1,
+                ')' if depth == 0 => return Some(i),
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The arguments of a call, split on commas outside strings and brackets.
+    fn arguments(body: &str) -> Vec<&str> {
+        let (mut args, mut start) = (vec![], 0);
+        let (mut depth, mut in_str, mut escaped) = (0usize, false, false);
+        for (i, c) in body.char_indices() {
+            if in_str {
+                match c {
+                    _ if escaped => escaped = false,
+                    '\\' => escaped = true,
+                    '"' => in_str = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                '"' => in_str = true,
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    args.push(body[start..i].trim());
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        args.push(body[start..].trim());
+        args.retain(|a| !a.is_empty());
+        args
+    }
+
+    /// The names a log call prints: `{name}` captures in its format string,
+    /// and arguments that are a plain variable or field, cast or not. A
+    /// function call is not a name: it is how a value is printed without its
+    /// key.
+    fn printed(body: &str) -> Vec<String> {
+        let mut args = arguments(body).into_iter().peekable();
+        if args.peek().is_some_and(|a| a.starts_with("target:")) {
+            args.next();
+        }
+        // `log::log!(level, "…")` names its level first.
+        if args.peek().is_some_and(|a| !a.starts_with('"')) {
+            args.next();
+        }
+        let mut names = vec![];
+        if let Some(format) = args.next() {
+            let mut rest = format;
+            while let Some(open) = rest.find('{') {
+                rest = &rest[open + 1..];
+                if let Some(escaped) = rest.strip_prefix('{') {
+                    rest = escaped;
+                    continue;
+                }
+                let end = rest.find('}').unwrap_or(rest.len());
+                let name = rest[..end].split(':').next().unwrap_or("").trim();
+                if !name.is_empty() && !name.chars().all(|c| c.is_ascii_digit()) {
+                    names.push(name.to_owned());
+                }
+                rest = &rest[end..];
+            }
+        }
+        for arg in args {
+            let value = arg.split_once('=').map_or(arg, |(_, v)| v).trim();
+            let value = uncast(value.trim_start_matches(['&', '*']));
+            if value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+            {
+                if let Some(last) = value.rsplit('.').next() {
+                    names.push(last.to_owned());
+                }
+            }
+        }
+        names
+    }
+
+    /// `x as u16`, `(x as u32)`: a cast prints `x`.
+    fn uncast(mut value: &str) -> &str {
+        loop {
+            let inner = value
+                .strip_prefix('(')
+                .and_then(|v| v.strip_suffix(')'))
+                .map(str::trim);
+            let bare = match value.rsplit_once(" as ") {
+                Some((head, ty))
+                    if ty
+                        .trim()
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':') =>
+                {
+                    Some(head.trim())
+                }
+                _ => None,
+            };
+            match inner.or(bare) {
+                Some(next) => value = next.trim_start_matches(['&', '*']),
+                None => return value,
+            }
+        }
+    }
+
+    #[test]
+    fn the_scan_reads_calls_the_way_the_compiler_does() {
+        let code = "log::trace!(\"{key:#?} is not a modifier\");\n\
+                    log::warn!(\n    \"a (b) {} (vk={:#04x})\",\n    scan_code,\n    hook.vkCode\n);\n\
+                    log::debug!(\"{}\", describe(&key));\n\
+                    log::log!(level, \"{{literal}} {n} {0}\", mods);\n\
+                    log::info!(\"released {} stuck key(s)\", keys.len());\n\
+                    log::warn!(\"no scancode: {} {}\", linux_keycode as u16, (key as u32));";
+        let calls = log_calls(code).expect("every call closes");
+        let names: Vec<Vec<String>> = calls.iter().map(|(_, b)| printed(b)).collect();
+        assert_eq!(
+            names,
+            vec![
+                vec!["key".to_owned()],
+                vec!["scan_code".to_owned(), "vkCode".to_owned()],
+                vec![],
+                vec!["n".to_owned(), "mods".to_owned()],
+                vec![],
+                vec!["linux_keycode".to_owned(), "key".to_owned()],
+            ],
+            "the scan misreads a log call, so the guard below would miss a key \
+             printed that way"
+        );
+        assert_eq!(
+            calls.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+            vec![1, 2, 7, 8, 9, 10]
+        );
+    }
+
+    #[test]
+    fn no_log_call_on_the_input_path_prints_a_key() {
+        let mut offenders = vec![];
+        let mut seen = 0;
+        for (file, src) in FILES {
+            let code = super::scan::code_only(src);
+            let calls = log_calls(&code).unwrap_or_else(|line| {
+                panic!("{file}:{line}: a log call with no closing parenthesis")
+            });
+            assert!(
+                !calls.is_empty(),
+                "{file}: no log call found. It logs, so the scan is not reading it \
+                 and would pass whatever it printed."
+            );
+            seen += calls.len();
+            for (line, body) in calls {
+                for name in printed(body) {
+                    if KEY_HOLDERS.contains(&name.as_str()) {
+                        offenders.push(format!("{file}:{line} prints `{name}`"));
+                    }
+                }
+            }
+        }
+        assert!(
+            seen > 200,
+            "only {seen} log calls read; files have gone missing"
+        );
+        assert!(
+            offenders.is_empty(),
+            "log calls on the input path print which key was pressed:\n  {}\n\n\
+             Anyone who raises HOPS_LOG_LEVEL to look at something else would \
+             start recording what is typed, and a warn line does it with no \
+             level raised at all (#117). Say that a key went down or up; send \
+             its identity to `input_event::keylog::key`, which is compiled out \
+             of release builds and time-boxed when armed.",
+            offenders.join("\n  ")
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the daemon runs as the user
+// ---------------------------------------------------------------------------
+
+mod the_windows_daemon_is_never_installed_elevated {
+    //! **Decided 2026-09-15 (#109).** The Windows daemon runs as the user and
+    //! is never elevated. An administrator process started from a folder the
+    //! user can write hands administrator to anything that can replace the
+    //! file, and its enter hook comes from a config file the user can write.
+    //!
+    //! The reason holds for every hops process, so the enforcement is in code
+    //! and covers every command: on Windows `main` refuses an elevated
+    //! process before it opens its log or parses an argument, daemon, app,
+    //! tray, TUI and CLI alike (`crate::elevation`, tested by calling `main.rs`
+    //! `unless_elevated`; that `main` goes through it is guarded below). The
+    //! enter hook is refused in any elevated process (`crate::enter_hook`).
+    //! Both install scripts refuse an elevated shell before they do anything
+    //! else, which the test below requires of their text, since no CI runner
+    //! runs them.
+    //!
+    //! The README scan below is a lint for honest mistakes. A scan of prose
+    //! cannot be complete: a lookalike letter, or wording it has not seen,
+    //! passes it. It may ask for an administrator PowerShell in one case: to
+    //! remove the task hops 0.12 registered elevated and stop the daemon it
+    //! started. A section that mentions elevation in any way, and every
+    //! section after it until a paragraph sends the reader to a new, normal
+    //! PowerShell in one of two fixed forms, may hold only code and inline
+    //! code that removes or reads, and prose that names nothing that
+    //! installs. No code in the Windows sections may start with `sudo` or
+    //! `gsudo`.
+
+    const SCRIPT: &str = include_str!("../service/windows/install-hops-daemon.ps1");
+    const INSTALLER: &str = include_str!("../install.ps1");
+    const README: &str = include_str!("../service/README.md");
+
+    /// PowerShell with `#` comments removed, lower-cased, since PowerShell
+    /// reads its parameter names without regard to case.
+    fn powershell_code(src: &str) -> String {
+        src.lines()
+            .map(|l| l.split('#').next().unwrap_or("").to_lowercase())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    // LEDGER T69 | class S | source text
+    #[test]
+    fn the_install_script_and_its_instructions_never_ask_for_elevation() {
+        let code = powershell_code(SCRIPT);
+        let run_levels: Vec<&str> = code
+            .split("-runlevel")
+            .skip(1)
+            .map(|after| after.split_whitespace().next().unwrap_or(""))
+            .collect();
+        assert!(
+            !run_levels.is_empty() && run_levels.iter().all(|level| *level == "limited"),
+            "install-hops-daemon.ps1 registers the daemon's task with run level \
+             {run_levels:?}; it must name `-RunLevel Limited` and nothing else. \
+             A task with the highest run level runs hops as an administrator from \
+             a folder the user can write, and runs its enter hook from a config \
+             file the user can write."
+        );
+
+        for (name, source) in [
+            ("install-hops-daemon.ps1", SCRIPT),
+            ("install.ps1", INSTALLER),
+        ] {
+            let refusal = refuses_elevation_first(&powershell_code(source));
+            assert!(
+                refusal.is_ok(),
+                "{name} does not refuse an elevated shell before it does anything \
+                 else: {}. It must test the current token with \
+                 `IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)` \
+                 and `exit` non-zero, with only its parameters, \
+                 `$ErrorActionPreference = 'Stop'` and the token read ahead of it.",
+                refusal.err().unwrap_or_default()
+            );
+
+            let script = words(source);
+            let asks: Vec<&str> = SCRIPT_ASKS
+                .into_iter()
+                .filter(|phrase| script.contains(phrase))
+                .collect();
+            assert!(
+                asks.is_empty(),
+                "{name} asks for elevation: {asks:?}. hops runs as the user, so its \
+                 install needs no administrator."
+            );
+        }
+
+        let (beyond, elevated_blocks) = elevated_beyond_removal(README);
+        assert!(
+            beyond.is_empty(),
+            "service/README.md asks for, or goes on in, an elevated PowerShell \
+             for more than removing hops 0.12's task and stopping its daemon: \
+             {beyond:?}. Where a section mentions elevation, and after it until a \
+             paragraph begins \"Then, from a new, normal PowerShell\" or says \
+             \"open a new, normal PowerShell\", code and inline code may hold only \
+             {REMOVE_OR_READ:?} and the prose may name nothing that installs; no \
+             code in the Windows sections may start with sudo or gsudo. \
+             Installing this version never needs an administrator."
+        );
+        assert!(
+            elevated_blocks > 0,
+            "no code block in service/README.md was read as run elevated, so the \
+             scan for the 0.12 removal steps matches nothing and proves nothing"
+        );
+    }
+
+    /// Whether an install script, as [`powershell_code`], refuses an elevated
+    /// shell before it does anything else: an `if` on the current token being
+    /// in the Administrators role, which under UAC it is only when elevated,
+    /// whose block exits non-zero. Only the script's parameters,
+    /// `$ErrorActionPreference = 'Stop'` and the token read come before it.
+    fn refuses_elevation_first(code: &str) -> Result<(), String> {
+        const ROLE: &str = "isinrole([security.principal.windowsbuiltinrole]::administrator)";
+        const TOKEN: &str = "$me = [security.principal.windowsprincipal]\
+                             [security.principal.windowsidentity]::getcurrent()";
+        let lines: Vec<&str> = code.lines().map(str::trim).collect();
+        let check = lines
+            .iter()
+            .position(|l| {
+                (l.starts_with("if (") || l.starts_with("if("))
+                    && l.contains(ROLE)
+                    && !l.contains("-not")
+                    && !l.contains('!')
+            })
+            .ok_or("no `if` tests the Administrators role")?;
+        let end = check
+            + lines[check..]
+                .iter()
+                .position(|l| *l == "}")
+                .ok_or("the `if` block is not closed")?;
+        let exits = lines[check..end].iter().any(|l| {
+            l.strip_prefix("exit ")
+                .and_then(|n| n.trim().parse::<i32>().ok())
+                .is_some_and(|n| n != 0)
+        });
+        if !exits {
+            return Err("its `if` block does not `exit` non-zero".into());
+        }
+        let mut params = false;
+        let mut read = false;
+        for line in &lines[..check] {
+            if params {
+                params = *line != ")";
+            } else if line.starts_with("param(") {
+                params = !line.ends_with(')');
+            } else if *line == TOKEN {
+                read = true;
+            } else if !line.is_empty() && *line != "$erroractionpreference = 'stop'" {
+                return Err(format!("`{line}` comes before the refusal"));
+            }
+        }
+        if !read {
+            return Err("it does not read the current token just before the refusal".into());
+        }
+        Ok(())
+    }
+
+    /// A backstop, as source text, for what [`crate::elevation`]'s and
+    /// `main.rs`'s tests cannot call: `main` itself, whose commands would
+    /// start a daemon or open a window. `main` does nothing before it asks
+    /// `unless_elevated` with the process's own answer; the log is opened
+    /// only after, in `start`, so a refused process creates, opens and
+    /// rotates no file; every command goes through `start`; and a refusal
+    /// exits with what [`crate::elevation::refuse`] returns.
+    // LEDGER T1094 | class S | source text | pair T1091, T1093, T1095, T1096, T1097, T1098
+    #[test]
+    fn every_command_goes_through_the_refusal_first() {
+        const SEAM: &str = "unless_elevated(hops::elevation::refused_here(), start)";
+        let code = super::scan::code_only(include_str!("main.rs"));
+        let squeezed = |from: &str, to: &str| -> String {
+            let at = code.find(from).unwrap_or(code.len());
+            let end = code[at..].find(to).map_or(code.len(), |i| at + i);
+            code[at..end]
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect()
+        };
+        assert_eq!(
+            squeezed("fn main() {", SEAM),
+            "fnmain(){match",
+            "src/main.rs: `main` must open with a match on `{SEAM}`. Anything \
+             before it runs elevated: the log, for one, creates and rotates files \
+             in a folder the user can write."
+        );
+        let main = squeezed("fn main() {", "\n}\n");
+        assert!(
+            main.contains(
+                "Err(HopsError::Elevated(e))=>process::exit(hops::elevation::refuse(&e)),"
+            ),
+            "src/main.rs: an elevated process must exit with what \
+             `hops::elevation::refuse` returns, which says why where it is seen \
+             and is 1 (T1096, T1097); `main` does something else"
+        );
+        assert_eq!(
+            squeezed("fn start() -> Result<(), HopsError> {", "\n}\n"),
+            "fnstart()->Result<(),HopsError>{hops::logging::init(hops::logging::role_from_argv());\
+             install_panic_logger();dispatch()",
+            "src/main.rs: `start` must open the log, install the panic logger and \
+             dispatch, and nothing else"
+        );
+        let calls = |name: &str| -> Vec<String> {
+            code.match_indices(name)
+                .filter(|(at, _)| {
+                    let prev = code[..*at].chars().next_back().unwrap_or(' ');
+                    let next = code[at + name.len()..].chars().next().unwrap_or(' ');
+                    !(prev.is_alphanumeric() || matches!(prev, '_' | ':' | '.'))
+                        && !(next.is_alphanumeric() || next == '_')
+                        && !code[..*at].ends_with("fn ")
+                })
+                .map(|(at, _)| super::scan::enclosing_fn(&code, at))
+                .collect()
+        };
+        assert_eq!(
+            (
+                calls("start"),
+                calls("hops::logging::init"),
+                calls("install_panic_logger"),
+                calls("dispatch"),
+                calls("run()"),
+            ),
+            (
+                vec!["fn main".to_string()],
+                vec!["fn start".to_string()],
+                vec!["fn start".to_string()],
+                vec!["fn start".to_string()],
+                vec!["fn dispatch".to_string()],
+            ),
+            "src/main.rs opens the log, or reaches `start`, `dispatch` or `run`, \
+             other than through `{SEAM}`"
+        );
+    }
+
+    /// What asks, in the install script, for an elevated shell, lower-cased.
+    /// The script's comments say why hops is never elevated, so bare words
+    /// such as "elevated" or "administrator" are not enough there.
+    const SCRIPT_ASKS: [&str; 12] = [
+        "run as administrator",
+        "runasadministrator",
+        "-verb runas",
+        "elevated powershell",
+        "elevated shell",
+        "elevated prompt",
+        "elevated terminal",
+        "administrator powershell",
+        "powershell as administrator",
+        "admin shell",
+        "admin prompt",
+        "as admin",
+    ];
+
+    /// What makes a README section one that mentions elevation, lower-cased.
+    /// Deliberately wide: a section that only explains elevation matches too,
+    /// and passes as long as it holds nothing but removal steps.
+    const ELEVATION: &[&str] = &[
+        "admin",
+        "elevat",
+        "run as",
+        "runas",
+        "uac",
+        "user account control",
+        "privilege",
+        "highest",
+        "same window",
+        "same shell",
+        "same powershell",
+        "same prompt",
+        "same terminal",
+        "same console",
+        "same session",
+        "that window",
+        "that shell",
+        "that powershell",
+        "this window",
+        "this shell",
+        "still open",
+        "keep it open",
+        "leave it open",
+        "keep using",
+        "this one",
+        "that one",
+        "same one",
+        "ctrl+shift+enter",
+    ];
+
+    /// The commands an elevated PowerShell in the README may run: they
+    /// remove 0.12's task and Run values, stop its daemon, or read state.
+    const REMOVE_OR_READ: [&str; 7] = [
+        "unregister-scheduledtask",
+        "stop-process",
+        "remove-itemproperty",
+        "get-scheduledtask",
+        "get-process",
+        "get-nettcpconnection",
+        "get-itemproperty",
+    ];
+
+    /// `text` lower-cased with every run of white space one space, so a
+    /// phrase wrapped across lines is still found.
+    fn words(text: &str) -> String {
+        text.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    }
+
+    /// A paragraph of prose, a heading among them, or a code block's lines.
+    enum Part {
+        Prose(String),
+        Code(Vec<String>),
+    }
+
+    /// A heading's level (0 before the first heading) and what follows it,
+    /// the heading first, as prose.
+    struct Section {
+        level: usize,
+        parts: Vec<Part>,
+    }
+
+    /// How far `line` is indented, a tab reaching the next multiple of four.
+    fn indent(line: &str) -> usize {
+        line.chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .fold(0, |n, c| if c == '\t' { n + 4 - n % 4 } else { n + 1 })
+    }
+
+    /// The fence `line` holds as CommonMark reads one: indented at most
+    /// three spaces, three or more backticks or tildes. Its character, its
+    /// length, and what follows it.
+    fn fence(line: &str) -> Option<(char, usize, &str)> {
+        if indent(line) > 3 {
+            return None;
+        }
+        let trimmed = line.trim_start();
+        let mark = trimmed.chars().next().filter(|c| *c == '`' || *c == '~')?;
+        let len = trimmed.chars().take_while(|c| *c == mark).count();
+        (len >= 3).then(|| (mark, len, &trimmed[len..]))
+    }
+
+    /// `doc` cut at each heading outside a code block, read as CommonMark
+    /// reads it. A fence closes only with its own character, at least as
+    /// long, and nothing after it; a fence left open runs to the end as
+    /// code. A line indented four spaces that does not continue a paragraph
+    /// starts an indented code block.
+    fn sections(doc: &str) -> Vec<Section> {
+        let mut sections = vec![Section {
+            level: 0,
+            parts: Vec::new(),
+        }];
+        let (mut prose, mut code) = (String::new(), Vec::new());
+        let mut fenced: Option<(char, usize)> = None;
+        let mut indented = false;
+        for line in doc.lines() {
+            let parts = &mut sections.last_mut().expect("never empty").parts;
+            if let Some((mark, len)) = fenced {
+                match fence(line) {
+                    Some((m, l, rest)) if m == mark && l >= len && rest.trim().is_empty() => {
+                        parts.push(Part::Code(std::mem::take(&mut code)));
+                        fenced = None;
+                    }
+                    _ => code.push(line.to_string()),
+                }
+                continue;
+            }
+            if indented {
+                if line.trim().is_empty() || indent(line) >= 4 {
+                    code.push(line.to_string());
+                    continue;
+                }
+                parts.push(Part::Code(std::mem::take(&mut code)));
+                indented = false;
+            }
+            let trimmed = line.trim_start();
+            match fence(line) {
+                // A backtick fence's info string holds no backtick.
+                Some((mark, len, info)) if mark == '~' || !info.contains('`') => {
+                    parts.push(Part::Prose(std::mem::take(&mut prose)));
+                    fenced = Some((mark, len));
+                }
+                _ if trimmed.is_empty() => parts.push(Part::Prose(std::mem::take(&mut prose))),
+                _ if indent(line) >= 4 && prose.is_empty() => {
+                    indented = true;
+                    code.push(line.to_string());
+                }
+                _ if indent(line) <= 3 && trimmed.starts_with('#') => {
+                    parts.push(Part::Prose(std::mem::take(&mut prose)));
+                    sections.push(Section {
+                        level: trimmed.chars().take_while(|c| *c == '#').count(),
+                        parts: vec![Part::Prose(line.to_string())],
+                    });
+                }
+                _ => {
+                    prose.push_str(line);
+                    prose.push('\n');
+                }
+            }
+        }
+        let parts = &mut sections.last_mut().expect("never empty").parts;
+        if fenced.is_some() || indented {
+            parts.push(Part::Code(code));
+        }
+        parts.push(Part::Prose(prose));
+        sections
+    }
+
+    /// Whether `text` mentions elevation in any of the ways [`ELEVATION`]
+    /// names.
+    fn mentions_elevation(text: &str) -> bool {
+        let text = words(text);
+        ELEVATION.iter().any(|phrase| text.contains(phrase))
+    }
+
+    /// Whether `paragraph` sends the reader to a new, normal PowerShell, in
+    /// one of two fixed forms: it begins "Then, from a new, normal
+    /// PowerShell", or says "open a new, normal PowerShell". It must also
+    /// mention no elevation and hold no word that could turn it around.
+    fn back_to_normal(paragraph: &str) -> bool {
+        const TURNS: [&str; 10] = [
+            "not", "no", "never", "don't", "nor", "instead", "rather", "except", "unless",
+            "without",
+        ];
+        let text = words(paragraph);
+        (text.starts_with("then, from a new, normal powershell")
+            || text.contains("open a new, normal powershell"))
+            && !mentions_elevation(&text)
+            && !text
+                .split(|c: char| !(c.is_alphanumeric() || c == '\''))
+                .any(|w| TURNS.contains(&w))
+    }
+
+    /// Whether a line of a code block run elevated only removes or reads:
+    /// blank, a comment, or one command of [`REMOVE_OR_READ`], alone or
+    /// assigned to a variable, with nothing that could chain, nest or
+    /// continue another command.
+    fn removes_or_reads(line: &str) -> bool {
+        let line = line.trim().to_lowercase();
+        if line.is_empty() || (line.starts_with('#') && !line.starts_with("#requires")) {
+            return true;
+        }
+        if line.contains([';', '|', '&', '(', ')', '{', '}', '`', '<', '>']) {
+            return false;
+        }
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let command = match words.as_slice() {
+            [var, "=", command, ..] if var.starts_with('$') => command,
+            [command, ..] => command,
+            [] => return true,
+        };
+        REMOVE_OR_READ.contains(command)
+    }
+
+    /// Whether a line of code starts with `sudo` or `gsudo`, which on
+    /// Windows run the rest of the line elevated: by name or path, with or
+    /// without `.exe`, after PowerShell's `&` or `.` if any.
+    fn runs_elevated(line: &str) -> bool {
+        let line = line.trim().to_lowercase();
+        let command = line
+            .split_whitespace()
+            .map(|w| w.trim_start_matches('&'))
+            .find(|w| !w.is_empty() && *w != ".")
+            .unwrap_or("")
+            .trim_matches(['"', '\'']);
+        let name = command.rsplit(['\\', '/']).next().unwrap_or("");
+        matches!(name.trim_end_matches(".exe"), "sudo" | "gsudo")
+    }
+
+    /// The inline code spans in `prose`.
+    fn spans(prose: &str) -> impl Iterator<Item = &str> {
+        prose.split('`').skip(1).step_by(2)
+    }
+
+    /// Everything in `doc` asked of an elevated PowerShell beyond removing
+    /// or reading, and how many code blocks were read as run elevated.
+    ///
+    /// A section that mentions elevation anywhere, its heading and code
+    /// comments included, is elevated throughout, and so is every section
+    /// after it until a paragraph outside an elevated section sends the
+    /// reader to a new, normal PowerShell ([`back_to_normal`]). A heading
+    /// alone does not: the reader's shell is still the one they opened. In
+    /// an elevated section every code line and inline code span must only
+    /// remove or read, and the prose may name nothing that installs.
+    ///
+    /// Apart from that, no code in the Windows sections (from a heading of
+    /// level three or less naming Windows to the next such heading) may
+    /// start with `sudo` or `gsudo`, elevated section or not.
+    fn elevated_beyond_removal(doc: &str) -> (Vec<String>, usize) {
+        let (mut beyond, mut blocks, mut carried, mut windows) = (Vec::new(), 0, false, false);
+        for Section { level, parts } in sections(doc) {
+            let heading = match parts.first() {
+                Some(Part::Prose(h)) => h.trim().to_string(),
+                _ => String::new(),
+            };
+            if (1..=3).contains(&level) {
+                windows = words(&heading).contains("windows");
+            }
+            let text: String = parts
+                .iter()
+                .map(|part| match part {
+                    Part::Prose(p) => p.clone(),
+                    Part::Code(lines) => lines.join("\n"),
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let asks = mentions_elevation(&text);
+            let mut elevated = carried || asks;
+            for part in &parts {
+                let code: Vec<&str> = match part {
+                    Part::Prose(p) => spans(p).collect(),
+                    Part::Code(lines) => lines.iter().map(String::as_str).collect(),
+                };
+                if windows {
+                    beyond.extend(
+                        code.iter()
+                            .filter(|line| runs_elevated(line))
+                            .map(|line| format!("{heading}: runs elevated: {}", line.trim())),
+                    );
+                }
+                match part {
+                    Part::Prose(p) => {
+                        if !asks && back_to_normal(p) {
+                            elevated = false;
+                        }
+                        if elevated {
+                            beyond.extend(
+                                installing(p)
+                                    .map(|w| format!("{heading}: names {w}: {}", words(p))),
+                            );
+                            beyond.extend(
+                                code.iter()
+                                    .filter(|span| !removes_or_reads(span))
+                                    .map(|span| format!("{heading}: runs `{}`", span.trim())),
+                            );
+                        }
+                    }
+                    Part::Code(_) if elevated => {
+                        blocks += 1;
+                        beyond.extend(
+                            code.iter()
+                                .filter(|line| !removes_or_reads(line))
+                                .map(|line| format!("{heading}: {}", line.trim())),
+                        );
+                    }
+                    Part::Code(_) => {}
+                }
+            }
+            carried = elevated;
+        }
+        beyond.dedup();
+        (beyond, blocks)
+    }
+
+    /// Each word of `text` that installs, registers or starts hops: an
+    /// install script, a registration, a service, or `hops.exe`. Removing
+    /// words, such as `uninstall` or `Unregister-ScheduledTask`, are not.
+    fn installing(text: &str) -> impl Iterator<Item = &str> {
+        text.split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '.'))
+            .filter(|w| {
+                let w = w.to_lowercase();
+                (w.contains("install") && !w.starts_with("uninstall"))
+                    || (w.contains("register") && !w.starts_with("unregister"))
+                    || w.contains("hops.exe")
+                    || w.contains("new-service")
+                    || w.contains("start-process")
+                    || w.contains("schtasks")
+                    || w == "sc.exe"
+                    || w.contains("new-itemproperty")
+                    || w.contains("set-itemproperty")
+            })
+    }
+
+    // LEDGER T69b | class B | 1 return value: elevated_beyond_removal on built documents
+    #[test]
+    fn the_scanner_reads_an_elevated_shell_on_across_blocks_and_headings() {
+        let removal = "Unregister-ScheduledTask -TaskName hops-daemon -Confirm:$false";
+        let doc = |after: &str| {
+            format!(
+                "## A\n\nOpen PowerShell as administrator:\n\n```powershell\n{removal}\n```\n{after}"
+            )
+        };
+        let install = "```powershell\n.\\install-hops-daemon.ps1\n```\n";
+        let (clean, blocks) = elevated_beyond_removal(&doc(""));
+        assert!(clean.is_empty() && blocks == 1, "{clean:?} {blocks}");
+        for after in [
+            format!("\n{install}"),
+            format!("\nIn the same window:\n\n{install}"),
+            format!("\n## B\n\n{install}"),
+            format!("\n## B\n\nNot from a normal PowerShell:\n\n{install}"),
+            format!("\n## B\n\nFrom a normal PowerShell, or the same window:\n\n{install}"),
+            "\n~~~\nSet-ExecutionPolicy Bypass\n~~~\n".to_string(),
+            format!("\nFrom a normal PowerShell:\n\n{install}"),
+            "\n```\nStop-Process -Id 1; hops\n```\n".to_string(),
+            // Only the two fixed forms send the reader back.
+            format!("\n## B\n\nFrom a normal PowerShell:\n\n{install}"),
+            format!("\n## B\n\nA normal PowerShell cannot, so go on here:\n\n{install}"),
+            format!("\n## B\n\nClose the normal PowerShell you opened first:\n\n{install}"),
+            // An indented code block is code.
+            "\nThen:\n\n    C:\\hops\\hops daemon\n".to_string(),
+            // A fence closes only as CommonMark closes it.
+            "\n```\nStop-Process -Id 1\n    ```\nC:\\hops\\hops daemon\n```\n".to_string(),
+            // Inline code in elevated prose is run through the allowlist.
+            "\nThen start it with `C:\\hops\\hops daemon`.\n".to_string(),
+            "\nThen run `irm https://example.invalid/a.ps1 | iex`.\n".to_string(),
+        ] {
+            let (beyond, _) = elevated_beyond_removal(&doc(&after));
+            assert!(!beyond.is_empty(), "passed: {after}");
+        }
+        for back in [
+            "Then, from a new, normal PowerShell:",
+            "Now open a new, normal PowerShell and run:",
+        ] {
+            let (beyond, _) =
+                elevated_beyond_removal(&doc(&format!("\n## B\n\n{back}\n\n{install}")));
+            assert!(beyond.is_empty(), "{back}: {beyond:?}");
+        }
+        let (beyond, _) =
+            elevated_beyond_removal(&doc("\nThen read it with `Get-ScheduledTask hops`.\n"));
+        assert!(beyond.is_empty(), "{beyond:?}");
+    }
+
+    // LEDGER T69c | class B | 1 return value: elevated_beyond_removal on built documents
+    #[test]
+    fn the_windows_sections_run_nothing_through_sudo_or_ctrl_shift_enter() {
+        let install = ".\\install-hops-daemon.ps1";
+        let windows = |body: &str| format!("### Windows\n\n{body}\n\n## Next\n");
+        let (clean, _) =
+            elevated_beyond_removal(&windows(&format!("```powershell\n{install}\n```")));
+        assert!(clean.is_empty(), "{clean:?}");
+        for body in [
+            format!("```powershell\nsudo {install}\n```"),
+            format!("```cmd\ngsudo.exe {install}\n```"),
+            format!("```\n& C:\\tools\\gsudo {install}\n```"),
+            format!("Then:\n\n    sudo {install}"),
+            format!("Open PowerShell with Ctrl+Shift+Enter:\n\n```powershell\n{install}\n```"),
+        ] {
+            let (beyond, _) = elevated_beyond_removal(&windows(&body));
+            assert!(!beyond.is_empty(), "passed: {body}");
+        }
+        let (linux, _) =
+            elevated_beyond_removal("### Linux\n\n```sh\nsudo loginctl enable-linger\n```\n");
+        assert!(linux.is_empty(), "{linux:?}");
     }
 }

@@ -14,7 +14,7 @@ members = [
 [package]
 name = "hops"
 description = "Software KVM Switch / mouse & keyboard sharing software for Local Area Networks"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2021"
 autobins = false
 license = "GPL-3.0-or-later"
@@ -25,6 +25,8 @@ repository = "https://github.com/jtjones09/grabbr-hops"
 # the wire protocol (ALPN `grabbr-hop/1`) and the on-disk state dir
 # (`~/.config/lan-mouse/`) keep their old names, for compatibility. One binary
 # does everything: `hops` (front door) / `hops gui` / `hops tui` / `hops daemon`.
+# The paths keep the upstream name on purpose; the identity shown to users is
+# com.grabbr.hops (input_event::APP_ID).
 [[bin]]
 name = "hops"
 path = "src/main.rs"
@@ -70,7 +72,6 @@ tokio = { version = "1.32.0", features = [
 ] }
 futures = "0.3.28"
 clap = { version = "4.4.11", features = ["derive"] }
-slab = "0.4.9"
 thiserror = "2.0.0"
 tokio-util = "0.7.11"
 local-channel = "0.1.5"
@@ -101,6 +102,7 @@ hostname = "0.4"
 mdns-sd = "0.21.2"
 
 [dev-dependencies]
+input-event = { path = "crates/input-event", version = "0.4.0", features = ["test-support"] }
 # `fuzz_api` is #[doc(hidden)] and upstream calls it "not part of the public
 # API" — acceptable for a test, never for shipping code. It exists because
 # `dns_parser` is crate-private, and it is the only way to reach the one parser
@@ -112,16 +114,58 @@ mdns-sd = { version = "0.21.2", features = ["unstable-fuzz-api"] }
 # feature of this crate forwards to either.
 input-emulation = { path = "crates/input-emulation", version = "0.4.0", default-features = false, features = ["recording"] }
 input-capture = { path = "crates/input-capture", version = "0.4.0", default-features = false, features = ["scripted"] }
+# The release workflows are YAML that only GitHub runs; the release pipeline
+# tests parse them to run each gate's shell and to read which job holds a
+# secret or may write.
+yaml-rust2 = { version = "0.13", default-features = false }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dev-dependencies]
+# A stand-in session bus and desktop portal, for the tests that watch what the
+# portal backends send it (tests/portal). Already in the tree through ashpd;
+# `p2p` lets a test serve a connection.
+zbus = { version = "5.16", default-features = false, features = ["tokio", "p2p"] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+# Releases the private pasteboard a test marks.
+objc2 = "0.6"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.148"
+# Splits the enter hook into a program and its arguments the way a POSIX shell
+# would, so it runs without one (#108). Already in the tree through `cc`.
+shlex = "1.3"
 
 [target.'cfg(windows)'.dependencies]
-# OpenProcess and GetExitCodeProcess, to tell whether a process has ended.
-# The same version and features the input crates already build.
+# OpenProcess and GetExitCodeProcess, to tell whether a process has ended, and
+# OpenProcessToken and GetTokenInformation, to tell whether it is elevated,
+# and GetConsoleProcessList and MessageBoxW, to say so where it is seen when
+# hops refuses to run elevated.
+# The clipboard formats that mark a copy as not to be shared.
+# The same version the input crates already build.
 windows = { version = "0.61.2", features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
     "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+# Lists the targets a copy offers on X11, to find the one that marks it as
+# not to be shared. The version arboard already builds.
+x11rb = "0.13"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The pasteboard types that mark a copy as not to be shared. The versions
+# arboard already builds.
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard"] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSEnumerator",
+    "NSString",
 ] }
 
 [features]
@@ -149,6 +193,11 @@ x11_capture = ["input-capture/x11"]
 # there is no unlimited mode, and the output goes to its own 0600 file rather than
 # the daemon log. Guarded by a test in src/main.rs. See #117.
 keylog = ["input-event/keylog"]
+# Lets a debug build run elevated, for GitHub's Windows runners only, which run
+# every job as an administrator. NOT IN `default` AND NOT IN ANY RELEASE FEATURE
+# SET, and a build without debug assertions refuses to compile with it: hops
+# never runs elevated (#109). Guarded in src/decision_guards.rs.
+elevated_ci_runner = []
 libei_capture = ["input-event/libei", "input-capture/libei"]
 libei_emulation = ["input-event/libei", "input-emulation/libei"]
 wlroots_emulation = ["input-emulation/wlroots"]

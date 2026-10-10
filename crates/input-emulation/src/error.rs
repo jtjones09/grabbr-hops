@@ -15,6 +15,23 @@ pub enum InputEmulationError {
          (see release.yml). Set HOPS_ALLOW_DUMMY=1 to override for testing."
     )]
     NoUsableBackend,
+    /// As [`Self::NoUsableBackend`], and the real backend that fell through
+    /// failed because the system withholds these permissions. What the
+    /// person can change, where a bare refusal named nothing.
+    #[error(
+        "input emulation cannot start: the system does not grant hops {}, and \
+         selection fell through to `dummy`, which discards all input. Refusing to run. \
+         Set HOPS_ALLOW_DUMMY=1 to override for testing.",
+        .0.iter().map(ToString::to_string).collect::<Vec<_>>().join(" and ")
+    )]
+    Withheld(Vec<Permission>),
+    /// The system took these permissions away while emulation ran, and
+    /// drops what it posts without an error (#240).
+    #[error(
+        "the system no longer grants hops {}; input emulation stopped",
+        .0.iter().map(ToString::to_string).collect::<Vec<_>>().join(" and ")
+    )]
+    Revoked(Vec<Permission>),
 }
 
 #[cfg(any(libei, rdp))]
@@ -73,7 +90,53 @@ pub enum EmulationCreationError {
     NoAvailableBackend,
 }
 
+/// A system permission emulation needs and was not granted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Permission {
+    /// macOS: Privacy & Security → Accessibility, which also grants posting
+    /// input events.
+    Accessibility,
+}
+
+impl std::fmt::Display for Permission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Accessibility => input_event::settings_pane::accessibility(),
+        })
+    }
+}
+
+impl InputEmulationError {
+    /// The permissions whose absence kept emulation from starting, when that
+    /// is why.
+    pub fn missing_permissions(&self) -> Option<&[Permission]> {
+        match self {
+            Self::Create(e) => e.missing_permissions(),
+            Self::Withheld(missing) | Self::Revoked(missing) => Some(missing),
+            _ => None,
+        }
+    }
+}
+
 impl EmulationCreationError {
+    /// The permissions whose absence kept the backend from starting, when
+    /// that is why.
+    pub fn missing_permissions(&self) -> Option<&'static [Permission]> {
+        #[cfg(target_os = "macos")]
+        if let Self::MacOs(
+            MacOSEmulationCreationError::AccessibilityPermission
+            | MacOSEmulationCreationError::InputControlPermission,
+        ) = self
+        {
+            return Some(&[Permission::Accessibility]);
+        }
+        #[cfg(feature = "recording")]
+        if let Self::Recording(crate::recording::RecordingEmulationCreationError::Refused) = self {
+            return Some(&[Permission::Accessibility]);
+        }
+        None
+    }
+
     /// request was intentionally denied by the user
     pub(crate) fn cancelled_by_user(&self) -> bool {
         #[cfg(libei)]
@@ -160,7 +223,10 @@ pub enum X11EmulationCreationError {
 pub enum MacOSEmulationCreationError {
     #[error("could not create event source")]
     EventSourceCreation,
-    #[error("accessibility permission is required")]
+    #[error(
+        "{} permission is required",
+        input_event::settings_pane::accessibility()
+    )]
     AccessibilityPermission,
     #[error("input control permission is required")]
     InputControlPermission,
@@ -169,3 +235,53 @@ pub enum MacOSEmulationCreationError {
 #[cfg(windows)]
 #[derive(Debug, Error)]
 pub enum WindowsEmulationCreationError {}
+
+#[cfg(all(test, target_os = "macos"))]
+mod a_mac_refused_its_permission {
+    use super::{EmulationCreationError, MacOSEmulationCreationError, Permission};
+
+    // LEDGER G2-5 | class B | 1 return value: EmulationCreationError::missing_permissions
+    /// Both ways macOS refuses to let hops post events are Accessibility in
+    /// System Settings, so both are named as it; a backend that failed
+    /// otherwise names nothing.
+    #[test]
+    fn both_refusals_name_accessibility() {
+        let named =
+            |e: MacOSEmulationCreationError| EmulationCreationError::MacOs(e).missing_permissions();
+        assert_eq!(
+            (
+                named(MacOSEmulationCreationError::AccessibilityPermission),
+                named(MacOSEmulationCreationError::InputControlPermission),
+                named(MacOSEmulationCreationError::EventSourceCreation),
+            ),
+            (
+                Some(&[Permission::Accessibility][..]),
+                Some(&[Permission::Accessibility][..]),
+                None,
+            ),
+            "(no {}, no input control, no event source)",
+            input_event::settings_pane::accessibility()
+        );
+    }
+}
+
+#[cfg(test)]
+mod a_permission_is_named_as_this_macos_names_it {
+    use super::Permission;
+    use input_event::settings_pane::assume_major;
+
+    // LEDGER T11 | class B | 1 return value: <Permission as Display>::fmt
+    #[test]
+    fn accessibility_is_device_control_and_data_access_from_macos_27() {
+        let said = |major| {
+            assume_major(Some(major));
+            let s = Permission::Accessibility.to_string();
+            assume_major(None);
+            s
+        };
+        assert_eq!(
+            [said(26), said(27)],
+            ["Accessibility", "Device Control and Data Access"]
+        );
+    }
+}

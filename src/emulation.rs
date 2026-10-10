@@ -18,10 +18,104 @@ use tokio::{
     task::{JoinHandle, spawn_local},
 };
 
+/// Whether a peer is driving this machine, as the service's refusal of the
+/// requests that widen trust reads it (#107).
+///
+/// On a KVM the pointer is not proof that anyone is at this machine: a peer
+/// that holds it can move it onto an approval and click. Its last event is
+/// not the whole of that. A key it holds down repeats here with nothing more
+/// sent, and a button it holds comes up when its session ends, which
+/// completes a click with no event from it at all.
+#[derive(Default)]
+pub(crate) struct Driven {
+    /// When a peer last put input into this machine: an event it sent, as it
+    /// arrived and again as it was injected, a key or button let go for it
+    /// when its session ended, or its leaving.
+    last_input: Cell<Option<Instant>>,
+    /// Whether a peer has crossed onto this machine and not left.
+    crossed: Cell<bool>,
+    /// Whether a key or button a peer pressed is still down here.
+    held: Cell<bool>,
+}
+
+impl Driven {
+    /// True while a peer is crossed onto this machine or holds a key or
+    /// button down here, and for `quiet` after its last input, after what it
+    /// held was let go, or after it left.
+    pub(crate) fn within(&self, quiet: Duration) -> bool {
+        self.crossed.get()
+            || self.held.get()
+            || self.last_input.get().is_some_and(|t| t.elapsed() < quiet)
+    }
+
+    fn input_now(&self) {
+        self.last_input.set(Some(Instant::now()));
+    }
+
+    /// After an event is injected: it counts from now, not from when it
+    /// arrived. An event that waited behind a backlog lands here late, and a
+    /// click that lands is what could approve something.
+    fn injected(&self, still_held: bool) {
+        self.input_now();
+        self.held.set(still_held);
+    }
+
+    /// After a teardown: a key or button let go for a peer is its input,
+    /// since the up is what completes the click.
+    fn let_go(&self, was_held: bool, still_held: bool) {
+        if was_held {
+            self.input_now();
+        }
+        self.held.set(still_held);
+    }
+}
+
+/// The peers crossed onto this machine and not left, kept in step with
+/// [`Driven::crossed`].
+struct Crossed {
+    peers: HashSet<SocketAddr>,
+    driven: Rc<Driven>,
+}
+
+impl Crossed {
+    fn new(driven: Rc<Driven>) -> Self {
+        Self {
+            peers: HashSet::new(),
+            driven,
+        }
+    }
+
+    fn insert(&mut self, addr: SocketAddr) {
+        self.peers.insert(addr);
+        self.driven.crossed.set(true);
+    }
+
+    /// A peer that leaves stops driving from now: the quiet window runs
+    /// from its leaving, not from its last event.
+    fn remove(&mut self, addr: &SocketAddr) {
+        if self.peers.remove(addr) {
+            self.driven.input_now();
+        }
+        self.driven.crossed.set(!self.peers.is_empty());
+    }
+
+    fn contains(&self, addr: &SocketAddr) -> bool {
+        self.peers.contains(addr)
+    }
+}
+
+impl Drop for Crossed {
+    /// The listener is gone, and with it every peer's session. Left set, the
+    /// widening requests would stay refused until the daemon restarts.
+    fn drop(&mut self) {
+        self.driven.crossed.set(false);
+    }
+}
+
 /// emulation handling events received from a listener
 pub(crate) struct Emulation {
-    /// shared with the proxy: when a peer last injected input into this machine
-    last_injected: Rc<Cell<Option<Instant>>>,
+    /// shared with the proxy and the listener: whether a peer drives this machine
+    driven: Rc<Driven>,
     task: JoinHandle<()>,
     request_tx: Sender<EmulationRequest>,
     event_rx: Receiver<EmulationEvent>,
@@ -35,8 +129,10 @@ pub(crate) enum EmulationEvent {
         addr: SocketAddr,
         fingerprint: String,
     },
+    /// A refused handshake, with the address it came from (#83).
     ConnectionAttempt {
         fingerprint: String,
+        addr: SocketAddr,
     },
     /// new connection
     Entered {
@@ -48,15 +144,22 @@ pub(crate) enum EmulationEvent {
         fingerprint: String,
     },
     /// connection closed
-    Disconnected {
-        addr: SocketAddr,
-    },
+    Disconnected { addr: SocketAddr },
+    /// The machine that proved `fingerprint` closed the link it opened to
+    /// this one because it removed this machine (#184).
+    RemovedBy { fingerprint: String },
     /// the port of the listener has changed
     PortChanged(Result<u16, ListenerCreationError>),
     /// emulation was disabled
     EmulationDisabled,
-    /// emulation was enabled
-    EmulationEnabled,
+    /// Emulation was enabled, through a backend that `needs` these
+    /// permissions while it runs (#240): none for `dummy`.
+    EmulationEnabled {
+        needs: &'static [input_emulation::Permission],
+    },
+    /// Emulation could not start, or stopped with an error: why, and the
+    /// permission to grant when that is why.
+    EmulationFailed(hops_ipc::EmulationFault),
     /// capture should be released
     ReleaseNotify,
     /// the remote-controlled cursor was deliberately pushed past a screen
@@ -76,36 +179,55 @@ pub(crate) enum EmulationEvent {
     /// broken (one-way setups, asymmetric NAT, peer's TCP listener
     /// down). The connect-side path stays as the primary source;
     /// this is the defensive fallback.
+    ///
+    /// `fingerprint` is the certificate the connection presented: the
+    /// service records the commit on the device pinned to it. Two machines
+    /// can share an address, so the address says nothing about which device
+    /// this is.
     PeerHello {
-        addr: SocketAddr,
+        fingerprint: Rc<str>,
         commit: [u8; 8],
     },
     /// peer sent us a Capability event advertising its supported
     /// features. Routed upward (mirroring `PeerHello`) so the service
     /// can record it via `client_manager.set_peer_caps` — the receiver
     /// side needs the sender's caps to gate the future Trueloop
-    /// return-channel, just as the sender needs the receiver's.
-    PeerCaps {
-        addr: SocketAddr,
-        flags: u32,
-    },
+    /// return-channel, just as the sender needs the receiver's. Matched to
+    /// a device by `fingerprint`, as `PeerHello` is.
+    PeerCaps { fingerprint: Rc<str>, flags: u32 },
 }
 
 enum EmulationRequest {
     Reenable,
+    /// The system took these permissions while emulation ran (#240).
+    StopForMissing(Vec<input_emulation::Permission>),
     Release(SocketAddr),
     ChangePort(u16),
     Terminate,
 }
 
 impl Emulation {
+    /// [`Self::among`] the backends a machine tries on its own.
+    #[cfg(test)]
     pub(crate) fn new(
         backend: Option<input_emulation::Backend>,
         listener: LanMouseListener,
         trust: crate::transport::Trust,
     ) -> Self {
-        let emulation_proxy = EmulationProxy::new(backend, listener.pressure(), trust.clone());
-        let last_injected = emulation_proxy.last_injected.clone();
+        Self::among(backend, InputEmulation::auto_order(), listener, trust)
+    }
+
+    /// Emulation through `backend`, or through the first of `candidates`
+    /// that starts when none is configured.
+    pub(crate) fn among(
+        backend: Option<input_emulation::Backend>,
+        candidates: Vec<input_emulation::Backend>,
+        listener: LanMouseListener,
+        trust: crate::transport::Trust,
+    ) -> Self {
+        let emulation_proxy =
+            EmulationProxy::among(backend, candidates, listener.pressure(), trust.clone());
+        let driven = emulation_proxy.driven.clone();
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let emulation_task = ListenTask {
@@ -118,19 +240,17 @@ impl Emulation {
         };
         let task = spawn_local(emulation_task.run());
         Self {
-            last_injected,
+            driven,
             task,
             request_tx,
             event_rx,
         }
     }
 
-    /// True if a peer injected input into this machine within `window`.
-    /// See `EmulationProxy::remotely_driven_within`.
-    pub(crate) fn remotely_driven_within(&self, window: Duration) -> bool {
-        self.last_injected
-            .get()
-            .is_some_and(|t| t.elapsed() < window)
+    /// True while a peer drives this machine, and for `quiet` after. See
+    /// [`Driven::within`].
+    pub(crate) fn remotely_driven_within(&self, quiet: Duration) -> bool {
+        self.driven.within(quiet)
     }
 
     pub(crate) fn send_leave_event(&self, addr: SocketAddr) {
@@ -142,6 +262,16 @@ impl Emulation {
     pub(crate) fn reenable(&self) {
         self.request_tx
             .send(EmulationRequest::Reenable)
+            .expect("channel closed");
+    }
+
+    /// The system no longer grants `missing`, and what emulation posts is
+    /// dropped without a word (#240). Emulation stops at once, letting go of
+    /// nothing more, and reports them as missing; it starts again only when
+    /// asked, as after any failure.
+    pub(crate) fn stop_for_missing(&self, missing: Vec<input_emulation::Permission>) {
+        self.request_tx
+            .send(EmulationRequest::StopForMissing(missing))
             .expect("channel closed");
     }
 
@@ -252,7 +382,7 @@ pub(crate) fn input_permitted<F: AsRef<str>>(
 /// Whether the peer at `addr` has crossed onto this machine and may inject.
 /// A peer sending input without crossing is logged once, by name (#102).
 fn has_crossed(
-    driving: &HashSet<SocketAddr>,
+    driving: &Crossed,
     logged: &mut HashSet<SocketAddr>,
     addr: SocketAddr,
     peer: &str,
@@ -283,8 +413,7 @@ impl ListenTask {
         }
         if refused.insert(addr) {
             // Its button- and key-ups are refused from here on too, so whatever
-            // it holds would stay down until the session is cut and the
-            // watchdog notices.
+            // it holds would stay down until its connection ends.
             log::warn!("releasing held keys and buttons: {addr} may no longer drive this machine");
             self.emulation_proxy.remove(addr);
         }
@@ -302,9 +431,10 @@ impl ListenTask {
         // inject: a paired peer that never sent Enter would otherwise type into
         // this machine with no crossing, no "entered" line in the log and
         // nothing in the app saying it was in control (#102). The session ends
-        // on the peer's Leave, its reaping or a new connection, never on our
-        // own release: its key-ups are still on the way then.
-        let mut driving: HashSet<SocketAddr> = HashSet::new();
+        // on the peer's Leave, its connection closing, its reaping or a new
+        // connection, never on our own release: its key-ups are still on the
+        // way then.
+        let mut driving = Crossed::new(self.emulation_proxy.driven.clone());
         // Peers already logged for sending input without crossing, so one
         // that keeps doing it costs one line, not one per event.
         let mut unentered_logged: HashSet<SocketAddr> = HashSet::new();
@@ -373,10 +503,14 @@ impl ListenTask {
                                 // sender that predates the event skips the unknown type
                                 // and keeps the connection alive.
                                 self.listener.reply(addr, ProtoEvent::Capability { flags: local_caps() }).await;
-                                self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
+                                if let Some(fingerprint) = self.peer_of.get(&addr).cloned() {
+                                    self.event_tx.send(EmulationEvent::PeerHello { fingerprint, commit }).expect("channel closed");
+                                }
                             }
                             ProtoEvent::Capability { flags } => {
-                                self.event_tx.send(EmulationEvent::PeerCaps { addr, flags }).expect("channel closed");
+                                if let Some(fingerprint) = self.peer_of.get(&addr).cloned() {
+                                    self.event_tx.send(EmulationEvent::PeerCaps { fingerprint, flags }).expect("channel closed");
+                                }
                             }
                             // Stage 2 absolute motion: reconstruct the per-event delta
                             // from the cumulative displacement and feed the UNCHANGED
@@ -411,8 +545,27 @@ impl ListenTask {
                     // Every refused handshake goes up. Whether it may prompt, and
                     // whether it repeats one just shown, is decided in one place,
                     // behind the pairing window (`prompt_gate`, #195).
-                    Some(ListenEvent::Rejected { fingerprint }) => {
-                        self.event_tx.send(EmulationEvent::ConnectionAttempt { fingerprint }).expect("channel closed");
+                    Some(ListenEvent::Rejected { fingerprint, addr }) => {
+                        self.event_tx.send(EmulationEvent::ConnectionAttempt { fingerprint, addr }).expect("channel closed");
+                    }
+                    // The peer's link is gone, so its button- and key-ups can
+                    // no longer arrive. Let go of what it held now, after
+                    // anything it sent first, rather than at the watchdog
+                    // 10-15 s later, and end its session (#156).
+                    Some(ListenEvent::RemovedBy { fingerprint }) => {
+                        self.event_tx.send(EmulationEvent::RemovedBy { fingerprint }).expect("channel closed");
+                    }
+                    Some(ListenEvent::Closed { addr }) => {
+                        log::debug!("{addr} closed its connection: letting go of anything it held");
+                        self.emulation_proxy.remove(addr);
+                        absmotion.forget(addr);
+                        refused.remove(&addr);
+                        driving.remove(&addr);
+                        unentered_logged.remove(&addr);
+                        // The watchdog has nothing left to find for it.
+                        last_response.remove(&addr);
+                        self.peer_of.remove(&addr);
+                        self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
                     }
                     None => break
                 }}
@@ -422,6 +575,7 @@ impl ListenTask {
                 request = self.request_rx.recv() => match request.expect("channel closed") {
                     // reenable emulation
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
+                    EmulationRequest::StopForMissing(missing) => self.emulation_proxy.stop_for_missing(missing),
                     // notify the other end that we hit a barrier (should release capture)
                     EmulationRequest::Release(addr) => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
                     EmulationRequest::ChangePort(port) => {
@@ -460,11 +614,11 @@ impl ListenTask {
 /// proxy handling the actual input emulation,
 /// discarding events when it is disabled
 pub(crate) struct EmulationProxy {
-    /// When a peer last injected input INTO this machine. Read by the service to
-    /// refuse trust GRANTS while the cursor is not ours — otherwise a peer that
-    /// still holds control can drive the pointer onto an approval button and
-    /// click it, manufacturing its own consent.
-    last_injected: Rc<Cell<Option<Instant>>>,
+    /// Whether a peer drives this machine. Read by the service to refuse trust
+    /// GRANTS while the cursor is not ours — otherwise a peer that still holds
+    /// control can drive the pointer onto an approval button and click it,
+    /// manufacturing its own consent.
+    driven: Rc<Driven>,
     emulation_active: Rc<Cell<bool>>,
     exit_requested: Rc<Cell<bool>>,
     request_tx: Sender<ProxyRequest>,
@@ -500,6 +654,8 @@ enum ProxyRequest {
     Remove(SocketAddr),
     Terminate,
     Reenable,
+    /// End the session: the system no longer grants these.
+    StopForMissing(Vec<input_emulation::Permission>),
 }
 
 /// Diagnostic counters for the network→injection queue: input events enqueued
@@ -531,8 +687,19 @@ impl QueueMetrics {
 }
 
 impl EmulationProxy {
+    /// [`Self::among`] the backends a machine tries on its own.
+    #[cfg(test)]
     fn new(
         backend: Option<input_emulation::Backend>,
+        pressure: Rc<crate::listen::InputPressure>,
+        trust: crate::transport::Trust,
+    ) -> Self {
+        Self::among(backend, InputEmulation::auto_order(), pressure, trust)
+    }
+
+    fn among(
+        backend: Option<input_emulation::Backend>,
+        candidates: Vec<input_emulation::Backend>,
         pressure: Rc<crate::listen::InputPressure>,
         trust: crate::transport::Trust,
     ) -> Self {
@@ -541,8 +708,11 @@ impl EmulationProxy {
         let emulation_active = Rc::new(Cell::new(false));
         let exit_requested = Rc::new(Cell::new(false));
         let metrics = Rc::new(QueueMetrics::default());
+        let driven = Rc::new(Driven::default());
         let emulation_task = EmulationTask {
+            driven: driven.clone(),
             backend,
+            candidates,
             exit_requested: exit_requested.clone(),
             request_rx,
             event_tx,
@@ -555,7 +725,7 @@ impl EmulationProxy {
         };
         let task = spawn_local(emulation_task.run());
         Self {
-            last_injected: Rc::new(Cell::new(None)),
+            driven,
             emulation_active,
             exit_requested,
             request_tx,
@@ -565,21 +735,19 @@ impl EmulationProxy {
         }
     }
 
-    /// True if a peer injected input into this machine within `window`.
+    /// [`Driven::within`], for this proxy's peers.
     ///
-    /// Production reads this through `Emulation`, which shares the same cell;
+    /// Production reads this through `Emulation`, which shares the same state;
     /// this exists so the test can drive `consume()` directly without standing up
     /// a listener, hence `cfg(test)` rather than an allow(dead_code).
     #[cfg(test)]
-    pub(crate) fn remotely_driven_within(&self, window: Duration) -> bool {
-        self.last_injected
-            .get()
-            .is_some_and(|t| t.elapsed() < window)
+    pub(crate) fn remotely_driven_within(&self, quiet: Duration) -> bool {
+        self.driven.within(quiet)
     }
 
     async fn event(&mut self) -> EmulationEvent {
         let event = self.event_rx.recv().await.expect("channel closed");
-        if let EmulationEvent::EmulationEnabled = event {
+        if let EmulationEvent::EmulationEnabled { .. } = event {
             self.emulation_active.replace(true);
         }
         if let EmulationEvent::EmulationDisabled = event {
@@ -591,7 +759,7 @@ impl EmulationProxy {
     fn consume(&self, event: Event, addr: SocketAddr, peer: Rc<str>) {
         // stamped before the enabled-check: what matters is that a REMOTE peer is
         // driving, not whether we happened to act on it
-        self.last_injected.set(Some(Instant::now()));
+        self.driven.input_now();
         // ignore events if emulation is currently disabled
         if self.emulation_active.get() {
             self.request_tx
@@ -613,6 +781,14 @@ impl EmulationProxy {
             .expect("channel closed");
     }
 
+    /// Nothing more is queued from here; the session ends with `missing`.
+    fn stop_for_missing(&self, missing: Vec<input_emulation::Permission>) {
+        self.emulation_active.replace(false);
+        self.request_tx
+            .send(ProxyRequest::StopForMissing(missing))
+            .expect("channel closed");
+    }
+
     async fn terminate(&mut self) {
         self.exit_requested.replace(true);
         self.request_tx
@@ -623,7 +799,12 @@ impl EmulationProxy {
 }
 
 struct EmulationTask {
+    /// Told what peers hold down here, and when a teardown lets go of it.
+    driven: Rc<Driven>,
+    /// The backend configured, if any.
     backend: Option<input_emulation::Backend>,
+    /// Tried in order when none is configured.
+    candidates: Vec<input_emulation::Backend>,
     exit_requested: Rc<Cell<bool>>,
     request_rx: Receiver<ProxyRequest>,
     event_tx: Sender<EmulationEvent>,
@@ -743,11 +924,54 @@ impl PeerQueues {
     }
 }
 
+/// Why `emulation` may not run, or `None` when it may: a real backend, or
+/// `dummy` asked for (`asked`) or overridden. A real backend the system
+/// withheld a permission from on the way down to `dummy` is named, so the
+/// person is told what to grant rather than only that input would be
+/// discarded; the override still runs `dummy` in its place.
+fn refuse_the_fall(
+    emulation: &InputEmulation,
+    asked: Option<input_emulation::Backend>,
+    overridden: bool,
+) -> Option<InputEmulationError> {
+    let dummy = input_emulation::Backend::Dummy;
+    if emulation.backend() != dummy || asked == Some(dummy) || overridden {
+        return None;
+    }
+    let withheld = emulation.withheld_permissions();
+    Some(if withheld.is_empty() {
+        InputEmulationError::NoUsableBackend
+    } else {
+        InputEmulationError::Withheld(withheld.to_vec())
+    })
+}
+
+/// What to tell the user about emulation that ended with `e`: the settings
+/// to change when a permission is missing, and the error otherwise.
+fn fault_of(e: &InputEmulationError) -> hops_ipc::EmulationFault {
+    match e.missing_permissions() {
+        Some(missing) if !missing.is_empty() => hops_ipc::EmulationFault::Missing(
+            missing
+                .iter()
+                .map(|p| match p {
+                    input_emulation::Permission::Accessibility => {
+                        hops_ipc::Permission::Accessibility
+                    }
+                })
+                .collect(),
+        ),
+        _ => hops_ipc::EmulationFault::Backend(e.to_string()),
+    }
+}
+
 impl EmulationTask {
     async fn run(mut self) {
         loop {
             if let Err(e) = self.do_emulation().await {
                 log::warn!("input emulation exited: {e}");
+                let _ = self
+                    .event_tx
+                    .send(EmulationEvent::EmulationFailed(fault_of(&e)));
             }
             if self.exit_requested.get() {
                 break;
@@ -759,7 +983,9 @@ impl EmulationTask {
                     ProxyRequest::Terminate => return,
                     // emulation inactive => drop, but keep the backlog counter honest
                     ProxyRequest::Input(..) => self.metrics.on_inject(),
-                    ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::Remove(..) | ProxyRequest::StopForMissing(..) => {
+                        /* emulation inactive => ignore */
+                    }
                 }
             }
         }
@@ -767,8 +993,15 @@ impl EmulationTask {
 
     async fn do_emulation(&mut self) -> Result<(), InputEmulationError> {
         log::info!("creating input emulation ...");
+        let (backend, candidates) = (self.backend, self.candidates.clone());
+        let chosen = async move {
+            match backend {
+                Some(_) => InputEmulation::new(backend).await,
+                None => InputEmulation::first_that_starts(candidates).await,
+            }
+        };
         let mut emulation = tokio::select! {
-            r = InputEmulation::new(self.backend) => r?,
+            r = chosen => r?,
             // allow termination event while requesting input emulation
             _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
         };
@@ -782,24 +1015,25 @@ impl EmulationTask {
         // The Linux release shipped exactly this for months (#47) — built with
         // no backend features at all, so selection had nowhere to go.
         if emulation.backend() == input_emulation::Backend::Dummy {
-            let asked_for_dummy = self.backend == Some(input_emulation::Backend::Dummy);
-            let overridden = std::env::var("HOPS_ALLOW_DUMMY").is_ok_and(|v| v != "0");
             let _ = self.event_tx.send(EmulationEvent::BackendDegraded(
                 emulation.backend().to_string(),
             ));
-            if !asked_for_dummy && !overridden {
-                log::error!(
-                    "input emulation fell back to `dummy` — all input would be silently \
-                     discarded. Refusing. Set HOPS_ALLOW_DUMMY=1 to override."
-                );
-                return Err(InputEmulationError::NoUsableBackend);
-            }
+        }
+        let overridden = std::env::var("HOPS_ALLOW_DUMMY").is_ok_and(|v| v != "0");
+        if let Some(refusal) = refuse_the_fall(&emulation, self.backend, overridden) {
+            log::error!(
+                "input emulation fell back to `dummy` — all input would be silently \
+                 discarded. Refusing. Set HOPS_ALLOW_DUMMY=1 to override."
+            );
+            return Err(refusal);
         }
 
         // used to send enabled and disabled events
         let _emulation_guard = DropGuard::new(
             self.event_tx.clone(),
-            EmulationEvent::EmulationEnabled,
+            EmulationEvent::EmulationEnabled {
+                needs: emulation.needs(),
+            },
             EmulationEvent::EmulationDisabled,
         );
 
@@ -820,7 +1054,9 @@ impl EmulationTask {
             self.metrics.on_inject();
         }
         // FIXME replace with async drop when stabilized
+        let was_held = emulation.holds_anything();
         emulation.terminate().await;
+        self.driven.let_go(was_held, false);
         res
     }
 
@@ -853,8 +1089,8 @@ impl EmulationTask {
             for _ in 0..SORT_BATCH {
                 match self.request_rx.recv().now_or_never() {
                     Some(request) => {
-                        if self.sort(request.expect("channel closed")) {
-                            return Ok(());
+                        if let Some(end) = self.sort(request.expect("channel closed")) {
+                            return end;
                         }
                     }
                     None => break,
@@ -897,7 +1133,7 @@ impl EmulationTask {
                                 dropped + 1
                             );
                             if let Some(handle) = self.handles.remove(&addr) {
-                                emulation.destroy(handle).await;
+                                self.destroy(emulation, handle).await;
                             }
                         }
                         Queued::Input(event, _) => {
@@ -911,7 +1147,9 @@ impl EmulationTask {
                                     handle
                                 }
                             };
-                            emulation.consume(event, handle).await?;
+                            let injected = emulation.consume(event, handle).await;
+                            self.driven.injected(emulation.holds_anything());
+                            injected?;
                             self.metrics.on_inject();
                             // Hand the runtime back periodically. `local_channel`
                             // recv resolves immediately while the queue is
@@ -946,22 +1184,32 @@ impl EmulationTask {
                         }
                         Queued::Remove => {
                             if let Some(handle) = self.handles.remove(&addr) {
-                                emulation.destroy(handle).await;
+                                self.destroy(emulation, handle).await;
                             }
                         }
                     }
                 }
                 e = self.request_rx.recv() => {
-                    if self.sort(e.expect("channel closed")) {
-                        break Ok(());
+                    if let Some(end) = self.sort(e.expect("channel closed")) {
+                        break end;
                     }
                 }
             }
         }
     }
 
-    /// File one request into its peer's queue. True for `Terminate`.
-    fn sort(&mut self, request: ProxyRequest) -> bool {
+    /// Tear `handle` down, letting go of what it holds. What is let go counts
+    /// as that peer's input: a button coming up completes a click.
+    async fn destroy(&self, emulation: &mut InputEmulation, handle: EmulationHandle) {
+        let was_held = emulation.holds(handle);
+        emulation.destroy(handle).await;
+        self.driven.let_go(was_held, emulation.holds_anything());
+    }
+
+    /// File one request into its peer's queue. `Some` with how the session
+    /// ends, for `Terminate` and `StopForMissing`: what is still queued is
+    /// then dropped, not injected.
+    fn sort(&mut self, request: ProxyRequest) -> Option<Result<(), InputEmulationError>> {
         match request {
             ProxyRequest::Input(event, addr, peer) => {
                 let (merged, waiting) = self.queued.push(addr, Queued::Input(event, peer));
@@ -973,14 +1221,17 @@ impl EmulationTask {
                 if waiting >= PEER_QUEUE_LIMIT {
                     self.pressure.hold(addr);
                 }
-                false
+                None
             }
             ProxyRequest::Remove(addr) => {
                 self.queued.push(addr, Queued::Remove);
-                false
+                None
             }
-            ProxyRequest::Terminate => true,
-            ProxyRequest::Reenable => false,
+            ProxyRequest::Terminate => Some(Ok(())),
+            ProxyRequest::Reenable => None,
+            ProxyRequest::StopForMissing(missing) => {
+                Some(Err(InputEmulationError::Revoked(missing)))
+            }
         }
     }
 }
@@ -1010,6 +1261,7 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
             ProxyRequest::Input(..) => continue,
             ProxyRequest::Remove(_) => continue,
             ProxyRequest::Reenable => continue,
+            ProxyRequest::StopForMissing(_) => continue,
         }
     }
 }
@@ -1085,6 +1337,184 @@ mod tests {
             );
         });
     }
+
+    // LEDGER DR-2 | class B | 1 struct state: EmulationProxy::consume into the recording backend, the driven state
+    /// A key a peer holds down keeps this machine driven for as long as it is
+    /// down, however long ago the peer sent it: the backend repeats a held key
+    /// with nothing more arriving, so a window after its last event would
+    /// open while it still types here (#107).
+    #[test]
+    fn a_held_key_keeps_the_machine_driven_until_it_is_let_go() {
+        use crate::test_harness::{machine, run_local, trust, wait_until};
+        use input_emulation::recording::{Recorded, Recording};
+        use input_event::{KeyboardEvent, scancode};
+
+        let key = |state| {
+            Event::Keyboard(KeyboardEvent::Key {
+                time: 0,
+                key: scancode::Linux::KeyA as u32,
+                state,
+            })
+        };
+        run_local(async {
+            let (us, peer) = (machine(), machine());
+            let recording = Recording::new();
+            let mut proxy = EmulationProxy::new(
+                Some(recording.backend()),
+                Default::default(),
+                trust(&us, &[&peer], crate::trust::Caps::INBOUND),
+            );
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !matches!(proxy.event().await, EmulationEvent::EmulationEnabled { .. }) {}
+            })
+            .await
+            .expect("emulation to start");
+            let from = Rc::<str>::from(peer.fingerprint.as_str());
+            let recording = &recording;
+            let reached = |event| {
+                move || {
+                    recording
+                        .calls()
+                        .iter()
+                        .any(|c| matches!(c, Recorded::Consume(e, _) if *e == event))
+                }
+            };
+
+            proxy.consume(key(1), addr(1), from.clone());
+            wait_until("the key-down to be injected", DEADLINE, reached(key(1))).await;
+            assert!(
+                proxy.remotely_driven_within(Duration::ZERO),
+                "a peer holds a key down here, and the machine reads as not driven \
+                 once the window after its last event has passed"
+            );
+
+            proxy.consume(key(0), addr(1), from);
+            wait_until("the key-up to be injected", DEADLINE, reached(key(0))).await;
+            wait_until("the machine to read as not driven", DEADLINE, || {
+                !proxy.remotely_driven_within(Duration::ZERO)
+            })
+            .await;
+        });
+    }
+
+    // LEDGER DR-3 | class B | 1 struct state: EmulationProxy::consume into a slow recording backend, the driven state
+    /// A click that waited in the queue lands when it is injected, and the
+    /// quiet window runs from then (#107). Run from its arrival, a peer that
+    /// queued a click behind a backlog longer than the window, then left,
+    /// would have it land on an approval with the window already shut.
+    #[test]
+    fn input_counts_from_when_it_is_injected_not_when_it_arrived() {
+        use crate::test_harness::{machine, run_local, trust, wait_until};
+        use input_emulation::recording::{Recorded, Recording};
+        use input_event::BTN_LEFT;
+
+        let button = |state| {
+            Event::Pointer(PointerEvent::Button {
+                time: 0,
+                button: BTN_LEFT,
+                state,
+            })
+        };
+        run_local(async {
+            let (us, peer) = (machine(), machine());
+            let recording = Recording::new();
+            let mut proxy = EmulationProxy::new(
+                Some(recording.backend()),
+                Default::default(),
+                trust(&us, &[&peer], crate::trust::Caps::INBOUND),
+            );
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !matches!(proxy.event().await, EmulationEvent::EmulationEnabled { .. }) {}
+            })
+            .await
+            .expect("emulation to start");
+            // Injection is the slow step, so the click waits in the queue.
+            recording.consume_takes(Duration::from_millis(300));
+            let from = Rc::<str>::from(peer.fingerprint.as_str());
+
+            proxy.consume(button(1), addr(1), from.clone());
+            proxy.consume(button(0), addr(1), from);
+            let arrived = Instant::now();
+            let recording = &recording;
+            wait_until("the click to be injected", DEADLINE, || {
+                recording
+                    .calls()
+                    .iter()
+                    .any(|c| matches!(c, Recorded::Consume(e, _) if *e == button(0)))
+                    && !proxy.remotely_driven_within(Duration::ZERO)
+            })
+            .await;
+            assert!(
+                proxy.remotely_driven_within(arrived.elapsed()),
+                "the quiet window ran from when the click arrived, not from when \
+                 it was injected: a click queued behind a backlog lands with the \
+                 window already shut"
+            );
+        });
+    }
+
+    // LEDGER DR-7 | class B | 1 struct state: EmulationProxy::consume and remove into the recording backend, the driven state
+    /// The button-up a teardown sends for a peer is that peer's input, since
+    /// it completes a click, and the quiet window runs from it (#107). No
+    /// listener here, so nothing else (a Leave, a crossing) stamps anything:
+    /// only the let-go can.
+    #[test]
+    fn a_button_let_go_when_a_peer_is_removed_counts_from_the_let_go() {
+        use crate::test_harness::{machine, run_local, trust, wait_until};
+        use input_emulation::recording::{Recorded, Recording};
+        use input_event::BTN_LEFT;
+
+        let button = |state| {
+            Event::Pointer(PointerEvent::Button {
+                time: 0,
+                button: BTN_LEFT,
+                state,
+            })
+        };
+        run_local(async {
+            let (us, peer) = (machine(), machine());
+            let recording = Recording::new();
+            let mut proxy = EmulationProxy::new(
+                Some(recording.backend()),
+                Default::default(),
+                trust(&us, &[&peer], crate::trust::Caps::INBOUND),
+            );
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !matches!(proxy.event().await, EmulationEvent::EmulationEnabled { .. }) {}
+            })
+            .await
+            .expect("emulation to start");
+            let recording = &recording;
+            let reached = |event| {
+                move || {
+                    recording
+                        .calls()
+                        .iter()
+                        .any(|c| matches!(c, Recorded::Consume(e, _) if *e == event))
+                }
+            };
+
+            let from = Rc::<str>::from(peer.fingerprint.as_str());
+            proxy.consume(button(1), addr(1), from);
+            wait_until("the press to be injected", DEADLINE, reached(button(1))).await;
+            let pressed = Instant::now();
+
+            proxy.remove(addr(1));
+            wait_until("the teardown to let the button go", DEADLINE, || {
+                reached(button(0))() && !proxy.remotely_driven_within(Duration::ZERO)
+            })
+            .await;
+            assert!(
+                proxy.remotely_driven_within(pressed.elapsed()),
+                "the button-up a teardown sent was not counted as input: the quiet \
+                 window ran from the press, so a peer that pressed over an \
+                 approval, waited and left had its click land unrefused"
+            );
+        });
+    }
+
+    /// Generous: these wait for a condition, and a loaded machine is slow.
+    const DEADLINE: Duration = Duration::from_secs(20);
 
     #[test]
     fn reconstructs_cumulative_to_per_event_deltas() {
@@ -1177,13 +1607,15 @@ mod held_input_is_released {
     //! the OS.
 
     use super::*;
-    use crate::test_harness::{Dialer, dialer, machine, run_local, trust, wait_until};
+    use crate::test_harness::{Dialer, Machine, dialer, machine, run_local, trust, wait_until};
     use crate::trust::Caps;
     use input_emulation::ButtonScope;
     use input_emulation::recording::{Recorded, Recording};
     use input_event::{BTN_LEFT, BTN_RIGHT, KeyboardEvent, scancode};
 
     const KEY_A: u32 = scancode::Linux::KeyA as u32;
+    const KEY_B: u32 = scancode::Linux::KeyB as u32;
+    const KEY_C: u32 = scancode::Linux::KeyC as u32;
 
     struct Session {
         recording: Recording,
@@ -1194,6 +1626,13 @@ mod held_input_is_released {
         trust: crate::transport::Trust,
         /// Each peer's fingerprint, in the order of `peers`.
         fingerprints: Vec<String>,
+        /// This machine, and the port it listens on, for a test that dials it
+        /// without the production dialler.
+        receiver: Machine,
+        port: u16,
+        /// Closes this machine's side of a peer's link, as removing the
+        /// device does.
+        revoker: crate::listen::ConnRevoker,
     }
 
     /// `n` senders that have crossed onto this machine and are ready to inject,
@@ -1224,6 +1663,7 @@ mod held_input_is_released {
         )
         .await
         .expect("listener");
+        let revoker = listener.revoker();
         let recording = Recording::with_button_scope(scope);
         let emulation = Emulation::new(Some(recording.backend()), listener, receiver_trust.clone());
         let mut peers = vec![];
@@ -1246,6 +1686,9 @@ mod held_input_is_released {
             peers,
             trust: receiver_trust,
             fingerprints: senders.iter().map(|m| m.fingerprint.clone()).collect(),
+            receiver,
+            port,
+            revoker,
         }
     }
 
@@ -1343,32 +1786,383 @@ mod held_input_is_released {
         }
     }
 
-    // LEDGER T1 | class B | 6 struct state: Recording::calls() after the ListenTask watchdog
-    /// The case in the issue: no Leave ever arrives. The link closes, the
-    /// watchdog notices 10-15 s later, and whatever was held must come up then.
+    /// A peer that speaks the wire protocol directly, from one socket of its
+    /// own, so a test can do what the production dialler never does: go
+    /// quiet without closing, or open a second connection from the address
+    /// of the first.
+    struct RawPeer {
+        endpoint: quinn::Endpoint,
+        at: SocketAddr,
+    }
+
+    impl RawPeer {
+        /// A peer the session's machine trusts to drive it.
+        fn new(s: &Session) -> RawPeer {
+            let peer = machine();
+            s.trust
+                .write()
+                .expect("trust lock")
+                .issue_confirmed(&peer.fingerprint, "raw peer", Caps::INBOUND)
+                .expect("grant");
+            let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().expect("loopback"))
+                .expect("endpoint");
+            endpoint.set_default_client_config(crate::test_harness::raw_client_config(
+                &peer,
+                trust(&peer, &[&s.receiver], Caps::OUTBOUND),
+                1 << 20,
+            ));
+            RawPeer {
+                endpoint,
+                at: SocketAddr::new("127.0.0.1".parse().expect("loopback"), s.port),
+            }
+        }
+
+        /// A new connection, crossed onto the session's machine, and the
+        /// stream its input goes on.
+        async fn connect(&self) -> (quinn::Connection, quinn::SendStream) {
+            let conn = self
+                .endpoint
+                .connect(self.at, "grabbr")
+                .expect("dial")
+                .await
+                .expect("handshake");
+            let mut input = conn.open_uni().await.expect("input stream");
+            crate::transport::write_frame(&mut input, ProtoEvent::Enter(Position::Right))
+                .await
+                .expect("enter");
+            (conn, input)
+        }
+    }
+
+    impl Session {
+        /// Send `event` on `input` and wait until it reaches the backend.
+        /// Returns the emulation handle it was injected under.
+        async fn inject_on(&self, input: &mut quinn::SendStream, event: Event) -> EmulationHandle {
+            let before = self.consumed(event).len();
+            crate::transport::write_frame(input, ProtoEvent::Input(event))
+                .await
+                .expect("send");
+            wait_until(
+                &format!("{event} to reach the backend"),
+                Duration::from_secs(10),
+                || self.consumed(event).len() > before,
+            )
+            .await;
+            self.consumed(event)[before].1
+        }
+    }
+
+    // LEDGER T1 | class B | 6 struct state: Recording::calls() and the driven state after the ListenTask watchdog
+    /// The case the watchdog is still for: no Leave and no close. The peer
+    /// sends nothing more while its connection stays up, as when the link
+    /// stalls or the other machine hangs. Only the watchdog can notice, 10-15 s
+    /// later, and whatever was held must come up then. A link that closes is
+    /// released at once (T60). The peer's crossing ends with it, or the
+    /// requests that widen trust stay refused until the link closes (#107).
     #[test]
     fn a_peer_that_vanishes_mid_drag_leaves_no_button_held() {
         run_local(async {
-            let s = session().await;
-            let handle = s.inject(button(BTN_LEFT, 1)).await;
-            s.inject(key(KEY_A, 1)).await;
+            // The raw peer is the only one crossed in.
+            let s = connected(0, ButtonScope::Machine, true).await;
+            let peer = RawPeer::new(&s);
+            let (conn, mut input) = peer.connect().await;
+            let handle = s.inject_on(&mut input, button(BTN_LEFT, 1)).await;
+            s.inject_on(&mut input, key(KEY_A, 1)).await;
 
-            // Close without a Leave, as a killed process or a dropped link does.
-            s.dialer()
-                .conn
-                .revoker()
-                .close_handles(&[s.dialer().handle])
-                .await;
-
+            // Nothing more is sent, and the connection is kept open.
             assert!(
                 s.released_before_destroy(handle, button(BTN_LEFT, 0)).await,
-                "the peer went away holding the left button and it was never \
+                "the peer went quiet holding the left button and it was never \
                  released here: {:?}",
                 s.recording.calls()
             );
             assert!(
                 s.released_before_destroy(handle, key(KEY_A, 0)).await,
                 "held keys must still be released: {:?}",
+                s.recording.calls()
+            );
+            wait_until(
+                "the watchdog to end the quiet peer's crossing",
+                Duration::from_secs(10),
+                || !s.emulation.remotely_driven_within(Duration::ZERO),
+            )
+            .await;
+            assert!(
+                conn.close_reason().is_none(),
+                "the link closed, so this did not exercise the watchdog: {:?}",
+                conn.close_reason()
+            );
+        });
+    }
+
+    // LEDGER DR-8 | class B | 5 process-in-test + 1 struct state: a second connection from one address over loopback QUIC, the driven state
+    /// A new connection from a peer's address is a new session, not yet
+    /// crossed in. The old session's crossing ends there, and the quiet
+    /// window runs from then; left set, the requests that widen trust stay
+    /// refused until the old link closes (#107).
+    #[test]
+    fn a_new_connection_from_a_crossed_peers_address_ends_its_crossing() {
+        run_local(async {
+            let s = connected(0, ButtonScope::Machine, true).await;
+            // One socket, so both connections come from one address.
+            let peer = RawPeer::new(&s);
+            let (_older, mut older_input) = peer.connect().await;
+            wait_until(
+                "the crossing to mark this machine as driven",
+                Duration::from_secs(20),
+                || s.emulation.remotely_driven_within(Duration::ZERO),
+            )
+            .await;
+
+            let reconnecting = Instant::now();
+            let _newer = peer
+                .endpoint
+                .connect(peer.at, "grabbr")
+                .expect("dial")
+                .await
+                .expect("handshake");
+            // The old link keeps answering, so the watchdog, which would also
+            // end the crossing, never fires for it.
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while s.emulation.remotely_driven_within(Duration::ZERO) {
+                assert!(
+                    Instant::now() < deadline,
+                    "a new connection came from a crossed peer's address, and the \
+                     old session still reads as crossed in 20s later"
+                );
+                crate::transport::write_frame(&mut older_input, ProtoEvent::Ping)
+                    .await
+                    .expect("ping");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(
+                s.emulation.remotely_driven_within(reconnecting.elapsed()),
+                "the crossing ended at the new connection, and the quiet window \
+                 did not run from then"
+            );
+        });
+    }
+
+    /// How soon a closed link must be let go of here. Loopback delivers the
+    /// close in about a millisecond; the watchdog, which used to be the only
+    /// release, takes 10 to 15 seconds.
+    const AT_ONCE: Duration = Duration::from_secs(1);
+
+    // LEDGER T60 | class B | 6 struct state: Recording::calls() within 1 s of the peer's link closing
+    /// A link that closes lets go of what its peer held at once. The peer can
+    /// no longer send the ups, so nothing else will (#156).
+    #[test]
+    fn a_closed_link_releases_held_input_at_once() {
+        run_local(async {
+            let s = session().await;
+            let handle = s.inject(button(BTN_LEFT, 1)).await;
+            s.inject(key(KEY_A, 1)).await;
+
+            // Close without a Leave, as a stopped service or a removed device
+            // does.
+            let addr = s
+                .dialer()
+                .clients
+                .active_addr(s.dialer().handle)
+                .expect("connected");
+            s.dialer().conn.revoker().close_addr(addr).await;
+
+            wait_until(
+                "the closed link's held input to be released",
+                AT_ONCE,
+                || s.recording.calls().contains(&Recorded::Destroy(handle)),
+            )
+            .await;
+            assert!(
+                s.released_before_destroy(handle, button(BTN_LEFT, 0)).await,
+                "the link closed while the left button was held and it was not \
+                 released: {:?}",
+                s.recording.calls()
+            );
+            assert!(
+                s.released_before_destroy(handle, key(KEY_A, 0)).await,
+                "the link closed while a key was held and it was not released: {:?}",
+                s.recording.calls()
+            );
+        });
+    }
+
+    // LEDGER T63 | class B | 6 struct state: Recording::calls() within 1 s of removing a peer that sent nothing since its press
+    /// Removing a device while it holds a key, with nothing more on the way
+    /// from it: its link is cut here, and what it held comes up at once
+    /// rather than at the watchdog (#216).
+    #[test]
+    fn removing_a_peer_that_holds_a_key_releases_it_at_once() {
+        run_local(async {
+            let s = session().await;
+            let handle = s.inject(key(KEY_A, 1)).await;
+
+            // What removing the device does: no more trust, and its link cut.
+            s.trust
+                .write()
+                .expect("trust lock")
+                .forget(&s.fingerprints[0]);
+            s.revoker.close_fingerprint(&s.fingerprints[0]).await;
+
+            wait_until(
+                "the removed peer's held key to be released",
+                AT_ONCE,
+                || s.recording.calls().contains(&Recorded::Destroy(handle)),
+            )
+            .await;
+            assert!(
+                s.released_before_destroy(handle, key(KEY_A, 0)).await,
+                "the peer was removed while holding a key and it was not \
+                 released: {:?}",
+                s.recording.calls()
+            );
+        });
+    }
+
+    // LEDGER T61 | class B | 1 return value: Emulation::event() within 1 s of the peer's link closing
+    /// The service is told at once that a link closed, including one from a
+    /// peer that never crossed onto this machine, so the app stops showing it
+    /// as connected (#34).
+    #[test]
+    fn a_closed_link_is_reported_at_once_even_if_the_peer_never_crossed() {
+        run_local(async {
+            let mut s = connected(1, ButtonScope::Machine, false).await;
+            let addr = sync(&mut s, 0)
+                .await
+                .iter()
+                .find_map(|e| match e {
+                    EmulationEvent::Connected { addr, .. } => Some(*addr),
+                    _ => None,
+                })
+                .expect("the peer's connection was reported");
+
+            let remote = s
+                .dialer()
+                .clients
+                .active_addr(s.dialer().handle)
+                .expect("connected");
+            s.dialer().conn.revoker().close_addr(remote).await;
+
+            let reported = tokio::time::timeout(AT_ONCE, async {
+                loop {
+                    if let EmulationEvent::Disconnected { addr: gone } = s.emulation.event().await {
+                        if gone == addr {
+                            break;
+                        }
+                    }
+                }
+            })
+            .await;
+            assert!(
+                reported.is_ok(),
+                "a peer that never crossed closed its link, and that was not \
+                 reported within {AT_ONCE:?}"
+            );
+        });
+    }
+
+    // LEDGER T62 | class B | 6 struct state: Recording::calls() after an older connection from the same address closes
+    /// Two connections from one address: the sender reached this machine
+    /// again from the same socket before its old connection ended here. The
+    /// old one closing must not end the new one's session or let go of what
+    /// it holds.
+    #[test]
+    fn a_late_close_from_an_older_connection_keeps_the_newer_session() {
+        run_local(async {
+            let s = session().await;
+            // One socket, so both connections come from one address.
+            let peer = RawPeer::new(&s);
+            let (older, mut older_input) = peer.connect().await;
+            s.inject_on(&mut older_input, key(KEY_A, 1)).await;
+            let (_newer, mut newer_input) = peer.connect().await;
+            let handle = s.inject_on(&mut newer_input, key(KEY_B, 1)).await;
+
+            older.close(0u32.into(), b"gone");
+            // Loopback delivers the close in about a millisecond.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            s.inject_on(&mut newer_input, key(KEY_C, 1)).await;
+            assert!(
+                !s.recording.calls().contains(&Recorded::Destroy(handle)),
+                "the older connection closed and the newer one's held keys were \
+                 let go: {:?}",
+                s.recording.calls()
+            );
+        });
+    }
+
+    // LEDGER T69 | class B | 6 struct state + 1 return value: Recording::calls() and Emulation::event() within 1 s of one of two peers' links closing
+    /// Two peers drive this machine and one link closes. That peer's held
+    /// input comes up and the service is told at once, whether or not another
+    /// peer is still connected; the other peer's session is left alone.
+    #[test]
+    fn a_closed_link_is_let_go_while_another_peer_stays_connected() {
+        run_local(async {
+            let mut s = session_with(2).await;
+            let closing = s.inject_from(0, key(KEY_A, 1)).await;
+            let staying = s.inject_from(1, key(KEY_B, 1)).await;
+            assert_ne!(closing, staying, "precondition: one handle per peer");
+            let addr = sync(&mut s, 0)
+                .await
+                .iter()
+                .find_map(|e| match e {
+                    EmulationEvent::Connected { addr, fingerprint }
+                        if *fingerprint == s.fingerprints[0] =>
+                    {
+                        Some(*addr)
+                    }
+                    _ => None,
+                })
+                .expect("the closing peer's connection was reported");
+
+            let remote = s.peers[0]
+                .clients
+                .active_addr(s.peers[0].handle)
+                .expect("connected");
+            s.peers[0].conn.revoker().close_addr(remote).await;
+
+            let reported = tokio::time::timeout(AT_ONCE, async {
+                loop {
+                    if let EmulationEvent::Disconnected { addr: gone } = s.emulation.event().await {
+                        if gone == addr {
+                            break;
+                        }
+                    }
+                }
+            })
+            .await;
+            assert!(
+                reported.is_ok(),
+                "one of two connected peers closed its link, and that was not \
+                 reported within {AT_ONCE:?}"
+            );
+            wait_until(
+                "the closed link's held key to be released while another peer \
+                 stays connected",
+                AT_ONCE,
+                || s.recording.calls().contains(&Recorded::Destroy(closing)),
+            )
+            .await;
+            assert!(
+                s.released_before_destroy(closing, key(KEY_A, 0)).await,
+                "the closed link's held key was not released: {:?}",
+                s.recording.calls()
+            );
+
+            // Its link is still up, so it keeps what it holds and still drives.
+            let kept = || {
+                !s.recording.calls().contains(&Recorded::Destroy(staying))
+                    && s.position(key(KEY_B, 0)).is_none()
+            };
+            assert!(
+                kept(),
+                "one peer's link closed and the other's held key was let go: {:?}",
+                s.recording.calls()
+            );
+            s.inject_from(1, key(KEY_C, 1)).await;
+            assert!(
+                kept(),
+                "one peer's link closed and the other's held key was let go: {:?}",
                 s.recording.calls()
             );
         });
@@ -1394,6 +2188,164 @@ mod held_input_is_released {
                 s.released_before_destroy(handle, key(KEY_A, 0)).await,
                 "a Leave must still release held keys: {:?}",
                 s.recording.calls()
+            );
+        });
+    }
+
+    // LEDGER DR-4 | class B | 5 process-in-test + 1 struct state: Enter and Leave over loopback QUIC, the driven state
+    /// A peer crossed onto this machine drives it until it leaves, whether or
+    /// not it has sent anything since, and the quiet window runs from its
+    /// leaving (#107).
+    #[test]
+    fn a_crossed_peer_drives_this_machine_until_it_leaves() {
+        run_local(async {
+            let s = session().await;
+            wait_until(
+                "the crossing to mark this machine as driven",
+                Duration::from_secs(20),
+                || s.emulation.remotely_driven_within(Duration::ZERO),
+            )
+            .await;
+
+            let leaving = Instant::now();
+            s.dialer().send(ProtoEvent::Leave(0)).await;
+            wait_until(
+                "the Leave to end the crossing",
+                Duration::from_secs(20),
+                || !s.emulation.remotely_driven_within(Duration::ZERO),
+            )
+            .await;
+            assert!(
+                s.emulation.remotely_driven_within(leaving.elapsed()),
+                "a peer that sent nothing while crossed in left, and the machine \
+                 read as not driven at once: the quiet window did not run from \
+                 its leaving"
+            );
+        });
+    }
+
+    // LEDGER DR-6 | class B | 5 process-in-test + 1 struct state: Emulation::terminate with a button held over loopback QUIC, the driven state
+    /// When the listener goes, every crossed peer's session goes with it, and
+    /// what they held is let go. Neither may leave the machine reading as
+    /// driven for good, and the let-go still counts as input (#107).
+    #[test]
+    fn shutting_down_ends_the_crossing_and_counts_the_let_go() {
+        run_local(async {
+            let mut s = session().await;
+            s.inject(button(BTN_LEFT, 1)).await;
+            let pressed = Instant::now();
+
+            s.emulation.terminate().await;
+            assert!(
+                s.position(button(BTN_LEFT, 0)).is_some(),
+                "the held button was not let go at shutdown: {:?}",
+                s.recording.calls()
+            );
+            assert!(
+                !s.emulation.remotely_driven_within(Duration::ZERO),
+                "the listener is gone, yet the machine still reads as driven with \
+                 no quiet window at all: widening requests stay refused until a \
+                 restart"
+            );
+            assert!(
+                s.emulation.remotely_driven_within(pressed.elapsed()),
+                "the button let go at shutdown was not counted as input"
+            );
+        });
+    }
+
+    // LEDGER DR-5 | class B | 5 process-in-test + 1 struct state: a Leave or a closed link over loopback QUIC, the recording backend, the driven state
+    /// A button a peer held comes up here when its session ends, and that up
+    /// completes a click. It counts as the peer's input, so the quiet window
+    /// starts again from it, however long the peer waited before leaving
+    /// (#107).
+    #[test]
+    fn a_button_let_go_at_a_leave_is_the_peers_input() {
+        run_local(a_button_let_go_at_the_end_of_a_session_is_input(true));
+    }
+
+    /// [`a_button_let_go_at_a_leave_is_the_peers_input`], when the peer drops
+    /// the link instead of leaving.
+    #[test]
+    fn a_button_let_go_at_a_closed_link_is_the_peers_input() {
+        run_local(a_button_let_go_at_the_end_of_a_session_is_input(false));
+    }
+
+    /// The peer, the only one, presses a button and then sends a Leave if
+    /// `leaves`, or else closes its link.
+    async fn a_button_let_go_at_the_end_of_a_session_is_input(leaves: bool) {
+        let how = if leaves { "a Leave" } else { "a closed link" };
+        let s = connected(usize::from(leaves), ButtonScope::Machine, true).await;
+        let (handle, pressed, _conn) = if leaves {
+            let handle = s.inject(button(BTN_LEFT, 1)).await;
+            let pressed = Instant::now();
+            s.dialer().send(ProtoEvent::Leave(0)).await;
+            (handle, pressed, None)
+        } else {
+            let (conn, mut input) = RawPeer::new(&s).connect().await;
+            let handle = s.inject_on(&mut input, button(BTN_LEFT, 1)).await;
+            let pressed = Instant::now();
+            conn.close(0u32.into(), b"gone");
+            (handle, pressed, Some(conn))
+        };
+        assert!(
+            s.released_before_destroy(handle, button(BTN_LEFT, 0)).await,
+            "the held button was not let go at {how}: {:?}",
+            s.recording.calls()
+        );
+        assert!(
+            !s.emulation.remotely_driven_within(Duration::ZERO),
+            "after {how} nothing is crossed or held, yet the machine still reads \
+             as driven with no quiet window at all"
+        );
+        assert!(
+            s.emulation.remotely_driven_within(pressed.elapsed()),
+            "the button that came up at {how} was not counted as input: the quiet \
+             window ran from the press, so a peer that pressed over an approval, \
+             waited and left had its click land unrefused"
+        );
+    }
+
+    // LEDGER T117-1 | class B | 5 log line: InputEmulation::release_held via a Leave over loopback
+    /// Releasing a held key is logged at warn, the level a default install
+    /// writes and macOS copies into the system log. The line says a key was
+    /// released, never which one (#117).
+    #[test]
+    fn a_key_released_at_teardown_is_not_named_in_the_log() {
+        const HELD: scancode::Linux = scancode::Linux::KeyA;
+        run_local(async {
+            let logs = crate::test_harness::logs::capture();
+            let s = session().await;
+            let handle = s.inject(key(HELD as u32, 1)).await;
+
+            s.dialer().send(ProtoEvent::Leave(0)).await;
+            assert!(
+                s.released_before_destroy(handle, key(HELD as u32, 0)).await,
+                "the held key must still be released: {:?}",
+                s.recording.calls()
+            );
+
+            let lines = logs.lines();
+            assert!(
+                lines.iter().any(|l| l.level == log::Level::Trace
+                    && l.target == "hops::emulation"
+                    && l.text.contains("<-<-<-<-<-")
+                    && l.text.contains("key(")),
+                "the receiver's trace line for the key never reached the capture, \
+                 so an empty result below would prove nothing: {lines:#?}"
+            );
+            assert!(
+                lines.iter().any(|l| l.level == log::Level::Warn
+                    && l.target.starts_with("input_emulation")
+                    && l.text.contains("stuck key")),
+                "the warn line for the released key never reached the capture: {lines:#?}"
+            );
+            let naming = logs.naming(HELD);
+            assert!(
+                naming.is_empty(),
+                "the log names the key the peer typed. Raising the log level, or \
+                 none at all for a warn line, must not record what someone types: \
+                 {naming:#?}"
             );
         });
     }
@@ -1822,7 +2774,7 @@ mod held_input_is_released {
             s.trust
                 .write()
                 .expect("trust lock")
-                .revoke(&s.fingerprints[0]);
+                .forget(&s.fingerprints[0]);
             for seq in 1..=5 {
                 s.peers[0].send(absolute(seq)).await;
             }
@@ -1847,7 +2799,7 @@ mod held_input_is_released {
             s.trust
                 .write()
                 .expect("trust lock")
-                .revoke(&s.fingerprints[0]);
+                .forget(&s.fingerprints[0]);
             s.peers[0].send(ProtoEvent::Enter(Position::Right)).await;
             let seen = sync(&mut s, 0).await;
             assert!(
@@ -1878,7 +2830,7 @@ mod held_input_is_released {
             s.trust
                 .write()
                 .expect("trust lock")
-                .revoke(&s.fingerprints[0]);
+                .forget(&s.fingerprints[0]);
 
             assert!(
                 s.released_before_destroy(handle, button(BTN_LEFT, 0)).await,
@@ -1891,6 +2843,15 @@ mod held_input_is_released {
                 s.consumed(key(KEY_A, 1)).is_empty(),
                 "a key queued before the peer lost permission was injected after it"
             );
+            // The button it held is no longer down, so once it leaves nothing
+            // keeps this machine reading as driven (#107).
+            s.peers[0].send(ProtoEvent::Leave(0)).await;
+            wait_until(
+                "the machine to read as not driven once the peer left",
+                Duration::from_secs(20),
+                || !s.emulation.remotely_driven_within(Duration::ZERO),
+            )
+            .await;
         });
     }
 
@@ -2005,7 +2966,7 @@ mod held_input_is_released {
             s.trust
                 .write()
                 .expect("trust lock")
-                .revoke(&s.fingerprints[0]);
+                .forget(&s.fingerprints[0]);
             // Refused: the peer is no longer allowed to drive this machine.
             s.dialer()
                 .send(ProtoEvent::Input(button(BTN_LEFT, 0)))
@@ -2048,7 +3009,7 @@ mod held_input_is_released {
             s.trust
                 .write()
                 .expect("trust lock")
-                .revoke(&s.fingerprints[0]);
+                .forget(&s.fingerprints[0]);
             let scroll = Event::Pointer(PointerEvent::Axis {
                 time: 0,
                 axis: 0,
@@ -2138,7 +3099,7 @@ mod held_input_is_released {
             s.trust
                 .write()
                 .expect("trust lock")
-                .issue(fingerprint, "peer", Caps::INBOUND)
+                .issue_confirmed(fingerprint, "peer", Caps::INBOUND)
                 .expect("grant again");
             let second = s.inject(button(BTN_RIGHT, 1)).await;
             assert_ne!(first, second, "precondition: a new handle");
@@ -2301,6 +3262,283 @@ mod held_input_is_released {
                  up was injected as a second one: {:?}",
                 s.recording.calls()
             );
+        });
+    }
+
+    // LEDGER T2436 | class B | 1 Emulation::event + 6 Recording::calls() after Emulation::stop_for_missing
+    /// macOS took Accessibility while a peer drives this machine. What
+    /// emulation posts from then on is dropped without an error, so it must
+    /// stop, report the permission, and inject nothing the peer sends after
+    /// (#240).
+    #[test]
+    fn emulation_stopped_for_a_missing_permission_says_so_and_injects_nothing_more() {
+        run_local(async {
+            let mut s = session().await;
+            s.inject(key(KEY_A, 1)).await;
+            s.inject(key(KEY_A, 0)).await;
+
+            s.emulation
+                .stop_for_missing(vec![input_emulation::Permission::Accessibility]);
+            let reported = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let EmulationEvent::EmulationFailed(fault) = s.emulation.event().await {
+                        return fault;
+                    }
+                }
+            })
+            .await;
+            // The peer may already have been told emulation is off, and
+            // refuse to send: either way nothing may reach the backend.
+            for event in [key(KEY_B, 1), key(KEY_B, 0)] {
+                let _ = s
+                    .dialer()
+                    .conn
+                    .send(ProtoEvent::Input(event), s.dialer().handle)
+                    .await;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            let injected_after: Vec<Event> = [key(KEY_B, 1), key(KEY_B, 0)]
+                .into_iter()
+                .filter(|&e| !s.consumed(e).is_empty())
+                .collect();
+            assert_eq!(
+                (reported.ok(), injected_after),
+                (
+                    Some(hops_ipc::EmulationFault::Missing(vec![
+                        hops_ipc::Permission::Accessibility
+                    ])),
+                    vec![]
+                ),
+                "(what emulation reported, what the peer sent after the stop that \
+                 reached the backend). It must report the permission macOS took, which \
+                 puts the banner up in the app (None: no failure reported), and inject \
+                 nothing more"
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod a_pairing_approved_both_ways {
+    //! Two machines that each approved the other in both directions drive each
+    //! other (#166). The first approval on each side lets one machine drive the
+    //! other; the second, the reverse. Everything is the production path: the
+    //! grant door the approval prompt calls, both TLS verifiers, the listener,
+    //! the per-event check and the emulation task, into a recording backend.
+
+    use super::*;
+    use crate::service::grant_for_attempt;
+    use crate::test_harness::{Dialer, Machine, dialer, machine, run_local, wait_until};
+    use crate::transport::Trust;
+    use crate::trust::TrustStore;
+    use hops_ipc::AttemptOrigin;
+    use input_emulation::recording::{Recorded, Recording};
+    use input_event::{KeyboardEvent, scancode};
+    use std::sync::{Arc, RwLock};
+
+    /// One machine: its store, and the listener and emulation it receives on.
+    struct Side {
+        machine: Machine,
+        trust: Trust,
+        recording: Recording,
+        _emulation: Emulation,
+        port: u16,
+    }
+
+    async fn side() -> Side {
+        let machine = machine();
+        let trust: Trust = Arc::new(RwLock::new(
+            TrustStore::new(&machine.fingerprint, 0).expect("our fingerprint"),
+        ));
+        let (clipboard_tx, _) = channel();
+        let (listener, port) =
+            LanMouseListener::bind_loopback(machine.identity.clone(), trust.clone(), clipboard_tx)
+                .await
+                .expect("listener");
+        let recording = Recording::new();
+        let emulation = Emulation::new(Some(recording.backend()), listener, trust.clone());
+        Side {
+            machine,
+            trust,
+            recording,
+            _emulation: emulation,
+            port,
+        }
+    }
+
+    /// What the approval prompt does when the user says yes to `peer`, and
+    /// the number is then confirmed on both machines if the pairing is new.
+    fn approve(on: &Side, peer: &Side, origin: AttemptOrigin) {
+        let mut trust = on.trust.write().expect("trust lock");
+        grant_for_attempt(
+            &mut trust,
+            &peer.machine.fingerprint,
+            "the other machine",
+            Some(origin),
+            // The direction these tests pair in: the machine that knocked
+            // controls, and the one dialled is controlled.
+            match origin {
+                AttemptOrigin::Inbound => hops_ipc::Controller::ThatMachine,
+                AttemptOrigin::OutboundDial => hops_ipc::Controller::ThisMachine,
+            },
+            false,
+        )
+        .expect("the approval grants");
+        if trust.is_pairing(&peer.machine.fingerprint) {
+            trust
+                .confirm(&peer.machine.fingerprint)
+                .expect("both machines confirmed the number");
+        }
+    }
+
+    /// `from` dials `to` and crosses onto it.
+    async fn drive(from: &Side, to: &Side) -> Dialer {
+        let d = dialer(
+            &from.machine,
+            from.trust.clone(),
+            to.port,
+            hops_ipc::Position::Left,
+        );
+        d.until_alive().await;
+        d.send(ProtoEvent::Enter(Position::Right)).await;
+        d
+    }
+
+    fn key(key: u32) -> Event {
+        Event::Keyboard(KeyboardEvent::Key {
+            time: 0,
+            key,
+            state: 1,
+        })
+    }
+
+    /// Send `event` over `d` and wait for it to reach `to`'s backend.
+    async fn types(d: &Dialer, to: &Side, event: Event, what: &str) {
+        let arrived = || {
+            to.recording
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Recorded::Consume(e, _) if *e == event))
+        };
+        d.send(ProtoEvent::Input(event)).await;
+        wait_until(what, Duration::from_secs(10), arrived).await;
+    }
+
+    // LEDGER T4 | class B | 6 struct state: Recording::calls() after service::grant_for_attempt on both machines, over LanMouseListener, Emulation and LanMouseConnection
+    #[test]
+    fn a_pairing_approved_both_ways_carries_input_both_ways() {
+        run_local(async {
+            let a = side().await;
+            let b = side().await;
+
+            // B drives A: A approved B's knock, B approved A answering its dial.
+            approve(&a, &b, AttemptOrigin::Inbound);
+            approve(&b, &a, AttemptOrigin::OutboundDial);
+            let b_to_a = drive(&b, &a).await;
+            types(
+                &b_to_a,
+                &a,
+                key(scancode::Linux::KeyA as u32),
+                "B's first key to reach A",
+            )
+            .await;
+
+            // Then A drives B: the reverse approval on each machine.
+            approve(&a, &b, AttemptOrigin::OutboundDial);
+            approve(&b, &a, AttemptOrigin::Inbound);
+            let a_to_b = drive(&a, &b).await;
+            types(
+                &a_to_b,
+                &b,
+                key(scancode::Linux::KeyB as u32),
+                "A's key to reach B",
+            )
+            .await;
+
+            // B still drives A, on the connection it already had...
+            types(
+                &b_to_a,
+                &a,
+                key(scancode::Linux::KeyC as u32),
+                "B's key to reach A after A was approved to drive B (#166: the \
+                 second approval replaced the first)",
+            )
+            .await;
+            // ...and on a new one, which passes both verifiers again.
+            let again = drive(&b, &a).await;
+            types(
+                &again,
+                &a,
+                key(scancode::Linux::KeyD as u32),
+                "B's key to reach A over a new connection",
+            )
+            .await;
+        });
+    }
+}
+
+#[cfg(test)]
+mod a_fall_to_dummy_names_what_was_withheld {
+    //! A Mac without Accessibility falls past its real backend to `dummy`,
+    //! which is refused. The refusal names the permission, so the app can
+    //! say what to grant; the override still runs `dummy`.
+    //!
+    //! The emulations here are chosen the way a Mac chooses its own, with
+    //! no backend configured: the recording stand-in refused its permission,
+    //! then `dummy`.
+
+    use super::{InputEmulationError, fault_of, refuse_the_fall};
+    use crate::test_harness::run_local;
+    use hops_ipc::{EmulationFault, Permission};
+    use input_emulation::recording::Recording;
+    use input_emulation::{Backend, InputEmulation};
+
+    async fn chosen(backends: impl IntoIterator<Item = Backend>) -> InputEmulation {
+        InputEmulation::first_that_starts(backends)
+            .await
+            .expect("dummy always starts")
+    }
+
+    // LEDGER G2-4 | class B | 1 return value: refuse_the_fall over emulations from first_that_starts, folded by fault_of
+    #[test]
+    fn the_refusal_names_the_permission_and_the_override_still_runs() {
+        run_local(async {
+            let refused = Recording::new();
+            refused.refuse_permission();
+            let fell_past_refusal = chosen([refused.backend(), Backend::Dummy]).await;
+            let gone = Recording::new().backend();
+            let fell_past_failure = chosen([gone, Backend::Dummy]).await;
+            let working = Recording::new();
+            let real = chosen([working.backend(), Backend::Dummy]).await;
+            let told = |e: &InputEmulation, asked: Option<Backend>, overridden: bool| {
+                refuse_the_fall(e, asked, overridden).map(|e| fault_of(&e))
+            };
+            assert_eq!(
+                told(&fell_past_refusal, None, false),
+                Some(EmulationFault::Missing(vec![Permission::Accessibility])),
+                "a fall past a backend refused Accessibility must name it"
+            );
+            assert!(
+                matches!(
+                    refuse_the_fall(&fell_past_failure, None, false),
+                    Some(InputEmulationError::NoUsableBackend)
+                ),
+                "a fall past backends that failed otherwise names no permission"
+            );
+            assert_eq!(
+                (
+                    told(&fell_past_refusal, Some(Backend::Dummy), false),
+                    told(&fell_past_refusal, None, true),
+                    told(&real, None, false),
+                ),
+                (None, None, None),
+                "(dummy asked for, HOPS_ALLOW_DUMMY set, a real backend): each runs"
+            );
+            for e in [fell_past_refusal, fell_past_failure, real] {
+                let mut e = e;
+                e.terminate().await;
+            }
         });
     }
 }

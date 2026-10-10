@@ -40,6 +40,19 @@ pub enum CaptureError {
     #[cfg(libei)]
     #[error("libei disconnected - reason: `{0}`")]
     Disconnected(String),
+    /// The compositor captured the pointer and left out what says for which
+    /// edge (#103).
+    #[cfg(libei)]
+    #[error("the compositor started input capture but {0}: no device to send it to")]
+    Unattributed(String),
+    /// The capture task ended without returning: it was cancelled or failed.
+    #[cfg(libei)]
+    #[error("the input capture task ended abnormally: {0}")]
+    TaskFailed(String),
+    /// The Wayland connection failed or the compositor broke the protocol.
+    #[cfg(layer_shell)]
+    #[error("wayland: {0}")]
+    Wayland(String),
     #[cfg(target_os = "macos")]
     #[error("failed to warp mouse cursor: `{0}`")]
     WarpCursor(CGError),
@@ -52,9 +65,59 @@ pub enum CaptureError {
     #[cfg(target_os = "macos")]
     #[error("unable to map key event: {0}")]
     KeyMapError(i64),
-    #[cfg(target_os = "macos")]
-    #[error("Event tap disabled")]
-    EventTapDisabled,
+    /// The OS took away a permission capture needs while it ran (#79).
+    #[error("{}", Permission::sentence(.0))]
+    MissingPermissions(Vec<Permission>),
+    /// The system stopped capture for a reason that passes, such as a
+    /// screen lock or an event tap disabled too often; capture starts again
+    /// on its own after a delay (#240).
+    #[error("input capture was interrupted ({0}); it starts again shortly")]
+    Interrupted(String),
+    /// Secure input (a password field, the lock screen) disabled the tap
+    /// that held the pointer on another machine; the pointer came back.
+    /// Capture starts again after a short fixed wait, however often this
+    /// happens, so it is never off for long after an unlock (#240).
+    #[error(
+        "secure input took the pointer back from another machine; input capture starts again shortly"
+    )]
+    SecureInput,
+}
+
+/// How capture that ended starts again without the user asking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Restart {
+    /// After a short fixed wait: the cause passes on its own.
+    Soon,
+    /// After a wait that grows while the cause keeps recurring.
+    Backoff,
+}
+
+/// An OS permission capture needs, named as macOS lists it under System
+/// Settings → Privacy & Security. Only macOS has such permissions; a test's
+/// scripted backend reports them anywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Permission {
+    /// Accessibility (`AXIsProcessTrusted`).
+    Accessibility,
+    /// Input Monitoring (`CGPreflightListenEventAccess`).
+    InputMonitoring,
+}
+
+impl std::fmt::Display for Permission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Accessibility => input_event::settings_pane::accessibility(),
+            Self::InputMonitoring => "Input Monitoring",
+        })
+    }
+}
+
+impl Permission {
+    /// "macOS does not grant hops Accessibility and Input Monitoring".
+    pub(crate) fn sentence(missing: &[Permission]) -> String {
+        let names: Vec<String> = missing.iter().map(ToString::to_string).collect();
+        format!("macOS does not grant hops {}", names.join(" and "))
+    }
 }
 
 #[derive(Debug, Error)]
@@ -81,10 +144,65 @@ pub enum CaptureCreationError {
     MacOS(#[from] MacosCaptureCreationError),
 }
 
+impl InputCaptureError {
+    /// The permissions whose absence stopped capture, when that is why.
+    pub fn missing_permissions(&self) -> Option<&[Permission]> {
+        match self {
+            Self::Create(e) => e.missing_permissions(),
+            Self::Capture(e) => e.missing_permissions(),
+        }
+    }
+
+    /// Whether the user declined to let capture start, which is switching
+    /// it off rather than a failure.
+    pub fn cancelled_by_user(&self) -> bool {
+        matches!(self, Self::Create(e) if e.cancelled_by_user())
+    }
+
+    /// How capture that ended for a reason that passes starts again without
+    /// the user asking; `None` for any other end. A missing permission is
+    /// not such a reason: the permission watch picks up its grant.
+    pub fn restart(&self) -> Option<Restart> {
+        match self {
+            Self::Capture(CaptureError::Interrupted(_)) => Some(Restart::Backoff),
+            Self::Capture(CaptureError::SecureInput) => Some(Restart::Soon),
+            _ => None,
+        }
+    }
+}
+
+impl CaptureError {
+    /// The permissions taken away while capture ran, when that is why it
+    /// stopped.
+    pub fn missing_permissions(&self) -> Option<&[Permission]> {
+        match self {
+            Self::MissingPermissions(missing) => Some(missing),
+            _ => None,
+        }
+    }
+}
+
 impl CaptureCreationError {
+    /// The permissions whose absence kept the backend from starting, when
+    /// that is why.
+    pub fn missing_permissions(&self) -> Option<&[Permission]> {
+        #[cfg(target_os = "macos")]
+        if let Self::MacOS(MacosCaptureCreationError::MissingPermissions(missing)) = self {
+            return Some(missing);
+        }
+        #[cfg(feature = "scripted")]
+        if let Self::Scripted(crate::scripted::ScriptedCaptureCreationError::MissingPermissions(
+            missing,
+        )) = self
+        {
+            return Some(missing);
+        }
+        None
+    }
+
     /// request was intentionally denied by the user
     #[cfg(libei)]
-    pub(crate) fn cancelled_by_user(&self) -> bool {
+    pub fn cancelled_by_user(&self) -> bool {
         matches!(
             self,
             CaptureCreationError::Libei(LibeiCaptureCreationError::Ashpd(ashpd::Error::Response(
@@ -93,7 +211,7 @@ impl CaptureCreationError {
         )
     }
     #[cfg(not(libei))]
-    pub(crate) fn cancelled_by_user(&self) -> bool {
+    pub fn cancelled_by_user(&self) -> bool {
         false
     }
 }
@@ -152,13 +270,38 @@ pub enum MacosCaptureCreationError {
     #[cfg(target_os = "macos")]
     #[error("event tap creation failed")]
     EventTapCreation,
-    #[error("accessibility permission is required")]
-    AccessibilityPermission,
-    #[error("input monitoring permission is required")]
-    InputMonitoringPermission,
+    /// Each permission macOS withholds, all of them, so the user is told
+    /// every setting to change at once.
+    #[error("{}", Permission::sentence(.0))]
+    MissingPermissions(Vec<Permission>),
     #[error("failed to set CG Cursor property")]
     CGCursorProperty,
     #[cfg(target_os = "macos")]
     #[error("failed to get display ids: {0}")]
     ActiveDisplays(CGError),
+}
+
+#[cfg(test)]
+mod a_permission_is_named_as_this_macos_names_it {
+    use super::Permission;
+    use input_event::settings_pane::assume_major;
+
+    // LEDGER T10 | class B | 1 return value: Permission::sentence
+    #[test]
+    fn the_sentence_names_the_list_as_macos_26_and_27_do() {
+        let said = |major| {
+            assume_major(Some(major));
+            let s = Permission::sentence(&[Permission::Accessibility, Permission::InputMonitoring]);
+            assume_major(None);
+            s
+        };
+        assert_eq!(
+            [said(26), said(27)],
+            [
+                "macOS does not grant hops Accessibility and Input Monitoring".to_string(),
+                "macOS does not grant hops Device Control and Data Access and Input Monitoring"
+                    .to_string(),
+            ]
+        );
+    }
 }
