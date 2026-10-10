@@ -2414,6 +2414,7 @@ dependencies = [
  "hostname",
  "i-slint-backend-testing",
  "image",
+ "input-event",
  "log",
  "slint",
  "slint-build",

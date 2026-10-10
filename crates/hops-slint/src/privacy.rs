@@ -9,9 +9,12 @@
 //! that is only ever controlled runs and nothing else, needs Accessibility,
 //! which also grants posting input; it never needs Input Monitoring.
 //!
-//! For Accessibility the app calls `AXIsProcessTrustedWithOptions` with the
+//! Enable input first checks Accessibility itself with the probe tap, unless
+//! the daemon already reports it missing or emulation runs. To ask for
+//! Accessibility the app calls `AXIsProcessTrustedWithOptions` with the
 //! prompt option and, when that answers untrusted, `CGRequestPostEventAccess`;
-//! for Input Monitoring, `CGRequestListenEventAccess`. Each answer is logged.
+//! for Input Monitoring, `CGRequestListenEventAccess`. Each answer is logged,
+//! and a burst of clicks asks once ([`Asking`]).
 //! Which of them shows a prompt and adds hops to the list on macOS 27 is
 //! UNVERIFIED on hardware.
 //!
@@ -24,6 +27,9 @@
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
 use hops_frontend_core::{CaptureFault, CaptureState, EmulationFault, EmulationState, Permission};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 /// What the app asks macOS for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,20 +77,21 @@ pub(crate) fn for_emulation(emulation: &EmulationState) -> Option<Ask> {
 }
 
 /// What enable input asks for: what capture and emulation report missing,
-/// and Accessibility when `untrusted` says this process lacks it. The
-/// daemon reports a permission only once a side has tried and failed, which
-/// on a Mac that never granted hops can be after the first click, so the
-/// app checks too. `untrusted` is called only when neither side already
-/// reports Accessibility missing.
+/// and Accessibility when `refused` says this process lacks it. The daemon
+/// reports a permission only once a side has tried and failed, which on a
+/// Mac that never granted hops can be after the first click, so the app
+/// checks too. `refused` is called only when neither side already reports
+/// Accessibility missing and emulation does not run: emulation that runs
+/// has Accessibility, so nothing asks for it then.
 pub(crate) fn for_enable_input(
     capture: &CaptureState,
     emulation: &EmulationState,
-    untrusted: impl FnOnce() -> bool,
+    refused: impl FnOnce() -> bool,
 ) -> Option<Ask> {
     let capture = for_capture(capture);
     let reported = capture.is_some_and(|a| a.accessibility)
         || for_emulation(emulation).is_some_and(|a| a.accessibility);
-    let accessibility = reported || untrusted();
+    let accessibility = !emulation.is_enabled() && (reported || refused());
     let input_monitoring = capture.is_some_and(|a| a.input_monitoring);
     let pane = match (accessibility, input_monitoring) {
         (true, _) => Permission::Accessibility,
@@ -123,9 +130,11 @@ pub(crate) enum Action {
 
 /// The calls through which the app asks macOS. [`System`] makes them.
 pub(crate) trait Macos {
-    /// `AXIsProcessTrusted`: whether this process has Accessibility. No
-    /// prompt.
-    fn trusted(&mut self) -> bool;
+    /// Whether this process has Accessibility, by the probe tap
+    /// ([`input_event::accessibility`]), which macOS answers afresh each
+    /// time; `AXIsProcessTrusted` can keep its first answer for the life of
+    /// the process (#240). No prompt.
+    fn accessibility_permitted(&mut self) -> bool;
     /// `AXIsProcessTrustedWithOptions` with `kAXTrustedCheckOptionPrompt`
     /// true.
     fn prompt_accessibility(&mut self) -> bool;
@@ -150,18 +159,22 @@ pub(crate) fn act(
     let (ask, open) = match action {
         Action::EnableInput => {
             let ask = for_enable_input(capture, emulation, || {
-                let trusted = mac.trusted();
-                log::info!("checked Accessibility (no prompt): trusted {trusted}");
-                !trusted
+                let permitted = mac.accessibility_permitted();
+                log::info!(
+                    "checked Accessibility by the probe tap (no prompt): permitted {permitted}"
+                );
+                !permitted
             });
             (ask, false)
         }
         Action::CaptureSettings => (for_capture(capture), true),
         Action::EmulationSettings => (for_emulation(emulation), true),
     };
-    let Some(ask) = ask else {
+    let Some(mut ask) = ask else {
         return;
     };
+    // Emulation that runs has Accessibility, whatever a stale report says.
+    ask.accessibility &= !emulation.is_enabled();
     if ask.accessibility {
         let trusted = mac.prompt_accessibility();
         log::info!("asked macOS for Accessibility (AX prompt): trusted {trusted}");
@@ -179,14 +192,58 @@ pub(crate) fn act(
     }
 }
 
-/// Ask macOS for what `action` needs, off the UI thread: whether the
-/// request calls wait for the user's answer is not documented. Does
-/// nothing off macOS.
+/// One ask at a time. A click while an ask is under way, or within
+/// [`Asking::hold`] of its start, asks nothing, so a burst of clicks makes
+/// one set of calls and at most one prompt each.
+pub(crate) struct Asking {
+    busy: AtomicBool,
+    hold: Duration,
+}
+
+/// How long after an ask begins further clicks ask nothing.
+const HOLD: Duration = Duration::from_secs(3);
+
+static ASKING: Asking = Asking::new(HOLD);
+
+impl Asking {
+    pub(crate) const fn new(hold: Duration) -> Self {
+        Self {
+            busy: AtomicBool::new(false),
+            hold,
+        }
+    }
+
+    /// Ask macOS through `mac` for what `action` needs, on a thread of its
+    /// own, off the UI thread: whether the request calls wait for the
+    /// user's answer is not documented. `None`, asking nothing, while
+    /// another ask holds.
+    pub(crate) fn ask<M: Macos + Send + 'static>(
+        &'static self,
+        action: Action,
+        capture: CaptureState,
+        emulation: EmulationState,
+        mut mac: M,
+    ) -> Option<JoinHandle<()>> {
+        if self.busy.swap(true, Ordering::AcqRel) {
+            log::info!("{action:?}: already asking macOS; this click asks nothing");
+            return None;
+        }
+        Some(std::thread::spawn(move || {
+            let started = Instant::now();
+            act(action, &capture, &emulation, &mut mac);
+            std::thread::sleep(self.hold.saturating_sub(started.elapsed()));
+            self.busy.store(false, Ordering::Release);
+        }))
+    }
+}
+
+/// Ask macOS for what `action` needs, one ask at a time. Does nothing off
+/// macOS.
 pub(crate) fn ask(action: Action, capture: CaptureState, emulation: EmulationState) {
     #[cfg(target_os = "macos")]
-    std::thread::spawn(move || act(action, &capture, &emulation, &mut System));
+    let _ = ASKING.ask(action, capture, emulation, System);
     #[cfg(not(target_os = "macos"))]
-    let _ = (action, capture, emulation);
+    let _ = (action, capture, emulation, &ASKING);
 }
 
 /// The calls themselves.
@@ -195,10 +252,8 @@ pub(crate) struct System;
 
 #[cfg(target_os = "macos")]
 impl Macos for System {
-    fn trusted(&mut self) -> bool {
-        // SAFETY: takes no arguments and only reads this process's grant.
-        // Apple declares the result `Boolean` (u8); normalized with != 0.
-        unsafe { AXIsProcessTrusted() != 0 }
+    fn accessibility_permitted(&mut self) -> bool {
+        input_event::accessibility::permitted_by(input_event::accessibility::create_active_tap)
     }
 
     fn prompt_accessibility(&mut self) -> bool {
@@ -244,7 +299,6 @@ impl Macos for System {
 #[cfg(target_os = "macos")]
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
-    fn AXIsProcessTrusted() -> u8;
     fn AXIsProcessTrustedWithOptions(options: *const std::ffi::c_void) -> u8;
 }
 

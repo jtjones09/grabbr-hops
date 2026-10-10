@@ -2626,7 +2626,7 @@ mod asking_macos_for_accessibility {
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Call {
-        Trusted,
+        Probe,
         PromptAccessibility,
         PostEvents,
         InputMonitoring,
@@ -2635,8 +2635,8 @@ mod asking_macos_for_accessibility {
     }
     use Call::*;
 
-    /// Records each call; answers `trusted` to both Accessibility calls and
-    /// false to the requests.
+    /// Records each call; answers `trusted` to the probe and the AX prompt,
+    /// and false to the requests.
     #[derive(Clone)]
     struct Fake {
         calls: Rc<RefCell<Vec<Call>>>,
@@ -2644,8 +2644,8 @@ mod asking_macos_for_accessibility {
     }
 
     impl Macos for Fake {
-        fn trusted(&mut self) -> bool {
-            self.calls.borrow_mut().push(Trusted);
+        fn accessibility_permitted(&mut self) -> bool {
+            self.calls.borrow_mut().push(Probe);
             self.trusted
         }
         fn prompt_accessibility(&mut self) -> bool {
@@ -2763,13 +2763,15 @@ mod asking_macos_for_accessibility {
         ui.invoke_enable_input();
         assert_eq!(
             take(&calls),
-            [Trusted, PromptAccessibility, PostEvents, Enable]
+            [Probe, PromptAccessibility, PostEvents, Enable]
         );
     }
 
     // LEDGER T2433 | class B | 6 struct state: Fake calls via AppWindow callbacks -> wire_permission_actions -> privacy::act
     /// With Accessibility granted nothing prompts; an AX prompt that
-    /// answers trusted is not followed by the posting request.
+    /// answers trusted is not followed by the posting request; and emulation
+    /// that runs proves Accessibility, so neither a stale refusal nor a
+    /// stale report from capture makes a prompting call.
     #[test]
     fn a_granted_accessibility_is_not_asked_for() {
         i_slint_backend_testing::init_no_event_loop();
@@ -2785,14 +2787,40 @@ mod asking_macos_for_accessibility {
             true,
         );
         ui.invoke_open_emulation_settings();
+        let prompt_trusted = take(&calls);
+
+        let (ui, calls) = window(
+            CaptureState::Failed(CaptureFault::Missing(vec![Permission::Accessibility])),
+            EmulationState::Enabled,
+            false,
+        );
+        ui.invoke_enable_input();
+        let enable_input = take(&calls);
+        ui.invoke_open_capture_settings();
+        let capture_settings = take(&calls);
+
+        let (ui, calls) = window(CaptureState::Disabled, EmulationState::Enabled, false);
+        ui.invoke_enable_input();
         assert_eq!(
-            [granted, take(&calls)],
             [
-                vec![Trusted, Enable],
-                vec![PromptAccessibility, OpenPane(Permission::Accessibility)],
+                granted,
+                prompt_trusted,
+                enable_input,
+                capture_settings,
+                take(&calls)
             ],
-            "(every action with nothing missing and the check trusted, open \
-             settings when the AX prompt answers trusted)"
+            [
+                vec![Probe, Enable],
+                vec![PromptAccessibility, OpenPane(Permission::Accessibility)],
+                vec![Enable],
+                vec![OpenPane(Permission::Accessibility)],
+                vec![Enable],
+            ],
+            "(every action with nothing missing and the probe permitted; open \
+             settings when the AX prompt answers trusted; enable input, then \
+             capture's open settings, with emulation running beside a stale \
+             refusal and a stale capture report; enable input with emulation \
+             running and a probe that would refuse)"
         );
     }
 
@@ -2811,5 +2839,132 @@ mod asking_macos_for_accessibility {
             false,
         );
         assert_eq!(take(&calls), []);
+    }
+
+    /// A fake that can be sent to the asking thread; its AX prompt waits
+    /// until `release` is set, so a second click lands while it is under way.
+    #[derive(Clone, Default)]
+    struct Slow {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<Call>>>,
+        release: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Slow {
+        fn calls(&self) -> Vec<Call> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl Macos for Slow {
+        fn accessibility_permitted(&mut self) -> bool {
+            self.calls.lock().unwrap().push(Probe);
+            false
+        }
+        fn prompt_accessibility(&mut self) -> bool {
+            while !self.release.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.calls.lock().unwrap().push(PromptAccessibility);
+            false
+        }
+        fn request_post_events(&mut self) -> bool {
+            self.calls.lock().unwrap().push(PostEvents);
+            false
+        }
+        fn request_input_monitoring(&mut self) -> bool {
+            self.calls.lock().unwrap().push(InputMonitoring);
+            false
+        }
+        fn open_pane(&mut self, pane: Permission) {
+            self.calls.lock().unwrap().push(OpenPane(pane));
+        }
+    }
+
+    /// The asking threads a window's clicks began; `None` for a click that
+    /// asked nothing.
+    type Threads = Rc<RefCell<Vec<Option<std::thread::JoinHandle<()>>>>>;
+
+    /// A window whose clicks ask through `asking` on its own thread, as the
+    /// app does, with emulation refused Accessibility; and the threads.
+    fn asking_window(asking: &'static privacy::Asking, fake: &Slow) -> (AppWindow, Threads) {
+        let ui = AppWindow::new().expect("window");
+        let threads: Threads = Rc::default();
+        let (fake, spawned) = (fake.clone(), threads.clone());
+        wire_permission_actions(
+            &ui,
+            || (CaptureState::Disabled, emulation_missing_accessibility()),
+            move |action: Action, c: CaptureState, e: EmulationState| {
+                let thread = asking.ask(action, c, e, fake.clone());
+                spawned.borrow_mut().push(thread);
+            },
+            || {},
+        );
+        (ui, threads)
+    }
+
+    // LEDGER T2436 | class B | 6 struct state: Slow calls via AppWindow callbacks -> wire_permission_actions -> privacy::Asking::ask -> privacy::act
+    /// Two quick clicks of enable input make one AX prompt and one posting
+    /// request: the second lands while the first is asking, and asks
+    /// nothing.
+    #[test]
+    fn two_quick_clicks_ask_once() {
+        i_slint_backend_testing::init_no_event_loop();
+        let asking: &'static privacy::Asking =
+            Box::leak(Box::new(privacy::Asking::new(Duration::ZERO)));
+        let fake = Slow::default();
+        let (ui, threads) = asking_window(asking, &fake);
+        ui.invoke_enable_input();
+        ui.invoke_enable_input();
+        fake.release
+            .store(true, std::sync::atomic::Ordering::Release);
+        let threads: Vec<_> = threads.take().into_iter().flatten().collect();
+        let spawned = threads.len();
+        for thread in threads {
+            thread.join().expect("asking thread");
+        }
+        assert_eq!(
+            (fake.calls(), spawned),
+            (vec![PromptAccessibility, PostEvents], 1),
+            "(calls made, asks begun) for two clicks while the first ask waits"
+        );
+    }
+
+    // LEDGER T2437 | class B | 6 struct state: Slow calls via AppWindow callbacks -> wire_permission_actions -> privacy::Asking::ask -> privacy::act
+    /// A click soon after an ask has made its calls still asks nothing:
+    /// the calls may return at once while the prompt shows, so finishing
+    /// them does not end the burst.
+    #[test]
+    fn a_click_just_after_an_ask_asks_nothing() {
+        i_slint_backend_testing::init_no_event_loop();
+        let asking: &'static privacy::Asking =
+            Box::leak(Box::new(privacy::Asking::new(Duration::from_secs(60))));
+        let fake = Slow::default();
+        fake.release
+            .store(true, std::sync::atomic::Ordering::Release);
+        let (ui, threads) = asking_window(asking, &fake);
+        ui.invoke_open_emulation_settings();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while fake.calls().len() < 3 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Past the calls, well inside the hold.
+        std::thread::sleep(Duration::from_millis(50));
+        ui.invoke_open_emulation_settings();
+        ui.invoke_enable_input();
+        std::thread::sleep(Duration::from_millis(50));
+        let begun = threads.borrow().iter().filter(|t| t.is_some()).count();
+        assert_eq!(
+            (fake.calls(), begun),
+            (
+                vec![
+                    PromptAccessibility,
+                    PostEvents,
+                    OpenPane(Permission::Accessibility)
+                ],
+                1
+            ),
+            "(calls made, asks begun) for two more clicks after the first ask's \
+             calls returned, within its hold"
+        );
     }
 }

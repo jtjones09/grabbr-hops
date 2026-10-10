@@ -459,10 +459,11 @@ fn check_macos_emulation_permissions() -> Result<(), MacOSEmulationCreationError
 ///
 /// Every check is silent. `trusted` is handed the prompt option, always
 /// false: under launchd macOS shows the daemon no prompt, so the app asks
-/// instead, when the user clicks enable input (#243). Its answer can also be stale in a running process, which is
-/// where emulation starts again after a failure (#240), so the probe,
-/// asked afresh, decides, as the daemon's permission watch reads it;
-/// `trusted` is logged beside it when they disagree.
+/// instead, when the user clicks enable input (#243). Its answer can also
+/// be stale in a running process, which is where emulation starts again
+/// after a failure (#240), so the probe, asked afresh, decides, as the
+/// daemon's permission watch reads it; `trusted` is logged beside it when
+/// they disagree.
 fn emulation_permissions(
     trusted: impl FnOnce(bool) -> bool,
     tap: impl FnOnce(u64) -> bool,
