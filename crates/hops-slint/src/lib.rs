@@ -743,6 +743,36 @@ fn show_opening_info(ui: &AppWindow, restarted: Option<&str>) {
     }
 }
 
+/// Wires enable input and each banner's open settings. `states` reads
+/// capture and emulation as the daemon last reported them; `ask` asks macOS
+/// for what an action needs ([`privacy::ask`] in the app); `enable` sends
+/// enable input's requests, after the asking has begun, so a prompt shows
+/// while the daemon tries (#169, #243). Nothing is asked here, at launch:
+/// only when the user acts.
+fn wire_permission_actions(
+    ui: &AppWindow,
+    states: impl Fn() -> (CaptureState, EmulationState) + Clone + 'static,
+    ask: impl Fn(privacy::Action, CaptureState, EmulationState) + Clone + 'static,
+    enable: impl Fn() + 'static,
+) {
+    let act = move |action| {
+        let (capture, emulation) = states();
+        ask(action, capture, emulation);
+    };
+    {
+        let act = act.clone();
+        ui.on_enable_input(move || {
+            act(privacy::Action::EnableInput);
+            enable();
+        });
+    }
+    {
+        let act = act.clone();
+        ui.on_open_capture_settings(move || act(privacy::Action::CaptureSettings));
+    }
+    ui.on_open_emulation_settings(move || act(privacy::Action::EmulationSettings));
+}
+
 pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
     let opening_info = launch.restarted.clone();
     // A second launch surfaces the resident window rather than duplicating the
@@ -873,38 +903,17 @@ pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
 
     // --- wire UI actions -> FrontendRequests (each closure owns a client clone) ---
     {
-        let c = client.clone();
-        ui.on_enable_input(move || {
-            // Turning capture on is when macOS is asked for what it lacks,
-            // so its prompt shows then (#169).
-            #[cfg(target_os = "macos")]
-            if let Some(ask) = privacy::for_capture(&c.snapshot().capture) {
-                privacy::act(ask, false);
+        let states = {
+            let c = client.clone();
+            move || {
+                let m = c.snapshot();
+                (m.capture, m.emulation)
             }
-            // Emulation's permission has no prompt of its own to raise: its
-            // setting is opened from the banner that names it.
+        };
+        let c = client.clone();
+        wire_permission_actions(&ui, states, privacy::ask, move || {
             c.request(FrontendRequest::EnableCapture);
             c.request(FrontendRequest::EnableEmulation);
-        });
-    }
-    {
-        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
-        let c = client.clone();
-        ui.on_open_capture_settings(move || {
-            #[cfg(target_os = "macos")]
-            if let Some(ask) = privacy::for_capture(&c.snapshot().capture) {
-                privacy::act(ask, true);
-            }
-        });
-    }
-    {
-        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
-        let c = client.clone();
-        ui.on_open_emulation_settings(move || {
-            #[cfg(target_os = "macos")]
-            if let Some(ask) = privacy::for_emulation(&c.snapshot().emulation) {
-                privacy::act(ask, true);
-            }
         });
     }
     {
@@ -2594,6 +2603,7 @@ mod every_pairing_has_a_row {
         assert_eq!(
             privacy::for_emulation(&failed),
             Some(privacy::Ask {
+                accessibility: true,
                 input_monitoring: false,
                 pane: Permission::Accessibility
             })
@@ -2603,5 +2613,203 @@ mod every_pairing_has_a_row {
             None,
             "nothing to open for a failure that is not a permission"
         );
+    }
+}
+
+#[cfg(test)]
+mod asking_macos_for_accessibility {
+    //! What the app asks macOS when the user clicks enable input or a
+    //! banner's open settings, through the window's own callbacks (#243).
+    use super::*;
+    use hops_frontend_core::{CaptureFault, EmulationFault, Permission};
+    use privacy::{Action, Macos};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Call {
+        Trusted,
+        PromptAccessibility,
+        PostEvents,
+        InputMonitoring,
+        OpenPane(Permission),
+        Enable,
+    }
+    use Call::*;
+
+    /// Records each call; answers `trusted` to both Accessibility calls and
+    /// false to the requests.
+    #[derive(Clone)]
+    struct Fake {
+        calls: Rc<RefCell<Vec<Call>>>,
+        trusted: bool,
+    }
+
+    impl Macos for Fake {
+        fn trusted(&mut self) -> bool {
+            self.calls.borrow_mut().push(Trusted);
+            self.trusted
+        }
+        fn prompt_accessibility(&mut self) -> bool {
+            self.calls.borrow_mut().push(PromptAccessibility);
+            self.trusted
+        }
+        fn request_post_events(&mut self) -> bool {
+            self.calls.borrow_mut().push(PostEvents);
+            false
+        }
+        fn request_input_monitoring(&mut self) -> bool {
+            self.calls.borrow_mut().push(InputMonitoring);
+            false
+        }
+        fn open_pane(&mut self, pane: Permission) {
+            self.calls.borrow_mut().push(OpenPane(pane));
+        }
+    }
+
+    /// A window wired as the app wires it (after
+    /// `i_slint_backend_testing::init_no_event_loop`, once per test), asking `Fake` inline, with
+    /// capture and emulation reported as given; and the calls it records.
+    fn window(
+        capture: CaptureState,
+        emulation: EmulationState,
+        trusted: bool,
+    ) -> (AppWindow, Rc<RefCell<Vec<Call>>>) {
+        let ui = AppWindow::new().expect("window");
+        let calls: Rc<RefCell<Vec<Call>>> = Rc::default();
+        let fake = Fake {
+            calls: calls.clone(),
+            trusted,
+        };
+        let enabled = calls.clone();
+        wire_permission_actions(
+            &ui,
+            move || (capture.clone(), emulation.clone()),
+            move |action: Action, c: CaptureState, e: EmulationState| {
+                privacy::act(action, &c, &e, &mut fake.clone())
+            },
+            move || enabled.borrow_mut().push(Enable),
+        );
+        ui.show().expect("show");
+        (ui, calls)
+    }
+
+    fn emulation_missing_accessibility() -> EmulationState {
+        EmulationState::Failed(EmulationFault::Missing(vec![Permission::Accessibility]))
+    }
+
+    fn take(calls: &Rc<RefCell<Vec<Call>>>) -> Vec<Call> {
+        std::mem::take(&mut *calls.borrow_mut())
+    }
+
+    // LEDGER T2431 | class B | 6 struct state: Fake calls via AppWindow callbacks -> wire_permission_actions -> privacy::act
+    /// With Accessibility reported missing, enable input and the banner's
+    /// open settings both ask with the AX prompt, then for posting events
+    /// when it answers untrusted; only open settings opens the list, and
+    /// only after asking.
+    #[test]
+    fn a_missing_accessibility_is_asked_for_before_the_list_opens() {
+        i_slint_backend_testing::init_no_event_loop();
+        let (ui, calls) = window(
+            CaptureState::Disabled,
+            emulation_missing_accessibility(),
+            false,
+        );
+        ui.invoke_enable_input();
+        let enable_input = take(&calls);
+        ui.invoke_open_emulation_settings();
+        let emulation_settings = take(&calls);
+        assert_eq!(
+            [enable_input, emulation_settings],
+            [
+                vec![PromptAccessibility, PostEvents, Enable],
+                vec![
+                    PromptAccessibility,
+                    PostEvents,
+                    OpenPane(Permission::Accessibility)
+                ],
+            ],
+            "(enable input, emulation's open settings) with emulation refused \
+             Accessibility"
+        );
+
+        let (ui, calls) = window(
+            CaptureState::Failed(CaptureFault::Missing(vec![
+                Permission::Accessibility,
+                Permission::InputMonitoring,
+            ])),
+            EmulationState::Disabled,
+            false,
+        );
+        ui.invoke_open_capture_settings();
+        assert_eq!(
+            take(&calls),
+            [
+                PromptAccessibility,
+                PostEvents,
+                InputMonitoring,
+                OpenPane(Permission::Accessibility)
+            ],
+            "capture's open settings with capture refused both permissions"
+        );
+    }
+
+    // LEDGER T2432 | class B | 6 struct state: Fake calls via AppWindow callbacks -> wire_permission_actions -> privacy::act
+    /// On a Mac that never granted hops, the daemon may report nothing
+    /// missing before the first click: the app's own check, which raises
+    /// no prompt, finds Accessibility missing and enable input asks.
+    #[test]
+    fn enable_input_asks_on_a_mac_the_daemon_has_not_reported_yet() {
+        i_slint_backend_testing::init_no_event_loop();
+        let (ui, calls) = window(CaptureState::Disabled, EmulationState::Disabled, false);
+        ui.invoke_enable_input();
+        assert_eq!(
+            take(&calls),
+            [Trusted, PromptAccessibility, PostEvents, Enable]
+        );
+    }
+
+    // LEDGER T2433 | class B | 6 struct state: Fake calls via AppWindow callbacks -> wire_permission_actions -> privacy::act
+    /// With Accessibility granted nothing prompts; an AX prompt that
+    /// answers trusted is not followed by the posting request.
+    #[test]
+    fn a_granted_accessibility_is_not_asked_for() {
+        i_slint_backend_testing::init_no_event_loop();
+        let (ui, calls) = window(CaptureState::Disabled, EmulationState::Disabled, true);
+        ui.invoke_enable_input();
+        ui.invoke_open_emulation_settings();
+        ui.invoke_open_capture_settings();
+        let granted = take(&calls);
+
+        let (ui, calls) = window(
+            CaptureState::Disabled,
+            emulation_missing_accessibility(),
+            true,
+        );
+        ui.invoke_open_emulation_settings();
+        assert_eq!(
+            [granted, take(&calls)],
+            [
+                vec![Trusted, Enable],
+                vec![PromptAccessibility, OpenPane(Permission::Accessibility)],
+            ],
+            "(every action with nothing missing and the check trusted, open \
+             settings when the AX prompt answers trusted)"
+        );
+    }
+
+    // LEDGER T2434 | class B | 6 struct state: Fake calls after wire_permission_actions and show
+    /// Wiring and showing the window asks macOS nothing, even with every
+    /// permission missing: only the user's click does (#169).
+    #[test]
+    fn launch_asks_nothing() {
+        i_slint_backend_testing::init_no_event_loop();
+        let (_ui, calls) = window(
+            CaptureState::Failed(CaptureFault::Missing(vec![
+                Permission::Accessibility,
+                Permission::InputMonitoring,
+            ])),
+            emulation_missing_accessibility(),
+            false,
+        );
+        assert_eq!(take(&calls), []);
     }
 }
