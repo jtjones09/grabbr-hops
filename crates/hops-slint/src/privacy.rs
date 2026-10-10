@@ -14,7 +14,13 @@
 //! Accessibility the app calls `AXIsProcessTrustedWithOptions` with the
 //! prompt option and, when that answers untrusted, `CGRequestPostEventAccess`;
 //! for Input Monitoring, `CGRequestListenEventAccess`. Each answer is logged,
-//! and a burst of clicks asks once ([`Asking`]).
+//! and a burst of clicks asks once ([`Asking`]). Each is asked at most once
+//! per run of the app: a later click opens the System Settings list
+//! instead, so answering a dialog never leads to a second one ([`Asked`]).
+//!
+//! Every click also tells the daemon, by its enable requests, that the user
+//! asked: only then may the daemon create the event taps that can make
+//! macOS show its dialog (#243).
 //! Which of them shows a prompt and adds hops to the list on macOS 27 is
 //! UNVERIFIED on hardware.
 //!
@@ -146,19 +152,71 @@ pub(crate) trait Macos {
     fn open_pane(&mut self, pane: Permission);
 }
 
+/// Which permissions this run of the app has asked macOS for already.
+#[derive(Debug, Default)]
+pub(crate) struct Asked {
+    accessibility: AtomicBool,
+    input_monitoring: AtomicBool,
+}
+
+impl Asked {
+    pub(crate) const fn new() -> Self {
+        Self {
+            accessibility: AtomicBool::new(false),
+            input_monitoring: AtomicBool::new(false),
+        }
+    }
+
+    fn of(&self, permission: Permission) -> &AtomicBool {
+        match permission {
+            Permission::Accessibility => &self.accessibility,
+            Permission::InputMonitoring => &self.input_monitoring,
+        }
+    }
+
+    /// Whether `permission` has been asked for.
+    fn already(&self, permission: Permission) -> bool {
+        self.of(permission).load(Ordering::Acquire)
+    }
+
+    /// True the first time only: `permission` may be asked for now.
+    fn first(&self, permission: Permission) -> bool {
+        !self.of(permission).swap(true, Ordering::AcqRel)
+    }
+}
+
 /// Ask macOS, through `mac`, for what `action` needs while capture is in
-/// `capture` and emulation in `emulation`. Accessibility is asked before
-/// Input Monitoring and both before the pane opens, so a prompt can show
-/// before System Settings takes the front.
+/// `capture` and emulation in `emulation`, as the first ask of a run.
+/// Accessibility is asked before Input Monitoring and both before the pane
+/// opens, so a prompt can show before System Settings takes the front.
+#[cfg(test)]
 pub(crate) fn act(
     action: Action,
     capture: &CaptureState,
     emulation: &EmulationState,
     mac: &mut impl Macos,
 ) {
+    act_once(action, capture, emulation, mac, &Asked::new());
+}
+
+/// [`act`], making each prompting call only if `asked` says this run has
+/// not made it yet. A click that would only repeat one opens the list
+/// instead, for enable input as for open settings.
+pub(crate) fn act_once(
+    action: Action,
+    capture: &CaptureState,
+    emulation: &EmulationState,
+    mac: &mut impl Macos,
+    asked: &Asked,
+) {
     let (ask, open) = match action {
         Action::EnableInput => {
             let ask = for_enable_input(capture, emulation, || {
+                if asked.already(Permission::Accessibility) {
+                    // The probe tap is a tap creation too; once asked, the
+                    // daemon's report decides.
+                    return false;
+                }
                 let permitted = mac.accessibility_permitted();
                 log::info!(
                     "checked Accessibility by the probe tap (no prompt): permitted {permitted}"
@@ -175,19 +233,35 @@ pub(crate) fn act(
     };
     // Emulation that runs has Accessibility, whatever a stale report says.
     ask.accessibility &= !emulation.is_enabled();
+    let mut asked_now = false;
     if ask.accessibility {
-        let trusted = mac.prompt_accessibility();
-        log::info!("asked macOS for Accessibility (AX prompt): trusted {trusted}");
-        if !trusted {
-            let granted = mac.request_post_events();
-            log::info!("asked macOS for posting events: granted {granted}");
+        if asked.first(Permission::Accessibility) {
+            let trusted = mac.prompt_accessibility();
+            log::info!("asked macOS for Accessibility (AX prompt): trusted {trusted}");
+            if !trusted {
+                let granted = mac.request_post_events();
+                log::info!("asked macOS for posting events: granted {granted}");
+            }
+            asked_now = true;
+        } else {
+            log::info!(
+                "{action:?}: Accessibility was asked for once in this run; opening the list"
+            );
         }
     }
     if ask.input_monitoring {
-        let granted = mac.request_input_monitoring();
-        log::info!("asked macOS for Input Monitoring: granted {granted}");
+        if asked.first(Permission::InputMonitoring) {
+            let granted = mac.request_input_monitoring();
+            log::info!("asked macOS for Input Monitoring: granted {granted}");
+            asked_now = true;
+        } else {
+            log::info!(
+                "{action:?}: Input Monitoring was asked for once in this run; opening the list"
+            );
+        }
     }
-    if open {
+    let wanted = ask.accessibility || ask.input_monitoring;
+    if open || (wanted && !asked_now) {
         mac.open_pane(ask.pane);
     }
 }
@@ -198,6 +272,7 @@ pub(crate) fn act(
 pub(crate) struct Asking {
     busy: AtomicBool,
     hold: Duration,
+    asked: Asked,
 }
 
 /// How long after an ask begins further clicks ask nothing.
@@ -210,6 +285,7 @@ impl Asking {
         Self {
             busy: AtomicBool::new(false),
             hold,
+            asked: Asked::new(),
         }
     }
 
@@ -230,7 +306,7 @@ impl Asking {
         }
         Some(std::thread::spawn(move || {
             let started = Instant::now();
-            act(action, &capture, &emulation, &mut mac);
+            act_once(action, &capture, &emulation, &mut mac, &self.asked);
             std::thread::sleep(self.hold.saturating_sub(started.elapsed()));
             self.busy.store(false, Ordering::Release);
         }))

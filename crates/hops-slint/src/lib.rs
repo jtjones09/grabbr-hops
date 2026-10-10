@@ -746,9 +746,10 @@ fn show_opening_info(ui: &AppWindow, restarted: Option<&str>) {
 /// Wires enable input and each banner's open settings. `states` reads
 /// capture and emulation as the daemon last reported them; `ask` asks macOS
 /// for what an action needs ([`privacy::ask`] in the app); `enable` sends
-/// enable input's requests, after the asking has begun, so a prompt shows
-/// while the daemon tries (#169, #243). Nothing is asked here, at launch:
-/// only when the user acts.
+/// the enable requests, after the asking has begun, for every one of these
+/// clicks: they are what tells the daemon the user asked, and so may create
+/// event taps (#169, #243). Nothing is asked or sent here, at launch: only
+/// when the user acts.
 fn wire_permission_actions(
     ui: &AppWindow,
     states: impl Fn() -> (CaptureState, EmulationState) + Clone + 'static,
@@ -759,18 +760,19 @@ fn wire_permission_actions(
         let (capture, emulation) = states();
         ask(action, capture, emulation);
     };
-    {
-        let act = act.clone();
-        ui.on_enable_input(move || {
-            act(privacy::Action::EnableInput);
+    // Every click tells the daemon the user asked, which is what lets it
+    // create event taps (#243); nothing else sends it.
+    let enable = Rc::new(enable);
+    let click = move |action| {
+        let (act, enable) = (act.clone(), enable.clone());
+        move || {
+            act(action);
             enable();
-        });
-    }
-    {
-        let act = act.clone();
-        ui.on_open_capture_settings(move || act(privacy::Action::CaptureSettings));
-    }
-    ui.on_open_emulation_settings(move || act(privacy::Action::EmulationSettings));
+        }
+    };
+    ui.on_enable_input(click(privacy::Action::EnableInput));
+    ui.on_open_capture_settings(click(privacy::Action::CaptureSettings));
+    ui.on_open_emulation_settings(click(privacy::Action::EmulationSettings));
 }
 
 pub fn run(hidden: bool, launch: Launch) -> Result<(), SlintError> {
@@ -2704,7 +2706,7 @@ mod asking_macos_for_accessibility {
     /// With Accessibility reported missing, enable input and the banner's
     /// open settings both ask with the AX prompt, then for posting events
     /// when it answers untrusted; only open settings opens the list, and
-    /// only after asking.
+    /// only after asking. Each click then tells the daemon (#243).
     #[test]
     fn a_missing_accessibility_is_asked_for_before_the_list_opens() {
         i_slint_backend_testing::init_no_event_loop();
@@ -2724,7 +2726,8 @@ mod asking_macos_for_accessibility {
                 vec![
                     PromptAccessibility,
                     PostEvents,
-                    OpenPane(Permission::Accessibility)
+                    OpenPane(Permission::Accessibility),
+                    Enable
                 ],
             ],
             "(enable input, emulation's open settings) with emulation refused \
@@ -2746,7 +2749,8 @@ mod asking_macos_for_accessibility {
                 PromptAccessibility,
                 PostEvents,
                 InputMonitoring,
-                OpenPane(Permission::Accessibility)
+                OpenPane(Permission::Accessibility),
+                Enable
             ],
             "capture's open settings with capture refused both permissions"
         );
@@ -2810,10 +2814,14 @@ mod asking_macos_for_accessibility {
                 take(&calls)
             ],
             [
-                vec![Probe, Enable],
-                vec![PromptAccessibility, OpenPane(Permission::Accessibility)],
+                vec![Probe, Enable, Enable, Enable],
+                vec![
+                    PromptAccessibility,
+                    OpenPane(Permission::Accessibility),
+                    Enable
+                ],
                 vec![Enable],
-                vec![OpenPane(Permission::Accessibility)],
+                vec![OpenPane(Permission::Accessibility), Enable],
                 vec![Enable],
             ],
             "(every action with nothing missing and the probe permitted; open \
@@ -2965,6 +2973,46 @@ mod asking_macos_for_accessibility {
             ),
             "(calls made, asks begun) for two more clicks after the first ask's \
              calls returned, within its hold"
+        );
+    }
+
+    // LEDGER T2455 | class B | 6 struct state: Slow calls via AppWindow callbacks -> wire_permission_actions -> privacy::Asking::ask -> privacy::act_once
+    /// The app asks macOS once per run (#243). A click after the first ask
+    /// is over, its hold included, makes no prompting call: it opens the
+    /// list, for enable input as for open settings. Measured on macOS 27.2:
+    /// a second ask after the user answered the first raised a second
+    /// dialog.
+    #[test]
+    fn a_later_click_only_opens_the_list() {
+        i_slint_backend_testing::init_no_event_loop();
+        let asking: &'static privacy::Asking =
+            Box::leak(Box::new(privacy::Asking::new(Duration::ZERO)));
+        let fake = Slow::default();
+        fake.release
+            .store(true, std::sync::atomic::Ordering::Release);
+        let (ui, threads) = asking_window(asking, &fake);
+        let mut per_click = Vec::new();
+        for click in [
+            AppWindow::invoke_enable_input as fn(&AppWindow),
+            AppWindow::invoke_enable_input,
+            AppWindow::invoke_open_emulation_settings,
+        ] {
+            let seen = fake.calls().len();
+            click(&ui);
+            for thread in threads.take().into_iter().flatten() {
+                thread.join().expect("asking thread");
+            }
+            per_click.push(fake.calls()[seen..].to_vec());
+        }
+        assert_eq!(
+            per_click,
+            [
+                vec![PromptAccessibility, PostEvents],
+                vec![OpenPane(Permission::Accessibility)],
+                vec![OpenPane(Permission::Accessibility)],
+            ],
+            "(first enable input, a second one after the first ask ended, then \
+             emulation's open settings), with emulation refused Accessibility"
         );
     }
 }

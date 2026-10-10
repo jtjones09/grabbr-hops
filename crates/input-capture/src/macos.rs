@@ -1423,9 +1423,15 @@ pub struct MacOSInputCapture {
 
 impl MacOSInputCapture {
     pub async fn new() -> Result<Self, MacosCaptureCreationError> {
-        // Asked once as capture starts: every permission, the probe tap
-        // included, which asks for no events.
-        let probe: Probe = Arc::new(granted);
+        Self::checked_by(Arc::new(granted)).await
+    }
+
+    /// Capture, once `probe` says every permission it needs is granted.
+    /// Nothing else is created before that answer: no tap of any kind while
+    /// a permission is missing (#243).
+    async fn checked_by(probe: Probe) -> Result<Self, MacosCaptureCreationError> {
+        // Asked once as capture starts: every permission, through the gate,
+        // which creates the probe tap only once it is open.
         let grants = Arc::new(Grants::default());
         let missing = missing_permissions(&probe);
         grants.record(&ALL_PERMISSIONS, &missing);
@@ -1458,7 +1464,10 @@ impl MacOSInputCapture {
             configure_cf_settings()?;
         }
 
-        log::info!("Enabling CGEvent tap (listen-only until the pointer crosses)");
+        log::info!(
+            "Enabling CGEvent tap (listen-only until the pointer crosses; Accessibility gate: {})",
+            accessibility::GATE.reason().unwrap_or("closed")
+        );
         let args = TapThread {
             shared: shared.clone(),
             link: Link {
@@ -1554,44 +1563,57 @@ impl MacOSInputCapture {
 /// Asks whether macOS grants a permission.
 type Probe = Arc<dyn Fn(Permission) -> bool + Send + Sync>;
 
-/// Whether macOS grants this process `permission`. Silent: none of the checks
-/// raises a prompt; the app asks instead (#169). Both are required: a tap
+/// Whether macOS grants this process `permission`. Both are required: a tap
 /// that starts without Input Monitoring may be sent no keys.
 ///
-/// Accessibility is answered by the probe tap
-/// ([`input_event::accessibility`]), not by `AXIsProcessTrusted`, which can
-/// keep its first answer for the life of the process on macOS 27, for a
-/// revocation and for a grant (#240). The latter is logged beside it when
-/// the probe's answer changes, so a disagreement shows in the log.
+/// Accessibility is asked through [`accessibility::GATE`]: by
+/// `AXIsProcessTrusted`, which never prompts, until the gate opens, and by
+/// the probe tap after, since `AXIsProcessTrusted` can keep its first
+/// answer for the life of the process on macOS 27 (#240). Its answer is
+/// logged beside the probe's when that changes, so a disagreement shows.
+/// Nothing here prompts; the app asks when the user clicks (#169, #243).
 fn granted(permission: Permission) -> bool {
     static LAST: LastAnswer = LastAnswer::new();
     let started = Instant::now();
-    let granted = answer(permission, accessibility::create_active_tap, || {
+    let granted = answer(
+        permission,
+        &accessibility::GATE,
         // SAFETY: takes no arguments and only reads this process's grant.
-        unsafe { CGPreflightListenEventAccess() }
-    });
+        || unsafe { AXIsProcessTrusted() } != 0,
+        accessibility::create_active_tap,
+        // SAFETY: takes no arguments and only reads this process's grant.
+        || unsafe { CGPreflightListenEventAccess() },
+    );
     if permission == Permission::Accessibility && LAST.changed(granted) {
         // SAFETY: takes no arguments and only reads this process's grant.
         let ax = unsafe { AXIsProcessTrusted() } != 0;
         log::debug!(
-            "Accessibility probe: active tap {} in {:?}; AXIsProcessTrusted says {ax}",
-            if granted { "permitted" } else { "refused" },
-            started.elapsed()
+            "Accessibility check: {} in {:?} ({}); AXIsProcessTrusted says {ax}",
+            if granted { "granted" } else { "missing" },
+            started.elapsed(),
+            if accessibility::GATE.is_open() {
+                "by the probe tap"
+            } else {
+                "no tap: the gate is closed"
+            }
         );
     }
     granted
 }
 
-/// Whether `permission` is granted: Accessibility by whether `tap` is
-/// allowed the probe tap, which asks for no events; Input Monitoring by
+/// Whether `permission` is granted: Accessibility through `gate`, by
+/// `trusted` while it is closed and by whether `tap` is allowed the probe
+/// tap, which asks for no events, once it is open; Input Monitoring by
 /// `listen`, its preflight check.
 fn answer(
     permission: Permission,
+    gate: &accessibility::Gate,
+    trusted: impl FnOnce() -> bool,
     tap: impl FnOnce(u64) -> bool,
     listen: impl FnOnce() -> bool,
 ) -> bool {
     match permission {
-        Permission::Accessibility => accessibility::permitted_by(tap),
+        Permission::Accessibility => gate.accessibility("capture", trusted, tap),
         Permission::InputMonitoring => listen(),
     }
 }
@@ -1881,6 +1903,7 @@ mod a_permission_lost_while_capture_runs {
     };
     use core_foundation::runloop::CFRunLoop;
     use futures::StreamExt;
+    use input_event::accessibility::Gate;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1888,6 +1911,13 @@ mod a_permission_lost_while_capture_runs {
 
     /// What must happen is waited for this long at most.
     const DEADLINE: Duration = Duration::from_secs(30);
+
+    /// A gate the user has opened.
+    fn consented() -> &'static Gate {
+        let gate: &'static Gate = Box::leak(Box::new(Gate::new()));
+        gate.consent();
+        gate
+    }
 
     fn run_local<F: std::future::Future>(f: F) -> F::Output {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -2074,11 +2104,14 @@ mod a_permission_lost_while_capture_runs {
     #[test]
     fn every_probe_capture_makes_asks_for_no_events() {
         let masks = Arc::new(Mutex::new(Vec::new()));
+        let open = consented();
         let recording: Probe = {
             let masks = masks.clone();
             Arc::new(move |p| {
                 super::answer(
                     p,
+                    open,
+                    || false,
                     |mask| {
                         masks.lock().expect("masks").push(mask);
                         true
@@ -2156,6 +2189,65 @@ mod a_permission_lost_while_capture_runs {
                  until the daemon got round to dropping the capture (#240)"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod a_capture_started_without_the_grant {
+    //! Capture started on a Mac whose silent checks say Accessibility and
+    //! Input Monitoring are missing, before the user has asked (#243). The
+    //! tap is a stand-in that counts; the gate is the one capture asks.
+
+    use super::{MacOSInputCapture, MacosCaptureCreationError, Permission, Probe, answer};
+    use input_event::accessibility::Gate;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // LEDGER T2451 | class B | 1 return value of MacOSInputCapture::checked_by + 6 stand-in taps created through answer()
+    /// No tap of any kind, probe or capture, and both permissions reported
+    /// missing, so the app shows its banner. Once the user has asked, the
+    /// same start probes.
+    #[test]
+    fn a_capture_started_without_the_grant_creates_no_tap() {
+        let taps = Arc::new(AtomicUsize::new(0));
+        let start = |gate: &'static Gate| {
+            let taps = taps.clone();
+            let probe: Probe = Arc::new(move |p| {
+                answer(
+                    p,
+                    gate,
+                    || false,
+                    |_| {
+                        taps.fetch_add(1, Ordering::SeqCst);
+                        false
+                    },
+                    || false,
+                )
+            });
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime");
+            let started = tokio::task::LocalSet::new()
+                .block_on(&rt, MacOSInputCapture::checked_by(probe))
+                .err();
+            match started {
+                Some(MacosCaptureCreationError::MissingPermissions(missing)) => Some(missing),
+                _ => None,
+            }
+        };
+        let gate: &'static Gate = Box::leak(Box::new(Gate::new()));
+        let at_launch = (start(gate), taps.load(Ordering::SeqCst));
+        gate.consent();
+        let asked = (start(gate), taps.load(Ordering::SeqCst));
+        let missing = Some(vec![Permission::Accessibility, Permission::InputMonitoring]);
+        assert_eq!(
+            (at_launch, asked),
+            ((missing.clone(), 0), (missing, 1)),
+            "((reported missing, taps created) as the daemon starts, after the user \
+             asked). A tap created at launch without Accessibility raised macOS's \
+             dialog before any click"
+        );
     }
 }
 

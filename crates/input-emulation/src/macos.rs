@@ -444,6 +444,7 @@ impl Drop for MacOSEmulation {
 
 fn check_macos_emulation_permissions() -> Result<(), MacOSEmulationCreationError> {
     let result = emulation_permissions(
+        &input_event::accessibility::GATE,
         accessibility_trusted,
         input_event::accessibility::create_active_tap,
         request_input_control_permission,
@@ -454,23 +455,26 @@ fn check_macos_emulation_permissions() -> Result<(), MacOSEmulationCreationError
     result
 }
 
-/// Whether emulation may start: Accessibility by the probe tap `tap`
-/// creates, posting events by `post` or by Accessibility, which grants it.
+/// Whether emulation may start: Accessibility through `gate`, posting
+/// events by `post` or by Accessibility, which grants it.
 ///
 /// Every check is silent. `trusted` is handed the prompt option, always
 /// false: under launchd macOS shows the daemon no prompt, so the app asks
-/// instead, when the user clicks enable input (#243). Its answer can also
-/// be stale in a running process, which is where emulation starts again
-/// after a failure (#240), so the probe, asked afresh, decides, as the
-/// daemon's permission watch reads it; `trusted` is logged beside it when
-/// they disagree.
+/// instead, when the user clicks enable input (#243). While `gate` is
+/// closed its answer decides and no tap is created, since creating one
+/// without Accessibility can raise macOS's dialog before the user has
+/// asked (#243). Once open, the probe tap `tap` creates decides: `trusted`
+/// can be stale in a running process, which is where emulation starts
+/// again after a failure (#240); it is logged beside the probe when they
+/// disagree.
 fn emulation_permissions(
+    gate: &input_event::accessibility::Gate,
     trusted: impl FnOnce(bool) -> bool,
     tap: impl FnOnce(u64) -> bool,
     post: impl FnOnce() -> bool,
 ) -> Result<(), MacOSEmulationCreationError> {
     let trusted = trusted(false);
-    let accessibility = input_event::accessibility::permitted_by(tap);
+    let accessibility = gate.accessibility("emulation", || trusted, tap);
     if trusted != accessibility {
         log::debug!(
             "Accessibility: probe tap {}, AXIsProcessTrusted says {trusted}",
@@ -2902,7 +2906,15 @@ mod decision_guards {
 #[cfg(test)]
 mod the_check_emulation_starts_with {
     use super::{MacOSEmulationCreationError, emulation_permissions};
+    use input_event::accessibility::Gate;
     use std::cell::RefCell;
+
+    /// A gate the user has opened, so the probe tap may be created.
+    fn consented() -> Gate {
+        let gate = Gate::new();
+        gate.consent();
+        gate
+    }
 
     // LEDGER T2443 | class B | 1 return value of emulation_permissions, with the masks asked recorded
     /// The probe tap decides, whatever AXIsProcessTrusted says, and asks
@@ -2910,8 +2922,10 @@ mod the_check_emulation_starts_with {
     #[test]
     fn the_probe_tap_decides_and_asks_for_no_events() {
         let masks = RefCell::new(Vec::new());
+        let open = consented();
         let start = |trusted: bool, permitted: bool| {
             emulation_permissions(
+                &open,
                 |_| trusted,
                 |mask| {
                     masks.borrow_mut().push(mask);
@@ -2930,6 +2944,40 @@ mod the_check_emulation_starts_with {
         );
     }
 
+    // LEDGER T2452 | class B | 1 return value of emulation_permissions + 6 stand-in taps created
+    /// Emulation started on a Mac whose silent check says Accessibility is
+    /// missing creates no tap until the user asks, and reports
+    /// Accessibility missing (#243); after the ask the probe decides. A
+    /// fresh process the silent check says has it probes at once.
+    #[test]
+    fn emulation_started_without_the_grant_creates_no_tap() {
+        let taps = RefCell::new(0);
+        let start = |gate: &Gate, trusted: bool| {
+            emulation_permissions(
+                gate,
+                |_| trusted,
+                |_| {
+                    *taps.borrow_mut() += 1;
+                    true
+                },
+                || false,
+            )
+            .map_err(|e| matches!(e, MacOSEmulationCreationError::AccessibilityPermission))
+        };
+        let gate = Gate::new();
+        let at_launch: Vec<_> = (0..5).map(|_| start(&gate, false)).collect();
+        let before = *taps.borrow();
+        gate.consent();
+        let asked = start(&gate, false);
+        let granted = start(&Gate::new(), true);
+        assert_eq!(
+            (at_launch, before, asked, granted, *taps.borrow()),
+            (vec![Err(true); 5], 0, Ok(()), Ok(()), 2),
+            "(starts before the user asked, taps created by them, start after the \
+             ask, start in a process the silent check says is granted, taps in all)"
+        );
+    }
+
     // LEDGER T2435 | class B | 1 return value of emulation_permissions, with the prompt options passed recorded
     /// The daemon's check never asks macOS to prompt, granted or not: under
     /// launchd no prompt shows, and the app asks instead (#243). The probe
@@ -2937,8 +2985,10 @@ mod the_check_emulation_starts_with {
     #[test]
     fn the_check_never_asks_to_prompt() {
         let options = RefCell::new(Vec::new());
+        let open = consented();
         let start = |permitted: bool| {
             emulation_permissions(
+                &open,
                 |prompt| {
                     options.borrow_mut().push(prompt);
                     false
