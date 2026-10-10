@@ -22,13 +22,18 @@
 //! only ever controlled would otherwise read as working with the grant gone.
 //! Capture is not watched here while it runs: its backend asks the same
 //! question on its own and takes its event taps down before it says so.
+//!
+//! Accessibility is asked through the process's tap gate
+//! ([`input_event::accessibility::Gate`]). Until the user clicks enable
+//! input or open settings, a daemon that `AXIsProcessTrusted` says lacks it
+//! creates no tap and so never sees a grant made while it runs (#243, #169).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use input_event::accessibility::REFUSALS_BEFORE_REVOKED;
+use input_event::accessibility::{Gate, REFUSALS_BEFORE_REVOKED};
 use tokio::task::JoinHandle;
 use tokio::time::{Interval, MissedTickBehavior};
 
@@ -216,19 +221,21 @@ impl PermissionWatch {
         watch
     }
 
-    /// This machine's: the macOS checks and launchd, as a daemon starts.
-    /// Elsewhere there are no such permissions, and nothing is ever watched.
-    pub fn of_this_machine() -> Self {
+    /// This machine's: the macOS checks through `gate` and launchd, as a
+    /// daemon starts. Elsewhere there are no such permissions, and nothing
+    /// is ever watched.
+    pub fn of_this_machine(gate: &'static Gate) -> Self {
         #[cfg(target_os = "macos")]
         {
             Self::at_daemon_start(
-                Arc::new(tcc::granted),
+                Arc::new(move |p| tcc::granted(gate, p)),
                 Arc::new(crate::daemon_start::launchd_restarts_this_process),
                 CHECK_EVERY,
             )
         }
         #[cfg(not(target_os = "macos"))]
         {
+            let _ = gate;
             Self {
                 enabled: false,
                 ..Self::new(Arc::new(|_| true), Arc::new(|| false), CHECK_EVERY)
@@ -440,17 +447,25 @@ impl PermissionWatch {
 /// answer for the life of a running process on macOS 27, so a grant made in
 /// System Settings went unseen until a manual restart (#240). Whether
 /// macOS lets the process create an active event tap is asked afresh each
-/// time, and it does only with Accessibility. So it answers Accessibility,
-/// and posting events, which Accessibility grants, is granted when either
-/// says so. Input Monitoring has no such probe: a listen-only tap is let
-/// through by Accessibility too.
+/// time, and it does only with Accessibility. So it answers Accessibility
+/// once `gate` is open, and posting events, which Accessibility grants, is
+/// granted when either says so. While `gate` is closed no tap is created
+/// and the preflight check answers Accessibility (#243). Input Monitoring
+/// has no such probe: a listen-only tap is let through by Accessibility too.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn answer(
     permission: Permission,
+    gate: &Gate,
     preflight: impl Fn(Permission) -> bool,
     tap: impl Fn(u64) -> bool,
 ) -> bool {
-    let probe = || input_event::accessibility::permitted_by(&tap);
+    let probe = || {
+        gate.accessibility(
+            "permission watch",
+            || preflight(Permission::Accessibility),
+            &tap,
+        )
+    };
     match permission {
         Permission::Accessibility => probe(),
         Permission::PostEvents => preflight(Permission::PostEvents) || probe(),
@@ -462,7 +477,7 @@ fn answer(
 #[cfg(target_os = "macos")]
 mod tcc {
     use super::Permission;
-    use input_event::accessibility::{self, LastAnswer};
+    use input_event::accessibility::{self, Gate, LastAnswer};
 
     #[link(name = "ApplicationServices", kind = "framework")]
     extern "C" {
@@ -491,7 +506,7 @@ mod tcc {
 
     /// Logged when its answer changes, not on every check: emulation
     /// that runs is checked every few seconds for as long as it runs.
-    pub(super) fn granted(permission: Permission) -> bool {
+    pub(super) fn granted(gate: &Gate, permission: Permission) -> bool {
         static ACCESSIBILITY: LastAnswer = LastAnswer::new();
         static INPUT_MONITORING: LastAnswer = LastAnswer::new();
         static POST_EVENTS: LastAnswer = LastAnswer::new();
@@ -500,7 +515,12 @@ mod tcc {
             Permission::InputMonitoring => &INPUT_MONITORING,
             Permission::PostEvents => &POST_EVENTS,
         };
-        let granted = super::answer(permission, preflight, accessibility::create_active_tap);
+        let granted = super::answer(
+            permission,
+            gate,
+            preflight,
+            accessibility::create_active_tap,
+        );
         if last.changed(granted) {
             log::debug!(
                 "permission watch: {permission:?} {}; preflight says {}",
@@ -519,9 +539,17 @@ mod a_grant_made_while_the_daemon_runs {
     //! holds many checks.
 
     use super::{AfterGrant, Change, Permission, PermissionWatch, Side, answer};
+    use input_event::accessibility::Gate;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    /// A gate the user has opened, so the probe tap may be created.
+    fn consented() -> &'static Gate {
+        let gate: &'static Gate = Box::leak(Box::new(Gate::new()));
+        gate.consent();
+        gate
+    }
 
     /// A system where `denied` are missing until `grant` is set.
     struct System {
@@ -654,7 +682,7 @@ mod a_grant_made_while_the_daemon_runs {
     // LEDGER T2255 | class B | 6 state of PermissionWatch::of_this_machine()
     #[test]
     fn this_machines_watch_waits_on_both_sides_from_the_start_only_on_a_mac() {
-        let mut watch = PermissionWatch::of_this_machine();
+        let mut watch = PermissionWatch::of_this_machine(Box::leak(Box::new(Gate::new())));
         let at_start: Vec<Side> = watch.waiting.keys().copied().collect();
         watch.stopped(Side::Capture);
         let after_a_stop: Vec<Side> = watch.waiting.keys().copied().collect();
@@ -794,12 +822,13 @@ mod a_grant_made_while_the_daemon_runs {
     fn a_grant_the_preflight_checks_never_see_is_seen_by_the_tap_probe() {
         let tap = Arc::new(AtomicBool::new(false));
         let asked = Arc::new(AtomicUsize::new(0));
+        let open = consented();
         let probe = {
             let (tap, asked) = (tap.clone(), asked.clone());
             Arc::new(move |p| {
                 asked.fetch_add(1, Ordering::SeqCst);
                 // Stale: every preflight check still says no.
-                answer(p, |_| false, |_| tap.load(Ordering::SeqCst))
+                answer(p, open, |_| false, |_| tap.load(Ordering::SeqCst))
             })
         };
         let mut watch = PermissionWatch::new(probe, Arc::new(|| true), EVERY);
@@ -823,6 +852,65 @@ mod a_grant_made_while_the_daemon_runs {
             "Accessibility was granted while the daemon ran and the preflight checks \
              never said so. The tap probe must answer, so launchd restarts the daemon \
              with the grant (Err(Elapsed): never noticed)"
+        );
+    }
+
+    // LEDGER T2453 | class B | 1 return value of PermissionWatch::changed over answer() + 6 stand-in taps created
+    /// The daemon a fresh launch starts: the silent checks say Accessibility
+    /// is missing and stay stale after it is granted, as they do in a
+    /// running process (#240). Before the user asks, no tap is created over
+    /// many checks, so the grant goes unseen; once the user asks, the probe
+    /// runs and the grant is found (#243).
+    #[test]
+    fn the_watch_creates_no_tap_until_the_user_asks() {
+        let gate: &'static Gate = Box::leak(Box::new(Gate::new()));
+        let taps = Arc::new(AtomicUsize::new(0));
+        let silent = Arc::new(AtomicUsize::new(0));
+        let probe = {
+            let (taps, silent) = (taps.clone(), silent.clone());
+            Arc::new(move |p| {
+                answer(
+                    p,
+                    gate,
+                    |_| {
+                        silent.fetch_add(1, Ordering::SeqCst);
+                        false
+                    },
+                    // Granted in System Settings: the probe is permitted.
+                    |_| {
+                        taps.fetch_add(1, Ordering::SeqCst);
+                        true
+                    },
+                )
+            })
+        };
+        let mut watch = PermissionWatch::at_daemon_start(probe, Arc::new(|| true), EVERY);
+        let (unasked, asked) = runtime().block_on(async {
+            let unasked = tokio::time::timeout(NOTHING_FOR, watch.changed()).await;
+            let before = (unasked.is_err(), taps.load(Ordering::SeqCst));
+            gate.consent();
+            (
+                before,
+                tokio::time::timeout(DEADLINE, watch.changed()).await,
+            )
+        });
+        assert!(
+            silent.load(Ordering::SeqCst) > 10,
+            "the watch made {} silent checks: too few to show anything",
+            silent.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            (unasked, asked),
+            (
+                (true, 0),
+                Ok(Change::Granted(AfterGrant::Exit(vec![
+                    Permission::Accessibility,
+                    Permission::PostEvents
+                ])))
+            ),
+            "((nothing found, taps created) before the user asked; what the watch \
+             found after). A tap before the ask can raise macOS's dialog at launch; \
+             no probe after it leaves the grant unseen (Err(Elapsed))"
         );
     }
 
@@ -873,11 +961,13 @@ mod a_grant_made_while_the_daemon_runs {
     #[test]
     fn every_probe_the_watch_makes_asks_for_no_events() {
         let masks = Arc::new(Mutex::new(Vec::new()));
+        let open = consented();
         let probe = {
             let masks = masks.clone();
             Arc::new(move |p| {
                 answer(
                     p,
+                    open,
                     |_| false,
                     |mask| {
                         masks.lock().expect("masks").push(mask);

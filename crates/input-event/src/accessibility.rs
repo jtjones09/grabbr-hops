@@ -18,6 +18,13 @@
 //! including while the pointer is on this Mac and nothing is missing.
 //!
 //! Here because capture, emulation and the daemon all ask it.
+//!
+//! No event tap is created until the [`Gate`] opens (#243). Measured on
+//! macOS 27.2 after the permission was reset: a daemon that created the
+//! probe tap at launch raised macOS's "would like to control this Mac"
+//! dialog before the user had clicked anything, which #169 rules out.
+
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 /// The events the probe tap asks for: none (`CGEventMask` 0).
 pub const PROBE_MASK: u64 = 0;
@@ -35,6 +42,128 @@ pub const REFUSALS_BEFORE_REVOKED: u32 = 2;
 /// one place the probe's mask is chosen, whoever creates the tap.
 pub fn permitted_by(tap: impl FnOnce(u64) -> bool) -> bool {
     tap(PROBE_MASK)
+}
+
+/// Whether this process may create an event tap (#243, #169).
+///
+/// Closed as a process starts. While it is closed, Accessibility is
+/// answered by `AXIsProcessTrusted` alone, which never prompts and is
+/// accurate in a process that has just started; it can keep that first
+/// answer for the life of the process (#240), which is why, once the gate
+/// is open, the probe tap answers instead. The gate opens, for the rest of
+/// the process's life, when that silent check says Accessibility is granted
+/// or when the user asks for it by clicking enable input or open settings.
+/// A revocation is then seen by the probe; a process that held the grant
+/// raised no dialog when it was reset while it probed (measured 2026-10-09).
+#[derive(Debug)]
+pub struct Gate {
+    state: AtomicU8,
+    /// A probe has been permitted: later probes are routine.
+    permitted: AtomicBool,
+    /// The first refusal by the silent check has been logged.
+    told: AtomicBool,
+}
+
+const CLOSED: u8 = 0;
+const GRANTED: u8 = 1;
+const CONSENTED: u8 = 2;
+
+/// The gate of this process. Capture, emulation and the daemon's
+/// permission watch all ask through it, and the daemon opens it when the
+/// app says the user asked.
+pub static GATE: Gate = Gate::new();
+
+impl Default for Gate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Gate {
+    pub const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(CLOSED),
+            permitted: AtomicBool::new(false),
+            told: AtomicBool::new(false),
+        }
+    }
+
+    /// The user asked for the permission: event taps may be created from
+    /// now on. True when this opened the gate.
+    pub fn consent(&self) -> bool {
+        let opened = self
+            .state
+            .compare_exchange(CLOSED, CONSENTED, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
+        if opened {
+            log::info!(
+                "Accessibility gate: the user asked; event taps may be created from now on \
+                 (consented)"
+            );
+        }
+        opened
+    }
+
+    /// Whether an event tap may be created.
+    pub fn is_open(&self) -> bool {
+        self.state.load(Ordering::SeqCst) != CLOSED
+    }
+
+    /// Why a tap may be created, as logged beside each one: `None` while
+    /// closed.
+    pub fn reason(&self) -> Option<&'static str> {
+        match self.state.load(Ordering::SeqCst) {
+            CLOSED => None,
+            _ if self.permitted.load(Ordering::SeqCst) => Some("routine"),
+            GRANTED => Some("startup-granted"),
+            _ => Some("consented"),
+        }
+    }
+
+    /// Whether this process has Accessibility, for `who`. While the gate is
+    /// closed `trusted` answers, and must not prompt (`AXIsProcessTrusted`
+    /// without options); a yes opens the gate. Once it is open, the probe
+    /// tap `tap` creates answers ([`permitted_by`]).
+    pub fn accessibility(
+        &self,
+        who: &str,
+        trusted: impl FnOnce() -> bool,
+        tap: impl FnOnce(u64) -> bool,
+    ) -> bool {
+        if !self.is_open() {
+            if !trusted() {
+                if !self.told.swap(true, Ordering::SeqCst) {
+                    log::info!(
+                        "Accessibility gate: {who}: AXIsProcessTrusted says not granted; no \
+                         event tap is created until the user clicks enable input or open \
+                         settings"
+                    );
+                }
+                return false;
+            }
+            if self
+                .state
+                .compare_exchange(CLOSED, GRANTED, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                log::info!(
+                    "Accessibility gate: {who}: AXIsProcessTrusted says granted; event taps \
+                     may be created from now on (startup-granted)"
+                );
+            }
+        }
+        let reason = self.reason().unwrap_or("closed");
+        if reason == "routine" {
+            log::trace!("Accessibility gate: {who}: creating the probe tap ({reason})");
+        } else {
+            log::debug!("Accessibility gate: {who}: creating the probe tap ({reason})");
+        }
+        let permitted = permitted_by(tap);
+        if permitted && !self.permitted.swap(true, Ordering::SeqCst) {
+            log::debug!("Accessibility gate: {who}: the probe tap was permitted");
+        }
+        permitted
+    }
 }
 
 /// Creates an active tap for the events in `mask` at the tail of the
@@ -118,8 +247,67 @@ impl LastAnswer {
 
 #[cfg(test)]
 mod tests {
-    use super::{LastAnswer, permitted_by};
+    use super::{Gate, LastAnswer, permitted_by};
     use std::cell::RefCell;
+
+    // LEDGER T2450 | class B | 1 return value of Gate::accessibility + 6 taps it created, silent checks asked, Gate::reason
+    /// A process the silent check says lacks Accessibility creates no tap
+    /// until the user asks; then the probe decides. One the silent check
+    /// says has it may probe at once (#243).
+    #[test]
+    fn no_tap_is_created_before_the_silent_check_or_the_user_allows_it() {
+        let (taps, silent) = (RefCell::new(0), RefCell::new(0));
+        let ask = |gate: &Gate, trusted: bool, permitted: bool| {
+            gate.accessibility(
+                "test",
+                || {
+                    *silent.borrow_mut() += 1;
+                    trusted
+                },
+                |_| {
+                    *taps.borrow_mut() += 1;
+                    permitted
+                },
+            )
+        };
+        let missing = Gate::new();
+        let before: Vec<bool> = (0..20).map(|_| ask(&missing, false, true)).collect();
+        let untouched = (*taps.borrow(), *silent.borrow(), missing.reason());
+        missing.consent();
+        let after = [
+            missing.reason(),
+            Some(if ask(&missing, false, true) { "y" } else { "n" }),
+            Some(if ask(&missing, false, false) {
+                "y"
+            } else {
+                "n"
+            }),
+            missing.reason(),
+        ];
+        let granted = Gate::new();
+        let fresh = [ask(&granted, true, true), ask(&granted, false, true)];
+        assert_eq!(
+            (
+                before.iter().any(|&b| b),
+                untouched,
+                after,
+                fresh,
+                granted.reason(),
+                *taps.borrow()
+            ),
+            (
+                false,
+                (0, 20, None),
+                [Some("consented"), Some("y"), Some("n"), Some("routine")],
+                [true, true],
+                Some("routine"),
+                4
+            ),
+            "(any yes before consent, (taps, silent checks, reason) before consent, \
+             reason then answers after consent, a granted process's answers, its \
+             reason, taps in all)"
+        );
+    }
 
     // LEDGER T2430 | class B | 1 return value: permitted_by, with the masks asked recorded
     /// The probe asks for no events, so WindowServer never routes one

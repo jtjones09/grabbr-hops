@@ -279,6 +279,21 @@ impl Daemon {
         self.service.keep_awake = crate::keep_awake::KeepAwake::with(power);
     }
 
+    /// The gate its enable requests open (#243), to read while its loop
+    /// runs.
+    pub(crate) fn tap_gate(&self) -> &'static input_event::accessibility::Gate {
+        self.service.tap_gate
+    }
+
+    /// Watch for macOS permissions with `watch` rather than this machine's
+    /// checks.
+    pub(crate) fn watch_permissions_with(
+        &mut self,
+        watch: crate::permission_watch::PermissionWatch,
+    ) {
+        self.service.permission_watch = watch;
+    }
+
     /// This machine's fingerprint.
     pub(crate) fn fingerprint(&self) -> String {
         self.service.public_key_fingerprint.clone()

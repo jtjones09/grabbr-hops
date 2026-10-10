@@ -246,6 +246,10 @@ pub struct Service {
     /// Watches for a macOS permission granted while capture or emulation
     /// cannot start (#221).
     permission_watch: PermissionWatch,
+    /// Whether this process may create an event tap, which only the user's
+    /// enable request opens (#243). The watch and the backends ask through
+    /// it; a test's daemon has one of its own.
+    tap_gate: &'static input_event::accessibility::Gate,
     /// keep track of registered connections to avoid duplicate barriers
     incoming_conns: HashSet<SocketAddr>,
     /// addrs whose cursor is currently ON this device (crossing-level state) —
@@ -1019,6 +1023,14 @@ impl Service {
 
         let port = config.port();
         let clipboard_in = ClipboardInbox::new(clipboard_in, trust.clone(), client_manager.clone());
+        // The process's own gate, which the macOS backends ask through too.
+        // A test's daemon gets one of its own, so that one test's enable
+        // request opens nothing for another.
+        #[cfg(not(test))]
+        let tap_gate = &input_event::accessibility::GATE;
+        #[cfg(test)]
+        let tap_gate: &'static input_event::accessibility::Gate =
+            Box::leak(Box::new(input_event::accessibility::Gate::new()));
         let service = Self {
             config,
             capture,
@@ -1053,7 +1065,8 @@ impl Service {
             pending_frontend_events: Default::default(),
             capture_status: Default::default(),
             emulation_status: Default::default(),
-            permission_watch: PermissionWatch::of_this_machine(),
+            permission_watch: PermissionWatch::of_this_machine(tap_gate),
+            tap_gate,
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             currently_controlling: Default::default(),
@@ -1385,8 +1398,16 @@ impl Service {
                 }
                 self.save_config();
             }
-            FrontendRequest::EnableCapture => self.capture.reenable(),
-            FrontendRequest::EnableEmulation => self.emulation.reenable(),
+            // Sent only when the user clicks enable input or open settings,
+            // or runs the matching command: never by a frontend on its own.
+            FrontendRequest::EnableCapture => {
+                self.tap_gate.consent();
+                self.capture.reenable();
+            }
+            FrontendRequest::EnableEmulation => {
+                self.tap_gate.consent();
+                self.emulation.reenable();
+            }
             FrontendRequest::Enumerate() => self.enumerate(),
             FrontendRequest::UpdateFixIps(handle, fix_ips) => {
                 self.update_fix_ips(handle, fix_ips);
@@ -4665,6 +4686,9 @@ mod a_permission_granted_while_it_runs;
 
 #[cfg(all(test, unix))]
 mod a_mac_missing_a_permission;
+
+#[cfg(all(test, unix))]
+mod only_the_user_opens_the_tap_gate;
 
 #[cfg(all(test, unix))]
 mod a_refused_crossing;
