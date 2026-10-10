@@ -18,6 +18,12 @@ thiserror = "2.0"
 log = "0.4"
 hostname = "0.4"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# The options dictionary for the Accessibility prompt (privacy.rs, #243).
+core-foundation = "0.10.0"
+# The probe tap that answers Accessibility afresh (#240).
+input-event = { path = "../input-event", version = "0.4.0", default-features = false }
+
 [build-dependencies]
 slint-build = "1.17"
 

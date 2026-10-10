@@ -123,7 +123,7 @@ unsafe impl Send for MacOSEmulation {}
 
 impl MacOSEmulation {
     pub(crate) fn new() -> Result<Self, MacOSEmulationCreationError> {
-        request_macos_emulation_permissions()?;
+        check_macos_emulation_permissions()?;
 
         let event_source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .map_err(|_| MacOSEmulationCreationError::EventSourceCreation)?;
@@ -442,14 +442,14 @@ impl Drop for MacOSEmulation {
     }
 }
 
-fn request_macos_emulation_permissions() -> Result<(), MacOSEmulationCreationError> {
+fn check_macos_emulation_permissions() -> Result<(), MacOSEmulationCreationError> {
     let result = emulation_permissions(
-        request_accessibility_permission,
+        accessibility_trusted,
         input_event::accessibility::create_active_tap,
         request_input_control_permission,
     );
     if result.is_err() {
-        guide_to_settings();
+        report_missing();
     }
     result
 }
@@ -457,18 +457,19 @@ fn request_macos_emulation_permissions() -> Result<(), MacOSEmulationCreationErr
 /// Whether emulation may start: Accessibility by the probe tap `tap`
 /// creates, posting events by `post` or by Accessibility, which grants it.
 ///
-/// `prompt` is asked first, and both up front, so the user sees both TCC
-/// prompts on the first launch. See the matching comment in
-/// crates/input-capture/src/macos.rs::request_macos_capture_permissions for
-/// the rationale. Its own answer can be stale in a running process, which
-/// is where emulation starts again after a failure (#240), so the probe,
-/// asked afresh, decides, as the daemon's permission watch reads it.
+/// Every check is silent. `trusted` is handed the prompt option, always
+/// false: under launchd macOS shows the daemon no prompt, so the app asks
+/// instead, when the user clicks enable input (#243). Its answer can also
+/// be stale in a running process, which is where emulation starts again
+/// after a failure (#240), so the probe, asked afresh, decides, as the
+/// daemon's permission watch reads it; `trusted` is logged beside it when
+/// they disagree.
 fn emulation_permissions(
-    prompt: impl FnOnce() -> bool,
+    trusted: impl FnOnce(bool) -> bool,
     tap: impl FnOnce(u64) -> bool,
     post: impl FnOnce() -> bool,
 ) -> Result<(), MacOSEmulationCreationError> {
-    let trusted = prompt();
+    let trusted = trusted(false);
     let accessibility = input_event::accessibility::permitted_by(tap);
     if trusted != accessibility {
         log::debug!(
@@ -490,39 +491,29 @@ fn emulation_permissions(
     Ok(())
 }
 
-/// On a missing grant, print an actionable message naming the exact binary and
-/// open the right System Settings pane — once per process. A backgrounded CLI's
-/// TCC dialog is unreliable, so we steer the user straight to the toggle instead
-/// of relying on a prompt that may never surface.
-fn guide_to_settings() {
+/// On a missing grant, name the list and the exact binary, once per
+/// process. Nothing is opened from here: the daemon runs in the background,
+/// so the app asks macOS and opens System Settings when the user acts
+/// (#243).
+fn report_missing() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         let exe = std::env::current_exe()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "the hops binary".into());
-        log::error!("──────────────────────────────────────────────────────────");
-        log::error!("hops can't inject input: a macOS permission is missing.");
-        log::error!("Enable BOTH for this exact binary, then re-run the launcher:");
         let pane = input_event::settings_pane::accessibility();
-        log::error!("  • {pane}");
-        log::error!("  • Input Monitoring");
-        log::error!("  binary: {exe}");
-        log::error!("Opening System Settings → Privacy & Security → {pane}…");
-        log::error!("──────────────────────────────────────────────────────────");
-        if let Ok(mut child) = std::process::Command::new("open")
-            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
-            .spawn()
-        {
-            let _ = child.wait(); // reap; `open` hands off to launchd and exits promptly
-        }
+        log::warn!(
+            "hops can't inject input: macOS does not grant it {pane}. Click enable input \
+             in the hops app, or turn hops on under System Settings → Privacy & Security \
+             → {pane}; binary: {exe}"
+        );
     });
 }
 
-fn request_accessibility_permission() -> bool {
-    // Fire the one-time system Accessibility prompt if not yet granted, then
-    // return the current trust state. Ported from the GUI's macos_privacy so a
-    // headless / TUI daemon is self-granting — there's no GUI to own the prompt.
+/// `AXIsProcessTrustedWithOptions` with `kAXTrustedCheckOptionPrompt` set
+/// to `prompt`: whether this process has Accessibility.
+fn accessibility_trusted(prompt: bool) -> bool {
     use core_foundation::base::TCFType;
     use core_foundation::boolean::CFBoolean;
     use core_foundation::dictionary::CFDictionary;
@@ -530,7 +521,7 @@ fn request_accessibility_permission() -> bool {
     // kAXTrustedCheckOptionPrompt == CFSTR("AXTrustedCheckOptionPrompt")
     let key = CFString::from_static_string("AXTrustedCheckOptionPrompt");
     let options =
-        CFDictionary::from_CFType_pairs(&[(key.as_CFType(), CFBoolean::true_value().as_CFType())]);
+        CFDictionary::from_CFType_pairs(&[(key.as_CFType(), CFBoolean::from(prompt).as_CFType())]);
     // SAFETY: `options` outlives the synchronous call. Normalize the `Boolean`
     // (u8) result with != 0 — materializing a non-canonical byte as Rust `bool` is UB.
     unsafe { AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef() as *const c_void) != 0 }
@@ -2914,14 +2905,14 @@ mod the_check_emulation_starts_with {
     use std::cell::RefCell;
 
     // LEDGER T2443 | class B | 1 return value of emulation_permissions, with the masks asked recorded
-    /// The probe tap decides, whatever the prompting check says, and asks
+    /// The probe tap decides, whatever AXIsProcessTrusted says, and asks
     /// for no events (#240).
     #[test]
     fn the_probe_tap_decides_and_asks_for_no_events() {
         let masks = RefCell::new(Vec::new());
         let start = |trusted: bool, permitted: bool| {
             emulation_permissions(
-                || trusted,
+                |_| trusted,
                 |mask| {
                     masks.borrow_mut().push(mask);
                     permitted
@@ -2934,8 +2925,35 @@ mod the_check_emulation_starts_with {
         assert_eq!(
             (got, masks.into_inner()),
             ([Ok(()), Err(true), Ok(())], vec![0, 0, 0]),
-            "(may emulation start: probe and prompt agree, probe refused with a stale \
-             prompt, probe permitted with a stale prompt; masks asked)"
+            "(may emulation start: probe and AX check agree, probe refused with a stale \
+             AX check, probe permitted with a stale AX check; masks asked)"
+        );
+    }
+
+    // LEDGER T2435 | class B | 1 return value of emulation_permissions, with the prompt options passed recorded
+    /// The daemon's check never asks macOS to prompt, granted or not: under
+    /// launchd no prompt shows, and the app asks instead (#243). The probe
+    /// still decides.
+    #[test]
+    fn the_check_never_asks_to_prompt() {
+        let options = RefCell::new(Vec::new());
+        let start = |permitted: bool| {
+            emulation_permissions(
+                |prompt| {
+                    options.borrow_mut().push(prompt);
+                    false
+                },
+                |_| permitted,
+                || false,
+            )
+            .is_ok()
+        };
+        let got = [start(true), start(false)];
+        assert_eq!(
+            (got, options.into_inner()),
+            ([true, false], vec![false, false]),
+            "(may emulation start with the probe permitted, refused; the prompt \
+             option each check passed)"
         );
     }
 }
