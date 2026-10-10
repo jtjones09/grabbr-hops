@@ -2758,16 +2758,50 @@ mod asking_macos_for_accessibility {
 
     // LEDGER T2432 | class B | 6 struct state: Fake calls via AppWindow callbacks -> wire_permission_actions -> privacy::act
     /// On a Mac that never granted hops, the daemon may report nothing
-    /// missing before the first click: the app's own check, which raises
-    /// no prompt, finds Accessibility missing and enable input asks.
+    /// missing before the first click: the app's own probe tap finds
+    /// Accessibility missing. Creating that tap may itself show macOS's
+    /// dialog, so it is the click's ask: no AX prompt follows it (#243).
     #[test]
     fn enable_input_asks_on_a_mac_the_daemon_has_not_reported_yet() {
         i_slint_backend_testing::init_no_event_loop();
         let (ui, calls) = window(CaptureState::Disabled, EmulationState::Disabled, false);
         ui.invoke_enable_input();
+        assert_eq!(take(&calls), [Probe, Enable]);
+    }
+
+    // LEDGER T2456 | class B | 6 struct state: Fake calls through privacy::act_once with one run's Asked
+    /// A refused probe tap counts as the run's ask for Accessibility: the
+    /// click that made it calls no AX prompt and opens nothing, and the
+    /// next click, with the daemon now reporting it missing, only opens
+    /// the list.
+    #[test]
+    fn a_refused_probe_is_the_runs_ask() {
+        let calls: Rc<RefCell<Vec<Call>>> = Rc::default();
+        let mut fake = Fake {
+            calls: calls.clone(),
+            trusted: false,
+        };
+        let asked = privacy::Asked::new();
+        privacy::act_once(
+            Action::EnableInput,
+            &CaptureState::Disabled,
+            &EmulationState::Disabled,
+            &mut fake,
+            &asked,
+        );
+        let first = take(&calls);
+        privacy::act_once(
+            Action::EnableInput,
+            &CaptureState::Disabled,
+            &emulation_missing_accessibility(),
+            &mut fake,
+            &asked,
+        );
         assert_eq!(
-            take(&calls),
-            [Probe, PromptAccessibility, PostEvents, Enable]
+            [first, take(&calls)],
+            [vec![Probe], vec![OpenPane(Permission::Accessibility)]],
+            "(first enable input with nothing reported and the probe refused, a \
+             second with Accessibility reported missing)"
         );
     }
 

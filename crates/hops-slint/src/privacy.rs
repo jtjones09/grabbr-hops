@@ -126,7 +126,9 @@ pub(crate) fn pane_url(pane: Permission) -> &'static str {
 /// What the user did that may need macOS asked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Action {
-    /// Clicked enable input: asks, opens nothing.
+    /// Clicked enable input: the first ask of a run opens nothing, so a
+    /// prompt is not hidden behind System Settings; a later click opens the
+    /// list of what is still missing.
     EnableInput,
     /// Clicked open settings on capture's banner.
     CaptureSettings,
@@ -209,6 +211,9 @@ pub(crate) fn act_once(
     mac: &mut impl Macos,
     asked: &Asked,
 ) {
+    // Whether this click's probe tap was refused: creating it may itself
+    // have made macOS show its dialog, so it is this run's ask.
+    let mut probe_refused = false;
     let (ask, open) = match action {
         Action::EnableInput => {
             let ask = for_enable_input(capture, emulation, || {
@@ -218,9 +223,11 @@ pub(crate) fn act_once(
                     return false;
                 }
                 let permitted = mac.accessibility_permitted();
-                log::info!(
-                    "checked Accessibility by the probe tap (no prompt): permitted {permitted}"
-                );
+                log::info!("checked Accessibility by the probe tap: permitted {permitted}");
+                if !permitted {
+                    asked.first(Permission::Accessibility);
+                    probe_refused = true;
+                }
                 !permitted
             });
             (ask, false)
@@ -233,8 +240,8 @@ pub(crate) fn act_once(
     };
     // Emulation that runs has Accessibility, whatever a stale report says.
     ask.accessibility &= !emulation.is_enabled();
-    let mut asked_now = false;
-    if ask.accessibility {
+    let mut asked_now = probe_refused;
+    if ask.accessibility && !probe_refused {
         if asked.first(Permission::Accessibility) {
             let trusted = mac.prompt_accessibility();
             log::info!("asked macOS for Accessibility (AX prompt): trusted {trusted}");
