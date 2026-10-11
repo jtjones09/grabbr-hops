@@ -3790,16 +3790,21 @@ mod a_discard_notice_ends_with_its_backend {
                     ],
                     false,
                 ),
+                // The daemon goes away and nothing has come back yet: the
+                // backend the notice spoke of is gone with it.
+                after(vec![FrontendEvent::Error(running_dummy())], true),
             ),
             (
                 None,
                 None,
                 Some(running_dummy()),
                 Some("could not resolve studio-pc".into()),
+                None,
             ),
             "(refused then failed, granted and restarted then on, dummy running, an \
-             unrelated error): a discard notice from before emulation's latest state \
-             must go, the one after it and any other error stay"
+             unrelated error, dummy running and then the daemon gone): a discard \
+             notice from before emulation's latest state, or from a daemon that is \
+             gone, must go; the one after it and any other error stay"
         );
     }
 }
