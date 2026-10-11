@@ -496,12 +496,16 @@ fn a_keyless_endpoint_at_the_controllers_address_does_not_say_it_removed_this_ma
     run_local(async {
         let pc = crate::test_harness::machine();
         let (_keyless, port, answered) = crate::test_harness::keyless_listener();
+        // An emulation that injects, not `dummy`: a daemon running `dummy`
+        // tells every frontend that attaches that it discards input (#238),
+        // which is a notice, and this test hears none.
+        let injects = input_emulation::recording::Recording::new();
         let mac = Daemon::start_paired(
             "keyless-mac",
             &dials_out_to(&pc.fingerprint, port),
             &paired_with(&pc.fingerprint),
             input_capture::Backend::Dummy,
-            input_emulation::Backend::Dummy,
+            injects.backend(),
         )
         .await;
         let mac_ipc = mac.ipc();

@@ -179,6 +179,52 @@ fn render_appwindow_to_png(path: &str) -> Result<(), Box<dyn std::error::Error>>
     if let Ok(notice) = std::env::var("PREVIEW_NOTICE") {
         ui.set_notice(notice.into());
     }
+    // PREVIEW_GRANT=before|after drives the window through the app's own
+    // poll: a Mac whose emulation fell to a refused `dummy`, as a daemon
+    // before #238 told it, and then (after) the grant, the daemon's restart
+    // and both sides on. The discard notice must be gone after. `dummy`
+    // shows a dummy backend that runs, whose notice must stay.
+    if let Ok(when) = std::env::var("PREVIEW_GRANT") {
+        use hops_frontend_core::{
+            AppModel, CaptureState, EmulationFault, EmulationState, FrontendEvent, Permission,
+        };
+        let mut m = AppModel::default();
+        m.connected = true;
+        m.apply(FrontendEvent::PublicKeyFingerprint(
+            "73:90:2a:3c:9d:e5:18:52:7c:aa:c3:de:de:04:cd:ec".into(),
+        ));
+        m.apply(FrontendEvent::PortChanged(4722, None));
+        m.apply(FrontendEvent::Error(
+            "This machine cannot inject input (using the \"dummy\" backend), so \
+             nothing a peer sends will do anything. On macOS this is usually a missing \
+             Device Control and Data Access permission for hops."
+                .into(),
+        ));
+        m.apply(FrontendEvent::EmulationStatus(EmulationState::Failed(
+            EmulationFault::Missing(vec![Permission::Accessibility]),
+        )));
+        let mut ticks = vec![m.clone()];
+        if when == "after" {
+            m.daemon_gone();
+            m.connected = true;
+            m.apply(FrontendEvent::PortChanged(4722, None));
+            m.apply(FrontendEvent::EmulationStatus(EmulationState::Enabled));
+            m.apply(FrontendEvent::CaptureStatus(CaptureState::Enabled));
+            ticks.push(m);
+        } else if when == "dummy" {
+            m.apply(FrontendEvent::EmulationStatus(EmulationState::Enabled));
+            m.apply(FrontendEvent::CaptureStatus(CaptureState::Enabled));
+            m.apply(FrontendEvent::Error(format!(
+                "{}: it runs the \"dummy\" backend, which discards everything a peer \
+                 sends. hops runs it only when the configuration or HOPS_ALLOW_DUMMY \
+                 asks for it.",
+                hops_ipc::CANNOT_INJECT
+            )));
+            ticks.push(m);
+        }
+        ui.set_notice("".into());
+        hops_slint::poll_for_preview(&ui, &ticks);
+    }
     // PREVIEW_INFO="..." shows the neutral info bar, e.g. the restart note.
     if let Ok(info) = std::env::var("PREVIEW_INFO") {
         ui.set_info(info.into());

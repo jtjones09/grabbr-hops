@@ -122,8 +122,10 @@ pub(crate) struct Emulation {
 }
 
 pub(crate) enum EmulationEvent {
-    /// Input emulation fell back to a backend that DISCARDS events. Raised so
-    /// this reaches the user instead of being a log line they never see.
+    /// Input emulation RUNS a backend that DISCARDS events: `dummy`, asked
+    /// for or overridden. Raised so this reaches the user instead of being a
+    /// log line they never see. Never raised for a `dummy` that was refused
+    /// (#238): that is `EmulationFailed`.
     BackendDegraded(String),
     Connected {
         addr: SocketAddr,
@@ -1014,11 +1016,6 @@ impl EmulationTask {
         // unavailable, and the honest response is to refuse rather than pretend.
         // The Linux release shipped exactly this for months (#47) — built with
         // no backend features at all, so selection had nowhere to go.
-        if emulation.backend() == input_emulation::Backend::Dummy {
-            let _ = self.event_tx.send(EmulationEvent::BackendDegraded(
-                emulation.backend().to_string(),
-            ));
-        }
         let overridden = std::env::var("HOPS_ALLOW_DUMMY").is_ok_and(|v| v != "0");
         if let Some(refusal) = refuse_the_fall(&emulation, self.backend, overridden) {
             log::error!(
@@ -1036,6 +1033,16 @@ impl EmulationTask {
             },
             EmulationEvent::EmulationDisabled,
         );
+        // Only a dummy backend that RUNS discards input, so only one that runs
+        // is reported as discarding; a refused one is reported by the failure
+        // above, which names what to grant (#238). After the enabled event, so
+        // a frontend that clears this notice when emulation changes state
+        // clears an earlier one, not this.
+        if emulation.backend() == input_emulation::Backend::Dummy {
+            let _ = self.event_tx.send(EmulationEvent::BackendDegraded(
+                emulation.backend().to_string(),
+            ));
+        }
 
         // create active handles
         if let Err(e) = self.create_clients(&mut emulation).await {

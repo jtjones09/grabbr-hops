@@ -203,6 +203,10 @@ pub const NOT_SAVED: &str = "The change was made but not saved";
 pub const TRUST_NOT_SAVED: &str = "Could not save a change to trusted devices";
 /// How every refusal of a trust grant begins.
 pub const GRANT_REFUSED: &str = "Nothing was trusted";
+/// How the notice begins while emulation runs a backend that discards every
+/// event. It holds only while that backend runs, so a frontend drops it once
+/// emulation reports a state, which the service sends before it (#238).
+pub const CANNOT_INJECT: &str = "This machine cannot inject input";
 
 #[derive(Debug, Default, Eq, Hash, PartialEq, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

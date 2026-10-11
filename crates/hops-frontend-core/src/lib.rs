@@ -253,7 +253,10 @@ impl AppModel {
                 self.unreached.remove(&h);
             }
             FrontendEvent::CaptureStatus(s) => self.capture = s,
-            FrontendEvent::EmulationStatus(s) => self.emulation = s,
+            FrontendEvent::EmulationStatus(s) => {
+                self.emulation = s;
+                self.withdraw_discarding_notice();
+            }
             FrontendEvent::Listening(listening) => self.dials_out_only = !listening,
             FrontendEvent::PublicKeyFingerprint(fp) => self.fingerprint = Some(fp),
             FrontendEvent::TrustUpdated(map) => {
@@ -691,6 +694,21 @@ impl AppModel {
         self.error_seq += 1;
     }
 
+    /// Drop the notice that emulation discards input, which holds only while
+    /// the backend that does runs. The service tells emulation's state before
+    /// that notice, so a new state ends an earlier one: one from a backend
+    /// that was refused, from before a permission was granted, or from a
+    /// daemon that has since restarted (#238).
+    fn withdraw_discarding_notice(&mut self) {
+        if self
+            .latest_error
+            .as_deref()
+            .is_some_and(|e| e.starts_with(hops_ipc::CANNOT_INJECT))
+        {
+            self.latest_error = None;
+        }
+    }
+
     /// The daemon connection is gone: drop every fact only a running daemon
     /// can vouch for, so nothing renders live while nothing is (#34). What
     /// the user configured stays, to be shown as it was last known.
@@ -715,6 +733,7 @@ impl AppModel {
         self.discovery_quiet = false;
         self.capture = CaptureState::Disabled;
         self.emulation = EmulationState::Disabled;
+        self.withdraw_discarding_notice();
         self.dials_out_only = false;
         for (_, state) in self.clients.values_mut() {
             state.active_addr = None;
@@ -3696,5 +3715,96 @@ mod the_state_follows_the_events {
         assert_eq!(state(&m), Connection::NotConnected);
         set(&mut m, linked(true, true));
         assert_eq!(state(&m), Connection::Connected);
+    }
+}
+
+#[cfg(test)]
+mod a_discard_notice_ends_with_its_backend {
+    //! The notice that emulation discards input holds only while the backend
+    //! that does runs. A notice from a backend that was refused, or from
+    //! before a grant or a daemon restart, must not stay up beside an
+    //! emulation that runs (#238).
+    use super::*;
+
+    /// What a daemon before #238 said as it refused `dummy` for a missing
+    /// permission, and then, beside a running emulation, kept saying.
+    const REFUSED_DUMMY: &str = "This machine cannot inject input (using the \"dummy\" \
+        backend), so nothing a peer sends will do anything. On macOS this is usually a \
+        missing Accessibility permission for hops.";
+
+    fn running_dummy() -> String {
+        format!(
+            "{}: it runs the \"dummy\" backend.",
+            hops_ipc::CANNOT_INJECT
+        )
+    }
+
+    // LEDGER T238-3 | class B | 6 struct state: AppModel::apply and daemon_gone, latest_error
+    #[test]
+    fn a_new_emulation_state_ends_an_earlier_discard_notice_only() {
+        let after = |events: Vec<FrontendEvent>, restart: bool| {
+            let mut m = AppModel::default();
+            let mut events = events.into_iter();
+            if let Some(first) = events.next() {
+                m.apply(first);
+            }
+            if restart {
+                m.daemon_gone();
+            }
+            for e in events {
+                m.apply(e);
+            }
+            m.latest_error().map(str::to_owned)
+        };
+        let missing = EmulationState::Failed(EmulationFault::Missing(vec![
+            hops_ipc::Permission::Accessibility,
+        ]));
+        assert_eq!(
+            (
+                after(
+                    vec![
+                        FrontendEvent::Error(REFUSED_DUMMY.into()),
+                        FrontendEvent::EmulationStatus(missing),
+                    ],
+                    false,
+                ),
+                after(
+                    vec![
+                        FrontendEvent::Error(REFUSED_DUMMY.into()),
+                        FrontendEvent::EmulationStatus(EmulationState::Enabled),
+                        FrontendEvent::CaptureStatus(CaptureState::Enabled),
+                    ],
+                    true,
+                ),
+                after(
+                    vec![
+                        FrontendEvent::EmulationStatus(EmulationState::Enabled),
+                        FrontendEvent::Error(running_dummy()),
+                    ],
+                    false,
+                ),
+                after(
+                    vec![
+                        FrontendEvent::Error("could not resolve studio-pc".into()),
+                        FrontendEvent::EmulationStatus(EmulationState::Enabled),
+                    ],
+                    false,
+                ),
+                // The daemon goes away and nothing has come back yet: the
+                // backend the notice spoke of is gone with it.
+                after(vec![FrontendEvent::Error(running_dummy())], true),
+            ),
+            (
+                None,
+                None,
+                Some(running_dummy()),
+                Some("could not resolve studio-pc".into()),
+                None,
+            ),
+            "(refused then failed, granted and restarted then on, dummy running, an \
+             unrelated error, dummy running and then the daemon gone): a discard \
+             notice from before emulation's latest state, or from a daemon that is \
+             gone, must go; the one after it and any other error stay"
+        );
     }
 }

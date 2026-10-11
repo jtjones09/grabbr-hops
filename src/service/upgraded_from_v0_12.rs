@@ -585,11 +585,15 @@ fn a_knock_from_a_listed_machine_dials_nothing_and_tells_nothing_of_a_dial() {
         ] {
             let receiver: Door = door(answers);
             receiver.open();
+            // An emulation that injects, not `dummy`: a daemon running
+            // `dummy` tells every frontend that attaches that it discards
+            // input (#238), which is a banner, and this test hears none.
+            let injects = input_emulation::recording::Recording::new();
             let daemon = Daemon::upgraded_with(
                 tag,
                 &v0_12_0_config_for(&iridium, receiver.port),
                 input_capture::Backend::Dummy,
-                input_emulation::Backend::Dummy,
+                injects.backend(),
             )
             .await;
             let (ours, port, ipc) = (daemon.fingerprint(), daemon.port(), daemon.ipc());
