@@ -17,7 +17,7 @@ use super::Service;
 use crate::discovery::{DiscoveredPeer, Discovery, DiscoveryEvent};
 use crate::permission_watch::PermissionWatch;
 use crate::test_harness::run_local;
-use hops_ipc::{AsyncFrontendListener, DaemonEndpoint};
+use hops_ipc::{AsyncFrontendListener, DaemonEndpoint, FrontendRequest};
 use input_capture::Permission;
 use input_capture::scripted::Script;
 use input_emulation::recording::Recording;
@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 /// What must happen is waited for this long at most.
 const DEADLINE: Duration = Duration::from_secs(30);
@@ -105,7 +105,8 @@ async fn shut_down(mut service: Service) {
 
 /// A frontend connected to the daemon over its IPC socket.
 struct Frontend {
-    lines: tokio::io::Lines<BufReader<tokio::net::UnixStream>>,
+    write: tokio::io::WriteHalf<tokio::net::UnixStream>,
+    lines: tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::net::UnixStream>>>,
 }
 
 impl Frontend {
@@ -114,19 +115,46 @@ impl Frontend {
             unreachable!("a unix socket")
         };
         let token = std::fs::read_to_string(scratch.dir.join("ipc-token")).expect("the token");
-        let mut stream = tokio::net::UnixStream::connect(path)
+        let stream = tokio::net::UnixStream::connect(path)
             .await
             .expect("the daemon's socket");
-        {
-            let (rx, mut tx) = stream.split();
-            let mut rx = BufReader::new(rx);
-            hops_ipc::prove_to_daemon(&mut rx, &mut tx, token.trim())
-                .await
-                .expect("the two-way proof is made");
-        }
+        let (read, mut write) = tokio::io::split(stream);
+        let mut read = BufReader::new(read);
+        hops_ipc::prove_to_daemon(&mut read, &mut write, token.trim())
+            .await
+            .expect("the two-way proof is made");
         Self {
-            lines: BufReader::new(stream).lines(),
+            write,
+            lines: read.lines(),
         }
+    }
+
+    /// Ask the daemon for `request`, as a frontend does.
+    async fn ask(&mut self, request: &FrontendRequest) {
+        let line = serde_json::to_string(request).expect("json");
+        self.write
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .expect("the request is sent");
+    }
+
+    /// Every event the daemon tells it, whole, until one `done` accepts;
+    /// `None` once the daemon hangs up.
+    async fn all_until(
+        &mut self,
+        seen: &mut Vec<Value>,
+        done: impl Fn(&Value) -> bool,
+    ) -> Option<Value> {
+        while let Ok(Some(line)) = self.lines.next_line().await {
+            let Ok(told) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            seen.push(told.clone());
+            if done(&told) {
+                return Some(told);
+            }
+        }
+        None
     }
 
     /// Each capture state the daemon tells it, until one `done` accepts,
@@ -346,6 +374,117 @@ fn a_network_that_answers_nothing_is_told_and_an_answer_clears_it() {
             "discovery ran and heard nobody, then a machine answered. A frontend must \
              be told the first while discovery is active, and then that it is over. \
              It was told: {seen:?}"
+        );
+    });
+}
+
+/// An emulation state, as the daemon tells it.
+fn emulation_is(told: &Value, state: impl Fn(&Value) -> bool) -> bool {
+    told.get("EmulationStatus").is_some_and(state)
+}
+
+/// Each notice in `seen` that says input is discarded.
+fn discard_notices(seen: &[Value]) -> Vec<&str> {
+    seen.iter()
+        .filter_map(|e| e.get("Error")?.as_str())
+        .filter(|t| t.starts_with(hops_ipc::CANNOT_INJECT) || t.contains("dummy"))
+        .collect()
+}
+
+/// A Mac without Accessibility falls past its real emulation backend to
+/// `dummy`, which is refused. Emulation does not run, so nothing is being
+/// discarded: the frontend is told emulation failed, naming the permission,
+/// and no notice says input is discarded (#238). Asked again, as enable
+/// input asks, the same holds.
+// LEDGER T238-1 | class B | 2 bytes over the real IPC socket: Service::run with EmulationTask::do_emulation
+#[test]
+fn a_refused_dummy_is_failed_and_no_notice_says_input_is_discarded() {
+    run_local(async {
+        let refused = Recording::new();
+        refused.refuse_permission();
+        let candidates = vec![refused.backend(), input_emulation::Backend::Dummy];
+        let (mut service, scratch) =
+            daemon_among("nodiscard", &Script::new(), None, candidates).await;
+        let mut seen = Vec::new();
+        let told = async {
+            let mut frontend = Frontend::connect(&scratch).await;
+            // Its state now, whether it was decided before this frontend
+            // attached or after.
+            frontend.ask(&FrontendRequest::Sync).await;
+            frontend
+                .all_until(&mut seen, |e| emulation_is(e, failed))
+                .await?;
+            // Emulation now waits to be asked again; this attempt is made
+            // while the frontend listens, so whatever it says is heard.
+            frontend.ask(&FrontendRequest::EnableEmulation).await;
+            let failed_again = frontend
+                .all_until(&mut seen, |e| emulation_is(e, failed))
+                .await?;
+            let _ =
+                tokio::time::timeout(NOTHING_FOR, frontend.all_until(&mut seen, |_| false)).await;
+            Some(failed_again["EmulationStatus"].clone())
+        };
+        let told = tokio::select! {
+            ended = service.run() => panic!("the daemon ended: {ended:?}"),
+            told = told => told,
+            _ = tokio::time::sleep(DEADLINE) => None,
+        };
+        shut_down(service).await;
+        assert_eq!(
+            (told, discard_notices(&seen)),
+            (
+                Some(json!({ "Failed": { "Missing": ["Accessibility"] } })),
+                vec![]
+            ),
+            "dummy was refused, so emulation is off and names Accessibility; no \
+             notice may say input is being discarded. It was told: {seen:?}"
+        );
+    });
+}
+
+/// `dummy` is configured, so it runs and discards everything a peer sends.
+/// The frontend is told emulation runs and then that input is discarded, and
+/// a frontend that attaches later is told the same.
+// LEDGER T238-2 | class B | 2 bytes over the real IPC socket: Service::run with EmulationTask::do_emulation and sync_frontend
+#[test]
+fn a_dummy_that_runs_is_reported_after_its_state_and_on_every_sync() {
+    run_local(async {
+        let (mut service, scratch) = daemon("discards", &Script::new()).await;
+        let mut seen = Vec::new();
+        let told = async {
+            let mut frontend = Frontend::connect(&scratch).await;
+            frontend
+                .all_until(&mut seen, |e| emulation_is(e, |s| s == &json!("Enabled")))
+                .await?;
+            let first = frontend
+                .all_until(&mut seen, |e| {
+                    !discard_notices(std::slice::from_ref(e)).is_empty()
+                })
+                .await?;
+            frontend.ask(&FrontendRequest::Sync).await;
+            frontend
+                .all_until(&mut seen, |e| emulation_is(e, |s| s == &json!("Enabled")))
+                .await?;
+            let again = frontend
+                .all_until(&mut seen, |e| {
+                    e.get("Error").is_some() || e.get("EmulationStatus").is_some()
+                })
+                .await?;
+            Some((first, again))
+        };
+        let told = tokio::select! {
+            ended = service.run() => panic!("the daemon ended: {ended:?}"),
+            told = told => told,
+            _ = tokio::time::sleep(DEADLINE) => None,
+        };
+        shut_down(service).await;
+        let notice = json!({ "Error": crate::service::discarding_notice("dummy") });
+        assert_eq!(
+            told,
+            Some((notice.clone(), notice)),
+            "dummy is configured and runs. After emulation's state, and again after \
+             it on a sync, a frontend must be told input is discarded. It was told: \
+             {seen:?}"
         );
     });
 }

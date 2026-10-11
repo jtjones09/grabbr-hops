@@ -224,10 +224,17 @@ async fn refusals_reach_the_app_as_errors_or_activity_and_a_stranger_prompts_onc
             app.texts("Activity")
         ));
     }
-    if !app.texts("Error").is_empty() {
+    // The daemon runs the `dummy` emulation this test configures, and tells
+    // every app so whenever it syncs them, as on its own config reload at
+    // start (#238). That notice is about its backend, not about a refusal.
+    let raised: Vec<String> = app
+        .texts("Error")
+        .into_iter()
+        .filter(|t| !t.starts_with(hops_ipc::CANNOT_INJECT))
+        .collect();
+    if !raised.is_empty() {
         failures.push(format!(
-            "1: a background refusal raised an error: {:?}",
-            app.texts("Error")
+            "1: a background refusal raised an error: {raised:?}"
         ));
     }
 

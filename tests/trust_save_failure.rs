@@ -118,6 +118,12 @@ async fn next_error(events: &mut AsyncFrontendEventReader, within: Duration) -> 
     let deadline = tokio::time::Instant::now() + within;
     loop {
         match tokio::time::timeout_at(deadline, events.next()).await {
+            // The daemon runs the `dummy` emulation this test configures,
+            // and tells a frontend that attaches so (#238): a notice about
+            // its backend, not about trust.
+            Ok(Some(Ok(FrontendEvent::Error(e)))) if e.starts_with(hops_ipc::CANNOT_INJECT) => {
+                continue;
+            }
             Ok(Some(Ok(FrontendEvent::Error(e)))) => return Some(e),
             Ok(Some(_)) => continue,
             _ => return None,

@@ -243,6 +243,9 @@ pub struct Service {
     capture_status: CaptureState,
     /// Whether input emulation runs, and why not when it should.
     emulation_status: EmulationState,
+    /// The backend emulation runs that discards every event, while it runs
+    /// one (#238). Told to every frontend that attaches.
+    emulation_discards: Option<String>,
     /// Watches for a macOS permission granted while capture or emulation
     /// cannot start (#221).
     permission_watch: PermissionWatch,
@@ -646,6 +649,18 @@ pub(crate) fn disagreement_notice(
          both.",
         way(ours.controls(), ours.controlled()),
         way(theirs.controlled(), theirs.controls()),
+    )
+}
+
+/// The notice while emulation runs `name`, a backend that discards every
+/// event. It runs only when the configuration or `HOPS_ALLOW_DUMMY` asks for
+/// it, so it names that rather than a permission.
+pub(crate) fn discarding_notice(name: &str) -> String {
+    format!(
+        "{}: it runs the \"{name}\" backend, which discards everything a peer \
+         sends. hops runs it only when the configuration or HOPS_ALLOW_DUMMY asks \
+         for it.",
+        hops_ipc::CANNOT_INJECT
     )
 }
 
@@ -1065,6 +1080,7 @@ impl Service {
             pending_frontend_events: Default::default(),
             capture_status: Default::default(),
             emulation_status: Default::default(),
+            emulation_discards: None,
             permission_watch: PermissionWatch::of_this_machine(tap_gate),
             tap_gate,
             incoming_conn_info: Default::default(),
@@ -1662,17 +1678,15 @@ impl Service {
 
     fn handle_emulation_event(&mut self, event: EmulationEvent) {
         match event {
+            // Raised only while the backend runs: a refused one is
+            // `EmulationFailed`, which names what to grant (#238).
             EmulationEvent::BackendDegraded(name) => {
                 log::error!(
-                    "input emulation fell back to the {name} backend — incoming input \
-                     is being DISCARDED"
+                    "input emulation runs the {name} backend — incoming input is \
+                     being DISCARDED"
                 );
-                let pane = input_event::settings_pane::accessibility();
-                self.notify_frontend(FrontendEvent::Error(format!(
-                    "This machine cannot inject input (using the \"{name}\" backend), so \
-                     nothing a peer sends will do anything. On macOS this is usually a \
-                     missing {pane} permission for hops."
-                )));
+                self.notify_frontend(FrontendEvent::Error(discarding_notice(&name)));
+                self.emulation_discards = Some(name);
             }
             EmulationEvent::ConnectionAttempt { fingerprint, addr } => {
                 self.raise_connection_attempt(fingerprint, AttemptOrigin::Inbound, Some(addr));
@@ -1728,6 +1742,7 @@ impl Service {
             EmulationEvent::EmulationDisabled => {
                 self.permission_watch.stopped(Side::Emulation);
                 self.emulation_status = EmulationState::Disabled;
+                self.emulation_discards = None;
                 self.notify_frontend(FrontendEvent::EmulationStatus(
                     self.emulation_status.clone(),
                 ));
@@ -1736,6 +1751,7 @@ impl Service {
                 self.permission_watch
                     .started(Side::Emulation, !needs.is_empty());
                 self.emulation_status = EmulationState::Enabled;
+                self.emulation_discards = None;
                 self.notify_frontend(FrontendEvent::EmulationStatus(
                     self.emulation_status.clone(),
                 ));
@@ -1745,6 +1761,7 @@ impl Service {
             EmulationEvent::EmulationFailed(fault) => {
                 self.permission_watch.stopped(Side::Emulation);
                 self.emulation_status = EmulationState::Failed(fault);
+                self.emulation_discards = None;
                 self.notify_frontend(FrontendEvent::EmulationStatus(
                     self.emulation_status.clone(),
                 ));
@@ -1976,6 +1993,10 @@ impl Service {
         self.notify_frontend(FrontendEvent::EmulationStatus(
             self.emulation_status.clone(),
         ));
+        // After the state, which a frontend lets replace this notice.
+        if let Some(name) = self.emulation_discards.clone() {
+            self.notify_frontend(FrontendEvent::Error(discarding_notice(&name)));
+        }
         self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status.clone()));
         // Before the port: a machine that only dials out binds none, and its
         // configured port is not one anything can reach (#15).

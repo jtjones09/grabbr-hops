@@ -366,6 +366,10 @@ struct Repaint {
     /// source, local validation, so only a new daemon notice may replace what
     /// it shows.
     daemon_notice: i32,
+    /// The banner's sequence when it last showed a daemon notice, so that
+    /// notice can be taken down when the daemon withdraws it (#238) while a
+    /// local notice put up since is left alone.
+    daemon_banner: Option<i32>,
 }
 
 impl Repaint {
@@ -411,7 +415,13 @@ impl Repaint {
                 notice_seq.set(notice_seq.get().wrapping_add(1));
                 ui.set_notice(snap.notice.as_str().into());
                 ui.set_notice_seq(notice_seq.get());
+                self.daemon_banner = Some(notice_seq.get());
             }
+        } else if snap.notice.is_empty() && self.daemon_banner == Some(notice_seq.get()) {
+            // The daemon's notice no longer holds, and nothing local has
+            // replaced it on the banner.
+            ui.set_notice("".into());
+            self.daemon_banner = None;
         }
         ui.set_devices(ModelRc::new(VecModel::from(snap.devices.clone())));
         self.last = Some(snap);
@@ -503,6 +513,17 @@ fn short_fp(fp: &str) -> String {
 #[doc(hidden)]
 pub fn open_canvas_for_preview(ui: &AppWindow, m: &AppModel) {
     canvas::Canvas::default().open(ui, m);
+}
+
+/// Put each of `ticks` in `ui` in turn, as the app's poll does, for the
+/// headless render harness (`examples/render_png.rs`).
+#[doc(hidden)]
+pub fn poll_for_preview(ui: &AppWindow, ticks: &[AppModel]) {
+    let mut repaint = Repaint::default();
+    let seq = Cell::new(0);
+    for m in ticks {
+        repaint.push(ui, polled_ui(m, None, Instant::now()), &seq);
+    }
 }
 
 /// Single-instance coordination result. A second `hops gui` launch signals the
@@ -2334,6 +2355,49 @@ mod the_banner_shows_errors {
         assert!(
             ui.get_notice_seq() != raised,
             "a repeat of the same failure did not raise the banner again"
+        );
+    }
+
+    /// A notice that input is discarded, from a `dummy` backend that was
+    /// refused or ran before a grant, comes down once emulation reports it
+    /// runs; a notice the window raised itself since stays up (#238).
+    // LEDGER T238-4 | class B | 3 widget tree: AppWindow notice after AppModel::apply, polled_ui + Repaint::push
+    #[test]
+    fn a_discard_notice_comes_down_once_emulation_runs() {
+        use hops_frontend_core::{CaptureState, EmulationState};
+        i_slint_backend_testing::init_no_event_loop();
+        let refused = "This machine cannot inject input (using the \"dummy\" backend), \
+                       so nothing a peer sends will do anything.";
+        let on = |m: &mut AppModel| {
+            m.apply(FrontendEvent::EmulationStatus(EmulationState::Enabled));
+            m.apply(FrontendEvent::CaptureStatus(CaptureState::Enabled));
+        };
+        let shown = |local: bool| {
+            let ui = AppWindow::new().expect("window");
+            let mut repaint = Repaint::default();
+            let seq = Cell::new(0);
+            let mut m = AppModel::default();
+            m.apply(FrontendEvent::Error(refused.into()));
+            repaint.push(&ui, polled_ui(&m, None, Instant::now()), &seq);
+            let before = ui.get_notice().to_string();
+            if local {
+                // as the window's own notice sink raises one
+                seq.set(seq.get() + 1);
+                ui.set_notice("That device changed, so it was not deleted.".into());
+                ui.set_notice_seq(seq.get());
+            }
+            on(&mut m);
+            repaint.push(&ui, polled_ui(&m, None, Instant::now()), &seq);
+            (before, ui.get_notice().to_string())
+        };
+        assert_eq!(
+            (shown(false), shown(true).1),
+            (
+                (refused.to_string(), String::new()),
+                "That device changed, so it was not deleted.".to_string()
+            ),
+            "(the discard notice before and after emulation runs, a local notice \
+             raised in between): the discard notice must come down, the local one stay"
         );
     }
 
