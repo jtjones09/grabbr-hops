@@ -214,8 +214,8 @@ fn rotate_if_needed(path: &Path, file: &mut File) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Whether to write stderr as well, given whether we own a file and whether
-/// stderr is a terminal.
+/// Whether a process in `role` writes stderr as well, given whether it owns
+/// a file and whether stderr is a terminal.
 ///
 /// Writing both unconditionally would leave the original defect standing. The
 /// service launchers redirect stderr into a file of their own that nothing
@@ -229,8 +229,14 @@ fn rotate_if_needed(path: &Path, file: &mut File) -> std::io::Result<()> {
 /// what happens outside this logger — output before init, and the runtime's own
 /// abort message under `panic = "abort"` — which is exactly what it is good for
 /// and is bounded by how rarely those happen.
-fn should_write_stderr(owns_file: bool, stderr_is_terminal: bool) -> bool {
-    !owns_file || stderr_is_terminal
+///
+/// The daemon writes its file alone, terminal or not. A write to a terminal
+/// can wait: a Windows console waits every write for as long as text is
+/// selected in it, and the daemon logs from the loop that carries input, so
+/// a selection in its terminal stopped the pointer crossing to other
+/// machines (#247). Its file is where its log is read from.
+fn should_write_stderr(role: &str, owns_file: bool, stderr_is_terminal: bool) -> bool {
+    !owns_file || (stderr_is_terminal && role != "daemon")
 }
 
 /// Open an append handle that is capped the same way this module's own log is.
@@ -391,8 +397,18 @@ pub fn init(role: &str) {
         }
     });
 
+    let stderr_is_terminal = std::io::stderr().is_terminal();
+    if let Some(lock) = file
+        .as_ref()
+        .filter(|_| stderr_is_terminal && !should_write_stderr(role, true, stderr_is_terminal))
+    {
+        // Once, before anything runs that a wait here could hold up.
+        if let Ok(guard) = lock.lock() {
+            eprintln!("hops: the {role} logs to {}", guard.0.display());
+        }
+    }
     let sink = Sink {
-        to_stderr: should_write_stderr(file.is_some(), std::io::stderr().is_terminal()),
+        to_stderr: should_write_stderr(role, file.is_some(), stderr_is_terminal),
         file,
         filter,
         to_os: cfg!(target_os = "macos"),
@@ -631,24 +647,48 @@ mod tests {
         }
     }
 
+    // LEDGER T2474 | class B | 1 return value of should_write_stderr
     #[test]
     fn a_redirected_stderr_does_not_get_a_second_unbounded_copy() {
         assert!(
-            !should_write_stderr(true, false),
+            !should_write_stderr("cli", true, false),
             "under a service launcher stderr is redirected into a file nothing \
              rotates. Writing there as well as to the rotated file means every \
              line lands twice, once somewhere unbounded — which leaves the \
              defect this module exists to fix standing."
         );
         assert!(
-            should_write_stderr(true, true),
+            should_write_stderr("cli", true, true),
             "a developer watching a terminal must still see output"
         );
         assert!(
-            should_write_stderr(false, false),
+            should_write_stderr("cli", false, false),
             "with no file open, stderr is the only sink there is — a process \
              that cannot open its log must not fall silent"
         );
+    }
+
+    /// The daemon logs from the loop that carries input, and a write to a
+    /// Windows console waits for as long as text is selected in it (#247).
+    // LEDGER T2473 | class B | 1 return value of should_write_stderr
+    #[test]
+    fn the_daemon_never_writes_a_terminal_while_it_has_its_file() {
+        assert!(
+            !should_write_stderr("daemon", true, true)
+                && !should_write_stderr("daemon", true, false),
+            "a daemon with its log file open writes its terminal as well: a selection \
+             in that terminal then stops input crossing to other machines"
+        );
+        assert!(
+            should_write_stderr("daemon", false, true),
+            "a daemon that could not open its file must still write somewhere"
+        );
+        for role in ["gui", "tui", "cli"] {
+            assert!(
+                should_write_stderr(role, true, true),
+                "the {role}, run from a terminal, must still print there"
+            );
+        }
     }
 
     #[test]
