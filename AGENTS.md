@@ -113,6 +113,8 @@ cargo check --workspace --all-targets
 RUSTFLAGS="-D warnings" cargo check --workspace --all-targets --no-default-features --features "tui slint"
 cargo test --workspace --no-default-features --features "tui slint"
 cargo fmt --all --check
+# the daemon (and the GUI) log to their file only and print its path once;
+# follow it there: tail -f, or Get-Content -Wait on Windows (docs/LOGGING.md)
 HOPS_LOG_LEVEL=debug cargo run -- daemon
 
 # is the binary about to run the one the source says it should be?

@@ -214,6 +214,12 @@ fn launch(started: Option<StartReport>) -> hops_frontend_core::Launch {
 fn run_gui(hidden: bool, started: Option<StartReport>) -> Result<(), HopsError> {
     #[cfg(feature = "slint")]
     {
+        // Opened from Explorer, the Start menu or a shortcut, Windows gave
+        // this process a terminal window of its own, which would stand beside
+        // the app and end it when closed (#247). One shared with a shell
+        // stays. Not before now: the first-run picker can choose the TUI,
+        // which draws in that terminal.
+        hops::console::release_if_alone(hops::console::Runs::Gui);
         hops_slint::run(hidden, launch(started))?;
         Ok(())
     }

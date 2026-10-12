@@ -40,6 +40,7 @@ pub mod client;
 mod clipboard;
 pub mod config;
 mod connect;
+pub mod console;
 mod crypto;
 pub mod daemon_start;
 mod dial_back;

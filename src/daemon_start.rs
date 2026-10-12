@@ -1779,22 +1779,47 @@ fn keep_output_private(plist: &Plist) {
     }
 }
 
-/// Start the daemon as a DETACHED background process (its own session, with
-/// stdio sent to the file the daemon logs to), then return without owning it.
-/// Used by the front door on non-macOS (macOS uses launchd): the daemon is the
-/// persistent core engine and must survive the front-end — and its terminal —
-/// going away.
-#[cfg(all(not(target_os = "macos"), any(feature = "tui", feature = "slint")))]
-fn start_detached_daemon() -> io::Result<u32> {
-    use std::process::{self, Stdio};
+/// `CreateProcess` flags: the process gets no console at all.
+#[cfg(any(all(windows, any(feature = "tui", feature = "slint")), test))]
+const DETACHED_PROCESS: u32 = 0x0000_0008;
+/// `CreateProcess` flags: the process gets a console window of its own.
+#[cfg(test)]
+const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+/// `CreateProcess` flags: the process leads a group of its own, so Ctrl+C
+/// and Ctrl+Break sent to the launching console's group do not reach it.
+#[cfg(any(all(windows, any(feature = "tui", feature = "slint")), test))]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+/// How the front door creates the daemon on Windows: with no console, so no
+/// terminal window opens for it and none the user closes can end it (#247),
+/// and in a process group of its own.
+#[cfg(any(all(windows, any(feature = "tui", feature = "slint")), test))]
+const fn windows_daemon_creation_flags() -> u32 {
+    DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+}
+
+/// The command [`start_detached_daemon`] runs: `exe` with `args` and then
+/// `daemon`, in a session of its own on Unix and with no console on Windows,
+/// reading nothing and writing to `log_file`, or to nothing when that cannot
+/// be opened. Never to the front door's terminal: a daemon that shares it
+/// stops whenever a write to that terminal waits, as one does while text is
+/// being selected in a Windows console (#247), and ends when it closes.
+#[cfg(any(
+    all(not(target_os = "macos"), any(feature = "tui", feature = "slint")),
+    test
+))]
+fn detached_daemon_command(
+    exe: &Path,
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+    log_file: Option<&Path>,
+) -> std::process::Command {
+    use std::process::{Command, Stdio};
     // The daemon's own log file, where it works out that file for itself:
     // `%LOCALAPPDATA%\hops\logs` on Windows, `$XDG_STATE_HOME/hops` on Linux.
     // What it writes to stdout and stderr is only what comes before its logger
     // starts, and the runtime's own message if it aborts, so the two share the
     // file the front door names when the daemon does not come up.
-    let log_file = crate::logging::file_for("daemon");
     let opened = log_file
-        .as_deref()
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -1815,15 +1840,14 @@ fn start_detached_daemon() -> io::Result<u32> {
                  will not be saved. Once it is running it logs to its own file — see \
                  the Logs section of the README for where.",
                 log_file
-                    .as_deref()
                     .map(|p| p.display().to_string())
                     .unwrap_or_default()
             );
             (Stdio::null(), Stdio::null())
         }
     };
-    let mut cmd = process::Command::new(std::env::current_exe()?);
-    cmd.args(std::env::args().skip(1))
+    let mut cmd = Command::new(exe);
+    cmd.args(args)
         .arg("daemon")
         .stdin(Stdio::null())
         .stdout(out)
@@ -1843,16 +1867,29 @@ fn start_detached_daemon() -> io::Result<u32> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // Windows has no setsid(): give the daemon its own detached console and
-        // process group so closing the launching terminal (or the console being
-        // logged off) can't deliver CTRL_CLOSE/CTRL_BREAK and take it down —
-        // without this the "detached" daemon dies with the front-end's console.
+        // Windows has no setsid(): start the daemon with no console at all, in
+        // a process group of its own, so the launching terminal closing can't
+        // deliver CTRL_CLOSE/CTRL_BREAK and take it down, no terminal window
+        // opens for it, and no write of its ever waits on a console (#247).
         // For login-persistent autostart prefer the Scheduled Task in
         // service/windows/; this only covers a hand-launched `hops`.
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        cmd.creation_flags(windows_daemon_creation_flags());
     }
+    cmd
+}
+
+/// Start the daemon as a DETACHED background process (its own session, with
+/// stdio sent to the file the daemon logs to), then return without owning it.
+/// Used by the front door on non-macOS (macOS uses launchd): the daemon is the
+/// persistent core engine and must survive the front-end — and its terminal —
+/// going away.
+#[cfg(all(not(target_os = "macos"), any(feature = "tui", feature = "slint")))]
+fn start_detached_daemon() -> io::Result<u32> {
+    let mut cmd = detached_daemon_command(
+        &std::env::current_exe()?,
+        std::env::args().skip(1).map(Into::into),
+        crate::logging::file_for("daemon").as_deref(),
+    );
     // `spawn` returns once the program is running: on Unix a failed exec is
     // reported here, not later. The daemon owns its own lifecycle; the handle
     // goes to a thread that only reaps it when it exits, so an exit is seen as
@@ -4326,5 +4363,64 @@ mod a_launch_agent_is_never_pointed_at_a_disk_image {
             through.display()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod the_daemon_opens_no_terminal_window_on_windows {
+    use super::{
+        CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS,
+        windows_daemon_creation_flags,
+    };
+
+    // LEDGER T2471 | class B | 1 return value of windows_daemon_creation_flags
+    #[test]
+    fn it_is_created_with_no_console_in_a_group_of_its_own() {
+        let flags = windows_daemon_creation_flags();
+        assert!(
+            flags & DETACHED_PROCESS != 0 && flags & CREATE_NEW_CONSOLE == 0,
+            "the daemon the front door starts on Windows must have no console: one \
+             of its own is a terminal window beside the app, and one shared with the \
+             front door ends it when that window closes (#247). flags {flags:#x}"
+        );
+        assert!(
+            flags & CREATE_NEW_PROCESS_GROUP != 0,
+            "the daemon must lead its own process group, so a console control \
+             event sent to the front door's group never reaches it. flags {flags:#x}"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod the_daemon_writes_to_its_log_never_to_the_front_doors_terminal {
+    use super::detached_daemon_command;
+
+    /// What the started daemon writes before its logger is up, and the
+    /// runtime's message if it aborts, land in its log file. Not in the
+    /// terminal the front door was opened from, where a write can wait for
+    /// as long as text is selected in a Windows console (#247).
+    // LEDGER T2472 | class B | 4 file on disk written by the process detached_daemon_command builds
+    #[test]
+    fn its_stdout_and_stderr_are_its_log_file() {
+        let dir = std::env::temp_dir().join(format!("hops-detached-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let log = dir.join("daemon.log");
+        // `sh -c <script> daemon`: the script runs with `daemon` as its $0.
+        let status = detached_daemon_command(
+            std::path::Path::new("/bin/sh"),
+            ["-c".into(), "echo on-stdout; echo on-stderr >&2".into()],
+            Some(&log),
+        )
+        .status()
+        .expect("sh runs");
+        let logged = std::fs::read_to_string(&log).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(status.success(), "{status}");
+        assert!(
+            logged.contains("on-stdout") && logged.contains("on-stderr"),
+            "the started daemon's stdout and stderr must be its log file, not the \
+             front door's terminal. The file holds: {logged:?}"
+        );
     }
 }

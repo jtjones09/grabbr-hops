@@ -61,7 +61,11 @@ asked for by name.
 
 `stderr` is written only when it is a terminal, or when no file could be opened.
 A service launcher that redirects stderr into a file of its own would otherwise
-receive a second, unrotated copy of everything.
+receive a second, unrotated copy of everything. The daemon and the GUI never
+write a terminal while they have their file, and say once which file that is:
+a Windows console holds every write while text is selected in it, which
+stopped input crossing to other machines and left the window not responding.
+Follow the file instead: `tail -f`, or `Get-Content -Wait` on Windows.
 
 ---
 
