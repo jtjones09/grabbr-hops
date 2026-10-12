@@ -566,7 +566,9 @@ impl Door {
     }
 
     /// Let no dial in from here on: each one waits unanswered until it
-    /// gives up. Connections already in stay.
+    /// gives up. Connections already in stay. The daemon tests that use it
+    /// run on unix.
+    #[cfg(unix)]
     pub(crate) fn shut(&self) {
         self.open.set(false);
     }
