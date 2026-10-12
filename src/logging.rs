@@ -48,7 +48,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use log::{LevelFilter, Log, Metadata, Record};
 
@@ -242,6 +242,41 @@ fn should_write_stderr(role: &str, owns_file: bool, stderr_is_terminal: bool) ->
     !owns_file || (stderr_is_terminal && !matches!(role, "daemon" | "gui"))
 }
 
+/// Whether this process opened its log file, and whether its stderr is a
+/// terminal, as [`init`] found them, for [`say`]. Unset before `init`.
+static SINKS: OnceLock<(bool, bool)> = OnceLock::new();
+
+/// The target of what [`say`] logs. The logger keeps it off stderr, because
+/// `say` writes stderr itself.
+const SAID: &str = "hops::said";
+
+/// Tell the person who started this process `msg`, and log it.
+///
+/// For what ends the process, or changes what it opens: an error that stops
+/// hops, or the interface opened in place of the one asked for. A role's
+/// routine lines may stay in its file alone (#247); this one may not. From a
+/// terminal, a process that ends with its reason only in a file looks like
+/// one that did nothing (#255). So it reaches stderr, once, whenever stderr
+/// is a terminal or there is no file to read it in, whatever the role.
+pub fn say(level: log::Level, msg: &dyn std::fmt::Display) {
+    let msg = msg.to_string();
+    log::log!(target: SAID, level, "{msg}");
+    let (owns_file, stderr_is_terminal) = SINKS
+        .get()
+        .copied()
+        .unwrap_or_else(|| (false, std::io::stderr().is_terminal()));
+    say_to(&mut std::io::stderr(), &msg, owns_file, stderr_is_terminal);
+}
+
+/// [`say`]'s line on `stderr`: written when stderr is a terminal, or when
+/// there is no file for the log line to reach. A stderr redirected beside
+/// the file does without it, as every other line does.
+fn say_to(stderr: &mut impl Write, msg: &str, owns_file: bool, stderr_is_terminal: bool) {
+    if stderr_is_terminal || !owns_file {
+        let _ = writeln!(stderr, "hops: {msg}");
+    }
+}
+
 /// Open an append handle that is capped the same way this module's own log is.
 ///
 /// For output that is redirected rather than written through the logger — the
@@ -266,6 +301,14 @@ struct Sink {
     to_os: bool,
 }
 
+impl Sink {
+    /// Whether a line logged to `target` is written to stderr too. Never what
+    /// [`say`] logs: it writes stderr itself.
+    fn writes_stderr(&self, target: &str) -> bool {
+        self.to_stderr && target != SAID
+    }
+}
+
 impl Log for Sink {
     fn enabled(&self, m: &Metadata) -> bool {
         self.filter.enabled(m)
@@ -283,7 +326,7 @@ impl Log for Sink {
             record.args()
         );
 
-        if self.to_stderr {
+        if self.writes_stderr(record.target()) {
             eprintln!("{line}");
         }
 
@@ -401,6 +444,7 @@ pub fn init(role: &str) {
     });
 
     let stderr_is_terminal = std::io::stderr().is_terminal();
+    let _ = SINKS.set((file.is_some(), stderr_is_terminal));
     if let Some(lock) = file
         .as_ref()
         .filter(|_| stderr_is_terminal && !should_write_stderr(role, true, stderr_is_terminal))
@@ -708,6 +752,55 @@ mod tests {
             should_write_stderr("gui", false, true),
             "a GUI that could not open its file must still write somewhere"
         );
+    }
+
+    /// What ends the process reaches the terminal it was started from once,
+    /// whatever the role, while the daemon's and the GUI's routine lines stay
+    /// in their files (#247). `hops gui` in a build with no GUI ended with
+    /// its reason in gui.log alone, and nothing on the terminal (#255).
+    // LEDGER T5 | class B | 2 bytes written by say_to + 1 return value of Sink::writes_stderr
+    #[test]
+    fn what_ends_the_process_reaches_a_terminal_once_whatever_the_role() {
+        let msg = "this build has no GUI";
+        let said = |owns_file: bool, terminal: bool| {
+            let mut out = Vec::new();
+            say_to(&mut out, msg, owns_file, terminal);
+            String::from_utf8(out).expect("utf-8")
+        };
+        for role in ["daemon", "gui", "tui", "cli"] {
+            for (owns_file, terminal) in [(true, true), (false, true), (false, false)] {
+                let sink = Sink {
+                    file: None,
+                    filter: build_filter("info"),
+                    to_stderr: should_write_stderr(role, owns_file, terminal),
+                    to_os: false,
+                };
+                let lines = said(owns_file, terminal).matches(msg).count()
+                    + usize::from(sink.writes_stderr(SAID));
+                assert_eq!(
+                    lines, 1,
+                    "the {role} (file {owns_file}, terminal {terminal}) wrote the line \
+                     that ends it to stderr {lines} times"
+                );
+            }
+            let sink = Sink {
+                file: None,
+                filter: build_filter("info"),
+                to_stderr: should_write_stderr(role, true, true),
+                to_os: false,
+            };
+            assert_eq!(
+                sink.writes_stderr("hops"),
+                matches!(role, "tui" | "cli"),
+                "the {role}'s routine lines changed where they go (#247)"
+            );
+        }
+        assert_eq!(
+            said(true, false),
+            "",
+            "a stderr redirected beside the log file got the line a second time"
+        );
+        assert_eq!(said(true, true), format!("hops: {msg}\n"));
     }
 
     #[test]

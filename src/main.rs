@@ -37,6 +37,18 @@ enum HopsError {
     Cli(#[from] CliError),
     #[error(transparent)]
     Elevated(#[from] hops::elevation::Elevated),
+    #[cfg(not(feature = "slint"))]
+    #[error(
+        "this build of hops has no graphical interface; run `hops tui` for the terminal \
+         one (developers: build with `--features slint`)"
+    )]
+    NoGui,
+    #[cfg(not(feature = "tui"))]
+    #[error(
+        "this build of hops has no terminal interface; run `hops gui` for the graphical \
+         one (developers: build with `--features tui`)"
+    )]
+    NoTui,
 }
 
 fn main() {
@@ -57,11 +69,13 @@ fn main() {
         // A grant ends the daemon on purpose, so that launchd starts it again
         // with the grant (#221): the exit is unsuccessful, the event normal.
         Err(e @ HopsError::Service(ServiceError::PermissionGranted(_))) => {
-            log::info!("{e}");
+            hops::logging::say(log::Level::Info, &e);
             process::exit(1);
         }
+        // On the terminal hops was started from as well as in its log,
+        // whatever the role (#255).
         Err(e) => {
-            log::error!("{e}");
+            hops::logging::say(log::Level::Error, &e);
             process::exit(1);
         }
     }
@@ -183,9 +197,10 @@ fn daemon_ended(ended: Result<(), HopsError>) -> Result<(), HopsError> {
         Err(HopsError::Service(ServiceError::IpcListen(
             IpcListenerCreationError::AlreadyRunning,
         ))) => {
-            log::warn!(
-                "a hops daemon is already running for this user; this one exits and \
-                 leaves it running"
+            hops::logging::say(
+                log::Level::Warn,
+                &"a hops daemon is already running for this user; this one exits and \
+                  leaves it running",
             );
             Ok(())
         }
@@ -208,7 +223,7 @@ fn launch(started: Option<StartReport>) -> hops_frontend_core::Launch {
     }
 }
 
-/// Open the Slint GUI (attach-only). No-op with a hint if this build lacks it.
+/// Open the Slint GUI (attach-only). An error if this build lacks it.
 /// `hidden` starts the app in the menu bar / tray only, no window shown.
 /// `started` is what the front door did about the service, if it ran.
 fn run_gui(hidden: bool, started: Option<StartReport>) -> Result<(), HopsError> {
@@ -226,8 +241,7 @@ fn run_gui(hidden: bool, started: Option<StartReport>) -> Result<(), HopsError> 
     #[cfg(not(feature = "slint"))]
     {
         let _ = (hidden, started);
-        log::error!("this build has no GUI — rebuild with `--features slint`");
-        Ok(())
+        Err(HopsError::NoGui)
     }
 }
 
@@ -264,7 +278,7 @@ fn install_panic_logger() {
     }));
 }
 
-/// Open the Ratatui TUI (attach-only). No-op with a hint if this build lacks it.
+/// Open the Ratatui TUI (attach-only). An error if this build lacks it.
 /// `started` is what the front door did about the service, if it ran.
 fn run_tui(started: Option<StartReport>) -> Result<(), HopsError> {
     #[cfg(feature = "tui")]
@@ -275,8 +289,7 @@ fn run_tui(started: Option<StartReport>) -> Result<(), HopsError> {
     #[cfg(not(feature = "tui"))]
     {
         let _ = started;
-        log::error!("this build has no TUI — rebuild with `--features tui`");
-        Ok(())
+        Err(HopsError::NoTui)
     }
 }
 
@@ -294,7 +307,7 @@ fn front_door() -> Result<(), HopsError> {
     // and one of another build went on serving without a word (#222).
     let started = hops::daemon_start::ensure_running();
 
-    let frontend = if onboarding_done() {
+    let wanted = if onboarding_done() {
         load_frontend().unwrap_or_else(default_frontend)
     } else if let Some(chosen) = run_onboarding_picker() {
         save_frontend(chosen);
@@ -305,6 +318,13 @@ fn front_door() -> Result<(), HopsError> {
         // again next launch), just use the environment default for THIS run
         default_frontend()
     };
+    // A choice saved by a build with the other interface opens this one's,
+    // and says so (#255). The saved choice stays as it is: every build
+    // on the machine reads it, and it is written only when someone chooses.
+    let (frontend, note) = openable(wanted, cfg!(feature = "slint"), cfg!(feature = "tui"));
+    if let Some(note) = note {
+        hops::logging::say(log::Level::Info, &note);
+    }
 
     match frontend {
         Frontend::Tui => run_tui(Some(started)),
@@ -313,10 +333,37 @@ fn front_door() -> Result<(), HopsError> {
     }
 }
 
+/// The interface the front door opens when `wanted` was chosen, in a build
+/// that has the graphical one if `gui` and the terminal one if `tui`, and,
+/// when that is not the one chosen, the line saying so (#255).
+///
+/// A build without the chosen interface opened nothing: the choice names the
+/// GUI on a machine that once ran a build with one, and a Linux build has none.
+#[cfg(any(feature = "tui", feature = "slint"))]
+fn openable(
+    wanted: hops_frontend_core::prefs::Frontend,
+    gui: bool,
+    tui: bool,
+) -> (hops_frontend_core::prefs::Frontend, Option<&'static str>) {
+    use hops_frontend_core::prefs::Frontend;
+    match wanted {
+        Frontend::Gui if !gui && tui => (
+            Frontend::Tui,
+            Some("this build has no graphical interface; opening the terminal one"),
+        ),
+        Frontend::Tui if !tui && gui => (
+            Frontend::Gui,
+            Some("this build has no terminal interface; opening the graphical one"),
+        ),
+        _ => (wanted, None),
+    }
+}
+
 /// Show the first-run interface picker in whichever medium fits the
 /// environment — the same GUI-on-desktop/TUI-over-SSH question as
 /// [`default_frontend`], since which picker CAN run is the same question as
-/// which front-end runs by default.
+/// which front-end runs by default. A build with one interface asks nothing:
+/// it has nothing to choose between (#255).
 #[cfg(any(feature = "tui", feature = "slint"))]
 fn run_onboarding_picker() -> Option<hops_frontend_core::prefs::Frontend> {
     #[cfg(all(feature = "slint", feature = "tui"))]
@@ -329,13 +376,9 @@ fn run_onboarding_picker() -> Option<hops_frontend_core::prefs::Frontend> {
             hops_slint::run_onboarding().ok().flatten()
         }
     }
-    #[cfg(all(feature = "slint", not(feature = "tui")))]
+    #[cfg(not(all(feature = "slint", feature = "tui")))]
     {
-        hops_slint::run_onboarding().ok().flatten()
-    }
-    #[cfg(all(feature = "tui", not(feature = "slint")))]
-    {
-        hops_tui::run_onboarding().ok().flatten()
+        None
     }
 }
 
@@ -599,5 +642,71 @@ mod the_front_door_shows_what_became_of_its_start {
                  up then reaches the screen as \"connecting\", with nothing said."
             );
         }
+    }
+}
+
+#[cfg(all(test, any(feature = "tui", feature = "slint")))]
+mod a_bare_launch_opens_an_interface_this_build_has {
+    //! The saved choice of interface is read by every build on the machine,
+    //! and a Linux build has no GUI. Asked for one, the front door opened
+    //! nothing and exited 0 (#255).
+    use super::openable;
+    use hops_frontend_core::prefs::Frontend;
+
+    // LEDGER T6 | class B | 1 return value of openable
+    #[test]
+    fn a_choice_this_build_lacks_opens_the_one_it_has_and_says_so() {
+        let (opens, note) = openable(Frontend::Gui, false, true);
+        assert_eq!(
+            opens,
+            Frontend::Tui,
+            "a build with only the TUI, asked for the GUI, did not open the TUI"
+        );
+        assert!(
+            note.is_some_and(|n| n.contains("no graphical interface")),
+            "it opened the TUI in place of the GUI without saying so: {note:?}"
+        );
+        let (opens, note) = openable(Frontend::Tui, true, false);
+        assert_eq!(opens, Frontend::Gui);
+        assert!(note.is_some_and(|n| n.contains("no terminal interface")));
+        for (wanted, gui, tui) in [
+            (Frontend::Gui, true, true),
+            (Frontend::Tui, true, true),
+            (Frontend::Gui, true, false),
+            (Frontend::Tui, false, true),
+        ] {
+            assert_eq!(
+                openable(wanted, gui, tui),
+                (wanted, None),
+                "a build with the {wanted:?} chosen opened another, or said something"
+            );
+        }
+    }
+}
+
+#[cfg(all(test, not(feature = "slint")))]
+mod a_build_with_no_gui_says_so_when_asked_for_one {
+    //! `hops gui` in a build with no GUI logged why to gui.log and exited 0;
+    //! the terminal it was typed in showed nothing (#255). As an error it
+    //! reaches `main`, which says it there and exits 1, naming what to run
+    //! instead.
+    use super::{HopsError, run_gui};
+
+    // LEDGER T7 | class B | 1 return value of run_gui
+    #[test]
+    fn asked_for_the_gui_it_ends_with_an_error() {
+        let got = run_gui(false, None);
+        assert!(
+            matches!(got, Err(HopsError::NoGui)),
+            "a build with no GUI, asked for one, ended as if it had opened: {got:?}"
+        );
+        // What a user of the Linux release reads: what to run instead, and a
+        // rebuild only as a note for developers.
+        let said = got.map_err(|e| e.to_string()).unwrap_err();
+        assert!(
+            said.starts_with("this build of hops has no graphical interface; run `hops tui`")
+                && said.contains("(developers: build with `--features slint`)"),
+            "{said}"
+        );
     }
 }
