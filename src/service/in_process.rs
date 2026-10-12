@@ -304,6 +304,14 @@ impl Daemon {
         self.service.trust.clone()
     }
 
+    /// List `peer` as found on the local network, as discovery does, before
+    /// its loop runs.
+    pub(crate) fn found_on_the_network(&mut self, peer: crate::discovery::DiscoveredPeer) {
+        self.service
+            .discovered
+            .found(peer, std::time::Instant::now());
+    }
+
     /// Its devices, to add one before its loop runs.
     pub(crate) fn clients(&self) -> crate::client::ClientManager {
         self.service.client_manager.clone()

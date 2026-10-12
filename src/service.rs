@@ -2562,6 +2562,9 @@ impl Service {
                 );
                 self.save_config();
                 self.broadcast_client(handle);
+                // Pinned to a machine with no pairing in force, which the
+                // network list still offered.
+                self.publish_discovered();
             }
             Ok(false) => {}
             Err(other) => log::info!(
@@ -3484,6 +3487,9 @@ impl Service {
         }
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
         self.notify_frontend(FrontendEvent::TrustUpdated(peers));
+        // The network list leaves out every paired machine: one paired
+        // while add device is open is no longer one to add (#257).
+        self.publish_discovered();
     }
 
     /// Drop what has lapsed, and cut the sessions it was holding open.

@@ -789,3 +789,93 @@ fn driven_through_the_device_added_for_it(tag: &str, mid_pairing: bool) {
         pc.run_while(mac.run_while(body)).await;
     });
 }
+
+// LEDGER T257-10 | class B | 2 bytes: FrontendEvent::Created and ConnectionAttempt over the controlling daemon's IPC socket; 6 struct state: ClientManager::answered_as after the daemon's own dial
+/// Something at the address the pc adds a device at presents the mac's
+/// certificate, which is public, and signs with a key of its own. The pc's
+/// dial sees the mac's certificate there, and records no machine as reached:
+/// what an address presented without signing proves nothing, and a record
+/// would send the real mac's dial-in to this device, under its name and
+/// edge (#257).
+#[test]
+fn a_copied_certificate_at_a_devices_address_does_not_claim_the_device() {
+    run_local(async {
+        let pc = Daemon::start("copied-pc", "", input_emulation::Backend::Dummy).await;
+        let (pc_ipc, pc_clients) = (pc.ipc(), pc.clients());
+        let (mac, impostor) = (
+            crate::test_harness::machine(),
+            crate::test_harness::machine(),
+        );
+        #[derive(Debug)]
+        struct Presents(std::sync::Arc<rustls::sign::CertifiedKey>);
+        impl rustls::server::ResolvesServerCert for Presents {
+            fn resolve(
+                &self,
+                _: rustls::server::ClientHello<'_>,
+            ) -> Option<std::sync::Arc<rustls::sign::CertifiedKey>> {
+                Some(self.0.clone())
+            }
+        }
+        crate::transport::install_crypto_provider();
+        let key = rustls::crypto::ring::default_provider()
+            .key_provider
+            .load_private_key(impostor.identity.key.clone_key())
+            .expect("a signing key");
+        let copied = rustls::sign::CertifiedKey::new(vec![mac.identity.cert.clone()], key);
+        let mut crypto = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(std::sync::Arc::new(Presents(std::sync::Arc::new(copied))));
+        crypto.alpn_protocols = vec![crate::transport::ALPN.to_vec()];
+        let server = quinn::ServerConfig::with_crypto(std::sync::Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(crypto).expect("quic server"),
+        ));
+        let endpoint = quinn::Endpoint::server(server, "127.0.0.1:0".parse().expect("addr"))
+            .expect("server endpoint");
+        let port = endpoint.local_addr().expect("local addr").port();
+        tokio::task::spawn_local(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                tokio::task::spawn_local(async move {
+                    let _ = incoming.await;
+                });
+            }
+        });
+
+        let body = async {
+            let mut app = Heard::new(pc_ipc.connect().await);
+            app.exchange(&[
+                FrontendRequest::OpenPairing,
+                FrontendRequest::Create(NewDevice {
+                    hostname: None,
+                    fix_ips: vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
+                    port,
+                    pos: hops_ipc::Position::Left,
+                }),
+            ])
+            .await;
+            let added = app
+                .until("the device added", |e| match e {
+                    FrontendEvent::Created(h, _, _) => Some(*h),
+                    _ => None,
+                })
+                .await;
+            // Raised by the dial's refusal, after what it reached is
+            // recorded.
+            app.until("the pc's dial to see the mac's certificate", |e| match e {
+                FrontendEvent::ConnectionAttempt { fingerprint, .. }
+                    if *fingerprint == mac.fingerprint =>
+                {
+                    Some(())
+                }
+                _ => None,
+            })
+            .await;
+            assert_eq!(
+                pc_clients.answered_as(added),
+                None,
+                "a certificate presented by something that cannot sign for it was \
+                 recorded as the machine the device reached"
+            );
+        };
+        pc.run_while(body).await;
+    });
+}
