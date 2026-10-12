@@ -34,6 +34,14 @@ struct Clients {
     /// dialled it, so the service can say which (#12). Dropped when the
     /// device is pinned, pointed elsewhere or removed.
     refused_as: BTreeMap<ClientHandle, String>,
+    /// The machine a device's own dial last read at its address, whether or
+    /// not the handshake then went through: the device the person added for
+    /// that machine, before it is pinned to it. A machine that pairs on its
+    /// own dial and then dials this one to be driven goes to this device
+    /// rather than to a second one (#257). Never saved, and not a pin: it
+    /// grants nothing and carries nothing. Dropped when the device is
+    /// pinned, pointed elsewhere or removed.
+    answered_as: BTreeMap<ClientHandle, String>,
 }
 
 impl Clients {
@@ -205,6 +213,7 @@ impl ClientManager {
         let mut clients = self.clients.borrow_mut();
         clients.answered.remove(&client);
         clients.refused_as.remove(&client);
+        clients.answered_as.remove(&client);
         clients.entries.remove(&client)
     }
 
@@ -233,6 +242,7 @@ impl ClientManager {
             if c.fix_ips != fix_ips {
                 c.fix_ips = fix_ips;
                 clients.refused_as.remove(&handle);
+                clients.answered_as.remove(&handle);
             }
         }
         drop(clients);
@@ -275,6 +285,7 @@ impl ClientManager {
             s.active_addr = None;
             s.dns_ips.clear();
             clients.refused_as.remove(&handle);
+            clients.answered_as.remove(&handle);
             drop(clients);
             self.update_ips(handle);
             true
@@ -537,11 +548,73 @@ impl ClientManager {
             return Err(first);
         }
         clients.refused_as.remove(&handle);
+        clients.answered_as.remove(&handle);
         Ok(clients.get_mut(handle).is_some_and(|(_, s)| {
             let new = s.peer_fingerprint.as_deref() != Some(fingerprint.as_str());
             s.peer_fingerprint = Some(fingerprint);
             new
         }))
+    }
+
+    /// Record that `handle`'s own dial read `fingerprint` at its address,
+    /// or, with `None`, that it read no one machine there. A later read
+    /// replaces an earlier one.
+    pub(crate) fn set_answered_as(&self, handle: ClientHandle, fingerprint: Option<String>) {
+        let mut clients = self.clients.borrow_mut();
+        match fingerprint {
+            Some(fp) if clients.entries.contains_key(&handle) => {
+                clients.answered_as.insert(handle, fp);
+            }
+            _ => {
+                clients.answered_as.remove(&handle);
+            }
+        }
+    }
+
+    /// The device a machine that dialled this one to be driven goes to,
+    /// and whether it was pinned to that machine just now (#257).
+    ///
+    /// The device pinned to `fingerprint`, if one is. Otherwise the device
+    /// pinned to no machine whose own dial read `fingerprint`, the first
+    /// added when several did, which is pinned to it here: the dial-in
+    /// proved the fingerprint with its key, and the device is the one the
+    /// person added for the machine at that address. `None` when no device
+    /// is either. Never found by the address the dial-in came from.
+    pub(crate) fn claim_for_dial_in(&self, fingerprint: &str) -> Option<(ClientHandle, bool)> {
+        if let Some(&pinned) = self.every_pinned_to(fingerprint).first() {
+            return Some((pinned, false));
+        }
+        let reached = {
+            let clients = self.clients.borrow();
+            let reached: Vec<ClientHandle> = clients
+                .answered_as
+                .iter()
+                .filter(|(_, fp)| fp.eq_ignore_ascii_case(fingerprint))
+                .map(|(&h, _)| h)
+                .filter(|&h| {
+                    clients
+                        .get(h)
+                        .is_some_and(|(_, s)| s.peer_fingerprint.is_none())
+                })
+                .collect();
+            if reached.len() > 1 {
+                log::info!(
+                    "clients {reached:?} each read {fingerprint} on their own dial; the first \
+                     added is pinned to it"
+                );
+            }
+            reached.first().copied()
+        }?;
+        self.pin(reached, fingerprint.to_string())
+            .ok()
+            .map(|new| (reached, new))
+    }
+
+    /// The machine `handle`'s own dial last read, while it is pinned to
+    /// none.
+    #[cfg(test)]
+    pub(crate) fn answered_as(&self, handle: ClientHandle) -> Option<String> {
+        self.clients.borrow().answered_as.get(&handle).cloned()
     }
 
     /// The device that dials the machine `handle` reached, when that is
@@ -1119,5 +1192,185 @@ mod one_device_dials_each_machine {
             })
             .await;
         });
+    }
+}
+
+#[cfg(test)]
+mod a_dial_in_goes_to_the_device_that_reached_it {
+    //! Two machines each added the other, and the pairing finished on the
+    //! other machine's dial. Its dial back to be driven made a second device
+    //! here, unnamed and at a free edge, while the device the person added
+    //! stayed unpaired (#257). The device whose own dial read that machine's
+    //! fingerprint is the one its dial-in goes to.
+
+    use super::*;
+
+    const X: &str = "aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa";
+    const Y: &str = "bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb:bb";
+
+    /// A device as add device leaves it: named, at an edge and an address,
+    /// switched on, pinned to `pin`.
+    fn added(m: &ClientManager, name: &str, pos: Position, pin: Option<&str>) -> ClientHandle {
+        m.add_with_config(ConfigClient {
+            label: Some(name.to_string()),
+            ips: HashSet::from(["192.0.2.7".parse().expect("ip")]),
+            hostname: None,
+            port: hops_ipc::DEFAULT_PORT,
+            pos,
+            active: true,
+            enter_hook: None,
+            fingerprint: pin.map(str::to_string),
+            geometry: None,
+        })
+    }
+
+    // LEDGER T257-1 | class B | 1 return value + 6 struct state: ClientManager::claim_for_dial_in after set_answered_as
+    #[test]
+    fn the_device_whose_dial_read_the_machine_is_pinned_to_it_and_no_other_is_made() {
+        let m = ClientManager::default();
+        let desk = added(&m, "desk", Position::Left, None);
+        m.set_answered_as(desk, Some(X.to_string()));
+        let before = m.get_client_states().len();
+
+        assert_eq!(
+            m.claim_for_dial_in(X),
+            Some((desk, true)),
+            "(device, pinned just now) for a dial-in from the machine the desk's own \
+             dial read. None makes the service add a second device for it (#257)."
+        );
+        let (c, s) = m.get_state(desk).expect("the desk");
+        assert_eq!(
+            (
+                s.peer_fingerprint.as_deref(),
+                c.label.as_deref(),
+                c.pos,
+                c.fix_ips.len(),
+                m.get_client_states().len(),
+            ),
+            (Some(X), Some("desk"), Position::Left, 1, before),
+            "(pin, name, edge, addresses, devices): the device the person added has to \
+             become the paired one, as they made it"
+        );
+        assert_eq!(
+            m.claim_for_dial_in(X),
+            Some((desk, false)),
+            "pinned already"
+        );
+    }
+
+    // LEDGER T257-2 | class B | 1 return value: ClientManager::claim_for_dial_in
+    #[test]
+    fn with_no_device_that_reached_the_machine_there_is_none_to_claim() {
+        let m = ClientManager::default();
+        let desk = added(&m, "desk", Position::Left, None);
+        assert_eq!(
+            m.claim_for_dial_in(X),
+            None,
+            "a device whose dial read nothing was claimed by a machine that dialled in"
+        );
+
+        m.set_answered_as(desk, Some(Y.to_string()));
+        assert_eq!(
+            m.claim_for_dial_in(X),
+            None,
+            "a device whose dial read another machine was claimed by this one"
+        );
+        assert_eq!(
+            m.peer_fingerprint(desk),
+            None,
+            "a dial-in from another machine pinned the device"
+        );
+    }
+
+    // LEDGER T257-3 | class B | 1 return value + 6 struct state: ClientManager::claim_for_dial_in
+    #[test]
+    fn a_device_pinned_to_the_machine_wins_over_one_that_only_reached_it() {
+        let m = ClientManager::default();
+        let reached = added(&m, "added again", Position::Left, None);
+        m.set_answered_as(reached, Some(X.to_string()));
+        let pinned = added(&m, "desk", Position::Right, Some(X));
+        assert_eq!(
+            (m.claim_for_dial_in(X), m.peer_fingerprint(reached)),
+            (Some((pinned, false)), None),
+            "(device claimed, pin of the one that only reached it)"
+        );
+    }
+
+    // LEDGER T257-4 | class B | 1 return value + 6 struct state: ClientManager::claim_for_dial_in
+    /// Two devices that reached one machine: the first added is pinned to
+    /// it, and the other is left as it was, a second entry for the machine
+    /// that pins nothing (#12).
+    #[test]
+    fn of_two_devices_that_reached_the_machine_the_first_added_is_claimed() {
+        let m = ClientManager::default();
+        let first = added(&m, "by name", Position::Left, None);
+        let second = added(&m, "by address", Position::Right, None);
+        m.set_answered_as(second, Some(X.to_string()));
+        m.set_answered_as(first, Some(X.to_string()));
+        assert_eq!(
+            (m.claim_for_dial_in(X), m.peer_fingerprint(second)),
+            (Some((first, true)), None),
+            "(device claimed, the other's pin)"
+        );
+    }
+
+    // LEDGER T257-5 | class B | 1 return value + 6 struct state: ClientManager::set_answered_as, set_fix_ips, set_hostname, remove_client, pin
+    /// What a dial read is what it read last, at the addresses the device
+    /// has now, and is a pin of nothing: never saved, and gone with the
+    /// device.
+    #[test]
+    fn what_a_dial_read_is_its_latest_read_at_its_current_address_and_no_pin() {
+        let m = ClientManager::default();
+        let desk = added(&m, "desk", Position::Left, None);
+        m.set_answered_as(desk, Some(X.to_string()));
+        let (c, s) = m.get_state(desk).expect("the desk");
+        assert_eq!(
+            (
+                s.peer_fingerprint.clone(),
+                m.pinned_to(X),
+                config_entry(&c, &s).fingerprint
+            ),
+            (None, vec![], None),
+            "(pin, devices pinned, saved fingerprint): a fingerprint read on a refused \
+             dial pinned the device or was saved"
+        );
+
+        m.set_answered_as(desk, Some(Y.to_string()));
+        assert_eq!(
+            m.claim_for_dial_in(X),
+            None,
+            "an earlier read outlived a later one"
+        );
+        m.set_answered_as(desk, Some(X.to_string()));
+        m.set_fix_ips(desk, vec!["192.0.2.8".parse().expect("ip")]);
+        assert_eq!(
+            m.claim_for_dial_in(X),
+            None,
+            "a read outlived a new address"
+        );
+        m.set_answered_as(desk, Some(X.to_string()));
+        m.set_hostname(desk, Some("desk.local".into()));
+        assert_eq!(m.claim_for_dial_in(X), None, "a read outlived a new name");
+        m.set_answered_as(desk, Some(X.to_string()));
+        m.set_answered_as(desk, None);
+        assert_eq!(
+            m.claim_for_dial_in(X),
+            None,
+            "a read outlived a conflicting one"
+        );
+
+        m.set_answered_as(desk, Some(X.to_string()));
+        m.remove_client(desk);
+        assert_eq!(
+            (m.claim_for_dial_in(X), m.answered_as(desk)),
+            (None, None),
+            "a removed device's read was claimed or kept"
+        );
+        m.set_answered_as(desk, Some(X.to_string()));
+        assert_eq!(
+            m.answered_as(desk),
+            None,
+            "a read recorded for a removed device"
+        );
     }
 }

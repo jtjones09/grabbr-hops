@@ -1176,6 +1176,17 @@ async fn connect_to_handle(
                     .iter()
                     .filter_map(|d| d.proven.lock().expect("lock").take().map(|fp| (d.addr, fp)))
                     .collect();
+                // Which machine this device's address reached, refused or
+                // not, so that machine's dial-in finds this device rather
+                // than a second one for it (#257). Read again on each dial;
+                // addresses that answered as different machines name none.
+                match decide_trust_prompt(&seen) {
+                    TrustPrompt::Offer { addr, fp } if client_manager.targets(handle, addr) => {
+                        client_manager.set_answered_as(handle, Some(fp));
+                    }
+                    TrustPrompt::Conflict => client_manager.set_answered_as(handle, None),
+                    _ => {}
+                }
                 if let Some((addr, fingerprint)) = listed_machine_measured(&seen, &proven, &trust) {
                     log::info!(
                         "client {handle}: {addr} proved it is {fingerprint}, which is listed \
@@ -1298,6 +1309,12 @@ async fn connect_to_handle(
             Landed::Link(link) => (link, None),
             Landed::Pairing { conn, fingerprint } => {
                 let ours = transport::fingerprint_of(&identity.cert);
+                // A pairing that ends on the other machine's dial leaves
+                // this one unpinned: the machine it reached is recorded, as
+                // a refused dial's is (#257).
+                if client_manager.targets(handle, addr) {
+                    client_manager.set_answered_as(handle, Some(fingerprint.clone()));
+                }
                 let confirmed = if client_manager.targets(handle, addr)
                     && client_manager.is_on(handle)
                 {

@@ -7,9 +7,9 @@
 //! backend; each injects into a recording one.
 
 use super::in_process::{DEADLINE, Daemon, Frontend};
-use crate::test_harness::{NEVER_WITHIN, run_local};
+use crate::test_harness::{Machine, NEVER_WITHIN, door, run_local, wait_until};
 use crate::trust::Caps;
-use hops_ipc::{ClientHandle, FrontendEvent, FrontendRequest};
+use hops_ipc::{ClientHandle, FrontendEvent, FrontendRequest, NewDevice};
 use input_capture::{CaptureEvent, Position, scripted::Script};
 use input_emulation::recording::{Recorded, Recording};
 use input_event::{Event, KeyboardEvent, PointerEvent};
@@ -620,5 +620,172 @@ fn a_name_that_resolves_to_nothing_is_told_once_until_it_changes() {
             .await;
         };
         mac.run_while(body).await;
+    });
+}
+
+// LEDGER T257-6 | class B | 2 bytes: FrontendEvent::Created, State and Enumerate over the controlling daemon's IPC socket; 4 file on disk: its saved config
+/// The pc adds the mac at its address, and its dial reads the mac there
+/// and is refused: the pc may not drive it yet. The pairing then finishes
+/// on the mac's own dial, and the mac dials back to be driven. Its link
+/// goes to the device the pc added, which is pinned to the mac and saved
+/// so, at the edge and address it was added with, and no second device is
+/// made for the mac (#257).
+#[test]
+fn a_machine_paired_on_its_own_dial_is_driven_through_the_device_added_for_it() {
+    driven_through_the_device_added_for_it("dup-new", false);
+}
+
+// LEDGER T257-7 | class B | 2 bytes: FrontendEvent::Created, State and Enumerate over the controlling daemon's IPC socket; 4 file on disk: its saved config
+/// As above, with the pc already approving the mac when it adds it: its
+/// dial reaches the mac mid-pairing and compares no number, since the
+/// pairing finishes on the mac's dial instead.
+#[test]
+fn a_machine_paired_on_its_own_dial_mid_pairing_here_is_driven_through_the_device_added_for_it() {
+    driven_through_the_device_added_for_it("dup-mid", true);
+}
+
+/// The mac paired with the pc on its own dial, after the pc added it and
+/// its dial read the mac: the pc approving the mac then, when
+/// `mid_pairing`, or not knowing it at all.
+fn driven_through_the_device_added_for_it(tag: &str, mid_pairing: bool) {
+    run_local(async {
+        let pc = Daemon::start(&format!("{tag}-pc"), "", input_emulation::Backend::Dummy).await;
+        let (pc_fp, pc_port, pc_trust, pc_ipc) =
+            (pc.fingerprint(), pc.port(), pc.trust(), pc.ipc());
+        let (pc_clients, pc_file) = (pc.clients(), pc.config_file());
+        let mac = Daemon::start_paired(
+            &format!("{tag}-mac"),
+            &dials_out_to(&pc_fp, pc_port),
+            &paired_with(&pc_fp),
+            input_capture::Backend::Dummy,
+            input_emulation::Backend::Dummy,
+        )
+        .await;
+        let mac_fp = mac.fingerprint();
+        // The mac's own key answers at the address the pc adds it at.
+        let identity = crate::crypto::load_or_generate_key_and_cert(
+            &mac.config_file().with_file_name("hops.pem"),
+        )
+        .expect("the mac's identity");
+        let its_address = door(&Machine {
+            identity: std::sync::Arc::new(identity),
+            fingerprint: mac_fp.clone(),
+        });
+        its_address.open();
+        if mid_pairing {
+            pc_trust
+                .write()
+                .expect("lock")
+                .issue(&mac_fp, "desk mac", Caps::OUTBOUND)
+                .expect("approve");
+        }
+        let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
+        let body = async {
+            let mut app = Heard::new(pc_ipc.connect().await);
+            app.exchange(&[
+                FrontendRequest::OpenPairing,
+                FrontendRequest::Create(NewDevice {
+                    hostname: None,
+                    fix_ips: vec![loopback],
+                    port: its_address.port,
+                    pos: hops_ipc::Position::Left,
+                }),
+            ])
+            .await;
+            let added = app
+                .until("the device added for the mac", |e| match e {
+                    FrontendEvent::Created(h, _, _) => Some(*h),
+                    _ => None,
+                })
+                .await;
+            // Mid-pairing, the pc's dial waits on a number the door never
+            // sends, and the mac's dial back can arrive meanwhile: what the
+            // dial read has to be known while it still waits.
+            let within = if mid_pairing {
+                crate::pair_ceremony::STEP_TIMEOUT / 2
+            } else {
+                DEADLINE
+            };
+            wait_until("the pc's dial to read the mac", within, || {
+                pc_clients.answered_as(added).as_deref() == Some(mac_fp.as_str())
+            })
+            .await;
+
+            // Paired on the mac's dial: the pc may drive the mac now, and
+            // its own dial no longer reaches it.
+            its_address.shut();
+            pc_trust
+                .write()
+                .expect("lock")
+                .issue_confirmed(&mac_fp, "desk mac", Caps::OUTBOUND)
+                .expect("issue");
+
+            let linked = app
+                .until("the mac's link", |e| match e {
+                    FrontendEvent::State(h, _, s) | FrontendEvent::Created(h, _, s)
+                        if s.peer_fingerprint.as_deref() == Some(mac_fp.as_str())
+                            && s.active_addr.is_some() =>
+                    {
+                        Some(*h)
+                    }
+                    _ => None,
+                })
+                .await;
+            app.exchange(&[FrontendRequest::Enumerate()]).await;
+            let cards = app
+                .backlog
+                .iter()
+                .rev()
+                .find_map(|e| match e {
+                    FrontendEvent::Enumerate(all) => Some(all.clone()),
+                    _ => None,
+                })
+                .expect("the pc's devices");
+            let listed: Vec<_> = cards
+                .iter()
+                .map(|(h, c, s)| (*h, c.pos, c.fix_ips.clone(), s.peer_fingerprint.clone()))
+                .collect();
+            assert_eq!(
+                (linked, listed),
+                (
+                    added,
+                    vec![(
+                        added,
+                        hops_ipc::Position::Left,
+                        vec![loopback],
+                        Some(mac_fp.clone())
+                    )]
+                ),
+                "(device linked, every device listed): the mac's dial-in has to go to the \
+                 device the pc added for it, which becomes the paired one, and not to a \
+                 second device for the same machine"
+            );
+
+            let saved: toml_edit::DocumentMut = std::fs::read_to_string(&pc_file)
+                .expect("the pc's config")
+                .parse()
+                .expect("the saved config parses");
+            let pins: Vec<_> = saved
+                .get("clients")
+                .and_then(|c| c.as_array_of_tables())
+                .map(|a| {
+                    a.iter()
+                        .map(|t| {
+                            t.get("fingerprint")
+                                .and_then(|f| f.as_str())
+                                .map(str::to_string)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                pins,
+                vec![Some(mac_fp.clone())],
+                "the pin the dial-in made was not saved with the device, so a restart \
+                 loses it"
+            );
+        };
+        pc.run_while(mac.run_while(body)).await;
     });
 }

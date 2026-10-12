@@ -565,6 +565,12 @@ impl Door {
         self.open.set(true);
     }
 
+    /// Let no dial in from here on: each one waits unanswered until it
+    /// gives up. Connections already in stay.
+    pub(crate) fn shut(&self) {
+        self.open.set(false);
+    }
+
     /// Streams the dialler has opened across every connection. The first on
     /// each connection carries input; any after it carries clipboard text.
     pub(crate) fn streams(&self) -> u32 {
