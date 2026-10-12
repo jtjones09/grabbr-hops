@@ -482,10 +482,11 @@ struct Dial {
 /// to no machine measured, and an address it proved its key at.
 ///
 /// Measured means every address that answered answered as that one machine,
-/// and at least one of them completed the handshake with its key. What an
+/// and at least one of them signed the handshake with its key. What an
 /// address presented without signing proves nothing: any machine can send
-/// another's certificate, and a certificate is refused before its holder
-/// signs anything.
+/// another's certificate. A certificate refused at the certificate step is
+/// refused before its signature is checked; a measuring dial checks the
+/// signature first (#257).
 fn listed_machine_measured(
     seen: &[(SocketAddr, String)],
     proven: &[(SocketAddr, String)],
@@ -1441,9 +1442,22 @@ async fn connect_to_handle(
                         let _ = persist_tx.send(handle);
                     }
                 }
+                // Pinned meanwhile, by its machine's dial-in, to another
+                // machine than the one this dial reached (#257): the dial
+                // began unpinned, so nothing compared them yet.
+                Err(crate::client::PinRefused::PinnedElsewhere(pin)) => {
+                    drop(open);
+                    log::warn!(
+                        "client {handle}: {addr} is {fp}, and the device was pinned to {pin} \
+                         while dialling it; closing this link"
+                    );
+                    link.conn.close(0u32.into(), b"fingerprint mismatch");
+                    connecting.lock().await.remove(&handle);
+                    return Err(LanMouseConnectionError::FingerprintMismatch);
+                }
                 // One device per machine (#12): this machine is another
                 // device's, so this device pins nothing and keeps no link.
-                Err(other) => {
+                Err(crate::client::PinRefused::Dialled(other)) => {
                     drop(open);
                     log::warn!(
                         "client {handle}: {addr} is {fp}, the machine client {other} \

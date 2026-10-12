@@ -252,8 +252,9 @@ pub fn fingerprint_of(der: &CertificateDer<'_>) -> String {
 /// This is the OUTBOUND question, and it is deliberately not the inbound one.
 ///
 /// A fingerprint in `observed` is only what the receiver presented: a
-/// rejected certificate is rejected before the receiver signs anything, so
-/// it proves nothing. `proven` is set once the receiver's signature over the
+/// certificate refused at this step is refused before its signature is
+/// checked, so it proves nothing. A measuring dial checks the signature
+/// first (#257). `proven` is set once the receiver's signature over the
 /// handshake checked out against that certificate, which only the holder of
 /// its key can make.
 #[derive(Debug)]
@@ -326,6 +327,8 @@ impl FpServerVerifier {
         cert: &CertificateDer<'_>,
         checked: Result<HandshakeSignatureValid, TlsError>,
     ) -> Result<HandshakeSignatureValid, TlsError> {
+        // For a measuring dial this is the only permission check: its
+        // certificate step lets every receiver through.
         let fingerprint = fingerprint_of(cert);
         if let (Ok(_), Some(proven)) = (&checked, &self.proven) {
             *proven.lock().expect("lock") = Some(fingerprint.clone());

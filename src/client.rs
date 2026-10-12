@@ -77,6 +77,24 @@ impl Clients {
     }
 }
 
+/// Why [`ClientManager::pin`] pinned nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PinRefused {
+    /// Another device already dials that machine (#12).
+    Dialled(ClientHandle),
+    /// The device is pinned to another machine already (#257).
+    PinnedElsewhere(String),
+}
+
+impl std::fmt::Display for PinRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dialled(other) => write!(f, "client {other} already dials that machine"),
+            Self::PinnedElsewhere(pin) => write!(f, "it is pinned to {pin}"),
+        }
+    }
+}
+
 /// What a config reload changes: the devices whose entry is gone or edited,
 /// and the entries to add for them. An entry the file still holds unchanged
 /// keeps its device, handle and connection.
@@ -525,26 +543,37 @@ impl ClientManager {
     }
 
     /// Pin `handle` to the machine that proved `fingerprint` on its dial,
-    /// unless another device already dials that machine: then nothing is
-    /// pinned, and that device is returned. Otherwise returns whether the pin
-    /// is new.
+    /// unless another device already dials that machine, or `handle` is
+    /// pinned to another machine already: then nothing is pinned, and the
+    /// refusal says which. Otherwise returns whether the pin is new.
     ///
     /// One device per machine. The same machine added twice, once by name
     /// and once by address, made one card whose name came from one entry and
     /// whose buttons acted on the other (#12). A config saved before this can
     /// still hold two devices pinned to one machine: only the one added
     /// first dials it.
+    ///
+    /// Never another machine in place of the one pinned: a dial begun while
+    /// the device was pinned to none can land after its machine's dial-in
+    /// pinned it (#257). Only revoking the pin clears it for another.
     pub(crate) fn pin(
         &self,
         handle: ClientHandle,
         fingerprint: String,
-    ) -> Result<bool, ClientHandle> {
+    ) -> Result<bool, PinRefused> {
         let mut clients = self.clients.borrow_mut();
+        if let Some(pin) = clients
+            .get(handle)
+            .and_then(|(_, s)| s.peer_fingerprint.clone())
+            .filter(|pin| !pin.eq_ignore_ascii_case(&fingerprint))
+        {
+            return Err(PinRefused::PinnedElsewhere(pin));
+        }
         if let Some(first) = clients.dialler_of(&fingerprint).filter(|&h| h != handle) {
             if clients.entries.contains_key(&handle) {
                 clients.refused_as.insert(handle, fingerprint);
             }
-            return Err(first);
+            return Err(PinRefused::Dialled(first));
         }
         clients.refused_as.remove(&handle);
         clients.answered_as.remove(&handle);
@@ -1206,6 +1235,53 @@ mod one_device_dials_each_machine {
                 d.conn.active_addr(d.handle).is_some()
             })
             .await;
+        });
+    }
+
+    // LEDGER T257-14 | class B | 6 struct state: ClientManager after LanMouseConnection::send's dial, 2 connection closed at a real QUIC receiver
+    /// A device pinned to no machine dials its address. While the dial
+    /// waits, the machine it was added for dials in and the device is
+    /// pinned to it (#257). The dial then reaches another machine this one
+    /// may drive: it keeps no link and the pin stays, rather than the device
+    /// becoming the machine its dial happened to reach.
+    #[test]
+    fn a_dial_that_lands_after_its_device_was_pinned_elsewhere_keeps_the_pin() {
+        run_local(async {
+            let (sender, desk, laptop) = (machine(), machine(), machine());
+            let answering = door(&laptop);
+            let d = dialer(
+                &sender,
+                trust(&sender, &[&desk, &laptop], Caps::OUTBOUND),
+                answering.port,
+                Position::Left,
+            );
+            assert_eq!(d.clients.peer_fingerprint(d.handle), None, "precondition");
+
+            let _ = d.conn.send(ProtoEvent::Ping, d.handle).await;
+            wait_until("the dial to reach the shut door", PATIENCE, || {
+                answering.knocks() > 0
+            })
+            .await;
+            // What the desk's dial-in does while this dial waits.
+            d.clients
+                .pin(d.handle, desk.fingerprint.clone())
+                .expect("precondition: the device was pinned to no machine");
+
+            let closed = answering.closed();
+            answering.open();
+            wait_until("the dial to land", PATIENCE, || {
+                answering.closed() > closed || d.conn.active_addr(d.handle).is_some()
+            })
+            .await;
+            assert_eq!(
+                (
+                    d.clients.peer_fingerprint(d.handle),
+                    d.conn.active_addr(d.handle).is_some(),
+                ),
+                (Some(desk.fingerprint.clone()), false),
+                "(pin, linked): a dial begun before the device was pinned replaced its \
+                 pin with the machine it reached, and kept a link to it"
+            );
         });
     }
 }

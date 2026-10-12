@@ -2431,8 +2431,8 @@ impl Service {
             .label(fp)
             .filter(|l| !l.is_empty());
         let handle = self.client_manager.add_client();
-        if let Err(other) = self.client_manager.pin(handle, fp.to_string()) {
-            log::warn!("client {handle}: {fp} is already client {other}'s machine");
+        if let Err(refused) = self.client_manager.pin(handle, fp.to_string()) {
+            log::warn!("client {handle}: not pinned to {fp}: {refused}");
         }
         self.client_manager.set_label(handle, label);
         self.client_manager.set_dials_us(handle, true);
@@ -2567,9 +2567,7 @@ impl Service {
                 self.publish_discovered();
             }
             Ok(false) => {}
-            Err(other) => log::info!(
-                "client {handle}: {addr} is {fp}, which client {other} is already pinned to"
-            ),
+            Err(refused) => log::info!("client {handle}: {addr} is {fp}, not pinned: {refused}"),
         }
     }
 
