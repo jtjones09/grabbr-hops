@@ -2392,13 +2392,24 @@ impl Service {
 
     /// A machine this one may drive dialled it to be driven (#15). Its link
     /// goes to the device pinned to that machine, found by the fingerprint it
-    /// proved and never by the address it came from. A machine with no
-    /// device here gets one, pinned to it and with no address: only its own
-    /// dial reaches it.
+    /// proved and never by the address it came from. With none pinned, it
+    /// goes to the device whose own dial read that fingerprint, which is
+    /// pinned to it and keeps its name, edge and addresses (#257). A machine
+    /// with neither gets a device, pinned to it and with no address: only
+    /// its own dial reaches it.
     fn handle_dialled_in(&mut self, dialled: crate::listen::DialledIn) {
         let fp = dialled.fingerprint.clone();
-        let handle = match self.client_manager.every_pinned_to(&fp).first() {
-            Some(&handle) => handle,
+        let handle = match self.client_manager.claim_for_dial_in(&fp) {
+            Some((handle, false)) => handle,
+            Some((handle, true)) => {
+                log::info!(
+                    "client {handle}: its own dial read {fp}, which dialled this machine to be \
+                     driven; pinned to it"
+                );
+                self.save_config();
+                self.broadcast_client(handle);
+                handle
+            }
             None => self.add_device_that_dials_us(&fp),
         };
         let adopter = self.adopter.clone();
@@ -2420,8 +2431,8 @@ impl Service {
             .label(fp)
             .filter(|l| !l.is_empty());
         let handle = self.client_manager.add_client();
-        if let Err(other) = self.client_manager.pin(handle, fp.to_string()) {
-            log::warn!("client {handle}: {fp} is already client {other}'s machine");
+        if let Err(refused) = self.client_manager.pin(handle, fp.to_string()) {
+            log::warn!("client {handle}: not pinned to {fp}: {refused}");
         }
         self.client_manager.set_label(handle, label);
         self.client_manager.set_dials_us(handle, true);
@@ -2551,11 +2562,12 @@ impl Service {
                 );
                 self.save_config();
                 self.broadcast_client(handle);
+                // Pinned to a machine with no pairing in force, which the
+                // network list still offered.
+                self.publish_discovered();
             }
             Ok(false) => {}
-            Err(other) => log::info!(
-                "client {handle}: {addr} is {fp}, which client {other} is already pinned to"
-            ),
+            Err(refused) => log::info!("client {handle}: {addr} is {fp}, not pinned: {refused}"),
         }
     }
 
@@ -3473,6 +3485,9 @@ impl Service {
         }
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
         self.notify_frontend(FrontendEvent::TrustUpdated(peers));
+        // The network list leaves out every paired machine: one paired
+        // while add device is open is no longer one to add (#257).
+        self.publish_discovered();
     }
 
     /// Drop what has lapsed, and cut the sessions it was holding open.

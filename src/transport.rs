@@ -252,8 +252,9 @@ pub fn fingerprint_of(der: &CertificateDer<'_>) -> String {
 /// This is the OUTBOUND question, and it is deliberately not the inbound one.
 ///
 /// A fingerprint in `observed` is only what the receiver presented: a
-/// rejected certificate is rejected before the receiver signs anything, so
-/// it proves nothing. `proven` is set once the receiver's signature over the
+/// certificate refused at this step is refused before its signature is
+/// checked, so it proves nothing. A measuring dial checks the signature
+/// first (#257). `proven` is set once the receiver's signature over the
 /// handshake checked out against that certificate, which only the holder of
 /// its key can make.
 #[derive(Debug)]
@@ -295,8 +296,9 @@ impl FpServerVerifier {
     /// For a dial that drives, by a device pinned to no machine: it also
     /// completes the handshake with a machine listed to pair again, and
     /// sets `proven` to the fingerprint whose key signed the handshake
-    /// (#231). Completing it grants nothing: the dial still checks, before
-    /// any stream, that this machine may drive the machine it reached.
+    /// (#231), refusing any other machine only once it signed (#257).
+    /// Completing it grants nothing: the dial still checks, before any
+    /// stream, that this machine may drive the machine it reached.
     pub fn measuring(
         trust: Trust,
         observed: Arc<Mutex<Option<String>>>,
@@ -310,16 +312,63 @@ impl FpServerVerifier {
     }
 
     /// Record `cert` as proven when its signature over the handshake
-    /// checked out.
+    /// checked out, then refuse it unless it is permitted.
+    ///
+    /// A measuring dial lets every certificate through to here, so that a
+    /// machine is refused only after it proved its key (#257): what an
+    /// address presented without signing proves nothing. The refusal is
+    /// the one [`ServerCertVerifier::verify_server_cert`] gives, and rustls
+    /// asks both in the one step that reads the receiver's
+    /// CertificateVerify, before this machine sends a certificate of its
+    /// own, so the machine refused sees the same alert at the same point.
+    /// Accepted are still exactly the permitted machines that signed.
     fn proved(
         &self,
         cert: &CertificateDer<'_>,
         checked: Result<HandshakeSignatureValid, TlsError>,
     ) -> Result<HandshakeSignatureValid, TlsError> {
+        // For a measuring dial this is the only permission check: its
+        // certificate step lets every receiver through.
+        let fingerprint = fingerprint_of(cert);
         if let (Ok(_), Some(proven)) = (&checked, &self.proven) {
-            *proven.lock().expect("lock") = Some(fingerprint_of(cert));
+            *proven.lock().expect("lock") = Some(fingerprint.clone());
         }
-        checked
+        let valid = checked?;
+        if self.permitted(&fingerprint) {
+            Ok(valid)
+        } else {
+            Err(self.refusal())
+        }
+    }
+
+    /// Whether this dial may go on with the machine `fingerprint`.
+    ///
+    /// Or a receiver this machine approved pairing with and has not yet
+    /// compared a number with: far enough to compare it, and no further
+    /// (#167). In either direction: which way control goes is what the
+    /// person approving chose (#220), not which machine dials, and until
+    /// both confirm nothing moves on the connection either way.
+    ///
+    /// A dial to be driven asks the inbound question of the machine it
+    /// reached, and nothing else: it is admitted only by a machine this
+    /// one lets drive it, and a pairing is never made over it.
+    fn permitted(&self, fingerprint: &str) -> bool {
+        let trust = self.trust.read().expect("lock");
+        match self.role {
+            Dialler::Drives => {
+                trust.we_may_drive(fingerprint)
+                    || trust.is_pairing(fingerprint)
+                    || (self.measure_listed && trust.to_pair_again(fingerprint).is_some())
+            }
+            Dialler::IsDriven => trust.may_drive_us(fingerprint),
+        }
+    }
+
+    fn refusal(&self) -> TlsError {
+        TlsError::General(match self.role {
+            Dialler::IsDriven => "we hold no live lease letting that machine drive this one".into(),
+            Dialler::Drives => "we hold no live lease permitting us to drive that receiver".into(),
+        })
     }
 }
 
@@ -333,37 +382,14 @@ impl ServerCertVerifier for FpServerVerifier {
         _now: UnixTime,
     ) -> Result<ServerCertVerified, TlsError> {
         let fingerprint = fingerprint_of(end_entity);
-        // Or a receiver this machine approved pairing with and has not yet
-        // compared a number with: far enough to compare it, and no further
-        // (#167). In either direction: which way control goes is what the
-        // person approving chose (#220), not which machine dials, and until
-        // both confirm nothing moves on the connection either way.
-        //
-        // A dial to be driven asks the inbound question of the machine it
-        // reached, and nothing else: it is admitted only by a machine this
-        // one lets drive it, and a pairing is never made over it.
-        let permitted = {
-            let trust = self.trust.read().expect("lock");
-            match self.role {
-                Dialler::Drives => {
-                    trust.we_may_drive(&fingerprint)
-                        || trust.is_pairing(&fingerprint)
-                        || (self.measure_listed && trust.to_pair_again(&fingerprint).is_some())
-                }
-                Dialler::IsDriven => trust.may_drive_us(&fingerprint),
-            }
-        };
+        let permitted = self.permitted(&fingerprint);
         *self.observed.lock().expect("lock") = Some(fingerprint);
-        if permitted {
+        // A measuring dial refuses at the signature instead, once the
+        // machine proved its key (see `proved`).
+        if permitted || self.proven.is_some() {
             Ok(ServerCertVerified::assertion())
-        } else if self.role == Dialler::IsDriven {
-            Err(TlsError::General(
-                "we hold no live lease letting that machine drive this one".into(),
-            ))
         } else {
-            Err(TlsError::General(
-                "we hold no live lease permitting us to drive that receiver".into(),
-            ))
+            Err(self.refusal())
         }
     }
 

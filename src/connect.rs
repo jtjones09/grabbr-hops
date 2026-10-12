@@ -439,6 +439,30 @@ fn decide_trust_prompt(seen: &[(SocketAddr, String)]) -> TrustPrompt {
     }
 }
 
+/// What a failed dial for a device tells of the machine at its address
+/// (#257): `Some(Some(..))` the machine that signed for its certificate at
+/// an address the device still `dials`, and where; `Some(None)` that its
+/// addresses answered as different machines, so it reached no one machine;
+/// `None` that it learned nothing, and an earlier read stands.
+///
+/// Only a machine that signed counts: what an address presented without
+/// signing proves nothing, as for [`listed_machine_measured`], and any
+/// machine can present another's certificate.
+fn what_the_dial_read(
+    seen: &[(SocketAddr, String)],
+    proven: &[(SocketAddr, String)],
+    dials: impl Fn(SocketAddr) -> bool,
+) -> Option<Option<(SocketAddr, String)>> {
+    match decide_trust_prompt(seen) {
+        TrustPrompt::Offer { fp, .. } => proven
+            .iter()
+            .find(|(at, p)| *p == fp && dials(*at))
+            .map(|(at, _)| Some((*at, fp))),
+        TrustPrompt::Conflict => Some(None),
+        TrustPrompt::Nothing => None,
+    }
+}
+
 /// One address in a parallel dial, with the fingerprint slot for THAT address.
 ///
 /// The slots must not be shared. A hostname resolving to several addresses does
@@ -458,10 +482,11 @@ struct Dial {
 /// to no machine measured, and an address it proved its key at.
 ///
 /// Measured means every address that answered answered as that one machine,
-/// and at least one of them completed the handshake with its key. What an
+/// and at least one of them signed the handshake with its key. What an
 /// address presented without signing proves nothing: any machine can send
-/// another's certificate, and a certificate is refused before its holder
-/// signs anything.
+/// another's certificate. A certificate refused at the certificate step is
+/// refused before its signature is checked; a measuring dial checks the
+/// signature first (#257).
 fn listed_machine_measured(
     seen: &[(SocketAddr, String)],
     proven: &[(SocketAddr, String)],
@@ -1176,6 +1201,14 @@ async fn connect_to_handle(
                     .iter()
                     .filter_map(|d| d.proven.lock().expect("lock").take().map(|fp| (d.addr, fp)))
                     .collect();
+                // Which machine this device's address reached, refused or
+                // not, so that machine's dial-in finds this device rather
+                // than a second one for it (#257).
+                if let Some(read) =
+                    what_the_dial_read(&seen, &proven, |at| client_manager.targets(handle, at))
+                {
+                    client_manager.set_answered_as(handle, read);
+                }
                 if let Some((addr, fingerprint)) = listed_machine_measured(&seen, &proven, &trust) {
                     log::info!(
                         "client {handle}: {addr} proved it is {fingerprint}, which is listed \
@@ -1298,6 +1331,13 @@ async fn connect_to_handle(
             Landed::Link(link) => (link, None),
             Landed::Pairing { conn, fingerprint } => {
                 let ours = transport::fingerprint_of(&identity.cert);
+                // A pairing that ends on the other machine's dial leaves
+                // this one unpinned: the machine it reached, which signed
+                // for its certificate to get this far, is recorded as a
+                // refused dial's is (#257).
+                if client_manager.targets(handle, addr) {
+                    client_manager.set_answered_as(handle, Some((addr, fingerprint.clone())));
+                }
                 let confirmed = if client_manager.targets(handle, addr)
                     && client_manager.is_on(handle)
                 {
@@ -1402,9 +1442,22 @@ async fn connect_to_handle(
                         let _ = persist_tx.send(handle);
                     }
                 }
+                // Pinned meanwhile, by its machine's dial-in, to another
+                // machine than the one this dial reached (#257): the dial
+                // began unpinned, so nothing compared them yet.
+                Err(crate::client::PinRefused::PinnedElsewhere(pin)) => {
+                    drop(open);
+                    log::warn!(
+                        "client {handle}: {addr} is {fp}, and the device was pinned to {pin} \
+                         while dialling it; closing this link"
+                    );
+                    link.conn.close(0u32.into(), b"fingerprint mismatch");
+                    connecting.lock().await.remove(&handle);
+                    return Err(LanMouseConnectionError::FingerprintMismatch);
+                }
                 // One device per machine (#12): this machine is another
                 // device's, so this device pins nothing and keeps no link.
-                Err(other) => {
+                Err(crate::client::PinRefused::Dialled(other)) => {
                     drop(open);
                     log::warn!(
                         "client {handle}: {addr} is {fp}, the machine client {other} \
@@ -2717,6 +2770,248 @@ mod tests {
                      only when the answer at its address proved that machine's key (#231); \
                      proven: {proved:?}"
                 );
+            }
+        });
+    }
+
+    // LEDGER T257-11 | class B | 1 return value: what_the_dial_read over the slots FpServerVerifier::measuring filled on real loopback handshakes
+    /// A dial for a device pinned to no machine reads, for that machine's
+    /// dial-in (#257), the machine that signed for its certificate at the
+    /// device's address. Addresses that answered as different machines read
+    /// as no one machine, which replaces an earlier read; an impostor
+    /// presenting a machine's certificate reads as nothing, which leaves it.
+    #[test]
+    fn a_dial_reads_the_machine_that_signed_and_no_one_when_its_addresses_disagree() {
+        transport::install_crypto_provider();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        tokio::task::LocalSet::new().block_on(&rt, async {
+            let (client, desk, laptop, impostor) = (identity(), identity(), identity(), identity());
+            let (desk_fp, laptop_fp) = (
+                transport::fingerprint_of(&desk.cert),
+                transport::fingerprint_of(&laptop.cert),
+            );
+            // Paired with neither: each dial is refused once the key is proven.
+            let trust: Trust = Arc::new(RwLock::new(
+                crate::trust::TrustStore::new(&transport::fingerprint_of(&client.cert), 0)
+                    .expect("our fingerprint"),
+            ));
+            let client_ep =
+                Endpoint::client("127.0.0.1:0".parse().expect("addr")).expect("client endpoint");
+            let listening = |server: quinn::ServerConfig| {
+                let ep = Endpoint::server(server, "127.0.0.1:0".parse().expect("addr"))
+                    .expect("server endpoint");
+                let addr = ep.local_addr().expect("local addr");
+                spawn_local(async move {
+                    while let Some(incoming) = ep.accept().await {
+                        spawn_local(async move {
+                            let _ = incoming.await;
+                        });
+                    }
+                });
+                addr
+            };
+            let read = |addrs: Vec<SocketAddr>| {
+                let dials: Vec<Dial> = addrs
+                    .into_iter()
+                    .map(|addr| {
+                        let (observed, proven) =
+                            (Arc::new(StdMutex::new(None)), Arc::new(StdMutex::new(None)));
+                        Dial {
+                            addr,
+                            cfg: measuring_client_config(
+                                &client,
+                                trust.clone(),
+                                observed.clone(),
+                                proven.clone(),
+                            ),
+                            observed,
+                            proven,
+                        }
+                    })
+                    .collect();
+                let (client_ep, trust) = (client_ep.clone(), trust.clone());
+                async move {
+                    let dialled = connect_any(&client_ep, &dials, None, &trust, 0).await;
+                    assert!(
+                        dialled.is_err(),
+                        "precondition: a dial to a stranger connected"
+                    );
+                    let slot = |d: &Dial, proven: bool| {
+                        let s = if proven { &d.proven } else { &d.observed };
+                        s.lock().expect("lock").clone().map(|fp| (d.addr, fp))
+                    };
+                    let seen: Vec<_> = dials.iter().filter_map(|d| slot(d, false)).collect();
+                    let proven: Vec<_> = dials.iter().filter_map(|d| slot(d, true)).collect();
+                    what_the_dial_read(&seen, &proven, |_| true)
+                }
+            };
+            let at_desk = listening(open_server(&desk));
+            let at_laptop = listening(open_server(&laptop));
+            let copied = listening(server_signing_as(&desk, &impostor));
+
+            assert_eq!(
+                read(vec![at_desk]).await,
+                Some(Some((at_desk, desk_fp.clone()))),
+                "the machine that signed at the device's address"
+            );
+            assert_eq!(
+                read(vec![at_desk, at_laptop]).await,
+                Some(None),
+                "addresses that answered as {desk_fp} and {laptop_fp} were read as one \
+                 machine, or left an earlier read standing"
+            );
+            assert_eq!(
+                read(vec![copied]).await,
+                None,
+                "a copied certificate signed with another key was read as its machine"
+            );
+        });
+    }
+
+    /// A server for `me` that asks every dialler for its certificate,
+    /// accepts any, and counts the ones presented.
+    fn counting_client_certs(
+        me: &Identity,
+    ) -> (quinn::ServerConfig, Arc<std::sync::atomic::AtomicU32>) {
+        use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+        #[derive(Debug)]
+        struct Counts(
+            Arc<std::sync::atomic::AtomicU32>,
+            Arc<rustls::crypto::CryptoProvider>,
+        );
+        impl ClientCertVerifier for Counts {
+            fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+                &[]
+            }
+            fn verify_client_cert(
+                &self,
+                _: &CertificateDer<'_>,
+                _: &[CertificateDer<'_>],
+                _: rustls::pki_types::UnixTime,
+            ) -> Result<ClientCertVerified, rustls::Error> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ClientCertVerified::assertion())
+            }
+            fn verify_tls12_signature(
+                &self,
+                message: &[u8],
+                cert: &CertificateDer<'_>,
+                dss: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
+                rustls::crypto::verify_tls12_signature(
+                    message,
+                    cert,
+                    dss,
+                    &self.1.signature_verification_algorithms,
+                )
+            }
+            fn verify_tls13_signature(
+                &self,
+                message: &[u8],
+                cert: &CertificateDer<'_>,
+                dss: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
+                rustls::crypto::verify_tls13_signature(
+                    message,
+                    cert,
+                    dss,
+                    &self.1.signature_verification_algorithms,
+                )
+            }
+            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+                self.1.signature_verification_algorithms.supported_schemes()
+            }
+        }
+        let presented = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut crypto = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(Arc::new(Counts(presented.clone(), provider)))
+            .with_single_cert(vec![me.cert.clone()], me.key.clone_key())
+            .expect("server cert");
+        crypto.alpn_protocols = vec![transport::ALPN.to_vec()];
+        let config = quinn::ServerConfig::with_crypto(Arc::new(
+            QuicServerConfig::try_from(crypto).expect("quic server"),
+        ));
+        (config, presented)
+    }
+
+    // LEDGER T257-9 | class B | 1 return value: a real loopback handshake under FpServerVerifier::measuring and client_config; 6 struct state: the proven slot, and the receiver's count of certificates presented to it
+    /// A dial for a device pinned to no machine lets the receiver prove its
+    /// key before refusing it (#257). Nothing refused before is let in: a
+    /// receiver this machine may not drive is refused though it signed, and
+    /// this machine's certificate is never presented to it, by that dial or
+    /// by a pinned device's.
+    #[test]
+    fn a_receiver_that_signs_and_may_not_be_driven_is_refused_without_our_certificate() {
+        transport::install_crypto_provider();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        tokio::task::LocalSet::new().block_on(&rt, async {
+            let (client, stranger, receiver) = (identity(), identity(), identity());
+            let mut store =
+                crate::trust::TrustStore::new(&transport::fingerprint_of(&client.cert), 0)
+                    .expect("our fingerprint");
+            store
+                .issue_confirmed(
+                    &transport::fingerprint_of(&receiver.cert),
+                    "receiver",
+                    crate::trust::Caps::OUTBOUND,
+                )
+                .expect("issue");
+            let trust: Trust = Arc::new(RwLock::new(store));
+            for measuring in [true, false] {
+                for (who, answering, may_drive) in [
+                    ("a stranger", &stranger, false),
+                    ("a receiver this machine may drive", &receiver, true),
+                ] {
+                    let (server, presented) = counting_client_certs(answering);
+                    let ep = Endpoint::server(server, "127.0.0.1:0".parse().expect("addr"))
+                        .expect("server endpoint");
+                    let addr = ep.local_addr().expect("local addr");
+                    spawn_local(async move {
+                        while let Some(incoming) = ep.accept().await {
+                            spawn_local(async move {
+                                if let Ok(conn) = incoming.await {
+                                    tokio::time::sleep(Duration::from_secs(4)).await;
+                                    drop(conn);
+                                }
+                            });
+                        }
+                    });
+                    let (observed, proven) =
+                        (Arc::new(StdMutex::new(None)), Arc::new(StdMutex::new(None)));
+                    let cfg = if measuring {
+                        measuring_client_config(&client, trust.clone(), observed, proven.clone())
+                    } else {
+                        client_config(&client, trust.clone(), observed)
+                    };
+                    let mut client_ep = Endpoint::client("127.0.0.1:0".parse().expect("addr"))
+                        .expect("client endpoint");
+                    client_ep.set_default_client_config(cfg);
+                    let connected = dials_ok(&client_ep, addr).await;
+                    let proved = proven.lock().expect("lock").clone();
+                    assert_eq!(
+                        (
+                            connected,
+                            presented.load(std::sync::atomic::Ordering::SeqCst) > 0,
+                            proved,
+                        ),
+                        (
+                            may_drive,
+                            may_drive,
+                            measuring.then(|| transport::fingerprint_of(&answering.cert)),
+                        ),
+                        "{who}, measuring: {measuring}: (connected, our certificate \
+                         presented to it, key proven)"
+                    );
+                }
             }
         });
     }
