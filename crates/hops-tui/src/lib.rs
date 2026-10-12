@@ -122,6 +122,32 @@ fn answer_key(answers: &mut PairingAnswers, code: KeyCode) -> bool {
     }
 }
 
+/// What a key does on the pairing-approval prompt.
+#[derive(Debug, PartialEq, Eq)]
+enum PromptKey {
+    /// `y`, or Enter: approve, as [`approve_prompt`] allows.
+    Approve,
+    /// One of the prompt's questions was answered ([`answer_key`]).
+    Answered,
+    /// `n` or Esc: deny for now.
+    Deny,
+    /// Any other key.
+    Nothing,
+}
+
+/// The pairing-approval prompt's keys. Enter approves as `y` does
+/// (#254), through the same [`approve_prompt`], so it is refused until a
+/// direction is chosen (#220) and until the prompt has shown the machine
+/// long enough for the key to have been meant for it (#168).
+fn prompt_key(answers: &mut PairingAnswers, code: KeyCode) -> PromptKey {
+    match code {
+        KeyCode::Char('y') | KeyCode::Enter => PromptKey::Approve,
+        code if answer_key(answers, code) => PromptKey::Answered,
+        KeyCode::Char('n') | KeyCode::Esc => PromptKey::Deny,
+        _ => PromptKey::Nothing,
+    }
+}
+
 /// A key on the number card, as the request it sends (#11, #167): `y`
 /// confirms the number this machine shows, `1` to `3` pick one of the three
 /// the machine being added offers, and `n` or Esc ends the pairing ("none of
@@ -573,11 +599,11 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                         }
                     } else if let Some(fp) = pairing.as_ref().map(|a| a.fingerprint.clone()) {
                         // ---- pairing-approval prompt ----
-                        match k.code {
+                        match prompt_key(answers.for_card(&fp), k.code) {
                             // The name prompt that follows is bound to this
                             // machine, and only if the prompt has shown it long
                             // enough for the key to have been meant for it.
-                            KeyCode::Char('y') => {
+                            PromptKey::Approve => {
                                 match approve_prompt(&card, &answers, fp, Instant::now()) {
                                     Ok(naming) => input = Some(naming),
                                     Err(refused) => {
@@ -586,11 +612,10 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                                     }
                                 }
                             }
-                            code if answer_key(answers.for_card(&fp), code) => {}
-                            KeyCode::Char('n') | KeyCode::Esc => {
+                            PromptKey::Deny => {
                                 dismissed.insert(fp, Instant::now());
                             }
-                            _ => {}
+                            PromptKey::Answered | PromptKey::Nothing => {}
                         }
                     } else if show_log {
                         // ---- activity-log overlay ----
@@ -1440,16 +1465,6 @@ fn pairing_popup(
     } else {
         "An untrusted device asks to pair with this machine:".to_string()
     };
-    // Room for the first line as it wraps, and one more row when there is an
-    // address line to render.
-    let inner = (f.area().width as usize * 70 / 100)
-        .saturating_sub(2)
-        .max(1);
-    let wrapped = u16::try_from(wrapped_rows(&first, inner)).unwrap_or(u16::MAX);
-    let rows = 11u16
-        .saturating_add(wrapped.max(1))
-        .saturating_add(u16::from(addr.is_some()));
-    let area = centered_rect(70, rows, f.area());
     let base = Style::default()
         .bg(col(theme.background))
         .fg(col(theme.foreground));
@@ -1514,21 +1529,25 @@ fn pairing_popup(
         ),
     ]));
     body.push(Line::from(Span::raw("")));
-    body.push(if answers.controller.is_some() {
+    // Enter answers as `y` does (#254): once a direction is chosen it is
+    // the key a person reaches for.
+    let keys = if answers.controller.is_some() {
         Line::from(vec![
             Span::styled("y", key),
-            Span::styled(" trust & name      ", muted),
+            Span::styled("/", muted),
+            Span::styled("enter", key),
+            Span::styled(" trust & name    ", muted),
             Span::styled("n", key),
             Span::styled(" deny (for now)", muted),
         ])
     } else {
         Line::from(vec![
             Span::styled("1 2 3", key),
-            Span::styled(" choose first      ", muted),
+            Span::styled(" choose first    ", muted),
             Span::styled("n", key),
             Span::styled(" deny (for now)", muted),
         ])
-    });
+    };
     if let Some(a) = addr {
         // our dial: the address that answered (#93); a knock: where from (#83)
         let line = if ours {
@@ -1538,39 +1557,39 @@ fn pairing_popup(
         };
         body.insert(1, Line::from(Span::styled(line, key)));
     }
-    f.render_widget(Clear, area);
-    f.render_widget(
-        Paragraph::new(body)
-            .wrap(Wrap { trim: false })
-            .style(base)
-            .block(block),
-        area,
-    );
+    card(f, block, body, keys, base);
 }
 
-/// How many rows `text` takes wrapped at word boundaries to `width`
-/// columns, as the card's paragraph wraps it: a word that does not fit on
-/// the row starts the next one.
-fn wrapped_rows(text: &str, width: usize) -> usize {
-    let width = width.max(1);
-    let mut rows = 1;
-    let mut used = 0;
-    for word in text.split(' ') {
-        let len = word.chars().count();
-        let need = if used == 0 { len } else { used + 1 + len };
-        if used > 0 && need > width {
-            rows += 1;
-            used = len;
-        } else {
-            used = need;
-        }
-        // A word longer than the row is broken across rows.
-        while used > width {
-            rows += 1;
-            used -= width;
-        }
-    }
-    rows
+/// Draw a card centered over the frame: `body` wrapped inside `block`, and
+/// under it `keys`, the line naming the keys that answer the card.
+///
+/// The card is as tall as its lines wrap to at its width, every line
+/// counted by the wrapping that draws it (#254): sized by its first line
+/// alone, the approval card cut off its last rows, the keys among them, once
+/// the fingerprint wrapped. On a terminal too short for the whole card the
+/// keys keep the bottom row and the body loses its end instead, so the card
+/// can always be answered.
+fn card(f: &mut Frame, block: Block, body: Vec<Line>, keys: Line, style: Style) {
+    let width = centered_rect(70, 0, f.area())
+        .width
+        .saturating_sub(2)
+        .max(1);
+    let body = Paragraph::new(body).wrap(Wrap { trim: false }).style(style);
+    let keys = Paragraph::new(keys).wrap(Wrap { trim: false }).style(style);
+    let body_rows = body.line_count(width);
+    let key_rows = keys.line_count(width);
+    let rows = body_rows.saturating_add(key_rows).saturating_add(2);
+    let area = centered_rect(70, u16::try_from(rows).unwrap_or(u16::MAX), f.area());
+    let inner = block.inner(area);
+    let key_rows = u16::try_from(key_rows)
+        .unwrap_or(u16::MAX)
+        .min(inner.height);
+    let [body_area, keys_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(key_rows)]).areas(inner);
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+    f.render_widget(body, body_area);
+    f.render_widget(keys, keys_area);
 }
 
 /// Render the number card (#11, #167): on the machine adding the other, the
@@ -1648,26 +1667,9 @@ fn check_popup(f: &mut Frame, card: &PairingCheckCard, theme: &Theme) {
     if show || !card.answered {
         body.extend([numbers, Line::from("")]);
     }
-    body.extend([
-        Line::from(Span::styled(say, base)),
-        Line::from(""),
-        Line::from(keys),
-    ]);
+    body.extend([Line::from(Span::styled(say, base)), Line::from("")]);
     // As tall as what it says: the explanation wraps on a narrow terminal.
-    let inner = centered_rect(70, 0, f.area())
-        .width
-        .saturating_sub(2)
-        .max(1) as usize;
-    let wrapped = say.chars().count().div_ceil(inner).saturating_sub(1);
-    let area = centered_rect(70, (body.len() + wrapped + 2) as u16, f.area());
-    f.render_widget(Clear, area);
-    f.render_widget(
-        Paragraph::new(body)
-            .wrap(Wrap { trim: false })
-            .style(base)
-            .block(block),
-        area,
-    );
+    self::card(f, block, body, Line::from(keys), base);
 }
 
 /// Render a centered overlay of the recent activity log (newest at the bottom).
@@ -3246,6 +3248,364 @@ mod tests {
         let card = answered.pairing_check().expect("a card");
         assert_eq!(check_key(card, KeyCode::Char('2')), None, "answered twice");
         assert_eq!(check_key(card, KeyCode::Esc), Some(cancel));
+    }
+    /// A fingerprint as the daemon sends one: 32 bytes, 95 characters.
+    const FULL_FP: &str = "1e:19:1b:2c:3d:4e:5f:60:71:82:93:a4:b5:c6:d7:e8:\
+                           f9:0a:1b:2c:3d:4e:5f:60:71:82:93:a4:b5:c6:d7:e8";
+
+    /// `ui` drawn at `width` x `height` with `pairing` on the prompt, one
+    /// String per row.
+    fn draw_prompt(
+        model: &AppModel,
+        pairing: Option<&PairingAttempt>,
+        answers: &PairingAnswers,
+        width: u16,
+        height: u16,
+    ) -> Vec<String> {
+        let theme = theme::default_theme();
+        let mut term = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+        term.draw(|f| {
+            ui(
+                f,
+                model,
+                &listable(model),
+                &mut ListState::default(),
+                None,
+                None,
+                pairing,
+                answers,
+                None,
+                false,
+                &theme,
+            )
+        })
+        .expect("draw");
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// The rows inside the card whose top border carries `title`, each
+    /// trimmed at its end; `None` when no such card is drawn.
+    fn card_rows(screen: &[String], title: &str) -> Option<Vec<String>> {
+        let top = screen.iter().position(|r| r.contains(title))?;
+        let row: Vec<char> = screen[top].chars().collect();
+        let first = title.chars().next()?;
+        let at = (0..row.len())
+            .find(|&i| row[i] == first && row[i..].iter().collect::<String>().starts_with(title))?;
+        let left = row[..at].iter().rposition(|&c| c == '┌')?;
+        let right = at + row[at..].iter().position(|&c| c == '┐')?;
+        let mut rows = Vec::new();
+        for line in &screen[top + 1..] {
+            let line: Vec<char> = line.chars().collect();
+            if line.get(left) == Some(&'└') {
+                return Some(rows);
+            }
+            rows.push(
+                line.get(left + 1..right)?
+                    .iter()
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string(),
+            );
+        }
+        None
+    }
+
+    /// Text with every run of whitespace made one space, so words can be
+    /// found across the rows they wrapped onto.
+    fn words(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// Kept for looking at when `HOPS_TUI_RENDERS` names a directory.
+    fn keep_render(name: &str, screen: &[String]) {
+        if let Some(dir) = std::env::var_os("HOPS_TUI_RENDERS") {
+            let _ = std::fs::write(std::path::Path::new(&dir).join(name), screen.join("\n"));
+        }
+    }
+
+    /// A model asking about FULL_FP, knocked or dialled, from `addr` if any;
+    /// for a dial, holding the device it dialled.
+    fn asking(origin: AttemptOrigin, addr: Option<std::net::SocketAddr>) -> AppModel {
+        let mut model = AppModel::default();
+        model.connected = true;
+        if let (AttemptOrigin::OutboundDial, Some(a)) = (origin, addr) {
+            model.apply(FrontendEvent::Created(
+                3,
+                ClientConfig {
+                    hostname: Some("desk-mac.local".into()),
+                    port: a.port(),
+                    ..Default::default()
+                },
+                ClientState {
+                    active: true,
+                    ips: [a.ip()].into(),
+                    ..Default::default()
+                },
+            ));
+        }
+        model.apply(FrontendEvent::ConnectionAttempt {
+            fingerprint: FULL_FP.into(),
+            origin,
+            addr,
+        });
+        model
+    }
+
+    /// The approval card is drawn whole at the sizes a terminal opens at,
+    /// for a knock and for this machine's own dial, with and without an
+    /// address, before and after a direction is chosen: every line of it,
+    /// the full fingerprint, and on its last row the keys that answer it
+    /// (#254). It was sized by its first line alone, so a wrapped
+    /// fingerprint pushed the keys off the card.
+    // LEDGER T1 | class B | 3 widget tree: ui() -> pairing_popup -> card on a ratatui TestBackend
+    #[test]
+    fn the_pairing_prompt_shows_all_it_says_and_its_keys() {
+        let at: std::net::SocketAddr = "192.0.2.7:4242".parse().expect("addr");
+        for (width, height) in [(80u16, 24u16), (60, 20)] {
+            for origin in [AttemptOrigin::Inbound, AttemptOrigin::OutboundDial] {
+                for addr in [None, Some(at)] {
+                    for chosen in [false, true] {
+                        let model = asking(origin, addr);
+                        let shown = PairingCard::default()
+                            .show(&model, Instant::now(), |_| false)
+                            .cloned()
+                            .expect("a prompt");
+                        let mut answers = PairingAnswers::default();
+                        // the clipboard line at its longest
+                        answer_key(answers.for_card(FULL_FP), KeyCode::Char('c'));
+                        if chosen {
+                            answer_key(answers.for_card(FULL_FP), KeyCode::Char('1'));
+                        }
+                        let screen = draw_prompt(&model, Some(&shown), &answers, width, height);
+                        let dial = origin == AttemptOrigin::OutboundDial;
+                        let case = format!(
+                            "{width}x{height} {} {} {}",
+                            if dial { "dial" } else { "knock" },
+                            if addr.is_some() { "addr" } else { "no-addr" },
+                            if chosen { "chosen" } else { "unchosen" },
+                        );
+                        keep_render(
+                            &format!("tui-prompt-{}.txt", case.replace(' ', "-")),
+                            &screen,
+                        );
+                        let all = screen.join("\n");
+                        let title = if dial {
+                            "we dialled this device"
+                        } else {
+                            "pairing request"
+                        };
+                        let rows = card_rows(&screen, title)
+                            .unwrap_or_else(|| panic!("{case}: no card:\n{all}"));
+                        let keys = if chosen {
+                            "y/enter trust & name"
+                        } else {
+                            "1 2 3 choose first"
+                        };
+                        let last = rows.last().map(String::as_str).unwrap_or("");
+                        assert!(
+                            last.contains(keys) && last.contains("n deny (for now)"),
+                            "{case}: the card's last row is not its keys ({keys}):\n{all}"
+                        );
+                        assert!(
+                            rows.concat().contains(FULL_FP),
+                            "{case}: the fingerprint is not all on the card:\n{all}"
+                        );
+                        let said = words(&rows.join(" "));
+                        let first = if dial {
+                            hops_frontend_core::our_dial_words(&model.dialled(&shown))
+                        } else {
+                            "An untrusted device asks to pair with this machine:".into()
+                        };
+                        let mut expected = vec![
+                            words(&first),
+                            "Which machine is in control?".into(),
+                            "share the clipboard: yes, the way control goes".into(),
+                        ];
+                        expected.extend(Controller::ALL.map(|c| c.describe().to_string()));
+                        if let Some(a) = addr {
+                            expected.push(if dial {
+                                format!("{a} answered")
+                            } else {
+                                format!("from {a}")
+                            });
+                        }
+                        for line in expected {
+                            assert!(
+                                said.contains(&line),
+                                "{case}: the card lost \"{line}\":\n{all}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// On a terminal too short for a whole card the keys that answer it
+    /// keep its last row, and the body gives up its end instead (#254).
+    // LEDGER T2 | class B | 3 widget tree: ui() -> pairing_popup, check_popup -> card on a ratatui TestBackend
+    #[test]
+    fn on_a_terminal_too_short_for_a_card_its_keys_stay() {
+        let model = asking(
+            AttemptOrigin::Inbound,
+            Some("192.0.2.7:51234".parse().expect("addr")),
+        );
+        let shown = PairingCard::default()
+            .show(&model, Instant::now(), |_| false)
+            .cloned()
+            .expect("a prompt");
+        let mut answers = PairingAnswers::default();
+        answer_key(answers.for_card(FULL_FP), KeyCode::Char('2'));
+        let numbers = checking(PairingCheck::Show("042917".into()), false);
+        for (width, height) in [(80u16, 12u16), (60, 10)] {
+            let screen = draw_prompt(&model, Some(&shown), &answers, width, height);
+            let all = screen.join("\n");
+            let rows = card_rows(&screen, "pairing request")
+                .unwrap_or_else(|| panic!("{width}x{height}: no card:\n{all}"));
+            assert!(
+                rows.last()
+                    .is_some_and(|r| r.contains("y/enter trust & name")),
+                "{width}x{height}: the keys are off the approval card:\n{all}"
+            );
+            let screen = draw_prompt(&numbers, None, &Default::default(), width, height);
+            let all = screen.join("\n");
+            let rows = card_rows(&screen, "pairing · confirm the number")
+                .unwrap_or_else(|| panic!("{width}x{height}: no number card:\n{all}"));
+            assert!(
+                rows.last().is_some_and(|r| r.contains("y confirm")),
+                "{width}x{height}: the keys are off the number card:\n{all}"
+            );
+        }
+    }
+
+    /// The number card is drawn whole in each of its four states at the
+    /// sizes a terminal opens at, and at 50 columns, where the estimate it
+    /// was sized by fell a row short: where the other machine is, what to
+    /// do, and on its last row the keys that answer it (#254).
+    // LEDGER T3 | class B | 3 widget tree: ui() -> check_popup -> card on a ratatui TestBackend
+    #[test]
+    fn the_number_card_shows_all_it_says_and_its_keys() {
+        let cases = [
+            (
+                "show",
+                PairingCheck::Show("042917".into()),
+                false,
+                "y confirm",
+            ),
+            (
+                "show-answered",
+                PairingCheck::Show("042917".into()),
+                true,
+                "n cancel",
+            ),
+            ("pick", picking(), false, "1-3 pick"),
+            ("pick-answered", picking(), true, "n cancel"),
+        ];
+        for (width, height) in [(80u16, 24u16), (60, 20), (50, 20)] {
+            for (name, check, answered, keys) in cases.clone() {
+                let model = checking(check, answered);
+                let card = model.pairing_check().expect("a number card");
+                let screen = draw_prompt(&model, None, &Default::default(), width, height);
+                keep_render(&format!("tui-number-{name}-{width}x{height}.txt"), &screen);
+                let all = screen.join("\n");
+                let title = if name.starts_with("show") {
+                    "pairing · confirm the number"
+                } else {
+                    "pairing · pick the number"
+                };
+                let rows = card_rows(&screen, title)
+                    .unwrap_or_else(|| panic!("{name} {width}x{height}: no card:\n{all}"));
+                assert!(
+                    rows.last().is_some_and(|r| r.contains(keys)),
+                    "{name} {width}x{height}: the card's last row is not its keys ({keys}):\n{all}"
+                );
+                let said = words(&rows.join(" "));
+                let what = match (name.starts_with("show"), answered) {
+                    (true, false) => "Once this one is picked there, confirm here.",
+                    (true, true) => "Waiting for the other machine to pick it.",
+                    (false, false) => "A wrong pick ends the pairing.",
+                    (false, true) => "Waiting for the other machine to confirm.",
+                };
+                assert!(
+                    said.contains(&words(&card.from())) && said.contains(what),
+                    "{name} {width}x{height}: the card lost what it says:\n{all}"
+                );
+            }
+        }
+    }
+
+    /// Enter on the approval prompt approves as `y` does, through the same
+    /// checks: refused until a direction is chosen (#220) and until the
+    /// prompt has shown the machine long enough (#168) (#254).
+    // LEDGER T4 | class B | 1 return value: prompt_key, approve_prompt
+    #[test]
+    fn enter_approves_the_pairing_prompt_as_y_does() {
+        let model = asking(AttemptOrigin::Inbound, None);
+        let t0 = Instant::now();
+        let mut card = PairingCard::default();
+        card.show(&model, t0, |_| false).expect("a prompt");
+        let mut answers = PairingAnswers::default();
+        let later = t0 + Duration::from_secs(2);
+        assert_eq!(
+            prompt_key(answers.for_card(FULL_FP), KeyCode::Enter),
+            PromptKey::Approve,
+            "Enter does not answer the approval prompt"
+        );
+        assert_eq!(
+            prompt_key(answers.for_card(FULL_FP), KeyCode::Char('y')),
+            PromptKey::Approve
+        );
+        assert!(
+            matches!(
+                approve_prompt(&card, &answers, FULL_FP.into(), later),
+                Err(ApprovalRefused::NoController)
+            ),
+            "approved before anyone chose which way control goes"
+        );
+        assert_eq!(
+            prompt_key(answers.for_card(FULL_FP), KeyCode::Char('3')),
+            PromptKey::Answered
+        );
+        assert!(
+            matches!(
+                approve_prompt(
+                    &card,
+                    &answers,
+                    FULL_FP.into(),
+                    t0 + Duration::from_millis(200)
+                ),
+                Err(ApprovalRefused::JustChanged)
+            ),
+            "a key pressed as the prompt appeared approved it (#168)"
+        );
+        assert!(
+            matches!(
+                approve_prompt(&card, &answers, FULL_FP.into(), later),
+                Ok(Input::TrustedName {
+                    grant: Some((Controller::Both, false)),
+                    ..
+                })
+            ),
+            "Enter with a direction chosen did not open the name prompt"
+        );
+        for (code, does) in [
+            (KeyCode::Char('n'), PromptKey::Deny),
+            (KeyCode::Esc, PromptKey::Deny),
+            (KeyCode::Char('x'), PromptKey::Nothing),
+        ] {
+            assert_eq!(
+                prompt_key(answers.for_card(FULL_FP), code),
+                does,
+                "{code:?}"
+            );
+        }
     }
 }
 
