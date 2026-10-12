@@ -50,6 +50,9 @@ struct Log {
     /// Can start again with nothing shown to the user, as the libei
     /// backend can with a restore token.
     unasked: bool,
+    /// Whether the desktop session is locked, as logind answers it for the
+    /// libei backend: `None` when it cannot be read.
+    locked: Option<bool>,
 }
 
 type Shared = Arc<Mutex<Log>>;
@@ -87,6 +90,7 @@ impl Recording {
             refused: false,
             as_mac: false,
             unasked: false,
+            locked: Some(false),
         }));
         REGISTRY
             .lock()
@@ -126,6 +130,12 @@ impl Recording {
         self.log.lock().expect("recording log").unasked = true;
     }
 
+    /// Answer `locked` when asked whether the desktop session is locked:
+    /// `None` as when logind cannot be read.
+    pub fn lock_session(&self, locked: Option<bool>) {
+        self.log.lock().expect("recording log").locked = locked;
+    }
+
     /// Make creating a backend fail as it does on a Mac that has not
     /// granted hops Accessibility.
     pub fn refuse_permission(&self) {
@@ -148,6 +158,18 @@ impl Drop for Recording {
             }
         }
     }
+}
+
+/// What the recording `id` answers when asked whether the desktop session
+/// is locked; `None` once the recording is dropped.
+pub(crate) fn session_locked(id: RecordingId) -> Option<bool> {
+    let log = REGISTRY
+        .lock()
+        .expect("recording registry")
+        .as_ref()
+        .and_then(|registry| registry.get(&id).cloned())?;
+    let locked = log.lock().expect("recording log").locked;
+    locked
 }
 
 pub(crate) struct RecordingEmulation {

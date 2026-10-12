@@ -13,9 +13,13 @@ use std::{
 };
 use tokio::task::JoinHandle;
 
-use ashpd::desktop::{
-    PersistMode, Session,
-    remote_desktop::{DeviceType, RemoteDesktop, SelectDevicesOptions},
+use ashpd::{
+    desktop::{
+        PersistMode, Session,
+        remote_desktop::{DeviceType, RemoteDesktop, SelectDevicesOptions},
+    },
+    zbus,
+    zvariant::OwnedObjectPath,
 };
 use async_trait::async_trait;
 
@@ -107,6 +111,68 @@ fn write_token(token: &str) -> io::Result<()> {
 /// shows the dialog.
 fn starts_unasked(token_saved: bool, stored: Option<String>) -> bool {
     token_saved && stored.is_some_and(|token| !token.is_empty())
+}
+
+/// Whether the user's graphical session is locked, read from logind
+/// (#258): the session the user's `Display` names. A daemon a service
+/// manager started runs in a session of its own, which says nothing about
+/// the screen. `None` when logind cannot say.
+///
+/// An automatic restart waits while the screen is locked: the portal may
+/// refuse a start then, and a refused start spends the restore token, so
+/// the start the user asks for after unlocking would show the dialog.
+pub(crate) async fn session_locked() -> Option<bool> {
+    match locked_hint().await {
+        Ok(locked) => Some(locked),
+        Err(e) => {
+            log::warn!("cannot read from logind whether the screen is locked: {e}");
+            None
+        }
+    }
+}
+
+/// A proxy for the logind object at `path` that reads every property
+/// afresh: a cached `LockedHint` could say unlocked after a new lock.
+async fn login1(
+    conn: &zbus::Connection,
+    path: OwnedObjectPath,
+    interface: &'static str,
+) -> zbus::Result<zbus::Proxy<'static>> {
+    zbus::proxy::Builder::new(conn)
+        .destination("org.freedesktop.login1")?
+        .path(path)?
+        .interface(interface)?
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await
+}
+
+/// `LockedHint` of the graphical session of the user this daemon runs as.
+async fn locked_hint() -> zbus::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let uid = fs::metadata("/proc/self")
+        .map_err(|e| zbus::Error::InputOutput(Arc::new(e)))?
+        .uid();
+    let conn = zbus::Connection::system().await?;
+    let manager = login1(
+        &conn,
+        OwnedObjectPath::try_from("/org/freedesktop/login1")?,
+        "org.freedesktop.login1.Manager",
+    )
+    .await?;
+    let user: OwnedObjectPath = manager.call("GetUser", &(uid,)).await?;
+    let user = login1(&conn, user, "org.freedesktop.login1.User").await?;
+    let (id, session): (String, OwnedObjectPath) = user.get_property("Display").await?;
+    if id.is_empty() {
+        return Err(zbus::Error::Failure(
+            "the user has no graphical session".into(),
+        ));
+    }
+    login1(&conn, session, "org.freedesktop.login1.Session")
+        .await?
+        .get_property("LockedHint")
+        .await
 }
 
 /// Microseconds since the Unix epoch, or 0 on a clock set before it.

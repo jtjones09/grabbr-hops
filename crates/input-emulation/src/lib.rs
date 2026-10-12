@@ -502,6 +502,21 @@ impl InputEmulation {
         self.emulation.starts_unasked()
     }
 
+    /// Whether the desktop session `backend` starts in is locked, where an
+    /// automatic restart of it depends on that; `None` when it cannot be
+    /// read (#258). Only libei depends on it: the portal may refuse a start
+    /// on a locked screen, which spends the restore token. Every other
+    /// backend answers unlocked.
+    pub async fn session_locked(backend: Backend) -> Option<bool> {
+        match backend {
+            #[cfg(libei)]
+            Backend::Libei => libei::session_locked().await,
+            #[cfg(feature = "recording")]
+            Backend::Recording(id) => recording::session_locked(id),
+            _ => Some(false),
+        }
+    }
+
     /// Whether any handle holds a key or a button down on this machine. While
     /// one does, the backend may repeat the key with no event arriving.
     pub fn holds_anything(&self) -> bool {

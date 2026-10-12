@@ -1,7 +1,7 @@
 use crate::config::{local_caps, local_commit};
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
 use crate::restart::{RESTART_AFTER, restart_wait};
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt, future::LocalBoxFuture};
 use hops_proto::{Position, ProtoEvent};
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError, Restart};
 use input_event::{Event, PointerEvent};
@@ -983,6 +983,67 @@ fn restart_of(e: &InputEmulationError, unasked: bool) -> Option<Restart> {
     e.restart().filter(|_| unasked)
 }
 
+/// What an automatic restart does, from what is known of the screen lock
+/// (#258).
+#[derive(Debug, PartialEq, Eq)]
+enum Gate {
+    /// Start: the session is unlocked.
+    Go,
+    /// Ask again later: the session is locked.
+    Wait,
+    /// Leave it to the user: whether the session is locked cannot be read,
+    /// and a start on a locked screen could spend the restore token.
+    WaitForUser,
+}
+
+/// An automatic restart starts only on a session known to be unlocked.
+fn gate(locked: Option<bool>) -> Gate {
+    match locked {
+        Some(false) => Gate::Go,
+        Some(true) => Gate::Wait,
+        None => Gate::WaitForUser,
+    }
+}
+
+/// Wait until `at`, then until the session `backend` starts in is unlocked,
+/// asking every [`RESTART_AFTER`]: `Some(backend)` to start it, or `None`
+/// when whether it is locked cannot be read and only the user starts it
+/// (#258).
+async fn restart_when_unlocked(
+    at: tokio::time::Instant,
+    backend: input_emulation::Backend,
+) -> Option<input_emulation::Backend> {
+    tokio::time::sleep_until(at).await;
+    let mut said = false;
+    loop {
+        match gate(InputEmulation::session_locked(backend).await) {
+            Gate::Go => return Some(backend),
+            Gate::Wait => {
+                if !said {
+                    log::info!("input emulation starts again once the screen is unlocked");
+                    said = true;
+                }
+                tokio::time::sleep(RESTART_AFTER).await;
+            }
+            Gate::WaitForUser => {
+                log::warn!(
+                    "cannot tell whether the screen is locked: input emulation starts \
+                     again only when switched on"
+                );
+                return None;
+            }
+        }
+    }
+}
+
+/// `restart`, or never when there is none.
+async fn until_restart<T>(restart: &mut Option<LocalBoxFuture<'static, T>>) -> T {
+    match restart {
+        Some(restart) => restart.as_mut().await,
+        None => std::future::pending().await,
+    }
+}
+
 impl EmulationTask {
     async fn run(mut self) {
         let mut waited: Option<Duration> = None;
@@ -1016,15 +1077,19 @@ impl EmulationTask {
             if self.exit_requested.get() {
                 break;
             }
-            // wait for reenable request, or the restart
+            // wait for reenable request, or the restart. The user's request
+            // is never held back by the screen lock.
+            let mut restart =
+                restart_at.map(|(at, backend)| restart_when_unlocked(at, backend).boxed_local());
             loop {
                 tokio::select! {
-                    _ = tokio::time::sleep_until(
-                        restart_at.map_or_else(tokio::time::Instant::now, |(at, _)| at)
-                    ), if restart_at.is_some() => {
-                        self.restart_with = restart_at.map(|(_, backend)| backend);
-                        break;
-                    }
+                    again = until_restart(&mut restart) => match again {
+                        Some(backend) => {
+                            self.restart_with = Some(backend);
+                            break;
+                        }
+                        None => restart = None,
+                    },
                     r = self.request_rx.recv() => match r.expect("channel closed") {
                         ProxyRequest::Reenable => break,
                         ProxyRequest::Terminate => return,
@@ -1033,7 +1098,7 @@ impl EmulationTask {
                         // The system no longer grants what the backend
                         // needs: no restart until the permission watch or
                         // the user asks for one.
-                        ProxyRequest::StopForMissing(..) => restart_at = None,
+                        ProxyRequest::StopForMissing(..) => restart = None,
                         ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
                     },
                 }
@@ -3507,6 +3572,63 @@ mod held_input_is_released {
             );
         });
     }
+
+    // LEDGER | behaviour | 1 Emulation::event while the session reads locked, then unlocked
+    /// A start on a locked screen can spend the portal's restore token, after
+    /// which the start the user asks for shows the dialog (#258). An
+    /// automatic restart waits for the unlock, then starts.
+    #[test]
+    fn emulation_starts_again_only_once_the_screen_is_unlocked() {
+        run_local(async {
+            let mut s = running(true).await;
+            s.inject(key(KEY_A, 1)).await;
+            s.inject(key(KEY_A, 0)).await;
+
+            s.recording.lock_session(Some(true));
+            end_the_session(&s).await;
+            // Three times the first wait before a restart.
+            let locked = told_until_enabled(&mut s, 3 * RESTART_AFTER).await;
+            s.recording.fail_when(|_| false);
+            s.recording.lock_session(Some(false));
+            let unlocked = told_until_enabled(&mut s, Duration::from_secs(10)).await;
+            assert_eq!(
+                (locked, unlocked),
+                (vec!["disabled", "failed"], vec!["enabled"]),
+                "(what emulation told the service while the screen was locked, after \
+                 it was unlocked). It must not start while locked, and start after"
+            );
+        });
+    }
+
+    // LEDGER | behaviour | 1 Emulation::event when the lock cannot be read, then with a Reenable
+    /// Not knowing whether the screen is locked is treated as locked for
+    /// good: only the user starts emulation, and the user is never held
+    /// back by it (#258).
+    #[test]
+    fn emulation_that_cannot_read_the_lock_waits_for_the_user() {
+        run_local(async {
+            let mut s = running(true).await;
+            s.inject(key(KEY_A, 1)).await;
+            s.inject(key(KEY_A, 0)).await;
+
+            s.recording.lock_session(None);
+            end_the_session(&s).await;
+            let unread = told_until_enabled(&mut s, 2 * RESTART_AFTER).await;
+            s.recording.fail_when(|_| false);
+            // Readable again, and unlocked: still nothing without the user.
+            s.recording.lock_session(Some(false));
+            let readable = told_until_enabled(&mut s, 3 * RESTART_AFTER).await;
+            s.recording.lock_session(None);
+            s.emulation.reenable();
+            let asked = told_until_enabled(&mut s, Duration::from_secs(10)).await;
+            assert_eq!(
+                (unread, readable, asked),
+                (vec!["disabled", "failed"], vec![], vec!["enabled"]),
+                "(what emulation told the service while the lock could not be read, once \
+                 it could, after the user asked). Only the user's request may start it"
+            );
+        });
+    }
 }
 
 #[cfg(test)]
@@ -3514,11 +3636,21 @@ mod emulation_starts_again_only_unasked {
     //! Which ends of emulation start it again without the user asking
     //! (#258).
 
-    use super::restart_of;
+    use super::{Gate, gate, restart_of};
     use input_emulation::recording::RecordingEmulationCreationError;
     use input_emulation::{
         EmulationCreationError, EmulationError, InputEmulationError, Permission, Restart,
     };
+
+    // LEDGER | behaviour | 1 return value: gate for each answer about the screen lock
+    #[test]
+    fn an_automatic_restart_starts_only_on_a_session_known_to_be_unlocked() {
+        assert_eq!(
+            [gate(Some(false)), gate(Some(true)), gate(None)],
+            [Gate::Go, Gate::Wait, Gate::WaitForUser],
+            "(unlocked, locked, cannot be read)"
+        );
+    }
 
     // LEDGER | behaviour | 1 return value: restart_of for each way emulation ends
     #[test]
