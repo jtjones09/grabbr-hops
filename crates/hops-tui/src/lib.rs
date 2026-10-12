@@ -85,7 +85,31 @@ fn approve_prompt(
         fp,
         buf: String::new(),
         grant: answers.controller.map(|c| (c, answers.clipboard)),
+        quiet_from: now,
     })
+}
+
+/// How long the name prompt a trust opens must go without Enter before
+/// Enter answers it (#254): Enter approves the card too, and one held Enter
+/// must not go from the card to a trusted device under the default name.
+const NAME_QUIET: Duration = Duration::from_millis(300);
+
+/// Whether Enter at `now` is ignored by `input`: on the name prompt a trust
+/// opened, until [`NAME_QUIET`] has passed since it opened or since the last
+/// Enter it ignored, so a held key's repeats never get through. Any other
+/// prompt takes Enter at once.
+fn ignores_enter(input: &mut Input, now: Instant) -> bool {
+    match input {
+        Input::TrustedName {
+            grant: Some(_),
+            quiet_from,
+            ..
+        } if now.saturating_duration_since(*quiet_from) < NAME_QUIET => {
+            *quiet_from = now;
+            true
+        }
+        _ => false,
+    }
 }
 
 /// The port edit `o` opens, or why there is none: a machine that only
@@ -193,6 +217,9 @@ enum Input {
         fp: String,
         buf: String,
         grant: Option<(Controller, bool)>,
+        /// When this prompt opened, or last ignored an Enter
+        /// ([`ignores_enter`]).
+        quiet_from: Instant,
     },
     /// Editing the daemon's listen port.
     Port { buf: String },
@@ -256,6 +283,7 @@ fn name_input(d: &Device) -> Option<Input> {
             fp: fp.clone(),
             buf: d.label.clone(),
             grant: None,
+            quiet_from: Instant::now(),
         }),
         _ => None,
     }
@@ -507,6 +535,10 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                     if input.is_some() {
                         // ---- text-input mode ----
                         match k.code {
+                            KeyCode::Enter
+                                if input
+                                    .as_mut()
+                                    .is_some_and(|i| ignores_enter(i, Instant::now())) => {}
                             KeyCode::Enter => match input.take().expect("input set") {
                                 // The whole device in one request (#32).
                                 Input::Add { buf } => match parse_target(&buf).and_then(
@@ -537,7 +569,7 @@ pub async fn run(launch: Launch) -> Result<(), TuiError> {
                                         fingerprint: pin,
                                     });
                                 }
-                                Input::TrustedName { fp, buf, grant } => match grant {
+                                Input::TrustedName { fp, buf, grant, .. } => match grant {
                                     // the same request, and the same fallback
                                     // name, the GUI sends
                                     Some((controller, clipboard)) => {
@@ -3358,17 +3390,24 @@ mod tests {
         model
     }
 
-    /// The approval card is drawn whole at the sizes a terminal opens at,
-    /// for a knock and for this machine's own dial, with and without an
-    /// address, before and after a direction is chosen: every line of it,
-    /// the full fingerprint, and on its last row the keys that answer it
-    /// (#254). It was sized by its first line alone, so a wrapped
-    /// fingerprint pushed the keys off the card.
+    /// The terminal sizes a card is checked at: every width from 40 to 160
+    /// columns with room for the whole card, since a card sized by the wrong
+    /// width loses a row at some widths and not others, then `small`.
+    fn card_sizes(small: &[(u16, u16)]) -> impl Iterator<Item = (u16, u16)> + '_ {
+        (40u16..=160).map(|w| (w, 60)).chain(small.iter().copied())
+    }
+
+    /// The approval card is drawn whole at every width from 40 to 160
+    /// columns and at the sizes a terminal opens at, for a knock and for
+    /// this machine's own dial, with and without an address, before and
+    /// after a direction is chosen: every line of it, the full fingerprint,
+    /// and last the keys that answer it (#254). It was sized by its first
+    /// line alone, so a wrapped fingerprint pushed the keys off the card.
     // LEDGER T1 | class B | 3 widget tree: ui() -> pairing_popup -> card on a ratatui TestBackend
     #[test]
     fn the_pairing_prompt_shows_all_it_says_and_its_keys() {
         let at: std::net::SocketAddr = "192.0.2.7:4242".parse().expect("addr");
-        for (width, height) in [(80u16, 24u16), (60, 20)] {
+        for (width, height) in card_sizes(&[(80, 24), (60, 20)]) {
             for origin in [AttemptOrigin::Inbound, AttemptOrigin::OutboundDial] {
                 for addr in [None, Some(at)] {
                     for chosen in [false, true] {
@@ -3404,20 +3443,19 @@ mod tests {
                         let rows = card_rows(&screen, title)
                             .unwrap_or_else(|| panic!("{case}: no card:\n{all}"));
                         let keys = if chosen {
-                            "y/enter trust & name"
+                            "y/enter trust & name n deny (for now)"
                         } else {
-                            "1 2 3 choose first"
+                            "1 2 3 choose first n deny (for now)"
                         };
-                        let last = rows.last().map(String::as_str).unwrap_or("");
+                        let said = words(&rows.join(" "));
                         assert!(
-                            last.contains(keys) && last.contains("n deny (for now)"),
-                            "{case}: the card's last row is not its keys ({keys}):\n{all}"
+                            said.ends_with(keys),
+                            "{case}: the card does not end with its keys ({keys}):\n{all}"
                         );
                         assert!(
                             rows.concat().contains(FULL_FP),
                             "{case}: the fingerprint is not all on the card:\n{all}"
                         );
-                        let said = words(&rows.join(" "));
                         let first = if dial {
                             hops_frontend_core::our_dial_words(&model.dialled(&shown))
                         } else {
@@ -3485,10 +3523,11 @@ mod tests {
         }
     }
 
-    /// The number card is drawn whole in each of its four states at the
-    /// sizes a terminal opens at, and at 50 columns, where the estimate it
-    /// was sized by fell a row short: where the other machine is, what to
-    /// do, and on its last row the keys that answer it (#254).
+    /// The number card is drawn whole in each of its four states at every
+    /// width from 40 to 160 columns and at the sizes a terminal opens at:
+    /// where the other machine is, the numbers, what to do, and last the
+    /// keys that answer it (#254). The estimate it was sized by fell a row
+    /// short at 50 to 52 columns.
     // LEDGER T3 | class B | 3 widget tree: ui() -> check_popup -> card on a ratatui TestBackend
     #[test]
     fn the_number_card_shows_all_it_says_and_its_keys() {
@@ -3497,7 +3536,7 @@ mod tests {
                 "show",
                 PairingCheck::Show("042917".into()),
                 false,
-                "y confirm",
+                "y confirm n cancel",
             ),
             (
                 "show-answered",
@@ -3505,38 +3544,54 @@ mod tests {
                 true,
                 "n cancel",
             ),
-            ("pick", picking(), false, "1-3 pick"),
+            ("pick", picking(), false, "1-3 pick n none of these"),
             ("pick-answered", picking(), true, "n cancel"),
         ];
-        for (width, height) in [(80u16, 24u16), (60, 20), (50, 20)] {
+        for (width, height) in card_sizes(&[(80, 24), (60, 20), (50, 20)]) {
             for (name, check, answered, keys) in cases.clone() {
                 let model = checking(check, answered);
                 let card = model.pairing_check().expect("a number card");
                 let screen = draw_prompt(&model, None, &Default::default(), width, height);
                 keep_render(&format!("tui-number-{name}-{width}x{height}.txt"), &screen);
                 let all = screen.join("\n");
-                let title = if name.starts_with("show") {
-                    "pairing · confirm the number"
-                } else {
-                    "pairing · pick the number"
-                };
-                let rows = card_rows(&screen, title)
+                // the start of either title, which a narrow card cuts short
+                let rows = card_rows(&screen, "pairing · ")
                     .unwrap_or_else(|| panic!("{name} {width}x{height}: no card:\n{all}"));
-                assert!(
-                    rows.last().is_some_and(|r| r.contains(keys)),
-                    "{name} {width}x{height}: the card's last row is not its keys ({keys}):\n{all}"
-                );
                 let said = words(&rows.join(" "));
-                let what = match (name.starts_with("show"), answered) {
-                    (true, false) => "Once this one is picked there, confirm here.",
-                    (true, true) => "Waiting for the other machine to pick it.",
-                    (false, false) => "A wrong pick ends the pairing.",
-                    (false, true) => "Waiting for the other machine to confirm.",
-                };
                 assert!(
-                    said.contains(&words(&card.from())) && said.contains(what),
-                    "{name} {width}x{height}: the card lost what it says:\n{all}"
+                    said.ends_with(keys),
+                    "{name} {width}x{height}: the card does not end with its keys ({keys}):\n{all}"
                 );
+                let show = name.starts_with("show");
+                let mut expected = vec![
+                    words(&card.from()),
+                    match (show, answered) {
+                        (true, false) => {
+                            "The other machine asks which of three numbers it sees. Once \
+                             this one is picked there, confirm here."
+                        }
+                        (true, true) => "Confirmed here. Waiting for the other machine to pick it.",
+                        (false, false) => {
+                            "Which number does the other machine show? A wrong pick ends \
+                             the pairing."
+                        }
+                        (false, true) => "Picked. Waiting for the other machine to confirm.",
+                    }
+                    .to_string(),
+                ];
+                match (show, answered) {
+                    (true, _) => expected.push("042 917".into()),
+                    (false, false) => {
+                        expected.extend(["1 318 204", "2 042 917", "3 775 061"].map(String::from))
+                    }
+                    (false, true) => {}
+                }
+                for line in expected {
+                    assert!(
+                        said.contains(&line),
+                        "{name} {width}x{height}: the card lost \"{line}\":\n{all}"
+                    );
+                }
             }
         }
     }
@@ -3606,6 +3661,47 @@ mod tests {
                 "{code:?}"
             );
         }
+    }
+
+    /// The name prompt a trust opens ignores Enter until it has gone 300 ms
+    /// without one, so a held Enter that approved the card cannot also name
+    /// the device and trust it (#254). A rename takes Enter at once.
+    // LEDGER T8 | class B | 1 return value + 6 struct state: approve_prompt, ignores_enter
+    #[test]
+    fn a_held_enter_does_not_trust_the_device_it_approved() {
+        let model = asking(AttemptOrigin::Inbound, None);
+        let t0 = Instant::now();
+        let mut card = PairingCard::default();
+        card.show(&model, t0, |_| false).expect("a prompt");
+        let mut answers = PairingAnswers::default();
+        answer_key(answers.for_card(FULL_FP), KeyCode::Char('1'));
+        let opened = t0 + Duration::from_secs(2);
+        let mut naming =
+            approve_prompt(&card, &answers, FULL_FP.into(), opened).expect("the name prompt");
+        let ms = |n: u64| opened + Duration::from_millis(n);
+        // A held key repeats every 30 ms or so once it starts repeating.
+        for at in [0, 250, 280, 310, 340, 560] {
+            assert!(
+                ignores_enter(&mut naming, ms(at)),
+                "an Enter {at} ms after the name prompt opened, while Enter was \
+                 still arriving, named and trusted the device"
+            );
+        }
+        assert!(
+            !ignores_enter(&mut naming, ms(560 + 300)),
+            "an Enter after 300 ms without one was ignored"
+        );
+
+        let mut rename = Input::TrustedName {
+            fp: FULL_FP.into(),
+            buf: "desk".into(),
+            grant: None,
+            quiet_from: opened,
+        };
+        assert!(
+            !ignores_enter(&mut rename, opened),
+            "a rename ignored Enter"
+        );
     }
 }
 
