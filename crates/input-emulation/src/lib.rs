@@ -113,6 +113,35 @@ impl Display for Backend {
     }
 }
 
+/// Whether the screen shield (the lock screen, or the curtain an idle
+/// screen fades to before it locks) is up on the desktop a backend runs on
+/// (#258). GNOME closes every remote-desktop session while it is up and
+/// refuses new ones, and a refused start spends the portal's restore token.
+pub struct ShieldWatch(Watch);
+
+enum Watch {
+    #[cfg(libei)]
+    Libei(libei::Shield),
+    #[cfg(feature = "recording")]
+    Recording(recording::RecordingId),
+    /// A backend whose desktop has no shield to read.
+    Unwatched,
+}
+
+impl ShieldWatch {
+    /// Whether the shield is up; `None` when that cannot be read, which a
+    /// backend nothing watches always answers.
+    pub async fn up(&mut self) -> Option<bool> {
+        match &mut self.0 {
+            #[cfg(libei)]
+            Watch::Libei(shield) => shield.up().await,
+            #[cfg(feature = "recording")]
+            Watch::Recording(id) => recording::shield_up(*id),
+            Watch::Unwatched => None,
+        }
+    }
+}
+
 pub struct InputEmulation {
     /// The backend actually selected. `new()` falls back down a list, so this is
     /// NOT necessarily what was asked for — and a fallback to `Dummy` silently
@@ -502,19 +531,22 @@ impl InputEmulation {
         self.emulation.starts_unasked()
     }
 
-    /// Whether the desktop session `backend` starts in is locked, where an
-    /// automatic restart of it depends on that; `None` when it cannot be
-    /// read (#258). Only libei depends on it: the portal may refuse a start
-    /// on a locked screen, which spends the restore token. Every other
-    /// backend answers unlocked.
-    pub async fn session_locked(backend: Backend) -> Option<bool> {
-        match backend {
+    /// Resolves with the error when the system ends the session with no
+    /// event injected; see [`Emulation::ended`].
+    pub async fn ended(&mut self) -> EmulationError {
+        self.emulation.ended().await
+    }
+
+    /// A watch on the screen shield of the desktop `backend` runs on, which
+    /// decides whether it starts again on its own (#258).
+    pub fn shield_watch(backend: Backend) -> ShieldWatch {
+        ShieldWatch(match backend {
             #[cfg(libei)]
-            Backend::Libei => libei::session_locked().await,
+            Backend::Libei => Watch::Libei(libei::Shield::default()),
             #[cfg(feature = "recording")]
-            Backend::Recording(id) => recording::session_locked(id),
-            _ => Some(false),
-        }
+            Backend::Recording(id) => Watch::Recording(id),
+            _ => Watch::Unwatched,
+        })
     }
 
     /// Whether any handle holds a key or a button down on this machine. While
@@ -570,6 +602,13 @@ trait Emulation: Send {
     /// been through why it can say so.
     fn starts_unasked(&self) -> bool {
         false
+    }
+    /// Resolves when the system ends the session with no event injected,
+    /// such as the compositor closing the libei stream, so the end is
+    /// known when it happens rather than at the next event (#258). Never,
+    /// by default.
+    async fn ended(&mut self) -> EmulationError {
+        std::future::pending().await
     }
     /// Adaptive-edge signal (see [`InputEmulation::take_edge_push`]). Backends
     /// without a detector keep the default: never signals.

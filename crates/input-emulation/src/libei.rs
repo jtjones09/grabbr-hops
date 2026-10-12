@@ -11,7 +11,7 @@ use std::{
     },
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::task::JoinHandle;
+use tokio::{sync::Notify, task::JoinHandle};
 
 use ashpd::{
     desktop::{
@@ -53,6 +53,8 @@ pub(crate) struct LibeiEmulation {
     ei_task: JoinHandle<()>,
     error: Arc<Mutex<Option<EmulationError>>>,
     libei_error: Arc<AtomicBool>,
+    /// Told when the ei stream ends, so the end is known at once.
+    ended: Arc<Notify>,
     _remote_desktop: RemoteDesktop,
     session: Session<RemoteDesktop>,
     /// The portal gave this session a restore token and it was saved.
@@ -113,65 +115,159 @@ fn starts_unasked(token_saved: bool, stored: Option<String>) -> bool {
     token_saved && stored.is_some_and(|token| !token.is_empty())
 }
 
-/// Whether the user's graphical session is locked, read from logind
-/// (#258): the session the user's `Display` names. A daemon a service
-/// manager started runs in a session of its own, which says nothing about
-/// the screen. `None` when logind cannot say.
-///
-/// An automatic restart waits while the screen is locked: the portal may
-/// refuse a start then, and a refused start spends the restore token, so
-/// the start the user asks for after unlocking would show the dialog.
-pub(crate) async fn session_locked() -> Option<bool> {
-    match locked_hint().await {
-        Ok(locked) => Some(locked),
-        Err(e) => {
-            log::warn!("cannot read from logind whether the screen is locked: {e}");
-            None
-        }
+/// The screen shield, read from logind and the screensaver services over
+/// connections kept while it is watched (#258). See
+/// [`crate::ShieldWatch`].
+#[derive(Default)]
+pub(crate) struct Shield {
+    system: Option<zbus::Connection>,
+    session: Option<zbus::Connection>,
+    /// The user's graphical session, as logind names it in `Display`. The
+    /// daemon a service manager started runs in a session of its own,
+    /// which says nothing about the screen.
+    display: Option<OwnedObjectPath>,
+}
+
+/// The screensaver services that say whether the shield is up: GNOME's,
+/// then the one other desktops answer.
+const SCREENSAVERS: [(&str, &str); 2] = [
+    ("org.gnome.ScreenSaver", "/org/gnome/ScreenSaver"),
+    (
+        "org.freedesktop.ScreenSaver",
+        "/org/freedesktop/ScreenSaver",
+    ),
+];
+
+/// Whether the shield is up, from the user's graphical session's
+/// `LockedHint` and what each screensaver answered: up if any says so;
+/// down only if `LockedHint` reads false and a screensaver answered;
+/// otherwise unknown. GNOME sets `LockedHint` only once the screen locks,
+/// and never for an account with no password, while the curtain of an idle
+/// screen is up before that, so `LockedHint` alone is not enough.
+fn shield(locked: Option<bool>, screensavers: &[Option<bool>]) -> Option<bool> {
+    if locked == Some(true) || screensavers.contains(&Some(true)) {
+        Some(true)
+    } else if locked == Some(false) && screensavers.iter().any(Option::is_some) {
+        Some(false)
+    } else {
+        None
     }
 }
 
-/// A proxy for the logind object at `path` that reads every property
-/// afresh: a cached `LockedHint` could say unlocked after a new lock.
-async fn login1(
-    conn: &zbus::Connection,
-    path: OwnedObjectPath,
-    interface: &'static str,
-) -> zbus::Result<zbus::Proxy<'static>> {
-    zbus::proxy::Builder::new(conn)
-        .destination("org.freedesktop.login1")?
-        .path(path)?
-        .interface(interface)?
-        .cache_properties(zbus::proxy::CacheProperties::No)
-        .build()
+impl Shield {
+    pub(crate) async fn up(&mut self) -> Option<bool> {
+        let locked = match self.locked_hint().await {
+            Ok(locked) => Some(locked),
+            Err(e) => {
+                log::debug!("cannot read LockedHint from logind: {e}");
+                self.system = None;
+                self.display = None;
+                None
+            }
+        };
+        let mut screensavers = Vec::with_capacity(SCREENSAVERS.len());
+        for (name, path) in SCREENSAVERS {
+            screensavers.push(match self.screensaver_active(name, path).await {
+                Ok(active) => Some(active),
+                Err(e) => {
+                    log::debug!("cannot read {name}.GetActive: {e}");
+                    None
+                }
+            });
+        }
+        shield(locked, &screensavers)
+    }
+
+    /// `LockedHint` of the graphical session of the user this daemon runs
+    /// as.
+    async fn locked_hint(&mut self) -> zbus::Result<bool> {
+        let conn = match &self.system {
+            Some(conn) => conn.clone(),
+            None => {
+                let conn = zbus::Connection::system().await?;
+                self.system = Some(conn.clone());
+                conn
+            }
+        };
+        let display = match &self.display {
+            Some(display) => display.clone(),
+            None => {
+                let display = graphical_session(&conn).await?;
+                self.display = Some(display.clone());
+                display
+            }
+        };
+        proxy(
+            &conn,
+            "org.freedesktop.login1",
+            display,
+            "org.freedesktop.login1.Session",
+        )
+        .await?
+        .get_property("LockedHint")
         .await
+    }
+
+    async fn screensaver_active(&mut self, name: &'static str, path: &str) -> zbus::Result<bool> {
+        let conn = match &self.session {
+            Some(conn) => conn.clone(),
+            None => {
+                let conn = zbus::Connection::session().await?;
+                self.session = Some(conn.clone());
+                conn
+            }
+        };
+        proxy(&conn, name, OwnedObjectPath::try_from(path)?, name)
+            .await?
+            .call("GetActive", &())
+            .await
+    }
 }
 
-/// `LockedHint` of the graphical session of the user this daemon runs as.
-async fn locked_hint() -> zbus::Result<bool> {
-    use std::os::unix::fs::MetadataExt;
-
-    let uid = fs::metadata("/proc/self")
-        .map_err(|e| zbus::Error::InputOutput(Arc::new(e)))?
-        .uid();
-    let conn = zbus::Connection::system().await?;
-    let manager = login1(
-        &conn,
+/// The graphical session of the user this daemon runs as: logind's
+/// `Display` for its uid.
+async fn graphical_session(conn: &zbus::Connection) -> zbus::Result<OwnedObjectPath> {
+    // SAFETY: getuid has no preconditions and cannot fail. The owner of
+    // /proc/self, read instead, is root for a process that is not dumpable.
+    let uid = unsafe { libc::getuid() };
+    let manager = proxy(
+        conn,
+        "org.freedesktop.login1",
         OwnedObjectPath::try_from("/org/freedesktop/login1")?,
         "org.freedesktop.login1.Manager",
     )
     .await?;
     let user: OwnedObjectPath = manager.call("GetUser", &(uid,)).await?;
-    let user = login1(&conn, user, "org.freedesktop.login1.User").await?;
-    let (id, session): (String, OwnedObjectPath) = user.get_property("Display").await?;
+    let user = proxy(
+        conn,
+        "org.freedesktop.login1",
+        user,
+        "org.freedesktop.login1.User",
+    )
+    .await?;
+    let (id, display): (String, OwnedObjectPath) = user.get_property("Display").await?;
     if id.is_empty() {
         return Err(zbus::Error::Failure(
             "the user has no graphical session".into(),
         ));
     }
-    login1(&conn, session, "org.freedesktop.login1.Session")
-        .await?
-        .get_property("LockedHint")
+    Ok(display)
+}
+
+/// A proxy that reads every property afresh: a cached `LockedHint` could
+/// say unlocked after a new lock.
+async fn proxy(
+    conn: &zbus::Connection,
+    destination: &'static str,
+    path: OwnedObjectPath,
+    interface: &'static str,
+) -> zbus::Result<zbus::Proxy<'static>> {
+    zbus::proxy::Builder::new(conn)
+        .destination(destination)?
+        .path(path)?
+        .interface(interface)?
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
         .await
 }
 
@@ -243,6 +339,7 @@ impl LibeiEmulation {
         let devices = Devices::default();
         let libei_error = Arc::new(AtomicBool::default());
         let error = Arc::new(Mutex::new(None));
+        let ended = Arc::new(Notify::new());
         let ei_handler = ei_task(
             events,
             conn.clone(),
@@ -250,6 +347,7 @@ impl LibeiEmulation {
             devices.clone(),
             libei_error.clone(),
             error.clone(),
+            ended.clone(),
         );
         let ei_task = tokio::task::spawn_local(ei_handler);
 
@@ -260,6 +358,7 @@ impl LibeiEmulation {
             ei_task,
             error,
             libei_error,
+            ended,
             _remote_desktop,
             session,
             token_saved,
@@ -412,6 +511,22 @@ impl Emulation for LibeiEmulation {
     fn starts_unasked(&self) -> bool {
         starts_unasked(self.token_saved, read_token())
     }
+
+    /// When the ei stream ends: the compositor closed it, as GNOME does
+    /// for every remote-desktop session when the screen shield goes up.
+    async fn ended(&mut self) -> EmulationError {
+        loop {
+            if self.libei_error.load(Ordering::SeqCst) {
+                return self
+                    .error
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take()
+                    .unwrap_or(EmulationError::EndOfStream);
+            }
+            self.ended.notified().await;
+        }
+    }
 }
 
 async fn ei_task(
@@ -421,6 +536,7 @@ async fn ei_task(
     devices: Devices,
     libei_error: Arc<AtomicBool>,
     error: Arc<Mutex<Option<EmulationError>>>,
+    ended: Arc<Notify>,
 ) {
     loop {
         match ei_event_handler(&mut events, &context, &devices).await {
@@ -431,6 +547,8 @@ async fn ei_task(
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .replace(e);
+                // A permit is kept if nothing waits yet.
+                ended.notify_one();
                 // wait for termination -> otherwise we will loop forever
                 future::pending::<()>().await;
             }
@@ -646,6 +764,29 @@ mod tests {
             [true, false, false, false],
             "(saved and on disk, not saved by the session that ran, saved and \
              since removed, saved empty)"
+        );
+    }
+
+    // LEDGER | behaviour | 1 return value: shield for each reading of logind and the screensavers
+    /// GNOME closes remote-desktop sessions whenever the shield is up, and
+    /// sets `LockedHint` only once the screen locks; the curtain of an idle
+    /// screen shows only in the screensaver (#258).
+    #[test]
+    fn the_shield_is_up_if_logind_or_a_screensaver_says_so_and_down_only_if_both_can_say() {
+        use super::shield;
+
+        assert_eq!(
+            [
+                shield(Some(true), &[Some(false), None]),
+                shield(Some(false), &[Some(true), None]),
+                shield(None, &[None, Some(true)]),
+                shield(Some(false), &[Some(false), None]),
+                shield(Some(false), &[None, None]),
+                shield(None, &[Some(false), Some(false)]),
+            ],
+            [Some(true), Some(true), Some(true), Some(false), None, None],
+            "(locked, idle curtain with no lock hint, curtain with logind unread, \
+             both down, no screensaver answered, logind unread)"
         );
     }
 

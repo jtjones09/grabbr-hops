@@ -983,51 +983,84 @@ fn restart_of(e: &InputEmulationError, unasked: bool) -> Option<Restart> {
     e.restart().filter(|_| unasked)
 }
 
-/// What an automatic restart does, from what is known of the screen lock
+/// How long after emulation ended the screen shield may take to read as
+/// up, when the shield is what ended it (#258). GNOME closes remote-desktop
+/// sessions as the shield goes up, before it says so: in gnome-shell 50.1
+/// `activate` pushes the unlock-dialog mode, which inhibits remote access,
+/// then `LockedHint` is set within milliseconds for an account with a
+/// password, and the screensaver reads active only after the lock screen
+/// slides in and fades (250 + 300 + 300 ms). Five seconds is several times
+/// that, for a loaded machine.
+const SHIELD_SETTLES: Duration = Duration::from_secs(5);
+
+/// How often the shield is read while it settles.
+const SHIELD_READ_EVERY: Duration = Duration::from_millis(250);
+
+/// What an automatic restart does, from what is known of the screen shield
 /// (#258).
 #[derive(Debug, PartialEq, Eq)]
 enum Gate {
-    /// Start: the session is unlocked.
+    /// Start: the shield is down.
     Go,
-    /// Ask again later: the session is locked.
+    /// Ask again later: the shield is up.
     Wait,
-    /// Leave it to the user: whether the session is locked cannot be read,
-    /// and a start on a locked screen could spend the restore token.
+    /// Leave it to the user: whether the shield is up cannot be read, and a
+    /// start under it could spend the restore token.
     WaitForUser,
 }
 
-/// An automatic restart starts only on a session known to be unlocked.
-fn gate(locked: Option<bool>) -> Gate {
-    match locked {
+/// An automatic restart starts only when the shield is known to be down.
+fn gate(up: Option<bool>) -> Gate {
+    match up {
         Some(false) => Gate::Go,
         Some(true) => Gate::Wait,
         None => Gate::WaitForUser,
     }
 }
 
-/// Wait until `at`, then until the session `backend` starts in is unlocked,
-/// asking every [`RESTART_AFTER`]: `Some(backend)` to start it, or `None`
-/// when whether it is locked cannot be read and only the user starts it
-/// (#258).
-async fn restart_when_unlocked(
+/// Whether the shield read as up within [`SHIELD_SETTLES`] of the end.
+async fn ended_by_the_shield(shield: &mut input_emulation::ShieldWatch) -> bool {
+    let until = tokio::time::Instant::now() + SHIELD_SETTLES;
+    loop {
+        if shield.up().await == Some(true) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= until {
+            return false;
+        }
+        tokio::time::sleep(SHIELD_READ_EVERY).await;
+    }
+}
+
+/// `Some(backend)` once `backend`, whose session the screen shield ended,
+/// may start again: not before `at`, and only once the shield is down,
+/// read every [`RESTART_AFTER`] over one connection. `None` when anything
+/// else ended it, such as the user stopping screen sharing, or when the
+/// shield cannot be read: only the user starts it then (#258).
+async fn restart_after_the_shield(
     at: tokio::time::Instant,
     backend: input_emulation::Backend,
 ) -> Option<input_emulation::Backend> {
+    let mut shield = InputEmulation::shield_watch(backend);
+    if !ended_by_the_shield(&mut shield).await {
+        log::info!(
+            "input emulation ended while the screen shield was down, as when screen \
+             sharing is stopped: it starts again only when switched on"
+        );
+        return None;
+    }
+    log::info!("the screen shield ended input emulation: it starts again once the shield is down");
     tokio::time::sleep_until(at).await;
-    let mut said = false;
     loop {
-        match gate(InputEmulation::session_locked(backend).await) {
-            Gate::Go => return Some(backend),
-            Gate::Wait => {
-                if !said {
-                    log::info!("input emulation starts again once the screen is unlocked");
-                    said = true;
-                }
-                tokio::time::sleep(RESTART_AFTER).await;
+        match gate(shield.up().await) {
+            Gate::Go => {
+                log::info!("the screen shield is down: input emulation starts again");
+                return Some(backend);
             }
+            Gate::Wait => tokio::time::sleep(RESTART_AFTER).await,
             Gate::WaitForUser => {
                 log::warn!(
-                    "cannot tell whether the screen is locked: input emulation starts \
+                    "cannot tell whether the screen shield is up: input emulation starts \
                      again only when switched on"
                 );
                 return None;
@@ -1070,7 +1103,6 @@ impl EmulationTask {
                     None => None,
                 };
                 if let (Some(wait), Some(backend)) = (wait, restarts) {
-                    log::info!("input emulation starts again in {wait:?}");
                     restart_at = Some((tokio::time::Instant::now() + wait, backend));
                 }
             }
@@ -1078,9 +1110,9 @@ impl EmulationTask {
                 break;
             }
             // wait for reenable request, or the restart. The user's request
-            // is never held back by the screen lock.
+            // is never held back by the screen shield.
             let mut restart =
-                restart_at.map(|(at, backend)| restart_when_unlocked(at, backend).boxed_local());
+                restart_at.map(|(at, backend)| restart_after_the_shield(at, backend).boxed_local());
             loop {
                 tokio::select! {
                     again = until_restart(&mut restart) => match again {
@@ -1322,6 +1354,10 @@ impl EmulationTask {
                         break end;
                     }
                 }
+                // The system ended the session with nothing injected: known
+                // now, not at the next event, so the app and the peers are
+                // told at once (#258).
+                e = emulation.ended() => break Err(e.into()),
             }
         }
     }
@@ -1776,6 +1812,17 @@ mod held_input_is_released {
 
     /// `n` senders connected to this machine, crossed onto it if `cross`.
     async fn connected(n: usize, scope: ButtonScope, cross: bool) -> Session {
+        connected_through(n, scope, cross, None).await
+    }
+
+    /// [`connected`], with no backend configured and `next` tried after the
+    /// recording's when one is given, as a machine picks its own.
+    async fn connected_through(
+        n: usize,
+        scope: ButtonScope,
+        cross: bool,
+        next: Option<input_emulation::Backend>,
+    ) -> Session {
         let receiver = machine();
         let senders: Vec<_> = (0..n).map(|_| machine()).collect();
         let receiver_trust = trust(
@@ -1793,7 +1840,15 @@ mod held_input_is_released {
         .expect("listener");
         let revoker = listener.revoker();
         let recording = Recording::with_button_scope(scope);
-        let emulation = Emulation::new(Some(recording.backend()), listener, receiver_trust.clone());
+        let emulation = match next {
+            Some(next) => Emulation::among(
+                None,
+                vec![recording.backend(), next],
+                listener,
+                receiver_trust.clone(),
+            ),
+            None => Emulation::new(Some(recording.backend()), listener, receiver_trust.clone()),
+        };
         let mut peers = vec![];
         for sender in &senders {
             let peer = dialer(
@@ -3468,10 +3523,15 @@ mod held_input_is_released {
         told
     }
 
-    /// A session whose backend can start again with nothing shown to the
-    /// user when `unasked`, already reported running.
+    /// A session already reported running, whose backend can start again
+    /// with nothing shown to the user when `unasked`.
     async fn running(unasked: bool) -> Session {
-        let mut s = session().await;
+        running_through(unasked, None).await
+    }
+
+    /// [`running`], with `next` tried after the recording's.
+    async fn running_through(unasked: bool, next: Option<input_emulation::Backend>) -> Session {
+        let mut s = connected_through(1, ButtonScope::Machine, true, next).await;
         if unasked {
             s.recording.starts_without_asking();
         }
@@ -3480,42 +3540,44 @@ mod held_input_is_released {
             ["enabled"],
             "emulation never reported it started"
         );
+        s.inject(key(KEY_A, 1)).await;
+        s.inject(key(KEY_A, 0)).await;
         s
     }
 
-    /// End the session as the system does: the backend fails the next
-    /// motion, as libei does once the compositor closed its stream.
-    async fn end_the_session(s: &Session) {
-        let motion = Event::Pointer(PointerEvent::Motion {
-            time: 0,
-            dx: 1.0,
-            dy: 0.0,
-        });
-        s.recording.fail_when(move |e| *e == motion);
-        s.dialer().send(ProtoEvent::Input(motion)).await;
+    /// End the session from the system's side with no event injected, with
+    /// the screen shield reading `shield` from then on, and return what the
+    /// service is told within a second.
+    async fn end_with_shield(s: &mut Session, shield: Option<bool>) -> Vec<&'static str> {
+        s.recording.shield(shield);
+        s.recording.end_session();
+        told_until_enabled(s, Duration::from_secs(1)).await
     }
 
-    // LEDGER | behaviour | 1 Emulation::event + 6 Recording::calls() after a backend error, with no Reenable
+    /// Long enough for an automatic restart to have happened: the shield
+    /// settled, then three times the first wait.
+    const PAST_A_RESTART: Duration = Duration::from_secs(8);
+
+    // LEDGER | behaviour | 1 Emulation::event while the shield is up, then down, with no Reenable
     /// A Linux receiver whose screen locked had its libei stream closed by
-    /// the compositor, and emulation stayed off until someone switched it on
-    /// again (#258). A backend that can start again with nothing shown to
-    /// the user starts again on its own, says so to the service and to the
-    /// sender, and injects what comes next.
+    /// GNOME's shield, and emulation stayed off until someone switched it
+    /// on again (#258). The end is reported when it happens, emulation does
+    /// not start while the shield is up, since a start refused under it
+    /// spends the portal's restore token, and it starts on its own once
+    /// the shield is down.
     #[test]
-    fn emulation_the_system_ended_starts_again_on_its_own() {
+    fn emulation_the_shield_ended_starts_again_once_the_shield_is_down() {
         run_local(async {
             let mut s = running(true).await;
-            s.inject(key(KEY_A, 1)).await;
-            s.inject(key(KEY_A, 0)).await;
-
-            end_the_session(&s).await;
-            let told = told_until_enabled(&mut s, Duration::from_secs(10)).await;
-            s.recording.fail_when(|_| false);
+            let ended = end_with_shield(&mut s, Some(true)).await;
+            let shielded = told_until_enabled(&mut s, PAST_A_RESTART).await;
+            s.recording.shield(Some(false));
+            let down = told_until_enabled(&mut s, Duration::from_secs(10)).await;
             assert_eq!(
-                told,
-                ["disabled", "failed", "enabled"],
-                "what emulation told the service after the system ended it, with \
-                 nobody asking it to start again"
+                (ended, shielded, down),
+                (vec!["disabled", "failed"], vec![], vec!["enabled"]),
+                "(what emulation told the service within a second of the end, while the \
+                 shield stayed up, once it was down)"
             );
             // The sender, told emulation was off, hears it is on again.
             s.dialer().until_alive().await;
@@ -3524,7 +3586,28 @@ mod held_input_is_released {
         });
     }
 
-    // LEDGER | behaviour | 1 Emulation::event after a backend error, with no Reenable, then with one
+    // LEDGER | behaviour | 1 Emulation::event after an end with the shield down, then with a Reenable
+    /// GNOME's "Stop Screen Sharing" ends hops' session with the shield
+    /// down. That is the user switching it off, and is never undone on its
+    /// own (#258).
+    #[test]
+    fn emulation_ended_with_the_shield_down_waits_for_the_user() {
+        run_local(async {
+            let mut s = running(true).await;
+            let ended = end_with_shield(&mut s, Some(false)).await;
+            let unasked = told_until_enabled(&mut s, PAST_A_RESTART).await;
+            s.emulation.reenable();
+            let asked = told_until_enabled(&mut s, Duration::from_secs(10)).await;
+            assert_eq!(
+                (ended, unasked, asked),
+                (vec!["disabled", "failed"], vec![], vec!["enabled"]),
+                "(what emulation told the service at the end, before the user asked, \
+                 after). It must stay off until asked"
+            );
+        });
+    }
+
+    // LEDGER | behaviour | 1 Emulation::event after a shield end through a backend that would ask the user
     /// A backend that would ask the user again, such as the portal without
     /// a restore token, is not started by anything but the user: a dialog
     /// nobody asked for must never appear (#258).
@@ -3532,20 +3615,41 @@ mod held_input_is_released {
     fn emulation_that_would_ask_the_user_waits_for_the_user() {
         run_local(async {
             let mut s = running(false).await;
-            s.inject(key(KEY_A, 1)).await;
-            s.inject(key(KEY_A, 0)).await;
+            let ended = end_with_shield(&mut s, Some(true)).await;
+            s.recording.shield(Some(false));
+            let unasked = told_until_enabled(&mut s, PAST_A_RESTART).await;
+            assert_eq!(
+                (ended, unasked),
+                (vec!["disabled", "failed"], vec![]),
+                "(what emulation told the service at the end, after the shield went \
+                 down). It must stay off until asked"
+            );
+        });
+    }
 
-            end_the_session(&s).await;
-            // Three times the first wait before a restart.
-            let unasked = told_until_enabled(&mut s, 3 * RESTART_AFTER).await;
-            s.recording.fail_when(|_| false);
+    // LEDGER | behaviour | 1 Emulation::event when the shield cannot be read, then with a Reenable
+    /// Not knowing whether the shield is up stops the automatic restart for
+    /// good: only the user starts emulation, and the user is never held back
+    /// by it (#258).
+    #[test]
+    fn emulation_that_cannot_read_the_shield_waits_for_the_user() {
+        run_local(async {
+            let mut s = running(true).await;
+            let ended = end_with_shield(&mut s, Some(true)).await;
+            s.recording.shield(None);
+            let unread = told_until_enabled(&mut s, PAST_A_RESTART).await;
+            // Readable again, and down: still nothing without the user.
+            s.recording.shield(Some(false));
+            let readable = told_until_enabled(&mut s, 3 * RESTART_AFTER).await;
+            s.recording.shield(None);
             s.emulation.reenable();
             let asked = told_until_enabled(&mut s, Duration::from_secs(10)).await;
             assert_eq!(
-                (unasked, asked),
-                (vec!["disabled", "failed"], vec!["enabled"]),
-                "(what emulation told the service before the user asked, after). \
-                 It must stay off until asked"
+                (ended, unread, readable, asked),
+                (vec!["disabled", "failed"], vec![], vec![], vec!["enabled"]),
+                "(what emulation told the service at the end, while the shield could not \
+                 be read, once it could, after the user asked). Only the user's request \
+                 may start it"
             );
         });
     }
@@ -3558,74 +3662,47 @@ mod held_input_is_released {
     fn an_automatic_restart_that_cannot_start_waits_for_the_user() {
         run_local(async {
             let mut s = running(true).await;
-            s.inject(key(KEY_A, 1)).await;
-
-            end_the_session(&s).await;
+            let ended = end_with_shield(&mut s, Some(true)).await;
             s.recording.refuse_permission();
-            // Past the first wait and the doubled second one.
-            let told = told_until_enabled(&mut s, 4 * RESTART_AFTER).await;
+            s.recording.shield(Some(false));
+            let after = told_until_enabled(&mut s, PAST_A_RESTART).await;
             assert_eq!(
-                told,
-                ["disabled", "failed", "failed"],
-                "what emulation told the service after the system ended it and the \
-                 restart could not start: it must try once and then wait for the user"
+                (ended, after),
+                (vec!["disabled", "failed"], vec!["failed"]),
+                "(what emulation told the service at the end, after the shield went \
+                 down). It must try once and then wait for the user"
             );
         });
     }
 
-    // LEDGER | behaviour | 1 Emulation::event while the session reads locked, then unlocked
-    /// A start on a locked screen can spend the portal's restore token, after
-    /// which the start the user asks for shows the dialog (#258). An
-    /// automatic restart waits for the unlock, then starts.
+    // LEDGER | behaviour | 1 Emulation::event + 6 Recording::started() of the backend after the one that ran
+    /// An automatic restart starts only the backend that ran. Falling down
+    /// the list could reach one that asks the user, such as the portal
+    /// backend with no restore token; the user's own request may (#258).
     #[test]
-    fn emulation_starts_again_only_once_the_screen_is_unlocked() {
+    fn an_automatic_restart_never_falls_back_to_another_backend() {
         run_local(async {
-            let mut s = running(true).await;
-            s.inject(key(KEY_A, 1)).await;
-            s.inject(key(KEY_A, 0)).await;
-
-            s.recording.lock_session(Some(true));
-            end_the_session(&s).await;
-            // Three times the first wait before a restart.
-            let locked = told_until_enabled(&mut s, 3 * RESTART_AFTER).await;
-            s.recording.fail_when(|_| false);
-            s.recording.lock_session(Some(false));
-            let unlocked = told_until_enabled(&mut s, Duration::from_secs(10)).await;
-            assert_eq!(
-                (locked, unlocked),
-                (vec!["disabled", "failed"], vec!["enabled"]),
-                "(what emulation told the service while the screen was locked, after \
-                 it was unlocked). It must not start while locked, and start after"
-            );
-        });
-    }
-
-    // LEDGER | behaviour | 1 Emulation::event when the lock cannot be read, then with a Reenable
-    /// Not knowing whether the screen is locked is treated as locked for
-    /// good: only the user starts emulation, and the user is never held
-    /// back by it (#258).
-    #[test]
-    fn emulation_that_cannot_read_the_lock_waits_for_the_user() {
-        run_local(async {
-            let mut s = running(true).await;
-            s.inject(key(KEY_A, 1)).await;
-            s.inject(key(KEY_A, 0)).await;
-
-            s.recording.lock_session(None);
-            end_the_session(&s).await;
-            let unread = told_until_enabled(&mut s, 2 * RESTART_AFTER).await;
-            s.recording.fail_when(|_| false);
-            // Readable again, and unlocked: still nothing without the user.
-            s.recording.lock_session(Some(false));
-            let readable = told_until_enabled(&mut s, 3 * RESTART_AFTER).await;
-            s.recording.lock_session(None);
+            let next = Recording::new();
+            let mut s = running_through(true, Some(next.backend())).await;
+            let ended = end_with_shield(&mut s, Some(true)).await;
+            s.recording.refuse_permission();
+            s.recording.shield(Some(false));
+            let after = told_until_enabled(&mut s, PAST_A_RESTART).await;
+            let next_started = next.started();
             s.emulation.reenable();
             let asked = told_until_enabled(&mut s, Duration::from_secs(10)).await;
             assert_eq!(
-                (unread, readable, asked),
-                (vec!["disabled", "failed"], vec![], vec!["enabled"]),
-                "(what emulation told the service while the lock could not be read, once \
-                 it could, after the user asked). Only the user's request may start it"
+                (ended, after, next_started, asked, next.started()),
+                (
+                    vec!["disabled", "failed"],
+                    vec!["failed"],
+                    0,
+                    vec!["enabled"],
+                    1
+                ),
+                "(what emulation told the service at the end, after the automatic \
+                 restart, how often the next backend started then, what it was told \
+                 after the user asked, how often the next backend started then)"
             );
         });
     }
@@ -3642,13 +3719,13 @@ mod emulation_starts_again_only_unasked {
         EmulationCreationError, EmulationError, InputEmulationError, Permission, Restart,
     };
 
-    // LEDGER | behaviour | 1 return value: gate for each answer about the screen lock
+    // LEDGER | behaviour | 1 return value: gate for each answer about the screen shield
     #[test]
-    fn an_automatic_restart_starts_only_on_a_session_known_to_be_unlocked() {
+    fn an_automatic_restart_starts_only_when_the_shield_is_known_to_be_down() {
         assert_eq!(
             [gate(Some(false)), gate(Some(true)), gate(None)],
             [Gate::Go, Gate::Wait, Gate::WaitForUser],
-            "(unlocked, locked, cannot be read)"
+            "(down, up, cannot be read)"
         );
     }
 

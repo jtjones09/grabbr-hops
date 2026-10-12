@@ -118,15 +118,16 @@ impl InputEmulationError {
         }
     }
 
-    /// How emulation that ended for a reason that passes starts again
+    /// How emulation that ended for a reason that may pass starts again
     /// without the user asking; `None` for any other end (#258). Only a
-    /// session that ran and that the backend ended is such a reason: the
-    /// compositor closing the libei stream at a screen lock, for one. A
+    /// session that ran and that the backend ended can be such a reason. A
     /// backend that could not start, or a permission the system withheld or
     /// took, waits for the permission watch or the user.
     ///
-    /// Whether the backend can start again without asking the user anything
-    /// is the backend's to say: see `InputEmulation::starts_unasked`.
+    /// The session must also have been ended by the screen shield, not by
+    /// the user stopping screen sharing (see `InputEmulation::shield_watch`),
+    /// and the backend must start again without asking the user anything
+    /// (see `InputEmulation::starts_unasked`).
     pub fn restart(&self) -> Option<Restart> {
         match self {
             Self::Emulate(_) => Some(Restart::Backoff),
