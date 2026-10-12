@@ -47,6 +47,9 @@ struct Log {
     refused: bool,
     /// Needs Accessibility while it runs, as the macOS backend does.
     as_mac: bool,
+    /// Can start again with nothing shown to the user, as the libei
+    /// backend can with a restore token.
+    unasked: bool,
 }
 
 type Shared = Arc<Mutex<Log>>;
@@ -83,6 +86,7 @@ impl Recording {
             consume_takes: None,
             refused: false,
             as_mac: false,
+            unasked: false,
         }));
         REGISTRY
             .lock()
@@ -113,6 +117,13 @@ impl Recording {
     /// it runs, as the macOS backend does.
     pub fn needs_accessibility(&self) {
         self.log.lock().expect("recording log").as_mac = true;
+    }
+
+    /// Make every backend created from this one say it can start again
+    /// with nothing shown to the user, as the libei backend does with a
+    /// restore token.
+    pub fn starts_without_asking(&self) {
+        self.log.lock().expect("recording log").unasked = true;
     }
 
     /// Make creating a backend fail as it does on a Mac that has not
@@ -208,6 +219,10 @@ impl Emulation for RecordingEmulation {
 
     fn button_scope(&self) -> ButtonScope {
         self.log.lock().expect("recording log").button_scope
+    }
+
+    fn starts_unasked(&self) -> bool {
+        self.log.lock().expect("recording log").unasked
     }
 
     fn needs(&self) -> &'static [crate::error::Permission] {

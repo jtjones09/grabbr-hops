@@ -7,6 +7,7 @@ use std::{
 use input_event::{Event, KeyboardEvent, PointerEvent};
 
 pub use self::error::{EmulationCreationError, EmulationError, InputEmulationError, Permission};
+pub use input_event::Restart;
 
 #[cfg(windows)]
 mod windows;
@@ -495,6 +496,12 @@ impl InputEmulation {
         self.emulation.needs()
     }
 
+    /// Whether this backend can start again with nothing shown to the user;
+    /// see [`Emulation::starts_unasked`].
+    pub fn starts_unasked(&self) -> bool {
+        self.emulation.starts_unasked()
+    }
+
     /// Whether any handle holds a key or a button down on this machine. While
     /// one does, the backend may repeat the key with no event arriving.
     pub fn holds_anything(&self) -> bool {
@@ -540,6 +547,14 @@ trait Emulation: Send {
     /// is checked on behalf of one that does not, such as `dummy`.
     fn needs(&self) -> &'static [Permission] {
         &[]
+    }
+    /// Whether this backend, once it ran, can start again with nothing
+    /// shown to the user: no permission dialog, no prompt (#258). Asked as
+    /// a session that the system ended closes, to decide whether emulation
+    /// starts again on its own. False by default: only a backend that has
+    /// been through why it can say so.
+    fn starts_unasked(&self) -> bool {
+        false
     }
     /// Adaptive-edge signal (see [`InputEmulation::take_edge_push`]). Backends
     /// without a detector keep the default: never signals.

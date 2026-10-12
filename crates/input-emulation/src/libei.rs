@@ -51,6 +51,8 @@ pub(crate) struct LibeiEmulation {
     libei_error: Arc<AtomicBool>,
     _remote_desktop: RemoteDesktop,
     session: Session<RemoteDesktop>,
+    /// The portal gave this session a restore token and it was saved.
+    token_saved: bool,
 }
 
 /// The RemoteDesktop token file, under `$XDG_CACHE_HOME` or else
@@ -97,6 +99,16 @@ fn write_token(token: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Whether emulation can start again with no portal dialog (#258): the
+/// session that ran saved the restore token the portal gave it, and a token
+/// is still on disk. The portal deletes a token as it is used and saves it
+/// again only when the session starts, so a session that did not save one
+/// leaves none that works; and a token it does not know is ignored, which
+/// shows the dialog.
+fn starts_unasked(token_saved: bool, stored: Option<String>) -> bool {
+    token_saved && stored.is_some_and(|token| !token.is_empty())
+}
+
 /// Microseconds since the Unix epoch, or 0 on a clock set before it.
 fn now_micros() -> u64 {
     SystemTime::now()
@@ -104,7 +116,10 @@ fn now_micros() -> u64 {
         .map_or(0, |d| d.as_micros() as u64)
 }
 
-async fn get_ei_fd() -> Result<(RemoteDesktop, Session<RemoteDesktop>, OwnedFd), ashpd::Error> {
+/// The portal session, its ei socket, and whether the restore token the
+/// portal gave it was saved.
+async fn get_ei_fd() -> Result<(RemoteDesktop, Session<RemoteDesktop>, OwnedFd, bool), ashpd::Error>
+{
     // Before any portal call, so the consent prompt can name hops.
     input_event::portal::register().await;
     let remote_desktop = RemoteDesktop::new().await?;
@@ -128,16 +143,18 @@ async fn get_ei_fd() -> Result<(RemoteDesktop, Session<RemoteDesktop>, OwnedFd),
         .response()?;
 
     // The restore token is only valid once, we need to re-save it each time
+    let mut token_saved = false;
     if let Some(token_str) = start_response.restore_token() {
-        if let Err(e) = write_token(token_str) {
-            log::warn!("failed to save RemoteDesktop token: {}", e);
+        match write_token(token_str) {
+            Ok(()) => token_saved = true,
+            Err(e) => log::warn!("failed to save RemoteDesktop token: {}", e),
         }
     }
 
     let fd = remote_desktop
         .connect_to_eis(&session, Default::default())
         .await?;
-    Ok((remote_desktop, session, fd))
+    Ok((remote_desktop, session, fd, token_saved))
 }
 
 /// Opens the ei connection on `stream` and names hops to the EIS server, which
@@ -155,7 +172,7 @@ async fn ei_handshake(
 
 impl LibeiEmulation {
     pub(crate) async fn new() -> Result<Self, LibeiEmulationCreationError> {
-        let (_remote_desktop, session, eifd) = get_ei_fd().await?;
+        let (_remote_desktop, session, eifd, token_saved) = get_ei_fd().await?;
         let (context, conn, events) = ei_handshake(UnixStream::from(eifd)).await?;
         let devices = Devices::default();
         let libei_error = Arc::new(AtomicBool::default());
@@ -179,6 +196,7 @@ impl LibeiEmulation {
             libei_error,
             _remote_desktop,
             session,
+            token_saved,
         })
     }
 }
@@ -321,6 +339,12 @@ impl Emulation for LibeiEmulation {
     /// is not checked.
     fn button_scope(&self) -> ButtonScope {
         ButtonScope::Machine
+    }
+
+    /// Only with the restore token this session saved: without it the
+    /// portal asks the user again (#258).
+    fn starts_unasked(&self) -> bool {
+        starts_unasked(self.token_saved, read_token())
     }
 }
 
@@ -535,6 +559,27 @@ mod tests {
         assert_eq!(
             token_file_path(Some("/c".into()), Some("/home/t".into())),
             Some(PathBuf::from("/c/lan-mouse/remote-desktop.token"))
+        );
+    }
+
+    // LEDGER | behaviour | 1 return value: starts_unasked for each token state
+    /// Emulation the system ended starts again on its own only when the
+    /// portal can restore the session without a dialog (#258).
+    #[test]
+    fn only_a_saved_restore_token_lets_emulation_start_again_unasked() {
+        use super::starts_unasked;
+
+        let token = || Some("a-token".to_string());
+        assert_eq!(
+            [
+                starts_unasked(true, token()),
+                starts_unasked(false, token()),
+                starts_unasked(true, None),
+                starts_unasked(true, Some(String::new())),
+            ],
+            [true, false, false, false],
+            "(saved and on disk, not saved by the session that ran, saved and \
+             since removed, saved empty)"
         );
     }
 

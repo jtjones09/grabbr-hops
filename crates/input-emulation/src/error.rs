@@ -36,6 +36,7 @@ pub enum InputEmulationError {
 
 #[cfg(any(libei, rdp))]
 use ashpd::{Error::Response, desktop::ResponseError};
+use input_event::Restart;
 use std::io;
 use thiserror::Error;
 
@@ -113,6 +114,22 @@ impl InputEmulationError {
         match self {
             Self::Create(e) => e.missing_permissions(),
             Self::Withheld(missing) | Self::Revoked(missing) => Some(missing),
+            _ => None,
+        }
+    }
+
+    /// How emulation that ended for a reason that passes starts again
+    /// without the user asking; `None` for any other end (#258). Only a
+    /// session that ran and that the backend ended is such a reason: the
+    /// compositor closing the libei stream at a screen lock, for one. A
+    /// backend that could not start, or a permission the system withheld or
+    /// took, waits for the permission watch or the user.
+    ///
+    /// Whether the backend can start again without asking the user anything
+    /// is the backend's to say: see `InputEmulation::starts_unasked`.
+    pub fn restart(&self) -> Option<Restart> {
+        match self {
+            Self::Emulate(_) => Some(Restart::Backoff),
             _ => None,
         }
     }

@@ -1,8 +1,9 @@
 use crate::config::{local_caps, local_commit};
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
+use crate::restart::{RESTART_AFTER, restart_wait};
 use futures::{FutureExt, StreamExt};
 use hops_proto::{Position, ProtoEvent};
-use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
+use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError, Restart};
 use input_event::{Event, PointerEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
@@ -724,6 +725,8 @@ impl EmulationProxy {
             queued: Default::default(),
             pressure,
             trust,
+            restarts: None,
+            restart_with: None,
         };
         let task = spawn_local(emulation_task.run());
         Self {
@@ -820,6 +823,12 @@ struct EmulationTask {
     /// Asked again before each event is injected: a peer can lose permission
     /// while its input waits in the queue (#156).
     trust: crate::transport::Trust,
+    /// The backend of the session that just ended, when it can start again
+    /// with nothing shown to the user (#258).
+    restarts: Option<input_emulation::Backend>,
+    /// The backend an automatic restart starts, and only it: falling down
+    /// the list could reach one that asks the user.
+    restart_with: Option<input_emulation::Backend>,
 }
 
 /// How many requests may wait for one peer before its connection stops
@@ -966,28 +975,67 @@ fn fault_of(e: &InputEmulationError) -> hops_ipc::EmulationFault {
     }
 }
 
+/// How emulation that ended with `e` starts again without being asked:
+/// only after the system ended a session that ran, through a backend that
+/// can start again with nothing shown to the user (`unasked`), so a restart
+/// never raises a permission dialog nobody asked for (#258).
+fn restart_of(e: &InputEmulationError, unasked: bool) -> Option<Restart> {
+    e.restart().filter(|_| unasked)
+}
+
 impl EmulationTask {
     async fn run(mut self) {
+        let mut waited: Option<Duration> = None;
         loop {
-            if let Err(e) = self.do_emulation().await {
+            let started = tokio::time::Instant::now();
+            // When to start again without being asked, and through which
+            // backend (#258). A refused or missing permission waits for the
+            // permission watch or the user, as capture does (#240).
+            let mut restart_at = None;
+            let result = self.do_emulation().await;
+            let restarts = self.restarts.take();
+            if let Err(e) = result {
                 log::warn!("input emulation exited: {e}");
                 let _ = self
                     .event_tx
                     .send(EmulationEvent::EmulationFailed(fault_of(&e)));
+                let wait = match restart_of(&e, restarts.is_some()) {
+                    Some(Restart::Soon) => Some(RESTART_AFTER),
+                    Some(Restart::Backoff) => {
+                        let wait = restart_wait(waited, started.elapsed(), RESTART_AFTER);
+                        waited = Some(wait);
+                        Some(wait)
+                    }
+                    None => None,
+                };
+                if let (Some(wait), Some(backend)) = (wait, restarts) {
+                    log::info!("input emulation starts again in {wait:?}");
+                    restart_at = Some((tokio::time::Instant::now() + wait, backend));
+                }
             }
             if self.exit_requested.get() {
                 break;
             }
-            // wait for reenable request
+            // wait for reenable request, or the restart
             loop {
-                match self.request_rx.recv().await.expect("channel closed") {
-                    ProxyRequest::Reenable => break,
-                    ProxyRequest::Terminate => return,
-                    // emulation inactive => drop, but keep the backlog counter honest
-                    ProxyRequest::Input(..) => self.metrics.on_inject(),
-                    ProxyRequest::Remove(..) | ProxyRequest::StopForMissing(..) => {
-                        /* emulation inactive => ignore */
+                tokio::select! {
+                    _ = tokio::time::sleep_until(
+                        restart_at.map_or_else(tokio::time::Instant::now, |(at, _)| at)
+                    ), if restart_at.is_some() => {
+                        self.restart_with = restart_at.map(|(_, backend)| backend);
+                        break;
                     }
+                    r = self.request_rx.recv() => match r.expect("channel closed") {
+                        ProxyRequest::Reenable => break,
+                        ProxyRequest::Terminate => return,
+                        // emulation inactive => drop, but keep the backlog counter honest
+                        ProxyRequest::Input(..) => self.metrics.on_inject(),
+                        // The system no longer grants what the backend
+                        // needs: no restart until the permission watch or
+                        // the user asks for one.
+                        ProxyRequest::StopForMissing(..) => restart_at = None,
+                        ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
+                    },
                 }
             }
         }
@@ -995,7 +1043,12 @@ impl EmulationTask {
 
     async fn do_emulation(&mut self) -> Result<(), InputEmulationError> {
         log::info!("creating input emulation ...");
-        let (backend, candidates) = (self.backend, self.candidates.clone());
+        // An automatic restart starts only the backend that ran, which said
+        // it starts again unasked; the user's own request tries the list.
+        let (backend, candidates) = match self.restart_with.take() {
+            Some(again) => (Some(again), vec![]),
+            None => (self.backend, self.candidates.clone()),
+        };
         let chosen = async move {
             match backend {
                 Some(_) => InputEmulation::new(backend).await,
@@ -1060,6 +1113,9 @@ impl EmulationTask {
         for _ in 0..self.queued.clear() {
             self.metrics.on_inject();
         }
+        // Asked before the backend is torn down: whether a session the
+        // system ended may start again on its own (#258).
+        self.restarts = emulation.starts_unasked().then_some(emulation.backend());
         // FIXME replace with async drop when stabilized
         let was_held = emulation.holds_anything();
         emulation.terminate().await;
@@ -3323,6 +3379,175 @@ mod held_input_is_released {
                  nothing more"
             );
         });
+    }
+
+    /// What emulation tells the service from now until it reports itself
+    /// running, or `limit` passes: `"disabled"`, `"failed"` and `"enabled"`,
+    /// in order.
+    async fn told_until_enabled(s: &mut Session, limit: Duration) -> Vec<&'static str> {
+        let mut told = vec![];
+        let _ = tokio::time::timeout(limit, async {
+            loop {
+                match s.emulation.event().await {
+                    EmulationEvent::EmulationFailed(_) => told.push("failed"),
+                    EmulationEvent::EmulationDisabled => told.push("disabled"),
+                    EmulationEvent::EmulationEnabled { .. } => {
+                        told.push("enabled");
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        told
+    }
+
+    /// A session whose backend can start again with nothing shown to the
+    /// user when `unasked`, already reported running.
+    async fn running(unasked: bool) -> Session {
+        let mut s = session().await;
+        if unasked {
+            s.recording.starts_without_asking();
+        }
+        assert_eq!(
+            told_until_enabled(&mut s, Duration::from_secs(10)).await,
+            ["enabled"],
+            "emulation never reported it started"
+        );
+        s
+    }
+
+    /// End the session as the system does: the backend fails the next
+    /// motion, as libei does once the compositor closed its stream.
+    async fn end_the_session(s: &Session) {
+        let motion = Event::Pointer(PointerEvent::Motion {
+            time: 0,
+            dx: 1.0,
+            dy: 0.0,
+        });
+        s.recording.fail_when(move |e| *e == motion);
+        s.dialer().send(ProtoEvent::Input(motion)).await;
+    }
+
+    // LEDGER | behaviour | 1 Emulation::event + 6 Recording::calls() after a backend error, with no Reenable
+    /// A Linux receiver whose screen locked had its libei stream closed by
+    /// the compositor, and emulation stayed off until someone switched it on
+    /// again (#258). A backend that can start again with nothing shown to
+    /// the user starts again on its own, says so to the service and to the
+    /// sender, and injects what comes next.
+    #[test]
+    fn emulation_the_system_ended_starts_again_on_its_own() {
+        run_local(async {
+            let mut s = running(true).await;
+            s.inject(key(KEY_A, 1)).await;
+            s.inject(key(KEY_A, 0)).await;
+
+            end_the_session(&s).await;
+            let told = told_until_enabled(&mut s, Duration::from_secs(10)).await;
+            s.recording.fail_when(|_| false);
+            assert_eq!(
+                told,
+                ["disabled", "failed", "enabled"],
+                "what emulation told the service after the system ended it, with \
+                 nobody asking it to start again"
+            );
+            // The sender, told emulation was off, hears it is on again.
+            s.dialer().until_alive().await;
+            s.inject(key(KEY_B, 1)).await;
+            s.inject(key(KEY_B, 0)).await;
+        });
+    }
+
+    // LEDGER | behaviour | 1 Emulation::event after a backend error, with no Reenable, then with one
+    /// A backend that would ask the user again, such as the portal without
+    /// a restore token, is not started by anything but the user: a dialog
+    /// nobody asked for must never appear (#258).
+    #[test]
+    fn emulation_that_would_ask_the_user_waits_for_the_user() {
+        run_local(async {
+            let mut s = running(false).await;
+            s.inject(key(KEY_A, 1)).await;
+            s.inject(key(KEY_A, 0)).await;
+
+            end_the_session(&s).await;
+            // Three times the first wait before a restart.
+            let unasked = told_until_enabled(&mut s, 3 * RESTART_AFTER).await;
+            s.recording.fail_when(|_| false);
+            s.emulation.reenable();
+            let asked = told_until_enabled(&mut s, Duration::from_secs(10)).await;
+            assert_eq!(
+                (unasked, asked),
+                (vec!["disabled", "failed"], vec!["enabled"]),
+                "(what emulation told the service before the user asked, after). \
+                 It must stay off until asked"
+            );
+        });
+    }
+
+    // LEDGER | behaviour | 1 Emulation::event after an automatic restart fails to start
+    /// An automatic restart that cannot start is not tried again: on the
+    /// portal, the attempt spent the restore token, so the next one would
+    /// show the dialog (#258).
+    #[test]
+    fn an_automatic_restart_that_cannot_start_waits_for_the_user() {
+        run_local(async {
+            let mut s = running(true).await;
+            s.inject(key(KEY_A, 1)).await;
+
+            end_the_session(&s).await;
+            s.recording.refuse_permission();
+            // Past the first wait and the doubled second one.
+            let told = told_until_enabled(&mut s, 4 * RESTART_AFTER).await;
+            assert_eq!(
+                told,
+                ["disabled", "failed", "failed"],
+                "what emulation told the service after the system ended it and the \
+                 restart could not start: it must try once and then wait for the user"
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod emulation_starts_again_only_unasked {
+    //! Which ends of emulation start it again without the user asking
+    //! (#258).
+
+    use super::restart_of;
+    use input_emulation::recording::RecordingEmulationCreationError;
+    use input_emulation::{
+        EmulationCreationError, EmulationError, InputEmulationError, Permission, Restart,
+    };
+
+    // LEDGER | behaviour | 1 return value: restart_of for each way emulation ends
+    #[test]
+    fn only_a_session_the_system_ended_starts_again_and_only_unasked() {
+        let ended = || InputEmulationError::Emulate(EmulationError::EndOfStream);
+        let accessibility = || vec![Permission::Accessibility];
+        assert_eq!(
+            [
+                restart_of(&ended(), true),
+                restart_of(&ended(), false),
+                restart_of(&InputEmulationError::Revoked(accessibility()), true),
+                restart_of(&InputEmulationError::Withheld(accessibility()), true),
+                restart_of(
+                    &InputEmulationError::Create(EmulationCreationError::Recording(
+                        RecordingEmulationCreationError::Refused
+                    )),
+                    true
+                ),
+                restart_of(
+                    &InputEmulationError::Create(EmulationCreationError::NoAvailableBackend),
+                    true
+                ),
+                restart_of(&InputEmulationError::NoUsableBackend, true),
+            ],
+            [Some(Restart::Backoff), None, None, None, None, None, None],
+            "(the system ended a session, the same through a backend that would ask \
+             the user, a permission taken, a permission withheld, a permission \
+             refused at start, no backend started, a fall to dummy refused)"
+        );
     }
 }
 

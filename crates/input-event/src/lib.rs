@@ -13,6 +13,16 @@ mod libei;
 #[cfg(all(unix, feature = "portal", not(target_os = "macos")))]
 pub mod portal;
 
+/// How capture or emulation that the system ended starts again without the
+/// user asking (#240, #258).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Restart {
+    /// After a short fixed wait: the cause passes on its own.
+    Soon,
+    /// After a wait that grows while the cause keeps recurring.
+    Backoff,
+}
+
 /// The name hops gives itself wherever the desktop shows who is asking for
 /// input: the Linux portals and the libei handshake, which names the virtual
 /// devices. It is the macOS bundle identifier and the id of the desktop entry
