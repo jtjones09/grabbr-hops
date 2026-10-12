@@ -230,13 +230,16 @@ fn rotate_if_needed(path: &Path, file: &mut File) -> std::io::Result<()> {
 /// abort message under `panic = "abort"` — which is exactly what it is good for
 /// and is bounded by how rarely those happen.
 ///
-/// The daemon writes its file alone, terminal or not. A write to a terminal
-/// can wait: a Windows console waits every write for as long as text is
-/// selected in it, and the daemon logs from the loop that carries input, so
-/// a selection in its terminal stopped the pointer crossing to other
-/// machines (#247). Its file is where its log is read from.
+/// The daemon and the GUI write their file alone, terminal or not. A write
+/// to a terminal can wait: a Windows console waits every write for as long
+/// as text is selected in it. The daemon logs from the loop that carries
+/// input, and the GUI from the one that draws its window, so a selection in
+/// the terminal either was started from stopped the pointer crossing to
+/// other machines or left the window not responding (#247). Their files are
+/// where their logs are read from. The TUI and the CLI answer in the
+/// terminal, which they need anyway.
 fn should_write_stderr(role: &str, owns_file: bool, stderr_is_terminal: bool) -> bool {
-    !owns_file || (stderr_is_terminal && role != "daemon")
+    !owns_file || (stderr_is_terminal && !matches!(role, "daemon" | "gui"))
 }
 
 /// Open an append handle that is capped the same way this module's own log is.
@@ -683,12 +686,28 @@ mod tests {
             should_write_stderr("daemon", false, true),
             "a daemon that could not open its file must still write somewhere"
         );
-        for role in ["gui", "tui", "cli"] {
+        for role in ["tui", "cli"] {
             assert!(
                 should_write_stderr(role, true, true),
                 "the {role}, run from a terminal, must still print there"
             );
         }
+    }
+
+    /// The GUI started from a shell shares the shell's console and keeps it,
+    /// and logs from the loop that draws its window (#247).
+    // LEDGER T2475 | class B | 1 return value of should_write_stderr
+    #[test]
+    fn the_gui_never_writes_a_terminal_while_it_has_its_file() {
+        assert!(
+            !should_write_stderr("gui", true, true),
+            "a GUI with its log file open writes the terminal it was started from: \
+             a selection in that terminal then leaves the window not responding"
+        );
+        assert!(
+            should_write_stderr("gui", false, true),
+            "a GUI that could not open its file must still write somewhere"
+        );
     }
 
     #[test]
