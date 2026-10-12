@@ -38,10 +38,16 @@ enum HopsError {
     #[error(transparent)]
     Elevated(#[from] hops::elevation::Elevated),
     #[cfg(not(feature = "slint"))]
-    #[error("this build has no GUI — rebuild with `--features slint`")]
+    #[error(
+        "this build of hops has no graphical interface; run `hops tui` for the terminal \
+         one (developers: build with `--features slint`)"
+    )]
     NoGui,
     #[cfg(not(feature = "tui"))]
-    #[error("this build has no TUI — rebuild with `--features tui`")]
+    #[error(
+        "this build of hops has no terminal interface; run `hops gui` for the graphical \
+         one (developers: build with `--features tui`)"
+    )]
     NoTui,
 }
 
@@ -682,7 +688,8 @@ mod a_bare_launch_opens_an_interface_this_build_has {
 mod a_build_with_no_gui_says_so_when_asked_for_one {
     //! `hops gui` in a build with no GUI logged why to gui.log and exited 0;
     //! the terminal it was typed in showed nothing (#255). As an error it
-    //! reaches `main`, which says it there and exits 1.
+    //! reaches `main`, which says it there and exits 1, naming what to run
+    //! instead.
     use super::{HopsError, run_gui};
 
     // LEDGER T7 | class B | 1 return value of run_gui
@@ -692,6 +699,14 @@ mod a_build_with_no_gui_says_so_when_asked_for_one {
         assert!(
             matches!(got, Err(HopsError::NoGui)),
             "a build with no GUI, asked for one, ended as if it had opened: {got:?}"
+        );
+        // What a user of the Linux release reads: what to run instead, and a
+        // rebuild only as a note for developers.
+        let said = got.map_err(|e| e.to_string()).unwrap_err();
+        assert!(
+            said.starts_with("this build of hops has no graphical interface; run `hops tui`")
+                && said.contains("(developers: build with `--features slint`)"),
+            "{said}"
         );
     }
 }
