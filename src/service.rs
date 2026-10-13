@@ -253,6 +253,10 @@ pub struct Service {
     /// enable request opens (#243). The watch and the backends ask through
     /// it; a test's daemon has one of its own.
     tap_gate: &'static input_event::accessibility::Gate,
+    /// The switched-on devices capture holds an edge for, and where. A
+    /// device whose pairing lets it control this machine, and not this
+    /// machine control it, has none (#259). See [`Service::settle_edge`].
+    edges: HashMap<ClientHandle, Position>,
     /// keep track of registered connections to avoid duplicate barriers
     incoming_conns: HashSet<SocketAddr>,
     /// addrs whose cursor is currently ON this device (crossing-level state) —
@@ -1083,6 +1087,7 @@ impl Service {
             emulation_discards: None,
             permission_watch: PermissionWatch::of_this_machine(tap_gate),
             tap_gate,
+            edges: Default::default(),
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             currently_controlling: Default::default(),
@@ -1115,6 +1120,7 @@ impl Service {
             // is already active in client_manager and does not create a
             // capture barrier in that case so we have to deactivate it first
             self.client_manager.deactivate_client(*handle);
+            self.edges.remove(handle);
         }
 
         for handle in active {
@@ -1223,6 +1229,9 @@ impl Service {
             // many places, and one missed would keep the machine awake, or
             // let it sleep, until the next.
             self.settle_keep_awake();
+            // The same for each device's edge, which follows its pairing and
+            // its pin, both changed in many places (#259).
+            self.settle_edges();
         }
 
         log::info!("terminating service ...");
@@ -3725,7 +3734,7 @@ impl Service {
     fn deactivate_client(&mut self, handle: ClientHandle) {
         log::debug!("deactivating client {handle}");
         if self.client_manager.deactivate_client(handle) {
-            self.capture.destroy(handle);
+            self.drop_edge(handle);
             self.broadcast_client(handle);
             log::info!("deactivated client {handle}");
         }
@@ -3762,9 +3771,78 @@ impl Service {
         /* activate the client */
         if self.client_manager.activate_client(handle) {
             /* notify capture and frontends */
-            self.capture.create(handle, pos, CaptureType::Default);
+            self.settle_edge(handle);
             self.broadcast_client(handle);
-            log::info!("activated client {handle} ({pos})");
+            if self.edges.contains_key(&handle) {
+                log::info!("activated client {handle} ({pos})");
+            } else {
+                log::info!(
+                    "activated client {handle} ({pos}), with no edge: it is paired to \
+                     control this machine, and not to be controlled from it"
+                );
+            }
+        }
+    }
+
+    /// Whether the device at `handle` should have a capture edge while it is
+    /// switched on: unless the pairing with the machine it is pinned to
+    /// never let this machine drive that one (#259).
+    ///
+    /// Crossing to such a machine could only be refused, and on a machine it
+    /// drives, the pointer it moves there reaches that edge on its way back,
+    /// where the refusal read as a permission lost. One this machine was let
+    /// drive and no longer may keeps its edge, and says so when crossed to.
+    /// So does a device pinned to no machine, or to one not paired yet:
+    /// crossing to it is how pairing it is asked for.
+    fn wants_edge(&self, handle: ClientHandle) -> bool {
+        self.client_manager
+            .peer_fingerprint(handle)
+            .is_none_or(|fp| !self.trust.read().expect("lock").paired_not_to_drive(&fp))
+    }
+
+    /// Give the device at `handle` the capture edge it should have now, at its
+    /// position, and take away one it should not.
+    fn settle_edge(&mut self, handle: ClientHandle) {
+        let wanted = self
+            .client_manager
+            .get_pos(handle)
+            .filter(|_| self.client_manager.is_on(handle) && self.wants_edge(handle));
+        let held = self.edges.get(&handle).copied();
+        if wanted == held {
+            return;
+        }
+        if held.is_some() {
+            self.drop_edge(handle);
+            if wanted.is_none() && self.client_manager.is_on(handle) {
+                log::info!(
+                    "client {handle}: its edge is removed; it is paired to control this \
+                     machine, and not to be controlled from it"
+                );
+            }
+        }
+        if let Some(pos) = wanted {
+            self.capture.create(handle, pos, CaptureType::Default);
+            self.edges.insert(handle, pos);
+            log::debug!("client {handle}: capture edge at {pos}");
+        }
+    }
+
+    /// [`Service::settle_edge`] for every device switched on or holding an
+    /// edge.
+    fn settle_edges(&mut self) {
+        let mut handles = self.client_manager.active_clients();
+        handles.extend(self.edges.keys().copied());
+        handles.sort_unstable();
+        handles.dedup();
+        for handle in handles {
+            self.settle_edge(handle);
+        }
+    }
+
+    /// Take away the capture edge of the device at `handle`, if it has one.
+    fn drop_edge(&mut self, handle: ClientHandle) {
+        if self.edges.remove(&handle).is_some() {
+            self.capture.destroy(handle);
         }
     }
 
@@ -3779,9 +3857,7 @@ impl Service {
     fn remove_client(&mut self, handle: ClientHandle) {
         self.adding.remove(&handle);
         let removed = self.client_manager.remove_client(handle);
-        if removed.as_ref().is_some_and(|(_, s)| s.active) {
-            self.capture.destroy(handle);
-        }
+        self.drop_edge(handle);
         // Close the device's connection. Nothing can address it once the
         // device is gone, since handles are never reused, but it stays open
         // and still carries clipboard text until something closes it.
@@ -4752,6 +4828,9 @@ mod kept_awake;
 
 #[cfg(all(test, unix))]
 mod a_move_onto_a_taken_edge;
+
+#[cfg(all(test, unix))]
+mod a_machine_that_only_drives_this_one;
 
 #[cfg(all(test, unix, any(feature = "tui", feature = "slint")))]
 mod every_pairing_is_listed;

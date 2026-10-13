@@ -1349,6 +1349,20 @@ impl TrustStore {
         self.permits(fingerprint, Caps::I_MAY_DRIVE)
     }
 
+    /// Is this machine paired with `fingerprint` in a way that never let it
+    /// drive that machine? A lease here, in force or not, confirmed or not,
+    /// without [`Caps::I_MAY_DRIVE`]: a machine paired to control this one,
+    /// and nothing more (#259).
+    ///
+    /// Not a permission: [`TrustStore::we_may_drive`] decides that. This
+    /// tells "never asked for" apart from "refused for now". A lease that
+    /// lapsed, or waits for its number, did ask for the direction, and a
+    /// machine this store holds no record of is not known to be refused it.
+    pub fn paired_not_to_drive(&self, fingerprint: &str) -> bool {
+        self.lease(fingerprint)
+            .is_some_and(|l| !l.caps.contains(Caps::I_MAY_DRIVE))
+    }
+
     /// May we accept clipboard contents from this peer?
     pub fn clipboard_from(&self, fingerprint: &str) -> bool {
         self.permits(fingerprint, Caps::CLIPBOARD_FROM)
