@@ -317,6 +317,12 @@ impl Daemon {
         self.service.client_manager.clone()
     }
 
+    /// How many times its loop settled every device's edge, to count while
+    /// it runs (#259).
+    pub(crate) fn edge_settles(&self) -> std::rc::Rc<std::cell::Cell<usize>> {
+        self.service.edge_settles.clone()
+    }
+
     /// Its listener's links in, to count them while its loop runs.
     pub(crate) fn links_in(&self) -> crate::listen::Admitter {
         self.service.dial_back.admitter()

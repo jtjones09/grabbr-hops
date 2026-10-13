@@ -253,6 +253,16 @@ pub struct Service {
     /// enable request opens (#243). The watch and the backends ask through
     /// it; a test's daemon has one of its own.
     tap_gate: &'static input_event::accessibility::Gate,
+    /// The switched-on devices whose edge is settled: where capture holds
+    /// one for each, or `None` for a device whose pairing lets it control
+    /// this machine, and not this machine control it (#259). See
+    /// [`Service::settle_edges`].
+    edges: HashMap<ClientHandle, Option<Position>>,
+    /// Which machine each device is, as capture asks before a crossing.
+    machines: crate::connect::Machines,
+    /// How many times every edge was settled, for a test to count.
+    #[cfg(test)]
+    edge_settles: std::rc::Rc<std::cell::Cell<usize>>,
     /// keep track of registered connections to avoid duplicate barriers
     incoming_conns: HashSet<SocketAddr>,
     /// addrs whose cursor is currently ON this device (crossing-level state) —
@@ -1001,6 +1011,7 @@ impl Service {
         let clipboard_out_listen = listener.clipboard_sender(client_manager.clone());
         // revocation handles, grabbed before both are moved into capture/emulation
         let revoke_conn = conn.revoker();
+        let machines = conn.machines();
         let revoke_listen = listener.revoker();
         // and the attempts each holds for a machine mid-pairing (#167)
         let pairings_in = listener.pairings();
@@ -1083,6 +1094,10 @@ impl Service {
             emulation_discards: None,
             permission_watch: PermissionWatch::of_this_machine(tap_gate),
             tap_gate,
+            edges: Default::default(),
+            machines,
+            #[cfg(test)]
+            edge_settles: Default::default(),
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             currently_controlling: Default::default(),
@@ -1115,11 +1130,13 @@ impl Service {
             // is already active in client_manager and does not create a
             // capture barrier in that case so we have to deactivate it first
             self.client_manager.deactivate_client(*handle);
+            self.edges.remove(handle);
         }
 
         for handle in active {
             self.activate_client(handle);
         }
+        self.settle_edges().await;
 
         // A lease nothing checks is a data structure. The point-of-injection
         // check catches a lapse the moment a peer sends anything, because it
@@ -1143,6 +1160,9 @@ impl Service {
 
         self.settle_keep_awake();
         loop {
+            // Edges are settled after each event but those two that fire on
+            // every move at an edge, and change nothing an edge follows.
+            let mut settle = true;
             tokio::select! {
                 _ = lease_sweep.tick() => {
                     self.sweep_lapsed_leases();
@@ -1161,8 +1181,14 @@ impl Service {
                 event = next_or_never(&mut self.pairing_events_out) => self.handle_pairing_event(event),
                 request = self.frontend_listener.next() => self.handle_frontend_request(request),
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
-                event = self.emulation.event() => self.handle_emulation_event(event),
-                event = self.capture.event() => self.handle_capture_event(event),
+                event = self.emulation.event() => {
+                    settle = !matches!(event, EmulationEvent::EdgePushed { .. });
+                    self.handle_emulation_event(event)
+                }
+                event = self.capture.event() => {
+                    settle = !matches!(event, ICaptureEvent::CaptureBegin(_));
+                    self.handle_capture_event(event)
+                }
                 event = self.resolver.event() => self.handle_resolver_event(event),
                 event = async {
                     match self.discovery.as_mut() {
@@ -1223,6 +1249,11 @@ impl Service {
             // many places, and one missed would keep the machine awake, or
             // let it sleep, until the next.
             self.settle_keep_awake();
+            // The same for each device's edge, which follows its pairing and
+            // its machine, both changed in many places (#259).
+            if settle {
+                self.settle_edges().await;
+            }
         }
 
         log::info!("terminating service ...");
@@ -3725,7 +3756,7 @@ impl Service {
     fn deactivate_client(&mut self, handle: ClientHandle) {
         log::debug!("deactivating client {handle}");
         if self.client_manager.deactivate_client(handle) {
-            self.capture.destroy(handle);
+            self.drop_edge(handle);
             self.broadcast_client(handle);
             log::info!("deactivated client {handle}");
         }
@@ -3761,10 +3792,84 @@ impl Service {
 
         /* activate the client */
         if self.client_manager.activate_client(handle) {
-            /* notify capture and frontends */
-            self.capture.create(handle, pos, CaptureType::Default);
+            /* notify frontends; its edge is settled after this event */
             self.broadcast_client(handle);
             log::info!("activated client {handle} ({pos})");
+        }
+    }
+
+    /// Whether the device at `handle` should have a capture edge while it is
+    /// switched on: unless the pairing with the machine it is
+    /// ([`crate::connect::Machines::of`]) never let this machine drive that
+    /// one (#259).
+    ///
+    /// Crossing to such a machine could only be refused, and on a machine it
+    /// drives, the pointer it moves there reaches that edge on its way back,
+    /// where the refusal read as a permission lost. One this machine was let
+    /// drive and no longer may keeps its edge, and says so when crossed to.
+    /// So does a device that is no known machine, or one not paired yet: a
+    /// crossing to it is refused with the notice that it is not paired yet.
+    async fn wants_edge(&self, handle: ClientHandle) -> bool {
+        self.machines
+            .of(handle)
+            .await
+            .is_none_or(|fp| !self.trust.read().expect("lock").paired_not_to_drive(&fp))
+    }
+
+    /// Give every device switched on the capture edge it should have now, at
+    /// its position, and take away each one it should not.
+    async fn settle_edges(&mut self) {
+        #[cfg(test)]
+        self.edge_settles.set(self.edge_settles.get() + 1);
+        let mut handles = self.client_manager.active_clients();
+        handles.extend(self.edges.keys().copied());
+        handles.sort_unstable();
+        handles.dedup();
+        for handle in handles {
+            let on = self
+                .client_manager
+                .get_pos(handle)
+                .filter(|_| self.client_manager.is_on(handle));
+            let wanted = match on {
+                Some(pos) if self.wants_edge(handle).await => Some(pos),
+                _ => None,
+            };
+            self.settle_edge(handle, on.map(|_| wanted));
+        }
+    }
+
+    /// Settle the edge of the device at `handle` as `settled`: `None` when it
+    /// is off or gone, else where its edge is, if it has one.
+    fn settle_edge(&mut self, handle: ClientHandle, settled: Option<Option<Position>>) {
+        let held = self.edges.get(&handle).copied();
+        if held == settled {
+            return;
+        }
+        let had_edge = matches!(held, Some(Some(_)));
+        self.drop_edge(handle);
+        let Some(edge) = settled else { return };
+        match edge {
+            Some(pos) => {
+                self.capture.create(handle, pos, CaptureType::Default);
+                log::debug!("client {handle}: capture edge at {pos}");
+            }
+            None => log::info!(
+                "client {handle}: {}; it is paired to control this machine, and not to be \
+                 controlled from it",
+                if had_edge {
+                    "its edge is removed"
+                } else {
+                    "no edge"
+                }
+            ),
+        }
+        self.edges.insert(handle, edge);
+    }
+
+    /// Take away the capture edge of the device at `handle`, if it has one.
+    fn drop_edge(&mut self, handle: ClientHandle) {
+        if let Some(Some(_)) = self.edges.remove(&handle) {
+            self.capture.destroy(handle);
         }
     }
 
@@ -3779,9 +3884,7 @@ impl Service {
     fn remove_client(&mut self, handle: ClientHandle) {
         self.adding.remove(&handle);
         let removed = self.client_manager.remove_client(handle);
-        if removed.as_ref().is_some_and(|(_, s)| s.active) {
-            self.capture.destroy(handle);
-        }
+        self.drop_edge(handle);
         // Close the device's connection. Nothing can address it once the
         // device is gone, since handles are never reused, but it stays open
         // and still carries clipboard text until something closes it.
@@ -4752,6 +4855,9 @@ mod kept_awake;
 
 #[cfg(all(test, unix))]
 mod a_move_onto_a_taken_edge;
+
+#[cfg(all(test, unix))]
+mod a_machine_that_only_drives_this_one;
 
 #[cfg(all(test, unix, any(feature = "tui", feature = "slint")))]
 mod every_pairing_is_listed;

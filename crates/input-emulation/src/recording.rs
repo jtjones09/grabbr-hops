@@ -63,6 +63,9 @@ struct Log {
     /// Tearing a backend down never finishes, as a portal that does not
     /// answer while the screen is locked.
     never_stops: bool,
+    /// Every event injected is a deliberate push past this edge, as a
+    /// backend's adaptive edge concludes while the pointer is held there.
+    pushed_past: Option<crate::EdgeSide>,
 }
 
 type Shared = Arc<Mutex<Log>>;
@@ -105,6 +108,7 @@ impl Recording {
             ends: 0,
             started: 0,
             never_stops: false,
+            pushed_past: None,
         }));
         REGISTRY
             .lock()
@@ -172,6 +176,13 @@ impl Recording {
     /// How many backends were created from this recording.
     pub fn started(&self) -> usize {
         self.log.lock().expect("recording log").started
+    }
+
+    /// Report every event injected from here on as a deliberate push past
+    /// `side`, as a backend's adaptive edge does while the pointer is held
+    /// against it; `None` stops.
+    pub fn pushes_past(&self, side: Option<crate::EdgeSide>) {
+        self.log.lock().expect("recording log").pushed_past = side;
     }
 
     /// Make creating a backend fail as it does on a Mac that has not
@@ -298,6 +309,10 @@ impl Emulation for RecordingEmulation {
 
     fn button_scope(&self) -> ButtonScope {
         self.log.lock().expect("recording log").button_scope
+    }
+
+    fn take_edge_push(&mut self) -> Option<crate::EdgeSide> {
+        self.log.lock().expect("recording log").pushed_past
     }
 
     fn starts_unasked(&self) -> bool {
