@@ -9,9 +9,14 @@ use std::{
         Arc, Mutex, PoisonError, RwLock,
         atomic::{AtomicBool, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{sync::Notify, task::JoinHandle};
+
+/// How long closing the portal session may take as emulation stops (#261).
+/// A portal answers in milliseconds; GNOME's leaves some calls unanswered
+/// while the screen is locked.
+const PORTAL_TEARDOWN: Duration = Duration::from_secs(2);
 
 use ashpd::{
     desktop::{
@@ -493,7 +498,12 @@ impl Emulation for LibeiEmulation {
     async fn destroy(&mut self, _: EmulationHandle) {}
 
     async fn terminate(&mut self) {
-        let _ = self.session.close().await;
+        if tokio::time::timeout(PORTAL_TEARDOWN, self.session.close())
+            .await
+            .is_err()
+        {
+            log::warn!("the portal did not close the emulation session within {PORTAL_TEARDOWN:?}");
+        }
         self.ei_task.abort();
     }
 

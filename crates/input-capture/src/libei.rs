@@ -26,6 +26,7 @@ use std::{
     rc::Rc,
     sync::Arc,
     task::{Context, Poll, ready},
+    time::Duration,
 };
 use tokio::{
     sync::{
@@ -50,6 +51,17 @@ use super::{
 /* there is a bug in xdg-remote-desktop-portal-gnome / mutter that
  * prevents receiving further events after a session has been disabled once.
  * Therefore the session needs to be recreated when the barriers are updated */
+
+/// How long a portal call that ends a session may take (#261). A portal
+/// answers in milliseconds; GNOME's leaves some calls unanswered while the
+/// screen is locked, for minutes.
+const PORTAL_TEARDOWN: Duration = Duration::from_secs(2);
+
+/// How long [`CaptureTask::terminate`] waits for the task before aborting
+/// it (#261). Longer than [`PORTAL_TEARDOWN`], so a portal call that does
+/// not answer is logged by name first; shorter than the daemon's own bound
+/// on stopping capture, so the abort here is the one that happens.
+const TERMINATE_WITHIN: Duration = Duration::from_secs(3);
 
 /// events that necessitate restarting the capture session
 #[derive(Clone, Copy, Debug)]
@@ -104,17 +116,38 @@ impl<T> CaptureTask<T> {
         Poll::Ready(joined(r))
     }
 
-    /// Stops the task and waits for it. Calling it again is harmless.
+    /// Stops the task and waits for it, for at most [`TERMINATE_WITHIN`];
+    /// a task still running then is aborted. Calling it again is harmless.
     async fn terminate(&mut self) -> Result<(), CaptureError> {
         self.cancel.cancel();
         if self.done {
             return Ok(());
         }
         log::debug!("waiting for capture to terminate...");
-        let r = (&mut self.task).await;
-        self.done = true;
-        log::debug!("done!");
-        joined(r)
+        match tokio::time::timeout(TERMINATE_WITHIN, &mut self.task).await {
+            Ok(r) => {
+                self.done = true;
+                log::debug!("done!");
+                joined(r)
+            }
+            Err(_) => {
+                log::warn!(
+                    "input capture did not stop within {TERMINATE_WITHIN:?}, \
+                     waiting on the portal: aborting it"
+                );
+                self.task.abort();
+                // The runtime drops an aborted task's future when it next
+                // runs it. Until the handle says so, the future may still
+                // point into `owner`, and Drop must leave it allocated.
+                if tokio::time::timeout(TERMINATE_WITHIN, &mut self.task)
+                    .await
+                    .is_ok()
+                {
+                    self.done = true;
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -383,7 +416,15 @@ async fn do_capture(
             // create session
             let mut session = match session.take() {
                 Some(s) => s,
-                None => create_session(input_capture).await?.0,
+                // GNOME's portal does not answer this while the screen is
+                // locked, so a stop must not wait on it (#261).
+                None => tokio::select! {
+                    r = create_session(input_capture) => r?.0,
+                    _ = cancellation_token.cancelled() => {
+                        log::debug!("stopped while the portal was creating a session");
+                        return Ok(());
+                    }
+                },
             };
 
             let capture_session = do_capture_session(
@@ -401,11 +442,20 @@ async fn do_capture(
 
             // disable capture
             log::debug!("disabling input capture");
-            if let Err(e) = input_capture.disable(&session, Default::default()).await {
-                log::warn!("input_capture.disable(&session) {e}");
+            let disable = input_capture.disable(&session, Default::default());
+            match tokio::time::timeout(PORTAL_TEARDOWN, disable).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => log::warn!("input_capture.disable(&session) {e}"),
+                Err(_) => {
+                    log::warn!("the portal did not answer Disable within {PORTAL_TEARDOWN:?}")
+                }
             }
-            if let Err(e) = session.close().await {
-                log::warn!("session.close(): {e}");
+            match tokio::time::timeout(PORTAL_TEARDOWN, session.close()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => log::warn!("session.close(): {e}"),
+                Err(_) => log::warn!(
+                    "the portal did not close the capture session within {PORTAL_TEARDOWN:?}"
+                ),
             }
 
             // propagate error from capture session
@@ -442,15 +492,28 @@ async fn do_capture_session(
     // current client
     let current_pos = Rc::new(Cell::new(None));
 
-    // connect to eis server
-    let (context, _conn, ei_event_stream) = connect_to_eis(input_capture, session).await?;
+    // Each step is a call the portal may leave unanswered, as GNOME's does
+    // while the screen is locked: a session cancelled meanwhile ends (#261).
+    let setup = async {
+        // connect to eis server
+        let (context, conn, ei_event_stream) = connect_to_eis(input_capture, session).await?;
 
-    // set barriers
-    let (barriers, pos_for_barrier_id) =
-        update_barriers(input_capture, session, active_clients, next_barrier_id).await?;
+        // set barriers
+        let (barriers, pos_for_barrier_id) =
+            update_barriers(input_capture, session, active_clients, next_barrier_id).await?;
 
-    log::debug!("enabling session");
-    input_capture.enable(session, Default::default()).await?;
+        log::debug!("enabling session");
+        input_capture.enable(session, Default::default()).await?;
+        Ok::<_, CaptureError>((context, conn, ei_event_stream, barriers, pos_for_barrier_id))
+    };
+    let (context, _conn, ei_event_stream, barriers, pos_for_barrier_id) = tokio::select! {
+        r = setup => r?,
+        _ = cancel_session.cancelled() => {
+            log::debug!("session cancelled while it was being set up");
+            cancel_update.cancel();
+            return Ok(());
+        }
+    };
 
     // cancellation token to release session
     let release_session = Arc::new(Notify::new());
@@ -511,11 +574,17 @@ async fn do_capture_session(
                         };
                         current_pos.replace(Some(pos));
 
-                        // client entered => send event
-                        event_tx
-                            .send((pos, CaptureEvent::Begin))
-                            .await
-                            .map_err(|_| CaptureError::EndOfStream)?;
+                        // client entered => send event. The channel holds
+                        // one event, and nothing reads it once capture stops.
+                        tokio::select! {
+                            r = event_tx.send((pos, CaptureEvent::Begin)) => {
+                                r.map_err(|_| CaptureError::EndOfStream)?
+                            }
+                            _ = cancel_session.cancelled() => {
+                                log::debug!("session cancel requested");
+                                break
+                            }
+                        }
 
                         tokio::select! {
                             _ = notify_release.notified() => { /* capture release */
@@ -1031,6 +1100,45 @@ mod terse_compositor {
                 assert!(polled.is_ok(), "the ended task was read twice");
                 drop(capture);
                 assert!(freed.get(), "a terminated capture leaked what it owned");
+            })
+            .await;
+    }
+
+    // LEDGER | behaviour | CaptureTask::terminate on a task that ignores cancellation, paused time
+    /// A task parked in a portal call, as one waiting on GNOME's
+    /// CreateSession while the screen is locked, does not see the cancel.
+    /// Stopping waited on it for good, and systemd killed the daemon after
+    /// 90 s (#261).
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_capture_task_stuck_in_the_portal_is_aborted_within_the_bound() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (guard, ended) = owner();
+                let (owner, freed) = owner();
+                let task = tokio::task::spawn_local(async move {
+                    let _guard = guard;
+                    futures::future::pending::<Result<(), CaptureError>>().await
+                });
+                let mut capture = CaptureTask::new(owner, task, CancellationToken::new());
+                let started = tokio::time::Instant::now();
+                let stopped =
+                    tokio::time::timeout(Duration::from_secs(60), capture.terminate()).await;
+                let took = started.elapsed();
+                match stopped {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => panic!("terminate failed: {e}"),
+                    Err(_) => panic!("terminate still waited on the stuck task after 60 s"),
+                }
+                assert!(
+                    took <= super::TERMINATE_WITHIN,
+                    "terminate took {took:?}, past its bound"
+                );
+                assert!(
+                    ended.get(),
+                    "terminate returned with the task still running"
+                );
+                drop(capture);
+                assert!(freed.get(), "an aborted capture leaked what it owned");
             })
             .await;
     }

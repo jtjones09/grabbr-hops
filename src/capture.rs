@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::connect::{LanMouseConnection, LanMouseConnectionError};
 use crate::restart::{RESTART_AFTER, restart_wait};
+use crate::teardown::{STOP_WITHIN, stop_within};
 
 pub(crate) struct Capture {
     cancellation_token: CancellationToken,
@@ -179,9 +180,7 @@ impl Capture {
     pub(crate) async fn terminate(&mut self) {
         self.cancellation_token.cancel();
         log::debug!("terminating capture");
-        if let Err(e) = (&mut self.task).await {
-            log::warn!("{e}");
-        }
+        stop_within("input capture", &mut self.task, STOP_WITHIN).await;
     }
 
     pub(crate) fn create(

@@ -799,7 +799,12 @@ impl EmulationProxy {
         self.request_tx
             .send(ProxyRequest::Terminate)
             .expect("channel closed");
-        let _ = (&mut self.task).await;
+        crate::teardown::stop_within(
+            "input emulation",
+            &mut self.task,
+            crate::teardown::STOP_WITHIN,
+        )
+        .await;
     }
 }
 

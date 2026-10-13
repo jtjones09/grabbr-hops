@@ -64,6 +64,7 @@ mod pid;
 mod prompt_gate;
 mod restart;
 pub mod service;
+mod teardown;
 mod transport;
 pub mod trust;
 pub mod trust_file;
