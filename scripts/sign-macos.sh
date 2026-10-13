@@ -97,8 +97,9 @@ xcrun stapler staple "$DMG"
 xcrun stapler validate "$DMG"
 
 echo "==> Gatekeeper assessment (expect: accepted / source=Notarized Developer ID)"
-spctl --assess --type execute -vv "$APP" 2>&1 || true
-spctl --assess --type open --context context:primary-signature -vv "$DMG" 2>&1 || true
+# Either one rejected stops the script here, before anything is published.
+spctl --assess --type execute -vv "$APP" 2>&1
+spctl --assess --type open --context context:primary-signature -vv "$DMG" 2>&1
 
 echo "==> Publishing signed artifacts to $OUT"
 mkdir -p "$OUT"

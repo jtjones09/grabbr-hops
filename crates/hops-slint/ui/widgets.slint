@@ -145,6 +145,94 @@ export component PillButton inherits Rectangle {
     }
 }
 
+// One of the three numbers a machine being added offers (#11): large mono
+// digits in an outlined box, so the three read as a choice and not as text.
+export component NumberButton inherits Rectangle {
+    in property <string> text;
+    callback clicked;
+
+    horizontal-stretch: 0;
+    height: 44px;
+    min-width: 112px;
+    border-radius: Radius.md;
+    border-width: 1px;
+    border-color: ta.has-hover ? Theme.c.accent : Theme.c.border;
+    background: ta.pressed
+        ? Theme.c.surface-raised.darker(0.1)
+        : (ta.has-hover ? Theme.c.surface-raised : Theme.c.surface);
+    animate background, border-color { duration: Motion.fast; }
+
+    Text {
+        text: root.text;
+        color: Theme.c.foreground;
+        font-family: Type.mono;
+        font-size: 20px;
+        font-weight: Type.bold;
+        letter-spacing: 1px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// One answer to a question with one answer (#220): a round mark, filled when
+// chosen, and the answer in full words, the whole row clickable. Chosen, the
+// row takes the accent border and tint, so which answer is given reads at a
+// glance and none reads as given before a click.
+export component ChoiceRow inherits Rectangle {
+    in property <string> text;
+    in property <bool> selected: false;
+    callback clicked;
+
+    height: Size.control;
+    border-radius: Radius.sm;
+    border-width: 1px;
+    border-color: root.selected ? Theme.c.accent : (ta.has-hover ? Theme.c.muted : Theme.c.border);
+    background: root.selected
+        ? Theme.c.accent.transparentize(0.85)
+        : (ta.has-hover ? Theme.c.surface-raised : Theme.c.surface);
+    animate background, border-color { duration: Motion.fast; }
+
+    HorizontalLayout {
+        padding-left: Space.sm;
+        padding-right: Space.sm;
+        spacing: Space.sm;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 14px;
+                height: 14px;
+                border-radius: 7px;
+                border-width: 2px;
+                border-color: root.selected ? Theme.c.accent : Theme.c.muted;
+                Rectangle {
+                    width: 6px;
+                    height: 6px;
+                    border-radius: 3px;
+                    background: root.selected ? Theme.c.accent : transparent;
+                }
+            }
+        }
+        Text {
+            text: root.text;
+            color: root.selected ? Theme.c.foreground : Theme.c.muted;
+            font-size: Type.small;
+            font-weight: root.selected ? Type.semibold : Type.regular;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
 // An iOS-style toggle switch. Track lights green when on; the knob slides.
 export component Toggle inherits Rectangle {
     in property <bool> checked;

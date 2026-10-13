@@ -1,17 +1,12 @@
-// hops — the drag-to-arrange spatial layout canvas. Lets you position
-// each device relative to "this Mac" by dragging; the result persists as a
-// Geometry rect per device (UpdateGeometry). STORAGE ONLY for now — nothing
-// reads these rects to change how crossing actually behaves yet. That's a
-// separate, deliberately deferred step: crossing behavior needs A/B hardware
-// testing before it can trust computed geometry (see the project's own
-// behavioral-bugs-need-runtime-test lesson — spatial crossing has been
-// misdiagnosed from code alone before).
+// hops — the drag-to-arrange layout canvas (#174). Where a device is
+// dropped sets the edge of this machine its pointer crosses at: Rust works
+// the edge out from the drop (src/canvas.rs), asks the daemon to move the
+// device there, and draws every device at a clean spot on its edge's side,
+// so the picture never shows a place the crossing does not honour.
 //
-// Box positions are intentionally NOT re-pushed by the ~250ms poll timer
-// while the canvas is open (see AppWindow.open-layout-canvas in app.slint) —
-// only a fresh open() call repopulates them. If the live device poll kept
-// overwriting `x`/`y` every tick, it would fight a drag in progress the same
-// way a live-bound rename TextField would (see app.slint's note on that).
+// The boxes are redrawn only when the devices they show change (added,
+// removed, renamed, switched, moved to another edge), not on every poll:
+// a redraw ends a drag in progress.
 
 import { Theme, Type, Space, Radius, Motion } from "theme.slint";
 import { PillButton } from "widgets.slint";
@@ -23,6 +18,8 @@ export struct CanvasBox {
     // struct without needing Slint's length wrapper type.
     x: float,
     y: float,
+    // switched on: the device the pointer crosses to at this edge
+    active: bool,
 }
 
 // shared constants — Slint has no top-level `const`, only `global` (the same
@@ -36,6 +33,7 @@ global CanvasSize {
 
 component DraggableBox inherits Rectangle {
     in property <string> label;
+    in property <bool> active;
     in-out property <length> box-x;
     in-out property <length> box-y;
     callback dropped(length /* x */, length /* y */);
@@ -44,22 +42,41 @@ component DraggableBox inherits Rectangle {
     height: CanvasSize.box-height;
     x: box-x;
     y: box-y;
-    background: ta.pressed ? Theme.c.accent.transparentize(0.55) : Theme.c.accent.transparentize(0.75);
+    // opaque, so a box drawn over another hides it cleanly; the tint is a
+    // layer on top
+    background: root.active ? Theme.c.background : Theme.c.surface;
     border-width: 2px;
-    border-color: Theme.c.accent;
+    border-color: root.active ? Theme.c.accent : Theme.c.border;
     border-radius: Radius.md;
-    animate background { duration: Motion.fast; }
+    accessible-role: list-item;
+    accessible-label: root.label;
+    accessible-description: root.active ? "" : "switched off";
 
-    Text {
-        text: root.label;
-        color: Theme.c.foreground;
-        font-size: Type.small;
-        font-weight: Type.semibold;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-        width: 100%;
-        height: 100%;
-        wrap: word-wrap;
+    Rectangle {
+        border-radius: Radius.md;
+        background: ta.pressed ? Theme.c.accent.transparentize(0.55)
+            : root.active ? Theme.c.accent.transparentize(0.75) : transparent;
+        animate background { duration: Motion.fast; }
+    }
+
+    VerticalLayout {
+        alignment: center;
+        padding-left: Space.xs;
+        padding-right: Space.xs;
+        Text {
+            text: root.label;
+            color: root.active ? Theme.c.foreground : Theme.c.muted;
+            font-size: Type.small;
+            font-weight: Type.semibold;
+            horizontal-alignment: center;
+            overflow: elide;
+        }
+        if !root.active: Text {
+            text: "off";
+            color: Theme.c.muted;
+            font-size: Type.caption;
+            horizontal-alignment: center;
+        }
     }
 
     ta := TouchArea {
@@ -87,9 +104,14 @@ component DraggableBox inherits Rectangle {
 
 export component LayoutCanvas inherits Rectangle {
     in property <[CanvasBox]> boxes: [];
+    // names of paired machines with no device here, so nothing to place
+    in property <string> unplaced;
+    in property <string> this-name;
+    in property <string> this-kind;
     callback close();
-    // x/y in plain logical-px floats — see CanvasBox's own note on why.
-    callback geometry-changed(string /* handle */, float /* x */, float /* y */);
+    // a box's top-left corner where it was dropped, in plain logical-px
+    // floats — see CanvasBox's own note on why.
+    callback dropped(string /* handle */, float /* x */, float /* y */);
 
     background: Theme.c.surface;
     border-radius: Radius.lg;
@@ -122,50 +144,69 @@ export component LayoutCanvas inherits Rectangle {
             }
         }
         Text {
-            text: "drag a device relative to this Mac — purely visual for now, doesn't change crossing yet";
+            text: "Drag each device to the side of this machine it sits on: the pointer crosses to it through that edge. Two switched-on devices swap sides when one is dropped on the other's; a switched-off one sits beside.";
             color: Theme.c.muted;
             font-size: Type.caption;
             wrap: word-wrap;
         }
 
-        Rectangle {
-            width: CanvasSize.width;
-            height: CanvasSize.height;
-            background: Theme.c.background;
-            border-radius: Radius.md;
-            border-width: 1px;
-            border-color: Theme.c.border;
-
-            // "this Mac" — a fixed anchor, not draggable (its own geometry
-            // isn't a remote client's config, so there's nowhere to persist
-            // a dragged position for it in this pass).
+        HorizontalLayout {
+            alignment: center;
             Rectangle {
-                width: CanvasSize.box-width;
-                height: CanvasSize.box-height;
-                x: (CanvasSize.width - self.width) / 2;
-                y: (CanvasSize.height - self.height) / 2;
-                background: Theme.c.surface-raised;
-                border-width: 2px;
-                border-color: Theme.c.muted;
+                width: CanvasSize.width;
+                height: CanvasSize.height;
+                background: Theme.c.background;
                 border-radius: Radius.md;
-                Text {
-                    text: "this Mac";
-                    color: Theme.c.foreground;
-                    font-size: Type.small;
-                    font-weight: Type.semibold;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                    width: 100%;
-                    height: 100%;
+                border-width: 1px;
+                border-color: Theme.c.border;
+
+                // this machine — a fixed anchor, not draggable: the edges
+                // are its own, and every device is placed around it.
+                Rectangle {
+                    width: CanvasSize.box-width;
+                    height: CanvasSize.box-height;
+                    x: (CanvasSize.width - self.width) / 2;
+                    y: (CanvasSize.height - self.height) / 2;
+                    background: Theme.c.surface-raised;
+                    border-width: 2px;
+                    border-color: Theme.c.muted;
+                    border-radius: Radius.md;
+                    VerticalLayout {
+                        alignment: center;
+                        padding-left: Space.xs;
+                        padding-right: Space.xs;
+                        if root.this-name != "": Text {
+                            text: root.this-name;
+                            color: Theme.c.foreground;
+                            font-size: Type.small;
+                            font-weight: Type.semibold;
+                            horizontal-alignment: center;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: root.this-kind;
+                            color: root.this-name != "" ? Theme.c.muted : Theme.c.foreground;
+                            font-size: root.this-name != "" ? Type.caption : Type.small;
+                            font-weight: root.this-name != "" ? Type.regular : Type.semibold;
+                            horizontal-alignment: center;
+                        }
+                    }
+                }
+
+                for b in root.boxes: DraggableBox {
+                    label: b.name;
+                    active: b.active;
+                    box-x: b.x * 1px;
+                    box-y: b.y * 1px;
+                    dropped(x, y) => { root.dropped(b.handle, x / 1px, y / 1px); }
                 }
             }
-
-            for b in root.boxes: DraggableBox {
-                label: b.name;
-                box-x: b.x * 1px;
-                box-y: b.y * 1px;
-                dropped(x, y) => { root.geometry-changed(b.handle, x / 1px, y / 1px); }
-            }
+        }
+        if root.unplaced != "": Text {
+            text: "Not shown: " + root.unplaced + ". Paired, but with no address here yet, so there is no edge to set; each appears once it connects to this machine.";
+            color: Theme.c.muted;
+            font-size: Type.caption;
+            wrap: word-wrap;
         }
     }
 }

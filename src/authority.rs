@@ -5,7 +5,7 @@
 //! Until now, "is this peer allowed to drive my keyboard?" was answered by
 //! reading `[authorized_fingerprints]` out of `config.toml`. That table is a
 //! plain, hand-editable document, and the only thing stopping a hand-edit from
-//! re-trusting an expelled device was a *precedence rule*: revocation outranks
+//! re-trusting a removed device was a *precedence rule*: revocation outranks
 //! the allowlist, applied at every door (`Config::effective_allowlist`).
 //!
 //! Precedence works because there are two tables and one of them wins. Once

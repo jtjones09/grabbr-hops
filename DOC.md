@@ -1,77 +1,70 @@
-# General Software Architecture
+# How hops is put together
 
-## Events
-
-Each instance of hops can emit and receive events, where
-an event is either a mouse or keyboard event for now.
-
-The general Architecture is shown in the following flow chart:
-```mermaid
-graph TD
-    A[Wayland Backend] -->|WaylandEvent| D{Input}
-    B[X11 Backend] -->|X11Event| D{Input}
-    C[Windows Backend] -->|WindowsEvent| D{Input}
-    D -->|Abstract Event| E[Emitter]
-    E -->|Udp Event| F[Receiver]
-    F -->|Abstract Event| G{Dispatcher}
-    G -->|Wayland Event| H[Wayland Backend]
-    G -->|X11 Event| I[X11 Backend]
-    G -->|Windows Event| J[Windows Backend]
-```
-
-### Input
-The input component is responsible for translating inputs from a given backend
-to a standardized format and passing them to the event emitter.
-
-### Emitter
-The event emitter serializes events and sends them over the network
-to the correct client.
-
-### Receiver
-The receiver receives events over the network and deserializes them into
-the standardized event format.
-
-### Dispatcher
-The dispatcher component takes events from the event receiver and passes them
-to the correct backend corresponding to the type of client.
-
-
-## Requests
-
-// TODO this currently works differently
-
-Aside from events, requests can be sent via a simple protocol.
-For this, a simple tcp server is listening on the same port as the udp
-event receiver and accepts requests for connecting to a device or to
-request the keymap of a device.
+## Input path
 
 ```mermaid
-sequenceDiagram
-    Alice->>+Bob: Request Connection (secret)
-    Bob-->>-Alice: Ack (Keyboard Layout)
+graph LR
+    A[input-capture] -->|CaptureEvent| B[capture]
+    B -->|hops-proto events| C((QUIC link))
+    C --> D[listener]
+    D -->|checked events| E[emulation]
+    E -->|Event| F[input-emulation]
 ```
 
-## Problems
-The general Idea is to have a bidirectional connection by default, meaning
-any connected device can not only receive events but also send events back.
+- **input-capture** reads the local keyboard and pointer through the
+  platform's backend (libei, layer-shell, macOS, Windows) and reports when
+  the pointer reaches the edge of a device.
+- **capture** (`src/capture.rs`) sends the input to the device the pointer
+  crossed to, encoded by **hops-proto**, over that device's link.
+- **listener** (`src/listen.rs`) accepts links, and admits each event only
+  from a machine whose pairing lets it control this one and that has
+  crossed onto this machine.
+- **emulation** (`src/emulation.rs`) hands admitted events to
+  **input-emulation**, which injects them through the platform's backend.
 
-This way when connecting e.g. a PC to a Laptop, either device can be used
-to control the other.
+## Links
 
-It needs to be ensured, that whenever a device is controlled the controlled
-device does not transmit the events back to the original sender.
-Otherwise events are multiplied and either one of the instances crashes.
+A link is one QUIC connection (quinn), authenticated with TLS 1.3 in both
+directions: each machine presents its own certificate, and each checks the
+other's fingerprint against its pairings during the handshake. There is no
+second channel: input, the clipboard, pairing and removal notices all use
+the link. The default port is UDP 4722.
 
-To keep the implementation of input backends simple this needs to be handled
-on the server level.
+The ALPN says which way control goes on a link:
 
-## Device State - Active and Inactive
-To solve this problem, each device can be in exactly two states:
+- `grabbr-hop/1`: the machine that dialled controls the one it reached.
+- `grabbr-hop/1-driven`: the machine that dialled is controlled by the one
+  it reached. A machine dials this way when the other may control it and
+  it may not control the other, or when `listen = false` stops it
+  listening (`src/dial_back.rs`). A machine behind a VPN or security
+  client that drops unsolicited inbound connections is controlled this
+  way; it needs `listen = false` only if control goes both ways, or to
+  stop it listening at all.
 
-Either events are sent or received.
+Which machine dials is decided by the pairing, not by the address. The
+ports and directions are listed in [docs/NETWORK.md](docs/NETWORK.md).
 
-This ensures that
-- a) Events can never result in a feedback loop.
-- b) As soon as a virtual input enters another client, hops will stop receiving events,
-which ensures clients can only be controlled directly and not indirectly through other clients.
+## Crossing
 
+A machine is in one of two states towards a device: sending to it, or
+receiving from it, never both at once, so input cannot loop back.
+
+1. When the pointer reaches a device's edge, capture sends `Enter` and
+   waits for `Ack` over the same link.
+2. Until the pointer comes back, local input goes to that device and not
+   to this machine.
+3. When the pointer comes back, capture sends `Leave`. If the link drops
+   instead, the receiving machine releases the keys and buttons it was
+   holding down for the other machine.
+
+After the handshake each side sends `Hello` (its build) and `Capability`
+(the optional protocol features it supports), and `Ping`/`Pong` tells the
+sender whether the receiver can inject input.
+
+## Frontends
+
+The daemon (`hops daemon`, `src/service.rs`) owns capture, emulation, the
+links and the trust store. The GUI (`hops-slint`), the terminal UI
+(`hops-tui`) and the CLI (`hops-cli`) reach it over a local channel
+(`hops-ipc`): a Unix socket, or a named pipe on Windows, where every
+connection must prove it holds the token beside `config.toml`.

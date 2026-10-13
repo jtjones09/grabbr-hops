@@ -20,6 +20,11 @@ use crate::error::EmulationError;
 
 use super::{ButtonScope, Emulation, EmulationHandle, error::XdpEmulationCreationError};
 
+/// How long closing the portal session may take as emulation stops (#261).
+/// A portal answers in milliseconds; GNOME's leaves some calls unanswered
+/// while the screen is locked.
+const PORTAL_TEARDOWN: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub(crate) struct DesktopPortalEmulation {
     proxy: RemoteDesktop,
     session: Session<RemoteDesktop>,
@@ -28,6 +33,8 @@ pub(crate) struct DesktopPortalEmulation {
 impl DesktopPortalEmulation {
     pub(crate) async fn new() -> Result<DesktopPortalEmulation, XdpEmulationCreationError> {
         log::debug!("connecting to org.freedesktop.portal.RemoteDesktop portal ...");
+        // Before any portal call, so the consent prompt can name hops.
+        input_event::portal::register().await;
         let proxy = RemoteDesktop::new().await?;
 
         // retry when user presses the cancel button
@@ -154,12 +161,17 @@ impl Emulation for DesktopPortalEmulation {
     async fn create(&mut self, _client: EmulationHandle) {}
     async fn destroy(&mut self, _client: EmulationHandle) {}
     async fn terminate(&mut self) {
-        if let Err(e) = self.session.close().await {
-            log::warn!("session.close(): {e}");
+        let close = async {
+            if let Err(e) = self.session.close().await {
+                log::warn!("session.close(): {e}");
+            };
+            if let Err(e) = self.session.receive_closed().await {
+                log::warn!("session.receive_closed(): {e}");
+            };
         };
-        if let Err(e) = self.session.receive_closed().await {
-            log::warn!("session.receive_closed(): {e}");
-        };
+        if tokio::time::timeout(PORTAL_TEARDOWN, close).await.is_err() {
+            log::warn!("the portal did not close the emulation session within {PORTAL_TEARDOWN:?}");
+        }
     }
 
     /// Every handle injects through the one RemoteDesktop session. mutter

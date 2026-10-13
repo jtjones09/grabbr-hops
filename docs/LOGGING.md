@@ -61,7 +61,11 @@ asked for by name.
 
 `stderr` is written only when it is a terminal, or when no file could be opened.
 A service launcher that redirects stderr into a file of its own would otherwise
-receive a second, unrotated copy of everything.
+receive a second, unrotated copy of everything. The daemon and the GUI never
+write a terminal while they have their file, and say once which file that is:
+a Windows console holds every write while text is selected in it, which
+stopped input crossing to other machines and left the window not responding.
+Follow the file instead: `tail -f`, or `Get-Content -Wait` on Windows.
 
 ---
 
@@ -125,7 +129,10 @@ every release feature set — the recording code is not in the binary.
 boolean: `30s`, `10m`, `1h`, capped at one hour. `HOPS_LOG_KEYS=1` reads like
 "on" and is rejected rather than quietly meaning one second.
 
-**Its own file.** `~/hops/logs/keystrokes.log`, mode `0600` on unix. Keystrokes
+**Its own file.** `keystrokes.log`, in the directory in the table above, mode
+`0600` on unix. `HOPS_LOG_FILE` does not move it. It sits beside the other
+logs, so leave `keystrokes.log` out when attaching the log folder to a report:
+it must never be shared. Keystrokes
 never enter the general log, so a daemon log stays shareable — you could not
 hand anyone a debug log without handing them your typing.
 

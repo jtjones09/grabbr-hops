@@ -65,6 +65,11 @@ windows = { version = "0.61.2", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[dev-dependencies]
+input-event = { path = "../input-event", version = "0.4.0", default-features = false, features = ["test-support"] }
+# Paused time, so a test of how long a stop waits takes no time.
+tokio = { version = "1.32.0", features = ["macros", "rt", "test-util", "time"] }
+
 [features]
 default = ["layer_shell", "x11", "libei"]
 layer_shell = [
@@ -73,7 +78,7 @@ layer_shell = [
     "dep:wayland-protocols-wlr",
 ]
 x11 = ["dep:x11"]
-libei = ["dep:reis", "dep:ashpd"]
+libei = ["dep:reis", "dep:ashpd", "input-event/portal"]
 # A backend a test feeds events into, in place of a device. Not in `default` and
 # not in any feature the hops crate exposes: the hops crate turns it on as a
 # dev-dependency only, so no shipped build contains it.

@@ -1,0 +1,338 @@
+//! The whole daemon keeps its machine awake only while a paired device may
+//! control it, and lets it sleep otherwise. Every Mac running hops used to
+//! hold its power assertion for the life of the daemon, paired or not.
+//!
+//! The assertion is watched through the recording seam; every change is
+//! made the way the app or a pairing makes it. The daemon answers the app
+//! only after settling the assertion for every request before, so an empty
+//! exchange is a barrier and each check waits on the daemon, not a clock.
+
+use super::in_process::{DEADLINE, Daemon, Frontend, compare_number, prompt_from, trusting};
+use crate::keep_awake::recording::{Recording, Seen};
+use crate::test_harness::{NEVER_WITHIN, dialer, machine, run_local, wait_until};
+use crate::trust::Caps;
+use hops_ipc::{Controller, FrontendEvent, FrontendRequest as R, Position};
+use hops_proto::ProtoEvent;
+use input_emulation::recording::{Recorded, Recording as Emulation};
+use input_event::{Event, PointerEvent};
+use std::rc::Rc;
+
+/// `(held, takes, releases)` once the daemon has handled everything sent.
+async fn settled(app: &mut Frontend, seen: &Seen) -> (bool, u32, u32) {
+    app.exchange(&[]).await;
+    seen.get()
+}
+
+// LEDGER KA-5 | class B | 2 PowerAssertion calls made by a running daemon, driven over its IPC socket
+/// The desk mac pairs with a pc, first only to control it, then to be
+/// controlled by it, and the pc is then removed from the mac's app.
+#[test]
+fn a_mac_is_kept_awake_only_while_a_machine_that_may_control_it_is_paired() {
+    run_local(async {
+        let mut mac = Daemon::start("awake-mac", "", input_emulation::Backend::Dummy).await;
+        let seen = Rc::new(Seen::default());
+        mac.keep_awake_through(Box::new(Recording(seen.clone())));
+        let (trust, ipc) = (mac.trust(), mac.ipc());
+        let pc = machine();
+
+        let body = async {
+            let mut app = ipc.connect().await;
+            assert_eq!(
+                settled(&mut app, &seen).await,
+                (false, 0, 0),
+                "(held, takes, releases) with nothing paired"
+            );
+
+            trust
+                .write()
+                .expect("lock")
+                .issue_confirmed(&pc.fingerprint, "desk pc", Caps::OUTBOUND)
+                .expect("issue");
+            assert_eq!(
+                settled(&mut app, &seen).await,
+                (false, 0, 0),
+                "(held, takes, releases) paired only to control the pc"
+            );
+
+            trust
+                .write()
+                .expect("lock")
+                .issue_confirmed(&pc.fingerprint, "desk pc", Caps::DRIVE)
+                .expect("issue");
+            assert_eq!(
+                settled(&mut app, &seen).await,
+                (true, 1, 0),
+                "(held, takes, releases) once the pc may control the mac"
+            );
+
+            app.exchange(&[R::RemoveAuthorizedKey(pc.fingerprint.clone())])
+                .await;
+            assert_eq!(
+                settled(&mut app, &seen).await,
+                (false, 1, 1),
+                "(held, takes, releases) once the pc was removed"
+            );
+        };
+        mac.run_while(body).await;
+    });
+}
+
+/// The mac's config: a device for the pc, pinned to it and switched on.
+/// The pairing itself is in the trust store the mac starts with
+/// ([`paired_both_ways`]): a config table grants nothing (#231).
+fn device_for(fp: &str) -> String {
+    format!(
+        "[[clients]]\nposition = \"left\"\nips = [\"127.0.0.1\"]\nport = 9\n\
+         activate_on_startup = true\nfingerprint = \"{fp}\"\n"
+    )
+}
+
+/// The mac paired with `fp` so that each controls the other, confirmed on
+/// both machines.
+fn paired_both_ways(fp: &str) -> [(&str, &str, Caps); 1] {
+    [(fp, "desk pc", Caps::DRIVE)]
+}
+
+// LEDGER KA-6 | class B | 3 PowerAssertion calls made by a running daemon driven over its IPC socket, a peer driving it over loopback QUIC, its recording emulation backend
+/// A pc paired with the mac from its start keeps the mac awake with its
+/// device switched off here, because it still controls the mac over a link
+/// it opens (#218); a lease that stops granting control lets it sleep.
+#[test]
+fn a_controlling_machine_switched_off_still_keeps_the_mac_awake() {
+    run_local(async {
+        let pc = machine();
+        let emulation = Emulation::new();
+        let mut mac = Daemon::start_paired(
+            "awake-off-mac",
+            &device_for(&pc.fingerprint),
+            &paired_both_ways(&pc.fingerprint),
+            input_capture::Backend::Dummy,
+            emulation.backend(),
+        )
+        .await;
+        let seen = Rc::new(Seen::default());
+        mac.keep_awake_through(Box::new(Recording(seen.clone())));
+        let (ours, port, trust, ipc) = (mac.fingerprint(), mac.port(), mac.trust(), mac.ipc());
+        assert!(
+            trust.read().expect("lock").may_drive_us(&pc.fingerprint),
+            "precondition: the pairing lets the pc control the mac"
+        );
+
+        let body = async {
+            let mut app = ipc.connect().await;
+            assert_eq!(
+                settled(&mut app, &seen).await,
+                (true, 1, 0),
+                "(held, takes, releases) with the pc paired and switched on"
+            );
+            let handle = app
+                .exchange(&[R::Enumerate()])
+                .await
+                .into_iter()
+                .find_map(|e| match e {
+                    FrontendEvent::Enumerate(all) => all
+                        .into_iter()
+                        .find(|(_, _, s)| {
+                            s.peer_fingerprint.as_deref() == Some(pc.fingerprint.as_str())
+                        })
+                        .map(|(h, _, _)| h),
+                    _ => None,
+                })
+                .expect("the mac's device for the pc");
+
+            app.exchange(&[R::Activate(handle, false)]).await;
+            assert_eq!(
+                settled(&mut app, &seen).await,
+                (true, 1, 0),
+                "(held, takes, releases) once the pc was switched off, while it may \
+                 still control the mac"
+            );
+
+            // Switched off here, the pc still moves the mac's pointer over a
+            // link it opens: the mac must still be awake to answer it.
+            let driver = dialer(&pc, trusting(&pc, &ours), port, Position::Left);
+            driver.until_alive().await;
+            let moved = Event::Pointer(PointerEvent::Motion {
+                time: 0,
+                dx: 2.0,
+                dy: 0.0,
+            });
+            let driving = async {
+                loop {
+                    driver
+                        .send(ProtoEvent::Enter(hops_proto::Position::Right))
+                        .await;
+                    driver.send(ProtoEvent::Input(moved)).await;
+                    tokio::time::sleep(NEVER_WITHIN / 4).await;
+                }
+            };
+            let arrived = wait_until(
+                "the switched-off pc moves the mac's pointer",
+                DEADLINE,
+                || {
+                    emulation
+                        .calls()
+                        .iter()
+                        .any(|c| matches!(c, Recorded::Consume(e, _) if *e == moved))
+                },
+            );
+            tokio::select! {
+                () = driving => unreachable!("the driver stops only with the test"),
+                () = arrived => {}
+            }
+            driver.send(ProtoEvent::Leave(0)).await;
+            assert_eq!(
+                settled(&mut app, &seen).await,
+                (true, 1, 0),
+                "(held, takes, releases) while the switched-off pc controlled the mac"
+            );
+
+            app.exchange(&[R::Activate(handle, true)]).await;
+            assert_eq!(
+                settled(&mut app, &seen).await,
+                (true, 1, 0),
+                "(held, takes, releases) once the pc was switched on again"
+            );
+
+            trust
+                .write()
+                .expect("lock")
+                .drop_capabilities(&pc.fingerprint, Caps::DRIVE_ME);
+            assert_eq!(
+                settled(&mut app, &seen).await,
+                (false, 1, 1),
+                "(held, takes, releases) once the pc may no longer control the mac"
+            );
+        };
+        mac.run_while(body).await;
+    });
+}
+
+// LEDGER KA-7 | class B | 3 PowerAssertion calls made by a running daemon, a peer pairing with it over loopback QUIC, AuthorizeKey and ConfirmPairing over its IPC socket
+/// A pairing is complete only when the pc's confirmation is read, which
+/// happens after the app picked the number and with no request from the
+/// app: the mac is kept awake then, not at the app's next request.
+#[test]
+fn a_pairing_confirmed_by_the_other_machine_keeps_the_mac_awake() {
+    run_local(async {
+        let mut mac = Daemon::start("awake-pair-mac", "", input_emulation::Backend::Dummy).await;
+        let seen = Rc::new(Seen::default());
+        mac.keep_awake_through(Box::new(Recording(seen.clone())));
+        let (ours, port, trust, ipc) = (mac.fingerprint(), mac.port(), mac.trust(), mac.ipc());
+        let pc = machine();
+
+        let body = async {
+            let mut app = ipc.connect().await;
+            app.exchange(&[R::OpenPairing]).await;
+            prompt_from(&mut app, &pc, port, &ours).await;
+            app.exchange(&[R::AuthorizeKey {
+                label: "desk pc".into(),
+                fingerprint: pc.fingerprint.clone(),
+                controller: Controller::ThatMachine,
+                clipboard: false,
+            }])
+            .await;
+            let comparing = compare_number(&mut app, &pc, port, &ours).await;
+            assert_eq!(
+                settled(&mut app, &seen).await,
+                (false, 0, 0),
+                "(held, takes, releases) before the number was picked"
+            );
+            app.exchange(&[R::ConfirmPairing {
+                fingerprint: pc.fingerprint.clone(),
+                number: comparing.number.clone(),
+            }])
+            .await;
+            // No request from the app from here on.
+            wait_until("the mac is kept awake for the pc", DEADLINE, || {
+                seen.get().0
+            })
+            .await;
+            assert!(
+                trust.read().expect("lock").may_drive_us(&pc.fingerprint),
+                "precondition: the pairing lets the pc control the mac"
+            );
+            assert_eq!(
+                seen.get(),
+                (true, 1, 0),
+                "(held, takes, releases) once paired"
+            );
+        };
+        mac.run_while(body).await;
+    });
+}
+
+// LEDGER KA-8 | class B | 2 PowerAssertion calls made by a running daemon whose first take the system refuses
+/// The system refuses the mac's first take; the daemon tries again at its
+/// lease sweep, whose first tick comes as it starts, rather than waiting
+/// for the pairing to change.
+#[test]
+fn a_refused_assertion_is_taken_at_the_next_sweep() {
+    run_local(async {
+        let pc = machine();
+        let mut mac = Daemon::start_paired(
+            "awake-refused-mac",
+            &device_for(&pc.fingerprint),
+            &paired_both_ways(&pc.fingerprint),
+            input_capture::Backend::Dummy,
+            input_emulation::Backend::Dummy,
+        )
+        .await;
+        let seen = Rc::new(Seen::default());
+        seen.refusals.set(1);
+        mac.keep_awake_through(Box::new(Recording(seen.clone())));
+        let body = async {
+            wait_until("the refused assertion is taken again", DEADLINE, || {
+                seen.get().0
+            })
+            .await;
+            assert_eq!(
+                (seen.get(), seen.refusals.get()),
+                ((true, 1, 0), 0),
+                "((held, takes, releases), refusals left) once retried"
+            );
+        };
+        mac.run_while(body).await;
+    });
+}
+
+// LEDGER R231-24 | class B | 2 PowerAssertion calls made by a running daemon + 1 struct state: its trust store, after a first start on a 0.12 config
+/// A mac upgraded from 0.12, whose list names the pc and whose device for
+/// the pc is pinned to it and switched on, is not kept awake by that list
+/// and does not let the pc control it: the list grants nothing until the
+/// two are paired again (#231).
+#[test]
+fn a_v0_12_list_keeps_the_mac_awake_for_nothing() {
+    run_local(async {
+        let pc = machine();
+        let tables = format!(
+            "[authorized_fingerprints]\n\"{}\" = \"desk pc\"\n\n{}",
+            pc.fingerprint,
+            device_for(&pc.fingerprint)
+        );
+        let mut mac =
+            Daemon::start("awake-v012-mac", &tables, input_emulation::Backend::Dummy).await;
+        let seen = Rc::new(Seen::default());
+        mac.keep_awake_through(Box::new(Recording(seen.clone())));
+        let (trust, ipc) = (mac.trust(), mac.ipc());
+        let body = async {
+            let mut app = ipc.connect().await;
+            let awake = settled(&mut app, &seen).await;
+            let (listed, granted) = {
+                let t = trust.read().expect("lock");
+                (
+                    t.to_pair_again(&pc.fingerprint).is_some(),
+                    t.capabilities(&pc.fingerprint),
+                )
+            };
+            assert_eq!(
+                (listed, granted, awake),
+                (true, Caps::NONE, (false, 0, 0)),
+                "(the pc listed to pair again, what it is granted, (held, takes, releases)) \
+                 after an upgrade from a 0.12 list with a device for the pc switched on: the \
+                 list granted the pc something or kept the mac awake (#231)"
+            );
+        };
+        mac.run_while(body).await;
+    });
+}

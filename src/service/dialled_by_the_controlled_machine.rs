@@ -1,0 +1,881 @@
+//! The controlled machine dials the machine that controls it (#15).
+//!
+//! Whole daemons in this process, each with its own scratch directory, on
+//! loopback, reached the way an app reaches them. The controlled machine is
+//! set to only dial out, as a machine behind a client that drops unsolicited
+//! inbound connections is. The controlling machine captures from a scripted
+//! backend; each injects into a recording one.
+
+use super::in_process::{DEADLINE, Daemon, Frontend};
+use crate::test_harness::{Machine, NEVER_WITHIN, door, run_local, wait_until};
+use crate::trust::Caps;
+use hops_ipc::{ClientHandle, FrontendEvent, FrontendRequest, NewDevice};
+use input_capture::{CaptureEvent, Position, scripted::Script};
+use input_emulation::recording::{Recorded, Recording};
+use input_event::{Event, KeyboardEvent, PointerEvent};
+use std::time::Duration;
+
+/// An app's events not yet looked at, oldest first. Every event an
+/// exchange returns is kept, and a wait takes only up to the one it wanted,
+/// so no wait misses an event an earlier exchange or wait already read.
+struct Heard {
+    app: Frontend,
+    backlog: std::collections::VecDeque<FrontendEvent>,
+}
+
+impl Heard {
+    fn new(app: Frontend) -> Self {
+        Self {
+            app,
+            backlog: Default::default(),
+        }
+    }
+
+    /// Send `requests`, keeping every event they caused.
+    async fn exchange(&mut self, requests: &[FrontendRequest]) {
+        let events = self.app.exchange(requests).await;
+        self.backlog.extend(events);
+    }
+
+    /// The first event `pick` makes something of, from those kept and then
+    /// those still to come; panic naming `what` if none does in time.
+    async fn until<T>(
+        &mut self,
+        what: &str,
+        mut pick: impl FnMut(&FrontendEvent) -> Option<T>,
+    ) -> T {
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        let mut seen = Vec::new();
+        loop {
+            while let Some(event) = self.backlog.pop_front() {
+                if let Some(found) = pick(&event) {
+                    return found;
+                }
+                seen.push(event);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what} did not happen within {DEADLINE:?}; the app was told {seen:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            self.exchange(&[]).await;
+        }
+    }
+}
+
+fn key(key: u32) -> CaptureEvent {
+    CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+        time: 0,
+        key,
+        state: 1,
+    }))
+}
+
+fn consumed(recording: &Recording, key: u32) -> bool {
+    recording.calls().iter().any(|c| {
+        matches!(c, Recorded::Consume(Event::Keyboard(KeyboardEvent::Key { key: k, .. }), _)
+            if *k == key)
+    })
+}
+
+fn motion(dx: f64) -> CaptureEvent {
+    CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
+        time: 0,
+        dx,
+        dy: 0.0,
+    }))
+}
+
+/// How far each motion the recording injected moved, across.
+fn motions(recording: &Recording) -> Vec<f64> {
+    recording
+        .calls()
+        .iter()
+        .filter_map(|c| match c {
+            Recorded::Consume(Event::Pointer(PointerEvent::Motion { dx, .. }), _) => Some(*dx),
+            _ => None,
+        })
+        .collect()
+}
+
+fn capture_pos(pos: hops_ipc::Position) -> Position {
+    match pos {
+        hops_ipc::Position::Left => Position::Left,
+        hops_ipc::Position::Right => Position::Right,
+        hops_ipc::Position::Top => Position::Top,
+        hops_ipc::Position::Bottom => Position::Bottom,
+    }
+}
+
+/// The controlled machine's config: it only dials out, and holds a device
+/// for the controlling machine at `port` on loopback, pinned to `fp`. Its
+/// pairing with that machine is [`paired_with`].
+fn dials_out_to(fp: &str, port: u16) -> String {
+    format!(
+        "listen = false\n\n\
+         [[clients]]\nposition = \"left\"\nips = [\"127.0.0.1\"]\nport = {port}\n\
+         activate_on_startup = true\nfingerprint = \"{fp}\"\n"
+    )
+}
+
+/// The controlled machine's pairing with the controlling machine `fp`: each
+/// may drive the other, as the pairing card's "each controls the other"
+/// leaves it.
+fn paired_with(fp: &str) -> [(&str, &str, Caps); 1] {
+    [(fp, "desk pc", Caps::DRIVE)]
+}
+
+// LEDGER T1 | class B | 6 struct state: Recording::calls() on the dialling daemon, two whole daemons in-process
+// LEDGER T3 | class B | 6 struct state: Recording::calls() on the controlling daemon (same test); an absence over NEVER_WITHIN, a regression check only
+// LEDGER T16 | class B | 2 bytes: FrontendEvent::State over the controlling daemon's IPC socket, after an Activate on the dialling daemon's (same test)
+/// The desk mac only dials out, and chose the desk pc to control it. It
+/// dials the desk pc, which gains a device for it keyed by its fingerprint,
+/// and the desk pc's keyboard types on the desk mac over the link the mac
+/// opened. Nothing flows the other way: the mac crossing to the pc drives
+/// nothing there. Switched off on the mac, the pc's device there closes the
+/// link the mac holds to it (#218).
+#[test]
+fn the_controlled_machine_dials_out_and_is_driven_over_its_own_link() {
+    run_local(async {
+        let (pc_script, mac_script) = (Script::new(), Script::new());
+        let (on_pc, on_mac) = (Recording::new(), Recording::new());
+        let pc = Daemon::start_capturing("rv-pc", "", pc_script.backend(), on_pc.backend()).await;
+        let (pc_fp, pc_port, pc_trust, pc_ipc) =
+            (pc.fingerprint(), pc.port(), pc.trust(), pc.ipc());
+        let mac = Daemon::start_paired(
+            "rv-mac",
+            &dials_out_to(&pc_fp, pc_port),
+            &paired_with(&pc_fp),
+            mac_script.backend(),
+            on_mac.backend(),
+        )
+        .await;
+        let (mac_fp, mac_trust, mac_ipc) = (mac.fingerprint(), mac.trust(), mac.ipc());
+        // The pc controls the mac, and not the other way round.
+        mac_trust
+            .write()
+            .expect("lock")
+            .drop_capabilities(&pc_fp, Caps::I_MAY_DRIVE);
+        pc_trust
+            .write()
+            .expect("lock")
+            .issue_confirmed(&mac_fp, "desk mac", Caps::OUTBOUND)
+            .expect("issue");
+
+        let body = async {
+            let mut on_pc_app = Heard::new(pc_ipc.connect().await);
+            let (handle, pos) = on_pc_app
+                .until(
+                    "a live device on the pc for the mac that dialled it",
+                    |e| match e {
+                        FrontendEvent::State(h, c, s) | FrontendEvent::Created(h, c, s)
+                            if s.peer_fingerprint.as_deref() == Some(mac_fp.as_str())
+                                && s.active_addr.is_some()
+                                && s.alive =>
+                        {
+                            Some((*h, c.pos))
+                        }
+                        _ => None,
+                    },
+                )
+                .await;
+            let _: ClientHandle = handle;
+
+            let pos = capture_pos(pos);
+            let deadline = tokio::time::Instant::now() + DEADLINE;
+            while !consumed(&on_mac, 30) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the pc's key never reached the mac over the link the mac dialled: {:?}",
+                    on_mac.calls()
+                );
+                pc_script.push(pos, CaptureEvent::Begin);
+                pc_script.push(pos, key(30));
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            // The wrong way: the mac may not drive the pc.
+            mac_script.push(Position::Left, CaptureEvent::Begin);
+            mac_script.push(Position::Left, key(48));
+            tokio::time::sleep(NEVER_WITHIN).await;
+            assert!(
+                on_pc.calls().is_empty(),
+                "the controlled mac drove the pc over the link it dialled: {:?}",
+                on_pc.calls()
+            );
+
+            // Off means off on the dialling end too: the mac switches its
+            // device for the pc off, and the link it holds to the pc closes.
+            let mut on_mac_app = mac_ipc.connect().await;
+            let pc_on_mac = on_mac_app
+                .exchange(&[FrontendRequest::Enumerate()])
+                .await
+                .into_iter()
+                .find_map(|e| match e {
+                    FrontendEvent::Enumerate(all) => all
+                        .into_iter()
+                        .find(|(_, _, s)| s.peer_fingerprint.as_deref() == Some(pc_fp.as_str()))
+                        .map(|(h, _, _)| h),
+                    _ => None,
+                })
+                .expect("the mac's device for the pc");
+            on_mac_app
+                .exchange(&[FrontendRequest::Activate(pc_on_mac, false)])
+                .await;
+            on_pc_app
+                .until(
+                    "the link closing once the mac switched the pc off",
+                    |e| match e {
+                        FrontendEvent::State(h, _, s)
+                            if *h == handle && s.active_addr.is_none() =>
+                        {
+                            Some(())
+                        }
+                        _ => None,
+                    },
+                )
+                .await;
+        };
+        pc.run_while(mac.run_while(body)).await;
+    });
+}
+
+/// The mac's device for the pc, as the mac's app lists it.
+async fn device_for(app: &mut Frontend, fp: &str) -> ClientHandle {
+    app.exchange(&[FrontendRequest::Enumerate()])
+        .await
+        .into_iter()
+        .find_map(|e| match e {
+            FrontendEvent::Enumerate(all) => all
+                .into_iter()
+                .find(|(_, _, s)| s.peer_fingerprint.as_deref() == Some(fp))
+                .map(|(h, _, _)| h),
+            _ => None,
+        })
+        .expect("the mac's device for the pc")
+}
+
+// LEDGER T30 | class B | 6 struct state: Recording::calls() on the dialling daemon and Script::held() on the controlling one, two whole daemons in-process
+/// The link the mac dialled drops while the pc's pointer is on the mac,
+/// as it does when the mac sleeps or its network reconnects, and the mac
+/// dials again. The crossing was acknowledged on the old link; the new one
+/// has crossed nothing, so the mac drops what arrives on it until an Enter
+/// does. The pc's next input either lands on the mac, the crossing made
+/// again over the new link, or the pc gets its pointer back. It is never
+/// held with everything typed on it thrown away. A crossing made again
+/// moves the mac's pointer by what the pc moves after it, not by what it
+/// moved before the link dropped.
+#[test]
+fn a_redial_while_the_pointer_is_across_lands_its_input_or_gives_it_back() {
+    run_local(async {
+        let (pc_script, mac_script) = (Script::new(), Script::new());
+        let (on_pc, on_mac) = (Recording::new(), Recording::new());
+        let pc = Daemon::start_capturing("rd-pc", "", pc_script.backend(), on_pc.backend()).await;
+        let (pc_fp, pc_port, pc_trust, pc_ipc) =
+            (pc.fingerprint(), pc.port(), pc.trust(), pc.ipc());
+        let mac = Daemon::start_paired(
+            "rd-mac",
+            &dials_out_to(&pc_fp, pc_port),
+            &paired_with(&pc_fp),
+            mac_script.backend(),
+            on_mac.backend(),
+        )
+        .await;
+        let (mac_fp, mac_trust, mac_ipc) = (mac.fingerprint(), mac.trust(), mac.ipc());
+        mac_trust
+            .write()
+            .expect("lock")
+            .drop_capabilities(&pc_fp, Caps::I_MAY_DRIVE);
+        pc_trust
+            .write()
+            .expect("lock")
+            .issue_confirmed(&mac_fp, "desk mac", Caps::OUTBOUND)
+            .expect("issue");
+
+        let body = async {
+            let mut on_pc_app = Heard::new(pc_ipc.connect().await);
+            let live = |e: &FrontendEvent| match e {
+                FrontendEvent::State(h, c, s) | FrontendEvent::Created(h, c, s)
+                    if s.peer_fingerprint.as_deref() == Some(mac_fp.as_str())
+                        && s.active_addr.is_some()
+                        && s.alive =>
+                {
+                    Some((*h, c.pos))
+                }
+                _ => None,
+            };
+            let (handle, pos) = on_pc_app.until("the mac's link", live).await;
+            let pos = capture_pos(pos);
+            let deadline = tokio::time::Instant::now() + DEADLINE;
+            while !consumed(&on_mac, 30) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "precondition: the pc's key never reached the mac: {:?}",
+                    on_mac.calls()
+                );
+                pc_script.push(pos, CaptureEvent::Begin);
+                pc_script.push(pos, key(30));
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            // Far across the mac, so a crossing made again from where this
+            // one left off would show as a jump.
+            while motions(&on_mac).is_empty() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "precondition: the pc's motion never reached the mac: {:?}",
+                    on_mac.calls()
+                );
+                pc_script.push(pos, motion(400.0));
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            // The mac's link drops and the mac dials again. The pc hears
+            // only that the link closed and that another was dialled in.
+            let mut on_mac_app = mac_ipc.connect().await;
+            let pc_on_mac = device_for(&mut on_mac_app, &pc_fp).await;
+            on_mac_app
+                .exchange(&[FrontendRequest::Activate(pc_on_mac, false)])
+                .await;
+            on_pc_app
+                .until("the link closing", |e| match e {
+                    FrontendEvent::State(h, _, s) if *h == handle && s.active_addr.is_none() => {
+                        Some(())
+                    }
+                    _ => None,
+                })
+                .await;
+            on_mac_app
+                .exchange(&[FrontendRequest::Activate(pc_on_mac, true)])
+                .await;
+            on_pc_app.until("the mac's link again", live).await;
+            assert!(
+                pc_script.held(),
+                "precondition: the pc let go of the pointer when the link dropped"
+            );
+
+            // Only input now, as a person typing on the pc: the pointer is
+            // held, so the backend yields no new Begin.
+            let deadline = tokio::time::Instant::now() + DEADLINE;
+            while !consumed(&on_mac, 31) && pc_script.held() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "after the mac dialled again the pc still holds the pointer, and none of \
+                     its input reached the mac: {:?}",
+                    on_mac.calls()
+                );
+                pc_script.push(pos, key(31));
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if !consumed(&on_mac, 31) {
+                return;
+            }
+
+            // Made again, the crossing moves the mac's pointer from where the
+            // mac anchors it on the new Enter, by what the pc moves now.
+            let before = motions(&on_mac).len();
+            let deadline = tokio::time::Instant::now() + DEADLINE;
+            while motions(&on_mac).len() == before {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "motion after the crossing was made again never reached the mac"
+                );
+                pc_script.push(pos, motion(3.0));
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let after = motions(&on_mac).split_off(before);
+            assert!(
+                after.iter().all(|dx| dx.abs() <= 10.0),
+                "the mac's pointer jumped by what the pc moved before the link dropped: {after:?}"
+            );
+        };
+        pc.run_while(mac.run_while(body)).await;
+    });
+}
+
+// LEDGER T2 | class B | 1 return value: UdpSocket::bind on the daemon's port while Service::run runs
+/// A machine set to only dial out binds nothing: its port is free while it
+/// runs, so no host can reach a handshake on it.
+#[test]
+fn a_machine_that_only_dials_out_binds_no_port() {
+    run_local(async {
+        let listening = Daemon::start("bind-on", "", input_emulation::Backend::Dummy).await;
+        let quiet = Daemon::start(
+            "bind-off",
+            "listen = false\n",
+            input_emulation::Backend::Dummy,
+        )
+        .await;
+        let (on_port, off_port) = (listening.port(), quiet.port());
+        let body = async {
+            assert!(
+                std::net::UdpSocket::bind(("127.0.0.1", on_port)).is_err(),
+                "precondition: a daemon that listens holds its port"
+            );
+            assert!(
+                std::net::UdpSocket::bind(("127.0.0.1", off_port)).is_ok(),
+                "a daemon set to only dial out bound its port"
+            );
+        };
+        listening.run_while(quiet.run_while(body)).await;
+    });
+}
+
+// LEDGER T4 | class B | 2 bytes: FrontendEvent::State over the controlling daemon's IPC socket
+/// The link is the controlled machine's to keep up, and a machine that
+/// only dials out keeps one to each machine that may drive it, even one it
+/// may drive too. Switched off on the pc, the link closes and the pc's
+/// card waits for the mac to dial; switched on again, the mac's next dial
+/// is taken. That a device switched off turns the dials away is pinned by
+/// `a_device_switched_off_takes_no_link_its_machine_dials`.
+#[test]
+fn the_controlled_machine_dials_again_until_its_link_is_taken() {
+    run_local(async {
+        let pc = Daemon::start("again-pc", "", input_emulation::Backend::Dummy).await;
+        let (pc_fp, pc_port, pc_trust, pc_ipc) =
+            (pc.fingerprint(), pc.port(), pc.trust(), pc.ipc());
+        let mac = Daemon::start_paired(
+            "again-mac",
+            &dials_out_to(&pc_fp, pc_port),
+            &paired_with(&pc_fp),
+            input_capture::Backend::Dummy,
+            input_emulation::Backend::Dummy,
+        )
+        .await;
+        // Each controls the other, as the mac's pairing says: the mac dials
+        // this one to be driven by it.
+        let mac_fp = mac.fingerprint();
+        pc_trust
+            .write()
+            .expect("lock")
+            .issue_confirmed(&mac_fp, "desk mac", Caps::OUTBOUND)
+            .expect("issue");
+
+        let body = async {
+            use FrontendRequest as R;
+            let mut app = Heard::new(pc_ipc.connect().await);
+            let up = |e: &FrontendEvent| match e {
+                FrontendEvent::State(h, _, s) | FrontendEvent::Created(h, _, s)
+                    if s.peer_fingerprint.as_deref() == Some(mac_fp.as_str())
+                        && s.active_addr.is_some() =>
+                {
+                    Some(*h)
+                }
+                _ => None,
+            };
+            let handle = app.until("the mac's link", up).await;
+
+            app.exchange(&[R::Activate(handle, false)]).await;
+            let waiting = app
+                .until("the link closing", |e| match e {
+                    FrontendEvent::State(h, _, s) if *h == handle && s.active_addr.is_none() => {
+                        Some(s.dials_us)
+                    }
+                    _ => None,
+                })
+                .await;
+            assert!(
+                waiting,
+                "the pc's card for the mac does not say the mac dials it"
+            );
+
+            app.exchange(&[R::Activate(handle, true)]).await;
+            let again = app.until("the mac's link again", up).await;
+            assert_eq!(again, handle, "the mac's link went to another device");
+        };
+        pc.run_while(mac.run_while(body)).await;
+    });
+}
+
+// LEDGER T32 | class B | 2 bytes: FrontendEvent::Enumerate and Error over the dialling daemon's IPC socket
+/// The mac dials the pc's address and something that holds no key of the
+/// pc's answers there, refusing with the alert the pc refuses a removed
+/// machine with. The mac's card does not say the pc removed it, and the
+/// person is told nothing about the pc: nothing proved the pc refused.
+#[test]
+fn a_keyless_endpoint_at_the_controllers_address_does_not_say_it_removed_this_machine() {
+    run_local(async {
+        let pc = crate::test_harness::machine();
+        let (_keyless, port, answered) = crate::test_harness::keyless_listener();
+        // An emulation that injects, not `dummy`: a daemon running `dummy`
+        // tells every frontend that attaches that it discards input (#238),
+        // which is a notice, and this test hears none.
+        let injects = input_emulation::recording::Recording::new();
+        let mac = Daemon::start_paired(
+            "keyless-mac",
+            &dials_out_to(&pc.fingerprint, port),
+            &paired_with(&pc.fingerprint),
+            input_capture::Backend::Dummy,
+            injects.backend(),
+        )
+        .await;
+        let mac_ipc = mac.ipc();
+        let body = async {
+            let mut app = Heard::new(mac_ipc.connect().await);
+            let deadline = tokio::time::Instant::now() + DEADLINE;
+            // Two dials, each from a socket of its own: the first one's
+            // refusal reached the service a retry's wait before the second
+            // began.
+            while answered.borrow().len() < 2 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "precondition: the mac never dialled the pc's address twice"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            // The answer to this Enumerate, not the one sent on connecting.
+            app.exchange(&[FrontendRequest::Enumerate()]).await;
+            let cards = app
+                .backlog
+                .iter()
+                .rev()
+                .find_map(|e| match e {
+                    FrontendEvent::Enumerate(all) => Some(all.clone()),
+                    _ => None,
+                })
+                .expect("the mac's devices");
+            let removed: Vec<_> = cards
+                .iter()
+                .filter(|(_, _, s)| s.peer_fingerprint.as_deref() == Some(pc.fingerprint.as_str()))
+                .map(|(_, _, s)| s.removed_by_peer)
+                .collect();
+            assert_eq!(
+                removed,
+                vec![false],
+                "the mac's card for the pc says the pc removed it, on a refusal from a machine \
+                 with no key"
+            );
+            // Not that the pc removed this machine, refused it, or runs an
+            // older hops: nothing at all, since nothing proved the pc spoke.
+            let told: Vec<_> = app
+                .backlog
+                .iter()
+                .filter(|e| matches!(e, FrontendEvent::Error(_)))
+                .collect();
+            assert!(told.is_empty(), "the person was told: {told:?}");
+        };
+        mac.run_while(body).await;
+    });
+}
+
+// LEDGER T36 | class B | 2 bytes: FrontendEvent::Error over the dialling daemon's IPC socket; the absence is over a fixed window, a regression check only
+/// The mac only dials out, and the pc's name resolves to nothing. The
+/// lookup made as the device is switched on and the ones its dial-out
+/// makes after each dial say so once between them, not once each. A new
+/// name is looked up, and a failure told about, afresh.
+#[test]
+fn a_name_that_resolves_to_nothing_is_told_once_until_it_changes() {
+    run_local(async {
+        let pc = crate::test_harness::machine();
+        let config = format!(
+            "listen = false\n\n\
+             [[clients]]\nposition = \"left\"\nhostname = \"no-such-machine.invalid\"\n\
+             port = 9\nactivate_on_startup = false\nfingerprint = \"{fp}\"\n",
+            fp = pc.fingerprint
+        );
+        let mac = Daemon::start_paired(
+            "unresolved-mac",
+            &config,
+            &paired_with(&pc.fingerprint),
+            input_capture::Backend::Dummy,
+            input_emulation::Backend::Dummy,
+        )
+        .await;
+        let mac_ipc = mac.ipc();
+        let body = async {
+            let not_found = |name: &'static str| {
+                move |e: &FrontendEvent| match e {
+                    FrontendEvent::Error(m) if m.contains(name) => Some(m.clone()),
+                    _ => None,
+                }
+            };
+            let handle = device_for(&mut mac_ipc.connect().await, &pc.fingerprint).await;
+            let mut app = Heard::new(mac_ipc.connect().await);
+            app.exchange(&[FrontendRequest::Activate(handle, true)])
+                .await;
+            app.until("the name not found", not_found("no-such-machine.invalid"))
+                .await;
+            // Past the dial-out's first dials, each followed by a lookup.
+            tokio::time::sleep(crate::dial_back::FIRST_RETRY * 3).await;
+            app.exchange(&[]).await;
+            let again: Vec<_> = app
+                .backlog
+                .iter()
+                .filter_map(not_found("no-such-machine.invalid"))
+                .collect();
+            assert!(
+                again.is_empty(),
+                "the person was told the name was not found more than once: {again:?}"
+            );
+
+            app.exchange(&[FrontendRequest::UpdateHostname {
+                handle,
+                hostname: Some("another-missing-machine.invalid".to_string()),
+                fingerprint: Some(pc.fingerprint.clone()),
+            }])
+            .await;
+            app.until(
+                "the new name not found",
+                not_found("another-missing-machine.invalid"),
+            )
+            .await;
+        };
+        mac.run_while(body).await;
+    });
+}
+
+// LEDGER T257-6 | class B | 2 bytes: FrontendEvent::Created, State and Enumerate over the controlling daemon's IPC socket; 4 file on disk: its saved config
+/// The pc adds the mac at its address, and its dial reads the mac there
+/// and is refused: the pc may not drive it yet. The pairing then finishes
+/// on the mac's own dial, and the mac dials back to be driven. Its link
+/// goes to the device the pc added, which is pinned to the mac and saved
+/// so, at the edge and address it was added with, and no second device is
+/// made for the mac (#257).
+#[test]
+fn a_machine_paired_on_its_own_dial_is_driven_through_the_device_added_for_it() {
+    driven_through_the_device_added_for_it("dup-new", false);
+}
+
+// LEDGER T257-7 | class B | 2 bytes: FrontendEvent::Created, State and Enumerate over the controlling daemon's IPC socket; 4 file on disk: its saved config
+/// As above, with the pc already approving the mac when it adds it: its
+/// dial reaches the mac mid-pairing and compares no number, since the
+/// pairing finishes on the mac's dial instead.
+#[test]
+fn a_machine_paired_on_its_own_dial_mid_pairing_here_is_driven_through_the_device_added_for_it() {
+    driven_through_the_device_added_for_it("dup-mid", true);
+}
+
+/// The mac paired with the pc on its own dial, after the pc added it and
+/// its dial read the mac: the pc approving the mac then, when
+/// `mid_pairing`, or not knowing it at all.
+fn driven_through_the_device_added_for_it(tag: &str, mid_pairing: bool) {
+    run_local(async {
+        let pc = Daemon::start(&format!("{tag}-pc"), "", input_emulation::Backend::Dummy).await;
+        let (pc_fp, pc_port, pc_trust, pc_ipc) =
+            (pc.fingerprint(), pc.port(), pc.trust(), pc.ipc());
+        let (pc_clients, pc_file) = (pc.clients(), pc.config_file());
+        let mac = Daemon::start_paired(
+            &format!("{tag}-mac"),
+            &dials_out_to(&pc_fp, pc_port),
+            &paired_with(&pc_fp),
+            input_capture::Backend::Dummy,
+            input_emulation::Backend::Dummy,
+        )
+        .await;
+        let mac_fp = mac.fingerprint();
+        // The mac's own key answers at the address the pc adds it at.
+        let identity = crate::crypto::load_or_generate_key_and_cert(
+            &mac.config_file().with_file_name("hops.pem"),
+        )
+        .expect("the mac's identity");
+        let its_address = door(&Machine {
+            identity: std::sync::Arc::new(identity),
+            fingerprint: mac_fp.clone(),
+        });
+        its_address.open();
+        if mid_pairing {
+            pc_trust
+                .write()
+                .expect("lock")
+                .issue(&mac_fp, "desk mac", Caps::OUTBOUND)
+                .expect("approve");
+        }
+        let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
+        let body = async {
+            let mut app = Heard::new(pc_ipc.connect().await);
+            app.exchange(&[
+                FrontendRequest::OpenPairing,
+                FrontendRequest::Create(NewDevice {
+                    hostname: None,
+                    fix_ips: vec![loopback],
+                    port: its_address.port,
+                    pos: hops_ipc::Position::Left,
+                }),
+            ])
+            .await;
+            let added = app
+                .until("the device added for the mac", |e| match e {
+                    FrontendEvent::Created(h, _, _) => Some(*h),
+                    _ => None,
+                })
+                .await;
+            // Mid-pairing, the pc's dial waits on a number the door never
+            // sends, and the mac's dial back can arrive meanwhile: what the
+            // dial read has to be known while it still waits.
+            let within = if mid_pairing {
+                crate::pair_ceremony::STEP_TIMEOUT / 2
+            } else {
+                DEADLINE
+            };
+            wait_until("the pc's dial to read the mac", within, || {
+                pc_clients.answered_as(added).as_deref() == Some(mac_fp.as_str())
+            })
+            .await;
+
+            // Paired on the mac's dial: the pc may drive the mac now, and
+            // its own dial no longer reaches it.
+            its_address.shut();
+            pc_trust
+                .write()
+                .expect("lock")
+                .issue_confirmed(&mac_fp, "desk mac", Caps::OUTBOUND)
+                .expect("issue");
+
+            let linked = app
+                .until("the mac's link", |e| match e {
+                    FrontendEvent::State(h, _, s) | FrontendEvent::Created(h, _, s)
+                        if s.peer_fingerprint.as_deref() == Some(mac_fp.as_str())
+                            && s.active_addr.is_some() =>
+                    {
+                        Some(*h)
+                    }
+                    _ => None,
+                })
+                .await;
+            app.exchange(&[FrontendRequest::Enumerate()]).await;
+            let cards = app
+                .backlog
+                .iter()
+                .rev()
+                .find_map(|e| match e {
+                    FrontendEvent::Enumerate(all) => Some(all.clone()),
+                    _ => None,
+                })
+                .expect("the pc's devices");
+            let listed: Vec<_> = cards
+                .iter()
+                .map(|(h, c, s)| (*h, c.pos, c.fix_ips.clone(), s.peer_fingerprint.clone()))
+                .collect();
+            assert_eq!(
+                (linked, listed),
+                (
+                    added,
+                    vec![(
+                        added,
+                        hops_ipc::Position::Left,
+                        vec![loopback],
+                        Some(mac_fp.clone())
+                    )]
+                ),
+                "(device linked, every device listed): the mac's dial-in has to go to the \
+                 device the pc added for it, which becomes the paired one, and not to a \
+                 second device for the same machine"
+            );
+
+            let saved: toml_edit::DocumentMut = std::fs::read_to_string(&pc_file)
+                .expect("the pc's config")
+                .parse()
+                .expect("the saved config parses");
+            let pins: Vec<_> = saved
+                .get("clients")
+                .and_then(|c| c.as_array_of_tables())
+                .map(|a| {
+                    a.iter()
+                        .map(|t| {
+                            t.get("fingerprint")
+                                .and_then(|f| f.as_str())
+                                .map(str::to_string)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                pins,
+                vec![Some(mac_fp.clone())],
+                "the pin the dial-in made was not saved with the device, so a restart \
+                 loses it"
+            );
+        };
+        pc.run_while(mac.run_while(body)).await;
+    });
+}
+
+// LEDGER T257-10 | class B | 2 bytes: FrontendEvent::Created and ConnectionAttempt over the controlling daemon's IPC socket; 6 struct state: ClientManager::answered_as after the daemon's own dial
+/// Something at the address the pc adds a device at presents the mac's
+/// certificate, which is public, and signs with a key of its own. The pc's
+/// dial sees the mac's certificate there, and records no machine as reached:
+/// what an address presented without signing proves nothing, and a record
+/// would send the real mac's dial-in to this device, under its name and
+/// edge (#257).
+#[test]
+fn a_copied_certificate_at_a_devices_address_does_not_claim_the_device() {
+    run_local(async {
+        let pc = Daemon::start("copied-pc", "", input_emulation::Backend::Dummy).await;
+        let (pc_ipc, pc_clients) = (pc.ipc(), pc.clients());
+        let (mac, impostor) = (
+            crate::test_harness::machine(),
+            crate::test_harness::machine(),
+        );
+        #[derive(Debug)]
+        struct Presents(std::sync::Arc<rustls::sign::CertifiedKey>);
+        impl rustls::server::ResolvesServerCert for Presents {
+            fn resolve(
+                &self,
+                _: rustls::server::ClientHello<'_>,
+            ) -> Option<std::sync::Arc<rustls::sign::CertifiedKey>> {
+                Some(self.0.clone())
+            }
+        }
+        crate::transport::install_crypto_provider();
+        let key = rustls::crypto::ring::default_provider()
+            .key_provider
+            .load_private_key(impostor.identity.key.clone_key())
+            .expect("a signing key");
+        let copied = rustls::sign::CertifiedKey::new(vec![mac.identity.cert.clone()], key);
+        let mut crypto = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(std::sync::Arc::new(Presents(std::sync::Arc::new(copied))));
+        crypto.alpn_protocols = vec![crate::transport::ALPN.to_vec()];
+        let server = quinn::ServerConfig::with_crypto(std::sync::Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(crypto).expect("quic server"),
+        ));
+        let endpoint = quinn::Endpoint::server(server, "127.0.0.1:0".parse().expect("addr"))
+            .expect("server endpoint");
+        let port = endpoint.local_addr().expect("local addr").port();
+        tokio::task::spawn_local(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                tokio::task::spawn_local(async move {
+                    let _ = incoming.await;
+                });
+            }
+        });
+
+        let body = async {
+            let mut app = Heard::new(pc_ipc.connect().await);
+            app.exchange(&[
+                FrontendRequest::OpenPairing,
+                FrontendRequest::Create(NewDevice {
+                    hostname: None,
+                    fix_ips: vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
+                    port,
+                    pos: hops_ipc::Position::Left,
+                }),
+            ])
+            .await;
+            let added = app
+                .until("the device added", |e| match e {
+                    FrontendEvent::Created(h, _, _) => Some(*h),
+                    _ => None,
+                })
+                .await;
+            // Raised by the dial's refusal, after what it reached is
+            // recorded.
+            app.until("the pc's dial to see the mac's certificate", |e| match e {
+                FrontendEvent::ConnectionAttempt { fingerprint, .. }
+                    if *fingerprint == mac.fingerprint =>
+                {
+                    Some(())
+                }
+                _ => None,
+            })
+            .await;
+            assert_eq!(
+                pc_clients.answered_as(added),
+                None,
+                "a certificate presented by something that cannot sign for it was \
+                 recorded as the machine the device reached"
+            );
+        };
+        pc.run_while(body).await;
+    });
+}

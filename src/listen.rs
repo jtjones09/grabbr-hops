@@ -2,7 +2,7 @@ use futures::{Stream, StreamExt};
 use hops_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender, channel};
 use quinn::crypto::rustls::QuicServerConfig;
-use quinn::{Connection, Endpoint, SendStream, TransportConfig};
+use quinn::{Connection, Endpoint, RecvStream, SendStream, TransportConfig};
 use rustls::pki_types::CertificateDer;
 use std::{
     cell::RefCell,
@@ -11,7 +11,7 @@ use std::{
     net::SocketAddr,
     rc::Rc,
     sync::{Arc, Mutex as StdMutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio::{
@@ -19,8 +19,9 @@ use tokio::{
     task::{JoinHandle, spawn_local},
 };
 
+use crate::client::ClientManager;
 use crate::crypto::Identity;
-use crate::transport::{self, FpClientVerifier, Trust};
+use crate::transport::{self, ClipboardInlet, FpClientVerifier, PeerClipboard, Trust};
 
 const KEEP_ALIVE: Duration = Duration::from_secs(8);
 const MAX_IDLE: Duration = Duration::from_secs(20);
@@ -33,6 +34,18 @@ pub enum ListenerCreationError {
     Rustls(#[from] rustls::Error),
     #[error(transparent)]
     NoInitialCipherSuite(#[from] quinn::crypto::rustls::NoInitialCipherSuite),
+    #[error("this machine only dials out, so it listens on no port")]
+    NotListening,
+}
+
+/// A connection a machine opened to this one to be driven by it (#15),
+/// admitted by this machine's TLS door because this machine may drive it.
+/// The service gives it to the device pinned to `fingerprint`, which drives
+/// it as though this machine had dialled it.
+pub(crate) struct DialledIn {
+    pub(crate) conn: Connection,
+    pub(crate) fingerprint: String,
+    pub(crate) addr: SocketAddr,
 }
 
 /// How much unsent reply and clipboard data this machine will hold for one
@@ -90,9 +103,62 @@ pub(crate) enum ListenEvent {
         addr: SocketAddr,
         fingerprint: String,
     },
+    /// A handshake refused because no lease lets the certificate's owner
+    /// drive this machine. Both fields come from the one connection, so a
+    /// prompt raised from this names the machine that knocked, and where it
+    /// knocked from (#83).
     Rejected {
         fingerprint: String,
+        addr: SocketAddr,
     },
+    /// No connection from `addr` is left: the last one closed, however it
+    /// ended. Sent once that connection's events have all been sent, so
+    /// nothing from it follows.
+    Closed {
+        addr: SocketAddr,
+    },
+    /// The machine that proved `fingerprint` on a link it opened closed that
+    /// link as [`transport::REMOVED`]: it removed this machine (#184). Sent
+    /// before that link's [`ListenEvent::Closed`].
+    RemovedBy {
+        fingerprint: String,
+    },
+}
+
+/// Failed handshakes, summarised in the log rather than one line each.
+///
+/// Anyone who can reach the port can fail a handshake as fast as it can dial,
+/// and each failure wrote a warning: a stranger minting a key per dial did 120
+/// a second (#101). The first failure is logged at once, then one line per
+/// [`Self::EVERY`] at most, counting the ones between.
+#[derive(Default)]
+struct HandshakeFailures {
+    last: Option<Instant>,
+    since: u32,
+}
+
+impl HandshakeFailures {
+    const EVERY: Duration = Duration::from_secs(10);
+
+    /// Count one failure, and log it when a line is due.
+    fn note(&mut self, from: SocketAddr, why: &dyn std::fmt::Display, now: Instant) {
+        self.since = self.since.saturating_add(1);
+        if self
+            .last
+            .is_some_and(|last| now.saturating_duration_since(last) < Self::EVERY)
+        {
+            return;
+        }
+        self.last = Some(now);
+        let more = std::mem::take(&mut self.since) - 1;
+        if more == 0 {
+            log::warn!("handshake from {from} failed: {why}");
+        } else {
+            log::warn!(
+                "handshake from {from} failed: {why} ({more} more failed since the last line)"
+            );
+        }
+    }
 }
 
 /// A live inbound connection plus the queue its replies wait in and the
@@ -190,21 +256,43 @@ pub(crate) struct LanMouseListener {
     pressure: Rc<InputPressure>,
     request_port_change: Sender<u16>,
     port_changed: Receiver<Result<u16, ListenerCreationError>>,
-    /// Where the first endpoint bound, so a test that asked for port 0 can dial it.
+    /// Asked before this machine's clipboard goes to a peer.
+    trust: Trust,
+    /// Connections from machines mid-pairing, held until both confirm (#167).
+    pairings: crate::pairing::Pairings,
+    /// What those attempts tell the service, until it takes it.
+    pairing_events: Option<Receiver<crate::pairing::PairingEvent>>,
+    /// Links machines opened to be driven by this one, until the service
+    /// takes them.
+    dialled_in: Option<Receiver<DialledIn>>,
+    /// Where each accepted connection's clipboard transfers are queued.
+    clipboard_in: Sender<PeerClipboard>,
+    /// Where the first endpoint bound, so a test that asked for port 0 can
+    /// dial it. `None` for a listener that only takes links it dialled.
     #[cfg(test)]
-    local_addr: SocketAddr,
+    local_addr: Option<SocketAddr>,
 }
 
-fn server_config(
+/// `refused` is where the verifier puts a certificate it turns away. Every
+/// connection is accepted with a config of its own (see the accept loop), so
+/// the slot belongs to exactly one connection.
+pub(crate) fn server_config(
     identity: &Identity,
     trust: Trust,
-    attempts: Arc<StdMutex<VecDeque<String>>>,
+    refused: Arc<StdMutex<Option<String>>>,
 ) -> Result<quinn::ServerConfig, ListenerCreationError> {
-    let verifier = Arc::new(FpClientVerifier::new(trust, attempts));
+    // The resolver notes which role the client asked for; the verifier, which
+    // shares the slot, asks the lease the question for that role (#15).
+    let offered: transport::Offered = Default::default();
+    let verifier = Arc::new(FpClientVerifier::for_roles(trust, refused, offered.clone()));
+    let resolver = Arc::new(transport::RoleResolver::new(
+        transport::certified_key(identity)?,
+        offered,
+    ));
     let mut crypto = rustls::ServerConfig::builder()
         .with_client_cert_verifier(verifier)
-        .with_single_cert(vec![identity.cert.clone()], identity.key.clone_key())?;
-    crypto.alpn_protocols = vec![transport::ALPN.to_vec()];
+        .with_cert_resolver(resolver);
+    crypto.alpn_protocols = transport::served_alpns();
     // REFUSE TLS 1.3 resumption. rustls only calls `verify_client_cert` from the
     // ExpectCertificate state, which a resumed handshake never enters: it restores
     // the peer's cert chain from the ticket and sets doing_client_auth = false. So
@@ -246,56 +334,123 @@ impl LanMouseListener {
         port: u16,
         identity: Arc<Identity>,
         trust: Trust,
-        clipboard_in: Sender<String>,
+        clipboard_in: Sender<PeerClipboard>,
     ) -> Result<Self, ListenerCreationError> {
-        let listen_addr = SocketAddr::new("0.0.0.0".parse().expect("invalid ip"), port);
-        Self::bind(listen_addr, identity, trust, clipboard_in).await
+        // A daemon a test runs in-process never listens on the network.
+        #[cfg(not(test))]
+        let ip = std::net::Ipv4Addr::UNSPECIFIED;
+        #[cfg(test)]
+        let ip = std::net::Ipv4Addr::LOCALHOST;
+        let listen_addr = SocketAddr::new(ip.into(), port);
+        Self::bind(Some(listen_addr), identity, trust, clipboard_in).await
     }
 
-    /// [`Self::new`] on a chosen address. Tests bind 127.0.0.1 port 0, so they
-    /// neither listen on the network nor collide with a running daemon.
-    async fn bind(
-        listen_addr: SocketAddr,
+    /// A listener that binds nothing: for a machine that only dials out
+    /// (#15). The links it dials to be driven are admitted into it through
+    /// [`Self::admitter`], and read exactly as a link dialled in would be.
+    pub(crate) async fn dial_only(
         identity: Arc<Identity>,
         trust: Trust,
-        clipboard_in: Sender<String>,
+        clipboard_in: Sender<PeerClipboard>,
+    ) -> Result<Self, ListenerCreationError> {
+        Self::bind(None, identity, trust, clipboard_in).await
+    }
+
+    /// [`Self::new`] on a chosen address, or on none. Tests bind 127.0.0.1
+    /// port 0, so they neither listen on the network nor collide with a
+    /// running daemon.
+    async fn bind(
+        listen_addr: Option<SocketAddr>,
+        identity: Arc<Identity>,
+        trust: Trust,
+        clipboard_in: Sender<PeerClipboard>,
     ) -> Result<Self, ListenerCreationError> {
         transport::install_crypto_provider();
         let (listen_tx, listen_rx) = channel();
         let (request_port_change, mut request_port_change_rx) = channel();
         let (port_changed_tx, port_changed) = channel();
-        let attempts: Arc<StdMutex<VecDeque<String>>> = Default::default();
-
-        let cfg = server_config(&identity, trust.clone(), attempts.clone())?;
-        let mut endpoint = Endpoint::server(cfg, listen_addr)?;
+        // The endpoint needs a default config, but no connection is accepted
+        // with it: each gets its own below, so its slot is never read.
+        let mut endpoint = match listen_addr {
+            Some(listen_addr) => {
+                let cfg = server_config(&identity, trust.clone(), Default::default())?;
+                Some(Endpoint::server(cfg, listen_addr)?)
+            }
+            None => {
+                log::info!("this machine only dials out: no port is listened on");
+                None
+            }
+        };
         #[cfg(test)]
-        let local_addr = endpoint.local_addr()?;
+        let local_addr = match &endpoint {
+            Some(e) => Some(e.local_addr()?),
+            None => None,
+        };
+        let (dialled_in_tx, dialled_in) = channel();
+        let clipboard_in_kept = clipboard_in.clone();
 
         let conns: Rc<AsyncMutex<Vec<ConnEntry>>> = Rc::new(AsyncMutex::new(Vec::new()));
         let conns_clone = conns.clone();
+        let clipboard_trust = trust.clone();
         let pressure: Rc<InputPressure> = Default::default();
         let pressure_clone = pressure.clone();
+        let (pairings, pairing_events) = crate::pairing::Pairings::new();
+        // Half of what a pairing number is built from. The peer's half is
+        // read off each connection, never from what it advertised.
+        let ours: Rc<str> = Rc::from(transport::fingerprint_of(&identity.cert).as_str());
 
         let listen_task: JoinHandle<()> = {
             let listen_tx = listen_tx.clone();
-            let attempts = attempts.clone();
             let authorized_accept = trust.clone();
+            let pairings = pairings.clone();
+            let failures: Rc<RefCell<HandshakeFailures>> = Default::default();
             spawn_local(async move {
                 loop {
                     tokio::select! {
-                        incoming = endpoint.accept() => {
+                        incoming = async {
+                            match &endpoint {
+                                Some(endpoint) => endpoint.accept().await,
+                                None => std::future::pending().await,
+                            }
+                        } => {
                             let Some(incoming) = incoming else { break };
+                            let remote = incoming.remote_address();
+                            // This connection's own verifier, and the slot it
+                            // reports a refused certificate in. Handshakes run
+                            // concurrently, so a slot shared between them could
+                            // hand one connection's rejection to another (#83).
+                            let refused: Arc<StdMutex<Option<String>>> = Default::default();
+                            let connecting = match server_config(
+                                &identity,
+                                authorized_accept.clone(),
+                                refused.clone(),
+                            ) {
+                                Ok(cfg) => match incoming.accept_with(Arc::new(cfg)) {
+                                    Ok(connecting) => connecting,
+                                    Err(e) => {
+                                        failures.borrow_mut().note(remote, &e, Instant::now());
+                                        continue;
+                                    }
+                                },
+                                Err(e) => {
+                                    log::warn!("refusing {remote}: could not build its TLS config: {e}");
+                                    incoming.refuse();
+                                    continue;
+                                }
+                            };
                             // Drive each handshake on its own task so one slow
                             // peer can't head-of-line-block all other accepts.
                             let conns = conns_clone.clone();
                             let pressure = pressure_clone.clone();
                             let listen_tx = listen_tx.clone();
-                            let attempts = attempts.clone();
                             let clipboard_in = clipboard_in.clone();
                             let trust = authorized_accept.clone();
+                            let pairings = pairings.clone();
+                            let ours = ours.clone();
+                            let failures = failures.clone();
+                            let dialled_in_tx = dialled_in_tx.clone();
                             spawn_local(async move {
-                                let remote = incoming.remote_address();
-                                match incoming.await {
+                                match connecting.await {
                                     Ok(conn) => {
                                         let addr = conn.remote_address();
                                         log::info!("client connected, ip: {addr}");
@@ -313,50 +468,113 @@ impl LanMouseListener {
                                             conn.close(0u32.into(), b"unauthorized");
                                             return;
                                         };
+                                        match transport::negotiated_role(&conn) {
+                                            Some(transport::Dialler::Drives) => {}
+                                            // It dialled to be driven by this
+                                            // machine (#15): asked again, and
+                                            // handed to the device that drives
+                                            // it. Nothing it sends is read here.
+                                            Some(transport::Dialler::IsDriven) => {
+                                                if !trust.read().expect("lock").we_may_drive(&fingerprint) {
+                                                    log::warn!(
+                                                        "{addr}: rejecting {fingerprint}, dialling to be driven — no live lease lets this machine drive it"
+                                                    );
+                                                    conn.close(0u32.into(), b"unauthorized");
+                                                    return;
+                                                }
+                                                log::info!("{addr}: {fingerprint} dialled this machine to be driven by it");
+                                                if let Err(e) = dialled_in_tx.send(DialledIn { conn, fingerprint, addr }) {
+                                                    e.into_inner().conn.close(0u32.into(), b"not taken");
+                                                }
+                                                return;
+                                            }
+                                            None => {
+                                                log::warn!("{addr}: rejecting {fingerprint} — no role of ours was negotiated");
+                                                conn.close(0u32.into(), b"unauthorized");
+                                                return;
+                                            }
+                                        }
                                         // The receiver's question. A lease that
                                         // lapsed between the TLS check and here
                                         // is refused, which is why the check is
                                         // repeated rather than assumed.
-                                        if !trust
-                                            .read()
-                                            .expect("lock")
-                                            .may_drive_us(&fingerprint)
+                                        let (drives, pairing, answer) = {
+                                            let t = trust.read().expect("lock");
+                                            (
+                                                t.may_drive_us(&fingerprint),
+                                                t.is_pairing(&fingerprint),
+                                                crate::pairing::Answer::here(&t, &fingerprint),
+                                            )
+                                        };
+                                        let mut first = None;
+                                        if !drives && pairing {
+                                            // Approved here and not yet confirmed
+                                            // on both machines: held for the
+                                            // number, out of every list, and
+                                            // nothing it sends is read until both
+                                            // confirm (#167).
+                                            first = crate::pairing::as_added(
+                                                &pairings,
+                                                &conn,
+                                                &ours,
+                                                &fingerprint,
+                                                addr,
+                                                answer,
+                                            )
+                                            .await;
+                                            if first.is_none() {
+                                                return;
+                                            }
+                                        }
+                                        if pairing
+                                            && first.is_some()
+                                            && !trust.read().expect("lock").may_drive_us(&fingerprint)
                                         {
+                                            // Paired, and the person here did not
+                                            // choose that machine to control this
+                                            // one (#220): the connection the
+                                            // number was compared on carries
+                                            // nothing. The machine that dialled
+                                            // still waits for this machine's
+                                            // confirmation, so it is sent first.
+                                            log::info!(
+                                                "{addr}: paired with {fingerprint}, which does not control this machine; closing the pairing connection"
+                                            );
+                                            answer_and_close(&conn).await;
+                                            return;
+                                        }
+                                        if !trust.read().expect("lock").may_drive_us(&fingerprint) {
                                             log::warn!(
                                                 "{addr}: rejecting {fingerprint} — no live lease permits it to drive this machine"
                                             );
                                             conn.close(0u32.into(), b"unauthorized");
-                                            let _ = listen_tx
-                                                .send(ListenEvent::Rejected { fingerprint });
+                                            if !pairing {
+                                                let _ = listen_tx
+                                                    .send(ListenEvent::Rejected { fingerprint, addr });
+                                            }
                                             return;
                                         }
-                                        let send = match conn.open_uni().await {
-                                            Ok(s) => s,
-                                            Err(e) => {
-                                                log::warn!("{addr}: opening reply stream failed: {e}");
-                                                return;
-                                            }
-                                        };
-                                        let replies: Rc<RefCell<PendingReplies>> = Default::default();
-                                        let ready = Rc::new(Notify::new());
-                                        spawn_local(reply_loop(addr, replies.clone(), ready.clone(), send));
-                                        conns.lock().await.push(ConnEntry {
+                                        admit(Admitted {
+                                            conns,
                                             addr,
-                                            conn: conn.clone(),
-                                            replies: replies.clone(),
-                                            ready: ready.clone(),
-                                            fingerprint: fingerprint.clone(),
-                                        });
-                                        let closer = ReplyQueueGuard { replies, ready };
-                                        let _ = listen_tx.send(ListenEvent::Accept { addr, fingerprint });
-                                        spawn_local(read_loop(conns.clone(), addr, conn, listen_tx.clone(), clipboard_in, closer, pressure));
+                                            conn,
+                                            fingerprint,
+                                            listen_tx,
+                                            clipboard_in,
+                                            trust,
+                                            pressure,
+                                            first,
+                                        })
+                                        .await;
                                     }
                                     Err(e) => {
-                                        log::warn!("handshake from {remote} failed: {e}");
-                                        if let Some(fingerprint) =
-                                            attempts.lock().expect("lock").pop_front()
-                                        {
-                                            let _ = listen_tx.send(ListenEvent::Rejected { fingerprint });
+                                        failures.borrow_mut().note(remote, &e, Instant::now());
+                                        let refused = refused.lock().expect("lock").take();
+                                        if let Some(fingerprint) = refused {
+                                            let _ = listen_tx.send(ListenEvent::Rejected {
+                                                fingerprint,
+                                                addr: remote,
+                                            });
                                         }
                                     }
                                 }
@@ -365,14 +583,21 @@ impl LanMouseListener {
                         port = request_port_change_rx.recv() => {
                             // None => the listener handle was dropped (shutdown); end the task.
                             let Some(port) = port else { break };
+                            // A machine that only dials out listens on no
+                            // port, and a port change does not start one.
+                            if endpoint.is_none() {
+                                let _ = port_changed_tx.send(Err(ListenerCreationError::NotListening));
+                                continue;
+                            }
                             let listen_addr = SocketAddr::new("0.0.0.0".parse().expect("invalid ip"), port);
                             // A dropped port_changed receiver (requester gone) must NOT panic
                             // this long-running accept loop — ignore the send result instead.
-                            match server_config(&identity, trust.clone(), attempts.clone()) {
+                            match server_config(&identity, trust.clone(), Default::default()) {
                                 Ok(cfg) => match Endpoint::server(cfg, listen_addr) {
                                     Ok(new_endpoint) => {
-                                        endpoint.close(0u32.into(), b"port change");
-                                        endpoint = new_endpoint;
+                                        if let Some(old) = endpoint.replace(new_endpoint) {
+                                            old.close(0u32.into(), b"port change");
+                                        }
                                         let _ = port_changed_tx.send(Ok(port));
                                     }
                                     Err(e) => {
@@ -399,9 +624,44 @@ impl LanMouseListener {
             listen_task,
             port_changed,
             request_port_change,
+            trust: clipboard_trust,
+            pairings,
+            pairing_events: Some(pairing_events),
+            dialled_in: Some(dialled_in),
+            clipboard_in: clipboard_in_kept,
             #[cfg(test)]
             local_addr,
         })
+    }
+
+    /// The attempts this listener holds for machines mid-pairing, for the
+    /// service to answer. Grabbed before the listener moves into `Emulation`.
+    pub(crate) fn pairings(&self) -> crate::pairing::Pairings {
+        self.pairings.clone()
+    }
+
+    /// What those attempts tell the service. Once: `None` after the first.
+    pub(crate) fn take_pairing_events(&mut self) -> Option<Receiver<crate::pairing::PairingEvent>> {
+        self.pairing_events.take()
+    }
+
+    /// The links machines open to be driven by this one (#15). Once: `None`
+    /// after the first. Grabbed before the listener moves into `Emulation`.
+    pub(crate) fn take_dialled_in(&mut self) -> Option<Receiver<DialledIn>> {
+        self.dialled_in.take()
+    }
+
+    /// A handle that admits a link this machine dialled to be driven (#15),
+    /// as though it had been dialled in: the same door, the same read loop,
+    /// the same checks on every event.
+    pub(crate) fn admitter(&self) -> Admitter {
+        Admitter {
+            conns: self.conns.clone(),
+            listen_tx: self.listen_tx.clone(),
+            clipboard_in: self.clipboard_in.clone(),
+            trust: self.trust.clone(),
+            pressure: self.pressure.clone(),
+        }
     }
 
     /// A listener on 127.0.0.1 at a port the OS picks, and that port.
@@ -409,11 +669,22 @@ impl LanMouseListener {
     pub(crate) async fn bind_loopback(
         identity: Arc<Identity>,
         trust: Trust,
-        clipboard_in: Sender<String>,
+        clipboard_in: Sender<PeerClipboard>,
     ) -> Result<(Self, u16), ListenerCreationError> {
         let addr = SocketAddr::new("127.0.0.1".parse().expect("loopback"), 0);
-        let listener = Self::bind(addr, identity, trust, clipboard_in).await?;
-        let port = listener.local_addr.port();
+        Self::bind_at(addr, identity, trust, clipboard_in).await
+    }
+
+    /// A listener at `addr`, and the port it bound.
+    #[cfg(test)]
+    pub(crate) async fn bind_at(
+        addr: SocketAddr,
+        identity: Arc<Identity>,
+        trust: Trust,
+        clipboard_in: Sender<PeerClipboard>,
+    ) -> Result<(Self, u16), ListenerCreationError> {
+        let listener = Self::bind(Some(addr), identity, trust, clipboard_in).await?;
+        let port = listener.local_addr.map_or(0, |a| a.port());
         Ok((listener, port))
     }
 
@@ -464,16 +735,83 @@ impl LanMouseListener {
     pub(crate) fn revoker(&self) -> ConnRevoker {
         ConnRevoker {
             conns: self.conns.clone(),
+            trust: self.trust.clone(),
         }
     }
 
-    /// A handle for broadcasting local clipboard changes to all connected
-    /// peers. Grabbed before this listener is moved into `Emulation` so the
-    /// service can drive it directly.
-    pub(crate) fn clipboard_sender(&self) -> ClipboardSenderListen {
+    /// A handle for broadcasting local clipboard changes to the connected
+    /// peers the pairing shares it with. Grabbed before this listener is moved
+    /// into `Emulation` so the service can drive it directly.
+    ///
+    /// `clients` holds the device switches: a machine switched off there is
+    /// sent none of it, over the link it opened to this one either (#218).
+    pub(crate) fn clipboard_sender(&self, clients: ClientManager) -> ClipboardSenderListen {
         ClipboardSenderListen {
             conns: self.conns.clone(),
+            trust: self.trust.clone(),
+            clients,
         }
+    }
+}
+
+/// Admits links this machine dialled to be driven into the listener (#15).
+#[derive(Clone)]
+pub(crate) struct Admitter {
+    conns: Rc<AsyncMutex<Vec<ConnEntry>>>,
+    listen_tx: Sender<ListenEvent>,
+    clipboard_in: Sender<PeerClipboard>,
+    trust: Trust,
+    pressure: Rc<InputPressure>,
+}
+
+impl Admitter {
+    /// How many links in are up from the machine that proved `fingerprint`,
+    /// each a link over which it drives this one: one it dialled, and one
+    /// this machine dialled to be driven by it and admitted here.
+    pub(crate) async fn links_from(&self, fingerprint: &str) -> usize {
+        self.conns
+            .lock()
+            .await
+            .iter()
+            .filter(|e| e.fingerprint == fingerprint && e.conn.close_reason().is_none())
+            .count()
+    }
+
+    /// Read `conn`, whose peer proved `fingerprint`, as a link in from a
+    /// machine that drives this one: its input reaches emulation through the
+    /// same checks as any other, each event asked again whether that machine
+    /// may drive this one and whether it crossed onto it (#211, #212).
+    ///
+    /// Asked here once more, too: a lease withdrawn since the handshake
+    /// admits nothing. Returns whether it was admitted.
+    /// `first` is the input stream and the first frame read from it, when
+    /// the dialler already read it to learn the link was taken.
+    pub(crate) async fn admit(
+        &self,
+        conn: Connection,
+        fingerprint: String,
+        first: Option<(RecvStream, ProtoEvent)>,
+    ) -> bool {
+        if !self.trust.read().expect("lock").may_drive_us(&fingerprint) {
+            log::warn!(
+                "{fingerprint} may no longer drive this machine; closing the link dialled to it"
+            );
+            conn.close(0u32.into(), b"not permitted");
+            return false;
+        }
+        admit(Admitted {
+            conns: self.conns.clone(),
+            addr: conn.remote_address(),
+            conn,
+            fingerprint,
+            listen_tx: self.listen_tx.clone(),
+            clipboard_in: self.clipboard_in.clone(),
+            trust: self.trust.clone(),
+            pressure: self.pressure.clone(),
+            first,
+        })
+        .await;
+        true
     }
 }
 
@@ -486,19 +824,24 @@ impl LanMouseListener {
 #[derive(Clone)]
 pub(crate) struct ConnRevoker {
     conns: Rc<AsyncMutex<Vec<ConnEntry>>>,
+    trust: Trust,
 }
 
 impl ConnRevoker {
     /// Close every live inbound session whose peer presented `fp`. Returns how
     /// many were cut. The read loop's own cleanup is idempotent, so removing the
     /// entries here does not race it.
+    ///
+    /// A peer this machine no longer holds any pairing with is told so as the
+    /// link closes ([`transport::REMOVED`], #184).
     pub(crate) async fn close_fingerprint(&self, fp: &str) -> usize {
+        let reason = transport::close_reason(&self.trust, fp, b"trust revoked");
         let mut conns = self.conns.lock().await;
         let mut closed = 0;
         conns.retain(|e| {
             if e.fingerprint == fp {
                 log::warn!("closing session with {} — trust revoked", e.addr);
-                e.conn.close(0u32.into(), b"trust revoked");
+                e.conn.close(0u32.into(), reason);
                 closed += 1;
                 false
             } else {
@@ -509,11 +852,14 @@ impl ConnRevoker {
     }
 }
 
-/// Broadcasts clipboard text to every connected peer, each on its own
-/// ephemeral uni stream. Cloneable handle over the shared connection list.
+/// Broadcasts clipboard text to each connected peer the pairing shares it
+/// with, each on its own ephemeral uni stream. Cloneable handle over the
+/// shared connection list.
 #[derive(Clone)]
 pub(crate) struct ClipboardSenderListen {
     conns: Rc<AsyncMutex<Vec<ConnEntry>>>,
+    trust: Trust,
+    clients: ClientManager,
 }
 
 /// One clipboard-failure line a minute is enough to tell you it is dropping,
@@ -528,7 +874,16 @@ impl ClipboardSenderListen {
     pub(crate) async fn broadcast(&self, text: String) {
         let conns: Vec<Connection> = {
             let conns = self.conns.lock().await;
-            conns.iter().map(|e| e.conn.clone()).collect()
+            let trust = self.trust.read().expect("lock");
+            // A peer that connected in is one that drives this machine, and
+            // the pairing sends it this machine's clipboard only if its lease
+            // says so (#186).
+            conns
+                .iter()
+                .filter(|e| trust.clipboard_to(&e.fingerprint))
+                .filter(|e| self.clients.switch_allows_clipboard(&e.fingerprint, None))
+                .map(|e| e.conn.clone())
+                .collect()
         };
         for conn in conns {
             let text = text.clone();
@@ -587,35 +942,163 @@ impl Stream for LanMouseListener {
     }
 }
 
-async fn remove_conn(conns: &Rc<AsyncMutex<Vec<ConnEntry>>>, addr: SocketAddr) {
+/// Forget a connection from `addr` that ended, and say so once no other
+/// connection from that address is left.
+///
+/// Sessions are kept per address, so a connection that ends while a newer one
+/// from the same address is up must not end the newer one's session: the
+/// sender reached this machine again before the old connection timed out here.
+async fn remove_conn(
+    conns: &Rc<AsyncMutex<Vec<ConnEntry>>>,
+    addr: SocketAddr,
+    listen_tx: &Sender<ListenEvent>,
+) {
     let mut conns = conns.lock().await;
     if let Some(index) = conns.iter().position(|e| e.addr == addr) {
         conns.remove(index);
     }
+    // Sent with the list still held, so a new connection from this address
+    // cannot be added between the check and the event.
+    if !conns.iter().any(|e| e.addr == addr) {
+        let _ = listen_tx.send(ListenEvent::Closed { addr });
+    }
 }
 
-async fn read_loop(
+/// A connection let in: one whose peer may drive this machine.
+struct Admitted {
     conns: Rc<AsyncMutex<Vec<ConnEntry>>>,
     addr: SocketAddr,
     conn: Connection,
+    fingerprint: String,
     listen_tx: Sender<ListenEvent>,
-    clipboard_in: Sender<String>,
-    // Dropped when this loop ends, which ends the connection's writer task.
-    _replies: ReplyQueueGuard,
+    clipboard_in: Sender<PeerClipboard>,
+    trust: Trust,
     pressure: Rc<InputPressure>,
-) {
-    // the peer's reliable inbound stream (their uni stream to us)
-    let mut recv = match conn.accept_uni().await {
-        Ok(recv) => recv,
+    /// For a connection that paired: its input stream, already accepted, and
+    /// the first frame read from it.
+    first: Option<(RecvStream, ProtoEvent)>,
+}
+
+/// Open the reply stream, list the connection, say it was accepted, and read
+/// its input.
+/// Answer a pairing both machines confirmed on `conn` with this machine's
+/// own confirmation, as [`admit`] does through its reply stream, then let
+/// the connection go: once the machine that dialled closes it, having read
+/// the answer, or after [`PAIRED_LINGER`]. Closing at once can discard the
+/// answer on its way, and the other machine then ends its side unpaired.
+async fn answer_and_close(conn: &quinn::Connection) {
+    let answer = async {
+        let mut send = conn.open_uni().await.ok()?;
+        crate::transport::write_frame(
+            &mut send,
+            ProtoEvent::Hello {
+                commit: crate::config::local_commit(),
+            },
+        )
+        .await
+        .ok()?;
+        send.finish().ok()
+    };
+    if answer.await.is_some() {
+        let _ = tokio::time::timeout(PAIRED_LINGER, conn.closed()).await;
+    }
+    conn.close(0u32.into(), b"paired");
+}
+
+/// How long a pairing connection that carries nothing stays open for the
+/// machine that dialled to read this machine's confirmation.
+const PAIRED_LINGER: Duration = Duration::from_secs(10);
+
+async fn admit(a: Admitted) {
+    let Admitted {
+        conns,
+        addr,
+        conn,
+        fingerprint,
+        listen_tx,
+        clipboard_in,
+        trust,
+        pressure,
+        first,
+    } = a;
+    let send = match conn.open_uni().await {
+        Ok(s) => s,
         Err(e) => {
-            log::info!("{addr}: no inbound stream: {e}");
-            remove_conn(&conns, addr).await;
+            log::warn!("{addr}: opening reply stream failed: {e}");
             return;
         }
     };
+    let replies: Rc<RefCell<PendingReplies>> = Default::default();
+    let ready = Rc::new(Notify::new());
+    spawn_local(reply_loop(addr, replies.clone(), ready.clone(), send));
+    conns.lock().await.push(ConnEntry {
+        addr,
+        conn: conn.clone(),
+        replies: replies.clone(),
+        ready: ready.clone(),
+        fingerprint: fingerprint.clone(),
+    });
+    let closer = ReplyQueueGuard { replies, ready };
+    let clipboard = ClipboardInlet {
+        from: fingerprint.clone(),
+        dialled_for: None,
+        trust: trust.clone(),
+        tx: clipboard_in,
+    };
+    let _ = listen_tx.send(ListenEvent::Accept {
+        addr,
+        fingerprint: fingerprint.clone(),
+    });
+    spawn_local(read_loop(
+        conns.clone(),
+        addr,
+        fingerprint,
+        conn,
+        listen_tx.clone(),
+        clipboard,
+        closer,
+        pressure,
+        first,
+    ));
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn read_loop(
+    conns: Rc<AsyncMutex<Vec<ConnEntry>>>,
+    addr: SocketAddr,
+    fingerprint: String,
+    conn: Connection,
+    listen_tx: Sender<ListenEvent>,
+    clipboard: ClipboardInlet,
+    // Dropped when this loop ends, which ends the connection's writer task.
+    _replies: ReplyQueueGuard,
+    pressure: Rc<InputPressure>,
+    first: Option<(RecvStream, ProtoEvent)>,
+) {
+    // the peer's reliable inbound stream (their uni stream to us), unless the
+    // pairing already read its first frame from it
+    let mut recv = match first {
+        Some((recv, event)) => {
+            let _ = listen_tx.send(ListenEvent::Msg { event, addr });
+            recv
+        }
+        None => match conn.accept_uni().await {
+            Ok(recv) => recv,
+            Err(e) => {
+                log::info!("{addr}: no inbound stream: {e}");
+                told_removed(&conn, fingerprint, &listen_tx);
+                remove_conn(&conns, addr, &listen_tx).await;
+                return;
+            }
+        },
+    };
     // The input stream above is accepted first (opened at connection setup);
     // clipboard transfers ride the subsequent uni streams on this connection.
-    spawn_local(clipboard_accept_loop(conn.clone(), addr, clipboard_in));
+    spawn_local(transport::clipboard_accept_loop(
+        conn.clone(),
+        addr,
+        clipboard,
+    ));
     loop {
         // A peer whose injection queue is full reads nothing more until it
         // drains, so its own flow control slows it and no other peer (#82).
@@ -636,41 +1119,26 @@ async fn read_loop(
         }
     }
     log::info!("client disconnected {addr:?}");
+    told_removed(&conn, fingerprint, &listen_tx);
     // Close the connection so the spawned clipboard_accept_loop's accept_uni
     // errors and the loop (and this connection's remaining clones) are
     // released. Mirrors connect.rs::disconnect; without it a half-closed-but-
     // alive connection (primary input stream finished/reset while keep-alive
     // holds the connection up) would leak the clipboard task and the connection.
     conn.close(0u32.into(), b"bye");
-    remove_conn(&conns, addr).await;
+    remove_conn(&conns, addr, &listen_tx).await;
 }
 
-/// Accepts the peer's ephemeral clipboard uni streams (everything after the
-/// primary input stream) and forwards each payload to the service.
-async fn clipboard_accept_loop(conn: Connection, addr: SocketAddr, clipboard_in: Sender<String>) {
-    // `while let` rather than `loop`+`match`: the error arm is only ever
-    // "connection closed", handled by the input loop, so there is nothing to
-    // distinguish.
-    while let Ok(recv) = conn.accept_uni().await {
-        {
-            let clipboard_in = clipboard_in.clone();
-            spawn_local(async move {
-                match tokio::time::timeout(
-                    transport::CLIPBOARD_IO_TIMEOUT,
-                    transport::recv_clipboard(recv),
-                )
-                .await
-                {
-                    Ok(Ok(text)) => {
-                        let _ = clipboard_in.send(text);
-                    }
-                    Ok(Err(e)) => log::debug!("{addr}: bad clipboard transfer: {e}"),
-                    // dropping the recv future on timeout stops the stream
-                    // and frees the uni-stream slot (never reaped otherwise)
-                    Err(_) => log::debug!("{addr}: clipboard transfer timed out"),
-                }
-            });
-        }
+/// Say so when the machine at the other end of `conn`, which proved
+/// `fingerprint`, closed it because it removed this machine (#184). Read
+/// before this side closes it, which would otherwise be the reason recorded.
+fn told_removed(conn: &Connection, fingerprint: String, listen_tx: &Sender<ListenEvent>) {
+    if conn
+        .close_reason()
+        .is_some_and(|e| transport::closed_as_removed(&e))
+    {
+        log::info!("{fingerprint} closed its link: it removed this machine");
+        let _ = listen_tx.send(ListenEvent::RemovedBy { fingerprint });
     }
 }
 
@@ -704,7 +1172,7 @@ mod tests {
         let mut store = crate::trust::TrustStore::new(us, 0).expect("our fingerprint");
         for f in fps {
             store
-                .issue(f, "peer", crate::trust::Caps::INBOUND)
+                .issue_confirmed(f, "peer", crate::trust::Caps::INBOUND)
                 .expect("issue");
         }
         Arc::new(RwLock::new(store))
@@ -717,7 +1185,7 @@ mod tests {
         let mut store = crate::trust::TrustStore::new(us, 0).expect("our fingerprint");
         for f in fps {
             store
-                .issue(f, "peer", crate::trust::Caps::OUTBOUND)
+                .issue_confirmed(f, "peer", crate::trust::Caps::OUTBOUND)
                 .expect("issue");
         }
         Arc::new(RwLock::new(store))
@@ -859,8 +1327,8 @@ mod tests {
 
             // server trusts the client (as if just approved)
             let trust = allow(&server_fp, &[&client_fp]);
-            let attempts: Arc<StdMutex<VecDeque<String>>> = Default::default();
-            let cfg = server_config(&server, trust.clone(), attempts).expect("server config");
+            let cfg =
+                server_config(&server, trust.clone(), Default::default()).expect("server config");
             let listen_addr: SocketAddr = "127.0.0.1:0".parse().expect("addr");
             let server_ep = Endpoint::server(cfg, listen_addr).expect("endpoint");
             let addr = server_ep.local_addr().expect("local addr");
@@ -892,8 +1360,8 @@ mod tests {
                 "an trust peer must be admitted"
             );
 
-            // revoke — exactly what remove_authorized_key does to the shared map
-            trust.write().expect("lock").revoke(&client_fp);
+            // revoke — exactly what remove_authorized_key does to the shared store
+            trust.write().expect("lock").forget(&client_fp);
 
             assert!(
                 !dials_ok(&client_ep, addr).await,
@@ -901,6 +1369,207 @@ mod tests {
                  consulted, almost certainly because the handshake resumed and \
                  skipped FpClientVerifier"
             );
+        });
+    }
+}
+
+#[cfg(test)]
+mod each_rejection_names_its_own_connection {
+    //! A refused handshake is reported with the fingerprint that connection
+    //! presented and the address it came from, however the handshakes around
+    //! it interleave (#83).
+    //!
+    //! Every connection's rejection used to go onto one queue, and whichever
+    //! handshake failed next popped from it. Handshakes run on their own tasks,
+    //! so when several failed together the pops did not follow the pushes: a
+    //! machine that dialled twice took the next machine's fingerprint with its
+    //! second failure, and that machine's own failure found the queue empty.
+    //!
+    //! The test lines that up deterministically. Each dialler runs on its own
+    //! thread and stops just before sending its certificate. The receiver's
+    //! thread is then held while the diallers are released one at a time, so
+    //! all three certificates are waiting in the socket, in a known order, when
+    //! it resumes and fails the three handshakes in one pass.
+    use super::*;
+    use crate::test_harness::{Machine, machine, run_local, trust, wait_until};
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::pki_types::{ServerName, UnixTime};
+    use rustls::{DigitallySignedStruct, SignatureScheme};
+    use std::collections::HashMap;
+    use std::sync::mpsc;
+
+    /// Accepts the receiver's certificate, but only once released: the dialler
+    /// sends its own certificate straight after this returns.
+    #[derive(Debug)]
+    struct HoldBeforeOurCertificate {
+        reached: mpsc::Sender<()>,
+        go: StdMutex<mpsc::Receiver<()>>,
+    }
+
+    impl ServerCertVerifier for HoldBeforeOurCertificate {
+        fn verify_server_cert(
+            &self,
+            _: &CertificateDer<'_>,
+            _: &[CertificateDer<'_>],
+            _: &ServerName<'_>,
+            _: &[u8],
+            _: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            let _ = self.reached.send(());
+            let _ = self.go.lock().expect("lock").recv();
+            Ok(ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer<'_>,
+            _: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer<'_>,
+            _: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    struct Dialler {
+        from: SocketAddr,
+        fingerprint: String,
+        go: mpsc::Sender<()>,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    /// `who` dials 127.0.0.1:`port` from a thread of its own, and waits before
+    /// sending its certificate until its `go` is sent.
+    fn dialler(who: &Machine, port: u16, reached: mpsc::Sender<()>) -> Dialler {
+        let (go, go_rx) = mpsc::channel();
+        let (from_tx, from_rx) = mpsc::channel();
+        let identity = who.identity.clone();
+        let thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async move {
+                let mut crypto = rustls::ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(HoldBeforeOurCertificate {
+                        reached,
+                        go: StdMutex::new(go_rx),
+                    }))
+                    .with_client_auth_cert(vec![identity.cert.clone()], identity.key.clone_key())
+                    .expect("client auth");
+                crypto.alpn_protocols = vec![transport::ALPN.to_vec()];
+                let config = quinn::ClientConfig::new(Arc::new(
+                    quinn::crypto::rustls::QuicClientConfig::try_from(crypto).expect("quic client"),
+                ));
+                let endpoint =
+                    Endpoint::client("127.0.0.1:0".parse().expect("loopback")).expect("endpoint");
+                from_tx
+                    .send(endpoint.local_addr().expect("local addr"))
+                    .expect("the test is waiting");
+                let at = SocketAddr::new("127.0.0.1".parse().expect("loopback"), port);
+                if let Ok(connecting) = endpoint.connect_with(config, at, "grabbr") {
+                    let _ = tokio::time::timeout(Duration::from_secs(10), connecting).await;
+                }
+            });
+        });
+        Dialler {
+            from: from_rx.recv().expect("the dialler's address"),
+            fingerprint: who.fingerprint.clone(),
+            go,
+            thread,
+        }
+    }
+
+    // LEDGER T1 | class B | 1 return value: LanMouseListener as Stream<ListenEvent> (Rejected) over loopback QUIC
+    #[test]
+    fn each_rejection_names_the_certificate_its_own_connection_presented() {
+        run_local(async {
+            let receiver = machine();
+            let nobody = trust(&receiver, &[], crate::trust::Caps::INBOUND);
+            let (clip_tx, _clip_rx) = local_channel::mpsc::channel();
+            let (mut listener, port) =
+                LanMouseListener::bind_loopback(receiver.identity.clone(), nobody, clip_tx)
+                    .await
+                    .expect("listener");
+
+            // The #83 shape: one machine dialling in a loop, and the machine the
+            // user is actually pairing, dialling once.
+            let persistent = machine();
+            let laptop = machine();
+            let (reached_tx, reached_rx) = mpsc::channel();
+            let diallers = [
+                dialler(&persistent, port, reached_tx.clone()),
+                dialler(&persistent, port, reached_tx.clone()),
+                dialler(&laptop, port, reached_tx),
+            ];
+            let mut waiting = 0;
+            wait_until(
+                "every dialler to reach the point of sending its certificate",
+                Duration::from_secs(10),
+                || {
+                    while reached_rx.try_recv().is_ok() {
+                        waiting += 1;
+                    }
+                    waiting == diallers.len()
+                },
+            )
+            .await;
+
+            // Hold this thread, and with it the whole receiver, while each
+            // certificate lands in the socket in turn.
+            for d in &diallers {
+                d.go.send(()).expect("the dialler is waiting");
+                std::thread::sleep(Duration::from_millis(200));
+            }
+
+            let mut reported: Vec<(String, SocketAddr)> = Vec::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while reported.len() < diallers.len() {
+                match tokio::time::timeout_at(deadline, listener.next()).await {
+                    Ok(Some(ListenEvent::Rejected { fingerprint, addr })) => {
+                        reported.push((fingerprint, addr))
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break,
+                }
+            }
+
+            let presented: HashMap<SocketAddr, String> = diallers
+                .iter()
+                .map(|d| (d.from, d.fingerprint.clone()))
+                .collect();
+            for (fingerprint, addr) in &reported {
+                assert_eq!(
+                    presented.get(addr),
+                    Some(fingerprint),
+                    "the rejection of the handshake from {addr} named {fingerprint}, which is \
+                     not the certificate that connection presented; all rejections: {reported:?}"
+                );
+            }
+            let mut from: Vec<SocketAddr> = reported.iter().map(|(_, a)| *a).collect();
+            from.sort();
+            let mut dialled: Vec<SocketAddr> = presented.keys().copied().collect();
+            dialled.sort();
+            assert_eq!(
+                from, dialled,
+                "every refused dial must be reported once, from its own address; \
+                 reported: {reported:?}"
+            );
+            for d in diallers {
+                d.thread.join().expect("dialler thread");
+            }
         });
     }
 }
@@ -966,5 +1635,291 @@ mod clipboard_failures_are_visible {
                  daemon log and a 4.4 GB keystroke log before it"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod failed_handshakes_are_summarised {
+    //! Anyone who can reach the port can fail a handshake, as fast as it can
+    //! dial. One warning per failure let a stranger minting a key per dial
+    //! write 120 lines a second into the log (#101).
+    use super::*;
+    use crate::test_harness::{logs, machine, raw_client_config, run_local, trust, wait_until};
+    use crate::trust::Caps;
+    use std::cell::Cell;
+
+    // LEDGER T2373 | class B | 5 log lines captured from the real listener's thread
+    #[test]
+    fn a_stranger_dialling_in_a_loop_writes_a_line_not_a_line_per_dial() {
+        run_local(async {
+            let captured = logs::capture();
+            let receiver = machine();
+            let nobody = trust(&receiver, &[], Caps::INBOUND);
+            let (clip_tx, _clip_rx) = channel();
+            let (mut listener, port) =
+                LanMouseListener::bind_loopback(receiver.identity.clone(), nobody, clip_tx)
+                    .await
+                    .expect("listener");
+            let rejected = Rc::new(Cell::new(0u32));
+            let counted = rejected.clone();
+            spawn_local(async move {
+                while let Some(event) = listener.next().await {
+                    if matches!(event, ListenEvent::Rejected { .. }) {
+                        counted.set(counted.get() + 1);
+                    }
+                }
+            });
+
+            const DIALS: u32 = 40;
+            let at = SocketAddr::new("127.0.0.1".parse().expect("loopback"), port);
+            let endpoint =
+                Endpoint::client("127.0.0.1:0".parse().expect("loopback")).expect("endpoint");
+            for _ in 0..DIALS {
+                // A fresh key per dial, as the stranger in #101 did.
+                let stranger = machine();
+                let config = raw_client_config(
+                    &stranger,
+                    trust(&stranger, &[&receiver], Caps::OUTBOUND),
+                    1 << 20,
+                );
+                if let Ok(connecting) = endpoint.connect_with(config, at, "grabbr") {
+                    if let Ok(Ok(conn)) =
+                        tokio::time::timeout(Duration::from_secs(5), connecting).await
+                    {
+                        let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+                    }
+                }
+            }
+            wait_until(
+                "the listener to refuse every dial",
+                Duration::from_secs(20),
+                || rejected.get() == DIALS,
+            )
+            .await;
+
+            let warned: Vec<String> = captured
+                .lines()
+                .into_iter()
+                .filter(|l| l.text.starts_with("handshake from"))
+                .map(|l| l.text)
+                .collect();
+            assert!(
+                !warned.is_empty(),
+                "no failed handshake was logged at all; the first must be"
+            );
+            assert!(
+                warned.len() <= 2,
+                "{DIALS} refused dials in a few seconds wrote {} warnings: {warned:#?}",
+                warned.len()
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod a_removed_machine_is_told {
+    //! Removing a device tells the machine at the other end (#184, #161).
+    //!
+    //! Connected, the link closes as `removed`, which only a machine that
+    //! holds no pairing with the other end sends. Not connected, the other
+    //! machine learns on its next dial: it is refused during the handshake as
+    //! `access_denied`, which a receiver sends only to a machine it holds no
+    //! record of, and every other refusal stays `handshake_failure`.
+    //!
+    //! The production listener and the production dialler, on loopback.
+    use super::*;
+    use crate::connect::DialRefusal;
+    use crate::test_harness::{Dialer, Machine, dialer, machine, run_local};
+    use crate::trust::{Caps, TrustStore};
+    use hops_ipc::Position;
+    use std::sync::RwLock;
+
+    const DEADLINE: Duration = Duration::from_secs(30);
+
+    fn store(me: &Machine, peers: &[(&Machine, Caps)]) -> Trust {
+        let mut store = TrustStore::new(&me.fingerprint, 0).expect("our fingerprint");
+        for (peer, caps) in peers {
+            store
+                .issue_confirmed(&peer.fingerprint, "peer", *caps)
+                .expect("issue");
+        }
+        Arc::new(RwLock::new(store))
+    }
+
+    async fn receiver(me: &Machine, trust: Trust) -> (LanMouseListener, u16) {
+        let (clipboard_tx, _clipboard) = local_channel::mpsc::channel();
+        // The clipboard queue is not what these tests watch; keeping its
+        // receiver would only hold the channel open.
+        std::mem::forget(_clipboard);
+        LanMouseListener::bind_loopback(me.identity.clone(), trust, clipboard_tx)
+            .await
+            .expect("a loopback listener")
+    }
+
+    /// Dial until the dialler reports a refusal, and return it.
+    async fn refusal_on_dial(d: &mut Dialer) -> DialRefusal {
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        loop {
+            let _ = d.conn.send(hops_proto::ProtoEvent::Ping, d.handle).await;
+            if let Ok(Some(r)) =
+                tokio::time::timeout(Duration::from_millis(200), d.notices.refusals.recv()).await
+            {
+                return r;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the dial was never refused"
+            );
+        }
+    }
+
+    /// Dial, and wait until the receiver has admitted the link.
+    async fn linked(d: &Dialer, listener: &mut LanMouseListener) {
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        loop {
+            let _ = d.conn.send(hops_proto::ProtoEvent::Ping, d.handle).await;
+            if let Ok(Some(ListenEvent::Accept { .. })) =
+                tokio::time::timeout(Duration::from_millis(200), listener.next()).await
+            {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the receiver never admitted the link"
+            );
+        }
+    }
+
+    // LEDGER R184-9 | class B | 1 return value: DialRefusal from the production dialler against the production listener
+    /// A dialler the receiver holds no record of, as after a removal there,
+    /// is refused as `access_denied`, and the dialler says so; a dialler the
+    /// receiver knows but does not let drive it is refused as before.
+    #[test]
+    fn a_dialler_the_receiver_forgot_is_told_it_was_removed() {
+        run_local(async {
+            let (rx, removed, one_way) = (machine(), machine(), machine());
+            let trust = store(&rx, &[(&one_way, Caps::OUTBOUND)]);
+            let (_listener, port) = receiver(&rx, trust).await;
+
+            let mut d = dialer(
+                &removed,
+                store(&removed, &[(&rx, Caps::OUTBOUND)]),
+                port,
+                Position::Left,
+            );
+            let refused = refusal_on_dial(&mut d).await;
+            assert!(
+                matches!(&refused, DialRefusal::Forgotten { fingerprint, .. }
+                    if *fingerprint == rx.fingerprint),
+                "a dialler the receiver holds no record of was not told it was \
+                 removed: {refused:?}"
+            );
+
+            let mut d = dialer(
+                &one_way,
+                store(&one_way, &[(&rx, Caps::OUTBOUND)]),
+                port,
+                Position::Left,
+            );
+            let refused = refusal_on_dial(&mut d).await;
+            assert!(
+                matches!(&refused, DialRefusal::RefusedByPeer { fingerprint, .. }
+                    if *fingerprint == rx.fingerprint),
+                "a dialler the receiver knows, paired the other way, was told it \
+                 was removed: {refused:?}"
+            );
+        });
+    }
+
+    // LEDGER R184-10 | class B | 1 return value: DialRefusal after ConnRevoker::close_fingerprint
+    /// The receiver removes a dialler whose link is up: the dialler is told,
+    /// by the link's close, which machine removed it.
+    #[test]
+    fn a_receiver_that_removes_a_connected_dialler_tells_it() {
+        run_local(async {
+            let (rx, tx) = (machine(), machine());
+            let trust = store(&rx, &[(&tx, Caps::INBOUND)]);
+            let (mut listener, port) = receiver(&rx, trust.clone()).await;
+            let mut d = dialer(
+                &tx,
+                store(&tx, &[(&rx, Caps::OUTBOUND)]),
+                port,
+                Position::Left,
+            );
+            linked(&d, &mut listener).await;
+
+            trust.write().expect("lock").forget(&tx.fingerprint);
+            assert_eq!(
+                listener.revoker().close_fingerprint(&tx.fingerprint).await,
+                1
+            );
+
+            let told = tokio::time::timeout(DEADLINE, d.notices.refusals.recv())
+                .await
+                .ok()
+                .flatten()
+                .expect("the dialler never heard why its link closed");
+            assert_eq!(
+                told,
+                DialRefusal::RemovedBy {
+                    handle: d.handle,
+                    fingerprint: rx.fingerprint.clone(),
+                },
+                "the dialler was not told the receiver removed it"
+            );
+        });
+    }
+
+    // LEDGER R184-11 | class B | 1 return value: ListenEvent after OutboundRevoker::close_fingerprint
+    /// The dialler removes a receiver whose link is up: the receiver is told,
+    /// by the link's close, which machine removed it. Closed for any other
+    /// reason, it is told nothing of the kind.
+    #[test]
+    fn a_dialler_that_removes_a_connected_receiver_tells_it() {
+        run_local(async {
+            let (rx, tx) = (machine(), machine());
+            let (mut listener, port) = receiver(&rx, store(&rx, &[(&tx, Caps::INBOUND)])).await;
+            let tx_trust = store(&tx, &[(&rx, Caps::OUTBOUND)]);
+
+            // Closed while still paired: the link ends, and says nothing of a
+            // removal.
+            let d = dialer(&tx, tx_trust.clone(), port, Position::Left);
+            linked(&d, &mut listener).await;
+            assert_eq!(d.conn.revoker().close_fingerprint(&rx.fingerprint).await, 1);
+            let mut heard = Vec::new();
+            loop {
+                match tokio::time::timeout(DEADLINE, listener.next()).await {
+                    Ok(Some(ListenEvent::Closed { .. })) => break,
+                    Ok(Some(ListenEvent::RemovedBy { fingerprint })) => heard.push(fingerprint),
+                    Ok(Some(_)) => {}
+                    _ => panic!("the receiver never saw the link close"),
+                }
+            }
+            assert!(
+                heard.is_empty(),
+                "a link closed while still paired was taken as a removal: {heard:?}"
+            );
+
+            // Removed: the receiver hears it, named by the link's proven
+            // identity, before the link's end.
+            let d = dialer(&tx, tx_trust.clone(), port, Position::Left);
+            linked(&d, &mut listener).await;
+            tx_trust.write().expect("lock").forget(&rx.fingerprint);
+            assert_eq!(d.conn.revoker().close_fingerprint(&rx.fingerprint).await, 1);
+            let mut told = None;
+            loop {
+                match tokio::time::timeout(DEADLINE, listener.next()).await {
+                    Ok(Some(ListenEvent::Closed { .. })) => break,
+                    Ok(Some(ListenEvent::RemovedBy { fingerprint })) => told = Some(fingerprint),
+                    Ok(Some(_)) => {}
+                    _ => panic!("the receiver never saw the link close"),
+                }
+            }
+            assert_eq!(
+                told.as_deref(),
+                Some(tx.fingerprint.as_str()),
+                "the receiver was not told the dialler removed it"
+            );
+        });
     }
 }

@@ -42,6 +42,30 @@ struct Log {
     /// How long each injected event takes, so a test can make injection the
     /// slow step and see what happens to everything waiting behind it.
     consume_takes: Option<std::time::Duration>,
+    /// Creating a backend fails as a system withholding its permission
+    /// does.
+    refused: bool,
+    /// Needs Accessibility while it runs, as the macOS backend does.
+    as_mac: bool,
+    /// Can start again with nothing shown to the user, as the libei
+    /// backend can with a restore token.
+    unasked: bool,
+    /// Whether the screen shield is up, as the libei backend reads it from
+    /// logind and the screensaver: `None` when it cannot be read.
+    shield: Option<bool>,
+    /// Reading the shield does not answer until this is cleared, as a
+    /// D-Bus service that hangs.
+    shield_stalls: bool,
+    /// How many times a test ended the session from the system's side.
+    ends: u64,
+    /// How many backends were created from this recording.
+    started: usize,
+    /// Tearing a backend down never finishes, as a portal that does not
+    /// answer while the screen is locked.
+    never_stops: bool,
+    /// Every event injected is a deliberate push past this edge, as a
+    /// backend's adaptive edge concludes while the pointer is held there.
+    pushed_past: Option<crate::EdgeSide>,
 }
 
 type Shared = Arc<Mutex<Log>>;
@@ -76,6 +100,15 @@ impl Recording {
             fail_when: None,
             button_scope,
             consume_takes: None,
+            refused: false,
+            as_mac: false,
+            unasked: false,
+            shield: Some(false),
+            shield_stalls: false,
+            ends: 0,
+            started: 0,
+            never_stops: false,
+            pushed_past: None,
         }));
         REGISTRY
             .lock()
@@ -102,6 +135,62 @@ impl Recording {
         self.log.lock().expect("recording log").consume_takes = Some(how_long);
     }
 
+    /// Make every backend created from this one need Accessibility while
+    /// it runs, as the macOS backend does.
+    pub fn needs_accessibility(&self) {
+        self.log.lock().expect("recording log").as_mac = true;
+    }
+
+    /// Make every backend created from this one say it can start again
+    /// with nothing shown to the user, as the libei backend does with a
+    /// restore token.
+    pub fn starts_without_asking(&self) {
+        self.log.lock().expect("recording log").unasked = true;
+    }
+
+    /// Answer `up` when asked whether the screen shield is up: `None` as
+    /// when it cannot be read.
+    pub fn shield(&self, up: Option<bool>) {
+        self.log.lock().expect("recording log").shield = up;
+    }
+
+    /// Make reading the shield hang while `stalls`, as a D-Bus service
+    /// that never answers does.
+    pub fn stall_shield(&self, stalls: bool) {
+        self.log.lock().expect("recording log").shield_stalls = stalls;
+    }
+
+    /// End the running session from the system's side with no event
+    /// injected, as the compositor closing the libei stream does.
+    pub fn end_session(&self) {
+        self.log.lock().expect("recording log").ends += 1;
+    }
+
+    /// Make tearing down every backend created from this one never finish,
+    /// as a backend whose portal does not answer while the screen is locked.
+    /// The call is still recorded.
+    pub fn never_stop(&self) {
+        self.log.lock().expect("recording log").never_stops = true;
+    }
+
+    /// How many backends were created from this recording.
+    pub fn started(&self) -> usize {
+        self.log.lock().expect("recording log").started
+    }
+
+    /// Report every event injected from here on as a deliberate push past
+    /// `side`, as a backend's adaptive edge does while the pointer is held
+    /// against it; `None` stops.
+    pub fn pushes_past(&self, side: Option<crate::EdgeSide>) {
+        self.log.lock().expect("recording log").pushed_past = side;
+    }
+
+    /// Make creating a backend fail as it does on a Mac that has not
+    /// granted hops Accessibility.
+    pub fn refuse_permission(&self) {
+        self.log.lock().expect("recording log").refused = true;
+    }
+
     /// Make `consume` return an error for every event matching `when`. The
     /// call is still recorded, since a real backend is handed the event before
     /// it fails.
@@ -120,8 +209,31 @@ impl Drop for Recording {
     }
 }
 
+/// What the recording `id` answers when asked whether the screen shield is
+/// up, once it no longer stalls; `None` once the recording is dropped.
+pub(crate) async fn shield_up(id: RecordingId) -> Option<bool> {
+    let log = REGISTRY
+        .lock()
+        .expect("recording registry")
+        .as_ref()
+        .and_then(|registry| registry.get(&id).cloned())?;
+    loop {
+        let (stalls, up) = {
+            let log = log.lock().expect("recording log");
+            (log.shield_stalls, log.shield)
+        };
+        if !stalls {
+            return up;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 pub(crate) struct RecordingEmulation {
     log: Shared,
+    /// Session ends asked for before this backend was created, which are
+    /// not its own.
+    ends_before: u64,
 }
 
 impl RecordingEmulation {
@@ -132,7 +244,15 @@ impl RecordingEmulation {
             .as_ref()
             .and_then(|registry| registry.get(&id).cloned())
             .ok_or(RecordingEmulationCreationError::NotRegistered)?;
-        Ok(Self { log })
+        let ends_before = {
+            let mut log = log.lock().expect("recording log");
+            if log.refused {
+                return Err(RecordingEmulationCreationError::Refused);
+            }
+            log.started += 1;
+            log.ends
+        };
+        Ok(Self { log, ends_before })
     }
 
     fn record(&self, call: Recorded) {
@@ -144,6 +264,8 @@ impl RecordingEmulation {
 pub enum RecordingEmulationCreationError {
     #[error("no recording is registered under this id; was it dropped?")]
     NotRegistered,
+    #[error("the system does not grant the permission to post input")]
+    Refused,
 }
 
 #[async_trait]
@@ -180,9 +302,35 @@ impl Emulation for RecordingEmulation {
 
     async fn terminate(&mut self) {
         self.record(Recorded::Terminate);
+        if self.log.lock().expect("recording log").never_stops {
+            std::future::pending::<()>().await;
+        }
     }
 
     fn button_scope(&self) -> ButtonScope {
         self.log.lock().expect("recording log").button_scope
+    }
+
+    fn take_edge_push(&mut self) -> Option<crate::EdgeSide> {
+        self.log.lock().expect("recording log").pushed_past
+    }
+
+    fn starts_unasked(&self) -> bool {
+        self.log.lock().expect("recording log").unasked
+    }
+
+    async fn ended(&mut self) -> EmulationError {
+        while self.log.lock().expect("recording log").ends == self.ends_before {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        EmulationError::EndOfStream
+    }
+
+    fn needs(&self) -> &'static [crate::error::Permission] {
+        if self.log.lock().expect("recording log").as_mac {
+            &[crate::error::Permission::Accessibility]
+        } else {
+            &[]
+        }
     }
 }

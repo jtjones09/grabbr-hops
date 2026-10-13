@@ -8,8 +8,9 @@
 //! server that counts connection attempts.
 #![cfg(unix)]
 
+mod common;
+
 use std::cell::Cell;
-use std::net::UdpSocket;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
@@ -54,47 +55,40 @@ fn start() -> (Daemon, u16) {
         std::env::set_var("XDG_RUNTIME_DIR", &dir);
         std::env::set_var("XDG_CONFIG_HOME", dir.join(".config"));
     }
-    let port = UdpSocket::bind("127.0.0.1:0")
-        .and_then(|s| s.local_addr())
-        .expect("a free port")
-        .port();
     let config = config_dir.join("config.toml");
-    std::fs::write(
-        &config,
-        format!(
-            "port = {port}\ncapture_backend = \"dummy\"\nemulation_backend = \"dummy\"\ndiscovery = false\n"
-        ),
-    )
-    .expect("a config");
     let log = dir.join("daemon.log");
-    let child = Command::new(env!("CARGO_BIN_EXE_hops"))
-        .arg("--config")
-        .arg(&config)
-        .arg("--cert-path")
-        .arg(config_dir.join("lan-mouse.pem"))
-        .arg("daemon")
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", &dir)
-        .env("XDG_RUNTIME_DIR", &dir)
-        .env("XDG_CONFIG_HOME", dir.join(".config"))
-        .env("XDG_STATE_HOME", &dir)
-        .env("HOPS_LOG_FILE", &log)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("the hops binary starts");
+    let (child, port) = common::launch(
+        &config,
+        |port| {
+            format!(
+                "port = {port}\ncapture_backend = \"dummy\"\nemulation_backend = \"dummy\"\ndiscovery = false\n"
+            )
+        },
+        &log,
+        || {
+            Command::new(env!("CARGO_BIN_EXE_hops"))
+                .arg("--config")
+                .arg(&config)
+                .arg("--cert-path")
+                .arg(config_dir.join("lan-mouse.pem"))
+                .arg("daemon")
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                // A test daemon holds no real power assertion.
+                .env("GRABBR_KEEP_AWAKE", "off")
+                .env("HOME", &dir)
+                .env("XDG_RUNTIME_DIR", &dir)
+                .env("XDG_CONFIG_HOME", dir.join(".config"))
+                .env("XDG_STATE_HOME", &dir)
+                .env("HOPS_LOG_FILE", &log)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("the hops binary starts")
+        },
+    );
     let daemon = Daemon { child, dir, log };
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while !daemon.log().contains("service running; stops on") {
-        assert!(
-            Instant::now() < deadline,
-            "the daemon never reported its service loop running; log:\n{}",
-            daemon.log()
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
     (daemon, port)
 }
 
@@ -138,7 +132,18 @@ async fn add_device(
     port: u16,
 ) -> u64 {
     requests
-        .request(FrontendRequest::Create)
+        .request(FrontendRequest::Create(hops_ipc::NewDevice {
+            hostname: Some("127.0.0.1".into()),
+            // Pinned, so the address is known the moment the device is
+            // switched on and the first dial really reaches the receiver, as
+            // it does for a device picked from the network list.
+            fix_ips: vec!["127.0.0.1".parse().expect("ip")],
+            port,
+            // The dummy capture backend crosses at the left edge only, a
+            // thousand times a second. On the right, nothing ever crosses to
+            // this device.
+            pos: Position::Right,
+        }))
         .await
         .expect("create");
     let handle = loop {
@@ -148,19 +153,6 @@ async fn add_device(
             other => panic!("no Created event: {other:?}"),
         }
     };
-    for r in [
-        FrontendRequest::UpdateHostname(handle, Some("127.0.0.1".into())),
-        // Pinned, so the address is known the moment the device is switched on
-        // and the first dial really reaches the receiver, as it does for a
-        // device picked from the network list.
-        FrontendRequest::UpdateFixIps(handle, vec!["127.0.0.1".parse().expect("ip")]),
-        FrontendRequest::UpdatePort(handle, port),
-        // The dummy capture backend crosses at the left edge only, a thousand
-        // times a second. On the right, nothing ever crosses to this device.
-        FrontendRequest::UpdatePosition(handle, Position::Right),
-    ] {
-        requests.request(r).await.expect("configure");
-    }
     handle
 }
 
@@ -209,11 +201,18 @@ fn a_device_added_while_pairing_is_open_is_dialled_until_switched_off() {
             .request(FrontendRequest::Activate(handle, true))
             .await
             .expect("activate");
-        settle(Duration::from_secs(4)).await;
+        // Waits for the third attempt rather than counting inside a fixed
+        // window: the retry is about a second apart, but a daemon started
+        // under a loaded test run can begin late (#226). One that dials once
+        // and gives up still never gets there.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while attempts.get() < 3 && Instant::now() < deadline {
+            settle(Duration::from_millis(200)).await;
+        }
         let dialled = attempts.get();
         assert!(
             dialled >= 3,
-            "a device added with add device open was dialled {dialled} time(s) in 4 s, \
+            "a device added with add device open was dialled {dialled} time(s) in 15 s, \
              with no crossing; expected about one a second; log:\n{}",
             daemon.log()
         );

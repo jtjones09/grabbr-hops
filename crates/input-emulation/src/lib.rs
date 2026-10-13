@@ -6,7 +6,8 @@ use std::{
 
 use input_event::{Event, KeyboardEvent, PointerEvent};
 
-pub use self::error::{EmulationCreationError, EmulationError, InputEmulationError};
+pub use self::error::{EmulationCreationError, EmulationError, InputEmulationError, Permission};
+pub use input_event::Restart;
 
 #[cfg(windows)]
 mod windows;
@@ -25,6 +26,10 @@ mod libei;
 
 #[cfg(target_os = "macos")]
 mod macos;
+
+/// The power assertion that keeps a Mac another machine controls awake.
+#[cfg(target_os = "macos")]
+pub mod macos_keep_awake;
 
 /// fallback input emulation (logs events)
 mod dummy;
@@ -108,6 +113,35 @@ impl Display for Backend {
     }
 }
 
+/// Whether the screen shield (the lock screen, or the curtain an idle
+/// screen fades to before it locks) is up on the desktop a backend runs on
+/// (#258). GNOME closes every remote-desktop session while it is up and
+/// refuses new ones, and a refused start spends the portal's restore token.
+pub struct ShieldWatch(Watch);
+
+enum Watch {
+    #[cfg(libei)]
+    Libei(libei::Shield),
+    #[cfg(feature = "recording")]
+    Recording(recording::RecordingId),
+    /// A backend whose desktop has no shield to read.
+    Unwatched,
+}
+
+impl ShieldWatch {
+    /// Whether the shield is up; `None` when that cannot be read, which a
+    /// backend nothing watches always answers.
+    pub async fn up(&mut self) -> Option<bool> {
+        match &mut self.0 {
+            #[cfg(libei)]
+            Watch::Libei(shield) => shield.up().await,
+            #[cfg(feature = "recording")]
+            Watch::Recording(id) => recording::shield_up(*id).await,
+            Watch::Unwatched => None,
+        }
+    }
+}
+
 pub struct InputEmulation {
     /// The backend actually selected. `new()` falls back down a list, so this is
     /// NOT necessarily what was asked for — and a fallback to `Dummy` silently
@@ -127,6 +161,11 @@ pub struct InputEmulation {
     pressed_buttons: HashMap<EmulationHandle, HashSet<u32>>,
     /// The backend's own answer, read once: it does not change.
     button_scope: ButtonScope,
+    /// What the system withheld from a backend tried before this one, when
+    /// that is why it failed. A fall to `dummy` from a Mac without
+    /// Accessibility keeps the reason, so a caller that refuses the fall can
+    /// name the permission rather than only that input would be discarded.
+    withheld: &'static [Permission],
 }
 
 impl InputEmulation {
@@ -155,6 +194,7 @@ impl InputEmulation {
             handles: HashSet::new(),
             pressed_keys: HashMap::new(),
             pressed_buttons: HashMap::new(),
+            withheld: &[],
         })
     }
 
@@ -162,6 +202,12 @@ impl InputEmulation {
     /// accepted and thrown away.
     pub fn backend(&self) -> Backend {
         self.backend
+    }
+
+    /// The permissions the system withheld from a backend tried before this
+    /// one, when that is why it failed; empty otherwise.
+    pub fn withheld_permissions(&self) -> &'static [Permission] {
+        self.withheld
     }
 
     pub async fn new(backend: Option<Backend>) -> Result<InputEmulation, EmulationCreationError> {
@@ -173,7 +219,13 @@ impl InputEmulation {
             return b;
         }
 
-        for backend in [
+        Self::first_that_starts(Self::auto_order()).await
+    }
+
+    /// The backends tried, in order, when none is configured. `Dummy` is
+    /// last, so it is chosen only when every real backend failed.
+    pub fn auto_order() -> Vec<Backend> {
+        vec![
             #[cfg(wlroots)]
             Backend::Wlroots,
             #[cfg(libei)]
@@ -187,14 +239,29 @@ impl InputEmulation {
             #[cfg(target_os = "macos")]
             Backend::MacOs,
             Backend::Dummy,
-        ] {
+        ]
+    }
+
+    /// The first of `backends` that starts, in order. What the system
+    /// withheld from one that failed before it is kept on it.
+    pub async fn first_that_starts(
+        backends: impl IntoIterator<Item = Backend>,
+    ) -> Result<InputEmulation, EmulationCreationError> {
+        let mut withheld: &'static [Permission] = &[];
+        for backend in backends {
             match Self::with_backend(backend).await {
-                Ok(b) => {
+                Ok(mut b) => {
                     log::info!("using emulation backend: {backend}");
+                    b.withheld = withheld;
                     return Ok(b);
                 }
                 Err(e) if e.cancelled_by_user() => return Err(e),
-                Err(e) => log::warn!("{e}"),
+                Err(e) => {
+                    if withheld.is_empty() {
+                        withheld = e.missing_permissions().unwrap_or_default();
+                    }
+                    log::warn!("{e}");
+                }
             }
         }
 
@@ -404,6 +471,12 @@ impl InputEmulation {
             .get_mut(&handle)
             .map(|k| k.drain().collect::<Vec<_>>())
             .unwrap_or_default();
+        // How many, never which: this is a warn line, written at the default
+        // level and copied into the macOS system log, and the keys are what
+        // the peer was typing (#117).
+        if !keys.is_empty() {
+            log::warn!("releasing {} stuck key(s)", keys.len());
+        }
         for key in keys {
             let event = Event::Keyboard(KeyboardEvent::Key {
                 time: 0,
@@ -412,9 +485,6 @@ impl InputEmulation {
             });
             if let Err(e) = self.emulation.consume(event, handle).await {
                 first_error.get_or_insert(e);
-            }
-            if let Ok(key) = input_event::scancode::Linux::try_from(key) {
-                log::warn!("releasing stuck key: {key:?}");
             }
         }
 
@@ -438,6 +508,52 @@ impl InputEmulation {
         self.pressed_keys
             .get(&handle)
             .is_some_and(|p| !p.is_empty())
+    }
+
+    /// Whether `handle` holds a key or a button down on this machine.
+    pub fn holds(&self, handle: EmulationHandle) -> bool {
+        self.has_pressed_keys(handle)
+            || self
+                .pressed_buttons
+                .get(&handle)
+                .is_some_and(|p| !p.is_empty())
+    }
+
+    /// The permissions the system can take from this backend while it
+    /// runs; see [`Emulation::needs`].
+    pub fn needs(&self) -> &'static [Permission] {
+        self.emulation.needs()
+    }
+
+    /// Whether this backend can start again with nothing shown to the user;
+    /// see [`Emulation::starts_unasked`].
+    pub fn starts_unasked(&self) -> bool {
+        self.emulation.starts_unasked()
+    }
+
+    /// Resolves with the error when the system ends the session with no
+    /// event injected; see [`Emulation::ended`].
+    pub async fn ended(&mut self) -> EmulationError {
+        self.emulation.ended().await
+    }
+
+    /// A watch on the screen shield of the desktop `backend` runs on, which
+    /// decides whether it starts again on its own (#258).
+    pub fn shield_watch(backend: Backend) -> ShieldWatch {
+        ShieldWatch(match backend {
+            #[cfg(libei)]
+            Backend::Libei => Watch::Libei(libei::Shield::default()),
+            #[cfg(feature = "recording")]
+            Backend::Recording(id) => Watch::Recording(id),
+            _ => Watch::Unwatched,
+        })
+    }
+
+    /// Whether any handle holds a key or a button down on this machine. While
+    /// one does, the backend may repeat the key with no event arriving.
+    pub fn holds_anything(&self) -> bool {
+        self.pressed_keys.values().any(|p| !p.is_empty())
+            || self.pressed_buttons.values().any(|p| !p.is_empty())
     }
 
     /// update the pressed_keys for the given handle
@@ -472,6 +588,28 @@ trait Emulation: Send {
     /// devices and one that shares a device need opposite release rules, so
     /// each backend states which it is, with its reason, where it injects.
     fn button_scope(&self) -> ButtonScope;
+    /// The permissions the system can take from this backend while it
+    /// runs, after which what it posts is dropped without an error (#240).
+    /// None by default: only a backend that needs one says so, and nothing
+    /// is checked on behalf of one that does not, such as `dummy`.
+    fn needs(&self) -> &'static [Permission] {
+        &[]
+    }
+    /// Whether this backend, once it ran, can start again with nothing
+    /// shown to the user: no permission dialog, no prompt (#258). Asked as
+    /// a session that the system ended closes, to decide whether emulation
+    /// starts again on its own. False by default: only a backend that has
+    /// been through why it can say so.
+    fn starts_unasked(&self) -> bool {
+        false
+    }
+    /// Resolves when the system ends the session with no event injected,
+    /// such as the compositor closing the libei stream, so the end is
+    /// known when it happens rather than at the next event (#258). Never,
+    /// by default.
+    async fn ended(&mut self) -> EmulationError {
+        std::future::pending().await
+    }
     /// Adaptive-edge signal (see [`InputEmulation::take_edge_push`]). Backends
     /// without a detector keep the default: never signals.
     fn take_edge_push(&mut self) -> Option<EdgeSide> {

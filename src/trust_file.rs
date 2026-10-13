@@ -44,12 +44,9 @@
 //!
 //! # Fail-closed, restated
 //!
-//! Today, a hand-edit cannot launder a denial because there are two tables and
-//! revocation outranks the allowlist ([`crate::config`]'s `subtract_revoked`).
-//! With one store that precedence has nothing to rank: deleting a revoked lease
-//! and adding an active one is a single coherent edit.
-//!
-//! So the property is preserved by a different mechanism, in four parts:
+//! A hand-edit of the store must not be able to grant anything. With one
+//! store there is no second table to rank against it, so the property rests on
+//! the file itself, in four parts:
 //!
 //! * **Authentication.** The file is signed by this machine's authority (see
 //!   [`crate::authority`]). An edited body, or a store copied in from another
@@ -58,7 +55,7 @@
 //!   already enforces, and for the identical reason: an absent file
 //!   legitimately means defaults, a corrupt one never does.
 //! * **Rollback.** A signature does not stop restoring an *older, validly
-//!   signed* store that still grants a device you have since expelled. A
+//!   signed* store that still grants a device you have since removed. A
 //!   monotonic `serial`, mirrored in a separate signed floor file that only
 //!   ever advances, refuses that file.
 //! * **Restoring both files.** Restoring both files together is
@@ -81,9 +78,12 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::trust::{Caps, Denial, Expiry, Lease, Origin, TrustError, TrustStore};
+use crate::trust::{
+    Caps, Expiry, Lease, Origin, TrustError, TrustStore, existing_pairing_clipboard,
+};
 
-use hops_ipc::pairing::canonical_fingerprint;
+use hops_ipc::Controller;
+use hops_ipc::identity::canonical_fingerprint;
 
 use crate::authority::{Authority, AuthorityError, SignatureAlg, verify};
 use crate::config::write_atomically;
@@ -104,7 +104,28 @@ pub const FLOOR_FILE_NAME: &str = "trust-floor.toml";
 
 /// Bumped when the file layout changes incompatibly. A build that meets a
 /// version it does not know refuses the file rather than guessing.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// Version 2 (#187) records on each lease whether both machines confirmed the
+/// pairing and, once someone chose it, its clipboard. This build reads
+/// version 1 as well and writes version 2 at its first save, keeping a copy of
+/// the version 1 files beside it ([`TRUST_V1_COPY_NAME`]). Builds that read
+/// only version 1, from #158 up, refuse a version 2 store and do not start.
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// The version the floor file declares. Its layout did not change with the
+/// store's: a build that reads only version 1 parses it, which is what lets
+/// such a build start again once `trust.toml` is moved aside.
+const FLOOR_VERSION: u32 = 1;
+
+/// Where the save that moves a version 1 store to [`SCHEMA_VERSION`] keeps the
+/// store as it was, for a build that reads only version 1. Deleted, with
+/// [`FLOOR_V1_COPY_NAME`], by the first save that drops any record it holds,
+/// so no removed device survives in it (#184, #187).
+pub const TRUST_V1_COPY_NAME: &str = "trust.v1.toml";
+
+/// The floor as it was beside the version 1 store, copied with it: restoring
+/// the store alone over a newer floor would be refused as a rollback.
+pub const FLOOR_V1_COPY_NAME: &str = "trust-floor.v1.toml";
 
 /// The longest lease a build from before #183 admits: its `MAX_TERM_SECS`,
 /// unchanged from #158, which added the trust store, until #183.
@@ -117,10 +138,11 @@ const OLDER_BUILD_CEILING_SECS: u64 = 400 * 86_400;
 ///
 /// Such a build refuses to start on an active lease with no `expires_at`, and
 /// drops, then erases at its next save, a lease dated more than
-/// [`OLDER_BUILD_CEILING_SECS`] after `issued_at`. Builds on both sides of #183
-/// can share one config directory, so this build writes a date it never reads:
-/// [`rebuild`] makes every active lease [`Expiry::Never`].
-fn expiry_older_builds_accept(issued_at: u64) -> u64 {
+/// [`OLDER_BUILD_CEILING_SECS`] after `issued_at`. Version 1 stores carried it
+/// so builds on both sides of #183 could share one config directory. Version 2
+/// keeps writing the same date, which no build reads: [`rebuild`] makes every
+/// active lease [`Expiry::Never`].
+pub(crate) fn expiry_older_builds_accept(issued_at: u64) -> u64 {
     issued_at.saturating_add(OLDER_BUILD_CEILING_SECS)
 }
 
@@ -204,10 +226,14 @@ pub enum DiskCap {
 pub enum DiskState {
     /// Carries whatever `caps` says. See [`LeaseRecord::expires_at`].
     Active,
-    /// Deliberately expelled. Carries no capability, does not lapse, and is
-    /// kept rather than deleted so the expulsion stays visible and so a
-    /// hand-edit cannot quietly convert it back into a grant.
+    /// A removal a build before #184 recorded. Carries no capability. Read,
+    /// and dropped as the store loads: removing a device now forgets it, so
+    /// this build never writes one.
     Revoked,
+    /// A machine a build before the trust store listed, to be paired again
+    /// (#231). Carries no capability and never loads as a lease: it names
+    /// the machine so the app can offer to pair it again or remove it.
+    PairAgain,
 }
 
 /// What act produced this lease. Recorded because under #130 the provenance of
@@ -222,9 +248,16 @@ pub enum DiskOrigin {
     OutboundDial,
     /// Carried forward from `[authorized_fingerprints]` by [`TrustStore::migrate_from_config`].
     Migrated,
-    // No `Restored`. An expelled fingerprint is never re-authorised — the
-    // machine returns by generating a new identity, which arrives as `Inbound`
-    // or `OutboundDial` like any other first contact.
+    /// The person approving chose that this machine controls the peer
+    /// (#220). The lease drives in exactly the chosen direction; a record
+    /// whose capabilities say otherwise is refused when the store loads.
+    ChosenIMayDrive,
+    /// The person approving chose that the peer controls this machine.
+    ChosenDriveMe,
+    /// The person approving chose that each controls the other.
+    ChosenBoth,
+    // No `Restored`. Removal forgets the machine, so one that comes back is a
+    // first contact: it arrives as `Inbound` or `OutboundDial` (#184).
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -234,7 +267,7 @@ pub struct LeaseRecord {
     /// verifiers compute, so this is the join key with everything else.
     pub fingerprint: String,
     /// Display name. Sanitised on every write; see
-    /// [`hops_ipc::pairing::sanitize_label`].
+    /// [`hops_ipc::identity::sanitize_label`].
     pub label: String,
     pub state: DiskState,
     pub origin: DiskOrigin,
@@ -244,27 +277,108 @@ pub struct LeaseRecord {
     /// lease [`Expiry::Never`] (#183).
     ///
     /// Written for every active lease all the same, as 400 days after
-    /// `issued_at` ([`expiry_older_builds_accept`]), so a build from before
-    /// #183 still starts on a store this build saved. That build does enforce
-    /// the date: past it, that build stops admitting the pairing and this one
-    /// keeps admitting it. A date already on disk may instead be a term that
-    /// build chose (30 days for an approval); the next save replaces it.
+    /// `issued_at` ([`expiry_older_builds_accept`]): in version 1 so a build
+    /// from before #183 still started on a store a later build saved, and
+    /// unchanged in version 2. A date a version 1 store holds may instead be
+    /// a term a build from before #183 chose (30 days for an approval); the
+    /// next save replaces it.
     ///
-    /// **A placeholder, never to be enforced.** Nothing in a schema-v1 store
-    /// tells this date apart from a real 400-day term: [`SCHEMA_VERSION`] did
-    /// not change and `deny_unknown_fields` rules out a marker. A build that
-    /// enforced it would end every pairing this build made on day 400, the
-    /// outage #183 removes. A stored term (#185) needs a schema bump or a new
-    /// field.
+    /// **A placeholder, never to be enforced.** Nothing in either version
+    /// tells this date apart from a real 400-day term. A build that enforced
+    /// it would end every pairing on day 400, the outage #183 removes. A
+    /// stored term (#185) needs a schema bump or a new field.
     ///
-    /// Absent on a revoked record, which does not lapse. Absent on an active
-    /// lease also loads and grants, because no stored date decides anything.
+    /// Absent on a revoked record. Absent on an active lease also loads and
+    /// grants, because no stored date decides anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoked_at: Option<u64>,
     /// Empty for a revoked record.
     pub caps: Vec<DiskCap>,
+    /// Both machines confirmed this pairing (#11, #167). A lease that is not
+    /// confirmed is a pairing interrupted before it finished: it is dropped
+    /// when the store loads, and the device is added again ([`start`]).
+    /// Every lease a version 1 store held predates the confirmation and is
+    /// confirmed.
+    ///
+    /// Required, so no build can read a record without saying what it is.
+    pub confirmed: bool,
+    /// The clipboard directions someone chose for this pairing: the off
+    /// switch writes `[]`. Absent when nobody chose, for a pairing made
+    /// before #182: it then loads as the directions the pairing drives
+    /// ([`crate::trust::existing_pairing_clipboard`], #186).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clipboard: Option<Vec<DiskClipboard>>,
+}
+
+/// A direction the clipboard moves. Names, not bits, for the reason
+/// [`DiskCap`] gives.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiskClipboard {
+    /// Accept the peer's clipboard.
+    From,
+    /// Send the peer this machine's clipboard.
+    To,
+}
+
+/// The version 1 shapes, read and never written. A version 1 store is read
+/// once, by the start that moves it to [`SCHEMA_VERSION`], and its copy is
+/// read to learn what records it holds.
+mod v1 {
+    use super::{AuthorityBlock, DiskCap, DiskOrigin, DiskState, LeaseRecord};
+    use serde::Deserialize;
+
+    #[derive(Deserialize, Clone, PartialEq, Eq, Debug)]
+    #[cfg_attr(test, derive(serde::Serialize))]
+    #[serde(deny_unknown_fields)]
+    pub(super) struct LeaseRecordV1 {
+        pub(super) fingerprint: String,
+        pub(super) label: String,
+        pub(super) state: DiskState,
+        pub(super) origin: DiskOrigin,
+        pub(super) issued_at: u64,
+        #[serde(default)]
+        #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+        pub(super) expires_at: Option<u64>,
+        #[serde(default)]
+        #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+        pub(super) revoked_at: Option<u64>,
+        pub(super) caps: Vec<DiskCap>,
+    }
+
+    #[derive(Deserialize, Clone, PartialEq, Eq, Debug)]
+    #[cfg_attr(test, derive(serde::Serialize))]
+    #[serde(deny_unknown_fields)]
+    pub(super) struct TrustBodyV1 {
+        pub(super) version: u32,
+        pub(super) serial: u64,
+        pub(super) written_at: u64,
+        pub(super) authority: AuthorityBlock,
+        #[serde(default)]
+        pub(super) leases: Vec<LeaseRecordV1>,
+    }
+
+    impl From<LeaseRecordV1> for LeaseRecord {
+        /// Confirmed, because version 1 predates the confirmation and a
+        /// person cannot compare a number they were never shown (#11, #167).
+        /// No clipboard, because nobody chose one (#186).
+        fn from(r: LeaseRecordV1) -> Self {
+            LeaseRecord {
+                fingerprint: r.fingerprint,
+                label: r.label,
+                state: r.state,
+                origin: r.origin,
+                issued_at: r.issued_at,
+                expires_at: r.expires_at,
+                revoked_at: r.revoked_at,
+                caps: r.caps,
+                confirmed: true,
+                clipboard: None,
+            }
+        }
+    }
 }
 
 // There is deliberately no decision function over a `LeaseRecord` here.
@@ -319,9 +433,9 @@ struct SignatureBlock {
 // ---------------------------------------------------------------------------
 // hex
 //
-// Not base64: the root crate has no base64 dependency (only `hops-ipc` does),
-// and hex is already this project's on-disk encoding for key material — it is
-// how `generate_fingerprint` renders a SHA-256. One convention, no new crate.
+// Not base64: no crate here depends on base64, and hex is already this
+// project's on-disk encoding for key material — it is how
+// `generate_fingerprint` renders a SHA-256. One convention, no new crate.
 // ---------------------------------------------------------------------------
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -391,6 +505,16 @@ fn unseal<T: DeserializeOwned>(
     path: &Path,
     expect: &AuthorityBlock,
 ) -> Result<T, TrustFileError> {
+    parse_body(verified_body(text, domain, path, expect)?, path)
+}
+
+/// The signed body of `text`, once its signature is checked against `expect`.
+fn verified_body<'a>(
+    text: &'a str,
+    domain: &[u8],
+    path: &Path,
+    expect: &AuthorityBlock,
+) -> Result<&'a str, TrustFileError> {
     // Last occurrence: the real block is emitted last, and a TOML string value
     // can never contain a raw newline (the serialiser escapes it), so a lease
     // label cannot forge one. If one somehow appeared earlier, splitting last
@@ -419,7 +543,11 @@ fn unseal<T: DeserializeOwned>(
             "the signature does not match its contents — the file has been edited",
         )
     })?;
+    Ok(body)
+}
 
+/// Parse a body [`verified_body`] vouched for.
+fn parse_body<T: DeserializeOwned>(body: &str, path: &Path) -> Result<T, TrustFileError> {
     toml_edit::de::from_str(body)
         .map_err(|e| TrustFileError::untrusted(path, format!("unreadable body: {e}")))
 }
@@ -510,6 +638,19 @@ pub struct TrustFile {
     authority: Arc<dyn Authority>,
     serial: u64,
     floor_seconds: u64,
+    /// The store and floor files as [`TrustFile::open`] found them when the
+    /// store was version 1, until the save that writes version 2 has copied
+    /// them aside.
+    v1_found: Option<V1Files>,
+    /// What the version 1 copy holds while one is kept, read from the copy
+    /// itself: each record's fingerprint and state.
+    v1_copy: Option<Vec<(String, DiskState)>>,
+}
+
+/// A version 1 store's files, byte for byte.
+struct V1Files {
+    trust: String,
+    floor: Option<String>,
 }
 
 impl std::fmt::Debug for TrustFile {
@@ -518,6 +659,8 @@ impl std::fmt::Debug for TrustFile {
             .field("trust_path", &self.trust_path)
             .field("serial", &self.serial)
             .field("floor_seconds", &self.floor_seconds)
+            .field("v1_found", &self.v1_found.is_some())
+            .field("v1_copy", &self.v1_copy)
             .finish_non_exhaustive()
     }
 }
@@ -529,6 +672,10 @@ impl TrustFile {
     /// certificate, no socket, no backends, no runtime. That is issue #127 — the
     /// reason there is not one behavioural trust test in the daemon today is
     /// that reaching the trust code required standing up all five.
+    ///
+    /// Reads a version 1 store as well as a version 2 one, and refuses any
+    /// other. A version 1 store's leases come back confirmed and with no
+    /// clipboard chosen; the next [`TrustFile::save`] writes version 2.
     pub fn open(
         config_dir: &Path,
         authority: Arc<dyn Authority>,
@@ -540,10 +687,24 @@ impl TrustFile {
             public_key: hex_encode(authority.public_key()),
         };
 
-        let floor: Option<FloorBody> = read_sealed(&floor_path, FLOOR_DOMAIN, &expect)?;
+        let floor_text = read_text(&floor_path)?;
+        let floor: Option<FloorBody> = match &floor_text {
+            Some(text) => {
+                check_authority(text, &floor_path, &expect)?;
+                Some(unseal(text, FLOOR_DOMAIN, &floor_path, &expect)?)
+            }
+            None => None,
+        };
         let (floor_seconds, floor_serial) = floor.map_or((0, 0), |f| (f.seconds, f.serial));
 
-        let body: Option<TrustBody> = read_sealed(&trust_path, TRUST_DOMAIN, &expect)?;
+        let trust_text = read_text(&trust_path)?;
+        let body = match &trust_text {
+            Some(text) => {
+                check_authority(text, &trust_path, &expect)?;
+                Some(verified_body(text, TRUST_DOMAIN, &trust_path, &expect)?)
+            }
+            None => None,
+        };
 
         let mut store = Self {
             trust_path,
@@ -551,47 +712,65 @@ impl TrustFile {
             authority,
             serial: floor_serial,
             floor_seconds,
+            v1_found: None,
+            v1_copy: read_v1_copy(config_dir, &expect),
         };
 
         let Some(body) = body else {
             return Ok((store, Loaded::Absent));
         };
 
-        if body.version != SCHEMA_VERSION {
-            return Err(TrustFileError::untrusted(
-                &store.trust_path,
-                format!(
-                    "schema version {} — this build understands {SCHEMA_VERSION}. \
-                     A newer hops wrote this store; run that one, or move the file aside.",
-                    body.version
-                ),
-            ));
-        }
+        let (serial, written_at, leases) = match declared_version(body, &store.trust_path)? {
+            1 => {
+                let v1: v1::TrustBodyV1 = parse_body(body, &store.trust_path)?;
+                store.v1_found = trust_text.clone().map(|trust| V1Files {
+                    trust,
+                    floor: floor_text.clone(),
+                });
+                (
+                    v1.serial,
+                    v1.written_at,
+                    v1.leases.into_iter().map(LeaseRecord::from).collect(),
+                )
+            }
+            SCHEMA_VERSION => {
+                let v2: TrustBody = parse_body(body, &store.trust_path)?;
+                (v2.serial, v2.written_at, v2.leases)
+            }
+            other => {
+                return Err(TrustFileError::untrusted(
+                    &store.trust_path,
+                    format!(
+                        "schema version {other} — this build understands 1 and {SCHEMA_VERSION}. \
+                         A newer hops wrote this store; run that one, or move the file aside."
+                    ),
+                ));
+            }
+        };
 
         // Rollback. A signature proves who wrote a file, never when. Without
-        // this, restoring yesterday's store re-grants a device expelled today
+        // this, restoring yesterday's store re-grants a device removed today
         // and every check above still passes.
-        if body.serial < floor_serial {
+        if serial < floor_serial {
             return Err(TrustFileError::untrusted(
                 &store.trust_path,
                 format!(
-                    "serial {} is older than the {floor_serial} this machine has already \
-                     written — it is a restored copy of an earlier trust store",
-                    body.serial
+                    "serial {serial} is older than the {floor_serial} this machine has already \
+                     written — it is a restored copy of an earlier trust store"
                 ),
             ));
         }
 
-        validate(&body.leases, &store.trust_path)?;
+        validate(&leases, &store.trust_path)?;
 
-        store.serial = store.serial.max(body.serial);
-        store.floor_seconds = store.floor_seconds.max(body.written_at);
+        store.serial = store.serial.max(serial);
+        store.floor_seconds = store.floor_seconds.max(written_at);
         Ok((
             store,
             Loaded::Present {
-                serial: body.serial,
-                written_at: body.written_at,
-                leases: body.leases,
+                serial,
+                written_at,
+                leases,
             },
         ))
     }
@@ -610,6 +789,12 @@ impl TrustFile {
         &self.trust_path
     }
 
+    /// The store [`TrustFile::open`] found is version 1, and no save has
+    /// written version 2 over it yet.
+    pub fn is_version_1(&self) -> bool {
+        self.v1_found.is_some()
+    }
+
     /// Replace the store with `leases`, then advance the floor.
     ///
     /// Order is load-bearing and is the opposite of the intuitive one. If the
@@ -619,8 +804,33 @@ impl TrustFile {
     /// unrecoverable without deleting a file by hand. Store first means the
     /// worst crash outcome is a floor one serial behind, which the next save
     /// corrects and which refuses nothing.
+    ///
+    /// Over a version 1 store, both files are first copied aside
+    /// ([`TRUST_V1_COPY_NAME`], [`FLOOR_V1_COPY_NAME`]), never over a copy
+    /// already there; a copy that cannot be made fails the save, so the store
+    /// never moves to version 2 without one. While a copy is kept, a save
+    /// that drops any record it holds, a removal or a removal an earlier
+    /// build recorded, deletes both copies before writing (#187, #184).
     pub fn save(&mut self, leases: &[LeaseRecord]) -> Result<(), TrustFileError> {
         validate(leases, &self.trust_path)?;
+
+        let config_dir = self
+            .trust_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        if let Some(found) = &self.v1_found {
+            keep_copy(&config_dir.join(TRUST_V1_COPY_NAME), &found.trust)?;
+            if let Some(floor) = &found.floor {
+                keep_copy(&config_dir.join(FLOOR_V1_COPY_NAME), floor)?;
+            }
+            let expect = AuthorityBlock {
+                alg: self.authority.algorithm().as_str().to_owned(),
+                public_key: hex_encode(self.authority.public_key()),
+            };
+            self.v1_copy = read_v1_copy(&config_dir, &expect);
+        }
+        self.delete_v1_copy_if_dropped(&config_dir, leases);
 
         let now = self.now();
         self.serial += 1;
@@ -642,10 +852,11 @@ impl TrustFile {
         // whole old file or the whole new one.
         write_atomically(&self.trust_path, sealed.as_bytes())
             .map_err(|e| TrustFileError::io(&self.trust_path, e))?;
+        self.v1_found = None;
 
         self.floor_seconds = self.floor_seconds.max(now);
         let floor = FloorBody {
-            version: SCHEMA_VERSION,
+            version: FLOOR_VERSION,
             seconds: self.floor_seconds,
             serial: self.serial,
             authority,
@@ -655,6 +866,58 @@ impl TrustFile {
             .map_err(|e| TrustFileError::io(&self.floor_path, e))?;
         Ok(())
     }
+
+    /// Delete both version 1 copies when `leases` no longer hold, in the same
+    /// state, a record the copy holds. Before the save writes, so no crash
+    /// leaves a copy granting a device the store on disk has removed.
+    ///
+    /// A copy that cannot be deleted is logged and tried again at the next
+    /// save; the save itself goes ahead, since the store is the file this
+    /// build reads.
+    fn delete_v1_copy_if_dropped(&mut self, config_dir: &Path, leases: &[LeaseRecord]) {
+        let Some(held) = &self.v1_copy else {
+            return;
+        };
+        let dropped: Vec<&str> = held
+            .iter()
+            .filter(|(fp, state)| {
+                !leases
+                    .iter()
+                    .any(|r| r.state == *state && same_fingerprint(&r.fingerprint, fp))
+            })
+            .map(|(fp, _)| fp.as_str())
+            .collect();
+        if dropped.is_empty() {
+            return;
+        }
+        let mut failed = false;
+        for name in [TRUST_V1_COPY_NAME, FLOOR_V1_COPY_NAME] {
+            let path = config_dir.join(name);
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    failed = true;
+                    log::error!(
+                        "trust store: could not delete {}, which still holds {} a removal \
+                         dropped; trying again at the next save: {e}",
+                        path.display(),
+                        dropped.join(", ")
+                    );
+                }
+            }
+        }
+        if !failed {
+            log::warn!(
+                "trust store: deleted {TRUST_V1_COPY_NAME} and {FLOOR_V1_COPY_NAME}, the copy \
+                 kept for builds that read only version 1 stores, because it still held {}, \
+                 which this store no longer holds. Such a build no longer starts here until \
+                 it is updated, or {TRUST_FILE_NAME} is moved aside",
+                dropped.join(", ")
+            );
+            self.v1_copy = None;
+        }
+    }
 }
 
 fn read_sealed<T: DeserializeOwned>(
@@ -662,16 +925,27 @@ fn read_sealed<T: DeserializeOwned>(
     domain: &[u8],
     expect: &AuthorityBlock,
 ) -> Result<Option<T>, TrustFileError> {
-    let text = match fs::read_to_string(path) {
-        Ok(t) => t,
+    let Some(text) = read_text(path)? else {
+        return Ok(None);
+    };
+    check_authority(&text, path, expect)?;
+    unseal(&text, domain, path, expect).map(Some)
+}
+
+/// The file at `path`, or `None` when there is none.
+fn read_text(path: &Path) -> Result<Option<String>, TrustFileError> {
+    match fs::read_to_string(path) {
+        Ok(t) => Ok(Some(t)),
         // Absent legitimately means "nothing yet". Every other IO failure —
         // permissions, a directory in the way, a bad disk — is fatal, because
         // continuing would come up with no trust and then persist that.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(TrustFileError::io(path, e)),
-    };
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(TrustFileError::io(path, e)),
+    }
+}
 
-    let declared = declared_authority(&text, path)?;
+fn check_authority(text: &str, path: &Path, expect: &AuthorityBlock) -> Result<(), TrustFileError> {
+    let declared = declared_authority(text, path)?;
     if declared != *expect {
         return Err(TrustFileError::untrusted(
             path,
@@ -679,7 +953,60 @@ fn read_sealed<T: DeserializeOwned>(
              another hops installation, not this one",
         ));
     }
-    unseal(&text, domain, path, expect).map(Some)
+    Ok(())
+}
+
+/// The version a verified store body declares, read before the body is
+/// parsed as either version's shape.
+fn declared_version(body: &str, path: &Path) -> Result<u32, TrustFileError> {
+    #[derive(Deserialize)]
+    struct JustTheVersion {
+        version: u32,
+    }
+    parse_body::<JustTheVersion>(body, path).map(|v| v.version)
+}
+
+/// What the version 1 copy in `config_dir` holds: each record's fingerprint
+/// and state. `None` when there is no copy, or none this machine can read,
+/// which no build could restore either.
+fn read_v1_copy(config_dir: &Path, expect: &AuthorityBlock) -> Option<Vec<(String, DiskState)>> {
+    let path = config_dir.join(TRUST_V1_COPY_NAME);
+    match read_sealed::<v1::TrustBodyV1>(&path, TRUST_DOMAIN, expect) {
+        Ok(copy) => copy.map(|b| {
+            b.leases
+                .into_iter()
+                .map(|r| (r.fingerprint, r.state))
+                .collect()
+        }),
+        Err(e) => {
+            log::warn!(
+                "trust store: the copy of the version 1 store cannot be read, so no build \
+                 can restore it, and it is left as it is: {e}"
+            );
+            None
+        }
+    }
+}
+
+/// Put `contents` at `path` unless a file is already there. A copy is never
+/// written over: the first one is the store as it was before any build wrote
+/// version 2.
+fn keep_copy(path: &Path, contents: &str) -> Result<(), TrustFileError> {
+    match crate::new_file::create_whole(
+        path,
+        contents.as_bytes(),
+        crate::new_file::Access::OwnerReadWrite,
+    ) {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        other => other.map_err(|e| TrustFileError::io(path, e)),
+    }
+}
+
+/// The form a fingerprint is keyed by in the store, so a record written in
+/// another spelling is still the same record.
+fn same_fingerprint(a: &str, b: &str) -> bool {
+    let key = |fp: &str| canonical_fingerprint(fp).unwrap_or_else(|| fp.trim().to_lowercase());
+    key(a) == key(b)
 }
 
 /// Structural checks every record must pass before the store is believed.
@@ -716,17 +1043,29 @@ fn validate(leases: &[LeaseRecord], path: &Path) -> Result<(), TrustFileError> {
                 // same, and refusing one would stop the daemon over a field
                 // that decides nothing.
             }
-            // A fingerprint that can only DENY need not be matchable.
-            // `remove_authorized_key` deliberately tombstones even an invalid
-            // string, on the grounds that refusing to record a revocation is
-            // the more dangerous failure. Dropping those here on the way in
-            // would launder exactly the denials that reasoning protects.
+            // A removal an earlier build recorded, dropped as the store
+            // loads. It need not be matchable, since it grants nothing, but a
+            // record claiming both states is not one this machine wrote.
             DiskState::Revoked => {
                 if !lease.caps.is_empty() {
                     return Err(TrustFileError::untrusted(
                         path,
                         format!(
                             "{} is revoked but still carries capabilities",
+                            lease.fingerprint
+                        ),
+                    ));
+                }
+            }
+            // Listed to be paired again: it grants nothing, so a record that
+            // claims a capability or a clipboard, or a confirmed pairing, is
+            // not one this machine wrote.
+            DiskState::PairAgain => {
+                if !lease.caps.is_empty() || lease.clipboard.is_some() || lease.confirmed {
+                    return Err(TrustFileError::untrusted(
+                        path,
+                        format!(
+                            "{} is listed to be paired again but claims a pairing",
                             lease.fingerprint
                         ),
                     ));
@@ -748,10 +1087,8 @@ pub struct Migration {
     pub leases: Vec<LeaseRecord>,
     /// Authorized fingerprints that became active leases.
     pub carried_forward: usize,
-    /// Revocations preserved.
-    pub tombstones: usize,
-    /// Authorized entries a tombstone outranked. `subtract_revoked`, run one
-    /// last time, at the boundary.
+    /// Authorized entries the removals table also named, not carried
+    /// forward. `subtract_revoked`, run one last time, at the boundary.
     pub refused: Vec<String>,
     /// Authorized entries whose fingerprint was malformed and could never have
     /// matched a peer.
@@ -783,27 +1120,59 @@ pub fn rebuild(
 
     for r in records {
         match r.state {
-            // A revocation is a record, not a grant. It goes in first and
-            // nothing later can lift it — `admit` refuses an expelled
-            // fingerprint outright.
+            // A removal an earlier build recorded. Removing a device now
+            // forgets it (#184), so the record is dropped, and the machine is
+            // a stranger that can pair again in full. `start` saves the store
+            // without it. Named in the log by fingerprint only: its name is
+            // exactly what removal drops.
             DiskState::Revoked => {
-                store.admit_denial(
-                    &r.fingerprint,
-                    Denial {
-                        label: r.label.clone(),
-                        at: r.revoked_at.unwrap_or(r.issued_at),
-                    },
-                );
+                refused.push(format!(
+                    "{}: a removal an earlier build kept on file is dropped; removing a \
+                     device now forgets it, and it can be paired again",
+                    r.fingerprint
+                ));
+            }
+            // A machine to pair again (#231). Listed, and never a lease.
+            DiskState::PairAgain => {
+                if let Err(e) = store.list_to_pair_again(&r.fingerprint, &r.label, r.issued_at) {
+                    refused.push(format!("{}: {e}", r.fingerprint));
+                }
+            }
+            // A pairing interrupted before both machines confirmed it. The
+            // number it was confirmed with died with that session, and a
+            // reconnect must not summon the comparison again, so it is dropped
+            // and the device added again (#11, #167). `start` saves the store
+            // without it.
+            DiskState::Active if !r.confirmed => {
+                refused.push(format!(
+                    "{} ({:?}): its pairing was never confirmed on both machines, so it \
+                     is dropped; add the device again to pair it",
+                    r.fingerprint, r.label
+                ));
             }
             DiskState::Active => {
-                let mut caps = Caps::NONE;
+                let mut drive = Caps::NONE;
                 for c in &r.caps {
-                    caps = caps
+                    drive = drive
                         | match c {
-                            DiskCap::Inbound => Caps::INBOUND,
-                            DiskCap::Outbound => Caps::OUTBOUND,
+                            DiskCap::Inbound => Caps::DRIVE_ME,
+                            DiskCap::Outbound => Caps::I_MAY_DRIVE,
                         };
                 }
+                // Nobody chose a clipboard for a pairing made before #182, and
+                // it keeps the one its lease always granted (#186). One that
+                // was chosen, the off switch included, is exactly what was
+                // chosen.
+                let clipboard = match &r.clipboard {
+                    None => existing_pairing_clipboard(drive),
+                    Some(chosen) => chosen.iter().fold(Caps::NONE, |acc, c| {
+                        acc | match c {
+                            DiskClipboard::From => Caps::CLIPBOARD_FROM,
+                            DiskClipboard::To => Caps::CLIPBOARD_TO,
+                        }
+                    }),
+                };
+                let caps = drive | clipboard;
                 let lease = Lease {
                     peer: r.fingerprint.clone(),
                     issued_to: ours.to_string(),
@@ -813,6 +1182,9 @@ pub fn rebuild(
                         DiskOrigin::Inbound => Origin::Inbound,
                         DiskOrigin::OutboundDial => Origin::OutboundDial,
                         DiskOrigin::Migrated => Origin::Migrated,
+                        DiskOrigin::ChosenIMayDrive => Origin::Chosen(Controller::ThisMachine),
+                        DiskOrigin::ChosenDriveMe => Origin::Chosen(Controller::ThatMachine),
+                        DiskOrigin::ChosenBoth => Origin::Chosen(Controller::Both),
                     },
                     issued_at: r.issued_at,
                     // Not `r.expires_at`. Builds from before #183 wrote 30
@@ -821,6 +1193,10 @@ pub fn rebuild(
                     // yet, so honouring any of them would take a working
                     // device away with no way back but pairing again (#183).
                     expiry: Expiry::Never,
+                    clipboard_chosen: r.clipboard.is_some(),
+                    // Only a confirmed record reaches here: one that was not
+                    // is dropped above.
+                    confirmed: true,
                 };
                 if let Err(e) = store.admit(lease) {
                     refused.push(format!("{}: {e}", r.fingerprint));
@@ -830,6 +1206,56 @@ pub fn rebuild(
     }
 
     Ok((store, refused))
+}
+
+/// The store the daemon starts with, from the records [`TrustFile::open`]
+/// found.
+///
+/// Rebuilds them and logs what a user may need to know. Then, when the file
+/// must change before anything else happens, saves at once: a version 1 store
+/// moves to [`SCHEMA_VERSION`], its copy kept for older builds, a pairing
+/// never confirmed on both machines is dropped (#187), and a removal an
+/// earlier build kept on file is dropped (#184). A save that fails is
+/// logged, not fatal: the store in memory is right, and the daemon's next
+/// save, at the latest its first minute sweep, writes it.
+pub fn start(
+    file: &mut TrustFile,
+    ours: &str,
+    records: &[LeaseRecord],
+) -> Result<TrustStore, TrustError> {
+    let (store, refused) = rebuild(ours, file.now(), records)?;
+    for why in &refused {
+        // Reported, never dropped silently: a device losing trust with no
+        // explanation is the failure this rework removes.
+        log::warn!("trust store: {why}");
+    }
+    for (level, line) in stored_terms(records, &store).log_lines() {
+        log::log!(level, "{line}");
+    }
+    let unconfirmed = records
+        .iter()
+        .any(|r| r.state == DiskState::Active && !r.confirmed);
+    let removals = records.iter().any(|r| r.state == DiskState::Revoked);
+    let why = if file.is_version_1() {
+        Some(format!(
+            "moving it to version {SCHEMA_VERSION}, with a copy of version 1 kept as \
+             {TRUST_V1_COPY_NAME} and {FLOOR_V1_COPY_NAME}"
+        ))
+    } else if unconfirmed || removals {
+        Some("dropping the pairings never confirmed and the removals kept on file".to_string())
+    } else {
+        None
+    };
+    if let Some(why) = why {
+        match file.save(&records_of(&store)) {
+            Ok(()) => log::info!("trust store: saved, {why}"),
+            Err(e) => log::error!(
+                "trust store: could not save it, {why}: {e}. It is in effect in memory, and \
+                 the next save tries again"
+            ),
+        }
+    }
+    Ok(store)
 }
 
 /// Stored expiry dates worth a line in the load log, sorted by what they mean.
@@ -853,9 +1279,9 @@ pub struct StoredTerms<'a> {
     pub replaced: Vec<&'a LeaseRecord>,
     /// Granting, with a date an older build chose that was at or before
     /// enforcement time at load. That build had stopped admitting this
-    /// pairing and this one admits it. Once this build saves, the date moves
-    /// to 400 days after pairing, and if that is still ahead, that build
-    /// admits it again until then.
+    /// pairing and this one admits it. That build reads only the version 1
+    /// copy kept at the save that moves the store to version 2, which keeps
+    /// the date it saved, so it goes on refusing this pairing.
     pub passed: Vec<&'a LeaseRecord>,
 }
 
@@ -866,38 +1292,25 @@ impl StoredTerms<'_> {
     /// it had stopped working on an older build and works on this one, which
     /// is a grant the user may not expect.
     pub fn log_lines(&self) -> Vec<(log::Level, String)> {
-        let ceiling_days = OLDER_BUILD_CEILING_SECS / 86_400;
         let mut lines = Vec::new();
         if !self.replaced.is_empty() {
             lines.push((
                 log::Level::Info,
                 format!(
                     "trust store: {} pairing(s) carry an expiry date an older build chose; \
-                     pairings no longer expire, so it is ignored, and the next save moves it \
-                     to {ceiling_days} days after pairing, the latest an older build accepts",
+                     pairings no longer expire, so it is ignored",
                     self.replaced.len(),
                 ),
             ));
         }
         for r in &self.passed {
-            let after_save = if expiry_older_builds_accept(r.issued_at) > self.now {
-                format!(
-                    "once this build saves the store, an older build admits it again until \
-                     {ceiling_days} days after pairing"
-                )
-            } else {
-                format!(
-                    "it was paired more than {ceiling_days} days ago, so an older build goes \
-                     on refusing it after this build saves the store"
-                )
-            };
             lines.push((
                 log::Level::Warn,
                 format!(
                     "trust store: {} ({:?}) had passed the expiry date an older hops build \
                      saved for it, so that build had stopped admitting it. Pairings no longer \
-                     expire, so this build admits it, and {after_save}. Remove it if that \
-                     machine should not have access",
+                     expire, so this build admits it. Remove it if that machine should not \
+                     have access",
                     r.fingerprint, r.label
                 ),
             ));
@@ -940,28 +1353,23 @@ pub fn stored_terms<'a>(records: &'a [LeaseRecord], store: &TrustStore) -> Store
 ///
 /// Every active lease is written with an `expires_at` and read back as
 /// [`Expiry::Never`] (#183). [`Expiry::Never`] is written as the latest date a
-/// build from before #183 accepts ([`expiry_older_builds_accept`]), so that
-/// build still starts on this store. [`Expiry::At`], which nothing in this
-/// build issues, is written with its own date.
+/// build from before #183 accepts ([`expiry_older_builds_accept`]), the date
+/// version 1 stores carried. [`Expiry::At`], which nothing in this build
+/// issues, is written with its own date.
+///
+/// A lease's `clipboard` is written when it was chosen, and when the lease
+/// holds other clipboard bits than an absent field loads as.
 pub fn records_of(store: &TrustStore) -> Vec<LeaseRecord> {
     let mut out: Vec<LeaseRecord> = Vec::new();
     for (fp, e) in store.entries() {
-        // The expulsion, if there is one. It is a record, not a grant: no
-        // capabilities, and it does not lapse.
-        if let Some(d) = e.denial.as_ref() {
-            out.push(LeaseRecord {
-                fingerprint: fp.to_string(),
-                label: d.label.clone(),
-                state: DiskState::Revoked,
-                origin: DiskOrigin::Migrated,
-                issued_at: d.at,
-                expires_at: None,
-                revoked_at: Some(d.at),
-                caps: Vec::new(),
-            });
-            continue;
-        }
         if let Some(l) = e.lease.as_ref() {
+            // A machine to pair again, approved here and waiting for its
+            // number, is written as the listing alone: one row per
+            // fingerprint, and the unconfirmed lease would be dropped as the
+            // store loads anyway, which leaves the listing as it was (#231).
+            if !l.confirmed && store.to_pair_again(fp).is_some() {
+                continue;
+            }
             let mut caps = Vec::new();
             if l.caps.contains(Caps::DRIVE_ME) {
                 caps.push(DiskCap::Inbound);
@@ -969,6 +1377,21 @@ pub fn records_of(store: &TrustStore) -> Vec<LeaseRecord> {
             if l.caps.contains(Caps::I_MAY_DRIVE) {
                 caps.push(DiskCap::Outbound);
             }
+            // Written when someone chose it, and also whenever the lease holds
+            // other clipboard bits than its absence loads as, so no narrowing
+            // is undone by a restart, whichever verb made it.
+            let held = l.caps.intersection(Caps::CLIPBOARD);
+            let clipboard = (l.clipboard_chosen || held != existing_pairing_clipboard(l.caps))
+                .then(|| {
+                    let mut chosen = Vec::new();
+                    if held.contains(Caps::CLIPBOARD_FROM) {
+                        chosen.push(DiskClipboard::From);
+                    }
+                    if held.contains(Caps::CLIPBOARD_TO) {
+                        chosen.push(DiskClipboard::To);
+                    }
+                    chosen
+                });
             out.push(LeaseRecord {
                 fingerprint: fp.to_string(),
                 label: l.label.clone(),
@@ -977,6 +1400,9 @@ pub fn records_of(store: &TrustStore) -> Vec<LeaseRecord> {
                     Origin::Inbound => DiskOrigin::Inbound,
                     Origin::OutboundDial => DiskOrigin::OutboundDial,
                     Origin::Migrated => DiskOrigin::Migrated,
+                    Origin::Chosen(Controller::ThisMachine) => DiskOrigin::ChosenIMayDrive,
+                    Origin::Chosen(Controller::ThatMachine) => DiskOrigin::ChosenDriveMe,
+                    Origin::Chosen(Controller::Both) => DiskOrigin::ChosenBoth,
                 },
                 issued_at: l.issued_at,
                 // Never absent. A build from before #183 refuses to start on
@@ -988,8 +1414,29 @@ pub fn records_of(store: &TrustStore) -> Vec<LeaseRecord> {
                 }),
                 revoked_at: None,
                 caps,
+                // As it is. One not yet confirmed on both machines is written
+                // so, and dropped when the store next loads: the number it
+                // waits on dies with the connection it was compared on.
+                confirmed: l.confirmed,
+                clipboard,
             });
         }
+    }
+    // A machine to pair again: its name and when the upgrade found it, and
+    // nothing it may do (#231).
+    for (fp, p) in store.every_to_pair_again() {
+        out.push(LeaseRecord {
+            fingerprint: fp.to_string(),
+            label: p.label.clone(),
+            state: DiskState::PairAgain,
+            origin: DiskOrigin::Migrated,
+            issued_at: p.since,
+            expires_at: None,
+            revoked_at: None,
+            caps: vec![],
+            confirmed: false,
+            clipboard: None,
+        });
     }
     // Stable order so an unchanged store produces an identical file, and a diff
     // of the file shows what actually changed.
@@ -1000,9 +1447,8 @@ pub fn records_of(store: &TrustStore) -> Vec<LeaseRecord> {
 //
 // There were two, and they disagreed: this one granted every carried-forward
 // fingerprint BOTH directions unconditionally, while `TrustStore::migrate_from_config`
-// grants outbound only to a peer the old config actually dialled — and explains
-// at length why minting it otherwise is a capability the user never granted,
-// created at upgrade, by the code that claims to retire exactly that defect.
+// explained why minting a direction nobody chose is a capability the user never
+// granted, created at upgrade. It now grants none at all (#231).
 //
 // The one with the reasoning and the tests had zero production callers. The one
 // that ran had none of either. Two implementations of one rule is how that
@@ -1013,14 +1459,11 @@ impl Migration {
     /// One line per fact a user might otherwise have to guess at.
     pub fn log(&self) {
         log::info!(
-            "migrated the trust store: {} device(s) carried forward, {} revocation(s) preserved",
+            "migrated the trust store: {} device(s) carried forward",
             self.carried_forward,
-            self.tombstones
         );
         for fp in &self.refused {
-            log::warn!(
-                "not carrying {fp} forward: it was revoked, and a revocation outranks the allowlist"
-            );
+            log::warn!("not carrying {fp} forward: it was removed");
         }
         for fp in &self.dropped {
             log::warn!(
@@ -1066,14 +1509,14 @@ mod tests {
             .collect()
     }
 
-    fn tombstones(pairs: &[(&str, u64)]) -> HashMap<String, RevokedEntry> {
+    fn removals(pairs: &[(&str, u64)]) -> HashMap<String, RevokedEntry> {
         pairs
             .iter()
             .map(|(k, at)| {
                 (
                     k.to_lowercase(),
                     RevokedEntry {
-                        label: "expelled".into(),
+                        label: "removed".into(),
                         revoked_at: *at,
                     },
                 )
@@ -1087,28 +1530,29 @@ mod tests {
     /// way to produce rows. They keep doing that, against the implementation
     /// that actually runs.
     ///
-    /// `dialled` is empty here, so a carried-forward fingerprint gets INBOUND
-    /// only. That is the correct rule and it is why the over-grant test below
-    /// changed rather than being deleted.
+    /// A carried-forward fingerprint is listed to be paired again and
+    /// granted nothing (#231).
     fn migrate(
         authorized: HashMap<String, String>,
         revoked: HashMap<String, RevokedEntry>,
         now: u64,
     ) -> Migration {
         let mut store = TrustStore::new(&ours(), now).expect("ours");
-        let report = store.migrate_from_config(
-            &authorized,
-            &revoked,
-            &std::collections::HashSet::new(),
-            now,
-        );
+        let report = store.migrate_from_config(&authorized, &revoked, now);
         Migration {
             leases: records_of(&store),
-            carried_forward: report.leased.len(),
-            tombstones: report.denied.len(),
+            carried_forward: report.to_pair_again.len(),
             refused: report.refused,
             dropped: report.dropped,
         }
+    }
+
+    /// The rows of a store holding one pairing with `fp`, approved and
+    /// confirmed on both machines, granting `caps`.
+    fn approved(fp: &str, label: &str, caps: Caps, now: u64) -> Vec<LeaseRecord> {
+        let mut store = TrustStore::new(&ours(), now).expect("ours");
+        store.issue_confirmed(fp, label, caps).expect("a pairing");
+        records_of(&store)
     }
 
     /// The machine the shim migrates for.
@@ -1128,18 +1572,33 @@ mod tests {
         m.leases.iter().find(|l| l.fingerprint == fp)
     }
 
-    // -- the four ported `subtract_revoked` tests ---------------------------
+    /// A removal as a build before #184 recorded it, which this build reads
+    /// and never writes.
+    fn removal_on_file(fp: &str, at: u64) -> LeaseRecord {
+        LeaseRecord {
+            fingerprint: fp.to_owned(),
+            label: "workshop".into(),
+            state: DiskState::Revoked,
+            origin: DiskOrigin::Migrated,
+            issued_at: at,
+            expires_at: None,
+            revoked_at: Some(at),
+            caps: vec![],
+            confirmed: true,
+            clipboard: None,
+        }
+    }
+
+    // -- the ported `subtract_revoked` tests ------------------------------
     //
-    // The precedence they encode is the invariant that survives the rewrite, so
-    // they are ported rather than deleted. They now assert it over the thing
-    // that replaced the rule — what the rebuilt store grants — instead of over a
-    // map subtraction that no longer exists.
+    // A fingerprint both old tables named was removed, so it is not carried
+    // forward, under any spelling. Removal forgets (#184), so nothing is
+    // recorded for it either.
 
     #[test]
-    fn a_revoked_fingerprint_gets_no_capabilities() {
-        let m = migrate(allow(&[(A, "old-thinkpad")]), tombstones(&[(A, NOW)]), NOW);
-        let lease = find(&m, A).expect("the tombstone is preserved, not deleted");
-        assert_eq!(lease.state, DiskState::Revoked);
+    fn a_fingerprint_both_tables_name_is_neither_carried_nor_recorded() {
+        let m = migrate(allow(&[(A, "old-thinkpad")]), removals(&[(A, NOW)]), NOW);
+        assert!(find(&m, A).is_none(), "a record of the removal was written");
         assert_eq!(
             rebuilt(&m.leases, NOW).capabilities(A),
             Caps::NONE,
@@ -1150,72 +1609,135 @@ mod tests {
     }
 
     #[test]
-    fn case_does_not_launder_a_tombstone() {
-        // Issue #67's exact shape: expelled lowercase, re-added uppercase.
+    fn case_does_not_carry_a_removed_fingerprint_forward() {
+        // Issue #67's exact shape: removed lowercase, re-added uppercase.
         let m = migrate(
             allow(&[(&A.to_uppercase(), "attacker")]),
-            tombstones(&[(A, NOW)]),
+            removals(&[(A, NOW)]),
             NOW,
         );
         assert_eq!(m.carried_forward, 0, "uppercasing must not resurrect it");
-        assert!(find(&m, A).is_some(), "the record is kept");
-        assert_eq!(rebuilt(&m.leases, NOW).capabilities(A), Caps::NONE);
+        assert!(m.leases.is_empty(), "a record was written");
     }
 
     #[test]
-    fn a_tombstone_written_in_uppercase_still_bites() {
+    fn a_removal_written_in_uppercase_still_leaves_it_out() {
         let m = migrate(
             allow(&[(A, "attacker")]),
-            tombstones(&[(&A.to_uppercase(), NOW)]),
+            removals(&[(&A.to_uppercase(), NOW)]),
             NOW,
         );
         assert_eq!(m.carried_forward, 0);
-        assert!(find(&m, A).is_some(), "the record is kept");
-        assert_eq!(rebuilt(&m.leases, NOW).capabilities(A), Caps::NONE);
+        assert!(m.leases.is_empty(), "a record was written");
     }
 
-    /// This asserted BOTH directions, and was wrong. The flat allowlist did
-    /// feed both verifiers, but membership was **necessary and not sufficient**
-    /// for outbound: a dial also needed a `[[clients]]` entry aimed at that
-    /// peer. A fingerprint that was allowlisted and never dialled had outbound
-    /// in theory and never once in practice, so minting it at upgrade creates a
-    /// capability the user never granted — by the code whose job is to retire
-    /// exactly that defect.
-    ///
-    /// The shim above migrates with an empty dialled set, so this peer is the
-    /// never-dialled case.
+    /// This asserted inbound carried forward, and before that both
+    /// directions. The old list never said which machine controls which, so
+    /// the upgrade grants neither (#231): the fingerprint is saved as a
+    /// machine to pair again, with nothing it may do, and reads back so.
+    // LEDGER R231-8 | class B | 1 return value: records_of, rebuild, to_pair_again
     #[test]
-    fn an_unrevoked_fingerprint_survives_with_inbound_and_is_not_handed_outbound() {
-        let m = migrate(allow(&[(A, "laptop")]), tombstones(&[]), NOW);
-        let lease = find(&m, A).expect("carried forward");
-        assert_eq!(lease.caps, vec![DiskCap::Inbound]);
+    fn an_unrevoked_fingerprint_is_listed_to_pair_again_and_granted_nothing() {
+        let m = migrate(allow(&[(A, "laptop")]), removals(&[]), NOW);
+        let record = find(&m, A).expect("listed");
+        assert_eq!(
+            (
+                record.state,
+                record.caps.as_slice(),
+                record.confirmed,
+                &record.clipboard
+            ),
+            (DiskState::PairAgain, &[][..], false, &None),
+            "the upgrade saved a pairing for a machine the old list named"
+        );
         let store = rebuilt(&m.leases, NOW);
-        assert!(
-            store.may_drive_us(A) && !store.we_may_drive(A),
-            "a peer the old config never dialled keeps inbound — dropping that \
-             would break a working fleet with nothing in the UI to explain it — \
-             and must NOT be handed outbound it never had"
+        assert_eq!(store.capabilities(A), Caps::NONE, "it grants something");
+        assert_eq!(
+            store.to_pair_again(A).map(|p| p.label.as_str()),
+            Some("laptop"),
+            "it is no longer listed, or lost its name, once saved and read back"
         );
         assert!(m.refused.is_empty());
     }
 
+    // LEDGER R231-9 | class B | 1 return value: validate, TrustFile::open
+    /// A machine listed to pair again, edited on disk to claim a capability,
+    /// is refused before the signature is even read, and by it after.
+    #[test]
+    fn a_hand_edit_that_turns_a_listing_into_a_grant_is_refused() {
+        let d = tmpdir("relist");
+        let m = migrate(allow(&[(A, "laptop")]), removals(&[]), NOW);
+        let (mut file, _) = TrustFile::open(&d, authority(&d)).expect("open");
+        file.save(&m.leases).expect("save");
+
+        let p = d.join(TRUST_FILE_NAME);
+        let text = fs::read_to_string(&p).expect("read");
+        let widened = text.replace("caps = []", "caps = [\"inbound\"]");
+        assert_ne!(widened, text, "precondition: the edit applied");
+        let forged: TrustBody =
+            toml_edit::de::from_str(widened.rsplit_once(SIGNATURE_SEPARATOR).expect("body").0)
+                .expect("the forgery parses");
+        assert!(
+            validate(&forged.leases, &p).is_err(),
+            "a listing that claims a capability passed the structural checks"
+        );
+        fs::write(&p, &widened).expect("write");
+        let err = TrustFile::open(&d, authority(&d)).expect_err("must refuse");
+        assert!(matches!(err, TrustFileError::Untrusted { .. }), "{err}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    // LEDGER R231-10 | class B | 1 return value: records_of, TrustFile::save, TrustFile::open, rebuild
+    /// A machine to pair again, approved here and waiting for its number,
+    /// is saved: as the listing alone, which reads back listed and granting
+    /// nothing, as a restart before the number is confirmed leaves it.
+    #[test]
+    fn a_listed_machine_approved_again_is_saved_as_still_listed() {
+        let d = tmpdir("reapprove");
+        let mut store = TrustStore::new(&ours(), NOW).expect("store");
+        store.list_to_pair_again(A, "laptop", NOW).expect("listed");
+        store
+            .issue_answered(A, "laptop", Controller::Both, false)
+            .expect("approved");
+        let (mut file, _) = TrustFile::open(&d, authority(&d)).expect("open");
+        if let Err(e) = file.save(&records_of(&store)) {
+            panic!("approving a machine listed to pair again could not be saved: {e}");
+        }
+        let (_, loaded) = TrustFile::open(&d, authority(&d)).expect("reopen");
+        let Loaded::Present { leases, .. } = loaded else {
+            panic!("the store must be found on the second open");
+        };
+        let (back, refused) = rebuild(&ours(), NOW, &leases).expect("rebuild");
+        assert_eq!(
+            (
+                back.capabilities(A),
+                back.to_pair_again(A).map(|p| p.label.as_str()),
+                refused
+            ),
+            (Caps::NONE, Some("laptop"), Vec::<String>::new()),
+            "an approval not yet confirmed, read back"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
     // -- the three questions the brief asks the migration to answer ---------
 
-    /// This asserted a warning at 395 days and a lapse at 401. A migrated
-    /// lease does not lapse (#183); its saved date is there for older builds.
+    /// This asserted a warning at 395 days and a lapse at 401. A lease does
+    /// not lapse (#183); its saved date is there for older builds.
     // LEDGER T5 | class B | 1 return value: records_of, rebuild
     #[test]
-    fn an_upgraded_fleet_is_still_working_ten_years_on() {
-        let m = migrate(allow(&[(A, "laptop")]), tombstones(&[]), NOW);
-        let lease = find(&m, A).expect("carried forward");
+    fn a_pairing_is_still_working_ten_years_on() {
+        let rows = approved(A, "laptop", Caps::INBOUND, NOW);
+        let lease = rows.iter().find(|l| l.fingerprint == A).expect("saved");
+        let at = lease.issued_at;
         assert_eq!(
             lease.expires_at,
-            Some(NOW + 400 * DAY),
+            Some(at + 400 * DAY),
             "a lease that does not lapse is saved with the latest date a build \
              from before #183 accepts, or that build refuses to start"
         );
-        let mut store = rebuilt(&m.leases, NOW);
-        for later in [NOW + 395 * DAY, NOW + 401 * DAY, NOW + 10 * 365 * DAY] {
+        let mut store = rebuilt(&rows, NOW);
+        for later in [at + 395 * DAY, at + 401 * DAY, at + 10 * 365 * DAY] {
             assert!(store.sweep(later).is_empty(), "lapsed at {later}");
             assert!(store.may_drive_us(A), "stopped working at {later}");
             assert!(!store.is_expiring(A), "asked to renew at {later}");
@@ -1239,6 +1761,8 @@ mod tests {
             expires_at: Some(issued + term_days * DAY),
             revoked_at: None,
             caps: vec![DiskCap::Inbound],
+            confirmed: true,
+            clipboard: None,
         };
         let rows = vec![
             written_before(A, DiskOrigin::Inbound, 30),
@@ -1294,56 +1818,30 @@ mod tests {
     }
 
     #[test]
-    fn a_tombstone_survives_migration_with_its_label_and_date() {
-        let m = migrate(allow(&[]), tombstones(&[(B, 1_788_579_979)]), NOW);
-        let lease = find(&m, B).expect("preserved");
-        assert_eq!(lease.state, DiskState::Revoked);
-        assert_eq!(lease.revoked_at, Some(1_788_579_979));
-        assert_eq!(lease.expires_at, None, "a revocation does not lapse");
-        assert!(lease.caps.is_empty());
-        assert_eq!(m.tombstones, 1);
-    }
-
-    #[test]
-    fn a_future_dated_tombstone_cannot_poison_the_clock() {
-        let m = migrate(allow(&[]), tombstones(&[(B, 4_102_444_800)]), NOW);
-        assert_eq!(
-            find(&m, B).expect("preserved").revoked_at,
-            Some(NOW),
-            "a hand-written year-2100 timestamp must be clamped, not believed"
-        );
-    }
-
-    #[test]
-    fn a_malformed_authorized_fingerprint_is_dropped_but_a_malformed_denial_is_kept() {
+    fn a_malformed_authorized_fingerprint_is_dropped() {
         let m = migrate(
             allow(&[("not-a-fingerprint", "whatever")]),
-            tombstones(&[("also-not-a-fingerprint", 0)]),
+            removals(&[("also-not-a-fingerprint", 0)]),
             NOW,
         );
         assert_eq!(m.dropped, vec!["not-a-fingerprint".to_string()]);
         assert_eq!(m.carried_forward, 0);
-        assert!(
-            find(&m, "also-not-a-fingerprint").is_some(),
-            "an unmatchable grant is inert; an unmatchable denial is still a decision"
-        );
+        assert!(m.leases.is_empty(), "a record was written");
     }
 
+    /// The state on disk on a machine that removed a device before the
+    /// upgrade: an empty allowlist and one removal. It migrates to a store
+    /// that holds nothing at all (#184, #161).
     #[test]
-    fn the_live_config_migrates_to_exactly_one_revoked_lease() {
-        // Byte-for-byte the state on disk today: an empty allowlist and one
-        // tombstone. The upgrade must produce a store with nothing trusted and
-        // that expulsion still recorded.
-        let m = migrate(allow(&[]), tombstones(&[(B, 1_788_579_979)]), NOW);
-        assert_eq!(m.leases.len(), 1);
+    fn the_live_config_migrates_to_an_empty_store() {
+        let m = migrate(allow(&[]), removals(&[(B, 1_788_579_979)]), NOW);
+        assert!(m.leases.is_empty(), "the removal was kept: {:?}", m.leases);
         assert_eq!(m.carried_forward, 0);
-        assert_eq!(m.leases[0].state, DiskState::Revoked);
-        assert_eq!(rebuilt(&m.leases, NOW).capabilities(B), Caps::NONE);
     }
 
     #[test]
     fn a_label_with_bidi_control_characters_is_sanitised_on_the_way_in() {
-        let m = migrate(allow(&[(A, "laptop\u{202e}evil")]), tombstones(&[]), NOW);
+        let m = migrate(allow(&[(A, "laptop\u{202e}evil")]), removals(&[]), NOW);
         assert_eq!(
             find(&m, A).expect("carried").label,
             "laptopevil",
@@ -1356,7 +1854,7 @@ mod tests {
     #[test]
     fn a_store_round_trips_through_disk() {
         let d = tmpdir("roundtrip");
-        let m = migrate(allow(&[(A, "laptop")]), tombstones(&[(B, NOW)]), NOW);
+        let m = migrate(allow(&[(A, "laptop"), (B, "desk")]), removals(&[]), NOW);
 
         let (mut file, loaded) = TrustFile::open(&d, authority(&d)).expect("open");
         assert!(matches!(loaded, Loaded::Absent), "nothing there yet");
@@ -1370,8 +1868,8 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
-    /// The #66 move, translated to one store: reach in and turn the expulsion
-    /// back into a grant.
+    /// The #66 move, translated to one store: reach in and turn a removal an
+    /// earlier build kept on file back into a grant.
     ///
     /// The edit is deliberately COMPLETE — real caps, and no expiry, which this
     /// build accepts on an active lease — so that `validate` accepts every
@@ -1381,9 +1879,8 @@ mod tests {
     #[test]
     fn a_hand_edit_that_launders_a_revocation_is_refused() {
         let d = tmpdir("handedit");
-        let m = migrate(allow(&[]), tombstones(&[(B, NOW)]), NOW);
         let (mut file, _) = TrustFile::open(&d, authority(&d)).expect("open");
-        file.save(&m.leases).expect("save");
+        file.save(&[removal_on_file(B, NOW)]).expect("save");
 
         let p = d.join(TRUST_FILE_NAME);
         let text = fs::read_to_string(&p).expect("read");
@@ -1421,9 +1918,9 @@ mod tests {
     #[test]
     fn a_hand_edit_that_widens_a_lease_is_refused() {
         let d = tmpdir("widen");
-        let m = migrate(allow(&[(A, "laptop")]), tombstones(&[]), NOW);
+        let rows = approved(A, "laptop", Caps::INBOUND, NOW);
         let (mut file, _) = TrustFile::open(&d, authority(&d)).expect("open");
-        file.save(&m.leases).expect("save");
+        file.save(&rows).expect("save");
 
         let p = d.join(TRUST_FILE_NAME);
         let text = fs::read_to_string(&p).expect("read");
@@ -1452,7 +1949,7 @@ mod tests {
     #[test]
     fn a_store_from_another_machine_says_so_rather_than_calling_it_an_edit() {
         let (mine, theirs) = (tmpdir("named-mine"), tmpdir("named-theirs"));
-        let m = migrate(allow(&[(A, "laptop")]), tombstones(&[]), NOW);
+        let m = migrate(allow(&[(A, "laptop")]), removals(&[]), NOW);
         let (mut file, _) = TrustFile::open(&theirs, authority(&theirs)).expect("open");
         file.save(&m.leases).expect("save");
 
@@ -1471,7 +1968,7 @@ mod tests {
     #[test]
     fn a_store_from_another_machine_is_refused() {
         let (mine, theirs) = (tmpdir("mine"), tmpdir("theirs"));
-        let m = migrate(allow(&[(A, "laptop")]), tombstones(&[]), NOW);
+        let m = migrate(allow(&[(A, "laptop")]), removals(&[]), NOW);
         let (mut file, _) = TrustFile::open(&theirs, authority(&theirs)).expect("open");
         file.save(&m.leases).expect("save");
 
@@ -1487,20 +1984,20 @@ mod tests {
         let d = tmpdir("rollback");
         let auth = authority(&d);
 
-        // Trusted, then expelled — the sequence a backup would undo.
-        let trusted = migrate(allow(&[(A, "laptop")]), tombstones(&[]), NOW);
+        // Trusted, then removed — the sequence a backup would undo.
+        let trusted = migrate(allow(&[(A, "laptop")]), removals(&[]), NOW);
         let (mut file, _) = TrustFile::open(&d, auth.clone()).expect("open");
         file.save(&trusted.leases).expect("save v1");
         let v1 = fs::read_to_string(d.join(TRUST_FILE_NAME)).expect("read v1");
 
-        let expelled = migrate(allow(&[]), tombstones(&[(A, NOW)]), NOW);
-        file.save(&expelled.leases).expect("save v2");
+        let removed = migrate(allow(&[]), removals(&[(A, NOW)]), NOW);
+        file.save(&removed.leases).expect("save v2");
 
         fs::write(d.join(TRUST_FILE_NAME), &v1).expect("restore the backup");
         let err = TrustFile::open(&d, auth).expect_err("must refuse");
         assert!(
             matches!(err, TrustFileError::Untrusted { .. }),
-            "a validly signed but SUPERSEDED store must not re-grant an expelled \
+            "a validly signed but SUPERSEDED store must not re-grant a removed \
              device: {err}"
         );
         let _ = fs::remove_dir_all(&d);
@@ -1509,7 +2006,7 @@ mod tests {
     #[test]
     fn a_truncated_store_is_fatal_rather_than_empty() {
         let d = tmpdir("truncated");
-        let m = migrate(allow(&[(A, "laptop")]), tombstones(&[]), NOW);
+        let m = migrate(allow(&[(A, "laptop")]), removals(&[]), NOW);
         let (mut file, _) = TrustFile::open(&d, authority(&d)).expect("open");
         file.save(&m.leases).expect("save");
 
@@ -1529,7 +2026,7 @@ mod tests {
     #[test]
     fn a_floor_file_put_in_the_stores_place_is_refused() {
         let d = tmpdir("swap");
-        let m = migrate(allow(&[(A, "laptop")]), tombstones(&[]), NOW);
+        let m = migrate(allow(&[(A, "laptop")]), removals(&[]), NOW);
         let (mut file, _) = TrustFile::open(&d, authority(&d)).expect("open");
         file.save(&m.leases).expect("save");
 
@@ -1548,7 +2045,7 @@ mod tests {
     fn a_signature_made_for_the_floor_is_not_valid_on_the_store() {
         let d = tmpdir("domain");
         let auth = authority(&d);
-        let m = migrate(allow(&[(A, "laptop")]), tombstones(&[]), NOW);
+        let m = migrate(allow(&[(A, "laptop")]), removals(&[]), NOW);
         let body = TrustBody {
             version: SCHEMA_VERSION,
             serial: 1,
@@ -1602,6 +2099,8 @@ mod tests {
             expires_at: Some(NOW + DAY),
             revoked_at: None,
             caps: vec![DiskCap::Inbound],
+            confirmed: true,
+            clipboard: None,
         };
         let mut two = one.clone();
         two.caps = vec![DiskCap::Outbound];
@@ -1623,6 +2122,8 @@ mod tests {
             expires_at: None,
             revoked_at: None,
             caps: vec![DiskCap::Inbound],
+            confirmed: true,
+            clipboard: None,
         };
         validate(std::slice::from_ref(&unbounded), Path::new("trust.toml"))
             .expect("an active lease with no expiry is a valid record");
@@ -1633,7 +2134,7 @@ mod tests {
 
     /// Real stores hold leases written since #158 with a 30-day term, and
     /// migrated ones with 400 days, sealed by the build before this one. They
-    /// must load, grant ten years on, keep every removal, and come back from
+    /// must load, grant ten years on, and come back from
     /// the next save dated 400 days after pairing.
     // LEDGER T7 | class B | 4 file on disk: TrustFile::save, TrustFile::open, records_of
     #[test]
@@ -1650,23 +2151,12 @@ mod tests {
             expires_at: Some(issued + term_days * DAY),
             revoked_at: None,
             caps: vec![cap],
-        };
-        const C: &str = "c0:c1:c2:c3:c4:c5:c6:c7:c8:c9:ca:cb:cc:cd:ce:cf:\
-d0:d1:d2:d3:d4:d5:d6:d7:d8:d9:da:db:dc:dd:de:df";
-        let removed = LeaseRecord {
-            fingerprint: C.to_owned(),
-            label: "removed".into(),
-            state: DiskState::Revoked,
-            origin: DiskOrigin::Migrated,
-            issued_at: issued,
-            expires_at: None,
-            revoked_at: Some(issued),
-            caps: vec![],
+            confirmed: true,
+            clipboard: None,
         };
         let rows = vec![
             active(A, DiskOrigin::Inbound, DiskCap::Inbound, 30),
             active(B, DiskOrigin::Migrated, DiskCap::Outbound, 400),
-            removed,
         ];
         let (mut file, _) = TrustFile::open(&d, auth.clone()).expect("open");
         file.save(&rows)
@@ -1708,7 +2198,6 @@ d0:d1:d2:d3:d4:d5:d6:d7:d8:d9:da:db:dc:dd:de:df";
                 store.we_may_drive(B),
                 "the 400-day pairing stopped at {later} (see #185 before changing this)"
             );
-            assert!(store.is_denied(C) && store.capabilities(C) == Caps::NONE);
         }
 
         file.save(&records_of(&store)).expect("the next save");
@@ -1728,7 +2217,6 @@ d0:d1:d2:d3:d4:d5:d6:d7:d8:d9:da:db:dc:dd:de:df";
         let (_, mut store) = load(&d);
         assert!(store.sweep(now + 10 * 365 * DAY).is_empty());
         assert!(store.may_drive_us(A) && store.we_may_drive(B));
-        assert!(store.is_denied(C), "the removal survived the rewrite");
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -1751,6 +2239,8 @@ d0:d1:d2:d3:d4:d5:d6:d7:d8:d9:da:db:dc:dd:de:df";
             expires_at: Some(issued_at + 30 * DAY),
             revoked_at: None,
             caps: vec![DiskCap::Inbound],
+            confirmed: true,
+            clipboard: None,
         };
         let rows = vec![
             row(A, "expired", now - 40 * DAY),
@@ -1827,6 +2317,8 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
             expires_at: Some(expires_at),
             revoked_at: None,
             caps: vec![DiskCap::Inbound],
+            confirmed: true,
+            clipboard: None,
         };
         let saved_by_this_build = FLOOR - 20 * DAY;
         let rows = vec![
@@ -1937,7 +2429,7 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
 
         let mut store = TrustStore::new(&ours(), now).expect("ours");
         store
-            .issue(A, "paired today", Caps::INBOUND)
+            .issue_confirmed(A, "paired today", Caps::INBOUND)
             .expect("issue");
         for (fp, label, age) in [
             (B, "400 days ago", 400 * DAY),
@@ -1953,6 +2445,8 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
                     origin: Origin::Inbound,
                     issued_at: now - age,
                     expiry: Expiry::Never,
+                    clipboard_chosen: false,
+                    confirmed: true,
                 })
                 .expect("admit");
         }
@@ -1993,5 +2487,808 @@ e0:e1:e2:e3:e4:e5:e6:e7:e8:e9:ea:eb:ec:ed:ee:ef";
         assert_eq!(hex_decode("abc"), None, "odd length");
         assert_eq!(hex_decode("zz"), None, "not hex");
         assert_eq!(hex_decode("AB"), None, "uppercase is not our encoding");
+    }
+
+    /// Two machines that drive each other: this one approved B's knock, then
+    /// approved B answering this machine's own dial. The second approval adds
+    /// a direction to the pairing. It used to replace the lease, so B lost the
+    /// right to drive this machine the moment this machine could drive B
+    /// (#166). Both directions, both clipboard directions and the name given
+    /// at the first approval survive the grant, the save and a restart.
+    // LEDGER T1 | class B | 4 file on disk + 1 return value: service::grant_for_attempt, TrustFile::save, TrustFile::open, rebuild, TrustStore::permits
+    #[test]
+    fn approving_the_second_direction_keeps_the_first() {
+        use crate::service::grant_for_attempt;
+        use hops_ipc::AttemptOrigin;
+
+        let d = tmpdir("second-direction");
+        let auth = authority(&d);
+        let (mut file, _) = TrustFile::open(&d, auth.clone()).expect("open");
+        let mut store = TrustStore::new(&ours(), file.now()).expect("ours");
+
+        grant_for_attempt(
+            &mut store,
+            B,
+            "desk mac",
+            Some(AttemptOrigin::Inbound),
+            hops_ipc::Controller::ThatMachine,
+            true,
+        )
+        .expect("the first approval grants");
+        store
+            .confirm(B)
+            .expect("both machines confirmed the number");
+        grant_for_attempt(
+            &mut store,
+            B,
+            "b4:ab short name",
+            Some(AttemptOrigin::OutboundDial),
+            hops_ipc::Controller::ThisMachine,
+            false,
+        )
+        .expect("the second approval grants");
+        file.save(&records_of(&store)).expect("save");
+
+        let (file, loaded) = TrustFile::open(&d, auth).expect("reopen");
+        let Loaded::Present { leases, .. } = loaded else {
+            panic!("the saved store must be found");
+        };
+        let (store, refused) = rebuild(&ours(), file.now(), &leases).expect("rebuild");
+        assert!(refused.is_empty(), "refused on load: {refused:?}");
+
+        // Both directions, and the clipboard the first approval said yes to.
+        let lost: Vec<String> = Caps::NAMED
+            .iter()
+            .filter(|(bit, _)| *bit != Caps::CLIPBOARD_TO && !store.permits(B, *bit))
+            .map(|(_, name)| (*name).to_owned())
+            .collect();
+        assert!(
+            lost.is_empty(),
+            "after approving both directions and restarting, the pairing no \
+             longer permits {lost:?}; it holds {}. A second approval must add \
+             to the pairing, not replace it (#166).",
+            store.capabilities(B)
+        );
+        assert_eq!(
+            store.label(B).as_deref(),
+            Some("desk mac"),
+            "the second approval renamed the device; it adds a direction and \
+             must keep the name the device already has"
+        );
+        assert_eq!(
+            store.lease(B).map(|l| l.origin),
+            Some(Origin::Chosen(hops_ipc::Controller::Both)),
+            "a pairing that holds both directions, each chosen, was saved as \
+             something else; two chosen directions add up to the choice that \
+             names both (#220)"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Each answer on the pairing card, with and without the clipboard,
+    /// survives the save and a restart as it was given (#220, #182): the
+    /// direction recorded as chosen, and the store granting what it granted
+    /// before. Read back any other way, the store refuses the pairing as not
+    /// what was chosen, and it is lost at the next start.
+    // LEDGER T12 | class B | 4 file on disk + 1 return value: service::grant_for_attempt, records_of, TrustFile::save, TrustFile::open, rebuild
+    #[test]
+    fn every_answer_on_the_card_survives_a_restart() {
+        use crate::service::grant_for_attempt;
+        use hops_ipc::{AttemptOrigin, Controller};
+
+        for (controller, written) in [
+            (Controller::ThisMachine, DiskOrigin::ChosenIMayDrive),
+            (Controller::ThatMachine, DiskOrigin::ChosenDriveMe),
+            (Controller::Both, DiskOrigin::ChosenBoth),
+        ] {
+            for clipboard in [false, true] {
+                let d = tmpdir("every-answer");
+                let auth = authority(&d);
+                let (mut file, _) = TrustFile::open(&d, auth.clone()).expect("open");
+                let mut store = TrustStore::new(&ours(), file.now()).expect("ours");
+                grant_for_attempt(
+                    &mut store,
+                    B,
+                    "desk mac",
+                    Some(AttemptOrigin::Inbound),
+                    controller,
+                    clipboard,
+                )
+                .expect("the approval grants");
+                store
+                    .confirm(B)
+                    .expect("both machines confirmed the number");
+                let granted = store.capabilities(B);
+                let records = records_of(&store);
+                assert_eq!(
+                    records
+                        .iter()
+                        .find(|r| r.fingerprint == B)
+                        .map(|r| r.origin),
+                    Some(written),
+                    "{controller:?}, clipboard {clipboard}: the answer was written as another"
+                );
+                file.save(&records).expect("save");
+
+                let (file, loaded) = TrustFile::open(&d, auth).expect("reopen");
+                let Loaded::Present { leases, .. } = loaded else {
+                    panic!("the saved store must be found");
+                };
+                let (store, refused) = rebuild(&ours(), file.now(), &leases).expect("rebuild");
+                assert!(
+                    refused.is_empty(),
+                    "{controller:?}, clipboard {clipboard}: refused at the next start: \
+                     {refused:?}"
+                );
+                assert_eq!(
+                    (store.lease(B).map(|l| l.origin), store.capabilities(B)),
+                    (Some(Origin::Chosen(controller)), granted),
+                    "{controller:?}, clipboard {clipboard}: a restart changed the pairing"
+                );
+                let _ = fs::remove_dir_all(&d);
+            }
+        }
+    }
+
+    /// A second approval to a pairing in force asks the clipboard question
+    /// again (#182), for the direction it adds: a yes shares the clipboard
+    /// that way, and a no leaves the clipboard the first answer gave.
+    // LEDGER T13 | class B | 1 return value: service::grant_for_attempt twice, TrustStore::capabilities
+    #[test]
+    fn a_second_approval_answers_the_clipboard_for_the_direction_it_adds() {
+        use crate::service::grant_for_attempt;
+        use hops_ipc::{AttemptOrigin, Controller};
+
+        for (first, second, want) in [
+            (
+                false,
+                true,
+                Caps::DRIVE_ME | Caps::I_MAY_DRIVE | Caps::CLIPBOARD_TO,
+            ),
+            (
+                true,
+                false,
+                Caps::DRIVE_ME | Caps::I_MAY_DRIVE | Caps::CLIPBOARD_FROM,
+            ),
+        ] {
+            let mut store = TrustStore::new(&ours(), NOW).expect("ours");
+            grant_for_attempt(
+                &mut store,
+                B,
+                "desk mac",
+                Some(AttemptOrigin::Inbound),
+                Controller::ThatMachine,
+                first,
+            )
+            .expect("the first approval grants");
+            store
+                .confirm(B)
+                .expect("both machines confirmed the number");
+            grant_for_attempt(
+                &mut store,
+                B,
+                "desk mac",
+                Some(AttemptOrigin::OutboundDial),
+                Controller::ThisMachine,
+                second,
+            )
+            .expect("the second approval grants");
+            assert_eq!(
+                store.capabilities(B),
+                want,
+                "clipboard {first} on the first approval, then {second} on the second: the \
+                 pairing does not share the clipboard the answers gave"
+            );
+        }
+    }
+    // -- schema 2 (#187) ----------------------------------------------------
+
+    fn authority_block(auth: &Arc<dyn Authority>) -> AuthorityBlock {
+        AuthorityBlock {
+            alg: auth.algorithm().as_str().to_owned(),
+            public_key: hex_encode(auth.public_key()),
+        }
+    }
+
+    fn v1_row(fp: &str, state: DiskState, caps: &[DiskCap]) -> v1::LeaseRecordV1 {
+        v1::LeaseRecordV1 {
+            fingerprint: fp.to_owned(),
+            label: format!("device {}", &fp[..2]),
+            state,
+            origin: DiskOrigin::Migrated,
+            issued_at: NOW,
+            expires_at: (state == DiskState::Active).then_some(NOW + 400 * DAY),
+            revoked_at: (state == DiskState::Revoked).then_some(NOW),
+            caps: caps.to_vec(),
+        }
+    }
+
+    /// Seal `rows` into `dir` as a version 1 build writes its store and its
+    /// floor, and return both files' text.
+    fn write_v1(
+        dir: &Path,
+        auth: &Arc<dyn Authority>,
+        serial: u64,
+        rows: Vec<v1::LeaseRecordV1>,
+    ) -> (String, String) {
+        let body = v1::TrustBodyV1 {
+            version: 1,
+            serial,
+            written_at: NOW,
+            authority: authority_block(auth),
+            leases: rows,
+        };
+        let trust = seal(&body, TRUST_DOMAIN, auth.as_ref()).expect("seal the store");
+        let floor = FloorBody {
+            version: 1,
+            seconds: NOW,
+            serial,
+            authority: authority_block(auth),
+        };
+        let floor = seal(&floor, FLOOR_DOMAIN, auth.as_ref()).expect("seal the floor");
+        fs::write(dir.join(TRUST_FILE_NAME), &trust).expect("write the store");
+        fs::write(dir.join(FLOOR_FILE_NAME), &floor).expect("write the floor");
+        (trust, floor)
+    }
+
+    /// The store body on disk, verified, as this build's shape.
+    fn body_on_disk(dir: &Path, auth: &Arc<dyn Authority>) -> TrustBody {
+        let path = dir.join(TRUST_FILE_NAME);
+        let text = fs::read_to_string(&path).expect("read the store");
+        let body =
+            verified_body(&text, TRUST_DOMAIN, &path, &authority_block(auth)).expect("verified");
+        parse_body(body, &path).expect("a version 2 body")
+    }
+
+    /// Open `dir` the way the daemon starts.
+    fn start_in(dir: &Path, auth: &Arc<dyn Authority>) -> (TrustFile, TrustStore) {
+        let (mut file, loaded) = TrustFile::open(dir, auth.clone()).expect("open");
+        let Loaded::Present { leases, .. } = loaded else {
+            panic!("the store must be found");
+        };
+        let store = start(&mut file, &ours(), &leases).expect("start");
+        (file, store)
+    }
+
+    fn copies_exist(dir: &Path) -> [bool; 2] {
+        [
+            dir.join(TRUST_V1_COPY_NAME).exists(),
+            dir.join(FLOOR_V1_COPY_NAME).exists(),
+        ]
+    }
+
+    /// The off switch is the lease's (#187). It used to reach disk as a lease
+    /// with no clipboard bits, which the loader reads back through
+    /// `Caps::INBOUND` / `Caps::OUTBOUND`, clipboard included, so a restart
+    /// turned it back on.
+    // LEDGER E2A-1 | class B | 4 file on disk: TrustStore::disable_clipboard, TrustFile::save, TrustFile::open, start
+    #[test]
+    fn turning_the_clipboard_off_survives_a_restart() {
+        let d = tmpdir("clipboard-off");
+        let auth = authority(&d);
+        let (mut file, _) = TrustFile::open(&d, auth.clone()).expect("open");
+        let mut store = TrustStore::new(&ours(), file.now()).expect("ours");
+        store
+            .issue_confirmed(A, "drives this machine", Caps::INBOUND)
+            .expect("issue");
+        store
+            .issue_confirmed(B, "driven from here", Caps::OUTBOUND)
+            .expect("issue");
+        for fp in [A, B] {
+            assert_eq!(
+                store.disable_clipboard(fp),
+                Some(true),
+                "{fp} has a lease to change"
+            );
+            assert!(
+                !store.capabilities(fp).intersects(Caps::CLIPBOARD),
+                "precondition: {fp}'s clipboard is off in memory"
+            );
+        }
+        file.save(&records_of(&store)).expect("save");
+
+        let (_, store) = start_in(&d, &auth);
+        for fp in [A, B] {
+            assert!(
+                !store.capabilities(fp).intersects(Caps::CLIPBOARD),
+                "the clipboard of {fp} came back on after a restart: {}",
+                store.capabilities(fp)
+            );
+        }
+        assert!(
+            store.may_drive_us(A) && store.we_may_drive(B),
+            "turning the clipboard off took away a direction to drive"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A version 1 store loads with every lease confirmed and no clipboard
+    /// chosen, the first start writes version 2, and both version 1 files are
+    /// kept byte for byte for a build that reads only version 1.
+    // LEDGER E2A-2 | class B | 4 file on disk: TrustFile::open, start, TrustFile::save
+    #[test]
+    fn a_v1_store_migrates_confirmed_without_a_clipboard_field_and_keeps_both_copies() {
+        let d = tmpdir("v1-migrates");
+        let auth = authority(&d);
+        let (trust_v1, floor_v1) = write_v1(
+            &d,
+            &auth,
+            7,
+            vec![
+                v1_row(A, DiskState::Active, &[DiskCap::Inbound]),
+                v1_row(B, DiskState::Active, &[DiskCap::Outbound]),
+            ],
+        );
+
+        let (file, store) = start_in(&d, &auth);
+        assert!(
+            !file.is_version_1(),
+            "the first start did not write version 2"
+        );
+        let body = body_on_disk(&d, &auth);
+        assert_eq!(body.version, SCHEMA_VERSION, "the store on disk");
+        assert_eq!(body.leases.len(), 2, "every lease is carried: {body:?}");
+        for r in &body.leases {
+            assert!(
+                r.confirmed,
+                "{} was saved unconfirmed; a pairing made before the \
+                 confirmation is confirmed (#11, #167)",
+                r.fingerprint
+            );
+            assert_eq!(
+                r.clipboard, None,
+                "{} was saved with a clipboard nobody chose",
+                r.fingerprint
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(d.join(TRUST_V1_COPY_NAME)).ok(),
+            Some(trust_v1),
+            "the version 1 store was not kept as it was"
+        );
+        assert_eq!(
+            fs::read_to_string(d.join(FLOOR_V1_COPY_NAME)).ok(),
+            Some(floor_v1),
+            "the version 1 floor was not kept as it was"
+        );
+
+        // What the pairings grant is unchanged, before and after a restart.
+        let (_, reloaded) = start_in(&d, &auth);
+        for s in [&store, &reloaded] {
+            assert_eq!(
+                s.capabilities(A),
+                Caps::DRIVE_ME | existing_pairing_clipboard(Caps::DRIVE_ME),
+                "{A}"
+            );
+            assert_eq!(
+                s.capabilities(B),
+                Caps::I_MAY_DRIVE | existing_pairing_clipboard(Caps::I_MAY_DRIVE),
+                "{B}"
+            );
+        }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Approving the other direction of a pairing adds that direction (#166)
+    /// and leaves a clipboard switched off, off: approved in the run that
+    /// switched it off, or in a later one that read the choice back from disk,
+    /// and across a restart after the approval too. A yes on that approval's
+    /// card answers for the direction it adds, and only that one (#182).
+    // LEDGER E2A-3 | class B | 4 file on disk: service::grant_for_attempt, TrustStore::disable_clipboard, TrustFile::save, start
+    #[test]
+    fn approving_the_second_direction_keeps_the_clipboard_off() {
+        use crate::service::grant_for_attempt;
+        use hops_ipc::AttemptOrigin;
+
+        for (approved, restart_first) in [("in the same run", false), ("after a restart", true)] {
+            let d = tmpdir(if restart_first {
+                "second-direction-later"
+            } else {
+                "second-direction-clipboard"
+            });
+            let auth = authority(&d);
+            let (mut file, _) = TrustFile::open(&d, auth.clone()).expect("open");
+            let mut store = TrustStore::new(&ours(), file.now()).expect("ours");
+            grant_for_attempt(
+                &mut store,
+                B,
+                "desk mac",
+                Some(AttemptOrigin::Inbound),
+                hops_ipc::Controller::ThatMachine,
+                true,
+            )
+            .expect("the first approval grants");
+            store
+                .confirm(B)
+                .expect("both machines confirmed the number");
+            assert_eq!(
+                store.disable_clipboard(B),
+                Some(true),
+                "a lease to switch off"
+            );
+            if restart_first {
+                file.save(&records_of(&store)).expect("save");
+                std::mem::drop(file);
+                (file, store) = start_in(&d, &auth);
+            }
+            // A yes to the clipboard, on the approval of the other direction,
+            // shares it the way that direction goes, and does not turn back
+            // on the clipboard switched off.
+            grant_for_attempt(
+                &mut store,
+                B,
+                "desk mac",
+                Some(AttemptOrigin::OutboundDial),
+                hops_ipc::Controller::ThisMachine,
+                true,
+            )
+            .expect("the second approval grants");
+            file.save(&records_of(&store)).expect("save");
+            let (_, reloaded) = start_in(&d, &auth);
+
+            for (when, s) in [
+                ("after the approval", &store),
+                ("after a restart", &reloaded),
+            ] {
+                assert!(
+                    s.may_drive_us(B) && s.we_may_drive(B),
+                    "second direction approved {approved}: {when}, the pairing does \
+                     not drive both ways: {}",
+                    s.capabilities(B)
+                );
+                assert_eq!(
+                    s.capabilities(B).intersection(Caps::CLIPBOARD),
+                    Caps::CLIPBOARD_TO,
+                    "second direction approved {approved}: {when}, the clipboard is not \
+                     what the answers gave: switched off the way the first direction \
+                     goes, and a yes for the way the second goes"
+                );
+            }
+            let _ = fs::remove_dir_all(&d);
+        }
+    }
+
+    // LEDGER G-5 | class B | 4 file on disk + 1 return value: records_of, TrustFile::save, start
+    /// Approving the second direction of a confirmed pairing does not ask
+    /// for the number again, and the pairing is still confirmed after a
+    /// restart: it loads, both ways (#11, #166).
+    #[test]
+    fn a_grant_to_a_confirmed_pairing_stays_confirmed_across_a_restart() {
+        use crate::service::grant_for_attempt;
+        use hops_ipc::AttemptOrigin;
+
+        let d = tmpdir("confirmed-second-grant");
+        let auth = authority(&d);
+        let (mut file, _) = TrustFile::open(&d, auth.clone()).expect("open");
+        let mut store = TrustStore::new(&ours(), file.now()).expect("ours");
+        grant_for_attempt(
+            &mut store,
+            B,
+            "desk mac",
+            Some(AttemptOrigin::Inbound),
+            hops_ipc::Controller::ThatMachine,
+            false,
+        )
+        .expect("the first approval");
+        store
+            .confirm(B)
+            .expect("both machines confirmed the number");
+        grant_for_attempt(
+            &mut store,
+            B,
+            "desk mac",
+            Some(AttemptOrigin::OutboundDial),
+            hops_ipc::Controller::ThisMachine,
+            false,
+        )
+        .expect("the second approval");
+        assert!(
+            !store.is_pairing(B),
+            "a second direction asked for the number again"
+        );
+        file.save(&records_of(&store)).expect("save");
+        std::mem::drop(file);
+
+        let (_, reloaded) = start_in(&d, &auth);
+        assert!(
+            reloaded.may_drive_us(B) && reloaded.we_may_drive(B),
+            "after a restart the pairing holds {}; it was saved unconfirmed and \
+             dropped",
+            reloaded.capabilities(B)
+        );
+    }
+
+    // LEDGER G-5b | class B | 4 file on disk: records_of, TrustFile::save, start
+    /// An approval saved while its pairing waits for the number is written as
+    /// unconfirmed, so a restart drops it rather than loading it as trust: the
+    /// number it waited on died with the connection (#167, 2026-09-07).
+    #[test]
+    fn an_approval_saved_before_the_number_is_dropped_at_the_next_start() {
+        let d = tmpdir("approved-then-restart");
+        let auth = authority(&d);
+        let (mut file, _) = TrustFile::open(&d, auth.clone()).expect("open");
+        let mut store = TrustStore::new(&ours(), file.now()).expect("ours");
+        store
+            .issue(A, "desk mac", Caps::INBOUND)
+            .expect("the approval");
+        assert!(store.is_pairing(A), "precondition: waiting for the number");
+        file.save(&records_of(&store)).expect("save");
+        std::mem::drop(file);
+
+        let (_, reloaded) = start_in(&d, &auth);
+        assert!(
+            !reloaded.is_known(A),
+            "an approval nobody confirmed loaded after a restart as {}",
+            reloaded.capabilities(A)
+        );
+    }
+
+    /// A pairing interrupted before both machines confirmed it does not load,
+    /// the load says so, and the start saves the store without it.
+    // LEDGER E2A-4 | class B | 4 file on disk + 1 return value: TrustFile::save, TrustFile::open, rebuild, start
+    #[test]
+    fn an_unconfirmed_lease_is_dropped_at_the_next_start() {
+        let d = tmpdir("unconfirmed");
+        let auth = authority(&d);
+        let (mut file, _) = TrustFile::open(&d, auth.clone()).expect("open");
+        let lease = |fp: &str, confirmed: bool| LeaseRecord {
+            fingerprint: fp.to_owned(),
+            label: "desk mac".into(),
+            state: DiskState::Active,
+            origin: DiskOrigin::Inbound,
+            issued_at: file.now(),
+            expires_at: None,
+            revoked_at: None,
+            caps: vec![DiskCap::Inbound],
+            confirmed,
+            clipboard: None,
+        };
+        let rows = vec![lease(A, true), lease(B, false)];
+        file.save(&rows).expect("save");
+
+        let (_, store) = start_in(&d, &auth);
+        assert!(store.may_drive_us(A), "the confirmed pairing did not load");
+        assert!(
+            !store.is_known(B),
+            "a pairing never confirmed on both machines loaded: {}",
+            store.capabilities(B)
+        );
+        let saved = body_on_disk(&d, &auth);
+        assert!(
+            saved.leases.iter().all(|r| r.fingerprint != B),
+            "the start did not save the store without it: {saved:?}"
+        );
+        let (_, refused) = rebuild(&ours(), file.now(), &rows).expect("rebuild");
+        assert!(
+            refused.iter().any(|why| why.contains(B)),
+            "the unconfirmed pairing is dropped without a word: {refused:?}"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// The version 1 copy goes at the first save that drops a record it
+    /// holds, so no removed device survives there (#184, #187): a removal,
+    /// in the run that migrated or a later one. A save that drops nothing
+    /// keeps it.
+    // LEDGER E2A-5 | class B | 4 file on disk: start, TrustStore::forget, TrustFile::save
+    #[test]
+    fn a_removal_after_migration_deletes_the_v1_copies() {
+        let rows = || {
+            vec![
+                v1_row(A, DiskState::Active, &[DiskCap::Inbound]),
+                v1_row(B, DiskState::Active, &[DiskCap::Outbound]),
+            ]
+        };
+        let migrated = |tag: &str| {
+            let d = tmpdir(tag);
+            let auth = authority(&d);
+            write_v1(&d, &auth, 3, rows());
+            let (file, store) = start_in(&d, &auth);
+            assert_eq!(
+                copies_exist(&d),
+                [true, true],
+                "precondition: both copies kept"
+            );
+            (d, auth, file, store)
+        };
+
+        // A save that drops nothing keeps the copies.
+        let (d, _, mut file, mut store) = migrated("copy-kept");
+        store.set_label(A, "renamed").expect("rename");
+        assert_eq!(
+            store.disable_clipboard(B),
+            Some(true),
+            "a lease to switch off"
+        );
+        file.save(&records_of(&store)).expect("save");
+        assert_eq!(
+            copies_exist(&d),
+            [true, true],
+            "a save that dropped nothing deleted the copies"
+        );
+        let _ = fs::remove_dir_all(&d);
+
+        /// What the case is called, its scratch directory, whether it runs
+        /// in a later start than the migration, and what it drops.
+        type Case = (&'static str, &'static str, bool, fn(&mut TrustStore));
+        let cases: [Case; 2] = [
+            ("a removal", "copy-removal", false, |s| {
+                s.forget(A);
+            }),
+            ("a removal in a later run", "copy-later", true, |s| {
+                s.forget(B);
+            }),
+        ];
+        for (what, tag, later, change) in cases {
+            let (d, auth, mut file, mut store) = migrated(tag);
+            if later {
+                // A later run: the migration's `TrustFile` is gone, and this
+                // build starts again on the files alone.
+                std::mem::drop(file);
+                (file, store) = start_in(&d, &auth);
+            }
+            change(&mut store);
+            file.save(&records_of(&store)).expect("save");
+            assert_eq!(
+                copies_exist(&d),
+                [false, false],
+                "{what} after the migration left the version 1 copy on disk, \
+                 where a build that reads it still acts on a record this machine \
+                 dropped"
+            );
+            let _ = fs::remove_dir_all(&d);
+        }
+    }
+
+    /// A removal an earlier build kept on file is dropped at the first start,
+    /// and saved without it, whether the store is version 1 or version 2
+    /// (#184). The version 1 copy follows its rule: the save that dropped the
+    /// removal is the first save that drops a record the copy holds, so the
+    /// copy goes with it and the removed device survives nowhere (#187).
+    /// The device can then pair again, and only in full (#161).
+    // LEDGER R161-2 | class B | 4 file on disk: TrustFile::open, start, records_of, TrustFile::save
+    #[test]
+    fn a_removal_an_earlier_build_kept_is_dropped_and_that_device_pairs_again() {
+        const Z: &str = "cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:\
+cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc:cc";
+        for version in [1, 2] {
+            let d = tmpdir(&format!("kept-removal-v{version}"));
+            let auth = authority(&d);
+            if version == 1 {
+                write_v1(
+                    &d,
+                    &auth,
+                    3,
+                    vec![
+                        v1_row(A, DiskState::Active, &[DiskCap::Inbound]),
+                        v1_row(Z, DiskState::Revoked, &[]),
+                    ],
+                );
+            } else {
+                let (mut file, _) = TrustFile::open(&d, auth.clone()).expect("open");
+                let mut store = TrustStore::new(&ours(), file.now()).expect("ours");
+                store
+                    .issue_confirmed(A, "kept", Caps::INBOUND)
+                    .expect("issue");
+                let mut rows = records_of(&store);
+                rows.push(removal_on_file(Z, NOW));
+                file.save(&rows)
+                    .expect("the store as an earlier build wrote it");
+            }
+
+            let (mut file, mut store) = start_in(&d, &auth);
+            assert!(
+                !store.is_known(Z),
+                "version {version}: a removal an earlier build kept is still on file"
+            );
+            assert!(
+                store.may_drive_us(A),
+                "version {version}: {A} lost its pairing"
+            );
+            let body = body_on_disk(&d, &auth);
+            assert!(
+                body.leases.iter().all(|r| r.fingerprint != Z),
+                "version {version}: the first start did not save the store without \
+                 the removal: {body:?}"
+            );
+            assert_eq!(
+                copies_exist(&d),
+                [false, false],
+                "version {version}: a copy still holds the removed device"
+            );
+
+            store
+                .issue(Z, "back again", Caps::INBOUND)
+                .expect("approving it is an ordinary approval");
+            assert_eq!(
+                store.capabilities(Z),
+                Caps::NONE,
+                "version {version}: an approval alone paired it"
+            );
+            store
+                .confirm(Z)
+                .expect("both machines confirmed the number");
+            file.save(&records_of(&store)).expect("save");
+            let (_, reloaded) = start_in(&d, &auth);
+            assert!(
+                reloaded.may_drive_us(Z),
+                "version {version}: the device removed before the upgrade did not \
+                 pair again"
+            );
+            let _ = fs::remove_dir_all(&d);
+        }
+    }
+
+    /// A version 1 store found again, after the copies were restored for an
+    /// older build that then saved, migrates again without writing over the
+    /// first copy.
+    // LEDGER E2A-6 | class B | 4 file on disk: start, TrustFile::save
+    #[test]
+    fn a_second_migration_keeps_the_first_copy() {
+        let d = tmpdir("second-migration");
+        let auth = authority(&d);
+        let (first, first_floor) = write_v1(
+            &d,
+            &auth,
+            5,
+            vec![v1_row(A, DiskState::Active, &[DiskCap::Inbound])],
+        );
+        let _ = start_in(&d, &auth);
+
+        // An older build is given the copies back and saves a pairing.
+        fs::copy(d.join(TRUST_V1_COPY_NAME), d.join(TRUST_FILE_NAME)).expect("restore");
+        fs::copy(d.join(FLOOR_V1_COPY_NAME), d.join(FLOOR_FILE_NAME)).expect("restore");
+        write_v1(
+            &d,
+            &auth,
+            6,
+            vec![
+                v1_row(A, DiskState::Active, &[DiskCap::Inbound]),
+                v1_row(B, DiskState::Active, &[DiskCap::Inbound]),
+            ],
+        );
+
+        let (_, store) = start_in(&d, &auth);
+        assert!(
+            store.may_drive_us(A) && store.may_drive_us(B),
+            "the second migration lost a pairing"
+        );
+        assert_eq!(body_on_disk(&d, &auth).version, SCHEMA_VERSION);
+        assert_eq!(
+            fs::read_to_string(d.join(TRUST_V1_COPY_NAME)).ok(),
+            Some(first),
+            "the second migration wrote over the first copy of the store"
+        );
+        assert_eq!(
+            fs::read_to_string(d.join(FLOOR_V1_COPY_NAME)).ok(),
+            Some(first_floor),
+            "the second migration wrote over the first copy of the floor"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Only versions 1 and 2 are read. A store from a later schema is refused
+    /// by name rather than parsed as either.
+    // LEDGER E2A-7 | class B | 1 return value: TrustFile::open
+    #[test]
+    fn a_store_of_a_later_schema_is_refused() {
+        let d = tmpdir("later-schema");
+        let auth = authority(&d);
+        let body = TrustBody {
+            version: SCHEMA_VERSION + 1,
+            serial: 1,
+            written_at: NOW,
+            authority: authority_block(&auth),
+            leases: Vec::new(),
+        };
+        let sealed = seal(&body, TRUST_DOMAIN, auth.as_ref()).expect("seal");
+        fs::write(d.join(TRUST_FILE_NAME), sealed).expect("write");
+        let err = TrustFile::open(&d, auth).expect_err("a later schema must be refused");
+        assert!(
+            matches!(&err, TrustFileError::Untrusted { reason, .. }
+                if reason.contains(&format!("schema version {}", SCHEMA_VERSION + 1))),
+            "refused for another reason: {err}"
+        );
+        let _ = fs::remove_dir_all(&d);
     }
 }

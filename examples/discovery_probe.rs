@@ -114,6 +114,9 @@ fn main() {
                         withdrawn.insert(l.clone());
                         println!("LOST   {l}  (stopped announcing — still counts as seen)");
                     }
+                    Some(hops::discovery::DiscoveryEvent::Quiet) => {
+                        println!("QUIET  no other machine has answered yet");
+                    }
                     None => break,
                 },
             }

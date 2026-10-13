@@ -48,7 +48,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use log::{LevelFilter, Log, Metadata, Record};
 
@@ -148,33 +148,55 @@ pub fn file_for(role: &str) -> Option<PathBuf> {
 ///
 /// Per-role rather than one shared file: the daemon and the tray are separate
 /// processes with separate lifetimes, and interleaving them makes both harder
-/// to read. `HOPS_LOG_FILE` overrides it entirely.
+/// to read. `HOPS_LOG_FILE` overrides it entirely. The directory is
+/// [`input_event::paths::log_dir`], which the keystroke log shares.
 fn default_path(role: &str) -> Option<PathBuf> {
     if let Ok(p) = std::env::var("HOPS_LOG_FILE") {
         return Some(PathBuf::from(p));
     }
-    let dir = if cfg!(target_os = "macos") {
-        PathBuf::from(std::env::var("HOME").ok()?)
-            .join("Library")
-            .join("Logs")
-            .join("hops")
-    } else if cfg!(windows) {
-        PathBuf::from(std::env::var("LOCALAPPDATA").ok()?)
-            .join("hops")
-            .join("logs")
-    } else {
-        // $XDG_STATE_HOME is where logs belong on Linux; $HOME/.local/state is
-        // its documented default.
-        std::env::var("XDG_STATE_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                PathBuf::from(std::env::var("HOME").unwrap_or_default())
-                    .join(".local")
-                    .join("state")
-            })
-            .join("hops")
-    };
-    Some(dir.join(format!("{role}.log")))
+    Some(input_event::paths::log_dir()?.join(format!("{role}.log")))
+}
+
+/// Open a log for appending, created readable by this user alone.
+///
+/// A log names peers, addresses and paths. Opened with the default umask it
+/// was readable by every account on the machine. A file an earlier build
+/// created that way is narrowed too, since the mode given at creation does
+/// nothing for a file that already exists.
+///
+/// Only a regular file is narrowed: `HOPS_LOG_FILE` may name a device, which
+/// other accounts need as it is. A file that cannot be narrowed is still
+/// written, and said so, rather than losing the log.
+fn open_log(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options.mode(0o600);
+        let file = options.open(path)?;
+        let open_to_others = file
+            .metadata()
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o077 != 0);
+        if open_to_others {
+            if let Err(e) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
+                eprintln!(
+                    "hops: {} is readable by other accounts and could not be made \
+                     private ({e})",
+                    path.display()
+                );
+            }
+        }
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    options.open(path)
+}
+
+/// Create `path` readable by this user alone, or narrow it if it is a regular
+/// file that is not, for output another process will write there.
+pub fn open_private(path: &Path) -> std::io::Result<()> {
+    open_log(path).map(drop)
 }
 
 /// Rename the current file aside once it is too big, keeping one generation.
@@ -188,12 +210,12 @@ fn rotate_if_needed(path: &Path, file: &mut File) -> std::io::Result<()> {
     let previous = path.with_extension("log.1");
     let _ = fs::remove_file(&previous);
     fs::rename(path, &previous)?;
-    *file = OpenOptions::new().create(true).append(true).open(path)?;
+    *file = open_log(path)?;
     Ok(())
 }
 
-/// Whether to write stderr as well, given whether we own a file and whether
-/// stderr is a terminal.
+/// Whether a process in `role` writes stderr as well, given whether it owns
+/// a file and whether stderr is a terminal.
 ///
 /// Writing both unconditionally would leave the original defect standing. The
 /// service launchers redirect stderr into a file of their own that nothing
@@ -207,8 +229,52 @@ fn rotate_if_needed(path: &Path, file: &mut File) -> std::io::Result<()> {
 /// what happens outside this logger — output before init, and the runtime's own
 /// abort message under `panic = "abort"` — which is exactly what it is good for
 /// and is bounded by how rarely those happen.
-fn should_write_stderr(owns_file: bool, stderr_is_terminal: bool) -> bool {
-    !owns_file || stderr_is_terminal
+///
+/// The daemon and the GUI write their file alone, terminal or not. A write
+/// to a terminal can wait: a Windows console waits every write for as long
+/// as text is selected in it. The daemon logs from the loop that carries
+/// input, and the GUI from the one that draws its window, so a selection in
+/// the terminal either was started from stopped the pointer crossing to
+/// other machines or left the window not responding (#247). Their files are
+/// where their logs are read from. The TUI and the CLI answer in the
+/// terminal, which they need anyway.
+fn should_write_stderr(role: &str, owns_file: bool, stderr_is_terminal: bool) -> bool {
+    !owns_file || (stderr_is_terminal && !matches!(role, "daemon" | "gui"))
+}
+
+/// Whether this process opened its log file, and whether its stderr is a
+/// terminal, as [`init`] found them, for [`say`]. Unset before `init`.
+static SINKS: OnceLock<(bool, bool)> = OnceLock::new();
+
+/// The target of what [`say`] logs. The logger keeps it off stderr, because
+/// `say` writes stderr itself.
+const SAID: &str = "hops::said";
+
+/// Tell the person who started this process `msg`, and log it.
+///
+/// For what ends the process, or changes what it opens: an error that stops
+/// hops, or the interface opened in place of the one asked for. A role's
+/// routine lines may stay in its file alone (#247); this one may not. From a
+/// terminal, a process that ends with its reason only in a file looks like
+/// one that did nothing (#255). So it reaches stderr, once, whenever stderr
+/// is a terminal or there is no file to read it in, whatever the role.
+pub fn say(level: log::Level, msg: &dyn std::fmt::Display) {
+    let msg = msg.to_string();
+    log::log!(target: SAID, level, "{msg}");
+    let (owns_file, stderr_is_terminal) = SINKS
+        .get()
+        .copied()
+        .unwrap_or_else(|| (false, std::io::stderr().is_terminal()));
+    say_to(&mut std::io::stderr(), &msg, owns_file, stderr_is_terminal);
+}
+
+/// [`say`]'s line on `stderr`: written when stderr is a terminal, or when
+/// there is no file for the log line to reach. A stderr redirected beside
+/// the file does without it, as every other line does.
+fn say_to(stderr: &mut impl Write, msg: &str, owns_file: bool, stderr_is_terminal: bool) {
+    if stderr_is_terminal || !owns_file {
+        let _ = writeln!(stderr, "hops: {msg}");
+    }
 }
 
 /// Open an append handle that is capped the same way this module's own log is.
@@ -222,7 +288,7 @@ pub fn open_capped(path: &Path) -> std::io::Result<File> {
     if let Some(dir) = path.parent() {
         let _ = fs::create_dir_all(dir);
     }
-    let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut f = open_log(path)?;
     rotate_if_needed(path, &mut f)?;
     Ok(f)
 }
@@ -233,6 +299,14 @@ struct Sink {
     to_stderr: bool,
     /// Forward to the platform's own log where that is free and unredacted.
     to_os: bool,
+}
+
+impl Sink {
+    /// Whether a line logged to `target` is written to stderr too. Never what
+    /// [`say`] logs: it writes stderr itself.
+    fn writes_stderr(&self, target: &str) -> bool {
+        self.to_stderr && target != SAID
+    }
 }
 
 impl Log for Sink {
@@ -252,7 +326,7 @@ impl Log for Sink {
             record.args()
         );
 
-        if self.to_stderr {
+        if self.writes_stderr(record.target()) {
             eprintln!("{line}");
         }
 
@@ -360,7 +434,7 @@ pub fn init(role: &str) {
         if let Some(dir) = path.parent() {
             let _ = fs::create_dir_all(dir);
         }
-        match OpenOptions::new().create(true).append(true).open(&path) {
+        match open_log(&path) {
             Ok(f) => Some(Mutex::new((path, f))),
             Err(e) => {
                 eprintln!("hops: could not open a log file ({e}); logging to stderr only");
@@ -369,8 +443,19 @@ pub fn init(role: &str) {
         }
     });
 
+    let stderr_is_terminal = std::io::stderr().is_terminal();
+    let _ = SINKS.set((file.is_some(), stderr_is_terminal));
+    if let Some(lock) = file
+        .as_ref()
+        .filter(|_| stderr_is_terminal && !should_write_stderr(role, true, stderr_is_terminal))
+    {
+        // Once, before anything runs that a wait here could hold up.
+        if let Ok(guard) = lock.lock() {
+            eprintln!("hops: the {role} logs to {}", guard.0.display());
+        }
+    }
     let sink = Sink {
-        to_stderr: should_write_stderr(file.is_some(), std::io::stderr().is_terminal()),
+        to_stderr: should_write_stderr(role, file.is_some(), stderr_is_terminal),
         file,
         filter,
         to_os: cfg!(target_os = "macos"),
@@ -451,6 +536,94 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    // LEDGER T7 | class B | 4 file on disk: open_capped and rotate_if_needed, mode read back
+    #[cfg(unix)]
+    #[test]
+    fn every_log_file_is_readable_by_this_user_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| fs::metadata(p).expect("stat").permissions().mode() & 0o777;
+        let dir = std::env::temp_dir().join(format!("hops-log-mode-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("a scratch directory");
+
+        // Created by a redirect's handle.
+        let path = dir.join("daemon.log");
+        drop(open_capped(&path).expect("open"));
+        assert_eq!(
+            mode(&path),
+            0o600,
+            "a new log was created {:o}",
+            mode(&path)
+        );
+
+        // One an earlier build left readable by everyone.
+        let old = dir.join("old.log");
+        fs::write(&old, b"a line").expect("an old log");
+        fs::set_permissions(&old, fs::Permissions::from_mode(0o644)).expect("chmod");
+        drop(open_capped(&old).expect("open"));
+        assert_eq!(mode(&old), 0o600, "an old log was left {:o}", mode(&old));
+
+        // The file a rotation starts.
+        let rot = dir.join("rot.log");
+        let mut f = open_capped(&rot).expect("open");
+        f.write_all(&vec![b'x'; (MAX_BYTES + 1) as usize])
+            .expect("fill");
+        rotate_if_needed(&rot, &mut f).expect("rotate");
+        assert!(rot.with_extension("log.1").exists(), "it did not rotate");
+        assert_eq!(
+            mode(&rot),
+            0o600,
+            "a rotated log was created {:o}",
+            mode(&rot)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // LEDGER T7c | class B | 4 file on disk: open_log on a device, mode read back
+    #[cfg(unix)]
+    #[test]
+    fn a_log_named_at_a_device_still_opens_and_the_device_is_left_as_it_was() {
+        // `HOPS_LOG_FILE` may name a device. Narrowing it fails for an
+        // account that does not own it, which lost the log, and for one that
+        // does it would cut every other account off from the device.
+        use std::os::unix::fs::PermissionsExt;
+        let null = Path::new("/dev/null");
+        let before = fs::metadata(null).expect("stat").permissions().mode() & 0o777;
+        let opened = open_log(null);
+        let after = fs::metadata(null).expect("stat").permissions().mode() & 0o777;
+        assert!(
+            opened.is_ok(),
+            "a log at /dev/null did not open: {opened:?}"
+        );
+        assert_eq!(after, before, "/dev/null was changed to {after:o}");
+
+        // One this account owns, which it could narrow: a pipe, with a reader
+        // so that opening it to write does not wait.
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!("hops-log-fifo-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("a scratch directory");
+        let fifo = dir.join("pipe");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("no NUL");
+        // SAFETY: `c_path` is NUL-terminated and outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0, "mkfifo");
+        fs::set_permissions(&fifo, fs::Permissions::from_mode(0o644)).expect("chmod");
+        let _reader = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .expect("a reader");
+        let opened = open_log(&fifo);
+        let mode = fs::metadata(&fifo).expect("stat").permissions().mode() & 0o777;
+        assert!(opened.is_ok(), "a log at a pipe did not open: {opened:?}");
+        assert_eq!(
+            mode, 0o644,
+            "a pipe this account owns was changed to {mode:o}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_file_rotates_rather_than_growing_without_bound() {
         let dir = std::env::temp_dir().join(format!("hops-log-test-{}", std::process::id()));
@@ -521,24 +694,113 @@ mod tests {
         }
     }
 
+    // LEDGER T2474 | class B | 1 return value of should_write_stderr
     #[test]
     fn a_redirected_stderr_does_not_get_a_second_unbounded_copy() {
         assert!(
-            !should_write_stderr(true, false),
+            !should_write_stderr("cli", true, false),
             "under a service launcher stderr is redirected into a file nothing \
              rotates. Writing there as well as to the rotated file means every \
              line lands twice, once somewhere unbounded — which leaves the \
              defect this module exists to fix standing."
         );
         assert!(
-            should_write_stderr(true, true),
+            should_write_stderr("cli", true, true),
             "a developer watching a terminal must still see output"
         );
         assert!(
-            should_write_stderr(false, false),
+            should_write_stderr("cli", false, false),
             "with no file open, stderr is the only sink there is — a process \
              that cannot open its log must not fall silent"
         );
+    }
+
+    /// The daemon logs from the loop that carries input, and a write to a
+    /// Windows console waits for as long as text is selected in it (#247).
+    // LEDGER T2473 | class B | 1 return value of should_write_stderr
+    #[test]
+    fn the_daemon_never_writes_a_terminal_while_it_has_its_file() {
+        assert!(
+            !should_write_stderr("daemon", true, true)
+                && !should_write_stderr("daemon", true, false),
+            "a daemon with its log file open writes its terminal as well: a selection \
+             in that terminal then stops input crossing to other machines"
+        );
+        assert!(
+            should_write_stderr("daemon", false, true),
+            "a daemon that could not open its file must still write somewhere"
+        );
+        for role in ["tui", "cli"] {
+            assert!(
+                should_write_stderr(role, true, true),
+                "the {role}, run from a terminal, must still print there"
+            );
+        }
+    }
+
+    /// The GUI started from a shell shares the shell's console and keeps it,
+    /// and logs from the loop that draws its window (#247).
+    // LEDGER T2475 | class B | 1 return value of should_write_stderr
+    #[test]
+    fn the_gui_never_writes_a_terminal_while_it_has_its_file() {
+        assert!(
+            !should_write_stderr("gui", true, true),
+            "a GUI with its log file open writes the terminal it was started from: \
+             a selection in that terminal then leaves the window not responding"
+        );
+        assert!(
+            should_write_stderr("gui", false, true),
+            "a GUI that could not open its file must still write somewhere"
+        );
+    }
+
+    /// What ends the process reaches the terminal it was started from once,
+    /// whatever the role, while the daemon's and the GUI's routine lines stay
+    /// in their files (#247). `hops gui` in a build with no GUI ended with
+    /// its reason in gui.log alone, and nothing on the terminal (#255).
+    // LEDGER T5 | class B | 2 bytes written by say_to + 1 return value of Sink::writes_stderr
+    #[test]
+    fn what_ends_the_process_reaches_a_terminal_once_whatever_the_role() {
+        let msg = "this build has no GUI";
+        let said = |owns_file: bool, terminal: bool| {
+            let mut out = Vec::new();
+            say_to(&mut out, msg, owns_file, terminal);
+            String::from_utf8(out).expect("utf-8")
+        };
+        for role in ["daemon", "gui", "tui", "cli"] {
+            for (owns_file, terminal) in [(true, true), (false, true), (false, false)] {
+                let sink = Sink {
+                    file: None,
+                    filter: build_filter("info"),
+                    to_stderr: should_write_stderr(role, owns_file, terminal),
+                    to_os: false,
+                };
+                let lines = said(owns_file, terminal).matches(msg).count()
+                    + usize::from(sink.writes_stderr(SAID));
+                assert_eq!(
+                    lines, 1,
+                    "the {role} (file {owns_file}, terminal {terminal}) wrote the line \
+                     that ends it to stderr {lines} times"
+                );
+            }
+            let sink = Sink {
+                file: None,
+                filter: build_filter("info"),
+                to_stderr: should_write_stderr(role, true, true),
+                to_os: false,
+            };
+            assert_eq!(
+                sink.writes_stderr("hops"),
+                matches!(role, "tui" | "cli"),
+                "the {role}'s routine lines changed where they go (#247)"
+            );
+        }
+        assert_eq!(
+            said(true, false),
+            "",
+            "a stderr redirected beside the log file got the line a second time"
+        );
+        assert_eq!(said(true, true), format!("hops: {msg}\n"));
     }
 
     #[test]

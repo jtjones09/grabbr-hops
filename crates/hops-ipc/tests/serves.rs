@@ -2,13 +2,13 @@
 //!
 //! A daemon binds its endpoint before it reads its config and keys, and exits
 //! on a failure there a moment later. The front door must not count that as a
-//! daemon running, so what it asks is whether the daemon takes the token and
+//! daemon running, so what it asks is whether the daemon proves the token and
 //! sends state, which a daemon does only once its service loop runs.
 //!
 //! Runs in its own test binary so pointing `HOME`, `XDG_CONFIG_HOME`,
 //! `XDG_RUNTIME_DIR` and `LOCALAPPDATA` at a scratch directory cannot disturb
 //! anything else. The listener binds an endpoint of its own, never the
-//! production socket or port.
+//! production socket or pipe.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -42,7 +42,7 @@ fn own_endpoint(dir: &std::path::Path) -> DaemonEndpoint {
     #[cfg(windows)]
     {
         let _ = dir;
-        DaemonEndpoint::Tcp("127.0.0.1:0".parse().expect("a loopback address"))
+        DaemonEndpoint::Pipe(format!(r"\\.\pipe\hops-test-serves-{}", std::process::id()))
     }
 }
 

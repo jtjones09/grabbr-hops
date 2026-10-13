@@ -12,6 +12,7 @@
 //! gap: with three to choose from, a careless tap approves one time in three.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 /// What to do with one unknown machine's attempt to pair.
@@ -23,12 +24,20 @@ pub(crate) enum Admit {
     Closed,
     /// Already prompted for this machine moments ago.
     Repeat,
+    /// Another machine at the same address prompted moments ago.
+    Throttled,
 }
 
 pub(crate) struct PromptGate {
     opened: Option<Instant>,
+    /// When the window last opened while it was closed. Opening it again
+    /// while it is open moves `opened` and not this: the window never closed.
+    open_since: Option<Instant>,
     recent: RecentPrompts,
-    refusals: RefusalLog,
+    sources: RecentSources,
+    refusals: Tally,
+    throttled: Tally,
+    admitted: AdmittedLog,
 }
 
 impl PromptGate {
@@ -38,13 +47,20 @@ impl PromptGate {
     pub(crate) fn new() -> Self {
         Self {
             opened: None,
+            open_since: None,
             recent: RecentPrompts::new(),
-            refusals: RefusalLog::new(),
+            sources: RecentSources::new(),
+            refusals: Tally::new(),
+            throttled: Tally::new(),
+            admitted: AdmittedLog::new(),
         }
     }
 
     /// Someone opened the add-device flow on this machine.
     pub(crate) fn open(&mut self, now: Instant) {
+        if self.remaining(now).is_none() {
+            self.open_since = Some(now);
+        }
         self.opened = Some(now);
     }
 
@@ -56,30 +72,103 @@ impl PromptGate {
             .filter(|left| !left.is_zero())
     }
 
-    /// Whether `fingerprint`'s attempt may raise a prompt.
+    /// Whether `fingerprint`'s attempt may raise a prompt. `from` is the
+    /// address an unsolicited knock came from; `None` for this machine's own
+    /// dial, which nobody else can time.
     ///
     /// Only an admitted attempt is remembered for the repeat check. A knock
     /// refused while the window was closed must not suppress the one that
     /// arrives just after it opens, or the person who opened it waits for a
     /// prompt that never comes.
-    pub(crate) fn admit(&mut self, fingerprint: &str, now: Instant) -> Admit {
+    ///
+    /// A knock is also refused while another machine at its address prompted
+    /// less than [`RecentSources::WINDOW`] ago. The fingerprint is the
+    /// knocker's own choice, so a stranger minting a key per dial passed the
+    /// repeat check every time and raised a prompt per dial, measured at 120
+    /// a second from one host (#101). An address costs it something.
+    pub(crate) fn admit(&mut self, fingerprint: &str, from: Option<IpAddr>, now: Instant) -> Admit {
         if self.remaining(now).is_none() {
             return Admit::Closed;
+        }
+        let from = from.map(source_of);
+        if from.is_some_and(|ip| self.sources.taken_by_another(ip, fingerprint, now)) {
+            return Admit::Throttled;
         }
         if self.recent.seen_recently(fingerprint, now) {
             return Admit::Repeat;
         }
+        if let Some(ip) = from {
+            self.sources.record(ip, fingerprint, now);
+        }
         Admit::Prompt
     }
 
-    /// Record a refusal, and return a line to log when one is due.
+    /// Record a refusal, and return a summary when one is due.
     ///
     /// A stranger generating a fresh key per dial offers a new fingerprint every
-    /// time, measured at 120 a second from one host. One log line per refusal
-    /// would let anyone on the network fill the log, so refusals are counted and
-    /// summarised at most once per `RefusalLog::EVERY`.
-    pub(crate) fn note_refusal(&mut self, fingerprint: &str, now: Instant) -> Option<String> {
-        self.refusals.note(fingerprint, now)
+    /// time, measured at 120 a second from one host. One log line, or one line
+    /// in the app, per refusal would let anyone on the network fill both, so
+    /// refusals are counted and summarised at most once per [`Tally::EVERY`].
+    pub(crate) fn note_refusal(
+        &mut self,
+        fingerprint: &str,
+        from: Option<SocketAddr>,
+        now: Instant,
+    ) -> Option<Refused> {
+        self.refusals.note(now).map(|count| Refused {
+            count,
+            fingerprint: fingerprint.to_owned(),
+            from,
+            paired: None,
+            pair_again: None,
+        })
+    }
+
+    /// Record a knock held back by [`Admit::Throttled`], and return a line to
+    /// log when one is due.
+    pub(crate) fn note_throttled(
+        &mut self,
+        from: Option<SocketAddr>,
+        now: Instant,
+    ) -> Option<String> {
+        let count = self.throttled.note(now)?;
+        let from = from.map_or_else(|| "an unknown address".to_owned(), |a| a.ip().to_string());
+        Some(format!(
+            "held back {count} pairing request(s), the latest from {from}: another machine \
+             at that address was shown a prompt less than {} s ago",
+            RecentSources::WINDOW.as_secs()
+        ))
+    }
+
+    /// Record an admitted request from another machine. `Some(n)` when it
+    /// should be logged, `n` being how many before it were not.
+    pub(crate) fn note_admitted(&mut self, now: Instant) -> Option<u32> {
+        self.admitted.note(now)
+    }
+
+    /// Whether a prompt admitted at `admitted` may be shown again now, to a
+    /// frontend that was not attached when it was raised (#114).
+    ///
+    /// Only while the window is open, as for any prompt, and only for a request
+    /// admitted since it opened: opening add device for one machine must not
+    /// bring back a request some other machine made in an earlier window.
+    /// Opening add device again while the window is open starts a new window,
+    /// so what was admitted before that is not shown again. A machine still
+    /// asking knocks again, and its next knock is admitted in the new window.
+    pub(crate) fn replayable(&self, admitted: Instant, now: Instant) -> bool {
+        self.remaining(now).is_some() && self.opened.is_some_and(|opened| admitted >= opened)
+    }
+
+    /// Whether the window has stayed open from `admitted` until `now`, so a
+    /// prompt admitted then may still be approved (#107).
+    ///
+    /// A prompt lapses when the window closes, and opening add device again
+    /// afterwards does not bring it back. Opening it again while the window
+    /// is still open closes nothing, so a prompt already on screen can still
+    /// be answered, though a reopen ends its being shown again to a frontend
+    /// that attaches later ([`Self::replayable`]).
+    pub(crate) fn open_throughout(&self, admitted: Instant, now: Instant) -> bool {
+        self.remaining(now).is_some() && self.open_since.is_some_and(|since| admitted >= since)
     }
 }
 
@@ -109,7 +198,10 @@ impl RecentPrompts {
     }
 
     /// True if `fingerprint` raised a prompt within the suppression window.
-    /// Records it either way.
+    /// Records it only when it raises one: a refresh on every knock kept a
+    /// machine that knocks every second suppressed for good, so its card went
+    /// stale on screen while it was still asking, and a machine added again
+    /// soon after an attempt ended was never asked about at all.
     fn seen_recently(&mut self, fingerprint: &str, now: Instant) -> bool {
         if self.seen.len() >= Self::PRUNE_AT {
             self.seen
@@ -122,20 +214,183 @@ impl RecentPrompts {
                 self.seen.clear();
             }
         }
-        match self.seen.insert(fingerprint.to_owned(), now) {
-            None => false,
-            Some(at) => now.saturating_duration_since(at) < Self::WINDOW,
+        match self.seen.get(fingerprint) {
+            Some(at) if now.saturating_duration_since(*at) < Self::WINDOW => true,
+            _ => {
+                self.seen.insert(fingerprint.to_owned(), now);
+                false
+            }
         }
     }
 }
 
-/// Counts refusals between log lines.
-struct RefusalLog {
+/// Bounds the log lines written for admitted requests.
+///
+/// Each one is logged with its fingerprint, so a machine without a frontend
+/// attached can still be approved from the command line (#114). Admission is
+/// per fingerprint, though, so a stranger generating a fresh key per dial is
+/// admitted on every dial while the window is open. A handful of lines per
+/// period covers any real pairing; past that, requests are counted and the
+/// count goes on the next line written.
+struct AdmittedLog {
+    period: Option<Instant>,
+    lines: u32,
+    unlogged: u32,
+}
+
+impl AdmittedLog {
+    const EVERY: Duration = Duration::from_secs(10);
+    const LINES: u32 = 8;
+
+    fn new() -> Self {
+        Self {
+            period: None,
+            lines: 0,
+            unlogged: 0,
+        }
+    }
+
+    fn note(&mut self, now: Instant) -> Option<u32> {
+        if self
+            .period
+            .is_none_or(|start| now.saturating_duration_since(start) >= Self::EVERY)
+        {
+            self.period = Some(now);
+            self.lines = 0;
+        }
+        if self.lines < Self::LINES {
+            self.lines += 1;
+            Some(std::mem::take(&mut self.unlogged))
+        } else {
+            self.unlogged = self.unlogged.saturating_add(1);
+            None
+        }
+    }
+}
+
+/// What refusing knocks came to since the last summary.
+pub(crate) struct Refused {
+    /// Knocks refused since the last summary, the latest included.
+    pub(crate) count: u32,
+    /// The latest knock's certificate.
+    pub(crate) fingerprint: String,
+    /// Where the latest knock came from.
+    pub(crate) from: Option<SocketAddr>,
+    /// What this machine holds for the latest knock's machine, when it holds
+    /// a pairing with it: set by the caller, which holds the trust store and
+    /// the devices.
+    pub(crate) paired: Option<PairedHere>,
+    /// The name the latest knock's machine was listed under, when a build
+    /// before the trust store paired it and it has not been paired since
+    /// (#231): set by the caller, which holds the trust store.
+    pub(crate) pair_again: Option<String>,
+}
+
+/// A refused machine this machine is paired with, in the terms the app's
+/// line uses.
+pub(crate) struct PairedHere {
+    /// The name it was paired under.
+    pub(crate) name: String,
+    /// This machine may control it.
+    pub(crate) controlled_from_here: bool,
+    /// Every device here for it is switched off.
+    pub(crate) switched_off: bool,
+}
+
+impl Refused {
+    /// The daemon log's line, which names the certificate.
+    pub(crate) fn log_line(&self) -> String {
+        let at = self.from.map(|a| format!(" at {a}")).unwrap_or_default();
+        if self.count == 1 {
+            format!(
+                "refused a pairing request from {}{at}: add device is not open on this machine",
+                self.fingerprint
+            )
+        } else {
+            format!(
+                "refused {} pairing requests, the latest from {}{at}: add device is not open \
+                 on this machine",
+                self.count, self.fingerprint
+            )
+        }
+    }
+
+    /// The app's line: activity, not an error. Nobody at this machine asked
+    /// for it, and a stranger can cause it whenever it likes (#150).
+    ///
+    /// Worded to hold for every machine refused here: a stranger and one
+    /// this machine has removed. A machine paired with this one is named,
+    /// and not told to open add device, which does nothing for it; its
+    /// device here being switched off is said, since that is what the person
+    /// here chose.
+    pub(crate) fn notice(&self) -> String {
+        if let Some(paired) = &self.paired {
+            return paired.notice(self.count);
+        }
+        if let Some(name) = &self.pair_again {
+            return pair_again_notice(name, self.count);
+        }
+        let from = self
+            .from
+            .map_or_else(|| "a machine".to_owned(), |a| a.ip().to_string());
+        if self.count == 1 {
+            format!(
+                "Refused a connection from {from}: it is not paired to control this machine, \
+                 and add device is not open here."
+            )
+        } else {
+            format!(
+                "Refused {} connections from machines not paired to control this one, the \
+                 latest from {from}: add device is not open here.",
+                self.count
+            )
+        }
+    }
+}
+
+/// The app's line for refusing a machine paired with an older version of
+/// hops and not paired since (#231): what it is, and how to pair it again.
+pub(crate) fn pair_again_notice(name: &str, count: u32) -> String {
+    let refused = if count == 1 {
+        format!("Refused a connection from {name}")
+    } else {
+        format!("Refused {count} connections, the latest from {name}")
+    };
+    format!(
+        "{refused}: it was paired with an older version of hops and must be paired again. \
+         Open add device here and on it, and choose which machine controls which."
+    )
+}
+
+impl PairedHere {
+    fn notice(&self, count: u32) -> String {
+        let name = &self.name;
+        let refused = if count == 1 {
+            format!("Refused a connection from {name}")
+        } else {
+            format!("Refused {count} connections, the latest from {name}")
+        };
+        let why = if self.controlled_from_here {
+            "this machine controls it, and it may not control this one"
+        } else {
+            "its pairing does not let it control this machine"
+        };
+        let off = if self.switched_off {
+            format!(" Its device here is switched off; switch {name} on to use it.")
+        } else {
+            String::new()
+        };
+        format!("{refused}: {why}.{off}")
+    }
+}
+
+/// Counts events between summaries, one summary per [`Self::EVERY`] at most.
+struct Tally {
     last: Option<Instant>,
     since: u32,
 }
 
-impl RefusalLog {
+impl Tally {
     const EVERY: Duration = Duration::from_secs(10);
 
     fn new() -> Self {
@@ -145,7 +400,9 @@ impl RefusalLog {
         }
     }
 
-    fn note(&mut self, fingerprint: &str, now: Instant) -> Option<String> {
+    /// Count one. When a summary is due, how many it covers, this one
+    /// included.
+    fn note(&mut self, now: Instant) -> Option<u32> {
         self.since = self.since.saturating_add(1);
         if self
             .last
@@ -153,19 +410,65 @@ impl RefusalLog {
         {
             return None;
         }
-        let count = std::mem::take(&mut self.since);
         self.last = Some(now);
-        Some(if count == 1 {
-            format!(
-                "refused a pairing request from {fingerprint}: add device is not open \
-                 on this machine"
-            )
-        } else {
-            format!(
-                "refused {count} pairing requests, the latest from {fingerprint}: add \
-                 device is not open on this machine"
-            )
+        Some(std::mem::take(&mut self.since))
+    }
+}
+
+/// The address a knock is counted against. IPv6 by its /64: one host on a
+/// network is handed a whole /64 and can knock from any address in it.
+fn source_of(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+        }
+        v4 => v4,
+    }
+}
+
+/// Which machine each address last raised a prompt for, and when.
+///
+/// Anyone on the network can add to this, one entry per address, so entries
+/// older than the window are dropped and the map is bounded.
+struct RecentSources {
+    seen: HashMap<IpAddr, (String, Instant)>,
+}
+
+impl RecentSources {
+    /// How long an address that raised a prompt holds back other machines'
+    /// knocks from it.
+    const WINDOW: Duration = Duration::from_secs(10);
+
+    /// Prune once the map is larger than a real network explains.
+    const PRUNE_AT: usize = 256;
+
+    fn new() -> Self {
+        Self {
+            seen: HashMap::new(),
+        }
+    }
+
+    /// Whether a machine other than `fingerprint` raised a prompt from `ip`
+    /// within the window.
+    fn taken_by_another(&self, ip: IpAddr, fingerprint: &str, now: Instant) -> bool {
+        self.seen.get(&ip).is_some_and(|(by, at)| {
+            by != fingerprint && now.saturating_duration_since(*at) < Self::WINDOW
         })
+    }
+
+    fn record(&mut self, ip: IpAddr, fingerprint: &str, now: Instant) {
+        if self.seen.len() >= Self::PRUNE_AT {
+            self.seen
+                .retain(|_, (_, at)| now.saturating_duration_since(*at) < Self::WINDOW);
+            // Every address still here prompted within the window: hundreds of
+            // addresses at once is a flood, not a network. Bounded memory comes
+            // first; each of those addresses can prompt again.
+            if self.seen.len() >= Self::PRUNE_AT {
+                self.seen.clear();
+            }
+        }
+        self.seen.insert(ip, (fingerprint.to_owned(), now));
     }
 }
 
@@ -179,7 +482,7 @@ mod tests {
     fn a_knock_while_add_device_is_closed_raises_no_prompt() {
         let mut gate = PromptGate::new();
         let now = Instant::now();
-        assert_eq!(gate.admit("stranger", now), Admit::Closed);
+        assert_eq!(gate.admit("stranger", None, now), Admit::Closed);
     }
 
     #[test]
@@ -187,9 +490,9 @@ mod tests {
         let mut gate = PromptGate::new();
         let now = Instant::now();
         gate.open(now);
-        assert_eq!(gate.admit("peer", now + S), Admit::Prompt);
+        assert_eq!(gate.admit("peer", None, now + S), Admit::Prompt);
         assert_eq!(
-            gate.admit("peer", now + S),
+            gate.admit("peer", None, now + S),
             Admit::Repeat,
             "a machine retrying in a loop must raise one prompt, not one per retry"
         );
@@ -202,11 +505,11 @@ mod tests {
         let now = Instant::now();
         gate.open(now);
         assert_eq!(
-            gate.admit("early", now + PromptGate::WINDOW - S),
+            gate.admit("early", None, now + PromptGate::WINDOW - S),
             Admit::Prompt
         );
         assert_eq!(
-            gate.admit("late", now + PromptGate::WINDOW),
+            gate.admit("late", None, now + PromptGate::WINDOW),
             Admit::Closed,
             "a knock after the two minutes was still allowed to prompt"
         );
@@ -219,10 +522,10 @@ mod tests {
     fn a_knock_refused_before_pairing_opens_prompts_once_it_opens() {
         let mut gate = PromptGate::new();
         let now = Instant::now();
-        assert_eq!(gate.admit("peer", now), Admit::Closed);
+        assert_eq!(gate.admit("peer", None, now), Admit::Closed);
         gate.open(now + S / 2);
         assert_eq!(
-            gate.admit("peer", now + S),
+            gate.admit("peer", None, now + S),
             Admit::Prompt,
             "the knock refused half a second before the window opened suppressed \
              the one after it"
@@ -235,7 +538,7 @@ mod tests {
         let now = Instant::now();
         gate.open(now);
         gate.open(now + 100 * S);
-        assert_eq!(gate.admit("peer", now + 200 * S), Admit::Prompt);
+        assert_eq!(gate.admit("peer", None, now + 200 * S), Admit::Prompt);
     }
 
     /// Remote unauthenticated memory growth. A peer generating a fresh
@@ -271,6 +574,130 @@ mod tests {
         }
     }
 
+    // LEDGER G-17 | class B | 1 return value: RecentPrompts::seen_recently
+    /// A machine that keeps knocking once a second, as the add dial does, is
+    /// prompted for again once the window since its last prompt has passed:
+    /// its card stays live while it asks, and adding it again soon after an
+    /// attempt ended still asks the person here (#167).
+    #[test]
+    fn a_peer_still_knocking_is_prompted_again_after_the_window() {
+        let mut recent = RecentPrompts::new();
+        let t0 = Instant::now();
+        assert!(!recent.seen_recently("aa:bb:cc", t0));
+        let mut prompted = 0;
+        for s in 1..=6 {
+            if !recent.seen_recently("aa:bb:cc", t0 + Duration::from_secs(s)) {
+                prompted += 1;
+            }
+        }
+        assert!(
+            prompted >= 2,
+            "a machine knocking every second for six seconds was prompted for {prompted} \
+             more time(s): the suppression never lets it through again"
+        );
+    }
+
+    /// A frontend that attaches while add device is open is shown what was
+    /// admitted since the window opened, and nothing else (#114, #195).
+    // LEDGER T7 | class B | 1 return value: PromptGate::replayable
+    #[test]
+    fn a_prompt_is_shown_again_only_inside_the_window_it_was_raised_in() {
+        let mut gate = PromptGate::new();
+        let now = Instant::now();
+        gate.open(now);
+        assert!(
+            gate.replayable(now + S, now + 30 * S),
+            "a request admitted half a minute ago, with the window open, was not \
+             shown to a frontend that attached since"
+        );
+        assert!(
+            !gate.replayable(now + 100 * S, now + PromptGate::WINDOW + 5 * S),
+            "a request 25 seconds old was shown again after the window closed"
+        );
+        gate.open(now + 200 * S);
+        assert!(
+            !gate.replayable(now + S, now + 201 * S),
+            "opening add device again brought back a request from an earlier window"
+        );
+        assert!(gate.replayable(now + 200 * S, now + 201 * S));
+    }
+
+    /// A request from an earlier window is not replayed into a later one, even
+    /// when it is under two minutes old. Someone who opens add device to pair
+    /// one machine must not be shown another machine's request from before.
+    // LEDGER T15 | class B | 1 return value: PromptGate::replayable
+    #[test]
+    fn a_request_from_an_earlier_window_is_not_replayed_in_a_new_one() {
+        let mut gate = PromptGate::new();
+        let now = Instant::now();
+        gate.open(now);
+        let from_x = now + 100 * S;
+        gate.open(now + 130 * S);
+        assert!(
+            !gate.replayable(from_x, now + 135 * S),
+            "X's request from the earlier window was replayed in the new one"
+        );
+        assert!(gate.replayable(now + 131 * S, now + 135 * S));
+    }
+
+    /// Opening add device again while the window is still open starts a new
+    /// window: what was admitted before the reopen is not replayed after it.
+    // LEDGER T16 | class B | 1 return value: PromptGate::replayable
+    #[test]
+    fn reopening_add_device_inside_the_window_starts_a_new_one_for_replay() {
+        let mut gate = PromptGate::new();
+        let now = Instant::now();
+        gate.open(now);
+        let from_x = now + 10 * S;
+        assert!(gate.replayable(from_x, now + 20 * S));
+        gate.open(now + 30 * S);
+        assert!(
+            !gate.replayable(from_x, now + 40 * S),
+            "a request admitted before add device was reopened was replayed after it"
+        );
+        assert!(
+            gate.replayable(now + 30 * S, now + 40 * S),
+            "a request admitted the instant the window reopened was not replayed"
+        );
+    }
+
+    /// Each admitted request is logged with its fingerprint, but a stranger
+    /// offering a fresh key per dial cannot turn that into a line per dial.
+    // LEDGER T8 | class B | 1 return value: PromptGate::note_admitted
+    #[test]
+    fn admitted_requests_are_each_logged_until_they_become_a_flood() {
+        let mut gate = PromptGate::new();
+        let now = Instant::now();
+        assert_eq!(
+            gate.note_admitted(now),
+            Some(0),
+            "the first request is logged"
+        );
+        assert_eq!(
+            gate.note_admitted(now + S),
+            Some(0),
+            "a second machine a second later is logged too"
+        );
+        let logged = (0..1200u64)
+            .filter(|i| {
+                gate.note_admitted(now + 2 * S + Duration::from_millis(i * 5))
+                    .is_some()
+            })
+            .count();
+        assert!(
+            logged <= AdmittedLog::LINES as usize,
+            "1,200 admitted requests in six seconds wrote {logged} lines"
+        );
+        let next = gate
+            .note_admitted(now + 11 * S)
+            .expect("a new period logs again");
+        assert_eq!(
+            next as usize,
+            1200 - logged,
+            "the requests that were not logged were not counted"
+        );
+    }
+
     /// A flood of refusals becomes a handful of log lines, and none is lost
     /// from the count.
     #[test]
@@ -281,9 +708,11 @@ mod tests {
             .filter_map(|i| {
                 gate.note_refusal(
                     &format!("fp-{i}"),
+                    None,
                     now + Duration::from_millis(i as u64 * 8),
                 )
             })
+            .map(|r| r.log_line())
             .collect();
         assert!(
             lines.len() <= 2,
@@ -295,11 +724,163 @@ mod tests {
             "the first refusal is logged at once"
         );
         let later = gate
-            .note_refusal("fp-last", now + 11 * S)
-            .expect("a line is due after ten seconds");
+            .note_refusal("fp-last", None, now + 11 * S)
+            .expect("a line is due after ten seconds")
+            .log_line();
         assert!(
             later.contains("refused 1200 pairing requests"),
             "the summary lost count: {later}"
+        );
+    }
+
+    fn at(ip: &str) -> Option<IpAddr> {
+        Some(ip.parse().expect("an address"))
+    }
+
+    /// A stranger minting a key per knock passes the repeat check every time.
+    /// Counted by its address, it raises one prompt per window (#101).
+    // LEDGER T2371 | class B | 1 return value: PromptGate::admit
+    #[test]
+    fn a_stranger_minting_a_key_per_knock_prompts_once_per_address_window() {
+        let mut gate = PromptGate::new();
+        let now = Instant::now();
+        gate.open(now);
+        let prompts = (0..1000u64)
+            .filter(|i| {
+                gate.admit(
+                    &format!("fp-{i}"),
+                    at("192.0.2.7"),
+                    now + Duration::from_millis(i * 5),
+                ) == Admit::Prompt
+            })
+            .count();
+        assert_eq!(
+            prompts, 1,
+            "1,000 knocks with fresh keys from one address in five seconds raised \
+             {prompts} prompts"
+        );
+        assert_eq!(
+            gate.admit("fp-later", at("192.0.2.7"), now + RecentSources::WINDOW + S),
+            Admit::Prompt,
+            "the address may prompt again once the window has passed"
+        );
+    }
+
+    /// The limit delays a second machine behind the same address; it must not
+    /// shut it out. A machine being added knocks every second, and a throttled
+    /// knock must not count as a prompt shown, or every later knock would be
+    /// a repeat of a prompt nobody saw.
+    #[test]
+    fn a_second_machine_at_the_same_address_prompts_once_the_window_passes() {
+        let mut gate = PromptGate::new();
+        let now = Instant::now();
+        gate.open(now);
+        assert_eq!(gate.admit("desk", at("192.0.2.7"), now), Admit::Prompt);
+        let mut second = None;
+        for i in 1..=15u32 {
+            let when = now + S * i;
+            if gate.admit("laptop", at("192.0.2.7"), when) == Admit::Prompt {
+                second = Some(when);
+                break;
+            }
+        }
+        let second = second.expect("the second machine never raised a prompt");
+        assert!(
+            second.duration_since(now) >= RecentSources::WINDOW,
+            "the second machine prompted {:?} after the first",
+            second.duration_since(now)
+        );
+    }
+
+    /// One machine retrying is still a repeat, and our own dial is never
+    /// counted against an address.
+    #[test]
+    fn the_limit_leaves_repeats_and_our_own_dials_alone() {
+        let mut gate = PromptGate::new();
+        let now = Instant::now();
+        gate.open(now);
+        assert_eq!(gate.admit("desk", at("192.0.2.7"), now), Admit::Prompt);
+        assert_eq!(gate.admit("desk", at("192.0.2.7"), now + S), Admit::Repeat);
+        assert_eq!(gate.admit("receiver", None, now + S), Admit::Prompt);
+        assert_eq!(gate.admit("other", None, now + S), Admit::Prompt);
+    }
+
+    /// An IPv6 host holds a whole /64; it is one source. An IPv4 address
+    /// written as IPv6 is the IPv4 address.
+    #[test]
+    fn a_source_is_an_ipv4_address_or_an_ipv6_64() {
+        let mut gate = PromptGate::new();
+        let now = Instant::now();
+        gate.open(now);
+        assert_eq!(gate.admit("a", at("2001:db8:1:2::10"), now), Admit::Prompt);
+        assert_eq!(
+            gate.admit("b", at("2001:db8:1:2::99"), now),
+            Admit::Throttled,
+            "another address in the same /64 is the same source"
+        );
+        assert_eq!(gate.admit("c", at("2001:db8:1:3::10"), now), Admit::Prompt);
+        assert_eq!(gate.admit("d", at("192.0.2.9"), now), Admit::Prompt);
+        assert_eq!(
+            gate.admit("e", at("::ffff:192.0.2.9"), now),
+            Admit::Throttled,
+            "an IPv4-mapped address is the IPv4 address"
+        );
+    }
+
+    /// Each address costs an entry, and addresses are cheap on a network a
+    /// stranger shares.
+    #[test]
+    fn a_flood_of_addresses_cannot_grow_memory_without_bound() {
+        let mut gate = PromptGate::new();
+        let now = Instant::now();
+        gate.open(now);
+        for i in 0..50_000u32 {
+            // Each in its own /64 of the documentation prefix.
+            let ip = IpAddr::V6(Ipv6Addr::new(
+                0x2001,
+                0xdb8,
+                (i >> 16) as u16,
+                i as u16,
+                0,
+                0,
+                0,
+                1,
+            ));
+            gate.admit(&format!("fp-{i}"), Some(ip), now);
+        }
+        assert!(
+            gate.sources.seen.len() < RecentSources::PRUNE_AT * 2,
+            "50,000 addresses left {} entries resident",
+            gate.sources.seen.len()
+        );
+    }
+
+    /// The app's line for refused knocks names where they came from and says
+    /// why, without the certificate a stranger chose.
+    #[test]
+    fn a_refusal_summary_says_where_and_why() {
+        let mut gate = PromptGate::new();
+        let now = Instant::now();
+        let from: SocketAddr = "192.0.2.7:50123".parse().expect("addr");
+        let first = gate
+            .note_refusal("aa:bb", Some(from), now)
+            .expect("the first refusal is summarised at once");
+        assert_eq!(
+            first.notice(),
+            "Refused a connection from 192.0.2.7: it is not paired to control this \
+             machine, and add device is not open here."
+        );
+        assert!(first.log_line().contains("aa:bb") && first.log_line().contains("192.0.2.7"));
+        for i in 0..5u32 {
+            assert!(gate.note_refusal("x", Some(from), now + S * i).is_none() || i == 0);
+        }
+        let later = gate
+            .note_refusal("cc:dd", Some(from), now + 11 * S)
+            .expect("a summary is due");
+        assert!(
+            later.notice().starts_with("Refused 6 connections"),
+            "{}",
+            later.notice()
         );
     }
 }

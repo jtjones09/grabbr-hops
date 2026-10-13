@@ -27,7 +27,19 @@
 //!    stays shareable. You cannot hand anyone a debug log today without handing
 //!    them your typing.
 
+use std::path::PathBuf;
 use std::time::Duration;
+
+/// Where keystrokes are written: `keystrokes.log` in hops' log directory
+/// ([`crate::paths::log_dir`]), beside the daemon's log but never in it.
+/// `HOPS_LOG_FILE` does not move it, so keystrokes never land in a file
+/// named for the general log. Creates the directory. `None` when there is
+/// no log directory.
+pub fn keystroke_log_path() -> Option<PathBuf> {
+    let dir = crate::paths::log_dir()?;
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir.join("keystrokes.log"))
+}
 
 /// Longest a single arming may last. Beyond this, re-arm deliberately.
 pub const MAX_DURATION: Duration = Duration::from_secs(60 * 60);
@@ -78,16 +90,6 @@ mod armed {
         expired: bool,
     }
 
-    fn log_path() -> PathBuf {
-        let mut p = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default();
-        p.push("hops/logs");
-        let _ = std::fs::create_dir_all(&p);
-        p.push("keystrokes.log");
-        p
-    }
-
     #[cfg(unix)]
     fn create_private(path: &std::path::Path) -> std::io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
@@ -116,7 +118,13 @@ mod armed {
             );
             return None;
         };
-        let path = log_path();
+        let Some(path) = super::keystroke_log_path() else {
+            log::error!(
+                "keystroke logging requested but there is no log directory: the \
+                 variable it comes from is not set"
+            );
+            return None;
+        };
         let file = match create_private(&path) {
             Ok(f) => f,
             Err(e) => {

@@ -1,4 +1,16 @@
+#[cfg(windows)]
 use windows::Win32::Foundation::RECT;
+
+/// Win32's `RECT`, so this geometry is tested on every OS.
+#[cfg(not(windows))]
+#[allow(clippy::upper_case_acronyms)]
+#[derive(Clone, Copy)]
+pub(crate) struct RECT {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
 
 use crate::Position;
 
@@ -70,30 +82,69 @@ pub(crate) fn entered_barrier(
     .find(|&pos| moved_across_boundary(prev_pos, curr_pos, displays, pos))
 }
 
+/// Clamps `point` to the display that contains `prev_point`, inclusive: where
+/// the OS leaves the cursor when a move leaves that display.
 ///
-/// clamp point to display bounds
-///
-/// # Arguments
-///
-/// * `prev_point`: coordinates, the cursor was before entering, within bounds of a display
-/// * `entry_point`: point to clamp
-///
-/// returns: (i32, i32), the corrected entry point
-///
+/// Runs inside the mouse hook, so it cannot panic: `None` when no display
+/// contains `prev_point`. A display that contains a point is at least one
+/// pixel wide and high, so its bounds are ordered.
 pub(crate) fn clamp_to_display_bounds(
     display_regions: &[RECT],
     prev_point: (i32, i32),
     point: (i32, i32),
-) -> (i32, i32) {
-    /* find display where movement came from */
+) -> Option<(i32, i32)> {
     let display = display_regions
         .iter()
-        .find(|&d| is_within_dp_region(prev_point, d))
-        .unwrap();
-
-    /* clamp to bounds (inclusive) */
+        .find(|&d| is_within_dp_region(prev_point, d))?;
     let (x, y) = point;
     let (min_x, max_x) = (display.left, display.right - 1);
     let (min_y, max_y) = (display.top, display.bottom - 1);
-    (x.clamp(min_x, max_x), y.clamp(min_y, max_y))
+    Some((x.max(min_x).min(max_x), y.max(min_y).min(max_y)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DESK: RECT = RECT {
+        left: 0,
+        top: 0,
+        right: 1920,
+        bottom: 1080,
+    };
+
+    #[test]
+    fn a_move_past_the_right_edge_enters_the_right_barrier_at_the_last_pixel() {
+        let displays = [DESK];
+        assert_eq!(entered_barrier((1900, 500), (1905, 500), &displays), None);
+        let entered = entered_barrier((1919, 500), (1925, 500), &displays);
+        assert!(matches!(entered, Some(Position::Right)));
+        assert_eq!(
+            clamp_to_display_bounds(&displays, (1919, 500), (1925, 500)),
+            Some((1919, 500))
+        );
+        assert_eq!(
+            clamp_to_display_bounds(&displays, (3, 2), (-4, -9)),
+            Some((0, 0))
+        );
+    }
+
+    #[test]
+    fn a_crossing_with_no_source_display_does_not_panic() {
+        assert_eq!(clamp_to_display_bounds(&[], (10, 10), (-5, 10)), None);
+        assert_eq!(
+            clamp_to_display_bounds(&[DESK], (5000, 10), (5005, 10)),
+            None
+        );
+        let empty = RECT {
+            left: 100,
+            top: 100,
+            right: 100,
+            bottom: 100,
+        };
+        assert_eq!(
+            clamp_to_display_bounds(&[empty], (100, 100), (99, 100)),
+            None
+        );
+    }
 }

@@ -52,11 +52,30 @@ DEVELOPER_ID="Developer ID Application: … (TEAMID)" NOTARY_PROFILE=hops-notary
 
 ## In CI (GitHub Actions)
 
-`release.yml` **already signs + notarizes the macOS `.dmg`** — you just add these
-repo **secrets** (Settings → Secrets and variables → Actions). With them set, a
-tagged release produces a signed, notarized `hops-macos-universal.dmg`; without
-them (e.g. on a fork) those steps are skipped and only the unsigned `.tar.gz` is
-built, so the workflow never fails for lack of credentials.
+`release.yml` signs and notarizes the macOS `.dmg` in its own job,
+`sign-macos`. That job runs no `cargo`: it receives only the unsigned universal
+build from the build job (the binary, `LICENSE`, `THIRD-PARTY-NOTICES.txt` and
+the SBOMs, which go into the app's `Contents/Resources`), bundles it with
+`package-macos.sh`, signs it with
+`sign-macos.sh`, and checks the result with `verify-macos-release.sh` before
+uploading it. The build job compiles every dependency's build script and proc
+macro, so no secret is visible there.
+
+Only `sign-macos` names the **`macos-signing` environment**, and the
+secrets belong there. The workflow cannot enforce this itself: GitHub
+creates an environment a job names without any protection, and
+repository-level secrets are readable by every job in every workflow, on
+any branch. Set it up once, before the first release that signs:
+
+1. Settings → Environments → `macos-signing` (create it if it is not
+   there) → Deployment branches and tags → Selected branches and tags:
+   add the tag rule `v*` and the branch rule `release/*`.
+2. Add the six secrets below as environment secrets there.
+3. Delete the repository-level `MACOS_*` secrets of the same names
+   (Settings → Secrets and variables → Actions).
+
+Until all three are done, a run from any branch can read the signing
+secrets.
 
 | secret | what |
 | --- | --- |
@@ -67,11 +86,35 @@ built, so the workflow never fails for lack of credentials.
 | `MACOS_NOTARY_KEY_ID` | the Key ID |
 | `MACOS_NOTARY_ISSUER` | the Issuer ID |
 
+`sign-macos` fails when any of the six is missing, on every run. A tag whose
+run cannot produce a verified dmg publishes nothing, and the publish job
+refuses a release that lacks any of its assets or whose assets do not match
+`SHA256SUMS`.
+
+To get a signed dmg without releasing, run the workflow by hand (Actions →
+release → Run workflow) from a `release/*` branch or a `v*` tag. Every job
+except publish runs, and the dmg is attached to the run as the
+`hops-macos-universal-dmg` artifact. Once the environment is limited to
+those refs as above, a run from any other branch stops at `sign-macos`
+without reading a secret.
+
+`verify-macos-release.sh` passes only when `spctl` reports
+`source=Notarized Developer ID` for the dmg and for the app inside it, both
+carry a stapled ticket, the app is signed as `com.grabbr.hops` by team
+`9V42Q953X9` (`TeamIdentifier` in `codesign -dv`), and it carries
+its licence, notices, an SBOM per target and a binary built with
+`cargo auditable`. Run it on
+any dmg you are about to distribute:
+
+```sh
+scripts/verify-macos-release.sh hops-macos-universal.dmg
+```
+
 The workflow imports the cert into a temporary keychain
-([Apple-Actions/import-codesign-certs](https://github.com/Apple-Actions/import-codesign-certs)),
-decodes the `.p8` to a temp file, then runs `package-macos.sh` + `sign-macos.sh`
-on the universal binary. `sign-macos.sh` signs in a private temp workspace, so it
-also works locally from an iCloud-synced checkout (no `xattr` dance needed).
+([Apple-Actions/import-codesign-certs](https://github.com/Apple-Actions/import-codesign-certs))
+and decodes the `.p8` to a temp file readable only by the runner user.
+`sign-macos.sh` signs in a private temp workspace, so it also works locally from
+an iCloud-synced checkout (no `xattr` dance needed).
 
 ## Notes
 

@@ -38,8 +38,10 @@ The harness already lives in the repo: [`crates/hops-slint/examples/render_png.r
 3. **Look** — `Read` the PNG. Actually study it.
 4. **Critique** against the target (the user's reference image, or plain good
    taste). Be your own harshest reviewer — see the checklist below.
-5. **Iterate** until it's genuinely right. *Then* show the user (copy the PNG
-   somewhere they can open it, e.g. `~/hops/`, and/or relaunch the live app).
+5. **Iterate** until it's genuinely right. *Then* show the user: keep the
+   render in the session scratchpad and hand it over with the file-sending
+   tool, and/or relaunch the live app. Never write into the user's home
+   directory.
 
 Do NOT hand the user a screenshot to QA for you. Render, review, fix, and only
 surface it when you'd be proud of it.

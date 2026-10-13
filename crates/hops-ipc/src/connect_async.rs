@@ -10,23 +10,16 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 use tokio_stream::wrappers::LinesStream;
 
 #[cfg(unix)]
-use tokio::net::UnixStream;
-
+type Conn = tokio::net::UnixStream;
 #[cfg(windows)]
-use tokio::net::TcpStream;
+type Conn = tokio::net::windows::named_pipe::NamedPipeClient;
 
 pub struct AsyncFrontendEventReader {
-    #[cfg(unix)]
-    lines_stream: LinesStream<BufReader<ReadHalf<UnixStream>>>,
-    #[cfg(windows)]
-    lines_stream: LinesStream<BufReader<ReadHalf<TcpStream>>>,
+    lines_stream: LinesStream<BufReader<ReadHalf<Conn>>>,
 }
 
 pub struct AsyncFrontendRequestWriter {
-    #[cfg(unix)]
-    tx: WriteHalf<UnixStream>,
-    #[cfg(windows)]
-    tx: WriteHalf<TcpStream>,
+    tx: WriteHalf<Conn>,
 }
 
 impl Stream for AsyncFrontendEventReader {
@@ -56,16 +49,20 @@ impl AsyncFrontendRequestWriter {
 }
 
 /// Connect to the daemon on this platform's endpoint,
-/// [`DaemonEndpoint::of_this_platform`], and present the token.
+/// [`DaemonEndpoint::of_this_platform`], and make the two-way proof.
 pub async fn connect_async(
     timeout: Option<Duration>,
 ) -> Result<(AsyncFrontendEventReader, AsyncFrontendRequestWriter), ConnectionError> {
     connect_async_to(&DaemonEndpoint::of_this_platform()?, timeout).await
 }
 
-/// Connect to the daemon listening on `endpoint`, and present the token.
+/// Connect to the daemon listening on `endpoint`, and make the two-way proof
+/// ([`crate::proof`]).
 ///
-/// Waits for the endpoint to come up, for at most `timeout` if one is given.
+/// Waits for the endpoint to come up, for at most `timeout` if one is given,
+/// then for at most [`crate::PROOF_WITHIN`] for the daemon to prove it holds
+/// the token. Fails with [`ConnectionError::Unproven`] when what answers
+/// does not: nothing but a random challenge has been sent to it then.
 pub async fn connect_async_to(
     endpoint: &DaemonEndpoint,
     timeout: Option<Duration>,
@@ -78,40 +75,26 @@ pub async fn connect_async_to(
     } else {
         wait_for_service(endpoint).await?
     };
-    #[cfg(unix)]
-    let (rx, tx): (ReadHalf<UnixStream>, WriteHalf<UnixStream>) = tokio::io::split(stream);
-    #[cfg(windows)]
-    let (rx, tx): (ReadHalf<TcpStream>, WriteHalf<TcpStream>) = tokio::io::split(stream);
-    let buf_reader = BufReader::new(rx);
-    let lines = buf_reader.lines();
-    let lines_stream = LinesStream::new(lines);
-    let reader = AsyncFrontendEventReader { lines_stream };
-    let mut writer = AsyncFrontendRequestWriter { tx };
-    // The token is the FIRST line on every connection — the daemon hangs up on
-    // anything that opens the socket without it. See `hops_ipc::token`.
-    writer.authenticate().await?;
-    Ok((reader, writer))
+    let token = crate::token::read()?;
+    let (rx, mut tx) = tokio::io::split(stream);
+    let mut buf_reader = BufReader::new(rx);
+    crate::proof::prove_to_daemon(&mut buf_reader, &mut tx, &token).await?;
+    let lines_stream = LinesStream::new(buf_reader.lines());
+    Ok((
+        AsyncFrontendEventReader { lines_stream },
+        AsyncFrontendRequestWriter { tx },
+    ))
 }
 
-impl AsyncFrontendRequestWriter {
-    /// Present the IPC token. Must precede any request on the connection.
-    async fn authenticate(&mut self) -> Result<(), ConnectionError> {
-        let token = crate::token::read()?;
-        self.tx.write_all(format!("{token}\n").as_bytes()).await?;
-        self.tx.flush().await?;
-        Ok(())
-    }
-}
-
-/// wait for the lan-mouse socket to come online
+/// wait for the daemon's socket to come online
 #[cfg(unix)]
-async fn wait_for_service(endpoint: &DaemonEndpoint) -> Result<UnixStream, ConnectionError> {
+async fn wait_for_service(endpoint: &DaemonEndpoint) -> Result<Conn, ConnectionError> {
     let DaemonEndpoint::Unix(socket_path) = endpoint else {
         return Err(ConnectionError::UnsupportedEndpoint(endpoint.clone()));
     };
     let mut duration = Duration::from_millis(10);
     loop {
-        if let Ok(stream) = UnixStream::connect(socket_path).await {
+        if let Ok(stream) = tokio::net::UnixStream::connect(socket_path).await {
             break Ok(stream);
         }
         // a signaling mechanism or inotify could be used to
@@ -120,13 +103,16 @@ async fn wait_for_service(endpoint: &DaemonEndpoint) -> Result<UnixStream, Conne
     }
 }
 
+/// wait for the daemon's pipe to come online
 #[cfg(windows)]
-async fn wait_for_service(endpoint: &DaemonEndpoint) -> Result<TcpStream, ConnectionError> {
-    let DaemonEndpoint::Tcp(addr) = endpoint;
+async fn wait_for_service(endpoint: &DaemonEndpoint) -> Result<Conn, ConnectionError> {
+    let DaemonEndpoint::Pipe(name) = endpoint else {
+        return Err(ConnectionError::UnsupportedEndpoint(endpoint.clone()));
+    };
     let mut duration = Duration::from_millis(10);
     loop {
-        if let Ok(stream) = TcpStream::connect(*addr).await {
-            break Ok(stream);
+        if let Ok(pipe) = crate::windows::open_pipe_now(name) {
+            break Ok(pipe);
         }
         tokio::time::sleep(exponential_back_off(&mut duration)).await;
     }

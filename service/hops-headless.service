@@ -1,7 +1,8 @@
-# hops-headless.service — HEADLESS Linux server (no display).
+# hops-headless.service — HEADLESS Linux server (no monitor, no login).
 #
-# Runs the hops daemon as a background service with no graphical session, so a
-# server can act as a KVM node you cross onto and control over the network.
+# Runs the hops daemon as a background service with no monitor and no login, so
+# a server can act as a KVM node you cross onto and control over the network.
+# It still needs a display server; see below.
 #
 # Install (as a user service):
 #   mkdir -p ~/.config/systemd/user

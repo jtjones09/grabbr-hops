@@ -7,6 +7,20 @@
 # (see the README "Quick start").
 
 $ErrorActionPreference = 'Stop'
+
+# Refuse to go on elevated, before building, writing or starting anything:
+# hops is never elevated, and hops.exe refuses to run so. Under UAC the token
+# is in the Administrators role only when it is elevated.
+$me = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+if ($me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Error ("This PowerShell is elevated. hops runs as you and is never " +
+        "elevated. Open a new, normal PowerShell and run this script again. " +
+        "If User Account Control is turned off for your account, every " +
+        "PowerShell is elevated: use a standard account, or turn User " +
+        "Account Control on.") -ErrorAction Continue
+    exit 1
+}
+
 $repo = $PSScriptRoot
 $bin  = Join-Path $repo 'target\release\hops.exe'
 
@@ -17,14 +31,16 @@ Pop-Location
 if (-not (Test-Path $bin)) { throw "build did not produce $bin" }
 
 $work = Join-Path $env:USERPROFILE 'hops'
-New-Item -ItemType Directory -Force -Path (Join-Path $work 'logs') | Out-Null
+New-Item -ItemType Directory -Force -Path $work | Out-Null
 
-# Daemon: a .cmd sets the log + runs it; a .vbs launches that .cmd hidden (no
-# console flash). Tray: a .vbs launches `hops gui --hidden`.
+# Daemon: a .cmd sets the log level + runs it; a .vbs launches that .cmd hidden
+# (no console flash). Tray: a .vbs launches `hops gui --hidden`. hops opens its
+# own log (%LOCALAPPDATA%\hops\logs), capped and rotated, so its output is not
+# redirected anywhere.
 Set-Content -Encoding ASCII (Join-Path $work 'hops-daemon.cmd') @"
 @echo off
 set "HOPS_LOG_LEVEL=info"
-"$bin" daemon >> "%USERPROFILE%\hops\logs\daemon.log" 2>&1
+"$bin" daemon
 "@
 Set-Content -Encoding ASCII (Join-Path $work 'hops-daemon.vbs') @"
 Set s = CreateObject("WScript.Shell")

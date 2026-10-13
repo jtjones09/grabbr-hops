@@ -1,4 +1,4 @@
-//! End-to-end check of the IPC token handshake over a REAL socket.
+//! End-to-end check of the IPC two-way proof over a REAL socket or pipe.
 //!
 //! The unit tests in `listen.rs` drive the server half over an in-memory duplex,
 //! which proves the gate refuses attackers but says nothing about whether a
@@ -40,7 +40,7 @@ fn isolate() -> PathBuf {
 }
 
 /// An endpoint of this test's own: a socket in the scratch directory, or a
-/// loopback port the system picks.
+/// pipe named for this process.
 fn own_endpoint(dir: &std::path::Path) -> DaemonEndpoint {
     #[cfg(unix)]
     {
@@ -49,7 +49,10 @@ fn own_endpoint(dir: &std::path::Path) -> DaemonEndpoint {
     #[cfg(windows)]
     {
         let _ = dir;
-        DaemonEndpoint::Tcp("127.0.0.1:0".parse().expect("a loopback address"))
+        DaemonEndpoint::Pipe(format!(
+            r"\\.\pipe\hops-test-roundtrip-{}",
+            std::process::id()
+        ))
     }
 }
 
@@ -80,33 +83,32 @@ async fn a_real_frontend_authenticates_and_is_heard() {
         "32 random bytes, hex encoded"
     );
 
-    let (_reader, mut writer) = tokio::time::timeout(
-        Duration::from_secs(5),
-        connect_async_to(listener.endpoint(), Some(Duration::from_secs(5))),
-    )
-    .await
-    .expect("connect must not hang")
-    .expect("a frontend must be able to connect");
-
-    writer
-        .request(FrontendRequest::Enumerate())
-        .await
-        .expect("request should send");
-
-    // Drain until the request arrives. `Sync` is emitted once the token is
-    // seen, so it is not evidence of the request; keep reading past it.
-    let waiting = std::time::Instant::now();
-    let heard = tokio::time::timeout(Duration::from_secs(5), async {
+    // The daemon answers the frontend's challenge only while its loop runs,
+    // so the frontend and the listener are driven together.
+    let endpoint = listener.endpoint().clone();
+    let frontend = async {
+        let (reader, mut writer) =
+            connect_async_to(&endpoint, Some(Duration::from_secs(5))).await?;
+        writer.request(FrontendRequest::Enumerate()).await?;
+        Ok::<_, hops_ipc::IpcError>((std::time::Instant::now(), reader, writer))
+    };
+    // Drain until the request arrives. `Sync` is emitted once the proof is
+    // made, so it is not evidence of the request; keep reading past it.
+    let daemon = async {
         loop {
             match listener.next().await {
                 Some(Ok(FrontendRequest::Sync)) => continue,
-                other => break other,
+                other => break (other, std::time::Instant::now()),
             }
         }
+    };
+    let (sent, (heard, heard_at)) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(frontend, daemon)
     })
     .await
     .expect("the daemon must hear an authenticated request, not hang up on it");
-    let took = waiting.elapsed();
+    let (sent_at, _reader, _writer) = sent.expect("a frontend must be able to connect and send");
+    let took = heard_at.saturating_duration_since(sent_at);
 
     assert!(
         matches!(heard, Some(Ok(FrontendRequest::Enumerate()))),

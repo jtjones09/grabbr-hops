@@ -11,7 +11,7 @@ use futures_core::Stream;
 
 use input_event::{Event, KeyboardEvent, scancode};
 
-pub use error::{CaptureCreationError, CaptureError, InputCaptureError};
+pub use error::{CaptureCreationError, CaptureError, InputCaptureError, Permission, Restart};
 
 pub mod error;
 
@@ -26,6 +26,16 @@ mod layer_shell;
 
 #[cfg(windows)]
 mod windows;
+
+// Built for tests on every OS, so the policy the Windows backend relies on is
+// tested where there is no Windows to run it.
+#[cfg(any(windows, test))]
+mod event_queue;
+
+// The Windows backend's display geometry, also built for tests elsewhere.
+#[cfg(all(test, not(windows)))]
+#[path = "windows/display_util.rs"]
+mod display_util;
 
 #[cfg(x11)]
 mod x11;
@@ -284,7 +294,19 @@ impl Stream for InputCapture {
             .unwrap_or(0);
 
         match len {
-            0 => Poll::Pending,
+            0 => {
+                // A crossing no client takes: no handle receives its events,
+                // so the release bind could never be seen while the backend
+                // holds the pointer. Give it back at once (#240).
+                if event == CaptureEvent::Begin {
+                    log::warn!("a crossing at the {pos} edge that no client takes: releasing it");
+                    self.capture.release_unclaimed();
+                }
+                // The backend was polled to Ready, so nothing will wake this
+                // task for its next event unless it is polled again.
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
             1 => Poll::Ready(Some(Ok((
                 self.position_map.get(&pos).expect("no id")[0],
                 event,
@@ -334,6 +356,11 @@ trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + U
     /// release mouse
     async fn release(&mut self) -> Result<(), CaptureError>;
 
+    /// Give the pointer back now, without waiting: a crossing reached the
+    /// stream for an edge no client takes any more. Backends that cannot
+    /// hold the pointer without a client do nothing.
+    fn release_unclaimed(&mut self) {}
+
     /// destroy the input capture
     async fn terminate(&mut self) -> Result<(), CaptureError>;
 }
@@ -375,6 +402,7 @@ async fn create(
         return b;
     }
 
+    let mut failures = Vec::new();
     for backend in [
         #[cfg(libei)]
         Backend::InputCapturePortal,
@@ -393,10 +421,23 @@ async fn create(
                 return Ok(b);
             }
             Err(e) if e.cancelled_by_user() => return Err(e),
-            Err(e) => log::warn!("{backend} input capture backend unavailable: {e}"),
+            Err(e) => {
+                log::warn!("{backend} input capture backend unavailable: {e}");
+                failures.push(e);
+            }
         }
     }
-    Err(CaptureCreationError::NoAvailableBackend)
+    Err(when_none_started(failures))
+}
+
+/// What to report once every backend failed: the first failure that names a
+/// missing permission, since it says what the user can change (#91), and
+/// otherwise that no backend is available.
+fn when_none_started(failures: Vec<CaptureCreationError>) -> CaptureCreationError {
+    failures
+        .into_iter()
+        .find(|e| e.missing_permissions().is_some())
+        .unwrap_or(CaptureCreationError::NoAvailableBackend)
 }
 
 #[cfg(test)]
@@ -547,3 +588,45 @@ mod focus_removal {
         assert!(!removal_drops_focus(None, &removed));
     }
 }
+
+#[cfg(all(test, feature = "scripted"))]
+mod a_backend_refused_for_a_permission {
+    //! When no backend starts, what capture reports must name a permission
+    //! one was refused for (#91): "no backend available" gives the user
+    //! nothing to change.
+
+    use super::{CaptureCreationError, Permission, scripted::ScriptedCaptureCreationError};
+
+    // LEDGER T4 | class B | 1 return value: when_none_started
+    #[test]
+    fn the_refusal_that_names_a_permission_is_what_is_reported() {
+        let failures = vec![
+            CaptureCreationError::Scripted(ScriptedCaptureCreationError::Unavailable),
+            CaptureCreationError::Scripted(ScriptedCaptureCreationError::MissingPermissions(vec![
+                Permission::InputMonitoring,
+            ])),
+            CaptureCreationError::Scripted(ScriptedCaptureCreationError::Unavailable),
+        ];
+        let reported = super::when_none_started(failures);
+        assert_eq!(
+            reported.missing_permissions(),
+            Some(&[Permission::InputMonitoring][..]),
+            "one backend was refused for want of Input Monitoring; the error \
+             reported must say so, but it was: {reported}"
+        );
+        assert!(
+            matches!(
+                super::when_none_started(vec![CaptureCreationError::Scripted(
+                    ScriptedCaptureCreationError::Unavailable
+                )]),
+                CaptureCreationError::NoAvailableBackend
+            ),
+            "with no permission named, no backend is available"
+        );
+    }
+}
+
+// Kept at the end: source guards elsewhere read this file up to its first
+// test module.
+#[cfg(test)]
+mod windows_guards;

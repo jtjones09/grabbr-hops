@@ -57,6 +57,9 @@ async fn main() {
                                 hops::discovery::DiscoveryEvent::Lost(l) => {
                                     eprintln!("EVENT {found}: LOST {l:?}")
                                 }
+                                hops::discovery::DiscoveryEvent::Quiet => {
+                                    eprintln!("EVENT {found}: QUIET, no other machine heard")
+                                }
                             }
                         }
                         None => { eprintln!("the discovery channel closed"); break; }

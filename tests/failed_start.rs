@@ -16,9 +16,9 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use hops::daemon_start::{DaemonStart, ThisMachine, Watch, ensure_running_with};
+use hops::daemon_start::{DaemonStart, ThisMachine, Watch, ensure_running_reported_with};
 
-// LEDGER T40 | class B | 5 process exit and log file + 1 return value
+// LEDGER T40 | class B | 5 process exit and log file + 1 return value (T64: the report's text)
 #[test]
 fn a_started_daemon_that_exits_on_its_config_is_reported_as_exited() {
     // Short, for `sun_path`.
@@ -69,7 +69,8 @@ fn a_started_daemon_that_exits_on_its_config_is_reported_as_exited() {
     };
     let within = Duration::from_secs(20);
     let began = Instant::now();
-    let got = ensure_running_with(start, &mut ThisMachine, within);
+    let report = ensure_running_reported_with(start, &mut ThisMachine, within);
+    let got = report.outcome;
     let took = began.elapsed();
     let named = ThisMachine.log_file();
     let logged = std::fs::read_to_string(&log).unwrap_or_default();
@@ -94,5 +95,12 @@ fn a_started_daemon_that_exits_on_its_config_is_reported_as_exited() {
     assert!(
         logged.contains("could not be parsed"),
         "the file the front door names does not say why the daemon exited:\n{logged}"
+    );
+    // What the app shows instead of "connecting" (#189).
+    let shown = report.problem().unwrap_or_default();
+    assert!(
+        shown.contains("stopped again before it answered")
+            && shown.contains(&log.display().to_string()),
+        "the app is not told the service stopped, or where it says why: {shown:?}"
     );
 }

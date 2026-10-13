@@ -1,7 +1,11 @@
-use futures::{Stream, StreamExt, stream::SelectAll};
+use futures::{
+    Stream, StreamExt,
+    stream::{FuturesUnordered, SelectAll},
+};
 #[cfg(unix)]
 use std::path::PathBuf;
 use std::{
+    future::Future,
     io::ErrorKind,
     pin::Pin,
     sync::{
@@ -12,27 +16,25 @@ use std::{
     time::Duration,
 };
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
-use tokio_stream::wrappers::LinesStream;
+use tokio::io::{
+    AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf,
+};
 
 #[cfg(unix)]
 use tokio::net::UnixListener;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 
-#[cfg(windows)]
-use tokio::net::TcpListener;
-#[cfg(windows)]
-use tokio::net::TcpStream;
-
-use crate::{FrontendEvent, FrontendRequest, IpcError, IpcListenerCreationError, ownership, token};
+use crate::{
+    FrontendEvent, FrontendRequest, IpcError, IpcListenerCreationError, ownership, proof, token,
+};
 
 /// The frontend transport. One alias instead of paired `cfg` attributes on every
 /// field, so the two platforms cannot drift apart silently.
 #[cfg(unix)]
 type Sock = UnixStream;
 #[cfg(windows)]
-type Sock = TcpStream;
+type Sock = tokio::net::windows::named_pipe::NamedPipeServer;
 
 /// How long a single frontend may stall a broadcast before it is dropped.
 ///
@@ -54,67 +56,265 @@ const WRITE_STALL_LIMIT: Duration = Duration::from_millis(250);
 /// tells the listener to stop writing to, and let go of, its partner.
 #[derive(Default)]
 struct ConnState {
-    /// set once the token has been presented; until then the connection is
-    /// written to by nobody
+    /// set once the frontend has made the two-way proof; until then nothing
+    /// but the proof's answer is written to the connection
     authed: AtomicBool,
-    /// set when the read half hangs up, so the write half goes with it
+    /// set when either half ends the connection: the read half hanging up,
+    /// so the write half goes with it, or a write that did not finish, so
+    /// nothing more is read from it either
     closed: AtomicBool,
 }
 
-/// A frontend connection that must present the IPC token before anything it says
-/// is honoured — or anything is said TO it — and that is HUNG UP on rather than
-/// tolerated when it sends something unparseable.
+/// The longest line a connection may send before it has proven it holds the
+/// token.
+///
+/// The only lines accepted before then are the two-way proof's challenge and
+/// proof ([`crate::proof`]), each a word and 64 hex digits. Twice the token's
+/// length leaves room for those and the whitespace the parsing trims, and for
+/// nothing else. There was no cap: a client that never sent a newline was
+/// read into memory until the daemon was killed, and on Windows any signed-in
+/// user could reach the port the daemon listened on then (#175).
+pub(crate) const PREAUTH_LINE_MAX: usize = 2 * token::TOKEN_CHARS;
+
+/// How long a connection may stay open without proving it holds the token.
+///
+/// Every frontend starts the proof the moment it connects, and finishes it
+/// as soon as the daemon answers. Before this there was no deadline, so a
+/// connection that sent a few bytes and then nothing was held, with its read
+/// buffer, until the client closed it (#175).
+pub const PREAUTH_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How many connections may be part-way through the proof at once. A
+/// connection accepted beyond this is closed at once.
+///
+/// Each costs a read buffer and its bookkeeping, about 9 KiB. There was no
+/// limit: thousands of idle connections grew the daemon by tens of MiB
+/// (#175). Frontends that have made the proof do not count.
+pub const PREAUTH_CONNECTIONS_MAX: usize = 32;
+
+/// Why a line could not be read.
+#[derive(Debug)]
+enum LineError {
+    /// More than this many bytes arrived without a newline.
+    TooLong(usize),
+    Io(std::io::Error),
+}
+
+/// Newline-terminated lines, refusing any longer than a maximum.
+///
+/// `tokio`'s own `lines()` extends its buffer until a newline arrives, with no
+/// maximum. This reads the same lines: a trailing `\r` is dropped, and a last
+/// line with no newline before the end of the stream is still returned.
+struct Lines<R> {
+    reader: BufReader<R>,
+    /// The line read so far. Never longer than `max`.
+    line: Vec<u8>,
+    /// The longest line accepted; `None` for no limit.
+    max: Option<usize>,
+}
+
+impl<R: AsyncRead + Unpin> Lines<R> {
+    fn new(reader: R, max: Option<usize>) -> Self {
+        Self {
+            reader: BufReader::new(reader),
+            line: Vec::new(),
+            max,
+        }
+    }
+
+    fn poll_next_line(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<String, LineError>>> {
+        loop {
+            let available = match Pin::new(&mut self.reader).poll_fill_buf(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(LineError::Io(e)))),
+                Poll::Ready(Ok(available)) => available,
+            };
+            if available.is_empty() {
+                if self.line.is_empty() {
+                    return Poll::Ready(None);
+                }
+                return Poll::Ready(Some(self.take_line()));
+            }
+            let newline = available.iter().position(|&b| b == b'\n');
+            let kept = newline.unwrap_or(available.len());
+            // Checked before anything is kept, so the line never outgrows it.
+            if let Some(max) = self.max {
+                if self.line.len() + kept > max {
+                    return Poll::Ready(Some(Err(LineError::TooLong(max))));
+                }
+            }
+            self.line.extend_from_slice(&available[..kept]);
+            let used = newline.map_or(kept, |at| at + 1);
+            Pin::new(&mut self.reader).consume(used);
+            if newline.is_some() {
+                return Poll::Ready(Some(self.take_line()));
+            }
+        }
+    }
+
+    fn take_line(&mut self) -> Result<String, LineError> {
+        let mut line = std::mem::take(&mut self.line);
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        String::from_utf8(line)
+            .map_err(|e| LineError::Io(std::io::Error::new(ErrorKind::InvalidData, e)))
+    }
+}
+
+/// A frontend connection that has made the two-way proof. What it sends is
+/// honoured, and it is HUNG UP on rather than tolerated when it sends
+/// something unparseable.
 struct AuthedLines<R> {
-    lines: LinesStream<BufReader<R>>,
-    token: std::sync::Arc<str>,
-    authed: bool,
+    lines: Lines<R>,
     state: Arc<ConnState>,
 }
 
-impl<R: tokio::io::AsyncRead + Unpin> Stream for AuthedLines<R> {
+impl<R: AsyncRead + Unpin> AuthedLines<R> {
+    /// The requests on a connection [`admit`] returned.
+    fn admitted(lines: Lines<R>, state: Arc<ConnState>) -> Self {
+        state.authed.store(true, Ordering::Release);
+        Self { lines, state }
+    }
+}
+
+impl<R: AsyncRead + Unpin> Stream for AuthedLines<R> {
     type Item = Result<FrontendRequest, IpcError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        loop {
-            let line = match this.lines.poll_next_unpin(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => {
-                    this.state.closed.store(true, Ordering::Release);
-                    return Poll::Ready(None);
-                }
-                Poll::Ready(Some(Err(e))) => {
-                    log::debug!("frontend connection read error: {e}");
-                    this.state.closed.store(true, Ordering::Release);
-                    return Poll::Ready(None);
-                }
-                Poll::Ready(Some(Ok(l))) => l,
-            };
-            if !this.authed {
-                if !token::matches(&this.token, line.trim()) {
-                    log::warn!(
-                        "frontend connection presented a bad IPC token — closing it. \
-                         A local process tried to drive the daemon without being able \
-                         to read the token file."
-                    );
-                    this.state.closed.store(true, Ordering::Release);
-                    return Poll::Ready(None);
-                }
-                this.authed = true;
-                this.state.authed.store(true, Ordering::Release);
-                continue;
+        // The write half closed the connection: nothing more is read from it.
+        if this.state.closed.load(Ordering::Acquire) {
+            return Poll::Ready(None);
+        }
+        let line = match this.lines.poll_next_line(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Some(Ok(l))) => l,
+            Poll::Ready(None) => {
+                this.state.closed.store(true, Ordering::Release);
+                return Poll::Ready(None);
             }
-            match serde_json::from_str(line.as_str()) {
-                Ok(request) => return Poll::Ready(Some(Ok(request))),
-                Err(e) => {
-                    // Hang up rather than skip. Tolerating junk let an attacker
-                    // prepend arbitrary lines (e.g. HTTP headers) before a real
-                    // request.
-                    log::warn!("frontend sent an unparseable request ({e}) — closing it");
-                    this.state.closed.store(true, Ordering::Release);
-                    return Poll::Ready(None);
-                }
+            Poll::Ready(Some(Err(e))) => {
+                log::debug!("frontend connection read error: {e:?}");
+                this.state.closed.store(true, Ordering::Release);
+                return Poll::Ready(None);
             }
+        };
+        match serde_json::from_str(line.as_str()) {
+            Ok(request) => Poll::Ready(Some(Ok(request))),
+            Err(e) => {
+                // Hang up rather than skip. Tolerating junk let an attacker
+                // prepend arbitrary lines (e.g. HTTP headers) before a real
+                // request.
+                log::warn!("frontend sent an unparseable request ({e}) — closing it");
+                this.state.closed.store(true, Ordering::Release);
+                Poll::Ready(None)
+            }
+        }
+    }
+}
+
+/// The next line of a connection that has not made the proof, or `None`
+/// once it has ended or sent more than [`PREAUTH_LINE_MAX`] bytes of one.
+async fn preauth_line<R: AsyncRead + Unpin>(lines: &mut Lines<R>) -> Option<String> {
+    match std::future::poll_fn(|cx| lines.poll_next_line(cx)).await {
+        Some(Ok(line)) => Some(line),
+        // Closed before the proof: a probe asking whether anything listens.
+        None => None,
+        Some(Err(LineError::TooLong(max))) => {
+            log::warn!(
+                "a frontend connection sent more than {max} bytes without a newline \
+                 before proving it holds the IPC token — closing it"
+            );
+            None
+        }
+        Some(Err(LineError::Io(e))) => {
+            log::debug!("frontend connection read error: {e}");
+            None
+        }
+    }
+}
+
+/// Make the daemon's half of the two-way proof ([`crate::proof`]) on a
+/// connection just accepted.
+///
+/// Returns the connection once the frontend has proven it holds `token`,
+/// or `None` when it has not, which closes it. Before then no line longer
+/// than [`PREAUTH_LINE_MAX`] is read, and the only thing written is the
+/// answer to a well-formed challenge. The caller bounds the whole of it by
+/// [`PREAUTH_DEADLINE`].
+async fn admit<R, W>(rx: R, mut tx: W, token: Arc<str>) -> Option<(Lines<R>, W)>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut lines = Lines::new(rx, Some(PREAUTH_LINE_MAX));
+    let first = preauth_line(&mut lines).await?;
+    let Some(nf) = proof::challenge_in(&first).map(str::to_string) else {
+        if token::matches(&token, first.trim()) {
+            log::warn!(
+                "a frontend from before the two-way proof sent the IPC token itself — \
+                 closing it. Update that frontend to this build."
+            );
+        } else {
+            log::warn!(
+                "a frontend connection opened with something other than the proof's \
+                 challenge — closing it. A local process tried to drive the daemon \
+                 without holding the IPC token."
+            );
+        }
+        return None;
+    };
+    let nd = match proof::nonce() {
+        Ok(nd) => nd,
+        Err(e) => {
+            log::warn!("could not answer a frontend's challenge: {e}");
+            return None;
+        }
+    };
+    let answer = proof::answer_line(&token, &nf, &nd);
+    match tokio::time::timeout(WRITE_STALL_LIMIT, tx.write_all(answer.as_bytes())).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            log::debug!("could not answer a frontend's challenge ({e}) — closing it");
+            return None;
+        }
+        Err(_) => {
+            log::warn!(
+                "a frontend did not read the answer to its challenge within \
+                 {WRITE_STALL_LIMIT:?} — closing it"
+            );
+            return None;
+        }
+    }
+    let second = preauth_line(&mut lines).await?;
+    if !proof::frontend_proven(&token, &nf, &nd, &second) {
+        log::warn!(
+            "a frontend connection did not prove it holds the IPC token — closing it. \
+             A local process tried to drive the daemon without being able to read \
+             the token file."
+        );
+        return None;
+    }
+    // A frontend that holds the token may send requests of any length.
+    lines.max = None;
+    Some((lines, tx))
+}
+
+/// [`admit`], given up on after [`PREAUTH_DEADLINE`].
+async fn admit_in_time<R, W>(rx: R, tx: W, token: Arc<str>) -> Option<(Lines<R>, W)>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(PREAUTH_DEADLINE, admit(rx, tx, token)).await {
+        Ok(admitted) => admitted,
+        Err(_) => {
+            log::warn!(
+                "a frontend connection did not prove it holds the IPC token within \
+                 {PREAUTH_DEADLINE:?} — closing it"
+            );
+            None
         }
     }
 }
@@ -139,9 +339,9 @@ async fn write_one(entry: &mut TxStream, bytes: &[u8]) -> bool {
         return false;
     }
     // Never write to a connection that has not presented the token. `Sync`
-    // carries the entire trust store, this machine's own fingerprint and its
-    // pairing code; before this gate existed, a bare connect was enough to
-    // receive all of it.
+    // carries the entire trust store and this machine's own fingerprint;
+    // before this gate existed, a bare connect was enough to receive all of
+    // it.
     if !entry.state.authed.load(Ordering::Acquire) {
         return true;
     }
@@ -149,18 +349,32 @@ async fn write_one(entry: &mut TxStream, bytes: &[u8]) -> bool {
     // silently truncating the event mid-JSON. And bounded, or one client that
     // stops reading freezes the whole daemon.
     match tokio::time::timeout(WRITE_STALL_LIMIT, entry.tx.write_all(bytes)).await {
-        Ok(Ok(())) => true,
-        Ok(Err(e)) => {
-            log::debug!("frontend write failed ({e}) — dropping it");
-            false
-        }
-        Err(_) => {
-            log::warn!(
-                "a frontend stopped reading for {WRITE_STALL_LIMIT:?} — dropping it rather \
-                 than letting it stall the daemon"
-            );
-            false
-        }
+        Ok(Ok(())) => return true,
+        Ok(Err(e)) => log::debug!("frontend write failed ({e}) — closing it"),
+        Err(_) => log::warn!(
+            "a frontend stopped reading for {WRITE_STALL_LIMIT:?} — closing it rather \
+             than letting it stall the daemon"
+        ),
+    }
+    close(entry).await;
+    false
+}
+
+/// End a connection whose write did not finish (#95).
+///
+/// Part of an event may have been written, and the rest never will be.
+/// Letting go of the write half alone left the connection open, since the
+/// read half shares the socket: the frontend kept a cut-off line and waited
+/// for events that never came, showing a list that no longer changed. Shut
+/// down the sending side, so the frontend reads to the end, sees the
+/// connection close and connects again for a full state, and stop reading
+/// requests from it.
+async fn close(entry: &mut TxStream) {
+    entry.state.closed.store(true, Ordering::Release);
+    // A shutdown asks nothing of the peer; bounded anyway, since the daemon
+    // loop waits on it.
+    if let Ok(Err(e)) = tokio::time::timeout(WRITE_STALL_LIMIT, entry.tx.shutdown()).await {
+        log::debug!("frontend connection shutdown failed ({e})");
     }
 }
 
@@ -207,11 +421,10 @@ async fn write_one(entry: &mut TxStream, bytes: &[u8]) -> bool {
 ///   that has stopped accepting.
 struct Claim {
     #[cfg(windows)]
-    listener: TcpListener,
+    listener: crate::windows::PipeListener,
     #[cfg(unix)]
     listener: UnixListener,
-    /// Where the listener is bound. For a TCP endpoint asked for on port 0,
-    /// the port the system picked.
+    /// Where the listener is bound.
     endpoint: crate::DaemonEndpoint,
     /// An exclusive lock on `<socket>.lock`, held for the life of the listener.
     ///
@@ -332,27 +545,66 @@ impl Claim {
         })
     }
 
+    /// The next frontend to connect.
+    #[cfg(unix)]
+    fn poll_accept(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<Sock>> {
+        self.listener.poll_accept(cx).map_ok(|(stream, _)| stream)
+    }
+
+    /// The next frontend to connect.
+    #[cfg(windows)]
+    fn poll_accept(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<Sock>> {
+        self.listener.poll_accept(cx)
+    }
+
+    /// Create the daemon's pipe as its first instance.
+    ///
+    /// A pipe has no lock file to take first: creating the first instance
+    /// fails when any pipe of that name exists, whoever made it, which makes
+    /// the create the whole claim. What holds the name is then asked of the
+    /// system, and only a process of this user counts as a daemon already
+    /// running. Anything else is named in the error, and the daemon exits
+    /// with it rather than leave frontends to whatever holds the pipe (#96).
     #[cfg(windows)]
     async fn take(endpoint: &crate::DaemonEndpoint) -> Result<Self, IpcListenerCreationError> {
-        let crate::DaemonEndpoint::Tcp(addr) = endpoint;
         let bind_error = |source| IpcListenerCreationError::Bind {
             endpoint: endpoint.clone(),
             source,
         };
-        // A port has one listener, so the bind is the whole claim.
-        let listener = match TcpListener::bind(*addr).await {
-            Ok(listener) => listener,
-            Err(e) if e.kind() == ErrorKind::AddrInUse => {
-                return Err(IpcListenerCreationError::AlreadyRunning);
-            }
-            Err(e) => return Err(bind_error(e)),
+        let crate::DaemonEndpoint::Pipe(name) = endpoint else {
+            return Err(bind_error(std::io::Error::new(
+                ErrorKind::Unsupported,
+                "the daemon listens on a named pipe on this platform",
+            )));
         };
-        let bound = listener.local_addr().map_err(bind_error)?;
-        Ok(Self {
-            listener,
-            endpoint: crate::DaemonEndpoint::Tcp(bound),
-        })
+        match crate::windows::PipeListener::first(name) {
+            Ok(listener) => Ok(Self {
+                listener,
+                endpoint: endpoint.clone(),
+            }),
+            Err(e) if crate::windows::taken(&e) => match crate::windows::who_holds(name).await {
+                crate::windows::Holder::ThisUser => Err(IpcListenerCreationError::AlreadyRunning),
+                crate::windows::Holder::Other(why) => Err(IpcListenerCreationError::Held {
+                    endpoint: endpoint.clone(),
+                    why,
+                    hint: held_hint(),
+                }),
+            },
+            Err(e) => Err(bind_error(e)),
+        }
     }
+}
+
+/// What to do about an endpoint something else holds.
+#[cfg(windows)]
+fn held_hint() -> String {
+    let token = token::token_path()
+        .map(|path| format!(" ({})", path.display()))
+        .unwrap_or_default();
+    format!(
+        "The daemon's pipe is named after the IPC token{token}. Delete that file and \
+         start hops again, and the daemon and the app use a new name"
+    )
 }
 
 /// `<socket_path>.lock`, the file a daemon locks to claim `socket_path`.
@@ -545,37 +797,74 @@ impl Drop for Claim {
     }
 }
 
+/// A connection part-way through the two-way proof, which ends with the
+/// connection when the frontend has made it.
+type Admitting =
+    Pin<Box<dyn Future<Output = Option<(Lines<ReadHalf<Sock>>, WriteHalf<Sock>)>> + Send>>;
+
 pub struct AsyncFrontendListener {
     claim: Claim,
+    /// connections that have not yet made the two-way proof
+    admitting: FuturesUnordered<Admitting>,
     line_streams: SelectAll<AuthedLines<ReadHalf<Sock>>>,
     tx_streams: Vec<TxStream>,
-    /// the secret every frontend must present as its first line
+    /// the secret every frontend must prove it holds
     token: std::sync::Arc<str>,
+    /// set while connections are being closed on accept because
+    /// [`PREAUTH_CONNECTIONS_MAX`] are part-way through the proof, so that is
+    /// logged once
+    refusing: bool,
 }
 
 impl AsyncFrontendListener {
     /// Claim this platform's endpoint, [`crate::DaemonEndpoint::of_this_platform`].
+    ///
+    /// On Windows that reads the token first, or mints it, since the token
+    /// names the pipe.
     pub async fn new() -> Result<Self, IpcListenerCreationError> {
         Self::at(&crate::DaemonEndpoint::of_this_platform()?).await
     }
 
-    /// Claim `endpoint`, then load the token frontends must present.
+    /// Claim `endpoint`, then load the token frontends must prove they hold.
     ///
     /// Returns [`IpcListenerCreationError::AlreadyRunning`] when another daemon
-    /// holds the endpoint or is part-way through claiming it. Nothing but the
-    /// claim's own lock file is read or written until the claim is held.
+    /// holds the endpoint or is part-way through claiming it, and on Windows
+    /// [`IpcListenerCreationError::Held`] when something else holds it.
+    /// Nothing but the claim's own lock file is read or written until the
+    /// claim is held.
     pub async fn at(endpoint: &crate::DaemonEndpoint) -> Result<Self, IpcListenerCreationError> {
+        Self::claim_then_token(endpoint, load_token).await
+    }
+
+    /// [`Self::at`], with the token kept in `token_file` rather than beside
+    /// the user's config: for a daemon a test runs whole in its own process,
+    /// which must neither read nor mint the user's token.
+    pub async fn at_with_token_file(
+        endpoint: &crate::DaemonEndpoint,
+        token_file: &std::path::Path,
+    ) -> Result<Self, IpcListenerCreationError> {
+        Self::claim_then_token(endpoint, || {
+            load_token_with(token_file, ownership::foreign_owner)
+        })
+        .await
+    }
+
+    async fn claim_then_token(
+        endpoint: &crate::DaemonEndpoint,
+        token: impl FnOnce() -> Result<String, IpcListenerCreationError>,
+    ) -> Result<Self, IpcListenerCreationError> {
         let claim = Claim::take(endpoint).await?;
         Ok(Self {
             claim,
-            token: load_token()?.into(),
+            token: token()?.into(),
+            admitting: FuturesUnordered::new(),
             line_streams: SelectAll::new(),
             tx_streams: vec![],
+            refusing: false,
         })
     }
 
-    /// Where this listener is bound: the endpoint it was given, with the port
-    /// filled in when that was a TCP endpoint on port 0.
+    /// Where this listener is bound.
     pub fn endpoint(&self) -> &crate::DaemonEndpoint {
         &self.claim.endpoint
     }
@@ -595,25 +884,68 @@ impl AsyncFrontendListener {
     }
 }
 
+/// Tell a connection the daemon will not take that it is busy, rather than
+/// only hang up: a daemon from before the two-way proof hangs up on the
+/// challenge, and an ask for the build reads that as an older daemon, which
+/// the app restarts (#222).
+///
+/// Written straight to the new socket, which has room for it: the runtime
+/// has not yet seen the socket writable, so its own write would not try.
+#[cfg(unix)]
+fn say_busy(stream: &Sock) {
+    use std::os::fd::AsRawFd;
+    let line = proof::BUSY_LINE.as_bytes();
+    #[cfg(target_os = "linux")]
+    let flags = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL;
+    #[cfg(not(target_os = "linux"))]
+    let flags = libc::MSG_DONTWAIT;
+    // SAFETY: the descriptor is open while `stream` lives, and `line`
+    // outlives the call.
+    let _ = unsafe { libc::send(stream.as_raw_fd(), line.as_ptr().cast(), line.len(), flags) };
+}
+
+/// On Windows the app never restarts a daemon it did not see started, so a
+/// hang-up is all a refused connection gets.
+#[cfg(windows)]
+fn say_busy(_: &Sock) {}
+
 impl Stream for AsyncFrontendListener {
     type Item = Result<FrontendRequest, IpcError>;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // Accept before reading. A connection's lines are read only once they
-        // have been polled, which is also what asks to be woken when its token
+        // have been polled, which is also what asks to be woken when its proof
         // arrives; accepted after the read, a new frontend waited unheard
         // until something else woke the daemon.
-        while let Poll::Ready(Ok((stream, _))) = self.claim.listener.poll_accept(cx) {
+        while let Poll::Ready(Ok(stream)) = self.claim.poll_accept(cx) {
+            let waiting = self.admitting.len();
+            if waiting >= PREAUTH_CONNECTIONS_MAX {
+                if !self.refusing {
+                    log::warn!(
+                        "{waiting} frontend connections are part-way through proving \
+                         they hold the IPC token — closing new ones until they finish \
+                         or time out"
+                    );
+                    self.refusing = true;
+                }
+                say_busy(&stream);
+                drop(stream);
+                continue;
+            }
+            self.refusing = false;
             let (rx, tx) = tokio::io::split(stream);
-            let lines = LinesStream::new(BufReader::new(rx).lines());
-            let token = self.token.clone();
+            // Accepted, but not yet heard or sent anything but the proof's
+            // answer. Accepting is not authenticating.
+            self.admitting
+                .push(Box::pin(admit_in_time(rx, tx, self.token.clone())));
+        }
+        // Registered once the proof is made; `Sync` below sends it state.
+        while let Poll::Ready(Some(admitted)) = self.admitting.poll_next_unpin(cx) {
+            let Some((lines, tx)) = admitted else {
+                continue;
+            };
             let state = Arc::new(ConnState::default());
-            self.line_streams.push(AuthedLines {
-                lines,
-                token,
-                authed: false,
-                state: state.clone(),
-            });
-            // Registered, but not yet spoken to. Accepting is not authenticating.
+            self.line_streams
+                .push(AuthedLines::admitted(lines, state.clone()));
             self.tx_streams.push(TxStream {
                 tx,
                 state,
@@ -646,25 +978,26 @@ impl Stream for AsyncFrontendListener {
 
 #[cfg(test)]
 mod tests {
-    use super::AuthedLines;
-    use crate::FrontendRequest;
+    //! The daemon's half of the two-way proof, and the requests after it,
+    //! over an in-memory connection. `tests/two_way_proof.rs` drives the real
+    //! listener and connector over this platform's transport.
+
+    use super::{AuthedLines, ConnState, admit};
+    use crate::{FrontendRequest, proof};
     use futures::StreamExt;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio_stream::wrappers::LinesStream;
+    use std::sync::Arc;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const OTHER: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 
-    /// Feed `script` to a fresh connection and collect what the daemon accepts.
-    async fn drive(script: &str) -> Vec<FrontendRequest> {
-        let (mut client, server) = tokio::io::duplex(4096);
-        client.write_all(script.as_bytes()).await.expect("write");
-        client.shutdown().await.expect("shutdown");
-        let mut stream = AuthedLines {
-            lines: LinesStream::new(BufReader::new(server).lines()),
-            token: TOKEN.into(),
-            authed: false,
-            state: std::sync::Arc::new(super::ConnState::default()),
+    /// The daemon's side of one connection: the proof, then what it honours.
+    async fn daemon_side(server: DuplexStream) -> Vec<FrontendRequest> {
+        let (rx, tx) = tokio::io::split(server);
+        let Some((lines, _tx)) = admit(rx, tx, TOKEN.into()).await else {
+            return vec![];
         };
+        let mut stream = AuthedLines::admitted(lines, Arc::new(ConnState::default()));
         let mut out = vec![];
         while let Some(Ok(req)) = stream.next().await {
             out.push(req);
@@ -672,32 +1005,119 @@ mod tests {
         out
     }
 
-    #[tokio::test]
-    async fn the_token_admits_a_request() {
-        let got = drive(&format!("{TOKEN}\n{{\"Enumerate\":[]}}\n")).await;
-        assert_eq!(got.len(), 1, "an authenticated request must be honoured");
+    /// A client that challenges the daemon, reads its answer, and replies
+    /// with the line `reply` makes from the two nonces and the answer, then
+    /// sends `script`.
+    async fn client(
+        conn: DuplexStream,
+        reply: impl FnOnce(&str, &str, &str) -> String,
+        script: &str,
+    ) {
+        let (rx, mut tx) = tokio::io::split(conn);
+        let mut rx = BufReader::new(rx);
+        let nf = proof::nonce().expect("a nonce");
+        tx.write_all(proof::challenge_line(&nf).as_bytes())
+            .await
+            .expect("the challenge");
+        let mut answer = String::new();
+        rx.read_line(&mut answer).await.expect("the answer");
+        let nd = answer.split(' ').nth(1).unwrap_or_default().to_string();
+        let _ = tx.write_all(reply(&nf, &nd, &answer).as_bytes()).await;
+        let _ = tx.write_all(script.as_bytes()).await;
+        let _ = tx.shutdown().await;
     }
 
-    #[tokio::test]
-    async fn no_token_means_no_requests() {
-        let got = drive("{\"Enumerate\":[]}\n").await;
-        assert!(got.is_empty(), "a request with no token must be refused");
+    /// What the daemon honours from a client that replies with `reply`.
+    async fn drive(
+        reply: impl FnOnce(&str, &str, &str) -> String,
+        script: &str,
+    ) -> Vec<FrontendRequest> {
+        let (conn, server) = tokio::io::duplex(4096);
+        let (_, got) = tokio::join!(client(conn, reply, script), daemon_side(server));
+        got
     }
 
-    #[tokio::test]
-    async fn a_wrong_token_hangs_up_before_anything_is_honoured() {
-        let got = drive(&format!("{}\n{{\"Enumerate\":[]}}\n", "f".repeat(64))).await;
-        assert!(got.is_empty(), "a bad token must close the connection");
+    /// What the daemon honours from a client that sends `script` and nothing
+    /// else.
+    async fn drive_raw(script: &str) -> Vec<FrontendRequest> {
+        let (mut conn, server) = tokio::io::duplex(4096);
+        conn.write_all(script.as_bytes()).await.expect("write");
+        conn.shutdown().await.expect("shutdown");
+        daemon_side(server).await
     }
 
-    /// THE attack: a web page can POST to 127.0.0.1:5252 because `text/plain` is
-    /// CORS-safelisted (no preflight). It cannot read the response, but the side
-    /// effect would land. This must die on the HTTP request line, long before the
-    /// body — and the body here is a REAL AuthorizeKey, so a regression is loud.
+    fn proves(nf: &str, nd: &str, _: &str) -> String {
+        proof::proof_line(TOKEN, nf, nd)
+    }
+
+    // LEDGER T9613 | class B | 6 requests the daemon side yields over a duplex
+    #[tokio::test]
+    async fn a_frontend_that_proves_the_token_is_heard() {
+        let got = drive(proves, "{\"Enumerate\":[]}\n").await;
+        assert_eq!(got.len(), 1, "a proven frontend's request must be honoured");
+    }
+
+    // LEDGER T9614 | class B | 6 requests the daemon side yields over a duplex
+    #[tokio::test]
+    async fn no_proof_means_no_requests() {
+        let got = drive_raw("{\"Enumerate\":[]}\n").await;
+        assert!(got.is_empty(), "a request with no proof must be refused");
+    }
+
+    /// A frontend from before the proof sends the token itself. That is not
+    /// a challenge, and admits nothing: a token such a frontend handed to
+    /// whatever held the endpoint must not open the daemon.
+    // LEDGER T9615 | class B | 6 requests the daemon side yields over a duplex
+    #[tokio::test]
+    async fn the_token_itself_admits_nothing() {
+        let got = drive_raw(&format!("{TOKEN}\n{{\"Enumerate\":[]}}\n")).await;
+        assert!(got.is_empty(), "the bare token was accepted: {got:?}");
+    }
+
+    // LEDGER T9616 | class B | 6 requests the daemon side yields over a duplex
+    #[tokio::test]
+    async fn a_proof_made_with_another_token_admits_nothing() {
+        let got = drive(
+            |nf, nd, _| proof::proof_line(OTHER, nf, nd),
+            "{\"Enumerate\":[]}\n",
+        )
+        .await;
+        assert!(got.is_empty(), "a proof of another token was accepted");
+    }
+
+    /// The daemon's own answer, sent back to it as the proof, admits nothing.
+    // LEDGER T9617 | class B | 6 requests the daemon side yields over a duplex
+    #[tokio::test]
+    async fn the_daemons_own_answer_sent_back_admits_nothing() {
+        let got = drive(
+            |_, _, answer| {
+                let mac = answer.trim().rsplit(' ').next().unwrap_or_default();
+                format!("proof {mac}\n")
+            },
+            "{\"Enumerate\":[]}\n",
+        )
+        .await;
+        assert!(
+            got.is_empty(),
+            "echoing the daemon's answer back admitted a client that holds no \
+             token: {got:?}"
+        );
+    }
+
+    /// A web page may POST to a loopback port because `text/plain` is
+    /// CORS-safelisted (no preflight). It cannot read the response, but the
+    /// side effect would land. This must die on the HTTP request line, long
+    /// before the body, and the body here is a REAL AuthorizeKey, so a
+    /// regression is loud.
+    // LEDGER T9618 | class B | 6 requests the daemon side yields over a duplex
     #[tokio::test]
     async fn an_http_post_from_a_browser_is_refused() {
-        let body = r#"{"AuthorizeKey":["attacker","aa:bb:cc:dd"]}"#;
-        let got = drive(&format!(
+        let body = r#"{"AuthorizeKey":{"label":"attacker","fingerprint":"aa:bb:cc:dd","controller":"ThatMachine","clipboard":true}}"#;
+        assert!(
+            serde_json::from_str::<crate::FrontendRequest>(body).is_ok(),
+            "the body must be a request the daemon would honour, or this proves nothing"
+        );
+        let got = drive_raw(&format!(
             "POST / HTTP/1.1\r\nHost: 127.0.0.1:5252\r\n\
              Content-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}\n",
             body.len()
@@ -709,14 +1129,73 @@ mod tests {
         );
     }
 
-    /// Junk after a GOOD token must also hang up, not be skipped: tolerating it
-    /// is what let an attacker prepend arbitrary lines to a real request.
+    /// The cap on what a client may send before the proof must not reach the
+    /// requests that follow it: a real request is routinely longer.
+    // LEDGER T63 | class B | 1 return value / error
     #[tokio::test]
-    async fn garbage_after_a_good_token_closes_the_connection() {
-        let got = drive(&format!("{TOKEN}\nnot json at all\n{{\"Enumerate\":[]}}\n")).await;
+    async fn after_the_proof_a_request_longer_than_the_proof_line_is_honoured() {
+        let request = format!(
+            "{{\"UpdateHostname\":{{\"handle\":0,\"hostname\":\"{}\",\"fingerprint\":null}}}}",
+            "h".repeat(1024)
+        );
+        let got = drive(proves, &format!("{request}\n")).await;
+        assert!(
+            matches!(got.as_slice(), [FrontendRequest::UpdateHostname { handle: 0, hostname: Some(name), .. }]
+                if name.len() == 1024),
+            "an authenticated request of {} bytes was refused ({} requests honoured). \
+             The pre-authentication cap must lift once the proof is made.",
+            request.len(),
+            got.len()
+        );
+    }
+
+    /// Junk after a GOOD proof must also hang up, not be skipped: tolerating
+    /// it is what let an attacker prepend arbitrary lines to a real request.
+    // LEDGER T9619 | class B | 6 requests the daemon side yields over a duplex
+    #[tokio::test]
+    async fn garbage_after_a_good_proof_closes_the_connection() {
+        let got = drive(proves, "not json at all\n{\"Enumerate\":[]}\n").await;
         assert!(
             got.is_empty(),
             "the connection must close on the junk line, not skip it"
+        );
+    }
+
+    /// The frontend's half: an answer made with another token is refused,
+    /// and nothing follows the challenge.
+    // LEDGER T9620 | class B | 1 return value of proof::prove_to_daemon + 2 bytes over a duplex
+    #[tokio::test]
+    async fn a_frontend_refuses_an_answer_made_with_another_token() {
+        let (conn, server) = tokio::io::duplex(4096);
+        let impostor = async move {
+            let (rx, mut tx) = tokio::io::split(server);
+            let mut rx = BufReader::new(rx);
+            let mut challenge = String::new();
+            rx.read_line(&mut challenge).await.expect("the challenge");
+            let nf = proof::challenge_in(&challenge)
+                .expect("a challenge")
+                .to_string();
+            let nd = proof::nonce().expect("a nonce");
+            tx.write_all(proof::answer_line(OTHER, &nf, &nd).as_bytes())
+                .await
+                .expect("the answer");
+            let mut rest = String::new();
+            let _ = tokio::io::AsyncReadExt::read_to_string(&mut rx, &mut rest).await;
+            rest
+        };
+        let frontend = async move {
+            let (rx, mut tx) = tokio::io::split(conn);
+            let mut rx = BufReader::new(rx);
+            let proven = proof::prove_to_daemon(&mut rx, &mut tx, TOKEN).await;
+            drop((rx, tx));
+            proven
+        };
+        let (after_challenge, proven) = tokio::join!(impostor, frontend);
+        assert!(
+            matches!(proven, Err(crate::ConnectionError::Unproven(_)))
+                && after_challenge.is_empty(),
+            "the frontend took an answer made with another token ({proven:?}), or \
+             sent more than its challenge: {after_challenge:?}"
         );
     }
 }
@@ -1598,6 +2077,469 @@ mod the_token_error_names_the_file {
             matches!(&mine, Err(IpcListenerCreationError::Token { hint, .. })
                 if hint.contains("Check that this user can read and write it")),
             "a token this user owns must get the ordinary hint: {mine:?}"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod an_unauthenticated_client_cannot_grow_memory {
+    //! Before the two-way proof is made, the only lines the daemon accepts are
+    //! the proof's. A client that sends anything longer is hung up on, rather
+    //! than read into memory until it chooses to send a newline (#175).
+
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// A real listener on a real socket, holding `TOKEN`.
+    async fn listener(tag: &str) -> (AsyncFrontendListener, PathBuf) {
+        let path = PathBuf::from(format!("/tmp/h-cap-{tag}-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let claim = Claim::take(&crate::DaemonEndpoint::Unix(path.clone()))
+            .await
+            .expect("a claim on a fresh socket path");
+        let listener = AsyncFrontendListener {
+            claim,
+            token: TOKEN.into(),
+            admitting: FuturesUnordered::new(),
+            line_streams: SelectAll::new(),
+            tx_streams: vec![],
+            refusing: false,
+        };
+        (listener, path)
+    }
+
+    /// Write `total` bytes with no newline, and return how many were accepted
+    /// before the daemon hung up, or `None` if all of them were.
+    async fn stream_one_line(client: &mut UnixStream, total: usize) -> Option<usize> {
+        let chunk = vec![b'x'; 64 * 1024];
+        let mut sent = 0;
+        while sent < total {
+            match client.write(&chunk).await {
+                Ok(0) | Err(_) => return Some(sent),
+                Ok(n) => sent += n,
+            }
+        }
+        None
+    }
+
+    // LEDGER T61 | class B | 2 bytes written to a socket
+    #[tokio::test]
+    async fn a_client_without_the_token_is_hung_up_on_before_it_can_fill_memory() {
+        const TOTAL: usize = 64 * 1024 * 1024;
+        let (mut listener, path) = listener("line").await;
+        let mut client = UnixStream::connect(&path).await.expect("connect");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::select! {
+                _ = async { while listener.next().await.is_some() {} } => {
+                    unreachable!("the listener stream never ends")
+                }
+                refused = stream_one_line(&mut client, TOTAL) => refused,
+            }
+        })
+        .await;
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(lock_path(&path));
+
+        let refused = outcome.expect("the daemon neither read nor refused the line in 30 s");
+        assert!(
+            refused.is_some_and(|sent| sent < 4 * 1024 * 1024),
+            "a client that never presented the token wrote {} bytes of one \
+             unterminated line and was not hung up on. Without the cap the daemon \
+             keeps every byte of such a line until a newline arrives, so any local \
+             process that can reach the socket can grow it until it is killed.",
+            refused.map_or(format!("all {TOTAL}"), |sent| sent.to_string())
+        );
+    }
+
+    /// Whether the daemon has closed `client`, without waiting. What it said
+    /// first, a refusal, is read past.
+    fn hung_up(client: &UnixStream) -> bool {
+        let mut buf = [0u8; 64];
+        loop {
+            match client.try_read(&mut buf) {
+                Ok(0) => return true,
+                Ok(_) => continue,
+                Err(e) => return e.kind() != ErrorKind::WouldBlock,
+            }
+        }
+    }
+
+    /// Serve `listener` for `how_long`.
+    async fn serve_for(listener: &mut AsyncFrontendListener, how_long: Duration) {
+        let _ = tokio::time::timeout(how_long, async { while listener.next().await.is_some() {} })
+            .await;
+    }
+
+    fn remove(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(lock_path(path));
+    }
+
+    /// Make the two-way proof on `frontend` while serving `listener` for
+    /// `how_long`. Whether the proof was made.
+    async fn prove_while_serving(
+        listener: &mut AsyncFrontendListener,
+        frontend: &mut UnixStream,
+        how_long: Duration,
+    ) -> bool {
+        let proving = async {
+            let (rx, mut tx) = frontend.split();
+            let mut rx = BufReader::new(rx);
+            crate::proof::prove_to_daemon(&mut rx, &mut tx, TOKEN).await
+        };
+        let (proven, ()) = tokio::join!(proving, serve_for(listener, how_long));
+        proven.is_ok()
+    }
+
+    // LEDGER T70 | class B | 2 connections on a socket, virtual clock
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_that_never_presents_the_token_is_closed_at_the_deadline() {
+        let (mut listener, path) = listener("late").await;
+        let idle = UnixStream::connect(&path).await.expect("connect");
+        idle.try_write(&[b'x'; 100])
+            .expect("100 bytes, under the cap");
+        let mut frontend = UnixStream::connect(&path).await.expect("connect");
+        let proven = prove_while_serving(&mut listener, &mut frontend, PREAUTH_DEADLINE / 2).await;
+        let early = hung_up(&idle);
+        serve_for(&mut listener, PREAUTH_DEADLINE * 2).await;
+        let late = hung_up(&idle);
+        let frontend_closed = hung_up(&frontend);
+        drop(listener);
+        remove(&path);
+
+        assert!(proven, "precondition: the frontend made the two-way proof");
+        assert!(!early, "an idle connection was closed before the deadline");
+        assert!(
+            late,
+            "a connection that sent 100 bytes and never a proof was still open \
+             {:?} later. Without a deadline the daemon holds such a connection, and \
+             its read buffer, for as long as the client likes.",
+            PREAUTH_DEADLINE * 5 / 2
+        );
+        assert!(
+            !frontend_closed,
+            "a frontend that made the proof was closed at the deadline"
+        );
+    }
+
+    /// A daemon holding as many connections part-way through the proof as
+    /// it may tells the next one it is busy, rather than hang up on it as a
+    /// daemon from before the two-way proof does (#222).
+    // LEDGER T9628 | class B | 2 bytes a refused connection reads from the real listener
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_connection_past_the_cap_is_told_the_daemon_is_busy() {
+        let (mut listener, path) = listener("busy").await;
+        let mut idle = vec![];
+        for _ in 0..PREAUTH_CONNECTIONS_MAX {
+            idle.push(UnixStream::connect(&path).await.expect("connect"));
+        }
+        serve_for(&mut listener, Duration::from_millis(100)).await;
+        let mut refused = UnixStream::connect(&path).await.expect("connect");
+        let challenge = proof::challenge_line(&proof::nonce().expect("a nonce"));
+        refused
+            .write_all(challenge.as_bytes())
+            .await
+            .expect("the challenge is written");
+        let reading = async {
+            let mut said = Vec::new();
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut refused, &mut said).await;
+            said
+        };
+        let (said, ()) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(20), reading),
+            serve_for(&mut listener, Duration::from_millis(500)),
+        );
+        drop(idle);
+        drop(listener);
+        remove(&path);
+        let said = said.map(|s| String::from_utf8_lossy(&s).into_owned());
+        assert_eq!(
+            said.as_deref(),
+            Ok(proof::BUSY_LINE),
+            "a connection the daemon would not take was told this. Hung up on \
+             without a word, it reads as a daemon from before the two-way proof, \
+             and the app restarts a daemon of its own build."
+        );
+    }
+
+    // LEDGER T71 | class B | 2 connections on a socket, virtual clock
+    #[tokio::test(start_paused = true)]
+    async fn connections_waiting_for_the_token_are_capped() {
+        const EXTRA: usize = 8;
+        let (mut listener, path) = listener("many").await;
+        let mut idle = vec![];
+        for _ in 0..PREAUTH_CONNECTIONS_MAX + EXTRA {
+            idle.push(UnixStream::connect(&path).await.expect("connect"));
+        }
+
+        serve_for(&mut listener, Duration::from_millis(100)).await;
+        let closed = idle.iter().filter(|c| hung_up(c)).count();
+
+        // Once those time out, a frontend is admitted again.
+        serve_for(&mut listener, PREAUTH_DEADLINE * 2).await;
+        let mut frontend = UnixStream::connect(&path).await.expect("connect");
+        let proven =
+            prove_while_serving(&mut listener, &mut frontend, Duration::from_millis(100)).await;
+        let admitted = proven
+            && listener
+                .tx_streams
+                .iter()
+                .any(|e| e.state.authed.load(Ordering::Acquire));
+        drop(listener);
+        remove(&path);
+
+        assert_eq!(
+            closed,
+            EXTRA,
+            "of {} idle connections without a proof, {closed} were closed at \
+             once; at most {PREAUTH_CONNECTIONS_MAX} may wait. Without a cap every \
+             one is held with its read buffer, and any local process can open \
+             thousands.",
+            PREAUTH_CONNECTIONS_MAX + EXTRA
+        );
+        assert!(
+            admitted,
+            "after the waiting connections timed out, a frontend that proves the \
+             token was not admitted"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod a_write_that_did_not_finish_closes_the_connection {
+    //! A broadcast that cannot be written in full ends that frontend's
+    //! connection, rather than leaving it open with part of an event and
+    //! nothing after it (#95).
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// A real listener on a real socket, holding `TOKEN`, and a frontend on
+    /// it that has made the two-way proof and been answered with `Sync`.
+    async fn attached(tag: &str) -> (AsyncFrontendListener, PathBuf, UnixStream) {
+        let path = PathBuf::from(format!("/tmp/h-short-{tag}-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let claim = Claim::take(&crate::DaemonEndpoint::Unix(path.clone()))
+            .await
+            .expect("a claim on a fresh socket path");
+        let mut listener = AsyncFrontendListener {
+            claim,
+            token: TOKEN.into(),
+            admitting: FuturesUnordered::new(),
+            line_streams: SelectAll::new(),
+            tx_streams: vec![],
+            refusing: false,
+        };
+        let mut frontend = UnixStream::connect(&path).await.expect("connect");
+        let proving = async {
+            let (rx, mut tx) = frontend.split();
+            let mut rx = BufReader::new(rx);
+            crate::proof::prove_to_daemon(&mut rx, &mut tx, TOKEN).await
+        };
+        let (proven, first) = tokio::join!(
+            proving,
+            tokio::time::timeout(Duration::from_secs(10), listener.next())
+        );
+        proven.expect("the frontend makes the two-way proof");
+        let first = first.expect("the listener answers the proof within 10 s");
+        assert!(
+            matches!(first, Some(Ok(FrontendRequest::Sync))),
+            "precondition: an authenticated frontend is synced, got {first:?}"
+        );
+        (listener, path, frontend)
+    }
+
+    fn remove(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(lock_path(path));
+    }
+
+    /// An event far larger than any socket buffer, to a frontend that is
+    /// not reading: the write cannot finish within the stall limit.
+    fn too_big() -> (FrontendEvent, usize) {
+        let event = FrontendEvent::Error("x".repeat(8 * 1024 * 1024));
+        let len = serde_json::to_string(&event).expect("json").len() + 1;
+        (event, len)
+    }
+
+    // LEDGER T526 | class B | 2 bytes read from a real socket after AsyncFrontendListener::broadcast
+    #[tokio::test]
+    async fn a_frontend_sent_part_of_an_event_is_hung_up_on() {
+        let (mut listener, path, mut frontend) = attached("eof").await;
+        let (event, len) = too_big();
+        listener.broadcast(event).await;
+
+        // Everything written is still readable; after it must come the end.
+        let mut got = Vec::new();
+        let ended =
+            tokio::time::timeout(Duration::from_secs(10), frontend.read_to_end(&mut got)).await;
+        drop(listener);
+        remove(&path);
+
+        assert!(
+            got.len() < len,
+            "precondition: the write was cut short, and {} of {len} bytes arrived",
+            got.len()
+        );
+        assert!(
+            matches!(ended, Ok(Ok(_))),
+            "the frontend read {} bytes of a {len}-byte event and the connection \
+             stayed open: it holds a cut-off line and waits for events that never \
+             come ({ended:?})",
+            got.len()
+        );
+    }
+
+    // LEDGER T527 | class B | 2 bytes written to a real socket, requests read by AsyncFrontendListener
+    #[tokio::test]
+    async fn a_closed_connection_is_not_read_from() {
+        let (mut listener, path, mut frontend) = attached("read").await;
+        let (event, _) = too_big();
+        listener.broadcast(event).await;
+
+        // The frontend sends a request before it notices the end.
+        frontend
+            .write_all(b"{\"Activate\":[0,false]}\n")
+            .await
+            .expect("the daemon still holds the read half");
+        let mut honoured = vec![];
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(request) = listener.next().await {
+                honoured.push(request);
+            }
+        })
+        .await;
+        drop(listener);
+        remove(&path);
+
+        assert!(
+            honoured.is_empty(),
+            "a connection the daemon closed on a failed write still had its \
+             requests honoured: {honoured:?}"
+        );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod the_pipe {
+    //! The daemon's named pipe on Windows: one daemon per user, a name
+    //! something else holds reported rather than taken for a daemon, and
+    //! nothing granted to anyone but this user (#110, #96).
+
+    use super::*;
+    use std::os::windows::io::AsRawHandle;
+
+    fn endpoint(tag: &str) -> crate::DaemonEndpoint {
+        crate::DaemonEndpoint::Pipe(format!(r"\\.\pipe\hops-test-{tag}-{}", std::process::id()))
+    }
+
+    fn describe(got: &Result<Claim, IpcListenerCreationError>) -> String {
+        match got {
+            Ok(_) => "claimed".to_string(),
+            Err(IpcListenerCreationError::AlreadyRunning) => "AlreadyRunning".to_string(),
+            Err(IpcListenerCreationError::Held { .. }) => "Held".to_string(),
+            Err(e) => format!("{e:?}"),
+        }
+    }
+
+    /// A second daemon of this user beside a running one is told one runs.
+    // LEDGER T9622 | class B | 1 return value of Claim::take on a real pipe
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_daemon_beside_one_of_this_user_is_already_running() {
+        let endpoint = endpoint("twice");
+        let first = Claim::take(&endpoint).await;
+        let second = Claim::take(&endpoint).await;
+        assert_eq!(
+            (describe(&first), describe(&second)),
+            ("claimed".to_string(), "AlreadyRunning".to_string()),
+            "(first daemon, second daemon) on one pipe"
+        );
+    }
+
+    /// A pipe under the daemon's name that this user may not open, as one
+    /// another user made first would be, is reported as held, and not taken
+    /// for a running daemon: the daemon used to exit quietly as "already
+    /// running" beside anything that held its endpoint.
+    // LEDGER T9623 | class B | 1 return value of Claim::take on a real pipe
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pipe_this_user_may_not_open_is_held_not_a_running_daemon() {
+        let endpoint = endpoint("held");
+        let crate::DaemonEndpoint::Pipe(name) = &endpoint else {
+            unreachable!("a pipe")
+        };
+        let _squatter =
+            crate::windows::testing::pipe_no_one_may_open(name).expect("a pipe no one may open");
+        let got = Claim::take(&endpoint).await;
+        let message = match &got {
+            Err(e @ IpcListenerCreationError::Held { .. }) => e.to_string(),
+            _ => String::new(),
+        };
+        assert!(
+            describe(&got) == "Held" && message.contains(name.as_str()),
+            "a daemon starting beside a pipe it may not open got {}, saying {message:?}. \
+             It must say what holds its endpoint, and exit unsuccessfully.",
+            describe(&got)
+        );
+    }
+
+    /// Only a pipe a process of this user holds answers the front door. One
+    /// held by anything else, however it lets this user in, is no daemon of
+    /// this user's: nothing answers, so the front door starts one, which
+    /// says what holds its pipe (#96).
+    // LEDGER T9625 | class B | 3 return values of DaemonEndpoint::answers on real pipes
+    #[tokio::test(flavor = "current_thread")]
+    async fn only_a_pipe_this_user_holds_answers() {
+        let ours = endpoint("answers-ours");
+        let _claim = Claim::take(&ours).await.expect("a claim on a fresh pipe");
+        let held = endpoint("answers-held");
+        let crate::DaemonEndpoint::Pipe(name) = &held else {
+            unreachable!("a pipe")
+        };
+        let _squatter =
+            crate::windows::testing::pipe_no_one_may_open(name).expect("a pipe no one may open");
+        let none = endpoint("answers-none");
+        assert_eq!(
+            (ours.answers(), held.answers(), none.answers()),
+            (true, false, false),
+            "(this user's pipe, a pipe this user may not open, no pipe)"
+        );
+    }
+
+    /// The pipe grants this user, and no one else, anything.
+    // LEDGER T9624 | class B | 6 security descriptor the system reports for the daemon's pipe
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_daemons_pipe_grants_this_user_alone() {
+        let endpoint = endpoint("dacl");
+        let crate::DaemonEndpoint::Pipe(name) = &endpoint else {
+            unreachable!("a pipe")
+        };
+        let _claim = Claim::take(&endpoint)
+            .await
+            .expect("a claim on a fresh pipe");
+        let client = crate::windows::open_pipe_now(name).expect("this user opens the pipe");
+        let dacl = crate::windows::testing::dacl_of(client.as_raw_handle()).expect("its DACL");
+        let me = crate::windows::this_user().expect("this user's SID");
+        let aces: Vec<&str> = dacl
+            .split('(')
+            .skip(1)
+            .map(|ace| ace.trim_end_matches(')'))
+            .collect();
+        // The trustee is the ACE's last field, in SDDL: this user's SID, or
+        // its alias when the user is a well-known account (`LA` for the
+        // built-in Administrator, as on a CI runner).
+        let this_user_alone = aces.iter().all(|ace| {
+            let trustee = ace.rsplit(';').next().unwrap_or_default();
+            ace.starts_with("A;")
+                && crate::windows::testing::same_sid(trustee, &me).expect("a trustee SID")
+        });
+        assert!(
+            dacl.starts_with("D:P") && !aces.is_empty() && this_user_alone,
+            "the daemon's pipe grants more than this user ({me}): {dacl}"
         );
     }
 }
