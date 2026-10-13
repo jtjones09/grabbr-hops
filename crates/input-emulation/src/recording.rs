@@ -53,6 +53,9 @@ struct Log {
     /// Whether the screen shield is up, as the libei backend reads it from
     /// logind and the screensaver: `None` when it cannot be read.
     shield: Option<bool>,
+    /// Reading the shield does not answer until this is cleared, as a
+    /// D-Bus service that hangs.
+    shield_stalls: bool,
     /// How many times a test ended the session from the system's side.
     ends: u64,
     /// How many backends were created from this recording.
@@ -95,6 +98,7 @@ impl Recording {
             as_mac: false,
             unasked: false,
             shield: Some(false),
+            shield_stalls: false,
             ends: 0,
             started: 0,
         }));
@@ -142,6 +146,12 @@ impl Recording {
         self.log.lock().expect("recording log").shield = up;
     }
 
+    /// Make reading the shield hang while `stalls`, as a D-Bus service
+    /// that never answers does.
+    pub fn stall_shield(&self, stalls: bool) {
+        self.log.lock().expect("recording log").shield_stalls = stalls;
+    }
+
     /// End the running session from the system's side with no event
     /// injected, as the compositor closing the libei stream does.
     pub fn end_session(&self) {
@@ -178,15 +188,23 @@ impl Drop for Recording {
 }
 
 /// What the recording `id` answers when asked whether the screen shield is
-/// up; `None` once the recording is dropped.
-pub(crate) fn shield_up(id: RecordingId) -> Option<bool> {
+/// up, once it no longer stalls; `None` once the recording is dropped.
+pub(crate) async fn shield_up(id: RecordingId) -> Option<bool> {
     let log = REGISTRY
         .lock()
         .expect("recording registry")
         .as_ref()
         .and_then(|registry| registry.get(&id).cloned())?;
-    let up = log.lock().expect("recording log").shield;
-    up
+    loop {
+        let (stalls, up) = {
+            let log = log.lock().expect("recording log");
+            (log.shield_stalls, log.shield)
+        };
+        if !stalls {
+            return up;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
 }
 
 pub(crate) struct RecordingEmulation {

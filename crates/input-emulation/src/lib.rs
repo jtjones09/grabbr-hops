@@ -136,7 +136,7 @@ impl ShieldWatch {
             #[cfg(libei)]
             Watch::Libei(shield) => shield.up().await,
             #[cfg(feature = "recording")]
-            Watch::Recording(id) => recording::shield_up(*id),
+            Watch::Recording(id) => recording::shield_up(*id).await,
             Watch::Unwatched => None,
         }
     }

@@ -515,17 +515,25 @@ impl Emulation for LibeiEmulation {
     /// When the ei stream ends: the compositor closed it, as GNOME does
     /// for every remote-desktop session when the screen shield goes up.
     async fn ended(&mut self) -> EmulationError {
-        loop {
-            if self.libei_error.load(Ordering::SeqCst) {
-                return self
-                    .error
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .take()
-                    .unwrap_or(EmulationError::EndOfStream);
-            }
-            self.ended.notified().await;
+        until_ended(&self.libei_error, &self.error, &self.ended).await
+    }
+}
+
+/// Why the ei stream ended, once `ei_task` has said it did.
+async fn until_ended(
+    libei_error: &AtomicBool,
+    error: &Mutex<Option<EmulationError>>,
+    ended: &Notify,
+) -> EmulationError {
+    loop {
+        if libei_error.load(Ordering::SeqCst) {
+            return error
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+                .unwrap_or(EmulationError::EndOfStream);
         }
+        ended.notified().await;
     }
 }
 
@@ -722,6 +730,52 @@ mod tests {
              than hops, so the devices it is given carry another name"
         );
         assert_eq!(context_type, eis::handshake::ContextType::Sender);
+    }
+
+    // LEDGER | behaviour | 2 a stand-in EIS server closes the stream; until_ended over ei_handshake and ei_task
+    /// GNOME closes the ei stream when the screen shield goes up. The end
+    /// must be known then, so the app and the peers are told at once, not
+    /// at the next event hops injects (#258).
+    #[tokio::test]
+    async fn a_closed_ei_stream_is_known_at_once() {
+        use std::sync::{Arc, Mutex, atomic::AtomicBool};
+        use tokio::sync::Notify;
+
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (ours, theirs) = UnixStream::pair().expect("a socket pair");
+                let compositor = std::thread::spawn(move || compositor_side(theirs));
+                let (context, conn, events) =
+                    tokio::time::timeout(Duration::from_secs(30), super::ei_handshake(ours))
+                        .await
+                        .expect("the handshake finished within 30s")
+                        .expect("the handshake succeeded on our side");
+                let (_, _, compositor_context) = compositor.join().expect("the compositor side");
+                let libei_error = Arc::new(AtomicBool::default());
+                let error = Arc::new(Mutex::new(None));
+                let ended = Arc::new(Notify::new());
+                tokio::task::spawn_local(super::ei_task(
+                    events,
+                    conn,
+                    context,
+                    super::Devices::default(),
+                    libei_error.clone(),
+                    error.clone(),
+                    ended.clone(),
+                ));
+
+                drop(compositor_context);
+                let end = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    super::until_ended(&libei_error, &error, &ended),
+                )
+                .await;
+                assert!(
+                    end.is_ok(),
+                    "the compositor closed the ei stream and nothing said so within 5s"
+                );
+            })
+            .await;
     }
 
     // LEDGER | behaviour | token_file_path for each environment a session may have

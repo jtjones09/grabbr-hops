@@ -1,6 +1,6 @@
 use crate::config::{local_caps, local_commit};
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
-use crate::restart::{RESTART_AFTER, restart_wait};
+use crate::restart::RESTART_AFTER;
 use futures::{FutureExt, StreamExt, future::LocalBoxFuture};
 use hops_proto::{Position, ProtoEvent};
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError, Restart};
@@ -996,6 +996,11 @@ const SHIELD_SETTLES: Duration = Duration::from_secs(5);
 /// How often the shield is read while it settles.
 const SHIELD_READ_EVERY: Duration = Duration::from_millis(250);
 
+/// How long one reading of the shield may take before it counts as
+/// unreadable: a D-Bus call has no timeout of its own, and a service that
+/// never answers must not hold a restart forever.
+const SHIELD_READ_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// What an automatic restart does, from what is known of the screen shield
 /// (#258).
 #[derive(Debug, PartialEq, Eq)]
@@ -1018,15 +1023,42 @@ fn gate(up: Option<bool>) -> Gate {
     }
 }
 
-/// Whether the shield read as up within [`SHIELD_SETTLES`] of the end.
-async fn ended_by_the_shield(shield: &mut input_emulation::ShieldWatch) -> bool {
+/// One reading of the shield, unreadable after [`SHIELD_READ_TIMEOUT`].
+async fn read_shield(shield: &mut input_emulation::ShieldWatch) -> Option<bool> {
+    tokio::time::timeout(SHIELD_READ_TIMEOUT, shield.up())
+        .await
+        .unwrap_or(None)
+}
+
+/// What the shield read as within [`SHIELD_SETTLES`] of the end.
+#[derive(Debug, PartialEq, Eq)]
+enum ShieldAtTheEnd {
+    /// Up at some reading: the shield ended the session.
+    Up,
+    /// Down at every reading that answered.
+    Down,
+    /// No reading answered.
+    Unreadable,
+}
+
+/// Read the shield until it reads up or [`SHIELD_SETTLES`] passes: GNOME
+/// closes the session before it says the shield is up, so the first
+/// reading is usually down.
+async fn shield_at_the_end(shield: &mut input_emulation::ShieldWatch) -> ShieldAtTheEnd {
     let until = tokio::time::Instant::now() + SHIELD_SETTLES;
+    let mut answered = false;
     loop {
-        if shield.up().await == Some(true) {
-            return true;
+        match read_shield(shield).await {
+            Some(true) => return ShieldAtTheEnd::Up,
+            Some(false) => answered = true,
+            None => {}
         }
         if tokio::time::Instant::now() >= until {
-            return false;
+            return if answered {
+                ShieldAtTheEnd::Down
+            } else {
+                ShieldAtTheEnd::Unreadable
+            };
         }
         tokio::time::sleep(SHIELD_READ_EVERY).await;
     }
@@ -1042,17 +1074,28 @@ async fn restart_after_the_shield(
     backend: input_emulation::Backend,
 ) -> Option<input_emulation::Backend> {
     let mut shield = InputEmulation::shield_watch(backend);
-    if !ended_by_the_shield(&mut shield).await {
-        log::info!(
-            "input emulation ended while the screen shield was down, as when screen \
-             sharing is stopped: it starts again only when switched on"
-        );
-        return None;
+    match shield_at_the_end(&mut shield).await {
+        ShieldAtTheEnd::Up => log::info!(
+            "the screen shield ended input emulation: it starts again once the shield is down"
+        ),
+        ShieldAtTheEnd::Down => {
+            log::info!(
+                "input emulation ended while the screen shield was down, as when screen \
+                 sharing is stopped: it starts again only when switched on"
+            );
+            return None;
+        }
+        ShieldAtTheEnd::Unreadable => {
+            log::warn!(
+                "cannot tell whether the screen shield was up: input emulation starts \
+                 again only when switched on"
+            );
+            return None;
+        }
     }
-    log::info!("the screen shield ended input emulation: it starts again once the shield is down");
     tokio::time::sleep_until(at).await;
     loop {
-        match gate(shield.up().await) {
+        match gate(read_shield(&mut shield).await) {
             Gate::Go => {
                 log::info!("the screen shield is down: input emulation starts again");
                 return Some(backend);
@@ -1079,9 +1122,7 @@ async fn until_restart<T>(restart: &mut Option<LocalBoxFuture<'static, T>>) -> T
 
 impl EmulationTask {
     async fn run(mut self) {
-        let mut waited: Option<Duration> = None;
         loop {
-            let started = tokio::time::Instant::now();
             // When to start again without being asked, and through which
             // backend (#258). A refused or missing permission waits for the
             // permission watch or the user, as capture does (#240).
@@ -1093,17 +1134,13 @@ impl EmulationTask {
                 let _ = self
                     .event_tx
                     .send(EmulationEvent::EmulationFailed(fault_of(&e)));
-                let wait = match restart_of(&e, restarts.is_some()) {
-                    Some(Restart::Soon) => Some(RESTART_AFTER),
-                    Some(Restart::Backoff) => {
-                        let wait = restart_wait(waited, started.elapsed(), RESTART_AFTER);
-                        waited = Some(wait);
-                        Some(wait)
-                    }
-                    None => None,
-                };
-                if let (Some(wait), Some(backend)) = (wait, restarts) {
-                    restart_at = Some((tokio::time::Instant::now() + wait, backend));
+                // Always the first wait, never a growing one as capture's:
+                // the shield gate keeps a restart from repeating while the
+                // screen is locked, and a failed automatic start is never
+                // tried again, so a growing wait would only keep emulation
+                // off for up to a minute after an unlock.
+                if let (Some(_), Some(backend)) = (restart_of(&e, restarts.is_some()), restarts) {
+                    restart_at = Some((tokio::time::Instant::now() + RESTART_AFTER, backend));
                 }
             }
             if self.exit_requested.get() {
@@ -3583,6 +3620,88 @@ mod held_input_is_released {
             s.dialer().until_alive().await;
             s.inject(key(KEY_B, 1)).await;
             s.inject(key(KEY_B, 0)).await;
+        });
+    }
+
+    // LEDGER | behaviour | 1 Emulation::event when the shield reads up only after the end
+    /// GNOME closes the session before it says the shield is up: LockedHint
+    /// follows in milliseconds, and the screensaver reads active about
+    /// 850 ms later on the animated lock. A shield that reads down at the
+    /// end and up within the settle window still ended the session (#258).
+    #[test]
+    fn a_shield_that_reads_up_only_after_the_end_still_restarts_emulation() {
+        run_local(async {
+            let mut s = running(true).await;
+            let ended = end_with_shield(&mut s, Some(false)).await;
+            // `end_with_shield` waited a second already: the shield is now
+            // seen 1.6 s after the end, as on a slow lock animation.
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            s.recording.shield(Some(true));
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            s.recording.shield(Some(false));
+            let down = told_until_enabled(&mut s, Duration::from_secs(10)).await;
+            assert_eq!(
+                (ended, down),
+                (vec!["disabled", "failed"], vec!["enabled"]),
+                "(what emulation told the service at the end, once the shield that \
+                 came up after it went down)"
+            );
+        });
+    }
+
+    // LEDGER | behaviour | 1 Emulation::event timings over repeated shield ends
+    /// The screen locked again and again: each unlock brings emulation back
+    /// after the first wait, not after one that has grown to a minute
+    /// (#258).
+    #[test]
+    fn emulation_after_repeated_locks_starts_again_without_a_growing_wait() {
+        run_local(async {
+            let mut s = running(true).await;
+            let mut waits = vec![];
+            for _ in 0..4 {
+                let ended = tokio::time::Instant::now();
+                assert_eq!(
+                    end_with_shield(&mut s, Some(true)).await,
+                    ["disabled", "failed"]
+                );
+                s.recording.shield(Some(false));
+                assert_eq!(
+                    told_until_enabled(&mut s, Duration::from_secs(20)).await,
+                    ["enabled"]
+                );
+                waits.push(ended.elapsed());
+            }
+            // Doubling from 1 s, the fourth wait would be 8 s.
+            assert!(
+                waits.iter().all(|w| *w < Duration::from_secs(3)),
+                "each restart after an unlock must take the same short wait; the \
+                 waits from the end until emulation ran again were {waits:?}"
+            );
+        });
+    }
+
+    // LEDGER | behaviour | 1 Emulation::event when reading the shield hangs, then answers
+    /// A service that never answers is unreadable after a second, so only
+    /// the user starts emulation; a reading that answers late is not trusted
+    /// after the fact (#258).
+    #[test]
+    fn a_shield_reading_that_hangs_waits_for_the_user() {
+        run_local(async {
+            let mut s = running(true).await;
+            let ended = end_with_shield(&mut s, Some(true)).await;
+            s.recording.stall_shield(true);
+            tokio::time::sleep(SHIELD_READ_TIMEOUT + 2 * RESTART_AFTER).await;
+            s.recording.shield(Some(false));
+            s.recording.stall_shield(false);
+            let unasked = told_until_enabled(&mut s, 4 * RESTART_AFTER).await;
+            s.emulation.reenable();
+            let asked = told_until_enabled(&mut s, Duration::from_secs(10)).await;
+            assert_eq!(
+                (ended, unasked, asked),
+                (vec!["disabled", "failed"], vec![], vec!["enabled"]),
+                "(what emulation told the service at the end, after the hung reading \
+                 answered down, after the user asked)"
+            );
         });
     }
 
