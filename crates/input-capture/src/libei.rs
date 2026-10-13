@@ -489,6 +489,10 @@ async fn do_capture_session(
     cancel: (CancellationToken, CancellationToken),
 ) -> Result<(), CaptureError> {
     let (cancel_session, cancel_update) = cancel;
+    // However the session ends, an error included, the task watching for
+    // updates must end with it: `do_capture` joins the two, and an error
+    // returned here reaches the caller only once both are done.
+    let _end_update = cancel_update.drop_guard();
     // current client
     let current_pos = Rc::new(Cell::new(None));
 
@@ -510,7 +514,6 @@ async fn do_capture_session(
         r = setup => r?,
         _ = cancel_session.cancelled() => {
             log::debug!("session cancelled while it was being set up");
-            cancel_update.cancel();
             return Ok(());
         }
     };
@@ -635,8 +638,6 @@ async fn do_capture_session(
     };
 
     let (a, b) = tokio::join!(ei_task, capture_session_task);
-
-    cancel_update.cancel();
 
     log::debug!("both session and ei task finished!");
     a?;

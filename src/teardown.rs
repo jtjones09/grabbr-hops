@@ -13,8 +13,10 @@ use tokio::task::JoinHandle;
 /// waited on for good, until systemd killed the daemon at its 90 s stop
 /// timeout. The backends bound their own portal calls first (2 s each, the
 /// libei capture task 3 s), so this fires only when something below has no
-/// bound of its own. Capture and emulation stop one after the other, so a
-/// stop waits at most twice this: well inside systemd's 90 s.
+/// bound of its own. A task that does not stop is waited on for this long,
+/// then for as long again to be dropped once aborted, which takes a
+/// moment. Capture and emulation stop one after the other: a stop waits
+/// about 10 s at most, 20 s in theory, inside systemd's 90 s.
 pub(crate) const STOP_WITHIN: Duration = Duration::from_secs(5);
 
 /// Waits for `task` to end, for at most `within`. A task still running then

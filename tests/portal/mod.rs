@@ -6,7 +6,9 @@
 //! portal call (#113). What a backend sends, and in which order, is what
 //! these tests observe. The stand-in answers the bus's own calls, reports
 //! the Registry as present, accepts `Register`, and refuses every other
-//! portal call, so a backend stops at its first one.
+//! portal call, so a backend stops at its first one. Started with
+//! [`start_creating_capture_sessions`], it also grants input capture's
+//! `CreateSession`, so a backend stops at the session's first setup step.
 //!
 //! One backend per test binary: the portal registration and ashpd's
 //! session-bus connection are both made once per process.
@@ -20,7 +22,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use zbus::message::Type;
-use zbus::zvariant::{OwnedValue, Value};
+use zbus::zvariant::{ObjectPath, OwnedValue, Value};
 use zbus::{Guid, MessageStream};
 
 const REGISTRY: &str = "org.freedesktop.host.portal.Registry";
@@ -39,6 +41,15 @@ impl Drop for StandIn {
 /// Serves the stand-in and points this process's session bus at it. Call it
 /// before anything in the process touches the session bus.
 pub fn start(tag: &str) -> StandIn {
+    serve_bus(tag, false)
+}
+
+/// As [`start`], granting input capture's `CreateSession` as well.
+pub fn start_creating_capture_sessions(tag: &str) -> StandIn {
+    serve_bus(tag, true)
+}
+
+fn serve_bus(tag: &str, create_sessions: bool) -> StandIn {
     let dir = std::env::temp_dir().join(format!("hops-portal-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("a scratch directory");
@@ -52,7 +63,7 @@ pub fn start(tag: &str) -> StandIn {
     let record = calls.clone();
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
-            tokio::spawn(serve(stream, record.clone()));
+            tokio::spawn(serve(stream, record.clone(), create_sessions));
         }
     });
     StandIn { calls, dir }
@@ -67,7 +78,11 @@ impl StandIn {
     }
 }
 
-async fn serve(stream: tokio::net::UnixStream, calls: Arc<Mutex<Vec<String>>>) {
+async fn serve(
+    stream: tokio::net::UnixStream,
+    calls: Arc<Mutex<Vec<String>>>,
+    create_sessions: bool,
+) {
     let Ok(builder) = zbus::connection::Builder::unix_stream(stream).server(Guid::generate())
     else {
         return;
@@ -111,6 +126,10 @@ async fn serve(stream: tokio::net::UnixStream, calls: Arc<Mutex<Vec<String>>>) {
                     refuse(&conn, &header).await
                 }
             }
+            (CAPTURE, "CreateSession") if create_sessions => {
+                calls.lock().unwrap().push(format!("{interface}.{member}"));
+                create_session(&conn, &msg).await
+            }
             (REGISTRY, "Register") => {
                 let (app_id, _): (String, HashMap<String, OwnedValue>) =
                     msg.body().deserialize().unwrap_or_default();
@@ -126,6 +145,50 @@ async fn serve(stream: tokio::net::UnixStream, calls: Arc<Mutex<Vec<String>>>) {
             return;
         }
     }
+}
+
+const CAPTURE: &str = "org.freedesktop.portal.InputCapture";
+
+/// The caller's unique name, as `Hello` gave it, in a portal object path.
+const CALLER: &str = "1_42";
+
+/// Grants a `CreateSession`: replies with the request's path, then sends
+/// the request's `Response` naming the session, as a portal does once the
+/// user allows it.
+async fn create_session(conn: &zbus::Connection, msg: &zbus::Message) -> zbus::Result<()> {
+    let header = msg.header();
+    let (_parent, options): (String, HashMap<String, OwnedValue>) = msg.body().deserialize()?;
+    let token = |key: &str| -> String {
+        options
+            .get(key)
+            .and_then(|v| String::try_from(v.try_clone().ok()?).ok())
+            .unwrap_or_default()
+    };
+    let request = ObjectPath::try_from(format!(
+        "/org/freedesktop/portal/desktop/request/{CALLER}/{}",
+        token("handle_token")
+    ))?
+    .into_owned();
+    let session = ObjectPath::try_from(format!(
+        "/org/freedesktop/portal/desktop/session/{CALLER}/{}",
+        token("session_handle_token")
+    ))?
+    .into_owned();
+    conn.reply(&header, &request).await?;
+    let results = HashMap::from([
+        ("session_handle", Value::from(session)),
+        // Keyboard | Pointer
+        ("capabilities", Value::U32(3)),
+    ]);
+    let response = zbus::Message::signal(
+        request.clone(),
+        "org.freedesktop.portal.Request",
+        "Response",
+    )?
+    .sender(":1.1")?
+    .destination(":1.42")?
+    .build(&(0u32, results))?;
+    conn.send(&response).await
 }
 
 async fn refuse(conn: &zbus::Connection, header: &zbus::message::Header<'_>) -> zbus::Result<()> {
