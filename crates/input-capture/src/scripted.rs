@@ -55,6 +55,9 @@ struct Shared {
     unclaimed: Arc<AtomicUsize>,
     /// The permissions the backend is refused at creation, as macOS refuses one.
     withheld: Arc<Mutex<Vec<Permission>>>,
+    /// Tearing the backend down never finishes, as a portal that does not
+    /// answer while the screen is locked.
+    never_stops: Arc<AtomicBool>,
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
@@ -136,6 +139,12 @@ impl Script {
     /// lets the next one start.
     pub fn withhold(&self, missing: &[Permission]) {
         *self.shared.withheld.lock().expect("withheld") = missing.to_vec();
+    }
+
+    /// Make tearing the backend down never finish, as a backend waiting on a
+    /// portal that does not answer while the screen is locked.
+    pub fn never_stop(&self) {
+        self.shared.never_stops.store(true, Ordering::SeqCst);
     }
 
     /// Take `missing` away from the running backend: its stream yields the
@@ -227,6 +236,9 @@ impl Capture for ScriptedCapture {
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {
         self.shared.held.store(false, Ordering::SeqCst);
+        if self.shared.never_stops.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         Ok(())
     }
 }

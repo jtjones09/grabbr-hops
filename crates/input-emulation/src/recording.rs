@@ -60,6 +60,9 @@ struct Log {
     ends: u64,
     /// How many backends were created from this recording.
     started: usize,
+    /// Tearing a backend down never finishes, as a portal that does not
+    /// answer while the screen is locked.
+    never_stops: bool,
 }
 
 type Shared = Arc<Mutex<Log>>;
@@ -101,6 +104,7 @@ impl Recording {
             shield_stalls: false,
             ends: 0,
             started: 0,
+            never_stops: false,
         }));
         REGISTRY
             .lock()
@@ -156,6 +160,13 @@ impl Recording {
     /// injected, as the compositor closing the libei stream does.
     pub fn end_session(&self) {
         self.log.lock().expect("recording log").ends += 1;
+    }
+
+    /// Make tearing down every backend created from this one never finish,
+    /// as a backend whose portal does not answer while the screen is locked.
+    /// The call is still recorded.
+    pub fn never_stop(&self) {
+        self.log.lock().expect("recording log").never_stops = true;
     }
 
     /// How many backends were created from this recording.
@@ -280,6 +291,9 @@ impl Emulation for RecordingEmulation {
 
     async fn terminate(&mut self) {
         self.record(Recorded::Terminate);
+        if self.log.lock().expect("recording log").never_stops {
+            std::future::pending::<()>().await;
+        }
     }
 
     fn button_scope(&self) -> ButtonScope {

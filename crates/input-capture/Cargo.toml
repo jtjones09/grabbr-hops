@@ -67,6 +67,8 @@ windows = { version = "0.61.2", features = [
 
 [dev-dependencies]
 input-event = { path = "../input-event", version = "0.4.0", default-features = false, features = ["test-support"] }
+# Paused time, so a test of how long a stop waits takes no time.
+tokio = { version = "1.32.0", features = ["macros", "rt", "test-util", "time"] }
 
 [features]
 default = ["layer_shell", "x11", "libei"]
