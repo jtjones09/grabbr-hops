@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+pub use input_event::Restart;
+
 #[derive(Debug, Error)]
 pub enum InputCaptureError {
     #[error("error creating input-capture: `{0}`")]
@@ -81,15 +83,6 @@ pub enum CaptureError {
         "secure input took the pointer back from another machine; input capture starts again shortly"
     )]
     SecureInput,
-}
-
-/// How capture that ended starts again without the user asking.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Restart {
-    /// After a short fixed wait: the cause passes on its own.
-    Soon,
-    /// After a wait that grows while the cause keeps recurring.
-    Backoff,
 }
 
 /// An OS permission capture needs, named as macOS lists it under System

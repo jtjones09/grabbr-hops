@@ -62,6 +62,7 @@ mod pairing;
 mod permission_watch;
 mod pid;
 mod prompt_gate;
+mod restart;
 pub mod service;
 mod transport;
 pub mod trust;

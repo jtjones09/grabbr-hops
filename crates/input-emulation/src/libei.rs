@@ -11,11 +11,15 @@ use std::{
     },
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::task::JoinHandle;
+use tokio::{sync::Notify, task::JoinHandle};
 
-use ashpd::desktop::{
-    PersistMode, Session,
-    remote_desktop::{DeviceType, RemoteDesktop, SelectDevicesOptions},
+use ashpd::{
+    desktop::{
+        PersistMode, Session,
+        remote_desktop::{DeviceType, RemoteDesktop, SelectDevicesOptions},
+    },
+    zbus,
+    zvariant::OwnedObjectPath,
 };
 use async_trait::async_trait;
 
@@ -49,8 +53,12 @@ pub(crate) struct LibeiEmulation {
     ei_task: JoinHandle<()>,
     error: Arc<Mutex<Option<EmulationError>>>,
     libei_error: Arc<AtomicBool>,
+    /// Told when the ei stream ends, so the end is known at once.
+    ended: Arc<Notify>,
     _remote_desktop: RemoteDesktop,
     session: Session<RemoteDesktop>,
+    /// The portal gave this session a restore token and it was saved.
+    token_saved: bool,
 }
 
 /// The RemoteDesktop token file, under `$XDG_CACHE_HOME` or else
@@ -97,6 +105,172 @@ fn write_token(token: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Whether emulation can start again with no portal dialog (#258): the
+/// session that ran saved the restore token the portal gave it, and a token
+/// is still on disk. The portal deletes a token as it is used and saves it
+/// again only when the session starts, so a session that did not save one
+/// leaves none that works; and a token it does not know is ignored, which
+/// shows the dialog.
+fn starts_unasked(token_saved: bool, stored: Option<String>) -> bool {
+    token_saved && stored.is_some_and(|token| !token.is_empty())
+}
+
+/// The screen shield, read from logind and the screensaver services over
+/// connections kept while it is watched (#258). See
+/// [`crate::ShieldWatch`].
+#[derive(Default)]
+pub(crate) struct Shield {
+    system: Option<zbus::Connection>,
+    session: Option<zbus::Connection>,
+    /// The user's graphical session, as logind names it in `Display`. The
+    /// daemon a service manager started runs in a session of its own,
+    /// which says nothing about the screen.
+    display: Option<OwnedObjectPath>,
+}
+
+/// The screensaver services that say whether the shield is up: GNOME's,
+/// then the one other desktops answer.
+const SCREENSAVERS: [(&str, &str); 2] = [
+    ("org.gnome.ScreenSaver", "/org/gnome/ScreenSaver"),
+    (
+        "org.freedesktop.ScreenSaver",
+        "/org/freedesktop/ScreenSaver",
+    ),
+];
+
+/// Whether the shield is up, from the user's graphical session's
+/// `LockedHint` and what each screensaver answered: up if any says so;
+/// down only if `LockedHint` reads false and a screensaver answered;
+/// otherwise unknown. GNOME sets `LockedHint` only once the screen locks,
+/// and never for an account with no password, while the curtain of an idle
+/// screen is up before that, so `LockedHint` alone is not enough.
+fn shield(locked: Option<bool>, screensavers: &[Option<bool>]) -> Option<bool> {
+    if locked == Some(true) || screensavers.contains(&Some(true)) {
+        Some(true)
+    } else if locked == Some(false) && screensavers.iter().any(Option::is_some) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+impl Shield {
+    pub(crate) async fn up(&mut self) -> Option<bool> {
+        let locked = match self.locked_hint().await {
+            Ok(locked) => Some(locked),
+            Err(e) => {
+                log::debug!("cannot read LockedHint from logind: {e}");
+                self.system = None;
+                self.display = None;
+                None
+            }
+        };
+        let mut screensavers = Vec::with_capacity(SCREENSAVERS.len());
+        for (name, path) in SCREENSAVERS {
+            screensavers.push(match self.screensaver_active(name, path).await {
+                Ok(active) => Some(active),
+                Err(e) => {
+                    log::debug!("cannot read {name}.GetActive: {e}");
+                    None
+                }
+            });
+        }
+        shield(locked, &screensavers)
+    }
+
+    /// `LockedHint` of the graphical session of the user this daemon runs
+    /// as.
+    async fn locked_hint(&mut self) -> zbus::Result<bool> {
+        let conn = match &self.system {
+            Some(conn) => conn.clone(),
+            None => {
+                let conn = zbus::Connection::system().await?;
+                self.system = Some(conn.clone());
+                conn
+            }
+        };
+        let display = match &self.display {
+            Some(display) => display.clone(),
+            None => {
+                let display = graphical_session(&conn).await?;
+                self.display = Some(display.clone());
+                display
+            }
+        };
+        proxy(
+            &conn,
+            "org.freedesktop.login1",
+            display,
+            "org.freedesktop.login1.Session",
+        )
+        .await?
+        .get_property("LockedHint")
+        .await
+    }
+
+    async fn screensaver_active(&mut self, name: &'static str, path: &str) -> zbus::Result<bool> {
+        let conn = match &self.session {
+            Some(conn) => conn.clone(),
+            None => {
+                let conn = zbus::Connection::session().await?;
+                self.session = Some(conn.clone());
+                conn
+            }
+        };
+        proxy(&conn, name, OwnedObjectPath::try_from(path)?, name)
+            .await?
+            .call("GetActive", &())
+            .await
+    }
+}
+
+/// The graphical session of the user this daemon runs as: logind's
+/// `Display` for its uid.
+async fn graphical_session(conn: &zbus::Connection) -> zbus::Result<OwnedObjectPath> {
+    // SAFETY: getuid has no preconditions and cannot fail. The owner of
+    // /proc/self, read instead, is root for a process that is not dumpable.
+    let uid = unsafe { libc::getuid() };
+    let manager = proxy(
+        conn,
+        "org.freedesktop.login1",
+        OwnedObjectPath::try_from("/org/freedesktop/login1")?,
+        "org.freedesktop.login1.Manager",
+    )
+    .await?;
+    let user: OwnedObjectPath = manager.call("GetUser", &(uid,)).await?;
+    let user = proxy(
+        conn,
+        "org.freedesktop.login1",
+        user,
+        "org.freedesktop.login1.User",
+    )
+    .await?;
+    let (id, display): (String, OwnedObjectPath) = user.get_property("Display").await?;
+    if id.is_empty() {
+        return Err(zbus::Error::Failure(
+            "the user has no graphical session".into(),
+        ));
+    }
+    Ok(display)
+}
+
+/// A proxy that reads every property afresh: a cached `LockedHint` could
+/// say unlocked after a new lock.
+async fn proxy(
+    conn: &zbus::Connection,
+    destination: &'static str,
+    path: OwnedObjectPath,
+    interface: &'static str,
+) -> zbus::Result<zbus::Proxy<'static>> {
+    zbus::proxy::Builder::new(conn)
+        .destination(destination)?
+        .path(path)?
+        .interface(interface)?
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await
+}
+
 /// Microseconds since the Unix epoch, or 0 on a clock set before it.
 fn now_micros() -> u64 {
     SystemTime::now()
@@ -104,7 +278,10 @@ fn now_micros() -> u64 {
         .map_or(0, |d| d.as_micros() as u64)
 }
 
-async fn get_ei_fd() -> Result<(RemoteDesktop, Session<RemoteDesktop>, OwnedFd), ashpd::Error> {
+/// The portal session, its ei socket, and whether the restore token the
+/// portal gave it was saved.
+async fn get_ei_fd() -> Result<(RemoteDesktop, Session<RemoteDesktop>, OwnedFd, bool), ashpd::Error>
+{
     // Before any portal call, so the consent prompt can name hops.
     input_event::portal::register().await;
     let remote_desktop = RemoteDesktop::new().await?;
@@ -128,16 +305,18 @@ async fn get_ei_fd() -> Result<(RemoteDesktop, Session<RemoteDesktop>, OwnedFd),
         .response()?;
 
     // The restore token is only valid once, we need to re-save it each time
+    let mut token_saved = false;
     if let Some(token_str) = start_response.restore_token() {
-        if let Err(e) = write_token(token_str) {
-            log::warn!("failed to save RemoteDesktop token: {}", e);
+        match write_token(token_str) {
+            Ok(()) => token_saved = true,
+            Err(e) => log::warn!("failed to save RemoteDesktop token: {}", e),
         }
     }
 
     let fd = remote_desktop
         .connect_to_eis(&session, Default::default())
         .await?;
-    Ok((remote_desktop, session, fd))
+    Ok((remote_desktop, session, fd, token_saved))
 }
 
 /// Opens the ei connection on `stream` and names hops to the EIS server, which
@@ -155,11 +334,12 @@ async fn ei_handshake(
 
 impl LibeiEmulation {
     pub(crate) async fn new() -> Result<Self, LibeiEmulationCreationError> {
-        let (_remote_desktop, session, eifd) = get_ei_fd().await?;
+        let (_remote_desktop, session, eifd, token_saved) = get_ei_fd().await?;
         let (context, conn, events) = ei_handshake(UnixStream::from(eifd)).await?;
         let devices = Devices::default();
         let libei_error = Arc::new(AtomicBool::default());
         let error = Arc::new(Mutex::new(None));
+        let ended = Arc::new(Notify::new());
         let ei_handler = ei_task(
             events,
             conn.clone(),
@@ -167,6 +347,7 @@ impl LibeiEmulation {
             devices.clone(),
             libei_error.clone(),
             error.clone(),
+            ended.clone(),
         );
         let ei_task = tokio::task::spawn_local(ei_handler);
 
@@ -177,8 +358,10 @@ impl LibeiEmulation {
             ei_task,
             error,
             libei_error,
+            ended,
             _remote_desktop,
             session,
+            token_saved,
         })
     }
 }
@@ -322,6 +505,36 @@ impl Emulation for LibeiEmulation {
     fn button_scope(&self) -> ButtonScope {
         ButtonScope::Machine
     }
+
+    /// Only with the restore token this session saved: without it the
+    /// portal asks the user again (#258).
+    fn starts_unasked(&self) -> bool {
+        starts_unasked(self.token_saved, read_token())
+    }
+
+    /// When the ei stream ends: the compositor closed it, as GNOME does
+    /// for every remote-desktop session when the screen shield goes up.
+    async fn ended(&mut self) -> EmulationError {
+        until_ended(&self.libei_error, &self.error, &self.ended).await
+    }
+}
+
+/// Why the ei stream ended, once `ei_task` has said it did.
+async fn until_ended(
+    libei_error: &AtomicBool,
+    error: &Mutex<Option<EmulationError>>,
+    ended: &Notify,
+) -> EmulationError {
+    loop {
+        if libei_error.load(Ordering::SeqCst) {
+            return error
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+                .unwrap_or(EmulationError::EndOfStream);
+        }
+        ended.notified().await;
+    }
 }
 
 async fn ei_task(
@@ -331,6 +544,7 @@ async fn ei_task(
     devices: Devices,
     libei_error: Arc<AtomicBool>,
     error: Arc<Mutex<Option<EmulationError>>>,
+    ended: Arc<Notify>,
 ) {
     loop {
         match ei_event_handler(&mut events, &context, &devices).await {
@@ -341,6 +555,8 @@ async fn ei_task(
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .replace(e);
+                // A permit is kept if nothing waits yet.
+                ended.notify_one();
                 // wait for termination -> otherwise we will loop forever
                 future::pending::<()>().await;
             }
@@ -516,6 +732,52 @@ mod tests {
         assert_eq!(context_type, eis::handshake::ContextType::Sender);
     }
 
+    // LEDGER | behaviour | 2 a stand-in EIS server closes the stream; until_ended over ei_handshake and ei_task
+    /// GNOME closes the ei stream when the screen shield goes up. The end
+    /// must be known then, so the app and the peers are told at once, not
+    /// at the next event hops injects (#258).
+    #[tokio::test]
+    async fn a_closed_ei_stream_is_known_at_once() {
+        use std::sync::{Arc, Mutex, atomic::AtomicBool};
+        use tokio::sync::Notify;
+
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (ours, theirs) = UnixStream::pair().expect("a socket pair");
+                let compositor = std::thread::spawn(move || compositor_side(theirs));
+                let (context, conn, events) =
+                    tokio::time::timeout(Duration::from_secs(30), super::ei_handshake(ours))
+                        .await
+                        .expect("the handshake finished within 30s")
+                        .expect("the handshake succeeded on our side");
+                let (_, _, compositor_context) = compositor.join().expect("the compositor side");
+                let libei_error = Arc::new(AtomicBool::default());
+                let error = Arc::new(Mutex::new(None));
+                let ended = Arc::new(Notify::new());
+                tokio::task::spawn_local(super::ei_task(
+                    events,
+                    conn,
+                    context,
+                    super::Devices::default(),
+                    libei_error.clone(),
+                    error.clone(),
+                    ended.clone(),
+                ));
+
+                drop(compositor_context);
+                let end = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    super::until_ended(&libei_error, &error, &ended),
+                )
+                .await;
+                assert!(
+                    end.is_ok(),
+                    "the compositor closed the ei stream and nothing said so within 5s"
+                );
+            })
+            .await;
+    }
+
     // LEDGER | behaviour | token_file_path for each environment a session may have
     /// A session started without HOME, as some service managers do, used to
     /// end the daemon when emulation asked the portal for a restore token.
@@ -535,6 +797,50 @@ mod tests {
         assert_eq!(
             token_file_path(Some("/c".into()), Some("/home/t".into())),
             Some(PathBuf::from("/c/lan-mouse/remote-desktop.token"))
+        );
+    }
+
+    // LEDGER | behaviour | 1 return value: starts_unasked for each token state
+    /// Emulation the system ended starts again on its own only when the
+    /// portal can restore the session without a dialog (#258).
+    #[test]
+    fn only_a_saved_restore_token_lets_emulation_start_again_unasked() {
+        use super::starts_unasked;
+
+        let token = || Some("a-token".to_string());
+        assert_eq!(
+            [
+                starts_unasked(true, token()),
+                starts_unasked(false, token()),
+                starts_unasked(true, None),
+                starts_unasked(true, Some(String::new())),
+            ],
+            [true, false, false, false],
+            "(saved and on disk, not saved by the session that ran, saved and \
+             since removed, saved empty)"
+        );
+    }
+
+    // LEDGER | behaviour | 1 return value: shield for each reading of logind and the screensavers
+    /// GNOME closes remote-desktop sessions whenever the shield is up, and
+    /// sets `LockedHint` only once the screen locks; the curtain of an idle
+    /// screen shows only in the screensaver (#258).
+    #[test]
+    fn the_shield_is_up_if_logind_or_a_screensaver_says_so_and_down_only_if_both_can_say() {
+        use super::shield;
+
+        assert_eq!(
+            [
+                shield(Some(true), &[Some(false), None]),
+                shield(Some(false), &[Some(true), None]),
+                shield(None, &[None, Some(true)]),
+                shield(Some(false), &[Some(false), None]),
+                shield(Some(false), &[None, None]),
+                shield(None, &[Some(false), Some(false)]),
+            ],
+            [Some(true), Some(true), Some(true), Some(false), None, None],
+            "(locked, idle curtain with no lock hint, curtain with logind unread, \
+             both down, no screensaver answered, logind unread)"
         );
     }
 

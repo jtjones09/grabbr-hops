@@ -19,6 +19,7 @@ use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
 use crate::connect::{LanMouseConnection, LanMouseConnectionError};
+use crate::restart::{RESTART_AFTER, restart_wait};
 
 pub(crate) struct Capture {
     cancellation_token: CancellationToken,
@@ -64,20 +65,6 @@ const ACK_DEADLINE: Duration = Duration::from_secs(1);
 /// edge froze the pointer for [`ACK_DEADLINE`] out of every push.
 const UNANSWERED_BACKOFF: Duration = Duration::from_secs(5);
 
-/// How long capture that the system interrupted waits before it starts
-/// again on its own the first time (#240). Each interruption soon after a
-/// restart doubles the wait, up to [`RESTART_AFTER_AT_MOST`]; but after
-/// secure input took the pointer back, the wait is always this, so capture
-/// is never off for long after an unlock.
-const RESTART_AFTER: Duration = Duration::from_secs(1);
-
-/// The longest wait before an interrupted capture starts again.
-const RESTART_AFTER_AT_MOST: Duration = Duration::from_secs(60);
-
-/// A capture that ran this long before it was interrupted starts the waits
-/// over from [`RESTART_AFTER`].
-const RAN_LONG_ENOUGH: Duration = Duration::from_secs(60);
-
 /// How long a crossing waits, and for what: [`ACK_DEADLINE`] and
 /// [`UNANSWERED_BACKOFF`] outside tests; and how long an interrupted
 /// capture waits before it starts again, [`RESTART_AFTER`].
@@ -95,16 +82,6 @@ impl Default for Timing {
             unanswered_backoff: UNANSWERED_BACKOFF,
             restart_after: RESTART_AFTER,
         }
-    }
-}
-
-/// The wait before an interrupted capture starts again: `restart_after`
-/// the first time, or after a capture that ran [`RAN_LONG_ENOUGH`]; double
-/// the previous wait otherwise, up to [`RESTART_AFTER_AT_MOST`].
-fn restart_wait(previous: Option<Duration>, ran: Duration, restart_after: Duration) -> Duration {
-    match previous {
-        Some(previous) if ran < RAN_LONG_ENOUGH => (previous * 2).min(RESTART_AFTER_AT_MOST),
-        _ => restart_after,
     }
 }
 

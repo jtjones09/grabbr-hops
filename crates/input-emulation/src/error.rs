@@ -36,6 +36,7 @@ pub enum InputEmulationError {
 
 #[cfg(any(libei, rdp))]
 use ashpd::{Error::Response, desktop::ResponseError};
+use input_event::Restart;
 use std::io;
 use thiserror::Error;
 
@@ -113,6 +114,23 @@ impl InputEmulationError {
         match self {
             Self::Create(e) => e.missing_permissions(),
             Self::Withheld(missing) | Self::Revoked(missing) => Some(missing),
+            _ => None,
+        }
+    }
+
+    /// How emulation that ended for a reason that may pass starts again
+    /// without the user asking; `None` for any other end (#258). Only a
+    /// session that ran and that the backend ended can be such a reason. A
+    /// backend that could not start, or a permission the system withheld or
+    /// took, waits for the permission watch or the user.
+    ///
+    /// The session must also have been ended by the screen shield, not by
+    /// the user stopping screen sharing (see `InputEmulation::shield_watch`),
+    /// and the backend must start again without asking the user anything
+    /// (see `InputEmulation::starts_unasked`).
+    pub fn restart(&self) -> Option<Restart> {
+        match self {
+            Self::Emulate(_) => Some(Restart::Backoff),
             _ => None,
         }
     }

@@ -47,6 +47,19 @@ struct Log {
     refused: bool,
     /// Needs Accessibility while it runs, as the macOS backend does.
     as_mac: bool,
+    /// Can start again with nothing shown to the user, as the libei
+    /// backend can with a restore token.
+    unasked: bool,
+    /// Whether the screen shield is up, as the libei backend reads it from
+    /// logind and the screensaver: `None` when it cannot be read.
+    shield: Option<bool>,
+    /// Reading the shield does not answer until this is cleared, as a
+    /// D-Bus service that hangs.
+    shield_stalls: bool,
+    /// How many times a test ended the session from the system's side.
+    ends: u64,
+    /// How many backends were created from this recording.
+    started: usize,
 }
 
 type Shared = Arc<Mutex<Log>>;
@@ -83,6 +96,11 @@ impl Recording {
             consume_takes: None,
             refused: false,
             as_mac: false,
+            unasked: false,
+            shield: Some(false),
+            shield_stalls: false,
+            ends: 0,
+            started: 0,
         }));
         REGISTRY
             .lock()
@@ -115,6 +133,36 @@ impl Recording {
         self.log.lock().expect("recording log").as_mac = true;
     }
 
+    /// Make every backend created from this one say it can start again
+    /// with nothing shown to the user, as the libei backend does with a
+    /// restore token.
+    pub fn starts_without_asking(&self) {
+        self.log.lock().expect("recording log").unasked = true;
+    }
+
+    /// Answer `up` when asked whether the screen shield is up: `None` as
+    /// when it cannot be read.
+    pub fn shield(&self, up: Option<bool>) {
+        self.log.lock().expect("recording log").shield = up;
+    }
+
+    /// Make reading the shield hang while `stalls`, as a D-Bus service
+    /// that never answers does.
+    pub fn stall_shield(&self, stalls: bool) {
+        self.log.lock().expect("recording log").shield_stalls = stalls;
+    }
+
+    /// End the running session from the system's side with no event
+    /// injected, as the compositor closing the libei stream does.
+    pub fn end_session(&self) {
+        self.log.lock().expect("recording log").ends += 1;
+    }
+
+    /// How many backends were created from this recording.
+    pub fn started(&self) -> usize {
+        self.log.lock().expect("recording log").started
+    }
+
     /// Make creating a backend fail as it does on a Mac that has not
     /// granted hops Accessibility.
     pub fn refuse_permission(&self) {
@@ -139,8 +187,31 @@ impl Drop for Recording {
     }
 }
 
+/// What the recording `id` answers when asked whether the screen shield is
+/// up, once it no longer stalls; `None` once the recording is dropped.
+pub(crate) async fn shield_up(id: RecordingId) -> Option<bool> {
+    let log = REGISTRY
+        .lock()
+        .expect("recording registry")
+        .as_ref()
+        .and_then(|registry| registry.get(&id).cloned())?;
+    loop {
+        let (stalls, up) = {
+            let log = log.lock().expect("recording log");
+            (log.shield_stalls, log.shield)
+        };
+        if !stalls {
+            return up;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 pub(crate) struct RecordingEmulation {
     log: Shared,
+    /// Session ends asked for before this backend was created, which are
+    /// not its own.
+    ends_before: u64,
 }
 
 impl RecordingEmulation {
@@ -151,10 +222,15 @@ impl RecordingEmulation {
             .as_ref()
             .and_then(|registry| registry.get(&id).cloned())
             .ok_or(RecordingEmulationCreationError::NotRegistered)?;
-        if log.lock().expect("recording log").refused {
-            return Err(RecordingEmulationCreationError::Refused);
-        }
-        Ok(Self { log })
+        let ends_before = {
+            let mut log = log.lock().expect("recording log");
+            if log.refused {
+                return Err(RecordingEmulationCreationError::Refused);
+            }
+            log.started += 1;
+            log.ends
+        };
+        Ok(Self { log, ends_before })
     }
 
     fn record(&self, call: Recorded) {
@@ -208,6 +284,17 @@ impl Emulation for RecordingEmulation {
 
     fn button_scope(&self) -> ButtonScope {
         self.log.lock().expect("recording log").button_scope
+    }
+
+    fn starts_unasked(&self) -> bool {
+        self.log.lock().expect("recording log").unasked
+    }
+
+    async fn ended(&mut self) -> EmulationError {
+        while self.log.lock().expect("recording log").ends == self.ends_before {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        EmulationError::EndOfStream
     }
 
     fn needs(&self) -> &'static [crate::error::Permission] {
