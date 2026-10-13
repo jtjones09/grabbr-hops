@@ -556,6 +556,35 @@ async fn connect_any(
     }
 }
 
+/// Which machine each device is, for a question asked of the trust store
+/// about it: the machine its link proved, else the one it is pinned to. A
+/// device with neither is no known machine.
+///
+/// One answer for every such question, so whether this machine may drive a
+/// device and whether the device has an edge here cannot disagree (#259).
+#[derive(Clone)]
+pub(crate) struct Machines {
+    conns: Rc<Mutex<HashMap<SocketAddr, PeerLink>>>,
+    client_manager: ClientManager,
+}
+
+impl Machines {
+    /// The machine device `handle` is: the one its link proved, else the one
+    /// it is pinned to.
+    pub(crate) async fn of(&self, handle: ClientHandle) -> Option<String> {
+        let proved = match self.client_manager.active_addr(handle) {
+            Some(addr) => self
+                .conns
+                .lock()
+                .await
+                .get(&addr)
+                .map(|link| link.fingerprint.clone()),
+            None => None,
+        };
+        proved.or_else(|| self.client_manager.peer_fingerprint(handle))
+    }
+}
+
 pub(crate) struct LanMouseConnection {
     endpoint: Endpoint,
     client_manager: ClientManager,
@@ -736,20 +765,22 @@ impl LanMouseConnection {
 
     /// Whether this machine's trust store refuses to let it drive `handle`'s
     /// peer: the machine its link proved, else the one the device is pinned
-    /// to. A device with neither is not known to be refused.
+    /// to ([`Machines::of`]). A device with neither is not known to be
+    /// refused.
     pub(crate) async fn may_not_drive(&self, handle: ClientHandle) -> bool {
-        let proved = match self.client_manager.active_addr(handle) {
-            Some(addr) => self
-                .conns
-                .lock()
-                .await
-                .get(&addr)
-                .map(|link| link.fingerprint.clone()),
-            None => None,
-        };
-        proved
-            .or_else(|| self.client_manager.peer_fingerprint(handle))
+        self.machines()
+            .of(handle)
+            .await
             .is_some_and(|fingerprint| !self.trust.read().expect("lock").we_may_drive(&fingerprint))
+    }
+
+    /// Which machine each device is, as [`Self::may_not_drive`] asks it.
+    /// Grabbed before this connection is moved into `Capture`.
+    pub(crate) fn machines(&self) -> Machines {
+        Machines {
+            conns: self.conns.clone(),
+            client_manager: self.client_manager.clone(),
+        }
     }
 
     pub(crate) async fn send(
@@ -2432,6 +2463,36 @@ mod tests {
             assert!(
                 !r.conn.conns.lock().await.contains_key(&r.addr),
                 "the link to a receiver we may no longer drive was left open"
+            );
+        });
+    }
+
+    // LEDGER T259f | class B | 1 return value: Machines::of on a device with a live link, then without one
+    /// A device is the machine its link proved, whatever it is pinned to,
+    /// and the machine it is pinned to once it has no link (#259). Both the
+    /// permission to drive it and its edge are asked of that one machine.
+    #[test]
+    fn a_device_is_the_machine_its_link_proved_and_else_its_pin() {
+        local(async {
+            let r = sender_to_a_recording_receiver().await;
+            let machines = r.conn.machines();
+            let pinned_elsewhere = "ab".repeat(32);
+            let unpinned = machines.of(r.handle).await;
+            r.conn
+                .client_manager
+                .set_peer_fingerprint(r.handle, Some(pinned_elsewhere.clone()));
+            let pinned = machines.of(r.handle).await;
+            r.conn.client_manager.set_active_addr(r.handle, None);
+            let unlinked = machines.of(r.handle).await;
+            assert_eq!(
+                (unpinned, pinned, unlinked),
+                (
+                    Some(r.receiver.clone()),
+                    Some(r.receiver.clone()),
+                    Some(pinned_elsewhere),
+                ),
+                "(linked and unpinned, linked and pinned to another machine, pinned \
+                 with no link): which machine the device is"
             );
         });
     }

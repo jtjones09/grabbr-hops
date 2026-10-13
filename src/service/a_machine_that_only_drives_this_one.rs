@@ -10,11 +10,16 @@
 //! the IPC socket is told, or a crossing no device takes, which the backend
 //! gives back at once.
 
-use super::in_process::{DEADLINE, Daemon, Frontend, compare_number, prompt_from, until_paired};
-use crate::test_harness::{approval, machine, run_local};
+use super::in_process::{
+    DEADLINE, Daemon, Frontend, compare_number, prompt_from, trusting, until_paired,
+};
+use crate::test_harness::{approval, dialer, door, machine, run_local, wait_until};
 use crate::trust::{Caps, Expiry, Lease, Origin};
 use hops_ipc::{ClientHandle, Controller, CrossingRefusal, FrontendEvent, FrontendRequest as R};
 use input_capture::{CaptureEvent, Position, scripted::Script};
+use input_emulation::EdgeSide;
+use input_emulation::recording::{Recorded, Recording};
+use input_event::{Event, PointerEvent};
 use std::time::Duration;
 
 /// What a crossing at an edge met.
@@ -236,8 +241,8 @@ fn a_device_gains_and_loses_its_edge_with_the_direction_its_pairing_grants() {
 
 // LEDGER T259c | class B | 2 bytes (CrossingRefused over the IPC socket) + 6 struct state (Script::unclaimed_releases): AuthorizeKey and ConfirmPairing over the IPC socket, the peer comparing its number over loopback QUIC
 /// A device added for the desk pc, pinned to it by the dial that reached
-/// it and not paired yet, has its edge: crossing to it is how pairing it is
-/// asked for. The desk pc
+/// it and not paired yet, has its edge: a crossing to it is refused with
+/// the notice that it is not paired yet. The desk pc
 /// knocks, the person here answers that it controls this machine, the two
 /// compare their number, and the edge is gone.
 #[test]
@@ -360,6 +365,179 @@ fn a_machine_this_one_may_no_longer_control_keeps_its_edge_and_says_so() {
                     crossing_at(&mut app, &script, Position::Right).await,
                     Met::Refused(vec![(rig_h, CrossingRefusal::NotPermitted)]),
                     "crossing to the media rig {rig_h}, whose lease lapsed"
+                );
+            })
+            .await;
+    });
+}
+
+// LEDGER T259g | class B | 2 bytes (CrossingRefused over the IPC socket) + 6 struct state (Script::unclaimed_releases, ClientManager::active_addr): Service::wants_edge through connect::Machines::of
+/// A device's edge follows the machine its link proved, as the permission
+/// to drive it does, not only its pin. The desk pc answers the device's
+/// dial, which pins the device to it. The pin is then forgotten while the
+/// link stays up, and the pairing narrowed to the desk pc controlling this
+/// machine: the edge goes, as it would for a device still pinned to it.
+#[test]
+fn a_device_whose_link_proved_a_machine_only_driving_this_one_has_no_edge() {
+    run_local(async {
+        let pc = machine();
+        let at_its_address = door(&pc);
+        at_its_address.open();
+        let script = Script::new();
+        let tables = format!(
+            "[[clients]]\nhostname = \"desk-pc\"\nposition = \"left\"\n\
+             ips = [\"127.0.0.1\"]\nport = {}\nactivate_on_startup = true\n",
+            at_its_address.port
+        );
+        let daemon = Daemon::start_paired(
+            "link-proved",
+            &tables,
+            &[(pc.fingerprint.as_str(), "desk pc", Caps::DRIVE)],
+            script.backend(),
+            input_emulation::Backend::Dummy,
+        )
+        .await;
+        let (ipc, clients, trust) = (daemon.ipc(), daemon.clients(), daemon.trust());
+        daemon
+            .run_while(async move {
+                let mut app = ipc.connect().await;
+                let _ = app.exchange(&[R::Sync]).await;
+                let pc_h = handle_of(&clients, "desk-pc");
+                // A crossing dials it; the link comes up and pins the device.
+                let linked = || {
+                    clients.active_addr(pc_h).is_some()
+                        && clients.peer_fingerprint(pc_h).as_deref()
+                            == Some(pc.fingerprint.as_str())
+                };
+                let deadline = tokio::time::Instant::now() + DEADLINE;
+                while !linked() {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "the desk pc's link never came up"
+                    );
+                    script.push(Position::Left, CaptureEvent::Begin);
+                    let _ = app.exchange(&[R::Enumerate()]).await;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+
+                clients.set_peer_fingerprint(pc_h, None);
+                trust
+                    .write()
+                    .expect("lock")
+                    .drop_capabilities(&pc.fingerprint, Caps::I_MAY_DRIVE);
+                until_unclaimed_at(&mut app, &script, Position::Left).await;
+                assert!(
+                    clients.active_addr(pc_h).is_some(),
+                    "precondition: the link stayed up while the edge went"
+                );
+            })
+            .await;
+    });
+}
+
+// LEDGER T259e | class B | 6 struct state (Service::edge_settles, Script::releases, Recording::calls): the run loop under EdgePushed and CaptureBegin events at move rate
+/// The desk pc controls this machine and its pointer is here. Two things
+/// fire on every move at an edge: emulation's adaptive edge while the
+/// pointer is held against one, and capture's edge back to the desk pc,
+/// which on the input-capture portal fires for every move along it. Each
+/// is an event to the daemon's loop, and the loop settles no edge for
+/// either: they change nothing an edge follows.
+#[test]
+fn moves_along_the_edge_back_to_a_controlling_machine_settle_no_edges() {
+    run_local(async {
+        let pc = machine();
+        let script = Script::new();
+        let recording = Recording::new();
+        let daemon = Daemon::start_paired(
+            "settle-count",
+            "",
+            &[(pc.fingerprint.as_str(), "desk pc", Caps::INBOUND)],
+            script.backend(),
+            recording.backend(),
+        )
+        .await;
+        let (ours, port, ipc, settles) = (
+            daemon.fingerprint(),
+            daemon.port(),
+            daemon.ipc(),
+            daemon.edge_settles(),
+        );
+        daemon
+            .run_while(async move {
+                let mut app = ipc.connect().await;
+                let _ = app.exchange(&[R::Sync]).await;
+                let driver = dialer(&pc, trusting(&pc, &ours), port, hops_ipc::Position::Left);
+                driver.until_alive().await;
+                let deadline = tokio::time::Instant::now() + DEADLINE;
+                let entered = loop {
+                    driver
+                        .send(hops_proto::ProtoEvent::Enter(hops_proto::Position::Right))
+                        .await;
+                    let events = app.exchange(&[]).await;
+                    if let Some(pos) = events.iter().find_map(|e| match e {
+                        FrontendEvent::DeviceEntered { pos, .. } => Some(*pos),
+                        _ => None,
+                    }) {
+                        break pos;
+                    }
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "the desk pc never entered this machine"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                };
+                let (at, pushed) = match entered {
+                    hops_ipc::Position::Left => (Position::Left, EdgeSide::Right),
+                    hops_ipc::Position::Right => (Position::Right, EdgeSide::Left),
+                    hops_ipc::Position::Top => (Position::Top, EdgeSide::Bottom),
+                    hops_ipc::Position::Bottom => (Position::Bottom, EdgeSide::Top),
+                };
+                const MOVES: usize = 100;
+                let consumed = || {
+                    recording
+                        .calls()
+                        .iter()
+                        .filter(|c| matches!(c, Recorded::Consume(..)))
+                        .count()
+                };
+                // Quiet first, so nothing else the loop handles is counted.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+
+                // Held against the far edge, not the one it entered from,
+                // so the pointer stays here and every move is injected.
+                recording.pushes_past(Some(pushed));
+                let (injected, before) = (consumed(), settles.get());
+                let moved = hops_proto::ProtoEvent::Input(Event::Pointer(PointerEvent::Motion {
+                    time: 0,
+                    dx: 1.0,
+                    dy: 0.0,
+                }));
+                // One at a time: moves queued together are injected as one.
+                for n in 1..=MOVES {
+                    driver.send(moved).await;
+                    wait_until("each move pushed at the edge is injected", DEADLINE, || {
+                        consumed() >= injected + n
+                    })
+                    .await;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let after_pushes = settles.get() - before;
+                recording.pushes_past(None);
+
+                let (released, before) = (script.releases(), settles.get());
+                for _ in 0..MOVES {
+                    script.push(at, CaptureEvent::Begin);
+                }
+                wait_until("every move along the edge is handed back", DEADLINE, || {
+                    script.releases() >= released + MOVES
+                })
+                .await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let after_edge = settles.get() - before;
+                assert!(
+                    after_pushes < MOVES / 4 && after_edge < MOVES / 4,
+                    "{MOVES} moves settled every edge {after_pushes} times pushed against \
+                     an edge, and {after_edge} times along the edge back to the desk pc"
                 );
             })
             .await;
