@@ -12,8 +12,18 @@ use std::path::PathBuf;
 use yaml_rust2::{Yaml, YamlLoader};
 
 const RELEASE: &str = ".github/workflows/release.yml";
-/// The one job that signs, and so the one job any secret may reach.
+/// The job that signs the macOS app, and so the one job any secret may reach.
 const SIGN: &str = "sign-macos";
+/// The job that signs hops.exe. It reads no secret: it signs as a federated
+/// identity, with an OIDC token, so it is one of two jobs that may mint one.
+const SIGN_WINDOWS: &str = "sign-windows";
+/// The artifact sign-windows receives: the unsigned Windows build, under a
+/// name attest's `hops-*` never collects.
+const UNSIGNED_WINDOWS: &str = "unsigned-windows-x86_64";
+/// The artifact sign-windows uploads: the signed zip and its SBOM.
+const SIGNED_WINDOWS: &str = "hops-windows-x86_64";
+/// What attest downloads, merged into the release: every artifact named so.
+const RELEASE_PATTERN: &str = "hops-*";
 /// The one job that publishes, and so the one job that may write.
 const PUBLISH: &str = "publish";
 /// The artifact the signing job receives: the unsigned universal binary.
@@ -21,8 +31,8 @@ const UNSIGNED: &str = "hops-macos-universal";
 const DMG: &str = "hops-macos-universal.dmg";
 
 const BUILD: &str = "build";
-/// The job that checksums and attests every asset, and so the one job that
-/// may mint an OIDC token.
+/// The job that checksums and attests every asset. It and sign-windows are
+/// the only jobs that may mint an OIDC token.
 const ATTEST: &str = "attest";
 /// The artifact attest uploads and publish releases: every asset, attested.
 const RELEASE_ARTIFACT: &str = "release";
@@ -162,20 +172,29 @@ fn is_ident(c: char) -> bool {
 /// that can reach every secret: `toJSON(secrets)`, a computed index, or a
 /// `secrets:` key, which hands secrets to a called workflow (`inherit`).
 fn secret_refs(y: &Yaml) -> BTreeSet<String> {
+    context_refs(y, "secrets")
+}
+
+/// Every use of the `vars` context in `y`, read as `secret_refs` reads secrets.
+fn var_refs(y: &Yaml) -> BTreeSet<String> {
+    context_refs(y, "vars")
+}
+
+fn context_refs(y: &Yaml, ctx: &str) -> BTreeSet<String> {
     let mut refs = BTreeSet::new();
-    walk_secret_refs(y, &mut refs);
+    walk_context_refs(y, ctx, &mut refs);
     refs
 }
 
-fn walk_secret_refs(y: &Yaml, refs: &mut BTreeSet<String>) {
+fn walk_context_refs(y: &Yaml, ctx: &str, refs: &mut BTreeSet<String>) {
     match y {
         Yaml::String(s) => {
             for e in expressions(s) {
                 // Context names are case-insensitive: `Secrets.X` reads the
                 // same secret as `secrets.X`. ASCII lowercasing keeps offsets.
                 let lower = e.to_ascii_lowercase();
-                for (i, _) in lower.match_indices("secrets") {
-                    let after = &e[i + "secrets".len()..];
+                for (i, _) in lower.match_indices(ctx) {
+                    let after = &e[i + ctx.len()..];
                     if e[..i].chars().next_back().is_some_and(is_ident)
                         || after.chars().next().is_some_and(is_ident)
                     {
@@ -205,13 +224,13 @@ fn walk_secret_refs(y: &Yaml, refs: &mut BTreeSet<String>) {
                 }
             }
         }
-        Yaml::Array(a) => a.iter().for_each(|v| walk_secret_refs(v, refs)),
+        Yaml::Array(a) => a.iter().for_each(|v| walk_context_refs(v, ctx, refs)),
         Yaml::Hash(h) => h.iter().for_each(|(k, v)| {
-            if k.as_str() == Some("secrets") {
+            if ctx == "secrets" && k.as_str() == Some("secrets") {
                 refs.insert("*".to_owned());
             }
-            walk_secret_refs(k, refs);
-            walk_secret_refs(v, refs);
+            walk_context_refs(k, ctx, refs);
+            walk_context_refs(v, ctx, refs);
         }),
         _ => {}
     }
@@ -1166,6 +1185,422 @@ done
         }
     }
 
+    // -----------------------------------------------------------------------
+    // sign-windows: its gates are PowerShell, run here under pwsh as a step
+    // with no `shell:` runs on a Windows runner. Get-AuthenticodeSignature
+    // exists only on Windows, so the verification gate runs against a stand-in
+    // for it; everything the gate decides from its answer is the step's own.
+    // -----------------------------------------------------------------------
+
+    const WINDOWS_ZIP: &str = "hops-windows-x86_64.zip";
+    const WINDOWS_TARGET: &str = "x86_64-pc-windows-msvc";
+    const UNPACK_WINDOWS: &str = "Unpack the unsigned Windows build";
+    const PACKAGE_SIGNED_WINDOWS: &str = "Package the signed Windows build";
+    const VERIFY_WINDOWS: &str = "Windows accepts the signed hops.exe in the zip";
+
+    /// Whether these tests can run pwsh. GitHub's Linux and macOS runners
+    /// have it, so on CI its absence fails the test rather than skipping it.
+    fn have_pwsh() -> bool {
+        let found = std::process::Command::new("pwsh")
+            .args(["-NoProfile", "-NonInteractive", "-Command", "exit 0"])
+            .status()
+            .is_ok_and(|s| s.success());
+        if !found {
+            assert!(
+                std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true"),
+                "pwsh is not on this runner, so sign-windows's gates went untested"
+            );
+            eprintln!("pwsh not found: sign-windows's PowerShell gates are not run here");
+        }
+        found
+    }
+
+    /// Run `script` as GitHub runs a pwsh step: `$ErrorActionPreference =
+    /// 'stop'` before it, its last exit code returned after it, dot-sourced by
+    /// `pwsh -command`. `prelude` runs first, standing in for what only
+    /// Windows provides.
+    fn pwsh(script: &str, prelude: &str, file_dir: &Path, cwd: &Path, env: &[(&str, &str)]) -> Ran {
+        let file = file_dir.join("step.ps1");
+        std::fs::write(
+            &file,
+            format!(
+                "$ErrorActionPreference = 'stop'\n{prelude}\n{script}\n\
+                 if ((Test-Path -LiteralPath variable:\\LASTEXITCODE)) {{ exit $LASTEXITCODE }}\n"
+            ),
+        )
+        .expect("write step");
+        let out = std::process::Command::new("pwsh")
+            .args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg(format!(". '{}'", file.display()))
+            .current_dir(cwd)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", std::env::var_os("HOME").unwrap_or_default())
+            .envs(env.iter().copied())
+            .output()
+            .expect("pwsh runs");
+        Ran {
+            ok: out.status.success(),
+            text: format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        }
+    }
+
+    // LEDGER T2251 | class B | 5 process exit code: release.yml sign-windows presence step, under pwsh
+    #[test]
+    fn windows_signing_without_every_variable_fails() {
+        if !have_pwsh() {
+            return;
+        }
+        const STEP: &str = "every signing variable is set";
+        let script = step_script(SIGN_WINDOWS, STEP);
+        let wf = parse(RELEASE);
+        let names: Vec<String> = step_named(&wf["jobs"][SIGN_WINDOWS], SIGN_WINDOWS, STEP)["env"]
+            .as_hash()
+            .expect("the presence check receives each variable's presence through env:")
+            .keys()
+            .map(|k| k.as_str().expect("env name").to_owned())
+            .collect();
+        assert_eq!(names.len(), 6, "only {names:?} are checked");
+        let s = scratch("win-vars");
+
+        let all: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "true")).collect();
+        let set = pwsh(&script, "", &s.0, &s.0, &all);
+        assert!(
+            set.ok,
+            "every variable set, yet the check failed:\n{}",
+            set.text
+        );
+
+        for missing in &names {
+            for absent in [Some("false"), None] {
+                let env: Vec<(&str, &str)> = names
+                    .iter()
+                    .filter_map(|n| match (n == missing, absent) {
+                        (true, Some(v)) => Some((n.as_str(), v)),
+                        (true, None) => None,
+                        (false, _) => Some((n.as_str(), "true")),
+                    })
+                    .collect();
+                let ran = pwsh(&script, "", &s.0, &s.0, &env);
+                assert!(
+                    !ran.ok && ran.text.contains(missing.as_str()),
+                    "{missing} is {absent:?} and the signing job carried on, or the failure \
+                     does not name it; a run without it produces no signed hops.exe:\n{}",
+                    ran.text
+                );
+            }
+        }
+    }
+
+    // LEDGER T2252 | class B | 5 process exit code + 4 files extracted: release.yml sign-windows unpack step, under pwsh
+    #[test]
+    fn the_windows_signing_job_unpacks_exactly_the_build() {
+        if !have_pwsh() {
+            return;
+        }
+        let script = step_script(SIGN_WINDOWS, UNPACK_WINDOWS);
+        let s = scratch("win-unpack");
+        let tmp = s.0.join("runner-temp");
+        let bin = tmp.join("bin");
+        let run = |change: &dyn Fn(&mut Members)| {
+            reset(&tmp);
+            std::fs::create_dir_all(tmp.join("unsigned")).unwrap();
+            let mut m = members("hops.exe", &[WINDOWS_TARGET]);
+            change(&mut m);
+            std::fs::write(tmp.join("unsigned").join(WINDOWS_ZIP), zip(&m)).unwrap();
+            pwsh(
+                &script,
+                "",
+                &s.0,
+                &s.0,
+                &[("RUNNER_TEMP", tmp.to_str().unwrap())],
+            )
+        };
+
+        let complete = run(&|_| {});
+        assert!(
+            complete.ok,
+            "a complete build failed to unpack:\n{}",
+            complete.text
+        );
+        let want = members("hops.exe", &[WINDOWS_TARGET]);
+        for (name, data) in &want {
+            assert_eq!(
+                std::fs::read(bin.join(name)).ok().as_ref(),
+                Some(data),
+                "{name} was not unpacked as the build wrote it"
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(&bin).unwrap().count(),
+            want.len(),
+            "something besides the build was unpacked"
+        );
+
+        for extra in ["extra.ps1", "../hops.exe", "sub/LICENSE", "license", "dir/"] {
+            let ran = run(&|m| m.push((extra.to_owned(), b"echo\n".to_vec())));
+            assert!(
+                !ran.ok && ran.text.contains(extra),
+                "a build carrying {extra:?} was unpacked for signing, or the failure does not \
+                 name it:\n{}",
+                ran.text
+            );
+            assert!(
+                !bin.exists(),
+                "a build carrying {extra:?} reached the signing job's disk"
+            );
+        }
+        for (missing, _) in &want {
+            let ran = run(&|m| m.retain(|(n, _)| n != missing));
+            assert!(
+                !ran.ok && ran.text.contains(missing.as_str()),
+                "a build without {missing} was unpacked for signing:\n{}",
+                ran.text
+            );
+        }
+        let twice = run(&|m| m.push(("hops.exe".to_owned(), b"MZ other".to_vec())));
+        assert!(
+            !twice.ok && twice.text.contains("2 times"),
+            "a build carrying hops.exe twice was unpacked for signing:\n{}",
+            twice.text
+        );
+        let empty = run(&|m| {
+            m.iter_mut()
+                .filter(|(n, _)| n == NOTICES)
+                .for_each(|(_, d)| d.clear())
+        });
+        assert!(
+            !empty.ok,
+            "empty notices were unpacked for signing:\n{}",
+            empty.text
+        );
+        let linked = run(&|m| {
+            m.iter_mut()
+                .filter(|(n, _)| n == LICENSE)
+                .for_each(|(_, d)| *d = [LINK, b"/etc/hosts"].concat())
+        });
+        assert!(
+            !linked.ok && linked.text.contains(LICENSE),
+            "{LICENSE} as a link was unpacked for signing:\n{}",
+            linked.text
+        );
+        reset(&tmp);
+        std::fs::create_dir_all(tmp.join("unsigned")).unwrap();
+        std::fs::write(tmp.join("unsigned").join(WINDOWS_ZIP), b"not a zip").unwrap();
+        let unreadable = pwsh(
+            &script,
+            "",
+            &s.0,
+            &s.0,
+            &[("RUNNER_TEMP", tmp.to_str().unwrap())],
+        );
+        assert!(
+            !unreadable.ok && unreadable.text.contains("cannot read"),
+            "an unreadable artifact was not refused:\n{}",
+            unreadable.text
+        );
+    }
+
+    // LEDGER T2253 | class B | 4 archive written: release.yml sign-windows package step, under pwsh
+    #[test]
+    fn the_signed_windows_zip_holds_exactly_the_signed_build() {
+        if !have_pwsh() {
+            return;
+        }
+        let script = step_script(SIGN_WINDOWS, PACKAGE_SIGNED_WINDOWS);
+        let s = scratch("win-package");
+        let tmp = s.0.join("runner-temp");
+        let bin = tmp.join("bin");
+        let cwd = s.0.join("workspace");
+        reset(&bin);
+        reset(&cwd);
+        let mut want = members("hops.exe", &[WINDOWS_TARGET]);
+        want[0].1 = b"MZ signed .dep-v0".to_vec();
+        for (name, data) in &want {
+            std::fs::write(bin.join(name), data).unwrap();
+        }
+        std::fs::write(bin.join("stray.txt"), b"not part of the build").unwrap();
+        let ran = pwsh(
+            &script,
+            "",
+            &s.0,
+            &cwd,
+            &[("RUNNER_TEMP", tmp.to_str().unwrap())],
+        );
+        assert!(ran.ok, "packaging failed:\n{}", ran.text);
+
+        let out = std::process::Command::new("unzip")
+            .arg("-Z1")
+            .arg(cwd.join(WINDOWS_ZIP))
+            .output()
+            .expect("unzip runs");
+        assert!(out.status.success(), "{WINDOWS_ZIP} was not written");
+        let mut got: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        got.sort();
+        let mut names: Vec<String> = want.iter().map(|(n, _)| n.clone()).collect();
+        names.sort();
+        assert_eq!(
+            got, names,
+            "{WINDOWS_ZIP} must hold exactly the build, at its top level"
+        );
+        let unpacked = s.0.join("unpacked");
+        reset(&unpacked);
+        assert!(
+            std::process::Command::new("unzip")
+                .arg("-q")
+                .arg(cwd.join(WINDOWS_ZIP))
+                .arg("-d")
+                .arg(&unpacked)
+                .status()
+                .unwrap()
+                .success()
+        );
+        for (name, data) in &want {
+            assert_eq!(
+                std::fs::read(unpacked.join(name)).ok().as_ref(),
+                Some(data),
+                "{name} in {WINDOWS_ZIP} is not the file that was signed"
+            );
+        }
+        let sbom_name = sbom(WINDOWS_TARGET);
+        assert_eq!(
+            std::fs::read(cwd.join(&sbom_name)).ok(),
+            std::fs::read(bin.join(&sbom_name)).ok(),
+            "the SBOM uploaded beside the zip is not the one in it"
+        );
+    }
+
+    /// Stands in for Get-AuthenticodeSignature, which exists only on Windows.
+    /// A file is signed when it holds `AUTHENTICODE`; its status, signer
+    /// subject and timestamp are then what the environment says.
+    const AUTHENTICODE_STUB: &str = r#"function Get-AuthenticodeSignature {
+  param([string]$LiteralPath, [string]$FilePath)
+  $path = if ($LiteralPath) { $LiteralPath } else { $FilePath }
+  $signed = [System.IO.File]::ReadAllText($path).Contains('AUTHENTICODE')
+  $cert = $null
+  if ($signed -and $env:STUB_SUBJECT) {
+    $key = [System.Security.Cryptography.ECDsa]::Create()
+    $req = [System.Security.Cryptography.X509Certificates.CertificateRequest]::new($env:STUB_SUBJECT, $key, [System.Security.Cryptography.HashAlgorithmName]::SHA256)
+    $cert = $req.CreateSelfSigned([DateTimeOffset]::Now.AddMinutes(-1), [DateTimeOffset]::Now.AddDays(3))
+  }
+  [pscustomobject]@{
+    Status = if ($signed) { $env:STUB_STATUS } else { 'NotSigned' }
+    StatusMessage = 'stub'
+    SignerCertificate = $cert
+    TimeStamperCertificate = if ($signed -and $env:STUB_TIMESTAMPED -eq 'yes') { $cert } else { $null }
+  }
+}"#;
+
+    const PUBLISHER: &str =
+        r#"CN="Hotash Studios, LLC", O="Hotash Studios, LLC", L=Madison, S=Wisconsin, C=US"#;
+
+    // LEDGER T2254 | class B | 5 process exit code: release.yml sign-windows verify step, under pwsh, stub Get-AuthenticodeSignature
+    #[test]
+    fn only_a_validly_signed_timestamped_auditable_exe_from_the_publisher_passes() {
+        if !have_pwsh() {
+            return;
+        }
+        let script = step_script(SIGN_WINDOWS, VERIFY_WINDOWS);
+        let s = scratch("win-verify");
+        let tmp = s.0.join("runner-temp");
+        let cwd = s.0.join("workspace");
+        let signed = format!("MZ code {AUDIT_SECTION} AUTHENTICODE").into_bytes();
+        let run = |exe: Option<&[u8]>, status: &str, subject: &str, stamped: &str| {
+            reset(&tmp);
+            reset(&cwd);
+            let mut m = members("hops.exe", &[WINDOWS_TARGET]);
+            match exe {
+                Some(bytes) => m[0].1 = bytes.to_vec(),
+                None => {
+                    m.remove(0);
+                }
+            }
+            std::fs::write(cwd.join(WINDOWS_ZIP), zip(&m)).unwrap();
+            // A signed hops.exe left where it was signed, and where an
+            // earlier check unpacked one: neither is what is uploaded.
+            std::fs::create_dir_all(tmp.join("bin")).unwrap();
+            std::fs::write(tmp.join("bin/hops.exe"), &signed).unwrap();
+            std::fs::create_dir_all(tmp.join("check")).unwrap();
+            std::fs::write(tmp.join("check/hops.exe"), &signed).unwrap();
+            pwsh(
+                &script,
+                AUTHENTICODE_STUB,
+                &s.0,
+                &cwd,
+                &[
+                    ("RUNNER_TEMP", tmp.to_str().unwrap()),
+                    ("STUB_STATUS", status),
+                    ("STUB_SUBJECT", subject),
+                    ("STUB_TIMESTAMPED", stamped),
+                ],
+            )
+        };
+
+        let good = run(Some(&signed), "Valid", PUBLISHER, "yes");
+        assert!(
+            good.ok,
+            "a valid, timestamped, auditable hops.exe failed:\n{}",
+            good.text
+        );
+
+        let unsigned = run(Some(b"MZ code .dep-v0"), "Valid", PUBLISHER, "yes");
+        assert!(
+            !unsigned.ok && unsigned.text.contains("NotSigned"),
+            "an unsigned hops.exe in the zip passed because another copy was signed:\n{}",
+            unsigned.text
+        );
+        for status in ["HashMismatch", "NotTrusted", "UnknownError", "Incompatible"] {
+            let ran = run(Some(&signed), status, PUBLISHER, "yes");
+            assert!(
+                !ran.ok && ran.text.contains(status),
+                "a signature Windows reports as {status} passed:\n{}",
+                ran.text
+            );
+        }
+        for subject in [
+            r#"CN="Hotash Studios, LLC", C=US"#,
+            r#"CN=hops, O="Hotash Studios LLC", C=US"#,
+            r#"CN=hops, O="Not Hotash Studios, LLC", C=US"#,
+            r#"CN=hops, O="Hotash Studios, LLC Ltd", C=US"#,
+            r#"CN=hops, O="hotash studios, llc", C=US"#,
+            r#"CN=hops, OU="Hotash Studios, LLC", C=US"#,
+            r#"CN=hops, O="Hotash Studios, LLC", O=Other, C=US"#,
+            "",
+        ] {
+            let ran = run(Some(&signed), "Valid", subject, "yes");
+            assert!(
+                !ran.ok && ran.text.contains("organization"),
+                "a hops.exe signed as {subject:?} passed as the publisher's:\n{}",
+                ran.text
+            );
+        }
+        let untimed = run(Some(&signed), "Valid", PUBLISHER, "no");
+        assert!(
+            !untimed.ok && untimed.text.contains("timestamp"),
+            "a signature with no timestamp passed:\n{}",
+            untimed.text
+        );
+        let unaudited = run(Some(b"MZ code AUTHENTICODE"), "Valid", PUBLISHER, "yes");
+        assert!(
+            !unaudited.ok && unaudited.text.contains(AUDIT_SECTION),
+            "a signed hops.exe without its dependency list passed:\n{}",
+            unaudited.text
+        );
+        let none = run(None, "Valid", PUBLISHER, "yes");
+        assert!(
+            !none.ok && none.text.contains("no hops.exe"),
+            "a zip without hops.exe passed:\n{}",
+            none.text
+        );
+    }
+
     // LEDGER T2246 | class B | 5 process exit code + files written: scripts/package-macos.sh
     #[test]
     fn packaging_puts_the_licence_notices_and_sboms_in_the_app() {
@@ -2043,6 +2478,35 @@ fn only_the_environment_scoped_signing_job_can_read_a_secret() {
         checked,
         "every secret {SIGN} uses is checked for presence before it is used"
     );
+
+    // sign-windows signs by OIDC and reads no secret. What it needs are
+    // identifiers, held as environment variables, and the presence check sees
+    // whether each is set, never its value, and covers every one it uses.
+    let win = &wf["jobs"][SIGN_WINDOWS];
+    assert!(!win.is_badvalue(), "release.yml has no {SIGN_WINDOWS} job");
+    assert!(
+        secret_refs(win).is_empty(),
+        "{SIGN_WINDOWS} references {:?}; it authenticates by OIDC and needs no secret",
+        secret_refs(win)
+    );
+    let check = step_named(win, SIGN_WINDOWS, "every signing variable is set")["env"]
+        .as_hash()
+        .expect("presence check env");
+    let mut checked = BTreeSet::new();
+    for (k, v) in check {
+        let (k, v) = (k.as_str().unwrap(), v.as_str().unwrap_or(""));
+        assert_eq!(
+            v.split_whitespace().collect::<String>(),
+            format!("${{{{vars.{k}!=''}}}}"),
+            "the presence check must receive `vars.{k} != ''`, not the variable"
+        );
+        checked.insert(k.to_owned());
+    }
+    assert_eq!(
+        var_refs(win),
+        checked,
+        "every variable {SIGN_WINDOWS} uses is checked for presence before it is used"
+    );
 }
 
 // LEDGER T5a | class S | the scan T5 relies on, over inline YAML
@@ -2071,40 +2535,55 @@ fn the_secret_scan_reads_the_context_name_in_any_case() {
 
 // LEDGER T6 | class S | parsed workflow YAML
 #[test]
-fn the_signing_job_builds_nothing_and_skips_nothing() {
+fn the_signing_jobs_build_nothing_and_skip_nothing() {
     let wf = parse(RELEASE);
-    let sign = &wf["jobs"][SIGN];
-    assert!(!sign.is_badvalue(), "release.yml has no {SIGN} job");
-    for step in steps(sign) {
-        let name = step["name"].as_str().unwrap_or(uses(step));
-        let run = step["run"].as_str().unwrap_or("");
-        assert!(
-            !run.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
-                .any(|w| w == "cargo"),
-            "{SIGN} step {name:?} runs cargo in the job that holds the signing secrets"
-        );
-        assert!(
-            !uses(step).contains("rust-toolchain") && !uses(step).contains("rust-cache"),
-            "{SIGN} step {name:?} sets up Rust in the job that holds the signing secrets"
-        );
-        assert!(
-            step["if"].is_badvalue(),
-            "{SIGN} step {name:?} is conditional; a skipped signing step is a release \
-             with no dmg"
-        );
-        if uses(step).starts_with("actions/download-artifact@") {
-            assert_eq!(
-                step["with"]["name"].as_str(),
-                Some(UNSIGNED),
-                "{SIGN} receives the unsigned binary and nothing else"
+    for (id, unsigned) in [(SIGN, UNSIGNED), (SIGN_WINDOWS, UNSIGNED_WINDOWS)] {
+        let sign = &wf["jobs"][id];
+        assert!(!sign.is_badvalue(), "release.yml has no {id} job");
+        let mut downloads = 0;
+        for step in steps(sign) {
+            let name = step["name"].as_str().unwrap_or(uses(step));
+            let run = step["run"].as_str().unwrap_or("");
+            assert!(
+                !run.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+                    .any(|w| w == "cargo"),
+                "{id} step {name:?} runs cargo in the job that can sign"
             );
+            assert!(
+                !uses(step).contains("rust-toolchain") && !uses(step).contains("rust-cache"),
+                "{id} step {name:?} sets up Rust in the job that can sign"
+            );
+            assert!(
+                step["if"].is_badvalue(),
+                "{id} step {name:?} is conditional; a skipped signing step is a release \
+                 with an unsigned asset or none"
+            );
+            if uses(step).starts_with("actions/download-artifact@") {
+                downloads += 1;
+                assert!(
+                    step["with"]["name"].as_str() == Some(unsigned)
+                        && step["with"]["pattern"].is_badvalue(),
+                    "{id} receives its unsigned build and nothing else"
+                );
+            }
         }
+        assert_eq!(downloads, 1, "{id} downloads {downloads} artifacts");
+        assert_eq!(
+            sign["needs"].as_str(),
+            Some("build"),
+            "{id} signs what build produced"
+        );
     }
-    assert_eq!(
-        sign["needs"].as_str(),
-        Some("build"),
-        "{SIGN} signs what build produced"
-    );
+    // sign-windows runs no script from the repository, so it checks out
+    // nothing, and restores no cache another ref could have written.
+    for step in steps(&wf["jobs"][SIGN_WINDOWS]) {
+        let name = step["name"].as_str().unwrap_or(uses(step));
+        assert!(
+            !uses(step).starts_with("actions/checkout@")
+                && !uses(step).starts_with("actions/cache"),
+            "{SIGN_WINDOWS} step {name:?} checks out the repository or restores a cache"
+        );
+    }
 }
 
 /// `permissions` that grant nothing beyond read.
@@ -2144,8 +2623,9 @@ fn only_the_publish_job_may_write() {
                 continue;
             }
             assert!(
-                rel == RELEASE && (id == PUBLISH || id == ATTEST),
-                "{rel}: job {id} may write; only {PUBLISH} and {ATTEST} in {RELEASE} may"
+                rel == RELEASE && [PUBLISH, ATTEST, SIGN_WINDOWS].contains(&id.as_str()),
+                "{rel}: job {id} is granted more than read; only {PUBLISH}, {ATTEST} and \
+                 {SIGN_WINDOWS} in {RELEASE} are"
             );
         }
     }
@@ -2162,6 +2642,45 @@ fn only_the_publish_job_may_write() {
         grants(&wf["jobs"][ATTEST], ATTEST),
         vec![pair("attestations", "write"), pair("id-token", "write")],
         "attest signs and stores attestations and does nothing else"
+    );
+    // An OIDC token to exchange with Azure, and the read that downloading
+    // its build needs. It writes nothing on GitHub.
+    assert_eq!(
+        grants(&wf["jobs"][SIGN_WINDOWS], SIGN_WINDOWS),
+        vec![pair("contents", "read"), pair("id-token", "write")],
+        "{SIGN_WINDOWS} mints a token to sign with and does nothing else"
+    );
+}
+
+// LEDGER T2257 | class S | parsed workflow YAML | pair NONE (what a token is accepted for is decided only by GitHub and Azure)
+#[test]
+fn only_attest_and_sign_windows_may_mint_an_oidc_token() {
+    let mints = |p: &Yaml| match p {
+        Yaml::String(s) => s == "write-all",
+        Yaml::Hash(h) => h
+            .iter()
+            .any(|(k, v)| k.as_str() == Some("id-token") && v.as_str() == Some("write")),
+        _ => false,
+    };
+    let mut found = BTreeSet::new();
+    for (rel, _, wf) in workflows() {
+        assert!(
+            !mints(&wf["permissions"]),
+            "{rel}: the workflow lets every job mint an OIDC token"
+        );
+        for (id, job) in jobs(&wf) {
+            if mints(&job["permissions"]) {
+                found.insert(format!("{rel}:{id}"));
+            }
+        }
+    }
+    assert_eq!(
+        found,
+        BTreeSet::from([
+            format!("{RELEASE}:{ATTEST}"),
+            format!("{RELEASE}:{SIGN_WINDOWS}")
+        ]),
+        "a token one of these jobs mints can sign as the project; no other job may mint one"
     );
 }
 
@@ -2291,7 +2810,14 @@ fn a_dispatch_builds_and_signs_and_only_a_tag_push_publishes() {
         .iter()
         .filter_map(Yaml::as_str)
         .collect();
-    for job in ["version-matches-tag", "advisories", BUILD, SIGN, ATTEST] {
+    for job in [
+        "version-matches-tag",
+        "advisories",
+        BUILD,
+        SIGN,
+        SIGN_WINDOWS,
+        ATTEST,
+    ] {
         assert!(
             needs.contains(job),
             "publish does not need {job}; a release could go out without it"
@@ -2328,6 +2854,253 @@ fn the_signing_job_uploads_only_a_verified_dmg() {
         "a missing dmg must fail the upload, not warn"
     );
 }
+/// Whether an artifact named `name` is among those a download `pattern`
+/// selects. Only the patterns the release uses, a literal or a literal
+/// followed by `*`, can be read; any other fails the test.
+fn selects(pattern: &str, name: &str) -> bool {
+    match pattern.split_once('*') {
+        None => pattern == name,
+        Some((prefix, "")) if !prefix.contains(['?', '[', '{', '!']) => name.starts_with(prefix),
+        _ => panic!("cannot tell which artifacts the download pattern {pattern:?} selects"),
+    }
+}
+
+/// Every artifact a job uploads, by name. The build job's name is its
+/// matrix's `artifact`, so it uploads one per leg.
+fn uploads(job_id: &str, job: &Yaml) -> Vec<String> {
+    let mut out = Vec::new();
+    for step in steps(job) {
+        if !uses(step).starts_with("actions/upload-artifact@") {
+            continue;
+        }
+        let name = step["with"]["name"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{job_id} uploads an artifact with no name"));
+        if name.split_whitespace().collect::<String>() == "${{matrix.artifact}}" {
+            for entry in job["strategy"]["matrix"]["include"]
+                .as_vec()
+                .expect("a matrix")
+            {
+                out.push(
+                    entry["artifact"]
+                        .as_str()
+                        .expect("matrix artifact")
+                        .to_owned(),
+                );
+            }
+        } else {
+            assert!(
+                !name.contains("${{"),
+                "{job_id} uploads under a name this test cannot resolve: {name}"
+            );
+            out.push(name.to_owned());
+        }
+    }
+    out
+}
+
+// LEDGER T2255 | class S | parsed workflow YAML | pair T3, T2244 (which artifacts a pattern collects is decided only on GitHub)
+#[test]
+fn the_unsigned_windows_build_can_never_be_attested() {
+    let wf = parse(RELEASE);
+    let build = &wf["jobs"][BUILD];
+    for entry in build["strategy"]["matrix"]["include"]
+        .as_vec()
+        .expect("a matrix")
+    {
+        let leg = entry["name"].as_str().expect("matrix name");
+        let artifact = entry["artifact"].as_str().unwrap_or("");
+        if runner_os(entry["os"].as_str().expect("matrix os")) == "Windows" {
+            assert_eq!(
+                artifact, UNSIGNED_WINDOWS,
+                "the {leg} leg uploads its unsigned build as {artifact:?}"
+            );
+            assert!(
+                !selects(RELEASE_PATTERN, artifact),
+                "the unsigned Windows build is uploaded as {artifact}, which attest's \
+                 {RELEASE_PATTERN} collects into the release"
+            );
+        } else {
+            assert_eq!(
+                artifact,
+                format!("hops-{leg}"),
+                "the {leg} leg's build is a release asset as it is built"
+            );
+        }
+    }
+
+    // Every artifact attest collects, and who uploads it: the signed Windows
+    // build comes from sign-windows and from nowhere else.
+    let mut collected: Vec<(String, String)> = Vec::new();
+    for (id, job) in jobs(&wf) {
+        for name in uploads(&id, job) {
+            if selects(RELEASE_PATTERN, &name) {
+                collected.push((id.clone(), name));
+            }
+        }
+    }
+    let windows: Vec<&(String, String)> = collected
+        .iter()
+        .filter(|(_, n)| n.contains("windows"))
+        .collect();
+    assert_eq!(
+        windows,
+        vec![&(SIGN_WINDOWS.to_owned(), SIGNED_WINDOWS.to_owned())],
+        "the Windows build reaches the release only as {SIGN_WINDOWS} signed it"
+    );
+    let upload = steps(&wf["jobs"][SIGN_WINDOWS])
+        .iter()
+        .find(|s| uses(s).starts_with("actions/upload-artifact@"))
+        .expect("sign-windows uploads");
+    let paths: BTreeSet<&str> = upload["with"]["path"]
+        .as_str()
+        .unwrap_or("")
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        paths,
+        BTreeSet::from([
+            "hops-windows-x86_64.zip",
+            "hops-x86_64-pc-windows-msvc.cdx.json"
+        ]),
+        "{SIGN_WINDOWS} uploads the release's Windows assets, the zip and its SBOM, and nothing else"
+    );
+    assert_eq!(upload["with"]["if-no-files-found"].as_str(), Some("error"));
+
+    // Only sign-windows downloads the unsigned build.
+    for (id, job) in jobs(&wf) {
+        for step in steps(job) {
+            if !uses(step).starts_with("actions/download-artifact@") {
+                continue;
+            }
+            let with = &step["with"];
+            let pattern = with["name"]
+                .as_str()
+                .or_else(|| with["pattern"].as_str())
+                .unwrap_or_else(|| panic!("{id} downloads every artifact of the run"));
+            if id != SIGN_WINDOWS {
+                assert!(
+                    !selects(pattern, UNSIGNED_WINDOWS),
+                    "{id} downloads {pattern}, which holds the unsigned Windows build"
+                );
+            }
+        }
+    }
+}
+
+// LEDGER T2256 | class S | parsed workflow YAML | pair T2251, T2252, T2253, T2254 (signing itself runs only on GitHub, against Azure)
+#[test]
+fn the_windows_signing_job_signs_with_its_profile_and_checks_what_it_uploads() {
+    const LOGIN: &str = "Azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906";
+    const SIGNING: &str = "Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82";
+    let wf = parse(RELEASE);
+    let job = &wf["jobs"][SIGN_WINDOWS];
+    assert_eq!(
+        job["environment"].as_str(),
+        Some("windows-signing"),
+        "Azure accepts the token of the windows-signing environment alone; another \
+         environment cannot sign, and none lets any ref try"
+    );
+    assert_eq!(job["runs-on"].as_str(), Some("windows-latest"));
+    assert!(
+        job["defaults"].is_badvalue(),
+        "{SIGN_WINDOWS} changes its default shell"
+    );
+    for step in steps(job) {
+        let name = step["name"].as_str().unwrap_or(uses(step));
+        assert!(
+            matches!(step["shell"].as_str(), None | Some("pwsh")),
+            "{SIGN_WINDOWS} step {name:?} runs in a shell other than pwsh"
+        );
+    }
+
+    let all = steps(job);
+    let pos = |what: &str, f: &dyn Fn(&Yaml) -> bool| {
+        all.iter()
+            .position(f)
+            .unwrap_or_else(|| panic!("{SIGN_WINDOWS} has no step that {what}"))
+    };
+    let named = |n: &str| step_position(job, SIGN_WINDOWS, n);
+    let order = [
+        named("every signing variable is set"),
+        pos("downloads the unsigned build", &|s| {
+            uses(s).starts_with("actions/download-artifact@")
+        }),
+        named("Unpack the unsigned Windows build"),
+        pos("logs in to Azure", &|s| uses(s).starts_with("Azure/login@")),
+        pos("signs", &|s| {
+            uses(s).starts_with("Azure/artifact-signing-action@")
+        }),
+        named("Package the signed Windows build"),
+        named("Windows accepts the signed hops.exe in the zip"),
+        pos("uploads", &|s| {
+            uses(s).starts_with("actions/upload-artifact@")
+        }),
+    ];
+    assert!(
+        order.windows(2).all(|w| w[0] < w[1]),
+        "{SIGN_WINDOWS} must check its variables, download, unpack, log in, sign, package, \
+         verify the zip, then upload: {order:?}"
+    );
+
+    let with = |s: &Yaml| -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = s["with"]
+            .as_hash()
+            .expect("with:")
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str().unwrap().to_owned(),
+                    v.as_str().unwrap_or("not a string").to_owned(),
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let pair = |k: &str, v: &str| (k.to_owned(), v.to_owned());
+    let login = &all[order[3]];
+    assert_eq!(uses(login), LOGIN, "azure/login is not the reviewed v3.1.0");
+    assert_eq!(
+        with(login),
+        vec![
+            pair("client-id", "${{ vars.AZURE_CLIENT_ID }}"),
+            pair("subscription-id", "${{ vars.AZURE_SUBSCRIPTION_ID }}"),
+            pair("tenant-id", "${{ vars.AZURE_TENANT_ID }}"),
+        ],
+        "the login is by OIDC as the federated identity, with no stored credential"
+    );
+    let sign = &all[order[4]];
+    assert_eq!(
+        uses(sign),
+        SIGNING,
+        "the signing action is not the reviewed v2.0.0"
+    );
+    assert_eq!(
+        with(sign),
+        vec![
+            pair("cache-dependencies", "false"),
+            pair(
+                "certificate-profile-name",
+                "${{ vars.ARTIFACT_SIGNING_PROFILE }}"
+            ),
+            pair("endpoint", "${{ vars.ARTIFACT_SIGNING_ENDPOINT }}"),
+            pair("file-digest", "SHA256"),
+            pair("files", "${{ runner.temp }}\\bin\\hops.exe"),
+            pair(
+                "signing-account-name",
+                "${{ vars.ARTIFACT_SIGNING_ACCOUNT }}"
+            ),
+            pair("timestamp-digest", "SHA256"),
+            pair("timestamp-rfc3161", "http://timestamp.acs.microsoft.com"),
+        ],
+        "the signing action signs the unpacked hops.exe, SHA-256 and timestamped, with the \
+         environment's profile, and restores no cache"
+    );
+}
+
 // LEDGER T2248 | class S | parsed workflow YAML | pair T2243, T2244 (the PowerShell step has no local runner)
 #[test]
 fn every_build_uploads_an_archive_of_everything_it_wrote_and_its_sboms() {
@@ -2475,8 +3248,8 @@ fn every_asset_is_attested_by_a_job_that_can_do_nothing_else() {
         .collect();
     assert_eq!(
         needs,
-        BTreeSet::from([BUILD, SIGN]),
-        "attest covers what build and {SIGN} produced"
+        BTreeSet::from([BUILD, SIGN, SIGN_WINDOWS]),
+        "attest covers what build, {SIGN} and {SIGN_WINDOWS} produced"
     );
     for step in steps(attest) {
         let name = step["name"].as_str().unwrap_or(uses(step));
@@ -2513,7 +3286,7 @@ fn every_asset_is_attested_by_a_job_that_can_do_nothing_else() {
         .to_owned();
     let downloaded = pos("downloads every build's assets", &|s| {
         uses(s).starts_with("actions/download-artifact@")
-            && s["with"]["pattern"].as_str() == Some("hops-*")
+            && s["with"]["pattern"].as_str() == Some(RELEASE_PATTERN)
             && s["with"]["merge-multiple"].as_bool() == Some(true)
             && s["with"]["path"].as_str() == Some(dir.as_str())
     });
@@ -2733,7 +3506,7 @@ fn every_step_that_makes_or_checks_an_asset_runs_on_every_leg_that_ships_one() {
     }
     // The advisories, signing and attest jobs each run on one runner, and
     // every step of theirs runs.
-    for job in ["advisories", SIGN, ATTEST] {
+    for job in ["advisories", SIGN, SIGN_WINDOWS, ATTEST] {
         for step in steps(&wf["jobs"][job]) {
             let name = step["name"].as_str().unwrap_or(uses(step));
             assert!(

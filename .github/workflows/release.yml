@@ -1,16 +1,19 @@
-# Build pre-built hops binaries, sign the macOS app, and publish a GitHub Release.
+# Build pre-built hops binaries, sign the macOS app and the Windows binary, and
+# publish a GitHub Release.
 #
 # Trigger: push a version tag (e.g. `git tag v0.11.0 && git push origin v0.11.0`),
 # or run it by hand from the Actions tab ("Run workflow"). Both run every job
 # except publish: a run by hand from any branch builds all three platforms and
-# produces the signed, notarized dmg as the `hops-macos-universal-dmg` artifact,
-# and publishes nothing. Only a pushed `v*` tag publishes.
+# produces the signed, notarized dmg as the `hops-macos-universal-dmg` artifact
+# and the signed Windows zip as `hops-windows-x86_64`, and publishes nothing.
+# Only a pushed `v*` tag publishes.
 #
 # Produces, per release:
 #   - hops-macos-universal.dmg       (Intel + Apple Silicon GUI app, signed and
 #                                     notarized; see docs/SIGNING.md)
 #   - hops-macos-universal.tar.gz    (the bare universal CLI binary; unsigned)
-#   - hops-windows-x86_64.zip        (GUI build)
+#   - hops-windows-x86_64.zip        (GUI build; hops.exe Authenticode-signed
+#                                     and timestamped, see docs/SIGNING.md)
 #   - hops-linux-x86_64.tar.gz       (daemon + terminal UI; the Slint GUI on Linux
 #                                     needs desktop libs, so the Linux artifact is
 #                                     TUI-only for a reliable, dependency-light build;
@@ -29,19 +32,21 @@
 #     --signer-workflow <owner>/<repo>/.github/workflows/release.yml \
 #     --source-ref refs/tags/v<version>
 #
-# Signing runs in its own job, sign-macos, which runs no cargo and receives only
-# the unsigned universal build. The build job compiles every dependency's build
-# script and proc macro, so nothing secret may be visible there. The signing
-# secrets live in the `macos-signing` environment and are read only by
-# sign-macos, which fails when any of them is missing: a run that cannot sign
-# is a failed run, never a release without its dmg.
+# Signing runs in two jobs of its own, sign-macos and sign-windows. Neither runs
+# cargo, and each receives only its platform's unsigned build. The build job
+# compiles every dependency's build script and proc macro, so nothing that can
+# sign may be visible there. The macOS signing secrets live in the
+# `macos-signing` environment and are read only by sign-macos. sign-windows
+# reads no secret: in the `windows-signing` environment it mints a GitHub OIDC
+# token, which Azure exchanges for the right to sign with one certificate
+# profile. Each fails when anything it needs is missing: a run that cannot sign
+# is a failed run, never a release without its signed dmg and signed hops.exe.
 #
 # Every action is pinned to a commit, with the tag it stands for in a comment.
 # A tag can be moved to other code after review; a commit cannot. That includes
 # dtolnay/rust-toolchain, whose version refs are branches: the compiler is its
 # `toolchain` input, which `toolchain_pin` in src/lib.rs checks against
 # rust-toolchain.toml.
-# Windows signing is still a TODO (see the marker below).
 name: release
 
 on:
@@ -288,16 +293,21 @@ jobs:
         # `targets` is every target the binary is compiled for. The SBOMs and
         # notices are generated for exactly these, and the builds compile
         # exactly these, so the two cannot describe different binaries.
+        #
+        # `artifact` is the name the build is uploaded under. Every artifact
+        # named hops-* is a release asset, since attest downloads them all; the
+        # Windows build is not one until sign-windows has signed it, so it goes
+        # up under a name outside that pattern, which only sign-windows reads.
         include:
-          - { os: macos-latest,   name: macos-universal,  targets: "aarch64-apple-darwin x86_64-apple-darwin", features: "tui slint" }
-          - { os: windows-latest, name: windows-x86_64,    targets: "x86_64-pc-windows-msvc", features: "tui slint" }
+          - { os: macos-latest,   name: macos-universal,  artifact: hops-macos-universal,    targets: "aarch64-apple-darwin x86_64-apple-darwin", features: "tui slint" }
+          - { os: windows-latest, name: windows-x86_64,    artifact: unsigned-windows-x86_64, targets: "x86_64-pc-windows-msvc", features: "tui slint" }
           # The Linux backends are FEATURE-gated while macOS/Windows backends are
           # PLATFORM-gated (`#[cfg(windows)]`, `#[cfg(target_os = "macos")]`), so
           # the same `--no-default-features` line produced a working binary on two
           # platforms and an inert one on the third. Built with "tui" alone this
           # shipped a KVM containing only the `dummy` backend — it accepted input
           # and discarded it, from 2026-07-06 through v0.12.0 (#47).
-          - { os: ubuntu-latest,  name: linux-x86_64,      targets: "x86_64-unknown-linux-gnu", features: "tui libei_capture libei_emulation layer_shell_capture wlroots_emulation x11_capture x11_emulation rdp_emulation" }
+          - { os: ubuntu-latest,  name: linux-x86_64,      artifact: hops-linux-x86_64,       targets: "x86_64-unknown-linux-gnu", features: "tui libei_capture libei_emulation layer_shell_capture wlroots_emulation x11_capture x11_emulation rdp_emulation" }
     runs-on: ${{ matrix.os }}
     env:
       FEATURES: ${{ matrix.features }}
@@ -344,8 +354,8 @@ jobs:
           cargo auditable build --locked --release --no-default-features --features "$env:FEATURES" --target "$env:TARGETS"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           New-Item -ItemType Directory -Force dist | Out-Null
+          # Unsigned here; sign-windows signs it.
           Copy-Item "target\$env:TARGETS\release\hops.exe" dist\hops.exe
-          # TODO(signing): signtool sign /fd SHA256 /tr <timestamp-url> /td SHA256 /a dist\hops.exe
 
       - name: System deps (Linux)
         if: runner.os == 'Linux'
@@ -430,7 +440,7 @@ jobs:
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: hops-${{ matrix.name }}
+          name: ${{ matrix.artifact }}
           path: |
             hops-${{ matrix.name }}.*
             hops-*.cdx.json
@@ -559,13 +569,206 @@ jobs:
           path: hops-macos-universal.dmg
           if-no-files-found: error
 
+  # Signs hops.exe with Azure Artifact Signing. It reads no secret: it may mint
+  # an OIDC token, which Azure accepts, through a federated credential bound to
+  # the `windows-signing` environment of this repository, as the right to sign
+  # with one certificate profile and nothing else. It runs no cargo, checks out
+  # nothing, restores no cache, and receives only the unsigned Windows build:
+  # the binary, its licence, notices and SBOM. Its steps run in pwsh, the
+  # default shell on Windows. No step is conditional, so every run signs or
+  # fails.
+  sign-windows:
+    name: sign-windows
+    needs: build
+    runs-on: windows-latest
+    environment: windows-signing
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      # Each value is whether the variable is set, never the variable itself.
+      - name: every signing variable is set
+        env:
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID != '' }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID != '' }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID != '' }}
+          ARTIFACT_SIGNING_ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT != '' }}
+          ARTIFACT_SIGNING_ACCOUNT: ${{ vars.ARTIFACT_SIGNING_ACCOUNT != '' }}
+          ARTIFACT_SIGNING_PROFILE: ${{ vars.ARTIFACT_SIGNING_PROFILE != '' }}
+        run: |
+          $missing = $false
+          foreach ($name in 'AZURE_CLIENT_ID', 'AZURE_TENANT_ID', 'AZURE_SUBSCRIPTION_ID',
+                            'ARTIFACT_SIGNING_ENDPOINT', 'ARTIFACT_SIGNING_ACCOUNT',
+                            'ARTIFACT_SIGNING_PROFILE') {
+            if ([Environment]::GetEnvironmentVariable($name) -cne 'true') {
+              Write-Output "::error::the $name variable is not set in the windows-signing environment."
+              $missing = $true
+            }
+          }
+          if ($missing) {
+            Write-Output 'Without every signing variable there is no signed hops.exe, and a'
+            Write-Output 'release without it is not published. See docs/SIGNING.md.'
+            exit 1
+          }
+          Write-Output 'OK: every signing variable is set.'
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: unsigned-windows-x86_64
+          path: ${{ runner.temp }}/unsigned
+
+      # The zip comes from the job that runs third-party build scripts, so it
+      # must hold exactly the binary, its licence, notices and SBOM, each once
+      # and each a plain file with content, before anything is extracted.
+      - name: Unpack the unsigned Windows build
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'unsigned/hops-windows-x86_64.zip'
+          $bin = Join-Path $env:RUNNER_TEMP 'bin'
+          $members = 'hops.exe', 'LICENSE', 'THIRD-PARTY-NOTICES.txt', 'hops-x86_64-pc-windows-msvc.cdx.json'
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          try {
+            $zip = [System.IO.Compression.ZipFile]::OpenRead($archive)
+          } catch {
+            Write-Output '::error::cannot read the unsigned artifact.'
+            exit 1
+          }
+          try {
+            $entries = @($zip.Entries)
+            $bad = $false
+            foreach ($f in $members) {
+              $n = @($entries | Where-Object { $_.FullName -ceq $f }).Count
+              if ($n -eq 0) {
+                Write-Output "::error::the unsigned artifact carries no $f, so the zip would ship without it."
+                $bad = $true
+              } elseif ($n -ne 1) {
+                Write-Output "::error::the unsigned artifact carries $f $n times."
+                $bad = $true
+              }
+            }
+            foreach ($e in $entries) {
+              # The file type a Unix archiver records in the high 16 bits.
+              $type = ($e.ExternalAttributes -shr 16) -band 0xF000
+              if ($members -cnotcontains $e.FullName) {
+                Write-Output "::error::the unsigned artifact carries $($e.FullName), which is not part of the build."
+                $bad = $true
+              } elseif ($type -ne 0 -and $type -ne 0x8000) {
+                Write-Output "::error::the unsigned artifact's $($e.FullName) is not a plain file."
+                $bad = $true
+              } elseif ($e.Length -eq 0) {
+                Write-Output "::error::the unsigned artifact's $($e.FullName) is empty."
+                $bad = $true
+              }
+            }
+            if ($bad) {
+              exit 1
+            }
+            New-Item -ItemType Directory -Force -Path $bin | Out-Null
+            foreach ($e in $entries) {
+              [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e, (Join-Path $bin $e.FullName), $false)
+            }
+          } finally {
+            $zip.Dispose()
+          }
+          foreach ($f in $members) {
+            $item = Get-Item -LiteralPath (Join-Path $bin $f) -ErrorAction SilentlyContinue
+            if ($null -eq $item -or $item.PSIsContainer -or $item.LinkType -or $item.Length -eq 0) {
+              Write-Output "::error::the unsigned artifact's $f is not a plain file with content."
+              exit 1
+            }
+          }
+
+      - uses: Azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # The action signs with the Azure CLI login above. Its dependency cache
+      # is off: a signing job restores nothing a run on another ref could have
+      # written. The timestamp keeps the signature valid after the short-lived
+      # certificate Artifact Signing issues has expired.
+      - uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+          files: ${{ runner.temp }}\bin\hops.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          cache-dependencies: "false"
+
+      - name: Package the signed Windows build
+        run: |
+          $bin = Join-Path $env:RUNNER_TEMP 'bin'
+          $members = 'hops.exe', 'LICENSE', 'THIRD-PARTY-NOTICES.txt', 'hops-x86_64-pc-windows-msvc.cdx.json'
+          Compress-Archive -LiteralPath ($members | ForEach-Object { Join-Path $bin $_ }) -DestinationPath hops-windows-x86_64.zip
+          Copy-Item -LiteralPath (Join-Path $bin 'hops-x86_64-pc-windows-msvc.cdx.json') -Destination .
+
+      # The hops.exe checked is the one read back out of the zip that is
+      # uploaded. `Valid` covers the signature, the file's hash and a chain to
+      # a root Windows trusts. The organization is compared field by field, as
+      # the certificate holds it, so a name that merely contains it does not
+      # pass.
+      - name: Windows accepts the signed hops.exe in the zip
+        run: |
+          $check = Join-Path $env:RUNNER_TEMP 'check'
+          if (Test-Path -LiteralPath $check) {
+            Remove-Item -Recurse -Force -LiteralPath $check
+          }
+          Expand-Archive -LiteralPath hops-windows-x86_64.zip -DestinationPath $check
+          $exe = Join-Path $check 'hops.exe'
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+            Write-Output '::error::hops-windows-x86_64.zip carries no hops.exe.'
+            exit 1
+          }
+          $bad = $false
+          $sig = Get-AuthenticodeSignature -LiteralPath $exe
+          if ("$($sig.Status)" -cne 'Valid') {
+            Write-Output "::error::hops.exe is not validly signed: $($sig.Status). $($sig.StatusMessage)"
+            $bad = $true
+          }
+          $orgs = @()
+          if ($null -ne $sig.SignerCertificate) {
+            foreach ($rdn in $sig.SignerCertificate.SubjectName.EnumerateRelativeDistinguishedNames()) {
+              if (-not $rdn.HasMultipleElements -and $rdn.GetSingleElementType().Value -ceq '2.5.4.10') {
+                $orgs += $rdn.GetSingleElementValue()
+              }
+            }
+          }
+          if ($orgs.Count -ne 1 -or $orgs[0] -cne 'Hotash Studios, LLC') {
+            Write-Output "::error::hops.exe is signed as '$($sig.SignerCertificate.Subject)', whose organization is not O=""Hotash Studios, LLC""."
+            $bad = $true
+          }
+          if ($null -eq $sig.TimeStamperCertificate) {
+            Write-Output '::error::hops.exe carries no timestamp, so its signature stops verifying when the certificate expires.'
+            $bad = $true
+          }
+          $bytes = [System.IO.File]::ReadAllBytes($exe)
+          if (-not [System.Text.Encoding]::Latin1.GetString($bytes).Contains('.dep-v0')) {
+            Write-Output '::error::the signed hops.exe no longer embeds its dependency list (.dep-v0).'
+            $bad = $true
+          }
+          if ($bad) {
+            exit 1
+          }
+          Write-Output "OK: hops.exe is signed as '$($sig.SignerCertificate.Subject)', timestamped, and still lists its dependencies."
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hops-windows-x86_64
+          path: |
+            hops-windows-x86_64.zip
+            hops-x86_64-pc-windows-msvc.cdx.json
+          if-no-files-found: error
+
   # Checksums for every asset, and a signed statement of which workflow run
   # built each one. It runs on a dispatch too, so a dry run proves the
   # attestation verifies before a tag depends on it. It may mint an OIDC token
   # and write attestations, and nothing else; it checks out no code.
   attest:
     name: checksums and provenance
-    needs: [build, sign-macos]
+    needs: [build, sign-macos, sign-windows]
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -578,7 +781,8 @@ jobs:
           merge-multiple: true
 
       # The dmg is checked on macOS by scripts/verify-macos-release.sh before
-      # sign-macos uploads it; the archives are checked here.
+      # sign-macos uploads it, and the signature on hops.exe on Windows before
+      # sign-windows uploads its zip; the archives are checked here.
       - name: every archive carries its licence, notices, SBOMs and audit data
         working-directory: artifacts
         run: |
@@ -671,7 +875,7 @@ jobs:
   # publishes the attested set and nothing else.
   publish:
     name: publish-release
-    needs: [version-matches-tag, advisories, build, sign-macos, attest]
+    needs: [version-matches-tag, advisories, build, sign-macos, sign-windows, attest]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:

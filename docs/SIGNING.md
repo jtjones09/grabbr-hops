@@ -1,10 +1,15 @@
-# Signing & notarizing the macOS build
+# Signing the macOS and Windows builds
+
+The macOS build is signed and notarized as described first; the Windows build
+is Authenticode-signed as described under [Windows](#windows).
+
+## macOS
 
 Goal: ship a macOS `.app` in a `.dmg` that opens with **no Gatekeeper warning** —
 double-click → "hops is from an identified developer" → runs, offline, no
 `xattr` dance. This needs an Apple Developer account (paid) and a one-time setup.
 
-## What you need to gather (once)
+### What you need to gather (once)
 
 1. **Developer ID Application certificate** — the identity that signs apps for
    distribution *outside* the App Store.
@@ -25,7 +30,7 @@ double-click → "hops is from an identified developer" → runs, offline, no
 3. Your **Team ID** — the 10-char code in the identity above / the portal
    membership page.
 
-## Sign locally
+### Sign locally
 
 ```sh
 # 1. build the universal binary (or use CI's), then assemble the bundle:
@@ -50,7 +55,7 @@ DEVELOPER_ID="Developer ID Application: … (TEAMID)" NOTARY_PROFILE=hops-notary
 `sign-macos.sh` prints a Gatekeeper assessment at the end — success looks like
 `accepted` / `source=Notarized Developer ID`.
 
-## In CI (GitHub Actions)
+### In CI (GitHub Actions)
 
 `release.yml` signs and notarizes the macOS `.dmg` in its own job,
 `sign-macos`. That job runs no `cargo`: it receives only the unsigned universal
@@ -116,7 +121,7 @@ and decodes the `.p8` to a temp file readable only by the runner user.
 `sign-macos.sh` signs in a private temp workspace, so it also works locally from
 an iCloud-synced checkout (no `xattr` dance needed).
 
-## Notes
+### Notes
 
 - **No entitlements needed.** The Slint build links only Apple frameworks (no
   library-validation issue) and uses no Apple Events, so `--options runtime`
@@ -124,5 +129,82 @@ an iCloud-synced checkout (no `xattr` dance needed).
 - A **bare binary can't be stapled** — only `.app`/`.dmg`/`.pkg` can — which is
   why we ship the `.app` in a `.dmg`. The CLI still works from inside:
   `hops.app/Contents/MacOS/hops daemon|tui`.
-- **Windows** signing is separate and still needs its own code-signing cert
-  (`signtool`), tracked as a follow-up.
+
+## Windows
+
+`hops.exe` is signed with Azure Artifact Signing (formerly Trusted Signing),
+which issues a short-lived certificate in the publishing organization's
+validated name for each signing and keeps the key in Microsoft's HSMs. There
+is no certificate file or password to store: the `sign-windows` job proves
+who it is to Azure with a GitHub OIDC token.
+
+### What is in Azure
+
+- An **Artifact Signing account** (`hotashsigning`), in the region whose
+  endpoint the workflow is given (for East US, `https://eus.codesigning.azure.net/`).
+- An **identity validation** of the publishing organization, Hotash Studios,
+  LLC, and a **certificate profile** of type **Public Trust** issued from it.
+  Signatures chain to a root Windows trusts, and the signer's subject carries
+  `O="Hotash Studios, LLC"`.
+- An **app registration** with a **federated credential** for GitHub Actions:
+  issuer `https://token.actions.githubusercontent.com`, subject
+  `repo:<owner>/<repo>:environment:windows-signing`, audience
+  `api://AzureADTokenExchange`. Only a job running in that environment of this
+  repository gets a token Azure accepts.
+- A role assignment of **Artifact Signing Certificate Profile Signer** to that
+  app registration, scoped to the signing account. It can sign with the
+  account's profiles and do nothing else in the subscription.
+
+### In CI
+
+`release.yml` signs in its own job, `sign-windows`, on a Windows runner. It
+runs no `cargo`, checks out nothing and restores no cache: it receives only
+the unsigned Windows build, which the build job uploads as
+`unsigned-windows-x86_64` so that attest, which collects every `hops-*`
+artifact, can never pick it up. `sign-windows` checks the zip holds exactly
+`hops.exe`, `LICENSE`, `THIRD-PARTY-NOTICES.txt` and the SBOM, logs in to Azure
+with [azure/login](https://github.com/Azure/login), signs `hops.exe` with
+[azure/artifact-signing-action](https://github.com/Azure/artifact-signing-action)
+(SHA-256, RFC-3161 timestamp from `http://timestamp.acs.microsoft.com`), and
+repackages the zip. Before uploading it as `hops-windows-x86_64` it reads
+`hops.exe` back out of that zip and fails unless `Get-AuthenticodeSignature`
+reports `Valid`, the signer's organization is exactly `Hotash Studios, LLC`,
+the signature is timestamped (the certificate itself lasts days, so an
+untimestamped signature would soon stop verifying), and the binary still
+carries the dependency list `cargo auditable` embedded.
+
+Set up once, before the first release that signs:
+
+1. Settings → Environments → `windows-signing` (create it if it is not
+   there) → Deployment branches and tags → Selected branches and tags: add
+   the tag rule `v*` and the branch rule `release/*`, as for `macos-signing`.
+   The federated credential trusts the environment, so these rules are what
+   decide which refs can sign.
+2. Add the six variables below as **environment variables** of
+   `windows-signing` (not secrets, and not repository variables). They are
+   identifiers, not credentials.
+
+| variable | what |
+| --- | --- |
+| `AZURE_CLIENT_ID` | the app registration's application (client) ID |
+| `AZURE_TENANT_ID` | the directory (tenant) ID |
+| `AZURE_SUBSCRIPTION_ID` | the subscription that holds the signing account |
+| `ARTIFACT_SIGNING_ENDPOINT` | the account's regional endpoint, e.g. `https://eus.codesigning.azure.net/` |
+| `ARTIFACT_SIGNING_ACCOUNT` | the signing account name, `hotashsigning` |
+| `ARTIFACT_SIGNING_PROFILE` | the Public Trust certificate profile name |
+
+`sign-windows` fails when any of the six is missing, naming it, on every run.
+A run that cannot produce a verified signed `hops.exe` publishes nothing.
+
+### Checking a download
+
+In Explorer: right-click `hops.exe` → Properties → **Digital Signatures**. The
+signer is Hotash Studios, LLC, and Details shows the signature is OK and has a
+timestamp. Or in PowerShell:
+
+```powershell
+Get-AuthenticodeSignature .\hops.exe | Format-List Status, SignerCertificate, TimeStamperCertificate
+```
+
+`Status` is `Valid`, the signer certificate's subject includes
+`O="Hotash Studios, LLC"`, and `TimeStamperCertificate` is present.
