@@ -22,8 +22,18 @@ const SIGN_WINDOWS: &str = "sign-windows";
 const UNSIGNED_WINDOWS: &str = "unsigned-windows-x86_64";
 /// The artifact sign-windows uploads: the signed zip and its SBOM.
 const SIGNED_WINDOWS: &str = "hops-windows-x86_64";
-/// What attest downloads, merged into the release: every artifact named so.
-const RELEASE_PATTERN: &str = "hops-*";
+/// The artifacts attest downloads, each by name, and gathers into the
+/// release: the two built as they ship, the dmg and the signed Windows build.
+const RELEASE_ARTIFACTS: [&str; 4] = [
+    "hops-linux-x86_64",
+    "hops-macos-universal",
+    "hops-macos-universal-dmg",
+    SIGNED_WINDOWS,
+];
+/// Where attest downloads each release artifact, and the step that checks
+/// each and gathers them into the release directory.
+const INCOMING: &str = "incoming";
+const GATHER_STEP: &str = "each artifact holds exactly the assets its job makes";
 /// The one job that publishes, and so the one job that may write.
 const PUBLISH: &str = "publish";
 /// The artifact the signing job receives: the unsigned universal binary.
@@ -611,6 +621,143 @@ mod gates {
         );
     }
 
+    /// Each release artifact and the assets it holds.
+    fn release_artifacts() -> Vec<(String, Vec<String>)> {
+        let mut out = vec![(format!("{}-dmg", UNSIGNED), vec![DMG.to_owned()])];
+        for (archive, _, targets) in ARCHIVES {
+            let name = archive
+                .trim_end_matches(".tar.gz")
+                .trim_end_matches(".zip")
+                .to_owned();
+            let mut files = vec![archive.to_owned()];
+            files.extend(targets.iter().map(|t| sbom(t)));
+            out.push((name, files));
+        }
+        out.sort();
+        out
+    }
+
+    // LEDGER T2258 | class B | 5 process exit code + 4 files moved: release.yml attest gather step
+    #[test]
+    fn the_release_is_gathered_from_exactly_its_artifacts() {
+        let script = step_script(ATTEST, GATHER_STEP);
+        let s = scratch("gather");
+        let incoming = s.0.join(INCOMING);
+        let out = s.0.join(step_dir(&s.0, ATTEST, SUMS_STEP));
+        let expected = release_artifacts();
+        assert_eq!(
+            expected.iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>(),
+            RELEASE_ARTIFACTS.to_vec(),
+            "the release's artifacts and the archives this file knows disagree"
+        );
+        let run = |change: &dyn Fn(&Path)| {
+            reset(&incoming);
+            let _ = std::fs::remove_dir_all(&out);
+            for (a, files) in &expected {
+                std::fs::create_dir_all(incoming.join(a)).unwrap();
+                for f in files {
+                    std::fs::write(incoming.join(a).join(f), format!("the bytes of {f}\n"))
+                        .unwrap();
+                }
+            }
+            change(&incoming);
+            bash(&script, &s.0, &s.0, &[])
+        };
+
+        let complete = run(&|_| {});
+        assert!(
+            complete.ok,
+            "a complete release failed to gather:\n{}",
+            complete.text
+        );
+        let mut got: Vec<String> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            assets(),
+            "the release directory is not exactly the release's assets"
+        );
+        for f in &got {
+            assert_eq!(
+                std::fs::read_to_string(out.join(f)).unwrap(),
+                format!("the bytes of {f}\n"),
+                "{f} is not the file its artifact carried"
+            );
+        }
+
+        let rogue = run(&|d| {
+            std::fs::create_dir_all(d.join("hops-zzz")).unwrap();
+            std::fs::write(d.join("hops-zzz").join(WINDOWS_ZIP), b"unsigned").unwrap();
+        });
+        assert!(
+            !rogue.ok && rogue.text.contains("hops-zzz"),
+            "an artifact nobody named was gathered, or the failure does not name it:\n{}",
+            rogue.text
+        );
+        assert!(!out.exists(), "a refused release was gathered anyway");
+
+        // The unsigned zip carried by another artifact, where merging would
+        // have let it replace the signed one.
+        let swapped = run(&|d| {
+            std::fs::write(d.join("hops-linux-x86_64").join(WINDOWS_ZIP), b"unsigned").unwrap()
+        });
+        assert!(
+            !swapped.ok
+                && swapped.text.contains("hops-linux-x86_64")
+                && swapped.text.contains(WINDOWS_ZIP),
+            "an artifact carrying another's asset was gathered:\n{}",
+            swapped.text
+        );
+        assert!(!out.exists(), "a refused release was gathered anyway");
+
+        for (a, files) in &expected {
+            for f in files {
+                let ran = run(&|d| std::fs::remove_file(d.join(a).join(f)).unwrap());
+                assert!(
+                    !ran.ok && ran.text.contains(a.as_str()) && ran.text.contains(f.as_str()),
+                    "the {a} artifact without {f} was gathered:\n{}",
+                    ran.text
+                );
+            }
+            let linked = run(&|d| {
+                let p = d.join(a).join(&files[0]);
+                std::fs::remove_file(&p).unwrap();
+                std::os::unix::fs::symlink("/etc/hosts", &p).unwrap();
+            });
+            assert!(
+                !linked.ok && linked.text.contains(&files[0]),
+                "the {a} artifact's {} as a link was gathered:\n{}",
+                files[0],
+                linked.text
+            );
+            for extra in [".hidden", "sub"] {
+                let ran = run(&|d| {
+                    if extra == "sub" {
+                        std::fs::create_dir_all(d.join(a).join(extra)).unwrap();
+                    } else {
+                        std::fs::write(d.join(a).join(extra), b"x").unwrap();
+                    }
+                });
+                assert!(
+                    !ran.ok && ran.text.contains(extra),
+                    "the {a} artifact carrying {extra} was gathered:\n{}",
+                    ran.text
+                );
+            }
+        }
+        let control = run(&|d| {
+            std::fs::write(d.join(RELEASE_ARTIFACTS[0]).join(CONTROL_NAME), b"x").unwrap()
+        });
+        assert!(
+            !control.ok && !control.text.contains('\r'),
+            "a file name with a carriage return reached the log raw, or passed:\n{:?}",
+            control.text
+        );
+    }
+
     fn app_docs() -> Vec<String> {
         let mut docs = vec![LICENSE.to_owned(), NOTICES.to_owned()];
         docs.extend(APPLE_TARGETS.iter().map(|t| sbom(t)));
@@ -835,6 +982,9 @@ done
     /// An archive's members, as (name, bytes).
     type Members = Vec<(String, Vec<u8>)>;
 
+    /// A member name a log would read as a line break and a workflow command.
+    const CONTROL_NAME: &str = "x\r::warning::injected";
+
     /// Bytes that make a member a symbolic link to the path after them.
     const LINK: &[u8] = b"\0link:";
 
@@ -1022,6 +1172,16 @@ done
                  does not name both:\n{}",
                 extra.text
             );
+            // A name from the archive reaches the log escaped, so a line
+            // break in it cannot start a workflow command.
+            let control = run(archive, &|m| {
+                m.push((CONTROL_NAME.to_owned(), b"echo\n".to_vec()))
+            });
+            assert!(
+                !control.ok && !control.text.contains('\r'),
+                "{archive}: a member name with a carriage return reached the log raw, or passed:\n{:?}",
+                control.text
+            );
             let unaudited = run(archive, &|m| m[0].1 = b"\x7fELF code".to_vec());
             assert!(
                 !unaudited.ok && unaudited.text.contains("cargo auditable"),
@@ -1146,6 +1306,12 @@ done
             extract[0]
         );
 
+        let control = run(&|d| std::fs::write(d.join(CONTROL_NAME), b"echo\n").unwrap());
+        assert!(
+            !control.ok && !control.text.contains('\r'),
+            "a member name with a carriage return reached the log raw, or passed:\n{:?}",
+            control.text
+        );
         let extra = run(&|d| std::fs::write(d.join("extra.sh"), b"echo\n").unwrap());
         assert!(
             !extra.ok && extra.text.contains("extra.sh"),
@@ -1388,6 +1554,16 @@ done
             "{LICENSE} as a link was unpacked for signing:\n{}",
             linked.text
         );
+        let control = run(&|m| m.push((CONTROL_NAME.to_owned(), b"echo\n".to_vec())));
+        assert!(
+            !control.ok && !control.text.contains('\r') && control.text.contains("\\x0d"),
+            "a member name with a carriage return reached the log raw, or passed:\n{:?}",
+            control.text
+        );
+        assert!(
+            !bin.exists(),
+            "a member with a control character in its name reached the disk"
+        );
         reset(&tmp);
         std::fs::create_dir_all(tmp.join("unsigned")).unwrap();
         std::fs::write(tmp.join("unsigned").join(WINDOWS_ZIP), b"not a zip").unwrap();
@@ -1479,7 +1655,8 @@ done
 
     /// Stands in for Get-AuthenticodeSignature, which exists only on Windows.
     /// A file is signed when it holds `AUTHENTICODE`; its status, signer
-    /// subject and timestamp are then what the environment says.
+    /// subject, the EKUs of its certificate and its timestamp are then what
+    /// the environment says.
     const AUTHENTICODE_STUB: &str = r#"function Get-AuthenticodeSignature {
   param([string]$LiteralPath, [string]$FilePath)
   $path = if ($LiteralPath) { $LiteralPath } else { $FilePath }
@@ -1488,6 +1665,11 @@ done
   if ($signed -and $env:STUB_SUBJECT) {
     $key = [System.Security.Cryptography.ECDsa]::Create()
     $req = [System.Security.Cryptography.X509Certificates.CertificateRequest]::new($env:STUB_SUBJECT, $key, [System.Security.Cryptography.HashAlgorithmName]::SHA256)
+    if ($env:STUB_EKUS) {
+      $oids = [System.Security.Cryptography.OidCollection]::new()
+      foreach ($o in $env:STUB_EKUS -split ',') { [void]$oids.Add([System.Security.Cryptography.Oid]::new($o)) }
+      $req.CertificateExtensions.Add([System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension]::new($oids, $false))
+    }
     $cert = $req.CreateSelfSigned([DateTimeOffset]::Now.AddMinutes(-1), [DateTimeOffset]::Now.AddDays(3))
   }
   [pscustomobject]@{
@@ -1498,8 +1680,11 @@ done
   }
 }"#;
 
-    const PUBLISHER: &str =
-        r#"CN="Hotash Studios, LLC", O="Hotash Studios, LLC", L=Madison, S=Wisconsin, C=US"#;
+    const PUBLISHER: &str = r#"CN="Hotash Studios, LLC", O="Hotash Studios, LLC", C=US"#;
+    /// Code signing, and the EKU every Artifact Signing Public Trust
+    /// certificate carries.
+    const CODE_SIGNING_EKU: &str = "1.3.6.1.5.5.7.3.3";
+    const ARTIFACT_SIGNING_EKU: &str = "1.3.6.1.4.1.311.97.1.0";
 
     // LEDGER T2254 | class B | 5 process exit code: release.yml sign-windows verify step, under pwsh, stub Get-AuthenticodeSignature
     #[test]
@@ -1512,35 +1697,41 @@ done
         let tmp = s.0.join("runner-temp");
         let cwd = s.0.join("workspace");
         let signed = format!("MZ code {AUDIT_SECTION} AUTHENTICODE").into_bytes();
-        let run = |exe: Option<&[u8]>, status: &str, subject: &str, stamped: &str| {
-            reset(&tmp);
-            reset(&cwd);
-            let mut m = members("hops.exe", &[WINDOWS_TARGET]);
-            match exe {
-                Some(bytes) => m[0].1 = bytes.to_vec(),
-                None => {
-                    m.remove(0);
+        let good_ekus = format!("{CODE_SIGNING_EKU},{ARTIFACT_SIGNING_EKU}");
+        let run_with =
+            |exe: Option<&[u8]>, status: &str, subject: &str, stamped: &str, ekus: &str| {
+                reset(&tmp);
+                reset(&cwd);
+                let mut m = members("hops.exe", &[WINDOWS_TARGET]);
+                match exe {
+                    Some(bytes) => m[0].1 = bytes.to_vec(),
+                    None => {
+                        m.remove(0);
+                    }
                 }
-            }
-            std::fs::write(cwd.join(WINDOWS_ZIP), zip(&m)).unwrap();
-            // A signed hops.exe left where it was signed, and where an
-            // earlier check unpacked one: neither is what is uploaded.
-            std::fs::create_dir_all(tmp.join("bin")).unwrap();
-            std::fs::write(tmp.join("bin/hops.exe"), &signed).unwrap();
-            std::fs::create_dir_all(tmp.join("check")).unwrap();
-            std::fs::write(tmp.join("check/hops.exe"), &signed).unwrap();
-            pwsh(
-                &script,
-                AUTHENTICODE_STUB,
-                &s.0,
-                &cwd,
-                &[
-                    ("RUNNER_TEMP", tmp.to_str().unwrap()),
-                    ("STUB_STATUS", status),
-                    ("STUB_SUBJECT", subject),
-                    ("STUB_TIMESTAMPED", stamped),
-                ],
-            )
+                std::fs::write(cwd.join(WINDOWS_ZIP), zip(&m)).unwrap();
+                // A signed hops.exe left where it was signed, and where an
+                // earlier check unpacked one: neither is what is uploaded.
+                std::fs::create_dir_all(tmp.join("bin")).unwrap();
+                std::fs::write(tmp.join("bin/hops.exe"), &signed).unwrap();
+                std::fs::create_dir_all(tmp.join("check")).unwrap();
+                std::fs::write(tmp.join("check/hops.exe"), &signed).unwrap();
+                pwsh(
+                    &script,
+                    AUTHENTICODE_STUB,
+                    &s.0,
+                    &cwd,
+                    &[
+                        ("RUNNER_TEMP", tmp.to_str().unwrap()),
+                        ("STUB_STATUS", status),
+                        ("STUB_SUBJECT", subject),
+                        ("STUB_TIMESTAMPED", stamped),
+                        ("STUB_EKUS", ekus),
+                    ],
+                )
+            };
+        let run = |exe: Option<&[u8]>, status: &str, subject: &str, stamped: &str| {
+            run_with(exe, status, subject, stamped, &good_ekus)
         };
 
         let good = run(Some(&signed), "Valid", PUBLISHER, "yes");
@@ -1581,6 +1772,30 @@ done
                 ran.text
             );
         }
+        // A profile-specific EKU beside them does not stand in for either.
+        for ekus in [
+            String::new(),
+            CODE_SIGNING_EKU.to_owned(),
+            format!("{CODE_SIGNING_EKU},1.3.6.1.4.1.311.97.990309390.766961637"),
+            ARTIFACT_SIGNING_EKU.to_owned(),
+            format!("{CODE_SIGNING_EKU},1.3.6.1.4.1.311.97.1.0.1"),
+        ] {
+            let ran = run_with(Some(&signed), "Valid", PUBLISHER, "yes", &ekus);
+            assert!(
+                !ran.ok && ran.text.contains("EKU"),
+                "a certificate with the EKUs {ekus:?} passed as an Artifact Signing one:\n{}",
+                ran.text
+            );
+        }
+        let profile = format!(
+            "{CODE_SIGNING_EKU},{ARTIFACT_SIGNING_EKU},1.3.6.1.4.1.311.97.990309390.766961637"
+        );
+        let with_profile = run_with(Some(&signed), "Valid", PUBLISHER, "yes", &profile);
+        assert!(
+            with_profile.ok,
+            "a certificate carrying its profile's EKU as well failed:\n{}",
+            with_profile.text
+        );
         let untimed = run(Some(&signed), "Valid", PUBLISHER, "no");
         assert!(
             !untimed.ok && untimed.text.contains("timestamp"),
@@ -2916,9 +3131,9 @@ fn the_unsigned_windows_build_can_never_be_attested() {
                 "the {leg} leg uploads its unsigned build as {artifact:?}"
             );
             assert!(
-                !selects(RELEASE_PATTERN, artifact),
-                "the unsigned Windows build is uploaded as {artifact}, which attest's \
-                 {RELEASE_PATTERN} collects into the release"
+                !RELEASE_ARTIFACTS.contains(&artifact),
+                "the unsigned Windows build is uploaded as {artifact}, which attest \
+                 gathers into the release"
             );
         } else {
             assert_eq!(
@@ -2929,24 +3144,40 @@ fn the_unsigned_windows_build_can_never_be_attested() {
         }
     }
 
-    // Every artifact attest collects, and who uploads it: the signed Windows
-    // build comes from sign-windows and from nowhere else.
-    let mut collected: Vec<(String, String)> = Vec::new();
+    // Every artifact attest gathers is uploaded by one job, the signed
+    // Windows build by sign-windows; every other upload is the unsigned
+    // Windows build or no release asset at all.
+    let mut uploaders: Vec<(String, String)> = Vec::new();
     for (id, job) in jobs(&wf) {
         for name in uploads(&id, job) {
-            if selects(RELEASE_PATTERN, &name) {
-                collected.push((id.clone(), name));
-            }
+            uploaders.push((name, id.clone()));
         }
     }
-    let windows: Vec<&(String, String)> = collected
+    for artifact in RELEASE_ARTIFACTS {
+        let by: Vec<&str> = uploaders
+            .iter()
+            .filter(|(n, _)| n == artifact)
+            .map(|(_, id)| id.as_str())
+            .collect();
+        assert_eq!(by.len(), 1, "{artifact} is uploaded by {by:?}");
+        if artifact == SIGNED_WINDOWS {
+            assert_eq!(
+                by,
+                [SIGN_WINDOWS],
+                "the Windows build reaches the release only as {SIGN_WINDOWS} signed it"
+            );
+        }
+    }
+    let others: BTreeSet<&str> = uploaders
         .iter()
-        .filter(|(_, n)| n.contains("windows"))
+        .map(|(n, _)| n.as_str())
+        .filter(|n| !RELEASE_ARTIFACTS.contains(n))
         .collect();
     assert_eq!(
-        windows,
-        vec![&(SIGN_WINDOWS.to_owned(), SIGNED_WINDOWS.to_owned())],
-        "the Windows build reaches the release only as {SIGN_WINDOWS} signed it"
+        others,
+        BTreeSet::from(["release", "release-notes", UNSIGNED_WINDOWS]),
+        "an artifact attest does not gather is uploaded; either it is a release asset \
+         left out of the release, or this list is out of date"
     );
     let upload = steps(&wf["jobs"][SIGN_WINDOWS])
         .iter()
@@ -3284,12 +3515,45 @@ fn every_asset_is_attested_by_a_job_that_can_do_nothing_else() {
         .as_str()
         .expect("the checksums are written in the release directory")
         .to_owned();
-    let downloaded = pos("downloads every build's assets", &|s| {
-        uses(s).starts_with("actions/download-artifact@")
-            && s["with"]["pattern"].as_str() == Some(RELEASE_PATTERN)
-            && s["with"]["merge-multiple"].as_bool() == Some(true)
-            && s["with"]["path"].as_str() == Some(dir.as_str())
-    });
+    // Each release artifact by name, into its own directory: no pattern,
+    // which would also collect an artifact uploaded under a matching name,
+    // and no merge, which would let one artifact's file replace another's.
+    let mut names = Vec::new();
+    let mut downloaded = 0;
+    for (i, s) in all.iter().enumerate() {
+        if !uses(s).starts_with("actions/download-artifact@") {
+            continue;
+        }
+        let name = s["with"]["name"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{ATTEST} downloads artifacts by pattern, not by name"));
+        assert!(
+            s["with"]["pattern"].is_badvalue() && s["with"]["merge-multiple"].is_badvalue(),
+            "{ATTEST} downloads {name} with a pattern or merged"
+        );
+        assert_eq!(
+            s["with"]["path"].as_str(),
+            Some(format!("{INCOMING}/{name}").as_str()),
+            "{ATTEST} downloads {name} into a directory it shares"
+        );
+        names.push(name);
+        downloaded = i;
+    }
+    names.sort();
+    assert_eq!(
+        names,
+        RELEASE_ARTIFACTS.to_vec(),
+        "{ATTEST} downloads each release artifact once, and nothing else"
+    );
+    let gathered = step_position(attest, ATTEST, GATHER_STEP);
+    assert!(
+        downloaded < gathered,
+        "{ATTEST} gathers the release before it has downloaded it"
+    );
+    assert!(
+        step_named(attest, ATTEST, GATHER_STEP)["working-directory"].is_badvalue(),
+        "{GATHER_STEP} must run where {INCOMING}/ and {dir}/ are"
+    );
     let checked = step_position(attest, ATTEST, ARCHIVE_GATE);
     let summed = step_position(attest, ATTEST, SUMS_STEP);
     let attested = pos("attests build provenance", &|s| {
@@ -3300,7 +3564,7 @@ fn every_asset_is_attested_by_a_job_that_can_do_nothing_else() {
             && s["with"]["name"].as_str() == Some(RELEASE_ARTIFACT)
     });
     assert!(
-        downloaded < checked && checked < summed && summed < attested && attested < uploaded,
+        gathered < checked && checked < summed && summed < attested && attested < uploaded,
         "{ATTEST} must download, check the archives, write SHA256SUMS, attest, then upload"
     );
     assert_eq!(

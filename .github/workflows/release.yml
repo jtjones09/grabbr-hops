@@ -3,10 +3,12 @@
 #
 # Trigger: push a version tag (e.g. `git tag v0.11.0 && git push origin v0.11.0`),
 # or run it by hand from the Actions tab ("Run workflow"). Both run every job
-# except publish: a run by hand from any branch builds all three platforms and
-# produces the signed, notarized dmg as the `hops-macos-universal-dmg` artifact
-# and the signed Windows zip as `hops-windows-x86_64`, and publishes nothing.
-# Only a pushed `v*` tag publishes.
+# except publish. A run by hand builds all three platforms and publishes
+# nothing; from a ref the signing environments admit (a `v*` tag or a
+# `release/*` branch) it also produces the signed, notarized dmg as the
+# `hops-macos-universal-dmg` artifact and the signed Windows zip as
+# `hops-windows-x86_64`. From any other ref the signing jobs fail at their
+# environment, and so does the run. Only a pushed `v*` tag publishes.
 #
 # Produces, per release:
 #   - hops-macos-universal.dmg       (Intel + Apple Silicon GUI app, signed and
@@ -521,7 +523,9 @@ jobs:
               if [ "$m" = "$f" ]; then known=yes; fi
             done
             if [ "$known" = no ]; then
-              echo "::error::the unsigned artifact carries $m, which is not part of the build."
+              # Printed escaped: a name from the archive could hold a line
+              # break that starts a workflow command of its own.
+              echo "::error::the unsigned artifact carries $(printf '%q' "$m"), which is not part of the build."
               bad=1
             fi
           done <<< "$listed"
@@ -648,14 +652,18 @@ jobs:
             foreach ($e in $entries) {
               # The file type a Unix archiver records in the high 16 bits.
               $type = ($e.ExternalAttributes -shr 16) -band 0xF000
+              # A name comes from the archive, so it is printed with every
+              # control character escaped: a line break in it could start a
+              # workflow command of its own.
+              $shown = [regex]::Replace($e.FullName, '[\x00-\x1f\x7f]', { '\x{0:x2}' -f [int][char]$args[0].Value })
               if ($members -cnotcontains $e.FullName) {
-                Write-Output "::error::the unsigned artifact carries $($e.FullName), which is not part of the build."
+                Write-Output "::error::the unsigned artifact carries $shown, which is not part of the build."
                 $bad = $true
               } elseif ($type -ne 0 -and $type -ne 0x8000) {
-                Write-Output "::error::the unsigned artifact's $($e.FullName) is not a plain file."
+                Write-Output "::error::the unsigned artifact's $shown is not a plain file."
                 $bad = $true
               } elseif ($e.Length -eq 0) {
-                Write-Output "::error::the unsigned artifact's $($e.FullName) is empty."
+                Write-Output "::error::the unsigned artifact's $shown is empty."
                 $bad = $true
               }
             }
@@ -740,6 +748,22 @@ jobs:
             Write-Output "::error::hops.exe is signed as '$($sig.SignerCertificate.Subject)', whose organization is not O=""Hotash Studios, LLC""."
             $bad = $true
           }
+          # Every Public Trust certificate Artifact Signing issues carries its
+          # EKU, 1.3.6.1.4.1.311.97.1.0, beside the code-signing EKU.
+          $ekus = @()
+          if ($null -ne $sig.SignerCertificate) {
+            foreach ($ext in $sig.SignerCertificate.Extensions) {
+              if ($ext -is [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension]) {
+                $ekus += @($ext.EnhancedKeyUsages | ForEach-Object { $_.Value })
+              }
+            }
+          }
+          foreach ($eku in '1.3.6.1.5.5.7.3.3', '1.3.6.1.4.1.311.97.1.0') {
+            if ($ekus -cnotcontains $eku) {
+              Write-Output "::error::the certificate hops.exe is signed with lacks the EKU $eku, so it is not an Artifact Signing Public Trust code-signing certificate."
+              $bad = $true
+            }
+          }
           if ($null -eq $sig.TimeStamperCertificate) {
             Write-Output '::error::hops.exe carries no timestamp, so its signature stops verifying when the certificate expires.'
             $bad = $true
@@ -774,11 +798,79 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      # Each release artifact is downloaded by name, into a directory of its
+      # own. A pattern would also collect any artifact a process in the build
+      # job uploaded under a matching name, and merging would let one
+      # artifact's file replace another's, in no defined order.
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          path: artifacts
-          pattern: hops-*
-          merge-multiple: true
+          name: hops-linux-x86_64
+          path: incoming/hops-linux-x86_64
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: hops-macos-universal
+          path: incoming/hops-macos-universal
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: hops-macos-universal-dmg
+          path: incoming/hops-macos-universal-dmg
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: hops-windows-x86_64
+          path: incoming/hops-windows-x86_64
+
+      # Each artifact holds exactly the assets its job makes, each a plain
+      # file, and only then are they gathered into the one directory that is
+      # checked, checksummed and attested.
+      - name: each artifact holds exactly the assets its job makes
+        run: |
+          assets_of() {
+            case "$1" in
+              hops-linux-x86_64) echo "hops-linux-x86_64.tar.gz hops-x86_64-unknown-linux-gnu.cdx.json" ;;
+              hops-macos-universal) echo "hops-macos-universal.tar.gz hops-aarch64-apple-darwin.cdx.json hops-x86_64-apple-darwin.cdx.json" ;;
+              hops-macos-universal-dmg) echo "hops-macos-universal.dmg" ;;
+              hops-windows-x86_64) echo "hops-windows-x86_64.zip hops-x86_64-pc-windows-msvc.cdx.json" ;;
+              *) return 1 ;;
+            esac
+          }
+          status=0
+          for d in incoming/* incoming/.[!.]*; do
+            [ -e "$d" ] || [ -L "$d" ] || continue
+            if ! assets_of "${d#incoming/}" > /dev/null; then
+              echo "::error::$(printf '%q' "${d#incoming/}") is not a release artifact."
+              status=1
+            fi
+          done
+          for a in hops-linux-x86_64 hops-macos-universal hops-macos-universal-dmg hops-windows-x86_64; do
+            want="$(assets_of "$a")"
+            for f in "incoming/$a"/* "incoming/$a"/.[!.]*; do
+              [ -e "$f" ] || [ -L "$f" ] || continue
+              name="${f#"incoming/$a/"}"
+              if ! printf '%s\n' $want | grep -qxF -- "$name"; then
+                echo "::error::the $a artifact carries $(printf '%q' "$name"), which its job does not make."
+                status=1
+              elif [ -L "$f" ] || [ ! -f "$f" ]; then
+                echo "::error::the $a artifact's $name is not a plain file."
+                status=1
+              fi
+            done
+            for f in $want; do
+              if [ ! -f "incoming/$a/$f" ] || [ -L "incoming/$a/$f" ]; then
+                echo "::error::the $a artifact carries no $f."
+                status=1
+              fi
+            done
+          done
+          if [ "$status" -ne 0 ]; then
+            exit 1
+          fi
+          mkdir artifacts
+          for a in hops-linux-x86_64 hops-macos-universal hops-macos-universal-dmg hops-windows-x86_64; do
+            for f in $(assets_of "$a"); do
+              mv -n "incoming/$a/$f" "artifacts/$f"
+            done
+          done
+          echo "OK: every release artifact holds exactly its assets."
 
       # The dmg is checked on macOS by scripts/verify-macos-release.sh before
       # sign-macos uploads it, and the signature on hops.exe on Windows before
@@ -818,7 +910,9 @@ jobs:
                 if [ "$m" = "$f" ]; then known=yes; fi
               done
               if [ "$known" = no ]; then
-                fail "$archive carries $m, which is not part of the build."
+                # Printed escaped: a name from the archive could hold a line
+                # break that starts a workflow command of its own.
+                fail "$archive carries $(printf '%q' "$m"), which is not part of the build."
               fi
             done <<< "$listed"
             mkdir -p "$dir"

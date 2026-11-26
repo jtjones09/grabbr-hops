@@ -133,68 +133,164 @@ an iCloud-synced checkout (no `xattr` dance needed).
 ## Windows
 
 `hops.exe` is signed with Azure Artifact Signing (formerly Trusted Signing),
-which issues a short-lived certificate in the publishing organization's
-validated name for each signing and keeps the key in Microsoft's HSMs. There
-is no certificate file or password to store: the `sign-windows` job proves
-who it is to Azure with a GitHub OIDC token.
+which issues a certificate in the publishing organization's validated name,
+valid for 72 hours, and keeps the key in Microsoft's HSMs. There is no
+certificate file or password to store: the `sign-windows` job proves who it
+is to Azure with a GitHub OIDC token.
 
 ### What is in Azure
 
-- An **Artifact Signing account** (`hotashsigning`), in the region whose
-  endpoint the workflow is given (for East US, `https://eus.codesigning.azure.net/`).
+- An **Artifact Signing account**, in the region whose endpoint the workflow
+  is given (`https://<region>.codesigning.azure.net/`).
 - An **identity validation** of the publishing organization, Hotash Studios,
   LLC, and a **certificate profile** of type **Public Trust** issued from it.
-  Signatures chain to a root Windows trusts, and the signer's subject carries
-  `O="Hotash Studios, LLC"`.
-- An **app registration** with a **federated credential** for GitHub Actions:
-  issuer `https://token.actions.githubusercontent.com`, subject
-  `repo:<owner>/<repo>:environment:windows-signing`, audience
-  `api://AzureADTokenExchange`. Only a job running in that environment of this
-  repository gets a token Azure accepts.
-- A role assignment of **Artifact Signing Certificate Profile Signer** to that
-  app registration, scoped to the signing account. It can sign with the
-  account's profiles and do nothing else in the subscription.
+  Signatures chain to a root Windows trusts; the signer's subject carries
+  `O="Hotash Studios, LLC"` and its certificate the Artifact Signing Public
+  Trust EKU `1.3.6.1.4.1.311.97.1.0`.
+- An **app registration** with one **federated credential**, bound to the
+  `windows-signing` environment of this repository by its immutable subject.
+- The **Artifact Signing Certificate Profile Signer** role for that app
+  registration, scoped to the one certificate profile.
 
 ### In CI
 
 `release.yml` signs in its own job, `sign-windows`, on a Windows runner. It
 runs no `cargo`, checks out nothing and restores no cache: it receives only
 the unsigned Windows build, which the build job uploads as
-`unsigned-windows-x86_64` so that attest, which collects every `hops-*`
-artifact, can never pick it up. `sign-windows` checks the zip holds exactly
-`hops.exe`, `LICENSE`, `THIRD-PARTY-NOTICES.txt` and the SBOM, logs in to Azure
-with [azure/login](https://github.com/Azure/login), signs `hops.exe` with
+`unsigned-windows-x86_64`. The attest job downloads each release artifact by
+name, so it never collects that one. `sign-windows` checks the zip holds
+exactly `hops.exe`, `LICENSE`, `THIRD-PARTY-NOTICES.txt` and the SBOM, logs
+in to Azure with [azure/login](https://github.com/Azure/login), signs
+`hops.exe` with
 [azure/artifact-signing-action](https://github.com/Azure/artifact-signing-action)
 (SHA-256, RFC-3161 timestamp from `http://timestamp.acs.microsoft.com`), and
 repackages the zip. Before uploading it as `hops-windows-x86_64` it reads
 `hops.exe` back out of that zip and fails unless `Get-AuthenticodeSignature`
 reports `Valid`, the signer's organization is exactly `Hotash Studios, LLC`,
-the signature is timestamped (the certificate itself lasts days, so an
-untimestamped signature would soon stop verifying), and the binary still
-carries the dependency list `cargo auditable` embedded.
+the certificate carries the code-signing and Artifact Signing Public Trust
+EKUs, the signature is timestamped (without one it stops verifying when the
+certificate expires), and the binary still carries the dependency list
+`cargo auditable` embedded.
 
-Set up once, before the first release that signs:
+### Setting it up
 
-1. Settings → Environments → `windows-signing` (create it if it is not
-   there) → Deployment branches and tags → Selected branches and tags: add
-   the tag rule `v*` and the branch rule `release/*`, as for `macos-signing`.
-   The federated credential trusts the environment, so these rules are what
-   decide which refs can sign.
-2. Add the six variables below as **environment variables** of
-   `windows-signing` (not secrets, and not repository variables). They are
-   identifiers, not credentials.
+Do these in order. A workflow that names an environment which does not
+exist creates it, with no protection, so the environment and its rules come
+before anything can sign through it.
 
-| variable | what |
-| --- | --- |
-| `AZURE_CLIENT_ID` | the app registration's application (client) ID |
-| `AZURE_TENANT_ID` | the directory (tenant) ID |
-| `AZURE_SUBSCRIPTION_ID` | the subscription that holds the signing account |
-| `ARTIFACT_SIGNING_ENDPOINT` | the account's regional endpoint, e.g. `https://eus.codesigning.azure.net/` |
-| `ARTIFACT_SIGNING_ACCOUNT` | the signing account name, `hotashsigning` |
-| `ARTIFACT_SIGNING_PROFILE` | the Public Trust certificate profile name |
+1. **The environment.** Settings → Environments → New environment →
+   `windows-signing`. Under Deployment branches and tags choose Selected
+   branches and tags and add the tag rule `v*` and the branch rule
+   `release/*`, as for `macos-signing`.
 
-`sign-windows` fails when any of the six is missing, naming it, on every run.
-A run that cannot produce a verified signed `hops.exe` publishes nothing.
+   Recommended: also turn on **Required reviewers** and add the maintainer.
+   Anyone with write access can push a `release/*` branch carrying a
+   modified `release.yml`, and that run would be admitted to the
+   environment and could sign what it likes. A required review puts a
+   person in front of every signing run, at one click per release; a
+   reviewer may approve their own run unless "Prevent self-review" is on.
+
+2. **The variables.** In the same environment, under Environment variables,
+   add the six below. They must be environment variables, never repository
+   variables: `vars.*` resolves a repository variable for a run on any
+   branch. They are identifiers, not credentials, so they are not secrets.
+
+   | variable | what |
+   | --- | --- |
+   | `AZURE_CLIENT_ID` | the app registration's application (client) ID |
+   | `AZURE_TENANT_ID` | the directory (tenant) ID |
+   | `AZURE_SUBSCRIPTION_ID` | the subscription that holds the signing account |
+   | `ARTIFACT_SIGNING_ENDPOINT` | the account's regional endpoint, `https://<region>.codesigning.azure.net/` |
+   | `ARTIFACT_SIGNING_ACCOUNT` | the signing account name |
+   | `ARTIFACT_SIGNING_PROFILE` | the Public Trust certificate profile name |
+
+   `sign-windows` fails, naming each one missing, on every run.
+
+3. **Immutable OIDC subjects.** By default a repository created before
+   2026-07-15 gets name-based OIDC subjects
+   (`repo:<owner>/<repo>:environment:windows-signing`). A credential that
+   trusts a name trusts whichever repository holds that name later, after a
+   rename, transfer or deletion. Opt the repository into the immutable form,
+   which adds the owner's and repository's numeric IDs, through the
+   repository's OIDC settings or the API:
+
+   ```sh
+   gh api -X PUT repos/<owner>/<repo>/actions/oidc/customization/sub \
+     -F use_default=true -F use_immutable_subject=true
+   gh api repos/<owner>/<repo>/actions/oidc/customization/sub --jq .sub_claim_prefix
+   ```
+
+   The second command prints the prefix tokens now carry,
+   `repo:<owner>@<owner_id>/<repo>@<repo_id>`. The two IDs are also what
+
+   ```sh
+   gh api repos/<owner>/<repo> --jq '.owner.id, .id'
+   ```
+
+   prints, owner first.
+
+4. **The federated credential.** On the app registration, add a federated
+   credential whose subject is the immutable one, for this environment
+   alone:
+
+   ```json
+   {
+     "name": "hops-windows-signing",
+     "issuer": "https://token.actions.githubusercontent.com",
+     "subject": "repo:<owner>@<owner_id>/<repo>@<repo_id>:environment:windows-signing",
+     "audiences": ["api://AzureADTokenExchange"]
+   }
+   ```
+
+   ```sh
+   az ad app federated-credential create --id <application-object-id> --parameters credential.json
+   ```
+
+   Remove any name-based credential for the same environment, so no
+   credential trusts a name.
+
+5. **The role.** Assign Artifact Signing Certificate Profile Signer to the
+   app registration's service principal at the scope of the one certificate
+   profile. The portal's Access control (IAM) assigns at the account; the
+   profile scope is set with the Azure CLI:
+
+   ```sh
+   az role assignment create \
+     --assignee <service-principal-object-id> \
+     --role "Artifact Signing Certificate Profile Signer" \
+     --scope "/subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.CodeSigning/codeSigningAccounts/<account>/certificateProfiles/<profile>"
+   ```
+
+To get a signed zip without releasing, run the workflow by hand from a
+`release/*` branch or a `v*` tag; it is attached to the run as the
+`hops-windows-x86_64` artifact.
+
+### What the signing job trusts
+
+`sign-windows` can sign as the publisher, so whatever runs in it can too.
+Besides the runner image and the two pinned actions, that is code fetched
+while it runs:
+
+- The signing action, at the pinned commit, installs the PowerShell module
+  `ArtifactSigning` 0.1.8 from the PowerShell Gallery. The version is pinned;
+  the content is not checked against a hash.
+- That module fetches NuGet packages at run time: the action's cache steps
+  name `Microsoft.Windows.SDK.BuildTools` 10.0.26100.4188,
+  `Microsoft.ArtifactSigning.Client` 1.0.128 and `sign`
+  0.9.1-beta.26227.3. These too are pinned by version only.
+- `cache-dependencies` is set to `"false"`, and this is load-bearing. The
+  action's cache keys are its dependency versions alone, and a cache entry
+  can be written by any run with the job's runtime token, including the
+  runs on `main` that compile third-party build scripts. With the cache on,
+  a module planted under that key would be restored into the signing job.
+  `tests/release_pipeline.rs` fails if the input changes.
+
+The job's OIDC token stays readable to the module while it signs. Clearing
+`ACTIONS_ID_TOKEN_REQUEST_URL` and `ACTIONS_ID_TOKEN_REQUEST_TOKEN` in the
+signing step was considered and not done: whether a step's `env:` overrides
+the variables the runner sets for OIDC is unverified, and the Azure CLI
+session from the login step already lets the module sign, so clearing them
+would not take that away.
 
 ### Checking a download
 
